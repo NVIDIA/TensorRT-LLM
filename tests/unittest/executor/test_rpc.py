@@ -42,9 +42,9 @@ class TestRpcBasics:
                 return "world"
 
         with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            client = RPCClient("ipc:///tmp/rpc_test")
-            ret = client.hello()  # sync call
-            assert ret == "world"
+            with RPCClient("ipc:///tmp/rpc_test") as client:
+                ret = client.hello()  # sync call
+                assert ret == "world"
 
     def test_remote_call_with_args(self):
 
@@ -55,9 +55,9 @@ class TestRpcBasics:
                 return f"hello {name} from {location}"
 
         with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            client = RPCClient("ipc:///tmp/rpc_test")
-            ret = client.hello("app", "Marvel")
-            assert ret == "hello app from Marvel"
+            with RPCClient("ipc:///tmp/rpc_test") as client:
+                ret = client.hello("app", "Marvel")
+                assert ret == "hello app from Marvel"
 
     def test_remote_call_with_kwargs(self):
 
@@ -68,9 +68,9 @@ class TestRpcBasics:
                 return f"hello {name} from {location}"
 
         with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            client = RPCClient("ipc:///tmp/rpc_test")
-            ret = client.hello(name="app", location="Marvel")
-            assert ret == "hello app from Marvel"
+            with RPCClient("ipc:///tmp/rpc_test") as client:
+                ret = client.hello(name="app", location="Marvel")
+                assert ret == "hello app from Marvel"
 
     def test_remote_call_with_args_and_kwargs(self):
 
@@ -81,9 +81,9 @@ class TestRpcBasics:
                 return f"hello {name} from {location}"
 
         with RpcServerWrapper(App(), addr="ipc:///tmp/rpc_test") as server:
-            client = RPCClient("ipc:///tmp/rpc_test")
-            ret = client.hello(name="app", location="Marvel")
-            assert ret == "hello app from Marvel"
+            with RPCClient("ipc:///tmp/rpc_test") as client:
+                ret = client.hello(name="app", location="Marvel")
+                assert ret == "hello app from Marvel"
 
     def test_rpc_server_address(self):
 
@@ -102,9 +102,9 @@ class TestRpcBasics:
 
         with RpcServerWrapper(App(),
                               addr="ipc:///tmp/rpc_test_error") as server:
-            client = RPCClient("ipc:///tmp/rpc_test_error")
-            with pytest.raises(RPCError):
-                client.hello()
+            with RPCClient("ipc:///tmp/rpc_test_error") as client:
+                with pytest.raises(RPCError):
+                    client.hello()
 
     def test_rpc_without_wait_response(self):
 
@@ -124,11 +124,12 @@ class TestRpcBasics:
 
         with RpcServerWrapper(App(),
                               addr="ipc:///tmp/rpc_test_no_wait") as server:
-            client = RPCClient("ipc:///tmp/rpc_test_no_wait")
-            client.send_task(__rpc_need_response=False)
-            time.sleep(
-                0.1)  # wait for some time to make sure the task is submitted
-            assert client.get_task_submitted()
+            with RPCClient("ipc:///tmp/rpc_test_no_wait") as client:
+                client.send_task(__rpc_need_response=False)
+                time.sleep(
+                    0.1
+                )  # wait for some time to make sure the task is submitted
+                assert client.get_task_submitted()
 
 
 class TestRpcError:
@@ -154,37 +155,36 @@ class TestRpcError:
             server.bind("ipc:///tmp/rpc_test_error")
             server.start()
             time.sleep(0.1)
-            client = RPCClient("ipc:///tmp/rpc_test_error")
+            with RPCClient("ipc:///tmp/rpc_test_error") as client:
+                # Test ValueError handling
+                with pytest.raises(RPCError) as exc_info:
+                    client.hello()
 
-            # Test ValueError handling
-            with pytest.raises(RPCError) as exc_info:
-                client.hello()
+                error = exc_info.value
+                assert "Test error message" in str(error)
+                assert error.cause is not None
+                assert isinstance(error.cause, ValueError)
+                assert error.traceback is not None
+                assert "ValueError: Test error message" in error.traceback
 
-            error = exc_info.value
-            assert "Test error message" in str(error)
-            assert error.cause is not None
-            assert isinstance(error.cause, ValueError)
-            assert error.traceback is not None
-            assert "ValueError: Test error message" in error.traceback
+                # Test ZeroDivisionError handling
+                with pytest.raises(RPCError) as exc_info:
+                    client.divide_by_zero()
 
-            # Test ZeroDivisionError handling
-            with pytest.raises(RPCError) as exc_info:
-                client.divide_by_zero()
+                error = exc_info.value
+                assert "division by zero" in str(error)
+                assert error.cause is not None
+                assert isinstance(error.cause, ZeroDivisionError)
+                assert error.traceback is not None
 
-            error = exc_info.value
-            assert "division by zero" in str(error)
-            assert error.cause is not None
-            assert isinstance(error.cause, ZeroDivisionError)
-            assert error.traceback is not None
+                # Test custom exception handling
+                with pytest.raises(RPCError) as exc_info:
+                    client.custom_exception()
 
-            # Test custom exception handling
-            with pytest.raises(RPCError) as exc_info:
-                client.custom_exception()
-
-            error = exc_info.value
-            assert "Custom error occurred" in str(error)
-            assert error.cause is not None
-            assert error.traceback is not None
+                error = exc_info.value
+                assert "Custom error occurred" in str(error)
+                assert error.cause is not None
+                assert error.traceback is not None
 
     def test_shutdown_cancelled_error(self):
         """Test that pending requests are cancelled with RPCCancelled when server shuts down."""
@@ -205,13 +205,15 @@ class TestRpcError:
         server.start()
         time.sleep(0.1)
 
-        client = RPCClient(addr)
-        client.shutdown_server()
-        pending_futures = [client.task(__rpc_mode="future") for _ in range(10)]
+        with RPCClient(addr) as client:
+            client.shutdown_server()
+            pending_futures = [
+                client.task(__rpc_mode="future") for _ in range(10)
+            ]
 
-        for future in pending_futures:
-            with pytest.raises(RPCCancelled):
-                future.result()
+            for future in pending_futures:
+                with pytest.raises(RPCCancelled):
+                    future.result()
 
         time.sleep(5)
 
@@ -227,21 +229,20 @@ class TestRpcError:
                 time.sleep(2.0)
                 return "completed"
 
-        with RPCServer(App()) as server:
-            server.bind("ipc:///tmp/rpc_test_timeout")
-            server.start()
+        with RpcServerWrapper(App(),
+                              addr="ipc:///tmp/rpc_test_timeout") as server:
             time.sleep(0.1)
 
             # Create client with short timeout
-            client = RPCClient("ipc:///tmp/rpc_test_timeout", timeout=0.5)
+            with RPCClient("ipc:///tmp/rpc_test_timeout",
+                           timeout=0.5) as client:
+                with pytest.raises(RPCError) as exc_info:
+                    client.slow_method(__rpc_timeout=0.5)
 
-            with pytest.raises(RPCError) as exc_info:
-                client.slow_method(__rpc_timeout=0.5)
-
-            error = exc_info.value
-            # Should be either a timeout error or RPC error indicating timeout
-            assert "timed out" in str(error).lower() or "timeout" in str(
-                error).lower()
+                    error = exc_info.value
+                    # Should be either a timeout error or RPC error indicating timeout
+                    assert "timed out" in str(
+                        error).lower() or "timeout" in str(error).lower()
 
     def test_method_not_found_error(self):
         """Test that calling non-existent methods returns proper error."""
@@ -251,19 +252,17 @@ class TestRpcError:
             def existing_method(self):
                 return "exists"
 
-        with RPCServer(App()) as server:
-            server.bind("ipc:///tmp/rpc_test_not_found")
-            server.start()
+        with RpcServerWrapper(App(),
+                              addr="ipc:///tmp/rpc_test_not_found") as server:
             time.sleep(0.1)
 
-            client = RPCClient("ipc:///tmp/rpc_test_not_found")
+            with RPCClient("ipc:///tmp/rpc_test_not_found") as client:
+                with pytest.raises(RPCError) as exc_info:
+                    client.non_existent_method()
 
-            with pytest.raises(RPCError) as exc_info:
-                client.non_existent_method()
-
-            error = exc_info.value
-            assert "not found" in str(error)
-            assert error.traceback is not None
+                error = exc_info.value
+                assert "not found" in str(error)
+                assert error.traceback is not None
 
 
 def test_rpc_shutdown_server():
@@ -277,11 +276,11 @@ def test_rpc_shutdown_server():
         server.bind("ipc:///tmp/rpc_test_shutdown")
         server.start()
         time.sleep(0.1)
-        client = RPCClient("ipc:///tmp/rpc_test_shutdown")
-        ret = client.hello()
-        assert ret == "world"
+        with RPCClient("ipc:///tmp/rpc_test_shutdown") as client:
+            ret = client.hello()
+            assert ret == "world"
 
-        client.shutdown_server()
+            client.shutdown_server()
 
     time.sleep(5)  # the server dispatcher thread need some time to quit
 
@@ -303,22 +302,21 @@ def test_rpc_without_response_performance():
         server.bind("ipc:///tmp/rpc_test_no_wait")
         server.start()
         time.sleep(0.1)
-        client = RPCClient("ipc:///tmp/rpc_test_no_wait")
+        with RPCClient("ipc:///tmp/rpc_test_no_wait") as client:
+            time_start = time.time()
+            for i in range(100):
+                client.send_task(__rpc_need_response=False)
+            time_end = time.time()
 
-        time_start = time.time()
-        for i in range(100):
-            client.send_task(__rpc_need_response=False)
-        time_end = time.time()
+            no_wait_time = time_end - time_start
 
-        no_wait_time = time_end - time_start
+            time_start = time.time()
+            for i in range(100):
+                client.send_task(__rpc_need_response=True)
+            time_end = time.time()
+            wait_time = time_end - time_start
 
-        time_start = time.time()
-        for i in range(100):
-            client.send_task(__rpc_need_response=True)
-        time_end = time.time()
-        wait_time = time_end - time_start
-
-        assert no_wait_time < wait_time, f"{no_wait_time} > {wait_time}"
+            assert no_wait_time < wait_time, f"{no_wait_time} > {wait_time}"
 
 
 @pytest.mark.parametrize("async_run_task", [True, False])
@@ -337,16 +335,16 @@ def test_rpc_benchmark(async_run_task: bool, use_ipc_addr: bool):
         server.start()
         time.sleep(0.1)
 
-        client = RPCClient(server.address)
+        with RPCClient(server.address) as client:
 
-        time_start = time.time()
-        for i in range(100):
-            ret = client.cal(i, __rpc_timeout=10)  # sync call
-            assert ret == i * 2, f"{ret} != {i * 2}"
-        time_end = time.time()
-        print(
-            f"Time taken: {time_end - time_start} seconds, {10000 / (time_end - time_start)} calls/second"
-        )
+            time_start = time.time()
+            for i in range(100):
+                ret = client.cal(i, __rpc_timeout=10)  # sync call
+                assert ret == i * 2, f"{ret} != {i * 2}"
+            time_end = time.time()
+            print(
+                f"Time taken: {time_end - time_start} seconds, {10000 / (time_end - time_start)} calls/second"
+            )
 
 
 @pytest.mark.parametrize("use_async", [True, False])
@@ -364,45 +362,53 @@ def test_rpc_timeout(use_async: bool):
             time.sleep(delay)
             return "completed"
 
-    with RPCServer(App()) as server:
-        server.bind("ipc:///tmp/rpc_test_timeout")
-        server.start()
+    # Use manual server lifecycle management to ensure server stays alive
+    server = RPCServer(App())
+    server.bind("ipc:///tmp/rpc_test_timeout")
+    server.start()
+
+    try:
         time.sleep(0.1)
-        client = RPCClient("ipc:///tmp/rpc_test_timeout")
+        with RPCClient("ipc:///tmp/rpc_test_timeout") as client:
 
-        # Test that a short timeout causes RPCTimeout exception
-        with pytest.raises(RPCTimeout) as exc_info:
-            import asyncio
+            # Test that a short timeout causes RPCTimeout exception
+            with pytest.raises(RPCTimeout) as exc_info:
+                import asyncio
+                if use_async:
+
+                    async def test_async_timeout():
+                        return await client.call_async('slow_operation',
+                                                       2.0,
+                                                       __rpc_timeout=0.1)
+
+                    asyncio.run(test_async_timeout())
+                else:
+                    assert client.slow_operation(
+                        2.0, __rpc_timeout=0.1)  # small timeout
+
+                assert "timed out" in str(
+                    exc_info.value
+                ), f"Timeout message not found: {exc_info.value}"
+
+            # Test that a long timeout allows the operation to complete
             if use_async:
+                import asyncio
 
-                async def test_async_timeout():
+                async def test_async_success():
                     return await client.call_async('slow_operation',
-                                                   2.0,
-                                                   __rpc_timeout=0.1)
+                                                   0.1,
+                                                   __rpc_timeout=10.0)
 
-                asyncio.run(test_async_timeout())
+                result = asyncio.run(test_async_success())
             else:
-                client.slow_operation(2.0, __rpc_timeout=0.1)  # small timeout
+                result = client.slow_operation(0.1, __rpc_timeout=10.0)
 
-            assert "timed out" in str(
-                exc_info.value), f"Timeout message not found: {exc_info.value}"
+            assert result == "completed"
 
-        # Test that a long timeout allows the operation to complete
-        if use_async:
-            import asyncio
+            print(f"final result: {result}")
 
-            async def test_async_success():
-                return await client.call_async('slow_operation',
-                                               0.1,
-                                               __rpc_timeout=10.0)
-
-            result = asyncio.run(test_async_success())
-        else:
-            result = client.slow_operation(0.1, __rpc_timeout=10.0)
-
-        assert result == "completed"
-
-        client.close()
+    finally:
+        server.shutdown()
 
 
 class TestRpcShutdown:
@@ -417,12 +423,12 @@ class TestRpcShutdown:
         with RpcServerWrapper(App(),
                               addr="ipc:///tmp/rpc_test_shutdown") as server:
             time.sleep(0.1)
-            client = RPCClient("ipc:///tmp/rpc_test_shutdown")
-            client.quick_task(1)
+            with RPCClient("ipc:///tmp/rpc_test_shutdown") as client:
+                client.quick_task(1)
 
-            # repeated shutdown should not raise an error
-            for i in range(10):
-                server.shutdown()
+                # repeated shutdown should not raise an error
+                for i in range(10):
+                    server.shutdown()
 
     def test_submit_request_after_server_shutdown(self):
 
@@ -437,14 +443,14 @@ class TestRpcShutdown:
         server.start()
 
         time.sleep(0.1)
-        client = RPCClient("ipc:///tmp/rpc_test_shutdown")
-        # This task should be continued after server shutdown
-        res = client.foo(10, __rpc_timeout=12, __rpc_mode="future")
+        with RPCClient("ipc:///tmp/rpc_test_shutdown") as client:
+            # This task should be continued after server shutdown
+            res = client.foo(10, __rpc_timeout=12, __rpc_mode="future")
 
-        # The shutdown will block until all pending requests are finished
-        server.shutdown()
+            # The shutdown will block until all pending requests are finished
+            server.shutdown()
 
-        assert res.result() == "foo"
+            assert res.result() == "foo"
 
 
 if __name__ == "__main__":

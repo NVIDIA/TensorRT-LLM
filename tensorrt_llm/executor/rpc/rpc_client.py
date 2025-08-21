@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import threading
 import uuid
 
 from ...logger import logger
@@ -35,12 +36,10 @@ class RPCClient:
             max_workers=num_workers, thread_name_prefix="rpc_client")
 
         self._server_stopped = False
+        self._loop = None
+        self._loop_thread = None
 
         logger.debug(f"RPC Client initialized. Connected to {self._address}")
-
-    def __del__(self):
-        """Cleanup executor when client is destroyed."""
-        self.close()
 
     def shutdown_server(self):
         """Shutdown the server."""
@@ -56,6 +55,11 @@ class RPCClient:
         if self._reader_task:
             self._reader_task.cancel()
             self._reader_task = None
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop_thread:
+            self._loop_thread.join()
+            self._loop_thread = None
         if self._executor:
             self._executor.shutdown(wait=True)
 
@@ -65,6 +69,7 @@ class RPCClient:
         while True:
             try:
                 response: RPCResponse = await self._client_socket.get_async()
+                logger.debug(f"RPC Client received response: {response}")
                 future = self._pending_futures.get(response.request_id)
                 if future and not future.done():
                     if response.error is None:
@@ -88,10 +93,15 @@ class RPCClient:
 
         self._reader_task = None
 
-    async def _start_reader_if_needed(self):
+    def _start_response_reader_lazily(self):
         if self._reader_task is None or self._reader_task.done():
-            loop = asyncio.get_running_loop()
-            self._reader_task = loop.create_task(self._response_reader())
+            # Ensure we have a persistent background loop
+            self._ensure_event_loop()
+            # Always create the reader task on the persistent loop
+            future = asyncio.run_coroutine_threadsafe(self._response_reader(),
+                                                      self._loop)
+            # Store the concurrent.futures.Future
+            self._reader_task = future
 
     async def _call_async(self, __rpc_method_name, *args, **kwargs):
         """Async version of RPC call.
@@ -112,7 +122,7 @@ class RPCClient:
         if self._server_stopped:
             raise RPCCancelled("Server is shutting down, request cancelled")
 
-        await self._start_reader_if_needed()
+        self._start_response_reader_lazily()
         need_response = kwargs.pop("__rpc_need_response", True)
         timeout = kwargs.pop("__rpc_timeout", self._timeout)
 
@@ -151,9 +161,28 @@ class RPCClient:
         finally:
             self._pending_futures.pop(request_id, None)
 
+    def _ensure_event_loop(self):
+        """Ensure we have a running event loop in a background thread."""
+        if self._loop is None or not self._loop.is_running():
+            self._loop = asyncio.new_event_loop()
+
+            def run_loop():
+                asyncio.set_event_loop(self._loop)
+                self._loop.run_forever()
+
+            self._loop_thread = threading.Thread(target=run_loop, daemon=True)
+            self._loop_thread.start()
+
+            # Give the loop a moment to start
+            import time
+            time.sleep(0.1)
+
     def _call_sync(self, __rpc_method_name, *args, **kwargs):
         """Synchronous version of RPC call."""
-        return asyncio.run(self._call_async(__rpc_method_name, *args, **kwargs))
+        self._ensure_event_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            self._call_async(__rpc_method_name, *args, **kwargs), self._loop)
+        return future.result()
 
     def call_async(self, name: str, *args, **kwargs):
         """
@@ -193,7 +222,10 @@ class RPCClient:
         """
 
         def _async_to_sync():
-            return asyncio.run(self._call_async(name, *args, **kwargs))
+            self._ensure_event_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                self._call_async(name, *args, **kwargs), self._loop)
+            return future.result()
 
         return self._executor.submit(_async_to_sync)
 
@@ -257,3 +289,12 @@ class RPCClient:
                                                **kwargs)
 
         return MethodProxy(self, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __del__(self):
+        self.close()

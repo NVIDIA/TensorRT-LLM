@@ -95,7 +95,6 @@ class RPCServer:
             is_remote_call: Whether the shutdown is called by a remote call.
                 This should be True when client.server_shutdown() is called.
         """
-
         # NOTE: shutdown is also a remote method, so it could be executed by
         # a thread in a worker executor thread
 
@@ -104,6 +103,10 @@ class RPCServer:
 
         logger.debug(
             "RPC Server shutdown signal received. Terminating server...")
+
+        # Set the stop event to True, this will trigger the dispatcher routine and
+        # the worker routine to prepare for exit, like stopping accepting new requests,
+        # and continue to process the pending requests.
         self._stop_event.set()
 
         # The worker routine should process the pending requests
@@ -115,18 +118,35 @@ class RPCServer:
         logger.debug(f"RPC Server shutdown finished pending requests")
 
         if not is_remote_call:
+            # Block the thread until shutdown is finished
+
+            # 1. Wait for the dispatcher thread to exit, so that no new requests are accepted
             logger.debug(f"RPC Server dispatcher thread joining")
             if self._dispatcher_thread:
                 self._dispatcher_thread.join()
                 self._dispatcher_thread = None
             logger.debug(f"RPC Server dispatcher thread joined")
 
+            # 2. Wait for the executor to exit, it will wait for the pending requests to be processed
             if self._executor:
                 self._executor.shutdown(wait=True)
                 self._executor = None
 
+            # 3. (Optionally) Close the client socket, this doesn't affect
+            # anything since zmq client will not timeout even if the target is not available
             if self._client_socket:
                 self._client_socket.close()
+        else:
+            # if the shutdown is called by a remote call, this method itself will
+            # be executed in a executor thread, so we cannot join the dispatcher thread as
+            # the dispatcher thread is awaiting for the shutdown result.
+            logger.debug(
+                f"RPC Server to shutdown: {self._num_pending_requests} pending requests"
+            )
+
+            while self._num_pending_requests > 0:
+                time.sleep(0.01)
+            logger.debug(f"RPC Server shutdown finished pending requests")
 
     def register_function(self, func, name=None):
         """Exposes a single function to clients."""
@@ -192,7 +212,9 @@ class RPCServer:
 
             # Some tasks don't need response, e.g. submit_request or shutdown
             if req.need_response:
+                logger.debug(f"RPC Server sending response for request {req}")
                 await self._client_socket.put_async(response)
+                logger.debug(f"RPC Server sent response for request {req}")
 
             self._num_pending_requests -= 1
 
@@ -212,6 +234,7 @@ class RPCServer:
             result = await asyncio.wait_for(loop.run_in_executor(
                 self._executor, call_with_kwargs),
                                             timeout=req.timeout)
+            logger.debug(f"RPC Server returned result for request {req}")
             response = RPCResponse(req.request_id, result)
 
         except asyncio.TimeoutError:

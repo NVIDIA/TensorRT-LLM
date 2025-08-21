@@ -1,9 +1,10 @@
 import os
 import sys
 
-from test_worker_base import TestWorkerBase
+from test_worker_base import create_fake_executor_config
 
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -18,15 +19,18 @@ model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 class TestRpcProxyTp1:
 
-    def __init__(self):
-        self.executor_config = TestWorkerBase.create_fake_executor_config(
-            model_path)
+    def setup_method(self):
+        self.executor_config = create_fake_executor_config(model_path)
 
     def create_proxy(self, tp_size: int):
+        mpi_session = MpiPoolSession(n_workers=tp_size)
         proxy = GenerationExecutorRpcProxy(
-            engine=model_path,
-            executor_config=self.executor_config,
-            model_world_size=tp_size,
+            worker_kwargs={
+                "engine": model_path,
+                "executor_config": self.executor_config,
+                "model_world_size": tp_size,
+            },
+            mpi_session=mpi_session,
         )
         return proxy
 
