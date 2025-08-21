@@ -4,13 +4,12 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 
 from tensorrt_llm._utils import nvtx_range_debug
-from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.inputs import create_input_processor, prompt_inputs
 from tensorrt_llm.inputs.data import PromptInputs
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .llm import BaseLLM, RequestOutput, _TorchLLM
-from .llm_args import PybindMirror
+from .llm_args import TorchLlmArgs
 from .mpi_session import external_mpi_comm_available
 
 
@@ -56,48 +55,21 @@ class MultimodalEncoder(_TorchLLM):
                                                       self.tokenizer)
         self._tokenizer = self.input_processor.tokenizer
 
-        max_batch_size = self.args.max_batch_size
-        max_num_tokens = self.args.max_num_tokens
-        max_seq_len = self.args.max_seq_len
-
-        kwargs = {}
-        if self._on_trt_backend:
-            kwargs[
-                "batching_type"] = self.args.batching_type or tllm.BatchingType.INFLIGHT
-
-        self._executor_config = tllm.ExecutorConfig(
-            scheduler_config=PybindMirror.maybe_to_pybind(
-                self.args.scheduler_config),
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            **kwargs)
-        from tensorrt_llm._torch.pyexecutor.config import update_executor_config
-        max_batch_size = self._executor_config.max_batch_size
-        update_executor_config(
-            self._executor_config,
-            backend=self.args.backend,
-            pytorch_backend_config=self.args.get_pytorch_backend_config()
-            if self.args.backend in ["pytorch", "_autodeploy"] else None,
-            mapping=self.args.parallel_config.to_mapping(),
-            hf_model_dir=self._hf_model_dir,
-            max_input_len=self.args.max_input_len,
-            max_seq_len=max_seq_len,
-            checkpoint_format=None if self.args.backend == "_autodeploy" else
-            self.args.checkpoint_format,
-            checkpoint_loader=None if self.args.backend == "_autodeploy" else
-            self.args.checkpoint_loader,
-            mm_encoder_only=True)
+        assert isinstance(self.args, TorchLlmArgs)
+        # Update the tokenizer in TorchLlmArgs, so it can be used in GenerationExecutorWorker to init executor_config
+        self.args.set_tokenizer(self.tokenizer)
+        self.args.set_mm_encoder_only(True)
 
         self._executor = self._executor_cls.create(
             self._engine_dir,
-            executor_config=self._executor_config,
+            executor_config=None,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
                 self.args.parallel_config.world_size),
             is_llm_executor=True,  # TODO: check if this is correct or needed
-            garbage_collection_gen0_threshold=self.args.
-            garbage_collection_gen0_threshold)
+            hf_model_dir=self._hf_model_dir,
+            llm_args=self.args)
 
     def _validate_mm_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass LLM-specific arguments when using MultimodalEncoder (PyTorch).

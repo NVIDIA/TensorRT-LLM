@@ -967,6 +967,8 @@ class _TorchLLM(BaseLLM):
         self._tokenizer = self.input_processor.tokenizer
 
         assert isinstance(self.args, TorchLlmArgs)
+        # Update the tokenizer in TorchLlmArgs, so it can be used in GenerationExecutorWorker to init executor_config
+        self.args.set_tokenizer(self.tokenizer)
 
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits

@@ -1837,6 +1837,9 @@ class BaseLlmArgs(StrictBaseModel):
                 moe_tp_size=moe_tp_size,
                 moe_ep_size=moe_ep_size)
 
+    def set_tokenizer(self, tokenizer):
+        self.tokenizer = tokenizer
+
 
 class TrtLlmArgs(BaseLlmArgs):
 
@@ -2185,6 +2188,13 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    mm_encoder_only: Optional[bool] = Field(
+        default=False,
+        description=
+        "Only load/execute the vision encoder part of the full model.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2376,6 +2386,9 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError("batch_wait_timeout_ms must be greater than 0")
         return self
 
+    def set_mm_encoder_only(self, mm_encoder_only):
+        self.mm_encoder_only = mm_encoder_only
+
     def get_executor_config(self,
                             _hf_model_dir: Optional[Path] = None
                             ) -> _ExecutorConfig:
@@ -2443,7 +2456,8 @@ class TorchLlmArgs(BaseLlmArgs):
             checkpoint_format=None
             if self.backend == "_autodeploy" else self.checkpoint_format,
             checkpoint_loader=None
-            if self.backend == "_autodeploy" else self.checkpoint_loader)
+            if self.backend == "_autodeploy" else self.checkpoint_loader,
+            mm_encoder_only=self.mm_encoder_only)
 
         return executor_config
 

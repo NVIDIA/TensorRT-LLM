@@ -91,14 +91,23 @@ class GenerationExecutorWorker(GenerationExecutor):
         if isinstance(engine, list):
             engine = engine[self.rank]
 
-        def _create_py_executor(comm_ranks, device_ids):
+        def _get_comm_ranks_device_id():
+            device_id = self.global_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_id)
+            # Make sure C++ executor would use same devices/ranks as py_executor
+            global_rank = global_mpi_rank()
+            comm_ranks = mpi_comm().allgather(global_rank)
+            device_ids = mpi_comm().allgather(device_id)
+            return comm_ranks, device_ids
 
+        def _create_py_executor(executor_config):
+            assert executor_config is None, "expect an empty executor_config is _create_py_executor"
             executor_config = llm_args.get_executor_config(hf_model_dir)
             # Persist so downstream code (e.g., default max_tokens deduction) has access
             self._executor_config = executor_config
-
             executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
                 processor_batched=batched_logits_processor, replicate=False)
+            comm_ranks, device_ids = _get_comm_ranks_device_id()
             executor_config.parallel_config = tllm.ParallelConfig(
                 participant_ids=comm_ranks, device_ids=device_ids)
             args = {
@@ -120,13 +129,12 @@ class GenerationExecutorWorker(GenerationExecutor):
                     f"Unsupported backend config: {executor_config.backend}")
             return create_executor(**args)
 
-        def _create_engine(comm_ranks, device_ids):
+        def _create_engine(executor_config):
             if executor_config is None:
                 executor_config = tllm.ExecutorConfig(1)
-
             executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
                 processor_batched=batched_logits_processor, replicate=False)
-
+            comm_ranks, device_ids = _get_comm_ranks_device_id()
             executor_config.parallel_config = tllm.ParallelConfig(
                 participant_ids=comm_ranks, device_ids=device_ids)
 
@@ -154,17 +162,9 @@ class GenerationExecutorWorker(GenerationExecutor):
                     f"Unsupported backend config: {executor_config.backend}")
             return create_executor(**args)
 
-        device_id = self.global_rank % torch.cuda.device_count()
-        torch.cuda.set_device(device_id)
-
-        # Make sure C++ executor would use same devices/ranks as py_executor
-        global_rank = global_mpi_rank()
-        comm_ranks = mpi_comm().allgather(global_rank)
-        device_ids = mpi_comm().allgather(device_id)
-
         self.engine = _create_py_executor(
-            comm_ranks, device_ids) if llm_args is not None else _create_engine(
-                comm_ranks, device_ids)
+            executor_config) if llm_args is not None else _create_engine(
+                executor_config)
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
