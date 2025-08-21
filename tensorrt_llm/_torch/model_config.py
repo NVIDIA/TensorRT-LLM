@@ -441,22 +441,14 @@ class ModelConfig(Generic[TConfig]):
             model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
+        print(
+            f"DEBUG: Before if self.pretrained_config.intermediate_size is not None:"
+        )
         if self.pretrained_config.intermediate_size is not None:
-            if isinstance(self.pretrained_config.intermediate_size,
-                          (list, tuple)):
-                # Per-layer MLP dimensions (e.g., Nemotron-NAS, variable MLP models)
-                mlp_hidden_size_per_layer = [
-                    intermediate_size // self.mapping.tp_size
-                    for intermediate_size in
-                    self.pretrained_config.intermediate_size
-                ]
-                model_config_cpp.mlp_hidden_size_per_layer = mlp_hidden_size_per_layer
-                # For LoRA compatibility, use the maximum MLP dimension
-                mlp_hidden_size = max(mlp_hidden_size_per_layer)
-            else:
-                # Uniform MLP dimensions across all layers
-                mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+            print(f"DEBUG: Intermediate size is not None")
+            mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
         else:
+            print(f"DEBUG: Intermediate size is None")
             # TODO: once tensorrt_llm._torch.AutoConfig is implemented, the following logic
             # should be moved to tensorrt_llm._torch.AutoConfig of the relevant modeling_xxx file
             if hasattr(self.pretrained_config, "architectures"
@@ -464,11 +456,20 @@ class ModelConfig(Generic[TConfig]):
                 architectures = self.pretrained_config.architectures
                 if len(architectures
                        ) == 1 and architectures[0] == "DeciLMForCausalLM":
+                    print(
+                        f"DEBUG: Calling _infer_nemotron_ffn_mult for Nemotron model"
+                    )
                     mlp_hidden_size = self._infer_nemotron_ffn_mult()
+                    print(f"DEBUG: Final mlp_hidden_size: {mlp_hidden_size}")
+                    print(f"DEBUG: TP size: {self.mapping.tp_size}")
+                    print(
+                        f"DEBUG: Expected mlp_hidden_size after TP: {mlp_hidden_size // self.mapping.tp_size}"
+                    )
                 else:
                     raise ValueError(
                         f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"
                     )
+        print(f"DEBUG: AFTER if mlp_hidden_size is None:")
         if mlp_hidden_size is None:
             raise ValueError(
                 f"Failed to infer mlp hidden size for model: {self.pretrained_config.model_type}"
@@ -487,6 +488,7 @@ class ModelConfig(Generic[TConfig]):
             head_size = hidden_size // num_heads
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
+        # model_config_cpp.coarse_mlp_hidden_size = self.coarse_mlp_hidden_size
         model_config_cpp.size_per_head = head_size
 
         # NOTE: this method is not robust, for Gemma3ForCausalLM only
@@ -501,17 +503,57 @@ class ModelConfig(Generic[TConfig]):
         # Nemotron-NAS has variable ffn_mult for each layer, we need to find the maximum
         # so that we don't set a too small mlp_hidden_size. This solution leads to a memory
         # consumption that is higher than required.
-        biggest_ffn_mult = max([
-            (x.ffn.ffn_mult if x.ffn.ffn_mult is not None else 0)
-            for x in self.pretrained_config.block_configs
-        ])
+
+        print(
+            f"DEBUG: _infer_nemotron_ffn_mult - TP size: {self.mapping.tp_size}"
+        )
+        print(
+            f"DEBUG: _infer_nemotron_ffn_mult - Number of block_configs: {len(self.pretrained_config.block_configs)}"
+        )
+
+        ffn_mults = [(x.ffn.ffn_mult if x.ffn.ffn_mult is not None else 0)
+                     for x in self.pretrained_config.block_configs]
+        print(f"DEBUG: _infer_nemotron_ffn_mult - All ffn_mults: {ffn_mults}")
+
+        biggest_ffn_mult = max(ffn_mults)
+        print(
+            f"DEBUG: _infer_nemotron_ffn_mult - Biggest ffn_mult: {biggest_ffn_mult}"
+        )
 
         from tensorrt_llm._torch.models.modeling_nemotron_nas import \
             _ffn_mult_to_intermediate_size
         mlp_hidden_size = _ffn_mult_to_intermediate_size(
             biggest_ffn_mult, self.pretrained_config.hidden_size)
 
+        print(
+            f"DEBUG: _infer_nemotron_ffn_mult - Calculated mlp_hidden_size: {mlp_hidden_size}"
+        )
+        print(
+            f"DEBUG: _infer_nemotron_ffn_mult - Hidden size: {self.pretrained_config.hidden_size}"
+        )
+
+        print(
+            f"DEBUG: _infer_nemotron_ffn_mult - Final TP-split mlp_hidden_size: {mlp_hidden_size}"
+        )
         return mlp_hidden_size
+
+    @property
+    def coarse_mlp_hidden_size(self):
+        """Get the MLP hidden size (TP-split) for LoRA padding calculations."""
+        if self.pretrained_config.intermediate_size is not None:
+            return self.pretrained_config.intermediate_size // self.mapping.tp_size
+        else:
+            # For Nemotron models, use the same logic as _infer_nemotron_ffn_mult
+            if (hasattr(self.pretrained_config, "architectures")
+                    and self.pretrained_config.architectures is not None
+                    and len(self.pretrained_config.architectures) == 1
+                    and self.pretrained_config.architectures[0]
+                    == "DeciLMForCausalLM"):
+                return self._infer_nemotron_ffn_mult()
+            else:
+                raise ValueError(
+                    f"Failed to infer mlp hidden size for model: {self.pretrained_config.model_type}"
+                )
 
     def get_layer_types(self) -> Optional[List[LayerTypeCpp]]:
         """

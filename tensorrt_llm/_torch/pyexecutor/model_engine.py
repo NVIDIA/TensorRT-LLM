@@ -461,11 +461,40 @@ class PyTorchModelEngine(ModelEngine):
 
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
+        coarse_mlp_hidden_size = None
+
+        # Debug: Check what type self.model.model_config is
+        print(
+            f"DEBUG: model_engine.py - self.model.model_config type: {type(self.model.model_config)}"
+        )
+        print(
+            f"DEBUG: model_engine.py - self.model.model_config dir: {dir(self.model.model_config)}"
+        )
+
+        if hasattr(self.model.model_config, 'coarse_mlp_hidden_size'):
+            coarse_mlp_hidden_size = self.model.model_config.coarse_mlp_hidden_size
+            print(
+                f"DEBUG: model_engine.py - coarse_mlp_hidden_size: {coarse_mlp_hidden_size}"
+            )
+        else:
+            print(
+                f"DEBUG: model_engine.py - coarse_mlp_hidden_size property not found"
+            )
+            # Try direct access to see if it works
+            try:
+                coarse_mlp_hidden_size = self.model.model_config.coarse_mlp_hidden_size
+                print(
+                    f"DEBUG: model_engine.py - Direct access worked: {coarse_mlp_hidden_size}"
+                )
+            except AttributeError as e:
+                print(f"DEBUG: model_engine.py - Direct access failed: {e}")
+
         self.lora_model_config = LoraModelConfig(
             lora_target_modules=lora_target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
             hidden_size=self.model.config.hidden_size,
-            dtype=torch_dtype_to_str(self.model.config.torch_dtype))
+            dtype=torch_dtype_to_str(self.model.config.torch_dtype),
+            coarse_mlp_hidden_size=coarse_mlp_hidden_size)
 
     @property
     def use_mrope(self):
