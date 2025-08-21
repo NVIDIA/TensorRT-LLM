@@ -166,8 +166,11 @@ def launch_server(host: str,
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
     elif backend == '_autodeploy':
-        print(f"Using AutoDeploy backend with args: {llm_args}")
+        # AutoDeploy does not support build_config
         del llm_args["build_config"]
+        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/7142):
+        # AutoDeploy does not support cache reuse yet.
+        llm_args["kv_cache_config"].enable_block_reuse = False
         llm = AutoDeployLLM(**llm_args)
     else:
         llm = LLM(**llm_args)

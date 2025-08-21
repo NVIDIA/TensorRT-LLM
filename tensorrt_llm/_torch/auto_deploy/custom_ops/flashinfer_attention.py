@@ -198,6 +198,7 @@ def prepare_flashinfer_metadata(
         flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, page_size),
         position_ids.numel(),
     )
+    
     # return metadata
     return (
         qo_indptr,
