@@ -373,7 +373,7 @@ def detect_column_row_shard(
     rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
         ad_logger.info("Skipping TP sharding for single device")
-        return
+        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
@@ -551,7 +551,7 @@ def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Tra
     rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
         ad_logger.info("Skipping DP BMM sharding for single device")
-        return
+        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
 
@@ -617,13 +617,13 @@ def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Tra
     )
 
 
-def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> None:
+def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> TransformInfo:
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     rank, world_size = sharding_config.rank, sharding_config.world_size
     if world_size < 2:
         ad_logger.info("Skipping EP sharding for single device")
-        return
+        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     num_moe_patterns = 0
