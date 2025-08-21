@@ -1316,6 +1316,8 @@ struct Gmem_tile_o_qgmma_fp32_16bits
     int64_t params_o_stride_in_bytes_;
     // Scaling factor; this usually means QKV descale factor in actuality
     uint32_t params_scale_bmm2_;
+    // Scaling factor; this usually means QKV descale factor in actuality
+    uint32_t params_scale_bmm2_;
     // The pointer.
     char* o_ptr_;
     // The row loaded by this thread.
