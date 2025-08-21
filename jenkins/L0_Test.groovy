@@ -1835,6 +1835,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
         "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
         "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
+        "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
@@ -2076,11 +2077,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 checkPipStage = true
             } else if (cpu_arch == AARCH64_TRIPLE) {
                 checkPipStage = true
-            }
-
-            if (cpu_arch == AARCH64_TRIPLE && values[5] != DLFW_IMAGE) {
-                checkPipStage = false
-                echo "Skip pip install sanity check due to https://nvbugs/5453827"
             }
 
             if (checkPipStage) {
