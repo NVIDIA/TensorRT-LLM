@@ -32,7 +32,8 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         if world_size <= 1:
             return num_p_og
         # the gate's weight and bias node
-        n_gate = num_experts * (hidden_size + 1)
+        # NOTE:gate layer is also distributed using simple_shard during tp_transform
+        n_gate = num_experts * (hidden_size + 1) // world_size
         num_experts_per_rank = num_experts // world_size
         if rank == world_size - 1:
             num_experts_per_rank += num_experts % world_size
