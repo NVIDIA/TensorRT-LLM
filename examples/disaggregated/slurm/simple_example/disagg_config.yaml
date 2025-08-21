@@ -1,0 +1,12 @@
+# Please replace `ctx_hostname` and `gen_hostname` with the actual addresses.
+hostname: localhost
+port: 8000
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+      - "ctx_hostname:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+      - "gen_hostname:8002"

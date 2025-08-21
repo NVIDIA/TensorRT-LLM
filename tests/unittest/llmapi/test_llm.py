@@ -42,7 +42,7 @@ from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
@@ -1459,20 +1459,7 @@ def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
         assert similar(output.outputs[0].text, ref)
 
 
-@pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
-    [
-        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
-        # llm.generate call, that's repeated twice.
-        ([
-            2,
-        ], 1, 2, 2, 3),
-        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
-        # cache size < LoRA CPU cache size
-        ([2, 2, 2], 1, 3, 1, 1),
-    ])
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_load_new_adapters(
+def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
@@ -1491,6 +1478,43 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         enable_lora=True,
         build_config=build_config,
         fast_build=True)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
+    """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+    llm.generate call, that's repeated twice.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2],
+        max_loras=1,
+        max_cpu_loras=2,
+        repeat_calls=2,
+        repeats_per_call=3)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
+    """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+    cache size < LoRA CPU cache size.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2, 2, 2],
+        max_loras=1,
+        max_cpu_loras=3,
+        repeat_calls=1,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_read_from_cache_after_insert():
+    """Test that loading and then using the same adapters loaded in cache works."""
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[3],
+        max_loras=3,
+        max_cpu_loras=3,
+        repeat_calls=2,
+        repeats_per_call=1)
 
 
 def test_llama_7b_peft_cache_config_affects_peft_cache_size():

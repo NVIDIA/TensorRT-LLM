@@ -1,3 +1,4 @@
+import pytest
 import torch
 from utils.llm_data import llm_models_root
 from utils.util import skip_gpu_memory_less_than
@@ -29,8 +30,10 @@ def extract_decode_logprobs(result: RequestOutput,
     return get_logprobs(token_ids, logits)
 
 
-def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
-                          max_batch_size):
+def create_nemotron_h_llm(use_cuda_graph,
+                          disable_overlap_scheduler,
+                          max_batch_size,
+                          mamba_ssm_cache_dtype=None):
     """Create LLM with specific overlap scheduler setting"""
     model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
     return LLM(
@@ -39,14 +42,19 @@ def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
         max_batch_size=max_batch_size,
         cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
-        enable_trtllm_sampler=True,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="auto"
+            if mamba_ssm_cache_dtype is None else mamba_ssm_cache_dtype),
+        sampler_type="TRTLLMSampler",
     )
 
 
 @skip_gpu_memory_less_than(
     (2 * 8 + 1) * 2**30)  # 8B, bf16, plus 1 GB for good measure
-def test_nemotron_h_correctness():
+@pytest.mark.parametrize("mamba_ssm_cache_dtype", [None, "float32"],
+                         ids=lambda n: f"mamba_ssm_cache_dtype:{n}")
+def test_nemotron_h_correctness(mamba_ssm_cache_dtype):
     # This test is close to memory limit on A30 (with 24GB), so empty cache first
     torch.cuda.empty_cache()
 
@@ -56,9 +64,11 @@ def test_nemotron_h_correctness():
     ]
     num_prompts = len(text_prompts)
 
-    nemotron_h = create_nemotron_h_llm(use_cuda_graph=False,
-                                       disable_overlap_scheduler=False,
-                                       max_batch_size=num_prompts)
+    nemotron_h = create_nemotron_h_llm(
+        use_cuda_graph=False,
+        disable_overlap_scheduler=False,
+        max_batch_size=num_prompts,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
 
     expected_completions = [
         " bright, with endless possibilities for innovation and growth",
@@ -306,12 +316,23 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
             f"Prompt {i}: with/without CG (no overlap) logprobs for all selected tokens {x}"
         )
 
+        # Similar comparison for with / without overlap scheduler, compare logits of first generation step (2nd generated token)
         # overlap scheduler should have no effect on all logits - low tolerance
         torch.testing.assert_close(
-            with_cg_no_overlap.outputs[0].generation_logits,
-            with_cg_with_overlap.outputs[0].generation_logits,
+            with_cg_no_overlap.outputs[0].generation_logits[1, :],
+            with_cg_with_overlap.outputs[0].generation_logits[1, :],
             atol=0.05,
             rtol=0.05,
             msg=lambda x:
-            f"Prompt {i}: with/without overlap (no CG) all generation logits {x}"
+            f"Prompt {i}: with/without overlap scheduler (with CG) logits for first generated step {x}"
+        )
+
+        # compare logprobs of all generated tokens
+        torch.testing.assert_close(
+            extract_decode_logprobs(with_cg_no_overlap),
+            extract_decode_logprobs(with_cg_with_overlap),
+            atol=0.05,
+            rtol=0.05,
+            msg=lambda x:
+            f"Prompt {i}: with/without overlap scheduler (with CG) logprobs for all selected tokens {x}"
         )

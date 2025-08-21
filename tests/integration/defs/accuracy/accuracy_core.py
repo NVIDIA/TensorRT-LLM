@@ -25,6 +25,7 @@ import yaml
 import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
@@ -144,7 +145,7 @@ class AccuracyTask:
         return num_samples, threshold
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
@@ -155,6 +156,8 @@ class AccuracyTask:
             spec_dec_algo = None
         elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
             spec_dec_algo = llm.args.speculative_config.decoding_type
+            if spec_dec_algo == 'AUTO':
+                spec_dec_algo = 'NGram'
         else:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
@@ -192,7 +195,11 @@ class AccuracyTask:
             evaluator_kwargs.update(extra_evaluator_kwargs)
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
-        accuracy = evaluator.evaluate(llm, sampling_params, streaming)
+        evaluate_kwargs = {}
+        if hasattr(self, 'EVALUATE_KWARGS'):
+            evaluate_kwargs.update(self.EVALUATE_KWARGS)
+        accuracy = evaluator.evaluate(llm, sampling_params, streaming,
+                                      **evaluate_kwargs)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
@@ -298,6 +305,8 @@ class GSM8K(AccuracyTask):
     EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8K
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
+    EVALUATE_KWARGS = dict(scores_filter=None)
+
 
 class GPQADiamond(AccuracyTask):
     DATASET = "gpqa_diamond"
@@ -330,6 +339,26 @@ class JsonModeEval(AccuracyTask):
     EVALUATOR_CLS = tensorrt_llm.evaluate.JsonModeEval
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
                             random_seed=0,
+                            apply_chat_template=True)
+
+
+class MMMU(AccuracyTask):
+    DATASET = "mmmu"
+    DATASET_DIR = f"{llm_models_root()}/datasets/MMMU"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 900
+
+    MAX_BATCH_SIZE = 128
+    MAX_INPUT_LEN = 8192
+    MAX_OUTPUT_LEN = 512
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.MMMU
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            is_multimodal=True,
                             apply_chat_template=True)
 
 

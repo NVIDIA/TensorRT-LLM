@@ -30,9 +30,9 @@ from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
 from ._utils import (QuantModeWrapper, bf16_array, bool_array,
                      dim_resolve_negative, dim_to_trt_axes, dims_array,
-                     fp16_array, fp32_array, int32_array, int64_array,
-                     np_dtype_to_trt, str_dtype_to_trt, trt_dtype_to_np,
-                     trt_dtype_to_str)
+                     fp16_array, fp32_array, get_sm_version, int32_array,
+                     int64_array, np_dtype_to_trt, str_dtype_to_trt,
+                     trt_dtype_to_np, trt_dtype_to_str)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
@@ -3882,6 +3882,7 @@ class AllReduceStrategy(IntEnum):
     TWOSHOT = 5
     LOWPRECISION = 6
     MNNVL = 7
+    NCCL_SYMMETRIC = 8
 
 
 class AllReduceFusionOp(IntEnum):
@@ -4733,6 +4734,15 @@ class RopeEmbeddingUtils:
             inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
             inv_freq = RopeEmbeddingUtils.apply_llama3_scaling(
                 inv_freq, rope_scaling_config)
+        elif scale_type == RotaryScalingType.dynamic:
+            # Make sure scaling_alpha exists in rope_scaling
+            # Ref: https://huggingface.co/tencent/Hunyuan-A13B-Instruct-FP8/blob/main/modeling_hunyuan.py#L346
+            assert rope_scaling_config[
+                "alpha"] is not None, "rope_scaling_config.alpha must be provided."
+            scaling_alpha = rope_scaling_config["alpha"]
+            adjusted_base = theta * (scaling_alpha**(dim / (dim - 2)))
+            inv_freq = 1.0 / (adjusted_base**(
+                np.arange(0, dim, 2, dtype=dtype) / dim)).astype(dtype)
         else:
             inv_freq = scale / (theta
                                 **(np.arange(0, dim, 2) / dim)).astype(dtype)
@@ -5718,7 +5728,8 @@ def gpt_attention(
     if (attention_mask is not None) or (attention_packed_mask is not None):
         # context fmha needs packed mask.
         assert attention_packed_mask is not None
-        mask_type = AttentionMaskType.custom_mask
+        if get_sm_version() < 100:
+            mask_type = AttentionMaskType.custom_mask
 
     mask_type_filed = trt.PluginField("mask_type",
                                       np.array([int(mask_type)], np.int32),
@@ -5843,7 +5854,7 @@ def gpt_attention(
     if attention_mask is not None and mask_type == AttentionMaskType.custom_mask:
         # useFullCustomMask
         plug_inputs += [attention_mask]
-    if attention_packed_mask is not None:
+    if attention_packed_mask is not None and get_sm_version() < 100:
         # usePackedCustomMask
         plug_inputs += [attention_packed_mask]
     if use_cache:

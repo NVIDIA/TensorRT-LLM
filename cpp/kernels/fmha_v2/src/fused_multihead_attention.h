@@ -192,10 +192,13 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
     void* packed_mask_ptr;
     // The mask input's stride in the N (K-seq) dimension.
     int64_t packed_mask_stride_in_bytes;
-    // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
+    // The Softmax stats vector of layout [total_tokens_q, h, 2], including softmax_max and softmax_sum
     void* softmax_stats_ptr;
-    // The stride between rows of softmax_stats_ptr
+    // The stride between rows of softmax_stats_ptr, default: h * sizeof(float2)
     int64_t softmax_stats_stride_in_bytes;
+
+    // The attention sinks (per head).
+    float* attention_sinks;
 
     // array of length b+1 holding prefix sum of actual q sequence lengths.
     int* cu_q_seqlens;

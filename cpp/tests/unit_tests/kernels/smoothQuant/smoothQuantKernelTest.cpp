@@ -286,13 +286,13 @@ TEST(Kernel, WeightOnly)
     std::vector<int> ks{2048, 4096};
     std::vector<tensorrt_llm::common::QuantMode> quant_modes(4);
     quant_modes[0] = tensorrt_llm::common::QuantMode::fromDescription(
-        false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+        false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
     quant_modes[1] = tensorrt_llm::common::QuantMode::fromDescription(
-        false, false, true, false, false, false, false, false, false, false, false, false, false, false);
+        false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false);
     quant_modes[2] = tensorrt_llm::common::QuantMode::fromDescription(
-        false, false, false, true, false, false, false, false, false, false, false, false, false, false);
+        false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false);
     quant_modes[3] = tensorrt_llm::common::QuantMode::fromDescription(
-        false, false, true, true, false, false, false, false, false, false, false, false, false, false);
+        false, false, true, true, false, false, false, false, false, false, false, false, false, false, false, false);
     for (auto m : ms)
     {
         for (auto n : ns)

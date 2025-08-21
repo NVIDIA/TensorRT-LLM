@@ -64,6 +64,8 @@ struct KernelParams
     // The output SF pointer (used for FP4 output).
     void* ptrSfO;
 
+    // The attention sinks pointer (additional value per head in the denominator of the softmax).
+    float const* ptrAttentionSinks;
     // The cumulative sequence lengths for Q.
     int32_t const* ptrCumSeqLensQ;
     // The cumulative sequence lengths for K/V.
@@ -138,9 +140,6 @@ struct KernelParams
     int32_t mNumHeadsQPerKv;
     // The hidden size of O.
     int64_t mNumHiddenEltsO;
-    // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens
-    // without paddings.
-    int32_t mNumMtpTokens;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
     // The output scale for FP8 quantization.
@@ -330,7 +329,7 @@ struct KernelParams
 
     // Compute the strides for K and V.
     template <class FmhaOptions>
-    static auto makeStrideKv(FmhaOptions const& options, bool isK)
+    static auto makeStrideKv(FmhaOptions const& options, Data_type dtypeKv, bool isK)
     {
 
         // The maximum headDim of K and V.
@@ -357,6 +356,12 @@ struct KernelParams
         else if (isContiguousKv(options.mQkvLayout))
         {
             strideKeysVals = maxHeadDimKv;
+        }
+        else if (isSeparateQkv(options.mQkvLayout) && !isK && options.mHeadDimQkNope > 0 && dtypeKv != DATA_TYPE_E4M3)
+        {
+            // Non-FP8 context MLA: tensor V is not contiguous. The token stride is mNumHeadsKv * (mHeadDimQkNope +
+            // mHeadDimV).
+            strideKeysVals = options.mNumHeadsKv * (options.mHeadDimQkNope + options.mHeadDimV);
         }
 
         // The stride between heads.
@@ -398,7 +403,7 @@ struct KernelParams
         // The shape elements.
         auto [numKeys, numHeadsQPerKv, batchSize] = makeShapeKv(options, params);
         // The stride elements.
-        auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
+        auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, dtypeKv, isK);
 
         // The headDim.
         // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
@@ -431,12 +436,13 @@ struct KernelParams
 
     // Create the TMA shape/stride for KV scaling factors.
     template <class FmhaOptions>
-    static auto makeTmaShapeStrideKvSf(FmhaOptions const& options, KernelParams const& params, bool isK)
+    static auto makeTmaShapeStrideKvSf(
+        FmhaOptions const& options, KernelParams const& params, Data_type dtypeKv, bool isK)
     {
         // The shape elements.
         auto [numKeys, numHeadsQPerKv, batchSize] = makeShapeKv(options, params);
         // The stride elements.
-        auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
+        auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, dtypeKv, isK);
 
         // The headDim.
         // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
@@ -686,7 +692,8 @@ struct KernelParams
             int32_t NumEltsPerSf = 16;
             // Compute the shape and stride for SF tensor.
             // FIXME: assume K and V uses the same shape.
-            auto [shapeKvSf, strideKvSf] = makeTmaShapeStrideKvSf(options, params, /*isK*/ true);
+            auto [shapeKvSf, strideKvSf]
+                = makeTmaShapeStrideKvSf(options, params, kernelMeta.mDataTypeKv, /*isK*/ true);
 
             // The tileShapes for K/V.
             std::vector<uint32_t> tileShapeKvSf(shapeKvSf.size(), 1);
@@ -717,6 +724,7 @@ struct KernelParams
             options, kernelMeta.mDataTypeQ, shapeO, strideO, tileShapeO, const_cast<void*>(options.oPtr));
 
         // Set the other kernel parameters.
+        params.ptrAttentionSinks = options.attentionSinksPtr;
         params.ptrCumSeqLensQ = options.cumSeqLensQPtr;
         params.ptrCumSeqLensKv = options.cumSeqLensKvPtr;
 
@@ -772,8 +780,6 @@ struct KernelParams
         params.mMaxNumCtasQ = maxNumCtasQ;
         params.mMaxNumCtasKv = maxNumCtasKv;
         params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
-        // TODO: just use mMaxSeqLenQ for number of MTP tokens.
-        params.mNumMtpTokens = options.mMaxSeqLenQ;
         params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
         params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
         params.mBatchSize = options.mBatchSize;

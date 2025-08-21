@@ -1,7 +1,9 @@
-from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
-from tensorrt_llm._torch.speculative.interface import SpecMetadata
+from typing import Optional
 
+from ..pyexecutor.guided_decoder import GuidedDecoder
+from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
+from ..speculative.interface import SpecMetadata
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
@@ -114,8 +116,11 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
-def get_spec_drafter(model_engine, draft_model_engine, sampler,
-                     spec_resource_manager):
+def get_spec_drafter(model_engine,
+                     draft_model_engine,
+                     sampler,
+                     spec_resource_manager,
+                     guided_decoder: Optional[GuidedDecoder] = None):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -126,10 +131,13 @@ def get_spec_drafter(model_engine, draft_model_engine, sampler,
     max_num_requests = model_engine.batch_size
     if spec_config.spec_dec_mode.is_draft_target(
     ) or spec_config.spec_dec_mode.is_eagle3():
-        return ModelDrafter(spec_config, draft_model_engine,
+        return ModelDrafter(spec_config,
+                            draft_model_engine,
                             spec_config.max_draft_len,
-                            SeqSlotManager(max_num_requests), sampler,
-                            spec_resource_manager)
+                            SeqSlotManager(max_num_requests),
+                            sampler,
+                            spec_resource_manager=spec_resource_manager,
+                            guided_decoder=guided_decoder)
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
@@ -146,11 +154,12 @@ def get_num_spec_layers(spec_config):
 
 
 def get_spec_worker(spec_config, model_config, mapping):
-    if spec_config.spec_dec_mode.is_mtp():
+    spec_dec_mode = spec_config.spec_dec_mode
+    if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config, model_config)
-    if spec_config.spec_dec_mode.is_mtp_eagle():
+    if spec_dec_mode.is_mtp_eagle():
         return MTPEagleWorker(spec_config, model_config)
-    if spec_config.spec_dec_mode.is_eagle3_one_model():
+    if spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping)
     return None
 

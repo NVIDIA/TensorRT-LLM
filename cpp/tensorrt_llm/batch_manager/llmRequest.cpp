@@ -200,6 +200,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     result.finishReasons = sliceBeams(mFinishReasons);
     result.decodingIter = mDecodingIter;
+    result.avgDecodedTokensPerIter = getAvgDecodedTokensPerIter();
 
     if (hasAdditionalOutputs())
     {
@@ -363,6 +364,12 @@ void LlmRequest::moveLoraWeightsToGpu(runtime::BufferManager const& manager)
     // TODO for tp / pp models we only need to move the bit that belong on the local device
     TensorPtr gpuLoraWeights = manager.copyFrom(*mLoraWeights.value(), runtime::MemoryType::kGPU);
     mLoraWeights = gpuLoraWeights;
+}
+
+void LlmRequest::removeLoraTensors()
+{
+    mLoraWeights.reset();
+    mLoraConfig.reset();
 }
 
 } // namespace tensorrt_llm::batch_manager

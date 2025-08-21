@@ -36,6 +36,10 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
     {
         return QkvLayout::PagedKv;
     }
+    else if (layout == AttentionInputLayout::SEPARATE_Q_K_V)
+    {
+        return QkvLayout::SeparateQkv;
+    }
     TLLM_CHECK_WITH_INFO(false, "Unexpected AttentionInputLayout");
     return QkvLayout::SeparateQkv;
 }
@@ -148,6 +152,10 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             maxBlocksPerSeq = pagedKvCache.mMaxBlocksPerSeq;
             numTokensPerBlock = pagedKvCache.mTokensPerBlock;
         }
+        else if (mFixedParams.attentionInputLayout == AttentionInputLayout::SEPARATE_Q_K_V)
+        {
+            qkvLayout = kernels::QkvLayout::SeparateQkv;
+        }
 
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
@@ -161,10 +169,11 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mMultiCtasKvMode = false;
 
         tllmRunnerParams.qPtr = runnerParams.qPtr;
-        tllmRunnerParams.kPtr = nullptr;
-        tllmRunnerParams.vPtr = nullptr;
+        tllmRunnerParams.kPtr = runnerParams.kPtr;
+        tllmRunnerParams.vPtr = runnerParams.vPtr;
         tllmRunnerParams.kvPtr = kvPoolPtr;
         tllmRunnerParams.qkvPtr = runnerParams.qkvPtr;
+        tllmRunnerParams.attentionSinksPtr = runnerParams.attentionSinksPtr;
         tllmRunnerParams.cumSeqLensQPtr = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(runnerParams.cuKvSeqLenPtr);
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(runnerParams.scaleBmm2Ptr);
@@ -180,6 +189,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // Assume same headDim for Qk and V here.
         tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
+        tllmRunnerParams.mHeadDimQkNope = mFixedParams.headSizeQkNope;
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = tllmRunnerParams.mNumHeadsQ / tllmRunnerParams.mNumHeadsKv;
@@ -201,6 +211,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
+
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else

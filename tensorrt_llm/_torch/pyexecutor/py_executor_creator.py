@@ -13,7 +13,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -33,6 +33,7 @@ from .py_executor import PyExecutor
 class _ExecutorCreationStage(enum.Enum):
     SAMPLER = "Sampler"
     DRAFTER = "Drafter"
+    GUIDED_DECODER = "Guided decoder"
     INIT_KV_CACHE = "Initial KV cache (temporary for KV cache size estimation)"
     INIT_EXTRA_RESOURCES = "Additional executor resources (temporary for KV cache size estimation)"
     MODEL_EXTRA = "Model resources created during usage"
@@ -169,6 +170,25 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
         )
         executor_config.enable_chunked_context = False
 
+    spec_config = executor_config.speculative_config
+    if not executor_config.pytorch_backend_config.disable_overlap_scheduler and spec_config is not None:
+        if not spec_config.spec_dec_mode.support_overlap_scheduler():
+            logger.warning(
+                f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
+            )
+            executor_config.pytorch_backend_config.disable_overlap_scheduler = True
+
+    if executor_config.mm_encoder_only:
+        from tensorrt_llm.llmapi.llm_args import LoadFormat
+        pytorch_backend_config.mm_encoder_only = True
+        pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
+        # Disable overlap scheduler for multimodal encoder-only mode
+        logger.warning(
+            "Disabling overlap scheduler for multimodal encoder-only mode. "
+            "The overlap scheduler is designed for generation models and is not needed "
+            "when only processing vision encoder inputs.")
+        pytorch_backend_config.disable_overlap_scheduler = True
+
 
 def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     if executor_config.mapping is None:
@@ -281,11 +301,13 @@ def create_py_executor(
                 f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
             )
 
-        if executor_config.kv_cache_config.enable_block_reuse and not (
-                get_sm_version() >= 90 and get_sm_version() <= 100):
+        sm_version = get_sm_version()
+        if executor_config.kv_cache_config.enable_block_reuse and sm_version not in [
+                90, 100, 120
+        ]:
             logger.warning(
-                f"KV cache reuse for MLA can only be enabled on SM90/SM100, "
-                f"disable enable_block_reuse for SM{get_sm_version()}")
+                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM120, "
+                f"disable enable_block_reuse for SM{sm_version}")
             executor_config.kv_cache_config.enable_block_reuse = False
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
@@ -297,11 +319,12 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             executor_config.kv_cache_config.enable_block_reuse = False
-        if executor_config.enable_chunked_context and not (get_sm_version()
-                                                           == 100):
+        if executor_config.enable_chunked_context and sm_version not in [
+                90, 100
+        ]:
             logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM100, "
-                f"disable enable_block_reuse for SM{get_sm_version()}")
+                "Chunked Prefill for MLA can only be enabled on SM90/SM100, "
+                f"disable enable_chunked_context for SM{sm_version}")
             executor_config.enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
@@ -326,20 +349,28 @@ def create_py_executor(
     else:
         ctx_chunk_config = None
 
+    with mem_monitor.observe_creation_stage(
+            _ExecutorCreationStage.GUIDED_DECODER):
+        guided_decoder: Optional[GuidedDecoder] = None
+        if executor_config.guided_decoding_config is not None:
+            if spec_config is not None and not has_spec_drafter:
+                raise ValueError(
+                    "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
+                )
+            if mapping.is_last_pp_rank():
+                max_num_draft_tokens = 0
+                if spec_config is not None:
+                    max_num_draft_tokens = spec_config.max_draft_len
+                guided_decoder = GuidedDecoder(
+                    executor_config.guided_decoding_config,
+                    executor_config.max_batch_size,
+                    model_engine.model.vocab_size_padded,
+                    max_num_draft_tokens=max_num_draft_tokens)
+
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,
                                       pytorch_backend_config, mapping)
-
-    guided_decoder: Optional[GuidedDecoder] = None
-    if executor_config.guided_decoding_config is not None:
-        if spec_config is not None:
-            raise ValueError(
-                "Guided decoding is not supported with speculative decoding.")
-        if mapping.is_last_pp_rank():
-            guided_decoder = GuidedDecoder(
-                executor_config.guided_decoding_config,
-                executor_config.max_batch_size,
-                model_engine.model.vocab_size_padded)
+        logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     resources = {}
     estimating_kv_cache = False
@@ -368,8 +399,11 @@ def create_py_executor(
 
     # Drafter for speculative decoding
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
-        drafter = get_spec_drafter(model_engine, draft_model_engine, sampler,
-                                   spec_resource_manager)
+        drafter = get_spec_drafter(model_engine,
+                                   draft_model_engine,
+                                   sampler,
+                                   spec_resource_manager=spec_resource_manager,
+                                   guided_decoder=guided_decoder)
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES

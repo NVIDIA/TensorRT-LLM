@@ -12,6 +12,7 @@ from strenum import StrEnum
 from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
@@ -81,6 +82,7 @@ def get_llm_args(model: str,
                  moe_expert_parallel_size: Optional[int] = None,
                  gpus_per_node: Optional[int] = None,
                  free_gpu_memory_fraction: Optional[float] = None,
+                 mamba_ssm_cache_dtype: str = "auto",
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
@@ -96,7 +98,8 @@ def get_llm_args(model: str,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction)
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
 
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
@@ -173,6 +176,22 @@ def launch_server(host: str,
     asyncio.run(server(host, port))
 
 
+def launch_mm_encoder_server(
+    host: str,
+    port: int,
+    encoder_args: dict,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+):
+    model = encoder_args["model"]
+    mm_encoder = MultimodalEncoder(**encoder_args)
+
+    server = OpenAIServer(llm=mm_encoder,
+                          model=model,
+                          server_role=ServerRole.MM_ENCODER,
+                          metadata_server_cfg=metadata_server_cfg)
+    asyncio.run(server(host, port))
+
+
 @click.command("serve")
 @click.argument("model", type=str)
 @click.option("--tokenizer",
@@ -238,6 +257,12 @@ def launch_server(host: str,
               help="Free GPU memory fraction reserved for KV Cache, "
               "after allocating model weights and buffers.")
 @click.option(
+    "--mamba_ssm_cache_dtype",
+    type=click.Choice(["auto", "float16", "bfloat16", "float32"]),
+    default="auto",
+    help="Data type for Mamba SSM cache. If 'auto', inferred from model config."
+)
+@click.option(
     "--num_postprocess_workers",
     type=int,
     default=0,
@@ -277,16 +302,17 @@ def launch_server(host: str,
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
-def serve(
-        model: str, tokenizer: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        ep_size: Optional[int], cluster_size: Optional[int],
-        gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
-        num_postprocess_workers: int, trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool):
+def serve(model: str, tokenizer: Optional[str], host: str, port: int,
+          log_level: str, backend: str, max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tp_size: int, pp_size: int, ep_size: Optional[int],
+          cluster_size: Optional[int], gpus_per_node: Optional[int],
+          kv_cache_free_gpu_memory_fraction: float, mamba_ssm_cache_dtype: str,
+          num_postprocess_workers: int, trust_remote_code: bool,
+          extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -307,6 +333,7 @@ def serve(
         moe_cluster_parallel_size=cluster_size,
         gpus_per_node=gpus_per_node,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
@@ -330,6 +357,79 @@ def serve(
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
     launch_server(host, port, llm_args, metadata_server_cfg, server_role)
+
+
+@click.command("mm_embedding_serve")
+@click.argument("model", type=str)
+@click.option("--host",
+              type=str,
+              default="localhost",
+              help="Hostname of the server.")
+@click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+@click.option("--max_batch_size",
+              type=int,
+              default=BuildConfig.max_batch_size,
+              help="Maximum number of requests that the engine can schedule.")
+@click.option(
+    "--max_num_tokens",
+    type=int,
+    default=16384,  # set higher default max_num_tokens for multimodal encoder
+    help=
+    "Maximum number of batched input tokens after padding is removed in each batch."
+)
+@click.option("--gpus_per_node",
+              type=int,
+              default=None,
+              help="Number of GPUs per node. Default to None, and it will be "
+              "detected automatically.")
+@click.option("--trust_remote_code",
+              is_flag=True,
+              default=False,
+              help="Flag for HF transformers.")
+@click.option(
+    "--extra_encoder_options",
+    type=str,
+    default=None,
+    help=
+    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
+)
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+def serve_encoder(model: str, host: str, port: int, log_level: str,
+                  max_batch_size: int, max_num_tokens: int,
+                  gpus_per_node: Optional[int], trust_remote_code: bool,
+                  extra_encoder_options: Optional[str],
+                  metadata_server_config_file: Optional[str]):
+    """Running an OpenAI API compatible server
+
+    MODEL: model name | HF checkpoint path | TensorRT engine path
+    """
+    logger.set_level(log_level)
+
+    # TODO: expose more argument progressivly
+    llm_args, _ = get_llm_args(model=model,
+                               max_batch_size=max_batch_size,
+                               max_num_tokens=max_num_tokens,
+                               gpus_per_node=gpus_per_node,
+                               trust_remote_code=trust_remote_code)
+
+    encoder_args_extra_dict = {}
+    if extra_encoder_options is not None:
+        with open(extra_encoder_options, 'r') as f:
+            encoder_args_extra_dict = yaml.safe_load(f)
+    encoder_args = update_llm_args_with_extra_dict(llm_args,
+                                                   encoder_args_extra_dict)
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
 
 
 def get_ctx_gen_server_urls(
@@ -637,7 +737,8 @@ main = DefaultGroup(
     commands={
         "serve": serve,
         "disaggregated": disaggregated,
-        "disaggregated_mpi_worker": disaggregated_mpi_worker
+        "disaggregated_mpi_worker": disaggregated_mpi_worker,
+        "mm_embedding_serve": serve_encoder
     })
 
 if __name__ == "__main__":

@@ -53,7 +53,7 @@ def add_llm_args(parser):
                         default='CUTLASS',
                         choices=[
                             'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL'
+                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
                         ])
     parser.add_argument('--enable_attention_dp',
                         default=False,
@@ -65,9 +65,9 @@ def add_llm_args(parser):
     parser.add_argument('--attention_dp_batching_wait_iters',
                         type=int,
                         default=0)
-    parser.add_argument('--enable_trtllm_sampler',
-                        default=False,
-                        action='store_true')
+    parser.add_argument('--sampler_type',
+                        default="auto",
+                        choices=["auto", "TorchSampler", "TRTLLMSampler"])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
@@ -108,6 +108,9 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Use piecewise CUDA graph to optimize the model')
+    parser.add_argument('--apply_chat_template',
+                        default=False,
+                        action='store_true')
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -227,7 +230,7 @@ def setup_llm(args, **kwargs):
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
         moe_config=MoeConfig(backend=args.moe_backend),
-        enable_trtllm_sampler=args.enable_trtllm_sampler,
+        sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,
@@ -243,8 +246,7 @@ def setup_llm(args, **kwargs):
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
-        **kwargs,
-    )
+        **kwargs)
 
     use_beam_search = args.max_beam_width > 1
     best_of = args.best_of or args.n
@@ -274,6 +276,15 @@ def main():
     prompts = args.prompt if args.prompt else example_prompts
 
     llm, sampling_params = setup_llm(args)
+    new_prompts = []
+    if args.apply_chat_template:
+        for prompt in prompts:
+            messages = [{"role": "user", "content": f"{prompt}"}]
+            new_prompts.append(
+                llm.tokenizer.apply_chat_template(messages,
+                                                  tokenize=False,
+                                                  add_generation_prompt=True))
+        prompts = new_prompts
     outputs = llm.generate(prompts, sampling_params)
 
     for i, output in enumerate(outputs):

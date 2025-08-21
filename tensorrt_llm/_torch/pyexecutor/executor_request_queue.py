@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .llm_request import (ExecutorRequest, LlmRequest,
@@ -44,12 +45,13 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 is_disaggregated: bool):
+                 batch_wait_timeout_ms: float, is_disaggregated: bool):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
         self.canceled_req_ids = []
         self.enable_attention_dp = enable_attention_dp
+        self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
         self.is_disaggregated = is_disaggregated
@@ -58,6 +60,7 @@ class ExecutorRequestQueue:
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
+        self.batch_wait_timeout_ms = batch_wait_timeout_ms
 
         # State tracking
         self.num_fetch_requests = 0
@@ -73,6 +76,7 @@ class ExecutorRequestQueue:
 
         items = []
         timeout_secs = timeout.total_seconds() if timeout is not None else None
+
         try:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
@@ -85,6 +89,26 @@ class ExecutorRequestQueue:
                     items.append(queue_item)
         except queue.Empty:
             pass
+
+        if self.batch_wait_timeout_ms == 0:
+            return items
+
+        if len(items) >= self.max_batch_size:
+            return items
+
+        deadline = time.monotonic() + self.batch_wait_timeout_ms / 1000.0
+        while len(items) < self.max_batch_size:
+            remaining_timeout = deadline - time.monotonic()
+
+            if remaining_timeout <= 0:
+                break
+
+            try:
+                item = self.request_queue.get(timeout=remaining_timeout)
+                items.append(item)
+            except queue.Empty:
+                break
+
         return items
 
     @staticmethod
@@ -233,8 +257,7 @@ class ExecutorRequestQueue:
 
     def can_enqueue_request(self) -> bool:
         with self.enqueue_lock:
-            can_enqueue = self.active
-        return can_enqueue and self.dist.rank == 0
+            return self.active and self.dist.rank == 0
 
     def _fetch_and_process_requests(
         self,
@@ -570,9 +593,9 @@ class ExecutorRequestQueue:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == 'ring_attention':
+            elif cp_type == CpType.RING:
                 raise NotImplementedError("ring attention not implemented yet")
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
