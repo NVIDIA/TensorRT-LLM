@@ -194,7 +194,7 @@ class Sharding(BaseTransform):
             and len(shared_config.sharding_config.get_predefined_config()) > 0
         ):
             ad_logger.info("Applying sharding from config")
-            factory_info = (gm, sharding_config)
+            factory_info = detect_sharding_from_factory_config(gm, sharding_config)
             return gm, factory_info
 
         ad_logger.info("Running autodeploy sharding heuristics")
