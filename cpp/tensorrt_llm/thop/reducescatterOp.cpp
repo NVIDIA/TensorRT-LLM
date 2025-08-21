@@ -40,8 +40,8 @@ namespace
 class ReducescatterOp
 {
 public:
-    ReducescatterOp(std::set<int> group)
-        : mGroup(std::move(group))
+    ReducescatterOp(std::set<int> group, ncclRedOp_t reduce_op)
+        : mGroup(std::move(group)), mReduceOp(reduce_op)
     {
     }
 
@@ -93,7 +93,7 @@ public:
             if (use_nccl_reducescatter)
             {
                 ncclReduceScatter(input.data_ptr(), output.mutable_data_ptr(), output.numel(), (*getDtypeMap())[type],
-                    ncclSum, *mNcclComm, stream);
+                    mReduceOp, *mNcclComm, stream);
             }
             else
             {
@@ -104,7 +104,7 @@ public:
                 {
                     auto split_size = sizes.value()[root];
                     ncclReduce(input.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).data_ptr(),
-                        output.mutable_data_ptr(), numel_base * split_size, (*getDtypeMap())[type], ncclSum, root,
+                        output.mutable_data_ptr(), numel_base * split_size, (*getDtypeMap())[type], mReduceOp, root,
                         *mNcclComm, stream);
                     split_offset += split_size;
                 }
@@ -123,6 +123,7 @@ public:
 private:
     std::set<int> mGroup;
     std::shared_ptr<ncclComm_t> mNcclComm;
+    ncclRedOp_t mReduceOp;
 };
 
 } // namespace
@@ -130,7 +131,7 @@ private:
 #endif // ENABLE_MULTI_DEVICE
 
 extern torch::Tensor reducescatter(
-    torch::Tensor input, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
+    torch::Tensor input, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_, int64_t reduceOp = 0)
 {
 #if ENABLE_MULTI_DEVICE
     std::set<int> group;
@@ -138,7 +139,8 @@ extern torch::Tensor reducescatter(
     {
         group.insert(static_cast<int>(rank));
     }
-    ReducescatterOp op(group);
+    ncclRedOp_t ncclReduceOp = static_cast<ncclRedOp_t>(reduceOp);
+    ReducescatterOp op(group, ncclReduceOp);
     op.initialize();
     auto output = op.run(input, sizes);
     return output;
@@ -148,7 +150,7 @@ extern torch::Tensor reducescatter(
 }
 
 extern std::vector<torch::Tensor> reducescatter_list(
-    torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_)
+    torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group_, int64_t reduceOp = 0)
 {
 #if ENABLE_MULTI_DEVICE
     std::set<int> group;
@@ -156,7 +158,8 @@ extern std::vector<torch::Tensor> reducescatter_list(
     {
         group.insert(static_cast<int>(rank));
     }
-    ReducescatterOp op(group);
+    ncclRedOp_t ncclReduceOp = static_cast<ncclRedOp_t>(reduceOp);
+    ReducescatterOp op(group, ncclReduceOp);
     op.initialize();
     auto output_list = op.run_list(input_list, sizes);
     return output_list;
@@ -169,8 +172,8 @@ extern std::vector<torch::Tensor> reducescatter_list(
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("reducescatter(Tensor input, SymInt[]? sizes, int[] group) -> Tensor");
-    m.def("reducescatter_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -> Tensor[]");
+    m.def("reducescatter(Tensor input, SymInt[]? sizes, int[] group, int reduceOp=0) -> Tensor");
+    m.def("reducescatter_list(Tensor[] input_list, SymInt[]? sizes, int[] group, int reduceOp=0) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

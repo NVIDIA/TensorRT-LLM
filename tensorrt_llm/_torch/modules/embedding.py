@@ -37,8 +37,8 @@ class LMHead(Linear):
         mapping = mapping or Mapping()
         tp_size = mapping.tp_size
 
-        # Attention DP doesn't work with embedding parallelization.
-        if mapping.enable_attention_dp:
+        # Attention DP doesn't work with embedding parallelization, unless enable_lm_tp_in_adp is set.
+        if mapping.enable_attention_dp and not getattr(mapping, 'enable_lm_tp_in_adp', False):
             tensor_parallel_mode = None
 
         if tensor_parallel_mode == TensorParallelMode.ROW:

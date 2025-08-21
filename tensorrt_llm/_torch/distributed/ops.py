@@ -6,7 +6,11 @@ import threading
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch import nn
+
+# Re-export ReduceOp for compatibility
+ReduceOp = dist.ReduceOp
 
 from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
@@ -230,9 +234,19 @@ def reducescatter(
     mapping: Mapping,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
+    reduce_op: str = "sum",
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     if mapping.tp_size == 1:
         return input
+
+    # Map reduce operation string to NCCL enum value
+    reduce_op_map = {
+        "sum": 0,  # ncclSum
+        "prod": 1,  # ncclProd
+        "max": 2,   # ncclMax
+        "min": 3,   # ncclMin
+    }
+    nccl_reduce_op = reduce_op_map.get(reduce_op.lower(), 0)  # default to sum
 
     if sizes is not None:
         assert len(sizes) == len(mapping.tp_group)
@@ -274,6 +288,7 @@ def reducescatter(
         input,
         sizes,
         mapping.tp_group,
+        nccl_reduce_op,
     )
 
     if isinstance(input, torch.Tensor):

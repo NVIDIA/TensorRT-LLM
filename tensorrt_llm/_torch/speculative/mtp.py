@@ -1093,6 +1093,24 @@ class MTPWorker(nn.Module):
             combined = self.get_local_max_and_combined(logits)
             gathered = allgather(combined, self.model_config.mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
+        elif (self.model_config is not None
+                and hasattr(self.model_config, 'mapping')
+                and self.model_config.mapping.tp_size
+                > 1) and (self.model_config.mapping.enable_attention_dp and
+                          getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+            # we need to reduce-max the logits by hidden_size dimension
+            # meanwhile, we need to scatter the logits by data parallel rank
+            # altogther it is a reduce-scatter operation
+            # logits: [num_tokens, vocab_size_local]
+            combined = self.get_local_max_and_combined(logits)
+            # reduce-scatter (reduce-max) operation
+            from tensorrt_llm._torch.distributed.ops import reducescatter, ReduceOp
+            draft_tokens = reducescatter(
+                combined, 
+                self.model_config.mapping, 
+                dim=-1, 
+                reduce_op="max"
+            )
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
