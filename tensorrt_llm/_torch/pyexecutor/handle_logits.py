@@ -31,8 +31,7 @@ class HandleLogits:
             return
 
         if not is_generation_model:
-            for batch_index, llm_req in enumerate(context_requests):
-                logits_temp = logits[batch_index]
+            for llm_req, logits_temp in zip(context_requests, logits):
                 if logits_temp.ndim == 1:
                     # For BERT: Add axis to be compatible with LogitsStorage
                     # (LogitsStorage will interpret this dim as the prompt_len which
