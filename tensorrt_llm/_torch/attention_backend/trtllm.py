@@ -599,59 +599,31 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
 
     def __post_init__(self) -> None:
-        self.post_init_with_buffers({})
-
-    def get_runtime_buffers(self):
-        buffers = {
-            "prompt_lens_cuda": self.prompt_lens_cuda,
-            "kv_lens_cuda": self.kv_lens_cuda,
-            "kv_lens": self.kv_lens,
-            "workspace": self.workspace
-        }
-
-        if self.kv_cache_manager is not None:
-            buffers["kv_cache_block_offsets"] = self.kv_cache_block_offsets
-
-            if self.enable_flash_mla:
-                buffers["block_ids_per_seq"] = self.block_ids_per_seq
-                buffers["kv_block_ids_per_seq"] = self.kv_block_ids_per_seq
-
-            if self.enable_paged_context_mla:
-                buffers[
-                    "ctx_cached_token_indptr"] = self.ctx_cached_token_indptr
-                buffers[
-                    "ctx_uncached_token_indptr"] = self.ctx_uncached_token_indptr
-                buffers["ctx_kv_indptr"] = self.ctx_kv_indptr
-
-        return buffers
-
-    def post_init_with_buffers(self, buffers) -> None:
         super().__post_init__()
+        self.__post_init_with_buffers(self.cuda_graph_buffers)
+
+    def __post_init_with_buffers(self, buffers) -> None:
 
         # Set a default value, as max_num_sequences is not always set.
         if self.max_num_sequences is None:
             self.max_num_sequences = self.max_num_requests
 
-        def find_or_create_buffer(like_tensor: torch.Tensor,
-                                  buffers: Optional[dict[str,
-                                                         list[torch.Tensor]]],
-                                  cache_name: str) -> torch.Tensor:
+        def get_empty(tensor_shape: list[int], dtype: torch.dtype,
+                      cache_name: str) -> torch.Tensor:
             """
             Finds a compatible, reusable buffer from a cache or creates a new one.
 
             This function searches for a pre-allocated tensor (buffer) that can be
-            reused for an operation involving a tensor with the shape of `like_tensor`.
+            reused for an operation involving a tensor with the shape of `tensor_shape`.
 
-            The compatibility rules are:
-            - For 1D tensors: The buffer's total elements must be >= `like_tensor`'s.
-            - For N-D tensors (>1D): The buffer's total elements must be a perfect
-            multiple of `like_tensor`'s.
+            The compatibility rules are: The buffer's total elements must be >= tensor_shape's.
 
             If a compatible buffer is found, it's returned immediately. Otherwise, a new
-            buffer is allocated on the 'cuda' device with the same properties as `like_tensor`.
+            buffer is allocated on the 'cuda' device with the give properties of 'tensor_shape' and 'dtype'.
 
             Args:
-                like_tensor: The tensor defining the required shape and dtype.
+                tensor_shape: The required shape.
+                dtype: The required dtype.
                 buffers: A dictionary mapping cache names to lists of buffer tensors.
                         Can be `None` or empty.
                 cache_name: The key for the specific list of buffers to search in.
@@ -659,125 +631,112 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             Returns:
                 An existing compatible buffer or a newly created one.
             """
-            # A "guard clause" to handle cases where buffers are not provided.
             if buffers is not None:
                 # Safely get the list of candidates. Defaults to an empty list if key is missing.
                 candidate_buffers = buffers.get(cache_name, [])
-                numel_like = like_tensor.numel()
+                numel_like = math.prod(tensor_shape)
 
                 for buffer in candidate_buffers:
                     numel_buffer = buffer.numel()
 
                     # buffer just needs to be large enough.
                     if numel_buffer >= numel_like:
-                        return buffer  # Found a fit, return immediately.
+                        return buffer[0:numel_like].view(
+                            tensor_shape)  # Found a fit, return immediately.
 
             # If we get here, no suitable buffer was found in the cache. Create a new one.
-            return torch.empty_like(like_tensor, device='cuda')
+            new_buffer = torch.zeros(tensor_shape, device='cuda', dtype=dtype)
+            if buffers is not None:
+                buffers.setdefault(cache_name, []).append(new_buffer)
+            return new_buffer
 
-        def find_or_create_buffer_by_shape(tensor_shape: list[int],
-                                           dtype: torch.dtype,
-                                           buffers: Optional[dict[
-                                               str, list[torch.Tensor]]],
-                                           cache_name: str) -> torch.Tensor:
-            tmp_cpu_tensor = torch.empty(tensor_shape,
-                                         device='cpu',
-                                         dtype=dtype)
+        def get_empty_like(like_tensor: torch.Tensor,
+                           cache_name: str) -> torch.Tensor:
+            return get_empty(like_tensor.shape,
+                             cache_name=cache_name,
+                             dtype=like_tensor.dtype)
 
-            return find_or_create_buffer(tmp_cpu_tensor, buffers, cache_name)
-
-        self.prompt_lens_cpu = torch.empty(
-            (self.max_num_sequences, ),
+        self.prompt_lens_cuda = get_empty((self.max_num_sequences, ),
+                                          cache_name="prompt_lens_cuda",
+                                          dtype=torch.int)
+        self.prompt_lens_cpu = torch.empty_like(
+            self.prompt_lens_cuda,
             device='cpu',
-            dtype=torch.int,
             pin_memory=True,
         )
-
-        self.prompt_lens_cuda = find_or_create_buffer(self.prompt_lens_cpu,
-                                                      buffers,
-                                                      "prompt_lens_cuda")
-
-        self.kv_lens = torch.empty_like(self.prompt_lens_cuda,
+        self.kv_lens_cuda = get_empty_like(self.prompt_lens_cuda,
+                                           cache_name="kv_lens_cuda")
+        self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
-
-        self.kv_lens_cuda = find_or_create_buffer(self.kv_lens, buffers,
-                                                  "kv_lens_cuda")
-
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
 
+        # For debugging, can use it to call the wrapper's plan function
         if self.workspace is None:
-            if "workspace" in buffers:
-                self.workspace = buffers['workspace'][0]
-            else:
-                self.workspace = torch.empty(
-                    (0, ),
-                    device='cuda',
-                    dtype=torch.int8,
-                )
-
+            self.workspace = torch.empty(
+                (0, ),
+                device='cuda',
+                dtype=torch.int8,
+            )
         if self.kv_cache_manager is not None:
-            self.host_kv_cache_block_offsets = torch.empty(
+            self.kv_cache_block_offsets = get_empty(
                 [
                     self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
+                cache_name="kv_cache_block_offsets",
+                dtype=torch.int32)
+            self.host_kv_cache_block_offsets = torch.empty_like(
+                self.kv_cache_block_offsets,
                 device='cpu',
-                dtype=torch.int32,
                 pin_memory=True,
             )
-
-            self.kv_cache_block_offsets = find_or_create_buffer(
-                self.host_kv_cache_block_offsets, buffers,
-                "kv_cache_block_offsets")
-
-            # They are referred in attention's forward no matter flash mla is enabled or not.
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
-                self.block_ids_per_seq = find_or_create_buffer_by_shape([
-                    self.kv_cache_manager.max_batch_size,
-                    self.kv_cache_manager.max_blocks_per_seq
-                ], torch.int32, buffers, 'block_ids_per_seq')
-
-                self.kv_block_ids_per_seq = find_or_create_buffer_by_shape([
-                    self.kv_cache_manager.max_batch_size,
-                    self.kv_cache_manager.max_blocks_per_seq
-                ], torch.int32, buffers, 'kv_block_ids_per_seq')
-
+                self.block_ids_per_seq = get_empty(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    cache_name="block_ids_per_seq",
+                    dtype=torch.int32)
+                self.kv_block_ids_per_seq = get_empty(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    cache_name="kv_block_ids_per_seq",
+                    dtype=torch.int32)
             if self.enable_paged_context_mla:
                 # for kv cache reuse/chunked context in MLA
-                self.host_ctx_cached_token_indptr = torch.zeros(
+                self.ctx_cached_token_indptr = get_empty(
                     (self.max_num_requests + 1, ),
+                    cache_name="ctx_cached_token_indptr",
+                    dtype=torch.int64)
+                self.host_ctx_cached_token_indptr = torch.zeros_like(
+                    self.ctx_cached_token_indptr,
                     device='cpu',
-                    dtype=torch.int64,
                     pin_memory=True,
                 )
-
-                self.ctx_cached_token_indptr = find_or_create_buffer(
-                    self.host_ctx_cached_token_indptr, buffers,
-                    "ctx_cached_token_indptr")
-
-                self.host_ctx_uncached_token_indptr = torch.zeros(
+                self.ctx_uncached_token_indptr = get_empty(
                     (self.max_num_requests + 1, ),
+                    cache_name="ctx_uncached_token_indptr",
+                    dtype=torch.int64)
+                self.host_ctx_uncached_token_indptr = torch.zeros_like(
+                    self.ctx_uncached_token_indptr,
                     device='cpu',
-                    dtype=torch.int64,
                     pin_memory=True,
                 )
-
-                self.ctx_uncached_token_indptr = find_or_create_buffer(
-                    self.host_ctx_uncached_token_indptr, buffers,
-                    "ctx_uncached_token_indptr")
-
-                self.host_ctx_kv_indptr = torch.zeros(
-                    (self.max_num_requests + 1, ),
+                # context full seqlens include cached tokens and uncached tokens
+                self.ctx_kv_indptr = get_empty((self.max_num_requests + 1, ),
+                                               cache_name="ctx_kv_indptr",
+                                               dtype=torch.int64)
+                self.host_ctx_kv_indptr = torch.zeros_like(
+                    self.ctx_kv_indptr,
                     device='cpu',
-                    dtype=torch.int64,
                     pin_memory=True,
                 )
-
-                self.ctx_kv_indptr = find_or_create_buffer(
-                    self.host_ctx_kv_indptr, buffers, "ctx_kv_indptr")
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()

@@ -932,14 +932,6 @@ class PyTorchModelEngine(ModelEngine):
         idx = bisect.bisect_left(self._cuda_graph_batch_sizes, batch_size)
         return self._cuda_graph_batch_sizes[idx]
 
-    def _update_attn_meta_buffers(self, meta_buffers):
-        if meta_buffers is None:
-            return
-        for key, value in meta_buffers.items():
-            if value is None:
-                continue
-            self.cuda_graph_meta_buffers.setdefault(key, []).append(value)
-
     def _maybe_get_cuda_graph(
         self,
         batch: ScheduledRequests,
@@ -981,7 +973,6 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
             num_sequences_in_batch, False, draft_len,
             self.cuda_graph_meta_buffers)
-        new_attn_buffers = attn_metadata.get_runtime_buffers()
 
         assert attn_metadata.is_cuda_graph
 
@@ -990,8 +981,6 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
                 num_sequences_in_batch)
             spec_metadata.draft_tokens = self.draft_tokens_cuda
-
-        self._update_attn_meta_buffers(new_attn_buffers)
 
         # Initialize nested dictionary if needed
         if batch_size not in self._cuda_graphs:
