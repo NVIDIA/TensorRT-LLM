@@ -592,6 +592,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
+    cache_salt: Optional[str] = Field(
+        default=None,
+        description=
+        ("If specified, KV cache will be salted with the provided string "
+         "to limit the kv cache reuse on with the requests having the same string."
+         ))
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
@@ -669,6 +676,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def check_suffix(cls, data):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_cache_salt_support(cls, data):
+        if data.get("cache_salt") is not None:
+            if not isinstance(data["cache_salt"],
+                              str) or not data["cache_salt"]:
+                raise ValueError(
+                    "Parameter 'cache_salt' must be a non-empty string if provided."
+                )
         return data
 
 

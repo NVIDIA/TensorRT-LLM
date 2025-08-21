@@ -32,7 +32,7 @@ class Request::Impl
 {
 
 public:
-    // 36 parameters, 36 items in initialization list
+    // 37 parameters, 37 items in initialization list
     Impl(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming, SamplingConfig const& samplingConfig,
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
@@ -48,7 +48,8 @@ public:
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
-        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs)
+        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
+        std::optional<CacheSaltIDType> cacheSaltID)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -85,6 +86,7 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
+        , mCacheSaltID(cacheSaltID)
     {
         validate();
     }
@@ -296,6 +298,11 @@ public:
         return mLanguageAdapterUid;
     }
 
+    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const
+    {
+        return mCacheSaltID;
+    }
+
     void setStreaming(bool streaming)
     {
         mStreaming = streaming;
@@ -470,6 +477,11 @@ public:
         mLanguageAdapterUid = languageAdapterUid;
     }
 
+    void setCacheSaltID(CacheSaltIDType cacheSaltID)
+    {
+        mCacheSaltID = cacheSaltID;
+    }
+
 private:
     void validate()
     {
@@ -543,6 +555,7 @@ private:
         lambda(mGuidedDecodingParams);
         lambda(mLanguageAdapterUid);
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
+        lambda(mCacheSaltID);
     }
 
     VecTokens mInputTokenIds;
@@ -581,6 +594,7 @@ private:
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
     std::optional<SizeType32> mLanguageAdapterUid;
     std::optional<MillisecondsType> mAllottedTimeMs;
+    std::optional<CacheSaltIDType> mCacheSaltID;
 };
 
 } // namespace tensorrt_llm::executor

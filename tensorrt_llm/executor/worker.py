@@ -572,7 +572,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
-                type=request_type)
+                type=request_type,
+                cache_salt_id=request.cache_salt_id)
             executor_request.py_lora_path = py_lora_path
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
