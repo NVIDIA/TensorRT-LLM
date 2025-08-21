@@ -83,10 +83,20 @@ auto deduce_layout_sf()
 {
     if constexpr (FLAG && A)
     {
+        // In moe_kernels.cu we rely on these two types being the same. This is not necessarily guaranteed by cutlass so
+        // we have a sanity check here.
+        static_assert(std::is_same_v<typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA,
+                          typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB>,
+            "Deduced layout SF does not match for A and B");
         return typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA{};
     }
     else if constexpr (FLAG && !A)
     {
+        // In moe_kernels.cu we rely on these two types being the same. This is not necessarily guaranteed by cutlass so
+        // we have a sanity check here.
+        static_assert(std::is_same_v<typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA,
+                          typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB>,
+            "Deduced layout SF does not match for A and B");
         return typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB{};
     }
     else
@@ -393,12 +403,12 @@ using SafeBF16 = void;
             using TensorOp = std::conditional_t<IsBlackwell && IsBlockScaled,                                                                                                                                                                                  \
                 cutlass::arch::OpClassBlockScaledTensorOp, cutlass::arch::OpClassTensorOp>;                                                                                                                                                                    \
                                                                                                                                                                                                                                                                \
-            using MainloopElementA                                                                                                                                                                                                                             \
+            using MainloopElementAct                                                                                                                                                                                                                           \
                 = std::conditional_t<IsBlackwell && IsBlockScaled, ElementActBlockScaled, ElementAct>;                                                                                                                                                         \
-            using MainloopElementB                                                                                                                                                                                                                             \
+            using MainloopElementWeight                                                                                                                                                                                                                        \
                 = std::conditional_t<IsBlackwell && IsBlockScaled, ElementWeightBlockScaled, ElementWeight>;                                                                                                                                                   \
-            using SwappedMainloopElementA = std::conditional_t<SwapAB, MainloopElementB, MainloopElementA>;                                                                                                                                                    \
-            using SwappedMainloopElementB = std::conditional_t<SwapAB, MainloopElementA, MainloopElementB>;                                                                                                                                                    \
+            using SwappedMainloopElementA = std::conditional_t<SwapAB, MainloopElementWeight, MainloopElementAct>;                                                                                                                                             \
+            using SwappedMainloopElementB = std::conditional_t<SwapAB, MainloopElementAct, MainloopElementWeight>;                                                                                                                                             \
             constexpr auto SwappedAlignmentA = SwapAB ? AlignmentWeight : AlignmentAct;                                                                                                                                                                        \
             constexpr auto SwappedAlignmentB = SwapAB ? AlignmentAct : AlignmentWeight;                                                                                                                                                                        \
             using LayoutA = TmaWarpSpecializedGroupedGemmInput::LayoutA;                                                                                                                                                                                       \
@@ -465,10 +475,10 @@ using SafeBF16 = void;
                             reinterpret_cast<ElementAct const**>(tma_ws_input.ptr_act),                                                                                                                                                                        \
                             reinterpret_cast<StrideB*>(tma_ws_input.stride_act),                                                                                                                                                                               \
                             reinterpret_cast<ElementSF const**>(tma_ws_input.fpX_block_scaling_factors_weight),                                                                                                                                                \
-                            reinterpret_cast<decltype(deduce_layout_sf<IsBlockScaled, GemmGrouped, false>())>(                                                                                                                                                 \
+                            reinterpret_cast<decltype(deduce_layout_sf<IsBlockScaled, GemmGrouped, true>())>(                                                                                                                                                  \
                                 tma_ws_input.fpX_block_scaling_factors_stride_weight),                                                                                                                                                                         \
                             reinterpret_cast<ElementSF const**>(tma_ws_input.fpX_block_scaling_factors_act),                                                                                                                                                   \
-                            reinterpret_cast<decltype(deduce_layout_sf<IsBlockScaled, GemmGrouped, true>())>(                                                                                                                                                  \
+                            reinterpret_cast<decltype(deduce_layout_sf<IsBlockScaled, GemmGrouped, false>())>(                                                                                                                                                 \
                                 tma_ws_input.fpX_block_scaling_factors_stride_act));                                                                                                                                                                           \
                     }                                                                                                                                                                                                                                          \
                     else                                                                                                                                                                                                                                       \

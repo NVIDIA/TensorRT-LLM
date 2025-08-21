@@ -1168,10 +1168,10 @@ __device__ void computeTmaWarpSpecializedInputStrides(
     {
         reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideB*>(layout_info.stride_act)[out_idx]
             = cutlass::make_cute_packed_stride(
-                TmaWarpSpecializedGroupedGemmInput::StrideB{}, cute::make_shape(gemm_n, gemm_k, 1));
+                TmaWarpSpecializedGroupedGemmInput::StrideB{}, cute::make_shape(gemm_m, gemm_k, 1));
         reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideA*>(layout_info.stride_weight)[out_idx]
             = cutlass::make_cute_packed_stride(
-                TmaWarpSpecializedGroupedGemmInput::StrideA{}, cute::make_shape(gemm_m, gemm_k, 1));
+                TmaWarpSpecializedGroupedGemmInput::StrideA{}, cute::make_shape(gemm_n, gemm_k, 1));
     }
     else
     {
@@ -1184,20 +1184,8 @@ __device__ void computeTmaWarpSpecializedInputStrides(
     }
     if (layout_info.stride_c)
     {
+        // TODO Enable 1xN bias matrix as C
         assert(false && "CUTLASS does not support a 1xN bias");
-        //        layout_info.stride_c[out_idx] = cute::make_stride(0, cute::Int<1>{}, 0);
-        if (layout_info.swap_ab)
-        {
-            reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideC_T*>(layout_info.stride_c)[out_idx]
-                = cutlass::make_cute_packed_stride(
-                    TmaWarpSpecializedGroupedGemmInput::StrideC_T{}, cute::make_shape(1, gemm_n, 1));
-        }
-        else
-        {
-            reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideC*>(layout_info.stride_c)[out_idx]
-                = cutlass::make_cute_packed_stride(
-                    TmaWarpSpecializedGroupedGemmInput::StrideC{}, cute::make_shape(gemm_n, 1, 1));
-        }
     }
     if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE)
     {
@@ -1299,22 +1287,24 @@ __global__ void computeStridesTmaWarpSpecializedKernel(int64_t const* expert_fir
 
     // M and N transposed since we are using the #tokens as the N dimension
     layout_info1.shape_info.problem_shapes[expert]
-        = TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(gemm1_n, gemm_m, gemm1_k);
+        = TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(
+            layout_info1.swap_ab ? gemm1_n : gemm_m, layout_info1.swap_ab ? gemm_m : gemm1_n, gemm1_k);
     layout_info2.shape_info.problem_shapes[expert]
-        = TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(gemm2_n, gemm_m, gemm2_k);
+        = TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(
+            layout_info2.swap_ab ? gemm2_n : gemm_m, layout_info2.swap_ab ? gemm_m : gemm2_n, gemm2_k);
 
     if (layout_info1.int4_groupwise_params.enabled)
     {
         layout_info1.int4_groupwise_params.shape.problem_shapes[expert]
             = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape(
-                gemm1_n, gemm_m, gemm1_k);
+                layout_info1.swap_ab ? gemm1_n : gemm_m, layout_info1.swap_ab ? gemm_m : gemm1_n, gemm1_k);
     }
 
     if (layout_info2.int4_groupwise_params.enabled)
     {
         layout_info2.int4_groupwise_params.shape.problem_shapes[expert]
             = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape(
-                gemm2_n, gemm_m, gemm2_k);
+                layout_info2.swap_ab ? gemm2_n : gemm_m, layout_info2.swap_ab ? gemm_m : gemm2_n, gemm2_k);
     }
 
     if (alpha_scale_flat1 && alpha_scale_flat2)
@@ -1362,144 +1352,6 @@ __global__ void computeStridesTmaWarpSpecializedKernel(int64_t const* expert_fir
         reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
             quant_params.groupwise.fc2.weight_scales),
         bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row, expert);
-}
-
-template <class T, class WeightType, class OutputType, class ScaleBiasType>
-__global__ void computeStridesTmaWarpSpecializedLowLatencyKernel(TmaWarpSpecializedGroupedGemmInput layout_info1,
-    TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens, int64_t gemm1_n, int64_t gemm1_k,
-    int64_t gemm2_n, int64_t gemm2_k, int64_t const num_experts_per_node, T const* in1, T const* in2,
-    WeightType const* weights1, WeightType const* weights2, float const* alpha_scale_flat1,
-    float const* alpha_scale_flat2, TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
-    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
-    ScaleBiasType const* bias1, ScaleBiasType const* bias2, OutputType* output1, OutputType* output2,
-    int const* num_active_experts_per, int const* active_expert_global_ids, int start_expert)
-{
-    // First, compute the global tid. We only need 1 thread per expert.
-    int const expert = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (expert >= num_experts_per_node)
-    {
-        return;
-    }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
-#endif
-
-    // Note: expert is used to calculate the offset of the input and output
-    // local_expert is used to calculate the offset of the weight
-    auto const num_tokens_before_expert = expert * num_tokens;
-    bool const is_active_expert = expert < *num_active_experts_per;
-    int const local_expert = is_active_expert ? active_expert_global_ids[expert] - start_expert : -1;
-    auto const gemm_m = is_active_expert ? num_tokens : 0;
-
-    // M and N transposed since we are using the #tokens as the N dimension
-    layout_info1.shape_info.problem_shapes[expert]
-        = TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(gemm1_n, gemm_m, gemm1_k);
-    layout_info2.shape_info.problem_shapes[expert]
-        = TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(gemm2_n, gemm_m, gemm2_k);
-
-    if (alpha_scale_flat1)
-    {
-        assert(alpha_scale_flat2);
-        if (is_active_expert)
-        {
-            layout_info1.alpha_scale_ptr_array[expert] = alpha_scale_flat1 + local_expert;
-            layout_info2.alpha_scale_ptr_array[expert] = alpha_scale_flat2 + local_expert;
-        }
-        else
-        {
-            layout_info1.alpha_scale_ptr_array[expert] = nullptr;
-            layout_info2.alpha_scale_ptr_array[expert] = nullptr;
-        }
-    }
-
-    if (quant_params.fp4.fc1.weight_block_scale)
-    {
-        setupFP4BlockScalingFactors<TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig>(layout_info1, expert,
-            gemm_m, gemm1_n, gemm1_k, fp4_act_flat1, quant_params.fp4.fc1.weight_block_scale, num_tokens_before_expert);
-
-        // Override the scaling factors, fc1 uses the same A input for all experts and the scaling factor B offsets from
-        // the local expert index
-        if (is_active_expert)
-        {
-            layout_info1.fpX_block_scaling_factors_act[expert] = fp4_act_flat1;
-            layout_info1.fpX_block_scaling_factors_weight[expert] = quant_params.fp4.fc1.weight_block_scale
-                + getOffsetWeightSF(
-                    local_expert, gemm1_n, gemm1_k, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
-        }
-        else
-        {
-            layout_info1.fpX_block_scaling_factors_act[expert] = nullptr;
-            layout_info1.fpX_block_scaling_factors_weight[expert] = nullptr;
-        }
-    }
-
-    if (quant_params.fp4.fc2.weight_block_scale)
-    {
-        setupFP4BlockScalingFactors<TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig>(layout_info2, expert,
-            gemm_m, gemm2_n, gemm2_k, fp4_act_flat2, quant_params.fp4.fc2.weight_block_scale, num_tokens_before_expert);
-
-        // Override the scaling factors, fc2 scaling factor B offsets by the local expert index
-        if (is_active_expert)
-        {
-            layout_info2.fpX_block_scaling_factors_weight[expert] = quant_params.fp4.fc2.weight_block_scale
-                + getOffsetWeightSF(
-                    local_expert, gemm2_n, gemm2_k, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
-        }
-        else
-        {
-            layout_info2.fpX_block_scaling_factors_act[expert] = nullptr;
-            layout_info2.fpX_block_scaling_factors_weight[expert] = nullptr;
-        }
-    }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
-#endif
-
-    assert(gemm_m <= INT32_MAX);
-    assert(gemm1_n > 0 && gemm1_n <= INT32_MAX);
-    assert(gemm1_k > 0 && gemm1_k <= INT32_MAX);
-    assert(gemm2_n > 0 && gemm2_n <= INT32_MAX);
-    assert(gemm2_k > 0 && gemm2_k <= INT32_MAX);
-    computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert);
-    computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert);
-
-    if (is_active_expert)
-    {
-        // Note: under low latency mode, we use the same input for all experts
-        // so for gemm1, the inputs are the same,
-        // for gemm2, we use the input generated by gemm1
-        layout_info1.ptr_act[expert] = in1;
-        layout_info2.ptr_act[expert] = safe_inc_ptr(in2, expert * num_tokens * gemm2_k);
-
-        // Each expert's weight matrix is a constant size NxK, get the matrix at index `expert`
-        layout_info1.ptr_weight[expert] = safe_inc_ptr(weights1, local_expert * (gemm1_n * gemm2_k));
-        layout_info2.ptr_weight[expert] = safe_inc_ptr(weights2, local_expert * (gemm1_n * gemm2_k));
-
-        assert(layout_info1.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
-        layout_info1.ptr_d[expert] = safe_inc_ptr(output1, expert * num_tokens * gemm1_n);
-
-        if (layout_info2.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE)
-        {
-            // The output prior to this contains N elements per token, with `num_tokens` tokens
-            layout_info2.ptr_d[expert] = safe_inc_ptr(output2, expert * num_tokens * gemm2_n);
-        }
-    }
-    else
-    {
-        layout_info1.ptr_act[expert] = nullptr;
-        layout_info2.ptr_act[expert] = nullptr;
-        layout_info1.ptr_weight[expert] = nullptr;
-        layout_info2.ptr_weight[expert] = nullptr;
-
-        layout_info1.ptr_d[expert] = nullptr;
-        if (layout_info2.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE)
-        {
-            layout_info2.ptr_d[expert] = nullptr;
-        }
-    }
 }
 
 // ========================== Permutation things =======================================
@@ -3947,54 +3799,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
     UnfusedGemmOutputType* output2, int const* num_active_experts_per, int const* active_expert_global_ids,
     int start_expert, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(!use_w4_groupwise, "W4AFP8 and WFP4A16 are not supported in low latency mode");
-
-    // Always nullptr
-    layout_info1.ptr_c = nullptr;
-    layout_info1.stride_c = nullptr;
-    layout_info2.ptr_c = nullptr;
-    layout_info2.stride_c = nullptr;
-
-    auto alpha_scale_flat1 = use_fp4 ? quant_params.fp4.fc1.global_scale
-        : use_wfp4afp8               ? quant_params.fp8_mxfp4.fc1.global_scale
-                                     : fp8_dequant1;
-    auto alpha_scale_flat2 = use_fp4 ? quant_params.fp4.fc2.global_scale
-        : use_wfp4afp8               ? quant_params.fp8_mxfp4.fc2.global_scale
-                                     : fp8_dequant2;
-    if (!alpha_scale_flat1)
-    {
-        layout_info1.alpha_scale_ptr_array = nullptr;
-    }
-    if (!alpha_scale_flat2)
-    {
-        layout_info2.alpha_scale_ptr_array = nullptr;
-    }
-
-    layout_info1.int4_groupwise_params.enabled = false;
-    layout_info2.int4_groupwise_params.enabled = false;
-    layout_info1.int4_groupwise_params.use_wfp4a16 = false;
-    layout_info2.int4_groupwise_params.use_wfp4a16 = false;
-
-    int const threads = std::min(1024, num_experts);
-    int const blocks = (num_experts + threads - 1) / threads;
-
-    cudaLaunchConfig_t config;
-    config.gridDim = blocks;
-    config.blockDim = threads;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    cudaLaunchKernelEx(&config,
-        computeStridesTmaWarpSpecializedLowLatencyKernel<T, WeightType, OutputType, ScaleBiasType>, layout_info1,
-        layout_info2, num_tokens, gemm1_n, gemm1_k, gemm2_n, gemm2_k, num_experts, input1, input2, weights1, weights2,
-        alpha_scale_flat1, alpha_scale_flat2, fc1_fp4_act_flat, fc2_fp4_act_flat, quant_params, bias1, bias2, output1,
-        output2, num_active_experts_per, active_expert_global_ids, start_expert);
-
-    return std::make_pair(layout_info1, layout_info2);
+    TLLM_THROW("Min latency mode is no longer supported");
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>

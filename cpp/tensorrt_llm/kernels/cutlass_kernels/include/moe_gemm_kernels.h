@@ -74,12 +74,12 @@ struct TmaWarpSpecializedGroupedGemmInput
     static_assert(std::is_same_v<cutlass::layout::RowMajor, TransposeLayoutTag<cutlass::layout::ColumnMajor>>);
     static_assert(std::is_same_v<cutlass::layout::ColumnMajor, TransposeLayoutTag<cutlass::layout::RowMajor>>);
 
-    // These are always the layout of A & B matrices
-    // Even when using Swap A&B we will both transpose and swap the order which will result in the same layout for A & B
+    // These are always the layout of A & B matrices, activations and weights will be assigned to either A or B based on
+    // swap_ab
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
 
-    // When using Swap A&B we want to transpose C & D
+    // When using Swap A&B we need to transpose the output matrix
     using LayoutC = cutlass::layout::RowMajor;
     using LayoutD = cutlass::layout::RowMajor;
     using LayoutC_T = TransposeLayoutTag<LayoutC>;
