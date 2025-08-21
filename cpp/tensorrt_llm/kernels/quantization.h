@@ -88,5 +88,9 @@ void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
 void invokeBlockScaleInterleaveReverse(
     int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
 
+template <typename T>
+void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* input, int const* tokensPerBatch,
+    float* globalScale, int multiProcessorCount, cudaStream_t stream = 0);
+
 } // namespace kernels
 } // namespace tensorrt_llm
