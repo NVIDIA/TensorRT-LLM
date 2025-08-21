@@ -271,6 +271,8 @@ def _(
     min_latency_mode: bool = False,
     use_fused_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
+    tuner_num_tokens: Optional[int] = None,
+    tuner_top_k: Optional[int] = None,
     unpadded_hidden_size: Optional[int] = None,
 ):
     seq_len = input.shape[0]
