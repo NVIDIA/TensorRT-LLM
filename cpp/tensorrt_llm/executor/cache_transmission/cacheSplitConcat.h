@@ -40,6 +40,15 @@ struct TargetRanksInfo
     std::vector<int> mIRanks;
     int mDupHeadFactor;
     int mPeerDupHeadFactor;
+    std::vector<int> mPeerAttentionLayerNumInDomainPP;
+
+    int getPeerPPDomainLayerNum(int targetRankIdx)
+    {
+        //[TP,PP]
+
+        int ppDomainRankIdx = targetRankIdx % mDomainPPSize;
+        return mPeerAttentionLayerNumInDomainPP[ppDomainRankIdx];
+    }
 };
 
 TargetRanksInfo targetIRanks(

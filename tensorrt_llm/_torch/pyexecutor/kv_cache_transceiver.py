@@ -3,6 +3,7 @@ from os import getenv
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
 from tensorrt_llm.bindings.executor import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
@@ -28,7 +29,7 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
 
 def create_kv_cache_transceiver(
-        mapping: Mapping, kv_cache_manager: KVCacheManager,
+        mapping: Mapping, dist: Distributed, kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
@@ -59,8 +60,8 @@ def create_kv_cache_transceiver(
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
-    return BindKvCacheTransceiver(mapping, kv_cache_manager, attention_type,
-                                  cache_transceiver_config)
+    return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
+                                  attention_type, cache_transceiver_config)
 
 
 class KvCacheTransceiver(ABC):
@@ -92,7 +93,8 @@ class KvCacheTransceiver(ABC):
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
 
-    def __init__(self, mapping: Mapping, kv_cache_manager: KVCacheManager,
+    def __init__(self, mapping: Mapping, dist: Distributed,
+                 kv_cache_manager: KVCacheManager,
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig):
         world_config = mapping_to_world_config(mapping)
@@ -100,10 +102,12 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         head_dim = kv_cache_manager.head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         dtype = kv_cache_manager.dtype
-
+        pp_layer_num = len(kv_cache_manager.pp_layers)
+        pp_layer_num_per_pp_rank = dist.pp_allgather(pp_layer_num)
         self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
                                         total_num_kv_heads_per_layer, head_dim,
-                                        tokens_per_block, world_config, dtype,
+                                        tokens_per_block, world_config,
+                                        pp_layer_num_per_pp_rank, dtype,
                                         attention_type,
                                         cache_transceiver_config)
 

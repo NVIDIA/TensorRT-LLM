@@ -96,13 +96,22 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
     executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
         modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
 
-    return std::make_unique<CacheTransceiver>(
-        cacheManager, cacheStateCfg, worldConfig, modelConfig.getKvDataType(), attentionType, cacheTransceiverConfig);
+    auto ppSize = worldConfig.getPipelineParallelism();
+
+    std::vector<SizeType32> attentionLayerNumPerPP(ppSize, 0);
+    for (int pp_rank = 0; pp_rank < ppSize; pp_rank++)
+    {
+        attentionLayerNumPerPP[pp_rank] = modelConfig.getNbAttentionLayers(ppSize, pp_rank);
+    }
+
+    return std::make_unique<CacheTransceiver>(cacheManager, cacheStateCfg, worldConfig, attentionLayerNumPerPP,
+        modelConfig.getKvDataType(), attentionType, cacheTransceiverConfig);
 }
 
 CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
     executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-    nvinfer1::DataType dataType, executor::kv_cache::CacheState::AttentionType attentionType,
+    std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+    executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
     : mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
     , mCacheTransceiverConfig{cacheTransceiverConfig}
@@ -124,7 +133,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         kvFactor = 1;
     }
     mCacheState = std::make_unique<executor::kv_cache::CacheState>(
-        cacheStateModelCfg, worldConfig, dataType, attentionType, kvFactor);
+        cacheStateModelCfg, worldConfig, attentionLayerNumPerPP, dataType, attentionType, kvFactor);
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
