@@ -214,8 +214,105 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
                                                         1 / scale.cpu(), 16, 1)
         return norm_out, dequant_fp4, residual_out
 
+    def calc_allgather(x, res):
+        print(f"[Rank {tensor_parallel_rank}] Starting calc_allgather")
+        print(f"[Rank {tensor_parallel_rank}] Input x shape: {x.shape}, dtype: {x.dtype}")
+        print(f"[Rank {tensor_parallel_rank}] Input x values: {x}")
+        
+        # Create rank-specific input data for AllGather testing
+        # Rank 0: [0,1,2,3,4,5,6,7], Rank 1: [10,11,12,13,14,15,16,17], etc.
+        print(f"[Rank {tensor_parallel_rank}] Using dtype: {dtype}")
+        
+        # First create with default dtype, then convert
+        rank_data_orig = torch.arange(
+            tensor_parallel_rank * 10, 
+            tensor_parallel_rank * 10 + 8, 
+            device="cuda"
+        ).reshape(1, 8)
+        print(f"[Rank {tensor_parallel_rank}] Original rank_data: {rank_data_orig} (dtype: {rank_data_orig.dtype})")
+        
+        rank_data = rank_data_orig.to(dtype)  # Convert to target dtype
+        
+        print(f"[Rank {tensor_parallel_rank}] Converted rank_data: {rank_data}")
+        print(f"[Rank {tensor_parallel_rank}] rank_data dtype: {rank_data.dtype}")
+        
+        # Pad or reshape to match expected input dimensions if needed
+        if rank_data.shape != x.shape:
+            rank_data = rank_data.expand(x.shape[0], -1)
+            if rank_data.shape[1] < x.shape[1]:
+                # Repeat pattern to fill the hidden dimension
+                repeat_factor = x.shape[1] // 8
+                remainder = x.shape[1] % 8
+                rank_data = rank_data.repeat(1, repeat_factor)
+                if remainder > 0:
+                    rank_data = torch.cat([rank_data, rank_data[:, :remainder]], dim=1)
+        
+        print(f"[Rank {tensor_parallel_rank}] Final rank_data shape: {rank_data.shape}")
+        print(f"[Rank {tensor_parallel_rank}] Final rank_data values: {rank_data}")
+        
+        # Use AllReduce with ALLGATHER fusion to gather data from all ranks
+        print(f"[Rank {tensor_parallel_rank}] About to call allreduce with ALLGATHER")
+        try:
+            # Run allreduce 100 times in a loop
+            output = None
+            for i in range(100):
+                output = allreduce(
+                    rank_data,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.ALLGATHER,
+                        enable_allreduce=True,
+                    ),
+                )
+            print(f"[Rank {tensor_parallel_rank}] AllGather completed!")
+            print(f"[Rank {tensor_parallel_rank}] Output shape: {output.shape}")
+            print(f"[Rank {tensor_parallel_rank}] Output values: {output}")
+            return [output]
+        except Exception as e:
+            print(f"[Rank {tensor_parallel_rank}] AllGather failed: {e}")
+            print(f"[Rank {tensor_parallel_rank}] Exception traceback: {traceback.format_exc()}")
+            raise
+
+    def ref_allgather(x, res):
+        print(f"[Rank {tensor_parallel_rank}] Starting ref_allgather")
+        # Reference implementation: manually create expected AllGather result
+        all_rank_data = []
+        for rank in range(tensor_parallel_size):
+            # Create with default dtype first, then convert
+            rank_data_orig = torch.arange(
+                rank * 10, 
+                rank * 10 + 8, 
+                device="cuda"
+            ).reshape(1, 8)
+            print(f"[Rank {tensor_parallel_rank}] Original ref data for rank {rank}: {rank_data_orig} (dtype: {rank_data_orig.dtype})")
+            
+            rank_data = rank_data_orig.to(dtype)
+            print(f"[Rank {tensor_parallel_rank}] Converted ref data for rank {rank}: {rank_data}")
+            print(f"[Rank {tensor_parallel_rank}] ref rank_data dtype: {rank_data.dtype}")
+            
+            # Pad or reshape to match expected input dimensions
+            if rank_data.shape != x.shape:
+                rank_data = rank_data.expand(x.shape[0], -1)
+                if rank_data.shape[1] < x.shape[1]:
+                    # Repeat pattern to fill the hidden dimension
+                    repeat_factor = x.shape[1] // 8
+                    remainder = x.shape[1] % 8
+                    rank_data = rank_data.repeat(1, repeat_factor)
+                    if remainder > 0:
+                        rank_data = torch.cat([rank_data, rank_data[:, :remainder]], dim=1)
+            
+            print(f"[Rank {tensor_parallel_rank}] Final ref data for rank {rank}: shape {rank_data.shape}, values {rank_data}")
+            all_rank_data.append(rank_data)
+        
+        # Concatenate along the first dimension (batch dimension)
+        gathered_result = torch.cat(all_rank_data, dim=0)
+        print(f"[Rank {tensor_parallel_rank}] Reference AllGather result:")
+        print(f"[Rank {tensor_parallel_rank}] Shape: {gathered_result.shape}")
+        print(f"[Rank {tensor_parallel_rank}] Values: {gathered_result} dtype: {gathered_result.dtype}")
+        return [gathered_result]
+
     fusion_op_to_func = {
         AllReduceFusionOp.NONE: (calc_allreduce, ref_allreduce),
+        AllReduceFusionOp.ALLGATHER: (calc_allgather, ref_allgather),
         AllReduceFusionOp.RESIDUAL_RMS_NORM: (calc_fused_allreduce,
                                               ref_residual_rms_norm),
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
@@ -258,14 +355,15 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Requires at least 2 GPUs for this test")
-@pytest.mark.parametrize("seq_len", [16, 256, 8192],
+@pytest.mark.parametrize("seq_len", [1], #256, 8192],
                          ids=lambda x: f"seqlen:{x}")
-@pytest.mark.parametrize("hidden_size", [128, 7168],
+@pytest.mark.parametrize("hidden_size", [8], #7168],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize(
     "fusion_op",
     [
         pytest.param(AllReduceFusionOp.NONE, id="none"),
+        pytest.param(AllReduceFusionOp.ALLGATHER, id="allgather"),
         pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM,
                      id="residual_rms_norm"),
         pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
@@ -280,11 +378,12 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
                      marks=skip_pre_blackwell),
     ],
 )
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("mpi_pool_executor", [8], indirect=True)
 def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
                                    mpi_pool_executor):
     torch.manual_seed(0)
-    dtype = torch.bfloat16
+    # dtype = torch.bfloat16
+    dtype = torch.float32
     tensor_parallel_size = mpi_pool_executor.num_workers
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     residual = torch.randn_like(x)

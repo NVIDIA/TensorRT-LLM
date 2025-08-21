@@ -957,7 +957,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
             )
-
         self.shared_head = DeepseekV3MTPHead(model_config)
 
     def forward(
@@ -989,12 +988,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # Split hidden_states columnwise based on TP
         tp_size = self.model_config.mapping.tp_size
         tp_rank = self.model_config.mapping.tp_rank
-
         if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
             hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
         hidden_states = self.eh_proj(hidden_states)
 
         # Input layer norm
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 

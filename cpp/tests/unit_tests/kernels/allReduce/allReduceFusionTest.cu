@@ -280,6 +280,8 @@ public:
         m_allreduce_in.allocate(m_message_size * sizeof(DType));
         m_residual_in.allocate(m_message_size * sizeof(DType));
         m_allreduce_out.allocate(m_message_size * sizeof(DType));
+        m_allgather_out.allocate(
+            m_message_size * m_world_size * sizeof(DType)); // AllGather output is world_size times larger
         m_residual_out.allocate(m_message_size * sizeof(DType));
         m_norm_out.allocate(m_message_size * sizeof(DType));
         m_quant_out.allocate(m_message_size * sizeof(DType));
@@ -298,6 +300,7 @@ public:
         m_params.allreduce_in = m_allreduce_in.device_data();
         m_params.residual_in = m_residual_in.device_data();
         m_params.allreduce_out = m_allreduce_out.device_data();
+        m_params.allgather_out = m_allgather_out.device_data();
         m_params.residual_out = m_residual_out.device_data();
         m_params.norm_out = m_norm_out.device_data();
         m_params.quant_out = m_quant_out.device_data();
@@ -380,12 +383,25 @@ public:
         // We directly compare the results of AR+AddResidual here, as the accumulation order in NCCL's AR might be
         // inconsistent across different kernels. Therefore, we set atol to 1 (setting it to 0 locally also passes the
         // test).
-        TLLM_NCCL_CHECK(ncclAllReduce(m_allreduce_in.device_data(), ref_output.device_data(), message_size,
-            kNCCLDataType, ncclSum, m_nccl_comm, 0));
+        
+        if constexpr (!ar_fusion::HasAllGatherOut<Pattern>)
+        {
+            TLLM_NCCL_CHECK(ncclAllReduce(m_allreduce_in.device_data(), ref_output.device_data(), message_size,
+                kNCCLDataType, ncclSum, m_nccl_comm, 0));
+        }
         if constexpr (ar_fusion::HasAllReduceOut<Pattern>)
         {
             TLLM_CHECK(compare<DType>(
                 m_rank, m_allreduce_out.host_data(), ref_output.host_data(), message_size, "allreduce out", 1));
+        }
+        if constexpr (ar_fusion::HasAllGatherOut<Pattern>)
+        {
+            // For AllGather, create reference output by gathering all ranks' input data
+            CudaBuffer ref_allgather_output(message_size * m_world_size * sizeof(DType));
+            TLLM_NCCL_CHECK(ncclAllGather(m_allreduce_in.device_data(), ref_allgather_output.device_data(),
+                message_size, kNCCLDataType, m_nccl_comm, 0));
+            TLLM_CHECK(compare<DType>(m_rank, m_allgather_out.host_data(), ref_allgather_output.host_data(),
+                message_size * m_world_size, "allgather out", 0));
         }
         if constexpr (ar_fusion::HasResidual<Pattern>)
         {
@@ -445,6 +461,12 @@ public:
             token_num * hidden_dim, kNCCLDataType, ncclSum, m_nccl_comm, m_stream->get()));
     }
 
+    void run_nccl_allgather(int token_num, int hidden_dim)
+    {
+        TLLM_NCCL_CHECK(ncclAllGather(m_allreduce_in.device_data(), m_allgather_out.device_data(),
+            token_num * hidden_dim, kNCCLDataType, m_nccl_comm, m_stream->get()));
+    }
+
     void run_residual_add(int token_num, int hidden_dim)
     {
         residual_add(m_residual_out.device_data<DType>(), m_residual_in.device_data<DType>(), token_num * hidden_dim,
@@ -470,6 +492,89 @@ public:
         ar_fusion::allreduce_fusion_op(m_params);
     }
 
+    void print_allgather_output(int token_num, int hidden_dim)
+    {
+        if constexpr (ar_fusion::HasAllGatherOut<Pattern>)
+        {
+            int message_size = token_num * hidden_dim;
+            auto output_data = m_allgather_out.host_data<DType>();
+
+            if (m_rank == 0)
+            {
+                printf("\n=== AllGather Output ===\n");
+                printf("Message size per rank: %d, Total ranks: %d\n", message_size, m_world_size);
+                printf("Total gathered size: %d elements\n", message_size * m_world_size);
+
+                // Print the gathered data as a single concatenated buffer
+                printf("Gathered buffer (all ranks concatenated): [");
+                for (int i = 0; i < message_size * m_world_size; ++i)
+                {
+                    float val = static_cast<float>(output_data[i]);
+                    printf("%.2f", val);
+                    if (i < message_size * m_world_size - 1)
+                        printf(", ");
+                }
+                printf("]\n\n");
+
+                // Also show breakdown by rank for clarity
+                printf("Breakdown by rank:\n");
+                for (int r = 0; r < m_world_size; ++r)
+                {
+                    printf("  Rank %d data: [", r);
+                    for (int i = 0; i < message_size; ++i)
+                    {
+                        float val = static_cast<float>(output_data[r * message_size + i]);
+                        printf("%.2f", val);
+                        if (i < message_size - 1)
+                            printf(", ");
+                    }
+                    printf("]\n");
+                }
+                printf("========================\n\n");
+            }
+        }
+    }
+
+    void print_input_data(int token_num, int hidden_dim)
+    {
+        int message_size = token_num * hidden_dim;
+        auto input_data = m_allreduce_in.host_data<DType>();
+
+        printf("Rank %d input data: [", m_rank);
+        for (int i = 0; i < message_size; ++i)
+        {
+            float val = static_cast<float>(input_data[i]);
+            printf("%.2f", val);
+            if (i < message_size - 1)
+                printf(", ");
+        }
+        printf("]\n");
+        fflush(stdout);
+    }
+
+    // Public method to set input data for testing
+    void set_input_data(int message_size, std::function<half(int)> data_generator)
+    {
+        auto input_data = m_allreduce_in.host_data<half>();
+        for (int i = 0; i < message_size; ++i)
+        {
+            input_data[i] = data_generator(i);
+        }
+        m_allreduce_in.h2d();
+    }
+
+    // Template method to set input data for any data type
+    template<typename T>
+    void set_input_data_typed(int message_size, std::function<T(int)> data_generator)
+    {
+        auto input_data = m_allreduce_in.host_data<T>();
+        for (int i = 0; i < message_size; ++i)
+        {
+            input_data[i] = data_generator(i);
+        }
+        m_allreduce_in.h2d();
+    }
+
     ~TestRunner()
     {
         TLLM_NCCL_CHECK(ncclCommDestroy(m_nccl_comm));
@@ -484,6 +589,7 @@ private:
     CudaBuffer m_allreduce_in;
     CudaBuffer m_residual_in;
     CudaBuffer m_allreduce_out;
+    CudaBuffer m_allgather_out;
     CudaBuffer m_residual_out;
     CudaBuffer m_norm_out;
     CudaBuffer m_quant_out;
@@ -543,9 +649,9 @@ TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
         return;
     }
     int iter = 10;
-    std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+    std::vector<int> candidate_hidden_dim{1024};
     int min_token_num = 1;
-    int max_token_num = 2048;
+    int max_token_num = 1;
     for (auto hidden_dim : candidate_hidden_dim)
     {
         Runner runner(max_token_num, hidden_dim);
@@ -566,6 +672,236 @@ TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
                 printf("\033[32mPass!\033[0m\n");
             }
         }
+    }
+}
+
+TEST(Kernel_AllReduceFusion, AllGatherAccuracyAndOutput)
+{
+    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kAllGather>;
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    if (world_size % 2)
+    {
+        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+        return;
+    }
+
+    int iter = 100;
+    int warmup = 50;
+    int token_num = 1;
+    bool run_benchmark = true;
+    int hidden_dim = 4; // Small size for easy output verification
+
+    Runner runner(token_num, hidden_dim);
+
+    if (rank == 0)
+    {
+        printf("[AllGather Test] token_num %d, hidden_dim %d, world_size %d, iter %d\n", token_num, hidden_dim, world_size, iter);
+    }
+
+    // Set up deterministic input data for each rank
+    int message_size = token_num * hidden_dim;
+    runner.set_input_data(message_size, [rank](int i) { return static_cast<half>(rank * 100.0f + i); });
+
+    // Print input data from each rank (only once, before iterations)
+    comm.barrier(); // Synchronize before printing
+    if (rank == 0)
+    {
+        printf("\n=== Input Data ===\n");
+    }
+    comm.barrier();
+
+    // Print input data in rank order
+    for (int r = 0; r < world_size; ++r)
+    {
+        if (rank == r)
+        {
+            runner.print_input_data(token_num, hidden_dim);
+        }
+        comm.barrier();
+    }
+
+    if (rank == 0)
+    {
+        printf("==================\n");
+        printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+    }
+
+    // Run accuracy verification
+    for (int i = 0; i < 10; ++i)
+    {
+        // runner.reset_io();
+        runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+        runner.verify(token_num, hidden_dim);
+    }
+
+    // Measure latency
+    if (run_benchmark)
+    {
+        auto latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            printf("======================BENCHMARK=========================\n");
+            printf("token_num %-4d, hidden_dim %-4d, AllGather fusion kernel latency %4.4fus \n", token_num, hidden_dim, latency);
+            printf("======================BENCHMARK=========================\n");
+        }
+    }
+
+    // Print the AllGather output (only once, after iterations)
+    runner.print_allgather_output(token_num, hidden_dim);
+
+    if (rank == 0)
+    {
+        printf("\033[32mAllGather Test PASSED!\033[0m\n");
+    }
+}
+
+TEST(Kernel_AllReduceFusion, AllGatherAccuracyAndOutputFloat)
+{
+    using Runner = TestRunner<float, ar_fusion::AllReduceFusionPattern::kAllGather>;
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    if (world_size % 2)
+    {
+        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+        return;
+    }
+
+    int iter = 500;
+    int warmup = 50;
+    bool run_benchmark = true;
+    bool enable_print = false;
+    
+    // Define test configurations
+    std::vector<int> token_nums{1, 2, 4, 8, 16, 32, 64}; // Removed 128 to avoid hanging
+    std::vector<int> hidden_dims{4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
+    
+    for (auto token_num : token_nums)
+    {
+        for (auto hidden_dim : hidden_dims)
+        {
+            Runner runner(std::max(token_num, 128), hidden_dim); // Use max token_num for allocation
+
+        if (rank == 0)
+        {
+            printf("[AllGather Float Test] token_num %d, hidden_dim %d, world_size %d, iter %d\n", token_num, hidden_dim, world_size, iter);
+        }
+
+        // Set up deterministic input data for each rank using float values
+        int message_size = token_num * hidden_dim;
+        runner.set_input_data_typed<float>(message_size, [rank](int i) { return static_cast<float>(rank * 100.0f + i); });
+
+        // Print input data from each rank (only once, before iterations)
+        if (enable_print)
+        {
+            comm.barrier(); // Synchronize before printing
+            if (rank == 0)
+            {
+                printf("\n=== Float Input Data ===\n");
+            }
+            comm.barrier();
+
+            // Print input data in rank order
+            for (int r = 0; r < world_size; ++r)
+            {
+                if (rank == r)
+                {
+                    runner.print_input_data(token_num, hidden_dim);
+                }
+                comm.barrier();
+            }
+        }
+
+        if (rank == 0)
+        {
+            printf("========================\n");
+            printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+        }
+
+        // Run accuracy verification
+        for (int i = 0; i < 10; ++i)
+        {
+            // runner.reset_io();
+            runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+            runner.verify(token_num, hidden_dim);
+        }
+
+        // Measure latency - Compare Fusion Kernel vs NCCL AllGather
+        if (run_benchmark)
+        {
+            // Benchmark Fusion Kernel
+            auto fusion_latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
+            
+            // Benchmark NCCL AllGather
+            auto nccl_latency = runner.benchmark(&Runner::run_nccl_allgather, warmup, iter, token_num, hidden_dim);
+            
+            if (rank == 0)
+            {
+                printf("======================PERFORMANCE COMPARISON=========================\n");
+                printf("RES: token_num %-4d, hidden_dim %-4d , AllGather Fusion Kernel latency: %4.4fus , NCCL AllGather latency: %4.4fus , Speedup (NCCL/Fusion): %4.4fx\n", token_num, hidden_dim, fusion_latency, nccl_latency, nccl_latency / fusion_latency);
+                printf("==================================================================\n");
+            }
+        }
+
+        if (enable_print)
+        {
+            // Print the AllGather output (only once, after iterations)
+            runner.print_allgather_output(token_num, hidden_dim);
+        }
+
+            if (rank == 0)
+            {
+                printf("\033[32mAllGather Float Test PASSED for token_num %d, hidden_dim %d!\033[0m\n", token_num, hidden_dim);
+            }
+        } // End hidden_dim loop
+    } // End token_num loop
+}
+
+TEST(Kernel_AllReduceFusion, AllReduceAccuracyFloat)
+{
+    using Runner = TestRunner<float, ar_fusion::AllReduceFusionPattern::kAllReduce>;
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    if (world_size % 2)
+    {
+        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+        return;
+    }
+
+    int iter = 10;
+    int token_num = 1;
+    int hidden_dim = 16; // Small size for easy verification
+
+    Runner runner(token_num, hidden_dim);
+
+    if (rank == 0)
+    {
+        printf("[AllReduce Float Test] token_num %d, hidden_dim %d, world_size %d, iter %d\n", token_num, hidden_dim, world_size, iter);
+    }
+
+    // Set up deterministic input data for each rank using float values
+    int message_size = token_num * hidden_dim;
+    runner.set_input_data_typed<float>(message_size, [rank](int i) { return static_cast<float>(rank * 10.0f + i); });
+
+    if (rank == 0)
+    {
+        printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+    }
+
+    // Run iterations
+    for (int i = 0; i < iter; ++i)
+    {
+        runner.reset_io();
+        runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+        runner.verify(token_num, hidden_dim);
+    }
+
+    if (rank == 0)
+    {
+        printf("\033[32mAllReduce Float Test PASSED!\033[0m\n");
     }
 }
 

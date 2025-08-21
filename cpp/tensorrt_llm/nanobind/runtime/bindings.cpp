@@ -345,6 +345,7 @@ void initBindings(nb::module_& m)
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
+	.value("ALLGATHER", tensorrt_llm::kernels::AllReduceFusionOp::ALLGATHER)
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
         .value("RESIDUAL_RMS_NORM", tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM)
         .value("LAST_PROCESS_FOR_UB", tensorrt_llm::kernels::AllReduceFusionOp::LAST_PROCESS_FOR_UB)

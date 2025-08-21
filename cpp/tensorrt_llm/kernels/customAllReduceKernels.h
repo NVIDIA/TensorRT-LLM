@@ -69,14 +69,15 @@ enum class AllReduceStrategyConfig : int8_t
 enum class AllReduceFusionOp : int8_t
 {
     NONE = 0,
-    RESIDUAL_RMS_NORM = 1,
-    LAST_PROCESS_FOR_UB = 2,
-    RESIDUAL_RMS_PREPOST_NORM = 3,
-    RESIDUAL_RMS_NORM_QUANT_FP8 = 4,
-    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5,
-    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
-    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
-    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
+    ALLGATHER = 1,
+    RESIDUAL_RMS_NORM = 2,
+    LAST_PROCESS_FOR_UB = 3,
+    RESIDUAL_RMS_PREPOST_NORM = 4,
+    RESIDUAL_RMS_NORM_QUANT_FP8 = 5,
+    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 6,
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 7,
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 8,
+    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 9,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -84,6 +85,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
     switch (op)
     {
     case AllReduceFusionOp::NONE: os << "NONE"; break;
+    case AllReduceFusionOp::ALLGATHER: os << "ALLGATHER"; break;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: os << "RESIDUAL_RMS_NORM"; break;
     case AllReduceFusionOp::LAST_PROCESS_FOR_UB: os << "LAST_PROCESS_FOR_UB"; break;
     case AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM: os << "RESIDUAL_RMS_PREPOST_NORM"; break;
