@@ -1144,7 +1144,6 @@ class PyTorchModelEngine(ModelEngine):
                                             weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
-                print("Loading dummy weights", type(model))
                 initialize_dummy_weights(model)
 
             elif load_format == LoadFormat.VISION_ONLY:

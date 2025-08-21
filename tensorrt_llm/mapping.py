@@ -358,9 +358,6 @@ class Mapping(object):
         if Mapping.device_mesh:
             mapping_dm = get_process_group_ranks(self.tp_group_pg)
             assert mapping_old == mapping_dm
-            # print(
-            #     f"[Rank {self.rank}] TP mapping_old: {mapping_old} mapping_dm: {mapping_dm}"
-            # )
             return mapping_dm
         return mapping_old
 
@@ -371,9 +368,6 @@ class Mapping(object):
         if Mapping.device_mesh:
             mapping_dm = get_process_group_ranks(self.pp_group_pg)
             assert mapping_old == mapping_dm
-            # print(
-            #     f"[Rank {self.rank}] PP mapping_old: {mapping_old} mapping_dm: {mapping_dm}"
-            # )
             return mapping_dm
         return mapping_old
 
@@ -384,9 +378,6 @@ class Mapping(object):
         if Mapping.device_mesh:
             mapping_dm = get_process_group_ranks(self.cp_group_pg)
             assert mapping_old == mapping_dm
-            print(
-                f"[Rank {self.rank}] CP mapping_old: {mapping_old} mapping_dm: {mapping_dm}"
-            )
             return mapping_dm
         return mapping_old
 
@@ -398,9 +389,6 @@ class Mapping(object):
         if Mapping.device_mesh:
             mapping_dm = get_process_group_ranks(self.moe_tp_group_pg)
             assert mapping_old == mapping_dm
-            print(
-                f"[Rank {self.rank}] MOE_TP mapping_old: {mapping_old} mapping_dm: {mapping_dm}"
-            )
             return mapping_dm
         return mapping_old
 
@@ -412,9 +400,6 @@ class Mapping(object):
         if Mapping.device_mesh:
             mapping_dm = get_process_group_ranks(self.moe_ep_group_pg)
             assert mapping_old == mapping_dm
-            print(
-                f"[Rank {self.rank}] MOE_EP mapping_old: {mapping_old} mapping_dm: {mapping_dm}"
-            )
             return mapping_dm
         return mapping_old
 
@@ -605,8 +590,8 @@ class Mapping(object):
         if self.moe_ep_size > 1:
             Mapping.tp_mesh = Mapping.device_mesh["moe_tp", "moe_ep"]._flatten(
                 mesh_dim_name="tp")
-        print(f"Mapping.device_mesh {Mapping.device_mesh}")
-        print(f"Mapping.tp_mesh {Mapping.tp_mesh}")
+        logger.debug(f"Mapping.device_mesh {Mapping.device_mesh}")
+        logger.debug(f"Mapping.tp_mesh {Mapping.tp_mesh}")
 
     def _init_parallel_groups(self):
         # init pp group

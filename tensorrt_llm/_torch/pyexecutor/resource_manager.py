@@ -545,9 +545,6 @@ class KVCacheManager(BaseResourceManager):
             if os.environ.get("DISABLE_MPI") == "1":
                 max_tokens = mapping.dist.all_reduce(
                     max_tokens, op=torch.distributed.ReduceOp.MIN)
-                print(
-                    f'max_tokens: {max_tokens}, rank: {torch.distributed.get_rank()}'
-                )
             else:
                 max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)
 

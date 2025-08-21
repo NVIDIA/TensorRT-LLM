@@ -110,5 +110,6 @@ if(ENABLE_UCX)
 endif()
 
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
-        HINTS ${TORCH_INSTALL_PREFIX}/lib)
-target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils)
+             HINTS ${TORCH_INSTALL_PREFIX}/lib)
+target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
+                      PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils)

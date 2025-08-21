@@ -380,7 +380,7 @@ class PyExecutor:
         if self.virtual_memory_pools is not None:
             keys = list(self.virtual_memory_pools.keys())
             for key in keys:
-                print("Freeing pool", key, flush=True)
+                logger.debug("Freeing pool %s", key)
                 del self.virtual_memory_pools[key]
 
     def can_enqueue_requests(self) -> bool:

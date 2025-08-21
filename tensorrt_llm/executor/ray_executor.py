@@ -54,9 +54,9 @@ class RayExecutor(GenerationExecutor):
         }
         try:
             ray.init(address="auto", **ray_init_args)
-            logger.info(f"Attached to existing Ray cluster")
+            logger.info(f"Attached to an existing Ray cluster.")
         except ConnectionError:
-            logger.info(f"Ray cluster not found, starting a new one")
+            logger.info(f"Ray cluster not found, starting a new one.")
 
         if not ray.is_initialized():
             ray.init(**ray_init_args)
@@ -91,7 +91,7 @@ class RayExecutor(GenerationExecutor):
         # If this is set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
         num_gpus = float(os.getenv("TRTLLM_RAY_PER_WORKER_GPUS", "1.0"))
-        print(f"{num_gpus=} for each RayWorker.")
+        logger.debug(f"{num_gpus=} for each worker.")
 
         runtime_env = ray.runtime_env.RuntimeEnv()
         runtime_env["env_vars"] = os.environ.copy()
@@ -138,8 +138,7 @@ class RayExecutor(GenerationExecutor):
                                       async_call=False,
                                       weights=weights)
         except Exception as e:
-            logger.error(f"Weight update failed: {e}")
-            raise
+            raise RuntimeError(f"Weight update failed: {e}")
 
     def async_update_weights(self, weights: dict):
         try:
@@ -148,8 +147,7 @@ class RayExecutor(GenerationExecutor):
                                       async_call=True,
                                       weights=weights)
         except Exception as e:
-            logger.error(f"Weight update failed: {e}")
-            raise
+            raise RuntimeError(f"Async weight update failed: {e}")
 
     def update_weights_from_ipc_handles(self, ipc_handles: dict):
         try:
@@ -158,8 +156,7 @@ class RayExecutor(GenerationExecutor):
                                       async_call=False,
                                       ipc_handles=ipc_handles)
         except Exception as e:
-            logger.error(f"Weight update from IPC handles failed: {e}")
-            raise
+            raise RuntimeError(f"Weight update from IPC handles failed: {e}")
 
     def async_update_weights_from_ipc_handles(self, ipc_handles: dict):
         try:
@@ -168,8 +165,8 @@ class RayExecutor(GenerationExecutor):
                                       async_call=True,
                                       ipc_handles=ipc_handles)
         except Exception as e:
-            logger.error(f"Weight update from IPC handles failed: {e}")
-            raise
+            raise RuntimeError(
+                f"Async weight update from IPC handles failed: {e}")
 
     def collective_rpc(self,
                        method: str,
@@ -247,7 +244,7 @@ class RayExecutor(GenerationExecutor):
         self.bundle_indices = None
 
         if self.has_start_local_cluser:
-            print("Shutting down Ray cluster")
+            logger.debug("Shutting down Ray cluster")
             ray.shutdown()
 
     @property
@@ -294,7 +291,7 @@ class RayExecutor(GenerationExecutor):
             assert max(bundle_indices) < len(pg.bundle_specs), \
                 f"{bundle_indices=} out of range for PG with {len(pg.bundle_specs)} bundles"
 
-            print(
+            logger.info(
                 f"Found existing placement group {pg.bundle_specs=}. {bundle_indices=}"
             )
 
@@ -331,12 +328,11 @@ class RayExecutor(GenerationExecutor):
             current = (current + 1) % bundle_gpu
 
         strategy = "PACK"
-        # strategy = "STRICT_SPREAD" # if need force spread for debugging multinode
-        print(
+        logger.debug(
             f"[Strategy={strategy}] Bundles: {bundles} for tp_size: {tp_size} and world_size: {self.world_size}"
         )
         pg = placement_group(bundles, strategy=strategy)
         ray.get(pg.ready())  # blocks until reserved
-        print(f"Placement group ready.")
+        logger.debug(f"Placement group ready.")
 
         return pg, bundle_indices

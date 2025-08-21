@@ -17,6 +17,7 @@ from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_broadcast,
                                  mpi_comm, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
                                  mpi_send_object)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 
@@ -162,12 +163,11 @@ class TorchDist(Distributed):
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
         assert dist.is_initialized()
-        # print("Legacy Mapping:", mapping.to_dict())
         self.mapping.dist = self  # Mapping handles device mesh creation
         self.cluster_info = None
 
         if self.rank == 0:
-            print(f"DeviceMesh: {self.mapping.device_mesh}")
+            logger.debug(f"DeviceMesh: {self.mapping.device_mesh}")
 
         self.setup_local_comm()
         self.default_store = torch.distributed.distributed_c10d._get_default_store(
@@ -187,14 +187,6 @@ class TorchDist(Distributed):
         pg_broker.init_pg(torch.distributed.group.WORLD, self.local_comm)
         pg_broker.init_store(self.default_store)
 
-        # pybind11_abi = f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
-        # pg_utils_bindings.init_pg(
-        #     torch.distributed.group.WORLD.boxed(), self.local_comm.boxed())
-        # pg_utils_bindings.init_store(self.default_store, pybind11_abi)
-
-        print(
-            f"TorchDist init - done w/ set_world_and_local_pg, rank {self.rank}",
-            flush=True)
         self.tp_group = self.mapping.tp_group
 
     def _get_free_port(self):
@@ -216,8 +208,8 @@ class TorchDist(Distributed):
             # even if some ranks are not part of the new process group being created
             pg = dist.new_group(ranks=ranks, backend='cuda:nccl,cpu:gloo')
             if int(self.rank) in ranks:
-                print(
-                    f"[Rank {self.rank}] Done set local comm. ip_to_ranks: {ip_to_ranks}"
+                logger.debug(
+                    f"[Rank {self.rank}] Done setting local comm. ip_to_ranks: {ip_to_ranks}"
                 )
                 self.local_comm = pg
 
@@ -227,7 +219,6 @@ class TorchDist(Distributed):
 
         node_ip = ray.util.get_node_ip_address()
 
-        # ray might return str
         gpu_index = [int(id) for id in ray.get_gpu_ids()]
 
         assert len(gpu_index) == 1
@@ -252,8 +243,7 @@ class TorchDist(Distributed):
 
         self.cluster_info = rank_info_list
 
-        # DEBUG
-        print("Cluster info: ", self.cluster_info)
+        logger.debug(f"Cluster info: {self.cluster_info}")
         return self.cluster_info
 
     @staticmethod
@@ -262,14 +252,13 @@ class TorchDist(Distributed):
         @wraps(func)
         def wrapper(*args, **kwargs):
             if enable_log:
-                # Skip self arg.
-                print(
+                logger.debug(
                     f"{func.__name__} enter: {args[1:]}, {kwargs}, rank: {torch.distributed.get_rank()}"
                 )
             ret = func(*args, **kwargs)
 
             if enable_log:
-                print(f"{func.__name__} exit:  {ret}")
+                logger.debug(f"{func.__name__} exit: {ret}")
             return ret
 
         return wrapper

@@ -2,7 +2,6 @@ import copy
 import importlib
 import json
 import os
-import socket
 from pathlib import Path
 from queue import Queue
 from typing import Any, Dict, Optional, Type, Union
@@ -10,14 +9,11 @@ from typing import Any, Dict, Optional, Type, Union
 import ray
 import torch
 
-from tensorrt_llm.logger import logger
-
 from .._torch.virtual_memory import materialize_with_tag, release_with_tag
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
-from ..llmapi.utils import print_colored_debug
 from ..lora_manager import LoraConfig, LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
@@ -54,9 +50,13 @@ class RayWorkerWrapper:
         self.master_address = os.environ["MASTER_ADDR"]
         self.master_port = os.environ["MASTER_PORT"]
 
-        # expect to see global counts w/ RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
+        # Ray can't pickle TensorRT logger; import/use it inside methods only.
+        from tensorrt_llm.logger import logger
+
+        # Expect to see global counts w/ RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
         # unless CUDA_VISIBLE_DEVICES is set to a subset of the global devices
-        print("Cuda devices: ", torch.cuda.device_count())
+        logger.debug(
+            f"CUDA device count visible to Ray: {torch.cuda.device_count()}")
 
         torch.cuda.is_available()
         assert len(ray.get_gpu_ids()) == 1
@@ -64,28 +64,17 @@ class RayWorkerWrapper:
         self.gpu = int(ray.get_gpu_ids()[0])
         local_gpu = self.physical_to_local_id(self.gpu)
 
-        # for debug
-        ip = ray.util.get_node_ip_address()
-        hostname = socket.gethostname()
-        print(
-            f"[Worker rank={rank}] Running on node: {hostname} (IP: {ip}), GPU ID Physical: {self.gpu}, GPU ID Local: {local_gpu} master_addr: {self.master_address} port: {self.master_port}",
-            flush=True)
-
         torch.distributed.init_process_group(
             backend="cuda:nccl,cpu:gloo",
             init_method=f"tcp://{self.master_address}:{self.master_port}",
             world_size=world_size,
             rank=rank)
 
-        print(
-            f"[FINISHED PG INIT rank={rank}] Running on node: {hostname} (IP: {ip}), GPU ID: {self.gpu}",
-            flush=True)
+        logger.info(
+            f"[Rank {rank}] Finished PG init. Global GPU ID: {self.gpu}, local GPU ID: {local_gpu}"
+        )
 
         torch.cuda.set_device(local_gpu)
-        device = torch.cuda.get_device_properties(local_gpu)
-        print(
-            f"pid: {os.getpid()}, device {self.gpu}: {device.name}, UUID: {device.uuid}, Memory: {device.total_memory / 1024**2:.0f}MB"
-        )
 
         worker_cls = self._inject_worker_extension(worker_cls,
                                                    worker_extension_cls)
@@ -145,14 +134,14 @@ class RayWorkerWrapper:
             return worker_class
 
         try:
+            from tensorrt_llm.logger import logger
             extension_cls = resolve_obj_by_qualname(extension_cls_name)
             # Check for conflicts
             for attr in dir(extension_cls):
                 if attr.startswith("__"):
                     continue
                 if hasattr(worker_class, attr):
-                    # TODO: change to serializable loggings
-                    print(
+                    logger.warning(
                         f"Worker class {worker_class.__name__} already has attribute '{attr}', "
                         f"which conflicts with extension {extension_cls.__name__}. "
                         f"Extension method will override.")
@@ -160,7 +149,7 @@ class RayWorkerWrapper:
             if extension_cls not in worker_class.__bases__:
                 worker_class.__bases__ = worker_class.__bases__ + (
                     extension_cls, )
-                print(
+                logger.debug(
                     f"Finished injection of {extension_cls.__name__} into {worker_class.__name__}."
                 )
 
@@ -269,6 +258,7 @@ class RayGPUWorker(GenerationExecutor):
         if self.engine.can_enqueue_requests():
             request_id = self._client_id_to_request_id.get(client_id, None)
             if request_id is None:
+                from tensorrt_llm.logger import logger
                 logger.warning(
                     f"Request of client_id {client_id} is finished, cannot abort it."
                 )
@@ -433,14 +423,14 @@ class RayGPUWorker(GenerationExecutor):
         try:
             self.engine.update_weights(weights)
         except Exception as e:
-            logger.error(
+            raise RuntimeError(
                 f"Worker rank {self.rank} failed to update weights: {e}")
-            raise
 
     def update_weights_from_ipc_handles(self, ipc_handles: dict):
         try:
             self.engine.update_weight_from_ipc_handles(ipc_handles)
         except Exception as e:
+            from tensorrt_llm.logger import logger
             logger.error(
                 f"Worker rank {self.rank} failed to update weights from ipc handles: {e}"
             )
@@ -471,7 +461,8 @@ class RayGPUWorker(GenerationExecutor):
         else:
             self.doing_shutdown = True
 
-        print_colored_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
+        from tensorrt_llm.logger import logger
+        logger.debug(f'Worker {mpi_rank()} shutting down...')
 
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
@@ -492,7 +483,7 @@ class RayGPUWorker(GenerationExecutor):
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
-        print_colored_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
+        logger.debug(f"Worker {mpi_rank()} shutdown done.")
 
     def block_subordinates(self):
         if self.rank != 0:

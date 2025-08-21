@@ -2,7 +2,8 @@ import torch
 import torch.distributed as dist
 
 
-def split(color: int, key: int, pg_boxed: torch.ScriptObject):
+def split(color: int, key: int,
+          pg_boxed: torch.ScriptObject) -> torch.ScriptObject:
     """Create a subgroup ProcessGroup.
 
     This gathers (color, key) from all ranks, selects members with matching color,
@@ -13,8 +14,7 @@ def split(color: int, key: int, pg_boxed: torch.ScriptObject):
     try:
         pg = torch.distributed.ProcessGroup.unbox(pg_boxed)
     except Exception as e:
-        print(f"Error unboxing ProcessGroup: {e}")
-        raise e
+        raise RuntimeError(f"Error unboxing ProcessGroup: {e}")
 
     group_size = dist.get_world_size(group=pg)
     # gather (color, key, global_rank) within the provided pg
