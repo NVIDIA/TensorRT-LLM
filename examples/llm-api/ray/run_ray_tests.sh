@@ -1,4 +1,7 @@
 #!/bin/bash
+set -e
+# Stop ray if it's running
+ray stop || true
 
 # Set script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

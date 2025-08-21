@@ -150,7 +150,12 @@ class CompletionOutput:
         return self.logprobs[self._last_logprobs_len:]
 
 
-#
+def warmup_tensorrt_llm():
+    import tensorrt_llm
+    print("Warmup by importing tensorrt_llm with version",
+          tensorrt_llm.version.__version__)
+
+
 # Async queue for response
 @ray.remote(max_concurrency=1000000, num_cpus=2)
 class ResponseRaySharedQueue:
@@ -158,6 +163,7 @@ class ResponseRaySharedQueue:
     def __init__(self):
         self.data = {}
         self.event_map = {}
+        self.warmup_done = False
 
     def register(self, key: int):
         assert key not in self.event_map, f"Key {key} already registered"
@@ -169,6 +175,12 @@ class ResponseRaySharedQueue:
 
         if key in self.data:
             del self.data[key]
+
+    def warmup(self):
+        if self.warmup_done:
+            return
+        warmup_tensorrt_llm()
+        self.warmup_done = True
 
     def put_response(self, key: int, item: Any):
         assert key in self.event_map, f"Key {key} not registered"
@@ -195,6 +207,7 @@ class ResponseSyncRaySharedQueue:
         self.data = {}
         self.event_map = {}
         self.semaphore = threading.Semaphore(SYNC_QUEUE_MAX_CONCURRENCY - 1)
+        self.warmup_done = False
 
     def register(self, key: int):
         assert key not in self.event_map, f"Key {key} already registered"
@@ -207,6 +220,12 @@ class ResponseSyncRaySharedQueue:
 
         if key in self.data:
             del self.data[key]
+
+    def warmup(self):
+        if self.warmup_done:
+            return
+        warmup_tensorrt_llm()
+        self.warmup_done = True
 
     def put_response(self, key: int, item: Any):
         self.data[key] = item

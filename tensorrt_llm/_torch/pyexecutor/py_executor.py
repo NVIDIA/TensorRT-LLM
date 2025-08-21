@@ -11,7 +11,6 @@ import weakref
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 
 try:
@@ -1726,18 +1725,8 @@ class PyExecutor:
                             resp
                     ) == LlmResponse and req_id in self.result_wait_queues and self.result_wait_queues[
                             req_id] is not None:
-                        # (TODO: joyang) TRTLLM import is pretty slow, WAR by send bytes for now.
-                        # TODO: need cleanup
-                        if hasattr(self.result_wait_queues[req_id],
-                                   "put_response"):
-                            data = np.frombuffer(
-                                pickle.dumps(resp),  # nosec B301
-                                dtype=np.uint8)
-                            self.result_wait_queues[req_id].put_response.remote(
-                                resp.client_id, data)
-                        else:
-                            self.result_wait_queues[req_id].put(
-                                pickle.dumps(resp))  # nosec B301
+                        self.result_wait_queues[req_id].put_response.remote(
+                            resp.client_id, resp)
                 self.response_cv.notify_all()
 
     @nvtx_range("_handle_first_token_response")

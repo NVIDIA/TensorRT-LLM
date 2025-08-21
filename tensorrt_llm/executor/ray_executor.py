@@ -47,10 +47,17 @@ class RayExecutor(GenerationExecutor):
                          is_llm_executor)
 
         self.has_start_local_cluser = False
+        runtime_env = {
+            "env_vars": {
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+            }
+        }
+
         ray_init_args = {
             "include_dashboard": False,
             "namespace": "trtllm",
-            "ignore_reinit_error": True
+            "ignore_reinit_error": True,
+            "runtime_env": runtime_env
         }
         try:
             ray.init(address="auto", **ray_init_args)
@@ -72,6 +79,9 @@ class RayExecutor(GenerationExecutor):
             self.response_queue)
         self.sync_response_queue_weakref = self.create_actor_weak_ref(
             self.response_sync_queue)
+
+        self.response_queue.warmup.remote()
+        self.response_sync_queue.warmup.remote()
 
         self.create_workers(RayGPUWorker, worker_kwargs, worker_extension_cls)
 
