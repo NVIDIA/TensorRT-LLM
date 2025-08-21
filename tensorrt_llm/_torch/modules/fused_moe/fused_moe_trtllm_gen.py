@@ -2,6 +2,8 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
+
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
@@ -67,6 +69,11 @@ class TRTLLMGenFusedMoE(MoE):
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
         )
+
+        sm_version = get_sm_version()
+        if sm_version >= 120:
+            raise NotImplementedError(
+                "TRTLLMGenFusedMoE does not support SM120 and above.")
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
