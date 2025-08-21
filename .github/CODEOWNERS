@@ -50,8 +50,8 @@
 /tests/unittest/_torch/compilation @NVIDIA/trt-llm-torch-graph-compiler
 /tests/unittest/_torch/multi_gpu/test_ar_residual_norm.py @NVIDIA/trt-llm-torch-graph-compiler
 /tests/unittest/_torch/multi_gpu/test_user_buffers.py @NVIDIA/trt-llm-torch-graph-compiler
-/tests/unittest/_torch/test_custom_ops.py @NVIDIA/trt-llm-torch-graph-compiler
-/tests/unittest/_torch/test_autotuner.py @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/thop/test_custom_ops.py @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/misc/test_autotuner.py @NVIDIA/trt-llm-torch-graph-compiler
 
 ## TensorRT-LLM Pytorch - Attention
 /tensorrt_llm/_torch/attention_backend @NVIDIA/trt-llm-torch-attention-devs
@@ -107,7 +107,7 @@
 /tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_nemotron_h.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
-/tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-runtime-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/nemotron_h_weight_mapper.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tests/unittest/_torch/modeling/test_modeling_nemotron.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs

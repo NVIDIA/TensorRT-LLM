@@ -52,7 +52,7 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
-    enable_paged_context_mla: bool = False
+    enable_context_mla_with_cached_kv: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
@@ -342,6 +342,7 @@ class PositionalEmbedder(Protocol):
 class RopeParams:
     dim: int = 0
     theta: float = 10000.0
+    alpha: float = 1.0
     scale_type: RotaryScalingType = RotaryScalingType.none
     scale: float = 1.0
     low_freq_factor: float = 1.0
@@ -384,6 +385,7 @@ class RopeParams:
         rope_params.scale_type = RotaryScalingType.none
         rope_params.scale = 1.0
         if rope_scaling is not None:
+            rope_params.alpha = rope_scaling.get("alpha", 1.0)
             rotary_scaling_type = rope_scaling.get(
                 "type", None) or rope_scaling.get("rope_type")
             rope_params.scale_type = RotaryScalingType.from_string(
@@ -462,6 +464,7 @@ class RopeParams:
                 self.scale_type,
                 rope_scaling_config={
                     "factor": self.scale,
+                    "alpha": self.alpha,
                     "low_freq_factor": self.low_freq_factor,
                     "high_freq_factor": self.high_freq_factor,
                     "original_max_position_embeddings":

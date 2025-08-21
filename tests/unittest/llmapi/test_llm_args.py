@@ -428,23 +428,20 @@ class TestTorchLlmArgs:
 
     @print_traceback_on_error
     def test_runtime_sizes(self):
-        llm = TorchLLM(
-            llama_model_path,
-            max_beam_width=1,
-            max_num_tokens=256,
-            max_seq_len=128,
-            max_batch_size=8,
-        )
+        with TorchLLM(llama_model_path,
+                      max_beam_width=1,
+                      max_num_tokens=256,
+                      max_seq_len=128,
+                      max_batch_size=8) as llm:
+            assert llm.args.max_beam_width == 1
+            assert llm.args.max_num_tokens == 256
+            assert llm.args.max_seq_len == 128
+            assert llm.args.max_batch_size == 8
 
-        assert llm.args.max_beam_width == 1
-        assert llm.args.max_num_tokens == 256
-        assert llm.args.max_seq_len == 128
-        assert llm.args.max_batch_size == 8
-
-        assert llm._executor_config.max_beam_width == 1
-        assert llm._executor_config.max_num_tokens == 256
-        assert llm._executor_config.max_seq_len == 128
-        assert llm._executor_config.max_batch_size == 8
+            assert llm._executor_config.max_beam_width == 1
+            assert llm._executor_config.max_num_tokens == 256
+            assert llm._executor_config.max_seq_len == 128
+            assert llm._executor_config.max_batch_size == 8
 
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
@@ -666,15 +663,15 @@ class TestStrictBaseModelArbitraryArgs:
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""
         # Valid arguments should work
-        config = CacheTransceiverConfig(backend="ucx",
+        config = CacheTransceiverConfig(backend="UCX",
                                         max_tokens_in_buffer=1024)
-        assert config.backend == "ucx"
+        assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            CacheTransceiverConfig(backend="ucx", invalid_config="should_fail")
+            CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
 
     def test_torch_compile_config_arbitrary_args(self):

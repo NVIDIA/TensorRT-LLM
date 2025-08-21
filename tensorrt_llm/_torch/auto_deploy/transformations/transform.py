@@ -5,21 +5,11 @@ import gc
 import torch
 import torch.nn as nn
 
-from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..llm_args import AutoDeployConfig
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..transform.optimizer import InferenceOptimizer as ModularInferenceOptimizer
-from ..utils.logger import ad_logger
-from .library import (
-    fuse_allreduce_residual_rmsnorm,
-    fuse_collectives,
-    fuse_rmsnorm,
-    insert_cached_attention,
-    resize_kv_cache,
-    update_in_out_nodes,
-)
 
 
 class InferenceOptimizer:
@@ -55,88 +45,60 @@ class InferenceOptimizer:
                 self.ad_config.attn_backend
             ).get_attention_layout()
 
-        new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
-
-        # TODO (hg): similar to above.
-        if "load_weights" in new_optimizer.config:
-            new_optimizer.config[
+        if "load_weights" in self.ad_config.transforms:
+            self.ad_config.transforms[
                 "load_weights"
             ].checkpoint_device = self.ad_config.checkpoint_device
-            new_optimizer.config["load_weights"].device = cm.device
+            self.ad_config.transforms["load_weights"].device = cm.device
+
+        if "resize_kv_cache" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "resize_kv_cache"
+            ].free_mem_ratio = self.ad_config.free_mem_ratio
+        if "insert_cached_attention" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "insert_cached_attention"
+            ].attn_backend = self.ad_config.attn_backend
+        if "insert_cached_mla_attention" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "insert_cached_mla_attention"
+            ].attn_backend = self.ad_config.mla_backend
+
+        # TODO: (hg)Missing MLA here. Figure out how to add MLA since duplicate transforms are not allowed.
+        # Old code:
+        # detect attention op and replace with cache-aware op
+        # for a_backend in [self.ad_config.attn_backend, self.ad_config.mla_backend]:
+        #     attn_descriptor = AttentionRegistry.get(a_backend)
+        #     insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
+
+        if "compile_model" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "compile_model"
+            ].cuda_graph_batch_sizes = self.ad_config.cuda_graph_batch_sizes
+            self.ad_config.transforms[
+                "compile_model"
+            ].compile_backend = self.ad_config.compile_backend
+
+        new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
+        # TODO: (hg) move this. let match_rope_layout and match_atten_layout use this shared config
+        new_optimizer.shared_config.attn_backend = self.ad_config.attn_backend
 
         egm = new_optimizer(cm)
 
-        # TODO (lucaslie): continue moving legacy transforms to the new optimizer
-        ############################################################################################
-        # RUN POST-LOAD FUSION AND OPTIMIZATIONS
-        ############################################################################################
+        # NOTE: (hg)Disabled visualization since compiled gm is a CapturedGraph instead of GraphModule.
+        # We can add a new stage in the optimizer to visualize the intermediate gm.
+        # if self.ad_config.visualize:
+        #     try:
+        #         from .library import visualize_namespace
 
-        # run MoE fusion
-        # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-        # fuse_moe(egm)
-
-        # run GEMM fusion
-        # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-        # fuse_gemms(egm)
-
-        # check if we can fuse allreduce, residual and rmsnorm
-        fuse_allreduce_residual_rmsnorm(egm)
-
-        # check if we can fuse collectives
-        fuse_collectives(egm)
-
-        # TODO (lucaslie): add backend selection as part of configurable inference optimizers
-        # check if we can fuse rmsnorm
-        fuse_rmsnorm(egm, "flashinfer")
-
-        # visualize the final graph
-        if self.ad_config.visualize:
-            try:
-                from .library import visualize_namespace
-
-                visualize_namespace(egm, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
-                ad_logger.warning(
-                    "Please run `pip install -r examples/auto_deploy/requirements.txt` to visualize"
-                    " the graph."
-                )
-            except ImportError:
-                pass
-
-        ############################################################################################
-        # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
-        ############################################################################################
-
-        update_in_out_nodes(egm, cm)
-
-        # detect attention op and replace with cache-aware op
-        for a_backend in [self.ad_config.attn_backend, self.ad_config.mla_backend]:
-            attn_descriptor = AttentionRegistry.get(a_backend)
-            insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
-
-        # initialize cache on correct device
-        cm.initialize_caches()
-
-        # resize kv cache to occupy the available GPU memory up to free_mem_ratio
-        resize_kv_cache(egm, cm, free_mem_ratio=self.ad_config.free_mem_ratio)
-
-        ############################################################################################
-        # COMPILE MODEL
-        ############################################################################################
-
-        cm.info.set_generate_only_batch()
-        compiler_kwargs = {
-            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
-            "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
-        }
-        egm_compiled = compile_and_capture(
-            egm,
-            self.ad_config.compile_backend,
-            args=cm.args,
-            dynamic_shapes=cm.dynamic_shapes,
-            compiler_kwargs=compiler_kwargs,
-        )
-        cm.info.reset()
+        #         visualize_namespace(egm, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
+        #         ad_logger.warning(
+        #             "Please run `pip install -r examples/auto_deploy/requirements.txt` to visualize"
+        #             " the graph."
+        #         )
+        #     except ImportError:
+        #         pass
 
         torch.cuda.empty_cache()
         gc.collect()
-        return egm_compiled
+        return egm

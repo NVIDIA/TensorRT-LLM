@@ -63,59 +63,6 @@ void loadChunkedKVKernelRef(T* kv_output, T* k_pe_output, tensorrt_llm::kernels:
     }
 }
 
-// kv {total_tokens, 2, h, nope_size}
-// k_pe {total_tokens, h=1, rope_size}
-// output {b, 2, ceil(max_seq / cache_tokens_per_block), h, cache_tokens_per_block, (nope_size + rope_size)}
-// max_seq <= chunk_size
-template <typename T>
-void setChunkedKVCacheForMLAKernelRef(T* output, T* kv_ptr, T* k_pe_ptr, int num_contexts, int64_t const* cu_seq_len,
-    int const max_input_seq_len, int num_heads, int nope_size, int rope_size, int cache_tokens_per_block)
-{
-    int head_size = nope_size + rope_size;
-    int const kv_cache_size_per_block = num_heads * cache_tokens_per_block * head_size;
-    int const kv_cache_block_num_per_seq = (max_input_seq_len + cache_tokens_per_block - 1) / cache_tokens_per_block;
-    for (int b = 0; b < num_contexts; b++)
-    {
-        int const global_token_offset = cu_seq_len[b];
-        int const current_seq_len = cu_seq_len[b + 1] - cu_seq_len[b];
-        for (int s = 0; s < current_seq_len; s++)
-        {
-            int const global_token_idx = global_token_offset + s;
-            int const kv_cache_block_offset_for_k
-                = (b * 2 * kv_cache_block_num_per_seq + s / cache_tokens_per_block) * kv_cache_size_per_block;
-            int const kv_cache_block_offset_for_v
-                = kv_cache_block_offset_for_k + (kv_cache_block_num_per_seq * kv_cache_size_per_block);
-            for (int h = 0; h < num_heads; h++)
-            {
-                int const ld_k_head_offset = (global_token_idx * 2 * num_heads * nope_size) + h * nope_size;
-                int const ld_v_head_offset = ld_k_head_offset + num_heads * nope_size;
-                int const ld_k_pe_head_offset = global_token_idx * rope_size;
-                // copy kv
-                for (int d = 0; d < nope_size; d++)
-                {
-                    int const ld_k_idx = ld_k_head_offset + d;
-                    int const ld_v_idx = ld_v_head_offset + d;
-                    int const st_k_idx = kv_cache_block_offset_for_k + h * cache_tokens_per_block * head_size
-                        + (s % cache_tokens_per_block) * head_size + d;
-                    int const st_v_idx = kv_cache_block_offset_for_v + h * cache_tokens_per_block * head_size
-                        + (s % cache_tokens_per_block) * head_size + d;
-                    output[st_k_idx] = kv_ptr[ld_k_idx];
-                    output[st_v_idx] = kv_ptr[ld_v_idx];
-                }
-
-                // copy k_pe
-                for (int d = 0; d < rope_size; d++)
-                {
-                    int const ld_k_pe_idx = ld_k_pe_head_offset + d;
-                    int const st_k_pe_idx = kv_cache_block_offset_for_k + h * cache_tokens_per_block * head_size
-                        + (s % cache_tokens_per_block) * head_size + (nope_size + d);
-                    output[st_k_pe_idx] = k_pe_ptr[ld_k_pe_idx];
-                }
-            }
-        }
-    }
-}
-
 // Q {total_q, H, D}
 // KV {total_kv, 2, H, D}
 // softmax_sum {total_q, H, 2} // {max/sum}
@@ -132,7 +79,6 @@ void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int nu
         int global_q_offset = cu_seq_q_len[b] * num_heads * head_size;
         int global_kv_offset = cu_seq_kv_len[b] * 2 * num_heads * head_size;
         int global_softmax_offset = cu_seq_q_len[b] * num_heads * 2;
-        float bmm1_scale = 1.F / std::sqrt(static_cast<float>(head_size));
         if (curr_q_len == 0 || curr_kv_len == 0)
         {
             continue; // skip empty sequences
@@ -322,9 +268,6 @@ protected:
         h_compressed_kv_output{nullptr}, d_compressed_kv_output{nullptr}, h_k_pe_output{nullptr},
         d_k_pe_output{nullptr}, h_compressed_kv_output_ref{nullptr}, h_k_pe_output_ref{nullptr},
         h_kv_scale_quant_orig{nullptr}, d_kv_scale_quant_orig{nullptr},
-
-        // for kernel 2
-        h_kv_tensor{nullptr}, d_kv_tensor{nullptr}, h_k_pe_tensor{nullptr}, d_k_pe_tensor{nullptr},
 
         // for merge attn {kv_full_tensor  = kv + k_pe}
         m_h_q_tensor{nullptr}, m_h_kv_full_tensor{nullptr}, m_h_chunked_kv_tensor{nullptr}, m_h_output_tensor{nullptr},
@@ -622,27 +565,6 @@ protected:
                 cudaMemcpyHostToDevice);
         }
 
-        // kv, k_pe for invokeMLASetChunkedKV (kernel 2)
-        this->h_kv_tensor = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mBatchSize * this->mChunkSize, 2, this->mNumHeads, this->mNopeSize}), dtype);
-        this->h_k_pe_tensor = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mBatchSize * this->mChunkSize, 1, this->mRopeSize}), dtype);
-        this->d_kv_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(this->h_kv_tensor->getShape(), dtype);
-        this->d_k_pe_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(this->h_k_pe_tensor->getShape(), dtype);
-        {
-            auto* kv_ptr = bufferCast<DataType>(*(this->h_kv_tensor));
-            auto* k_pe_ptr = bufferCast<DataType>(*(this->h_k_pe_tensor));
-
-            fillArrayDataWithMod<DataType>(kv_ptr, h_kv_tensor->getSize());
-            fillArrayDataWithMod<DataType>(k_pe_ptr, h_k_pe_tensor->getSize());
-
-            cudaMemcpyAsync(d_kv_tensor->data(), h_kv_tensor->data(), h_kv_tensor->getSizeInBytes(),
-                cudaMemcpyHostToDevice, mStream->get());
-            cudaMemcpyAsync(d_k_pe_tensor->data(), h_k_pe_tensor->data(), h_k_pe_tensor->getSizeInBytes(),
-                cudaMemcpyHostToDevice, mStream->get());
-            cudaStreamSynchronize(mStream->get());
-        }
-
         // invokeMergeAttnWithSoftmax, we just ignore rope_size here for simplicity
 
         this->m_h_q_tensor = tensorrt_llm::runtime::BufferManager::pinned(
@@ -916,39 +838,6 @@ protected:
             cudaMemcpyDeviceToHost);
         sync_check_cuda_error(this->mStream->get());
     }
-
-    void PerformSetChunkedKVRef()
-    {
-        using tensorrt_llm::runtime::bufferCast;
-        auto* kv_ptr = bufferCast<DataType>(*(this->h_kv_tensor));
-        auto* k_pe_ptr = bufferCast<DataType>(*(this->h_k_pe_tensor));
-        auto* kv_cache_ptr = bufferCast<DataType>(*(this->h_kv_cache_tensor_ref));
-        auto* cu_chunked_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_chunk_lens));
-        this->PrepareChunkedLen(0);
-        setChunkedKVCacheForMLAKernelRef(kv_cache_ptr, kv_ptr, k_pe_ptr, this->mBatchSize, cu_chunked_seq_lens_ptr,
-            this->mChunkSize, this->mNumHeads, this->mNopeSize, this->mRopeSize, this->mTokensPerBlock);
-    }
-
-    void PerformSetChunkedKV()
-    {
-        using tensorrt_llm::runtime::bufferCast;
-        auto* kv_ptr = bufferCast<DataType>(*(this->d_kv_tensor));
-        auto* k_pe_ptr = bufferCast<DataType>(*(this->d_k_pe_tensor));
-        auto* kv_cache_ptr = bufferCast<DataType>(*(this->d_kv_cache_tensor));
-        auto* cu_chunked_seq_lens_ptr = bufferCast<int64_t>(*(this->d_cu_chunk_lens));
-        this->PrepareChunkedLen(0);
-        // copy cu chunk lens to device
-        cudaMemcpy(this->d_cu_chunk_lens->data(), this->h_cu_chunk_lens->data(),
-            this->h_cu_chunk_lens->getSizeInBytes(), cudaMemcpyHostToDevice);
-        tensorrt_llm::kernels::invokeMLASetChunkedKV(kv_cache_ptr, kv_ptr, k_pe_ptr, this->mBatchSize, this->mChunkSize,
-            this->mNumHeads, this->mNopeSize, this->mRopeSize, cu_chunked_seq_lens_ptr, this->mTokensPerBlock,
-            mStream->get());
-        cudaStreamSynchronize(this->mStream->get());
-        // copy result back to host
-        cudaMemcpy(this->h_kv_cache_tensor->data(), kv_cache_ptr, this->h_kv_cache_tensor->getSizeInBytes(),
-            cudaMemcpyDeviceToHost);
-        sync_check_cuda_error(this->mStream->get());
-    }
 };
 
 using MLATypes
@@ -1086,42 +975,4 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedLoad)
         }
     }
     ASSERT_TRUE(allEqual);
-}
-
-TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedSet)
-{
-    using tensorrt_llm::runtime::bufferCast;
-    using DataType = typename TestFixture::DataType;
-    using TCache = typename TestFixture::TCache;
-    if constexpr (std::is_same_v<DataType, TCache>)
-    {
-        this->setDefaultParams();
-        this->allocateBuffers();
-
-        sync_check_cuda_error(this->mStream->get());
-        bool allEqual{true};
-
-        this->PerformSetChunkedKVRef();
-        sync_check_cuda_error(this->mStream->get());
-        this->PerformSetChunkedKV();
-        sync_check_cuda_error(this->mStream->get());
-
-        // check result
-        auto* kv_cache_ptr = bufferCast<DataType>(*(this->h_kv_cache_tensor));
-        auto* kv_cache_ptr_ref = bufferCast<DataType>(*(this->h_kv_cache_tensor_ref));
-
-        for (int i = 0; i < this->h_kv_cache_tensor->getSize(); i++)
-        {
-            if (std::abs(static_cast<float>(kv_cache_ptr[i]) - static_cast<float>(kv_cache_ptr_ref[i]))
-                > getTolerance<DataType>(kv_cache_ptr[i]))
-            {
-                std::cout << "KV cache mismatch at index " << i << ": "
-                          << "expected " << static_cast<float>(kv_cache_ptr_ref[i]) << ", got "
-                          << static_cast<float>(kv_cache_ptr[i]) << std::endl;
-                allEqual = false;
-                break;
-            }
-        }
-        ASSERT_TRUE(allEqual);
-    }
 }
