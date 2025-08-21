@@ -122,16 +122,22 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
                 TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type
                         == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
                     "MXFPX is the only supported scaling type for WFP4AFP8");
-                return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                    WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, true, false>;
+                return hopper_input.swap_ab
+                    ? &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                        WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, true, false, true>
+                    : &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                        WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, true, false, false>;
             }
             else
             {
                 TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type
                         != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
                     "MXFPX is not supported for the selected weight combination");
-                return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                    WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false, false>;
+                return hopper_input.swap_ab
+                    ? &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                        WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false, false, true>
+                    : &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                        WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape, false, false, false>;
             }
         };
         getFunc()(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
