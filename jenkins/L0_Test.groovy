@@ -7,7 +7,6 @@ import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
 import com.nvidia.bloom.CloudManager
-import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
@@ -219,8 +218,11 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
-    def nodeName = "${cluster.host}-test-${UUID.randomUUID().toString()}"
-    def nodeSecret = CloudManager.createNode(nodeName)
+    // Create a unique suffix for the node name and workspace
+    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    def nodeName = "${cluster.host}-test-${customSuffix}"
+    def customWorkspace = "/tmp/${nodeName}"
+    def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -263,12 +265,30 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+                node(nodeName) {
+                    sh """
+                        env | sort
+                        pwd && ls -alh
+                        ls -alh ${env.WORKSPACE}
+                        ls -alh ${env.WORKSPACE_TMP}
+                    """
+                }
+
+                def dockerArgs = "--gpus ${gpuCount} " +
+                    "--cap-add=SYS_ADMIN " +
+                    "--ipc=host " +
+                    "--security-opt seccomp=unconfined " +
+                    "-u root:root " +
+                    "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
+                    "-v /tmp/ccache:${CCACHE_DIR}:rw " +
+                    "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
+                    "--cap-add syslog"
 
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
                 }
-                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+
+                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
             } else {
                 echo "The node does not come online in 2 hours, terminating the job"
@@ -560,6 +580,13 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                 "${UPLOAD_PATH}/test-results/"
             )
             junit(testResults: "${stageName}/results*.xml")
+
+            // Clean up the workspace
+            sh """
+                env | sort
+                pwd && ls -alh
+                rm -rf ./*
+            """
         }
     }
 }
@@ -796,7 +823,7 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def runLLMDocBuild(pipeline, config)
 {
-    // Step 1: cloning tekit source code
+    // Step 1: cloning source code
     sh "pwd && ls -alh"
     sh "env | sort"
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -1241,13 +1268,16 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
-    // Step 1: create LLM_ROOT dir
-    sh "pwd && ls -alh"
-    // TODO: proper way to clean workspace, maybe save in a folder named with BUILD_ID.
-    // So that it can work with multiple job running in same node
-    sh "rm -rf ./*"
+    // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
-    sh "mkdir ${llmRootConfig}"
+    sh """
+        env | sort
+        pwd && ls -alh
+        rm -rf ./*
+        mkdir ${llmRootConfig}
+        ls -alh ${env.WORKSPACE}
+        ls -alh ${env.WORKSPACE_TMP}
+    """
 
     def llmPath = sh (script: "realpath ${llmRootConfig}", returnStdout: true).trim()
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
@@ -1890,12 +1920,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-PyTorch-1": ["gb200-unrestricted", "l0_gb200", 1, 3],
-        "GB200-PyTorch-2": ["gb200-unrestricted", "l0_gb200", 2, 3],
-        "GB200-PyTorch-3": ["gb200-unrestricted", "l0_gb200", 3, 3],
-        "GB200-TensorRT-1": ["gb200-unrestricted", "l0_gb200", 1, 2],
-        "GB200-TensorRT-2": ["gb200-unrestricted", "l0_gb200", 2, 2],
-        "GB200-Triton-Post-Merge-1": ["gb200-unrestricted", "l0_gb200", 1, 1],
+        // Not used in the pipeline now
+        // "GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 3],
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
     ]
@@ -1909,7 +1935,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 7, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 7, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-6": ["gb200-multi-node", "l0_gb200_multi_nodes", 6, 7, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-7": ["gb200-multi-node", "l0_gb200_multi_nodes", 7, 7, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -2129,7 +2154,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
                             sh "env | sort"
-                            checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                            timeout(time: 1, unit: 'HOURS') {
+                                checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                            }
                         }
                         echo "###### Run LLMAPI tests Start ######"
                         def config = VANILLA_CONFIG
@@ -2464,7 +2491,7 @@ pipeline {
 
                     def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
-                        def dgxSigns = ["DGX_H100", "DGX_H200", "GB200-4_GPUs", "GB200-8_GPUs", "DGX_B200", "RTXPro6000-4_GPUs"]
+                        def dgxSigns = ["2_GPUs", "4_GPUs", "8_GPUs"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
