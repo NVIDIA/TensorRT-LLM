@@ -514,7 +514,8 @@ def disaggregated(config_file: Optional[str],
         ctx_router_config=disagg_cfg.ctx_router_config,
         gen_router_config=disagg_cfg.gen_router_config,
         conditional_disagg_config=disagg_cfg.conditional_disagg_config,
-        metadata_server_cfg=metadata_server_cfg)
+        metadata_server_cfg=metadata_server_cfg,
+        observability_cfg=disagg_cfg.observability_config)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 
