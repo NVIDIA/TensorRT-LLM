@@ -3956,6 +3956,7 @@ def test_mistral_small_3_1_24b_pixtral(
     mistral_small_3_1_24b_model_root,
     llm_backend_multimodal_example_root,
     llm_backend_venv,
+    llm_root,
 ):
     if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
         pytest.skip("Skipping. V1 doesn't support max_utilization.")
@@ -4017,6 +4018,22 @@ def test_mistral_small_3_1_24b_pixtral(
         shell=True)
     check_server_ready()
 
+    image_merlion = os.path.join(
+        llm_root,
+        "tests/integration/test_input_files/merlion.png",
+    )
+    image_football = os.path.join(
+        llm_root,
+        "tests/integration/test_input_files/pexels-franco-monsalvo-252430633-32285228.jpg",
+    )
+    image_hockey = os.path.join(
+        llm_root,
+        "tests/integration/test_input_files/pexels-ron-lach-8975010.jpg",
+    )
+    image_basketball = os.path.join(
+        llm_root,
+        "tests/integration/test_input_files/pexels-maxim-shklyaev-1511525-2914194.jpg",
+    )
 
     test_cases = [
         {
@@ -4026,21 +4043,25 @@ def test_mistral_small_3_1_24b_pixtral(
         },
         {
             "text": "In as few words as possible, what city is this?",
-            "image": "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png",
+            "image": image_merlion,
             "match": re.compile("singapore", re.IGNORECASE)
         },
         {
-            "text": "In as few words as possible, what sports are depicted in the images?",
-            "image": "https://images.pexels.com/photos/32285228/pexels-photo-32285228.jpeg?cs=srgb&fm=jpg&w=1280&h=720," \
-                     "https://images.pexels.com/photos/8975010/pexels-photo-8975010.jpeg?cs=srgb&fm=jpg&w=640&h=960",
-            "match": re.compile("(football|soccer).*hockey", re.IGNORECASE | re.DOTALL)
+            "text":
+            "In as few words as possible, what sports are depicted in the images?",
+            "image":
+            ",".join([image_football, image_hockey]),
+            "match":
+            re.compile("(football|soccer).*hockey", re.IGNORECASE | re.DOTALL)
         },
         {
-            "text": "In as few words as possible, what sports are depicted in the images?",
-            "image": "https://images.pexels.com/photos/32285228/pexels-photo-32285228.jpeg?cs=srgb&fm=jpg&w=1280&h=720," \
-                     "https://images.pexels.com/photos/8975010/pexels-photo-8975010.jpeg?cs=srgb&fm=jpg&w=640&h=960," \
-                     "https://images.pexels.com/photos/2914194/pexels-photo-2914194.jpeg?cs=srgb&fm=jpg&w=640&h=853",
-            "match": re.compile("(football|soccer).*hockey.*basket", re.IGNORECASE | re.DOTALL)
+            "text":
+            "In as few words as possible, what sports are depicted in the images?",
+            "image":
+            ",".join([image_football, image_hockey, image_basketball]),
+            "match":
+            re.compile("(football|soccer).*hockey.*basket",
+                       re.IGNORECASE | re.DOTALL)
         },
     ]
 
