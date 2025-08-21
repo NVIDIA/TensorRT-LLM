@@ -1427,7 +1427,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
     }
 
-    trtllm_utils.llmStageWithRetry(pipeline, "[${stageName}] Run Pytest", {
+    stage ("[${stageName}] Run Pytest")
+    {
         echoNodeAndGpuInfo(pipeline, stageName)
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
 
@@ -1542,7 +1543,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 """
             }
         }
-    })
+    }
 }
 
 
@@ -2311,7 +2312,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
 
     parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values -> [key, {
-        stage(key) {
+        trtllm_utils.llmStageWithRetry(pipeline, key, {
             if (key in testFilter[REUSE_STAGE_LIST]) {
                 stage("Skip - reused") {
                     echo "Skip - Passed in the last pipeline."
@@ -2330,7 +2331,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             } else {
                 values()
             }
-        }
+        })
     }]}
 
     return parallelJobsFiltered
