@@ -2446,15 +2446,60 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         [
             (8, 1, 8, True, True, True, "CUTLASS", False),
             (8, 1, 8, True, True, True, "TRTLLM", False),
-            (8, 1, 8, False, False, False, "TRTLLM", True),
+            (8, 1, 8, True, True, True, "TRTLLM", True),
         ],
         ids=[
-            "latency_moe_cutlass", "latency_moe_trtllm",
-            "latency_moe_trtllm_eagle3"
+            "latency_moe_cutlass",
+            "latency_moe_trtllm",
+            "latency_moe_trtllm_eagle3",
         ],
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, moe_backend, eagle3):
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                        enable_block_reuse=not eagle3)
+        spec_config = None
+        if eagle3:
+            spec_config = EagleDecodingConfig(
+                max_draft_len=2,
+                speculative_model_dir=
+                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
+                eagle3_one_model=True)
+        with LLM(
+                f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                kv_cache_config=kv_cache_config,
+                speculative_config=spec_config) as llm:
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
+        [
+            (4, 1, 4, False, False, False, "TRTLLM",
+             True),  # TP8 has bug when we use TRTLLM moe backend and eagle3
+        ],
+        ids=[
+            "latency_moe_trtllm_eagle3",
+        ],
+    )
+    def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
+                         cuda_graph, overlap_scheduler, moe_backend, eagle3):
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
