@@ -175,7 +175,9 @@ class Sharding(BaseTransform):
             factory.get_sharding_config() if factory else {}
         )
         shared_config.sharding_config.factory_source = (
-            shared_config.sharding_config.predefined_config["source"]
+            shared_config.sharding_config.predefined_config.get(
+                "source", ShardingConfigSource.UNKNOWN
+            )
             if factory
             else ShardingConfigSource.UNKNOWN
         )
@@ -192,7 +194,7 @@ class Sharding(BaseTransform):
             and len(shared_config.sharding_config.get_predefined_config()) > 0
         ):
             ad_logger.info("Applying sharding from config")
-            factory_info = detect_sharding_from_factory_config(gm, sharding_config)
+            factory_info = (gm, sharding_config)
             return gm, factory_info
 
         ad_logger.info("Running autodeploy sharding heuristics")
@@ -219,7 +221,7 @@ class Sharding(BaseTransform):
 def detect_sharding_from_factory_config(
     gm: GraphModule,
     sharding_config: ShardingConfig,
-) -> None:
+) -> TransformInfo:
     """
     Create sharding transformations from the predefined config.
     TODO: currently, it applies only to TP sharding.
@@ -349,7 +351,7 @@ def detect_sharding_from_factory_config(
 def detect_column_row_shard(
     gm: GraphModule,
     sharding_config: ShardingConfig,
-) -> None:
+) -> TransformInfo:
     """A transformation to apply sharding to the model following tensor parallelism.
 
     The transformation is based on the following steps:
@@ -536,7 +538,7 @@ def detect_column_row_shard(
     )
 
 
-def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> None:
+def detect_dp_bmm_shard(gm: GraphModule, sharding_config: ShardingConfig) -> TransformInfo:
     """A transformation to apply sharding to batched matrix multiplications in the graph.
 
     We'll shard the BMM nodes by slicing the batch dimension of input tensors into world_size number of slices.
