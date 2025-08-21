@@ -210,7 +210,10 @@ We can use `trtllm-serve` to serve the model by translating the benchmark comman
 
 ```bash
 trtllm-serve \
-  openai/gpt-oss-120b \  # Or ${local_model_path}
+Note: You can also point to a local path containing the model weights instead of the HF repo (e.g., `${local_model_path}`).
+
+trtllm-serve \
+  openai/gpt-oss-120b \
   --host 0.0.0.0 \
   --port 8000 \
   --backend pytorch \
@@ -228,7 +231,8 @@ For max-throughput configuration, run:
 
 ```bash
 trtllm-serve \
-  openai/gpt-oss-120b \  # Or ${local_model_path}
+trtllm-serve \
+  openai/gpt-oss-120b \
   --host 0.0.0.0 \
   --port 8000 \
   --backend pytorch \
