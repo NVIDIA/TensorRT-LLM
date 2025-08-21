@@ -41,14 +41,18 @@ Please list clearly what are the relevant test(s) that can safeguard the changes
 -->
 
 ## PR Checklist
-Please check the following items wherever appropriate, else strick them out if N/A. This is needed to merge the PR.
-All items must be resolved either by checking boxes or striking the line if N/A. This will be needed to merge the PR.
-- [ ] Have you made sure the PR description is explaining what you’re doing and why?
-- [ ] Are you following the [TRT-LLM CODING GUIDELINES](https://github.com/NVIDIA/TensorRT-LLM/blob/main/CODING_GUIDELINES.md) to the best of your knowledge?
-- [ ] Do you have test cases for new code paths? See https://github.com/NVIDIA/TensorRT-LLM/tree/main/tests#1-how-does-the-ci-work for instructions on how to add.
-- [ ] Have you introduced any new dependencies? If so, please make sure that scans have been run for license permissiveness and vulnerability issues recursively for the dependency and its dependencies.
-- [ ] Have you updated https://github.com/NVIDIA/TensorRT-LLM/blob/main/.github/CODEOWNERS to reflect any changes in ownership due to your PR?
-- [ ] Have you updated any documentation that is associated with your change?
+
+Please review the following before submitting your PR:
+- PR description clearly explains what and why. If using CodeRabbit's summary, please make sure it makes sense.
+- PR Follows [TRT-LLM CODING GUIDELINES](https://github.com/NVIDIA/TensorRT-LLM/blob/main/CODING_GUIDELINES.md) to the best of your knowledge.
+- Test cases are provided for new code paths (see [test instructions](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tests#1-how-does-the-ci-work))
+- Any new dependencies have been scanned for license and vulnerabilities
+- [CODEOWNERS](https://github.com/NVIDIA/TensorRT-LLM/blob/main/.github/CODEOWNERS) updated if ownership changes
+- Documentation updated as needed
+- The reviewers assigned automatically/manually are appropriate for the PR.
+
+
+- [ ] Please check this after reviewing the above items as appropriate for this PR.
 
 ## GitHub Bot Help
 
