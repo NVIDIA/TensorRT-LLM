@@ -1503,8 +1503,8 @@ protected:
 
                 ASSERT_NEAR(
                     OutputType{sum}, final_results[token_id * hidden_size_to_check + hidden_id], getTolerance(sum))
-                    << "Incorrect final value at for token: " << token_id << " offset: " << hidden_id
-                    << " hidden_size: " << mHiddenSize << " unpadded_hidden_size: " << mUnpaddedHiddenSize
+                    << "Incorrect final value at for token: " << token_id << "/" << mTotalTokens
+                    << " offset: " << hidden_id << " hidden_size: " << mHiddenSize << " unpadded_hidden_size: " << mUnpaddedHiddenSize
                     << " inter_size: " << mInterSize;
             }
         }
