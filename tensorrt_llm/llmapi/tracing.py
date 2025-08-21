@@ -2,13 +2,15 @@
 
 __all__ = [
     'SpanAttributes', 'SpanKind', 'contains_trace_headers',
-    'extract_trace_context', 'extract_trace_headers', 'get_span_exporter',
-    'global_otlp_tracer', 'init_tracer', 'insufficient_request_metrics_warning',
-    'is_otel_available', 'is_tracing_enabled', 'log_tracing_disabled_warning',
-    'set_global_otlp_tracer'
+    'extract_trace_context', 'get_span_exporter', 'global_otlp_tracer',
+    'init_tracer', 'insufficient_request_metrics_warning', 'is_otel_available',
+    'is_tracing_enabled', 'log_tracing_disabled_warning',
+    'set_global_otlp_tracer', 'extract_trace_headers'
 ]
 
+import functools
 import os
+import typing
 from collections.abc import Mapping
 from typing import Optional
 
@@ -28,9 +30,11 @@ try:
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.trace import SpanKind, Tracer, set_tracer_provider
+    from opentelemetry.trace import (SpanKind, Status, StatusCode, Tracer,
+                                     get_current_span, set_tracer_provider)
     from opentelemetry.trace.propagation.tracecontext import \
         TraceContextTextMapPropagator
+    from opentelemetry.util import types
 
     _is_otel_imported = True
 except ImportError:
@@ -94,10 +98,23 @@ def extract_trace_context(
         return None
 
 
-def extract_trace_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
-    # Return only recognized trace headers with normalized lowercase keys
-    lower_map = {k.lower(): v for k, v in headers.items()}
-    return {h: lower_map[h] for h in TRACE_HEADERS if h in lower_map}
+def extract_trace_headers(
+        headers: Mapping[str, str]) -> Optional[Mapping[str, str]]:
+    if is_tracing_enabled():
+        # Return only recognized trace headers with normalized lowercase keys
+        lower_map = {k.lower(): v for k, v in headers.items()}
+        return {h: lower_map[h] for h in TRACE_HEADERS if h in lower_map}
+    if contains_trace_headers(headers):
+        log_tracing_disabled_warning()
+    return None
+
+
+def inject_trace_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
+    if is_tracing_enabled():
+        trace_headers = extract_trace_headers(headers) if not headers else {}
+        TraceContextTextMapPropagator().inject(trace_headers)
+        return trace_headers
+    return None
 
 
 def global_otlp_tracer() -> Tracer:
@@ -128,12 +145,29 @@ class SpanAttributes:
     GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN = "gen_ai.latency.time_to_first_token"
     GEN_AI_LATENCY_E2E = "gen_ai.latency.e2e"
     GEN_AI_LATENCY_TIME_IN_QUEUE = "gen_ai.latency.time_in_queue"
+    GEN_AI_LATENCY_KV_CACHE_TRANSFER_TIME = "gen_ai.latency.kv_cache_transfer_time"
     GEN_AI_RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons"
+
+
+class SpanEvents:
+    KV_CACHE_TRANSFER_START = "kv_cache_transfer_start"
+    KV_CACHE_TRANSFER_END = "kv_cache_transfer_end"
+    CTX_SERVER_SELECTED = "ctx_server.selected"
+    GEN_SERVER_SELECTED = "gen_server.selected"
 
 
 def contains_trace_headers(headers: Mapping[str, str]) -> bool:
     lower_keys = {k.lower() for k in headers.keys()}
     return any(h in lower_keys for h in TRACE_HEADERS)
+
+
+def add_event(name: str,
+              attributes: types.Attributes = None,
+              timestamp: typing.Optional[int] = None) -> None:
+    """Add an event to the current span if tracing is available."""
+    if not is_tracing_enabled():
+        return
+    get_current_span().add_event(name, attributes, timestamp)
 
 
 @run_once
@@ -146,3 +180,37 @@ def log_tracing_disabled_warning() -> None:
 def insufficient_request_metrics_warning() -> None:
     logger.warning(
         "Insufficient request metrics available; trace generation aborted.")
+
+
+def trace_span(name: str = None):
+
+    def decorator(func):
+
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            span_name = name if name is not None else func.__name__
+            if global_otlp_tracer() is None:
+                return await func(*args, **kwargs)
+
+            trace_headers = None
+            for arg in list(args) + list(kwargs.values()):
+                if hasattr(arg, 'headers'):
+                    trace_headers = extract_trace_context(arg.headers)
+                    break
+
+            with global_otlp_tracer().start_as_current_span(
+                    span_name, kind=SpanKind.SERVER,
+                    context=trace_headers) as span:
+                try:
+                    result = await func(*args, **kwargs)
+                    span.set_status(Status(StatusCode.OK))
+                    return result
+                except Exception as e:
+                    span.record_exception(e)
+                    span.set_status(
+                        Status(StatusCode.ERROR, f"An error occurred: {e}"))
+                    raise e
+
+        return async_wrapper
+
+    return decorator

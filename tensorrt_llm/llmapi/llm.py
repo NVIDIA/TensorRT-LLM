@@ -17,6 +17,7 @@ from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.llmapi import tracing
+from tensorrt_llm.metrics.enums import MetricNames
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -458,6 +459,10 @@ class BaseLLM:
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
         )
+
+        if sampling_params.return_perf_metrics:
+            result.metrics_dict.update(
+                {MetricNames.ARRIVAL_TIMESTAMP: time.time()})
 
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)
