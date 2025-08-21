@@ -1,3 +1,4 @@
+from itertools import chain
 from typing import List
 
 import torch
@@ -25,10 +26,8 @@ class HandleLogits:
             num_context_logits_prefix_sum: Prefix sum of the logits
             is_generation_model: Bool containing whether the model is generation or not
         """
-        if not any(r.py_return_context_logits
-                   for r in context_requests) and not any(
-                       r.py_return_generation_logits
-                       for r in generation_requests):
+        if not any(r.py_return_context_logits or r.py_return_generation_logits
+                   for r in chain(context_requests, generation_requests)):
             return
 
         if not is_generation_model:
