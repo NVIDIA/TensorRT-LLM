@@ -1127,13 +1127,13 @@ __device__ void setupFP4BlockScalingFactors(TmaWarpSpecializedGroupedGemmInput& 
     assert(layout_info.fpX_block_scaling_factors_stride_act);
     assert(layout_info.fpX_block_scaling_factors_stride_weight);
 
-    // M & N swapped for transpose
     auto stride_act_ptr
         = reinterpret_cast<typename BSConfig::LayoutSF*>(layout_info.fpX_block_scaling_factors_stride_act);
     auto stride_weight_ptr
         = reinterpret_cast<typename BSConfig::LayoutSF*>(layout_info.fpX_block_scaling_factors_stride_weight);
     if (layout_info.swap_ab)
     {
+        // M & N swapped for transpose
         stride_act_ptr[expert]
             = BSConfig::tile_atom_to_shape_SFB(cute::make_shape((int) gemm_n, (int) gemm_m, (int) gemm_k, (int) 1));
         stride_weight_ptr[expert]
@@ -1142,9 +1142,9 @@ __device__ void setupFP4BlockScalingFactors(TmaWarpSpecializedGroupedGemmInput& 
     else
     {
         stride_act_ptr[expert]
-            = BSConfig::tile_atom_to_shape_SFA(cute::make_shape((int) gemm_n, (int) gemm_m, (int) gemm_k, (int) 1));
+            = BSConfig::tile_atom_to_shape_SFA(cute::make_shape((int) gemm_m, (int) gemm_n, (int) gemm_k, (int) 1));
         stride_weight_ptr[expert]
-            = BSConfig::tile_atom_to_shape_SFB(cute::make_shape((int) gemm_n, (int) gemm_m, (int) gemm_k, (int) 1));
+            = BSConfig::tile_atom_to_shape_SFB(cute::make_shape((int) gemm_m, (int) gemm_n, (int) gemm_k, (int) 1));
     }
 
     // This assert validates our current assumption that A&B can be safely transposed without needing to modify
@@ -1168,19 +1168,19 @@ __device__ void computeTmaWarpSpecializedInputStrides(
     {
         reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideB*>(layout_info.stride_act)[out_idx]
             = cutlass::make_cute_packed_stride(
-                TmaWarpSpecializedGroupedGemmInput::StrideB{}, cute::make_shape(gemm_m, gemm_k, 1));
+                TmaWarpSpecializedGroupedGemmInput::StrideB{}, cute::make_shape(gemm_n, gemm_k, 1));
         reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideA*>(layout_info.stride_weight)[out_idx]
             = cutlass::make_cute_packed_stride(
-                TmaWarpSpecializedGroupedGemmInput::StrideA{}, cute::make_shape(gemm_n, gemm_k, 1));
+                TmaWarpSpecializedGroupedGemmInput::StrideA{}, cute::make_shape(gemm_m, gemm_k, 1));
     }
     else
     {
         reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideA*>(layout_info.stride_act)[out_idx]
             = cutlass::make_cute_packed_stride(
-                TmaWarpSpecializedGroupedGemmInput::StrideA{}, cute::make_shape(gemm_n, gemm_k, 1));
+                TmaWarpSpecializedGroupedGemmInput::StrideA{}, cute::make_shape(gemm_m, gemm_k, 1));
         reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideB*>(layout_info.stride_weight)[out_idx]
             = cutlass::make_cute_packed_stride(
-                TmaWarpSpecializedGroupedGemmInput::StrideB{}, cute::make_shape(gemm_m, gemm_k, 1));
+                TmaWarpSpecializedGroupedGemmInput::StrideB{}, cute::make_shape(gemm_n, gemm_k, 1));
     }
     if (layout_info.stride_c)
     {
@@ -1196,7 +1196,7 @@ __device__ void computeTmaWarpSpecializedInputStrides(
         {
             reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideC*>(layout_info.stride_c)[out_idx]
                 = cutlass::make_cute_packed_stride(
-                    TmaWarpSpecializedGroupedGemmInput::StrideC{}, cute::make_shape(1, gemm_n, 1));
+                    TmaWarpSpecializedGroupedGemmInput::StrideC{}, cute::make_shape(gemm_n, 1, 1));
         }
     }
     if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE)
@@ -1211,7 +1211,7 @@ __device__ void computeTmaWarpSpecializedInputStrides(
         {
             reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideD*>(layout_info.stride_d)[out_idx]
                 = cutlass::make_cute_packed_stride(
-                    TmaWarpSpecializedGroupedGemmInput::StrideD{}, cute::make_shape(gemm_n, gemm_m, 1));
+                    TmaWarpSpecializedGroupedGemmInput::StrideD{}, cute::make_shape(gemm_m, gemm_n, 1));
         }
     }
     if (layout_info.int4_groupwise_params.enabled)

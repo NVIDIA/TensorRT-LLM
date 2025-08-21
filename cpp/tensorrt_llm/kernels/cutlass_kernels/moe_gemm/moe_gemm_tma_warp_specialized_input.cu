@@ -31,8 +31,8 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     int num_experts, FpXBlockScalingType scaling_type)
 {
     size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
-    size_t stride_act_size = sizeof(StrideA) * num_experts;
-    size_t stride_weight_size = sizeof(StrideB) * num_experts;
+    size_t stride_act_size = std::max(sizeof(StrideA), sizeof(StrideB)) * num_experts;
+    size_t stride_weight_size = std::max(sizeof(StrideA), sizeof(StrideB)) * num_experts;
     size_t stride_c_size = std::max(sizeof(StrideC), sizeof(StrideC_T)) * num_experts;
     size_t stride_d_size = std::max(sizeof(StrideD), sizeof(StrideD_T)) * num_experts;
 
@@ -82,8 +82,8 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
     shape_info.num_groups = num_experts;
     shape_info.problem_shapes = reinterpret_cast<ProblemShape::UnderlyingProblemShape*>(pointers[0]);
     shape_info.host_problem_shapes = nullptr;
-    stride_act = reinterpret_cast<StrideA*>(pointers[1]);
-    stride_weight = reinterpret_cast<StrideB*>(pointers[2]);
+    stride_act = reinterpret_cast<void*>(pointers[1]);
+    stride_weight = reinterpret_cast<void*>(pointers[2]);
     stride_c = reinterpret_cast<void*>(pointers[3]);
     stride_d = reinterpret_cast<void*>(pointers[4]);
 
@@ -120,7 +120,7 @@ void TmaWarpSpecializedGroupedGemmInput::setFinalizeFusionParams(
     fused_finalize_epilogue.ptr_final_output = final_output;
 
     fused_finalize_epilogue.stride_final_output = cutlass::make_cute_packed_stride(
-        FusedFinalizeEpilogue::StrideFinalOutput{}, cute::make_shape(hidden_size, num_output_tokens, 1));
+        FusedFinalizeEpilogue::StrideFinalOutput{}, cute::make_shape(num_output_tokens, hidden_size, 1));
     fused_finalize_epilogue.stride_final_output_transposed = cutlass::make_cute_packed_stride(
         FusedFinalizeEpilogue::StrideFinalOutput_T{}, cute::make_shape(hidden_size, num_output_tokens, 1));
 
