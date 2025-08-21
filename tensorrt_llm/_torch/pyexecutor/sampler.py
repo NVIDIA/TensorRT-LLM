@@ -673,8 +673,7 @@ class TorchSampler(Sampler):
             for i in range(len(scheduled_requests.context_requests)):
                 gen_logits_indices.append(num_context_logits_prefix_sum[i + 1] -
                                           1)
-            for i in range(len(scheduled_requests.generation_requests)):
-                gen_logits_indices.append(total_context_logits + i)
+            gen_logits_indices.extend(range(total_context_logits, total_context_logits + len(scheduled_requests.generation_requests)))
             raw_logits = model_outputs["logits"][gen_logits_indices]
         else:
             raw_logits = model_outputs["logits"]
