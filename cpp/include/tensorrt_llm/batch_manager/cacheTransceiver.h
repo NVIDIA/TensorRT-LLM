@@ -145,20 +145,17 @@ public:
             auto subgroup = mMpiComm->split(color, key);
             return CacheTransceiverComm(std::make_shared<mpi::MpiComm const>(std::move(subgroup)));
         }
+        bool const initialized = Py_IsInitialized();
+        TLLM_CHECK_WITH_INFO(initialized, "Trying to use ProcessGroup communicator but Python is not initialized");
         try
         {
             pybind11::gil_scoped_acquire gil;
-            if (!Py_IsInitialized())
-            {
-                Py_Initialize();
-            }
-            pybind11::module m = pybind11::module::import("tensorrt_llm._torch.distributed.pg_utils");
+            auto const m = pybind11::module::import("tensorrt_llm._torch.distributed.pg_utils");
             // Properly box the existing intrusive_ptr ProcessGroup into an IValue
             // and convert to a Python object without constructing a new instance.
-            c10::IValue iv_pg(mPgComm);
-            pybind11::object py_pg = torch::jit::toPyObject(iv_pg);
+            auto const py_pg = torch::jit::toPyObject(c10::IValue(mPgComm));
 
-            pybind11::object py_sub_pg = m.attr("split")(color, key, py_pg);
+            auto const py_sub_pg = m.attr("split")(color, key, py_pg);
             auto pgSub = torch::jit::toCustomClass<c10d::ProcessGroup>(py_sub_pg);
             return CacheTransceiverComm(pgSub);
         }
