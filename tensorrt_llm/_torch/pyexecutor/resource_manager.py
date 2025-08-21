@@ -1037,6 +1037,13 @@ class PeftCacheManager(BaseResourceManager):
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
         self._lora_config = lora_config
+        # if model_engine is not None and hasattr(model_engine, "lora_model_config"):
+        #     self._lora_model_config = model_engine.lora_model_config
+        # else:
+        #     self._lora_model_config = LoraModelConfig(
+        #         lora_config.lora_target_modules,
+        #         lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
+        #         binding_to_str_dtype(model_config.data_type))
         self._lora_model_config = LoraModelConfig(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
@@ -1052,6 +1059,9 @@ class PeftCacheManager(BaseResourceManager):
                 # cached, we can safely remove both from the request.
                 request.remove_lora_tensors()
             elif request.lora_weights is None and request.py_lora_path:
+                print(
+                    f"DEBUG: INSIDE add_request_peft: request.py_lora_path: {request.py_lora_path}"
+                )
                 self._lora_manager.load_from_ckpt(
                     [request.py_lora_path],
                     model_config=self._lora_model_config,
