@@ -343,7 +343,7 @@ class ReportUtility:
             "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
             "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
             "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
-            "kv_cache_percentage": kv_cache_mem_percent * 100.0,
+            "kv_cache_percentage": kv_cache_mem_percent,
             "issue_rate": self.convert_rate_to_s(self.statistics.issue_rate_ns)
         }
 
