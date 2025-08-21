@@ -372,9 +372,9 @@ def preparation(pipeline, testFilter, globalVars)
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
-        stage("Merge Test Waive List") {
-            mergeWaiveList(pipeline, globalVars)
-        }
+        // stage("Merge Test Waive List") {
+        //     mergeWaiveList(pipeline, globalVars)
+        // }
     })
 }
 
