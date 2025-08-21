@@ -536,7 +536,7 @@ class ShardingConfig(BaseModel):
             self.predefined_config = {}
             return False
 
-        if "tp_plan" not in self.predefined_config:
+        if "tp_plan" not in self.predefined_config or self.predefined_config["tp_plan"] is None:
             ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
             # invalidate the config
             self.predefined_config = {}
