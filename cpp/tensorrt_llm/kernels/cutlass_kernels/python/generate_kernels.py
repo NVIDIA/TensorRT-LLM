@@ -507,13 +507,15 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
         TrtLlm_EpilogueFusion.epilogue_fusion_finalize
     ]
 
+    swap_ab = [True, False]
+
     cga_shapes = product([1, 2], [1, 2], [1])
 
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mn, cga_shapes)
+                           cta_shapes_mn, cga_shapes, swap_ab)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape, swap_ab in partial_args:
         max_k_bits = 128 * 8
         cta_shape_k = max_k_bits // GetDataTypeBits(dtype)
         cta_shape_mnk = cta_shape_mn + (cta_shape_k, )
@@ -526,10 +528,23 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cta_shape_mnk, warp_shape, stages, cga_shape,
-                mainloop_schedule, epi_schedule, epi_fusion)
+            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
+                                                     arch,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     otype,
+                                                     quant_op,
+                                                     epi_tag,
+                                                     cta_shape_mnk,
+                                                     warp_shape,
+                                                     stages,
+                                                     cga_shape,
+                                                     mainloop_schedule,
+                                                     epi_schedule,
+                                                     epi_fusion,
+                                                     swap_ab=swap_ab)
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
