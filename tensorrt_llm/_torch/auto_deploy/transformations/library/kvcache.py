@@ -26,9 +26,6 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> None:
     # loop through nodes to get input, output, and get_attr nodes
     input_nodes, output_nodes = get_all_input_output_nodes(egm.graph)
 
-    # we only expect one input node
-    assert len(input_nodes) == 2, "Expected exactly two input nodes (input_ids, position_ids)."
-
     # NOTE: for now, we wanna make sure we *only* return the final output and no hidden states.
     # Later on, we can revisit how to support returning hidden states.
     assert len(output_nodes) == 1, "Expected exactly one output node!"
@@ -73,16 +70,17 @@ def insert_cached_attention(
 
     # retrieve input nodes
     input_nodes, _ = get_all_input_output_nodes(egm.graph)
+    input_nodes_mapping = {n.target: n for n in input_nodes}
+
+    # filtered and sorted for SequenceInfo arguments (input_ids, position_ids, etc.)
+    input_nodes_from_info = [input_nodes_mapping[k] for k in cm.info.named_standard_args.keys()]
 
     # insert metadata computation and extract each argument as a node
     get_metadata, num_metadata = attn_descriptor.get_prepare_metadata_op()
     with graph.inserting_before(input_nodes[-1].next):
         ret_node = graph.call_function(
             get_metadata,
-            args=(
-                *input_nodes,
-                cm.info.page_size,
-            ),
+            args=(*input_nodes_from_info, *cm.info.extra_args_for_prepare_metadata),
         )
         metadata_nodes = [
             graph.call_function(operator.getitem, args=(ret_node, idx))
@@ -162,7 +160,7 @@ def resize_kv_cache(
 
     try:
         # Let's run a forward pass to get the memory usage
-        cm.info._set_max_num_tokens_sample()
+        cm.info.set_max_num_tokens_sample()
         free_mem_pre, _ = _get_mem_info_in_mb()
         ad_logger.info(f"Free memory before forward pass (MB): {free_mem_pre}")
 

@@ -82,7 +82,7 @@ class GenerationExecutorWorker(GenerationExecutor):
             self)  # TODO: make it weakref
         self._executor_config = executor_config
         self._is_pytorch_backend = getattr(self._executor_config, "backend",
-                                           None) == "pytorch"
+                                           None) in ["pytorch", "_autodeploy"]
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
