@@ -1849,6 +1849,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
         "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
         "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
+        "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
@@ -1914,12 +1915,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-6": ["gb200-multi-node", "l0_gb200_multi_nodes", 6, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 7, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 7, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 7, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 7, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 7, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-6": ["gb200-multi-node", "l0_gb200_multi_nodes", 6, 7, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-7": ["gb200-multi-node", "l0_gb200_multi_nodes", 7, 7, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 

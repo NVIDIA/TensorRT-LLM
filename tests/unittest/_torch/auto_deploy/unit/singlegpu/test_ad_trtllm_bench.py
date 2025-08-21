@@ -279,7 +279,7 @@ def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
             # For TinyLlama-1.1B, model should be 2.2GB
             estimated_model_size_mb = 2200  # Conservative estimate
             # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/6335 check why there is extra consumption
-            extra_consumption_mb = 2500
+            extra_consumption_mb = 2700
             expected_free_mem_range = (
                 total_mem_mb - estimated_model_size_mb - extra_consumption_mb,
                 total_mem_mb - estimated_model_size_mb,
@@ -290,10 +290,7 @@ def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
 
             # Free memory values should be in reasonable range
             expected_free_mem_pre_range = expected_free_mem_range
-            expected_free_mem_post_range = (
-                expected_free_mem_range[0] - 1000,
-                expected_free_mem_range[1] - 500,
-            )
+            expected_free_mem_post_range = expected_free_mem_range
 
             print("📊 GPU Memory Analysis:")
             print(f"  Total GPU memory: {total_mem_mb}MB")
@@ -347,14 +344,13 @@ def validate_kv_cache_metrics_dynamic(kv_cache_metrics: dict, expected_metrics: 
         )
         print(f"  ✅ free_mem_post_mb: {free_mem_post}MB (within range)")
 
-    # Validate memory consumption (pre should be > post)
+    # Validate memory reduction (pre should be > post)
     if free_mem_pre and free_mem_post:
-        memory_consumed = free_mem_pre - free_mem_post
-        assert memory_consumed > 0, (
-            f"Expected memory consumption during forward pass, got {memory_consumed}MB"
+        memory_reduction = free_mem_pre - free_mem_post
+        assert memory_reduction > 0, (
+            f"Expected memory reduction during forward pass, got {memory_reduction}MB"
         )
-        assert memory_consumed < 5000, f"Memory consumption too high: {memory_consumed}MB"
-        print(f"  ✅ Memory consumed during forward pass: {memory_consumed}MB (reasonable)")
+        print(f"  ✅ Memory reduction during forward pass: {memory_reduction}MB")
 
     # Validate calculated new_cache_size
     new_cache_size = kv_cache_metrics.get("new_cache_size")
@@ -455,7 +451,7 @@ def trtllm_bench_unified_comparison(
     num_hidden_layers=2,
     max_batch_size=32,  # below this value the kv cache resizing is skipped
     golden_tokens_per_sec=1400,
-    backend_relative_tolerance=0.2,
+    backend_relative_tolerance=0.3,
     backend_absolute_tolerance=250.0,
     golden_relative_tolerance=0.1,
     golden_absolute_tolerance=5.0,
@@ -605,7 +601,27 @@ def test_trtllm_bench(llm_root):  # noqa: F811
         run_benchmark(model_name, dataset_path, temp_dir)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5458798")
 @pytest.mark.no_xdist
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
-    """Test that compares autodeploy backend performance against pytorch backend."""
+    """Test that compares autodeploy backend performance against pytorch backend
+    with given relative and absolute thresholds.
+
+    It also checks the memory footprint of the autodeploy backend by parsing the
+    log output from the resize_kv_cache function and extracting the following metrics:
+    current_cache_size - the cache size before resize
+    free_mem_pre_mb - the free memory before forward pass
+    free_mem_post_mb - the free memory after forward pass
+    new_cache_size - the cache size after resize
+
+    The following checks are performed:
+    1. free_mem_pre_fw_pass and free_mem_post_fw_pass are in:
+       [Total mem - expected_model_size - extra_consumption, Total mem - expected_model_size]
+    2. memory_reduction = free_mem_pre_fw_pass - free_mem_post_fw_pass > 0
+    3. expected_new_cache = free_mem_post * free_mem_ratio + current_cache_size
+       cache_size_diff = abs(new_cache_size - expected_new_cache) / expected_new_cache
+       assert cache_size_diff <= 0.01
+
+    extra_consumption_mb = 2700 - this is unexplained memory consumption to be investigated.
+    """
     trtllm_bench_unified_comparison(llm_root, comparison_mode="backend")

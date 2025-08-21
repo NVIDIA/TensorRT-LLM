@@ -27,3 +27,6 @@ properties:
   finished:
     annotation: bool
     default: inspect._empty
+  mm_embedding_handle:
+    annotation: Optional[Dict[str, Any]]
+    default: inspect._empty

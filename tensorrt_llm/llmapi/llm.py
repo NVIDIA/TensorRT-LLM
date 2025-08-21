@@ -53,6 +53,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
+        mm_embedding_handle (Dict[str, Any], optional): The multimodal embedding handle of the request.
         finished (bool): Whether the whole request is finished.
     """
 
@@ -81,7 +82,8 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     def _repr_fields(self):
         return [
-            "request_id", "prompt", "prompt_token_ids", "outputs", "finished"
+            "request_id", "prompt", "prompt_token_ids", "outputs", "finished",
+            "mm_embedding_handle"
         ]
 
 
@@ -789,7 +791,7 @@ class _TrtLLM(BaseLLM):
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
-        self.tokenizer = self.input_processor.tokenizer
+        self._tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size
         max_num_tokens = self.args.max_num_tokens
@@ -954,7 +956,7 @@ class _TorchLLM(BaseLLM):
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
-        self.tokenizer = self.input_processor.tokenizer
+        self._tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size
         max_num_tokens = self.args.max_num_tokens
