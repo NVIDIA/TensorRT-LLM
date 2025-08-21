@@ -23,6 +23,22 @@ import tensorrt_llm as tllm
 has_setup_max_sm_count = False
 
 
+def quant_and_dequant(tensor):
+    tensor = tensor.reshape(1, -1)
+    global_scale = (448 * 6) / tensor.abs().max().float()
+    fp4_tensor, scale_factors = torch.ops.trtllm.fp4_quantize(
+        tensor, global_scale, 16, False, False)
+
+    dequantized_cpu = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+        fp4_tensor.cpu(),
+        scale_factors.cpu(),
+        (1.0 / global_scale).cpu(),
+        16,
+        1,  # sf_type (1 for UE4M3)
+        False)
+    return dequantized_cpu.to(tensor.device).reshape(-1)
+
+
 class TestMoeAlltoAllSingleGPU(unittest.TestCase):
 
     def setUp(self):
@@ -128,19 +144,33 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         (4, 901, [1472, 46, 4,
                   4], torch.float16),  # large input that reuses workspace
         (4, 5, [2944], torch.bfloat16),  # large input that reuses workspace
+        (4, 5, [2944], torch.bfloat16,
+         True),  # large input that reuses workspace
         (8, 901, [
             32768,
         ],
          torch.float16),  # large input that reuses workspace, larger world size
+        (8, 901, [
+            32768,
+        ], torch.float16,
+         True),  # large input that reuses workspace, larger world size
         (
             8, 16384, [
                 128,
             ], torch.float16
         ),  # large input count with small vector dim that requires more indices per fifo
+        (
+            8, 16384, [
+                128,
+            ], torch.float16, True
+        ),  # large input count with small vector dim that requires more indices per fifo
     ])
-    def test_moe_alltoall_multi_rank_single_gpu(self, world_size,
+    def test_moe_alltoall_multi_rank_single_gpu(self,
+                                                world_size,
                                                 input_entry_per_rank,
-                                                vector_dims, dtype):
+                                                vector_dims,
+                                                dtype,
+                                                use_low_precision=False):
         torch.cuda.set_device(0)
         max_world_size = 8
         assert world_size <= max_world_size, f"should run with world_size at most {max_world_size}"
@@ -278,10 +308,16 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
             ]
             with torch.cuda.stream(cuda_streams_all_ranks[rank]):
                 output_tensors_this_rank = torch.ops.trtllm.moe_comm(
-                    input_tensors_this_rank, send_cumsum_all_ranks[rank],
-                    send_ids_all_ranks[rank], recv_cumsum_all_ranks[rank],
-                    recv_ids_all_ranks[rank], all_workspaces,
-                    input_entry_per_rank * world_size, rank, world_size)
+                    input_tensors_this_rank,
+                    send_cumsum_all_ranks[rank],
+                    send_ids_all_ranks[rank],
+                    recv_cumsum_all_ranks[rank],
+                    recv_ids_all_ranks[rank],
+                    all_workspaces,
+                    input_entry_per_rank * world_size,
+                    rank,
+                    world_size,
+                    use_low_precision=use_low_precision)
                 output_tensors_all_ranks.append(output_tensors_this_rank)
 
         for rank in range(world_size):
@@ -298,12 +334,19 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                 actual_output_parts.append(
                     output_tensors_all_ranks[rank][i][:total_recv_count])
 
+            atol, rtol = 1e-5, 1e-5
+            if use_low_precision:
+                for token_id in range(ref_output_tensors[i].shape[0]):
+                    ref_output_tensors[i][token_id] = quant_and_dequant(
+                        ref_output_tensors[i][token_id])
+                atol, rtol = 1e-2, 1e-2
+
             # Concatenate all ranks' outputs to form the complete result
             actual_output = torch.cat(actual_output_parts, dim=0)
             torch.testing.assert_close(actual_output,
                                        ref_output_tensors[i],
-                                       atol=1e-5,
-                                       rtol=1e-5)
+                                       atol=atol,
+                                       rtol=rtol)
 
 
 class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):

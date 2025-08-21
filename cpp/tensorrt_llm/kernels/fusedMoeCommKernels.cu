@@ -20,11 +20,258 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/quantization.cuh"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
+
+// Quantize a contiguous shared-memory buffer containing elements of DType into NVFP4 with per-16-element FP8 scales.
+// Output layout (repeated per 16-element group per lane), followed by one global scale float:
+//   [WARP_SIZE * 8 bytes packed e2m1 values] [WARP_SIZE * 1 byte E4M3 per-group scales] ... [global_scale (4 bytes)]
+// Each lane writes one 64-bit packed e2m1 for its 16 values and one 1-byte E4M3 scale per group.
+// Global scale is computed as (448*6)/absmax and written once at the end of the buffer.
+template <typename DType>
+__device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, int sizeInBytes, int laneId)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    int const numElems = sizeInBytes / sizeof(DType);
+    assert(numElems % 2 == 0);
+    if (numElems <= 0)
+    {
+        return;
+    }
+
+    DType const* in = reinterpret_cast<DType const*>(compact_ptr);
+
+    // 1) Global absmax across the field (warp reduce) in original dtype precision when possible
+    float threadMaxFloat = 0.f;
+    if constexpr (std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>)
+    {
+        using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
+        DType2 const* in2 = reinterpret_cast<DType2 const*>(in);
+        int const numPairs = numElems / 2;
+
+        auto localMax2 = tensorrt_llm::common::cuda_abs(in2[0]);
+        // stride over pairs
+        for (int i = laneId; i < numPairs; i += WARP_SIZE)
+        {
+            DType2 v2 = in2[i];
+            localMax2 = tensorrt_llm::common::cuda_max(localMax2, tensorrt_llm::common::cuda_abs(v2));
+        }
+        // Reduce vector to scalar float in-thread
+        DType localMax = tensorrt_llm::common::cuda_max<DType, DType2>(localMax2);
+        threadMaxFloat = tensorrt_llm::common::cuda_cast<float>(localMax);
+    }
+    else
+    {
+        float localMax = 0.f;
+        for (int i = laneId; i < numElems; i += WARP_SIZE)
+        {
+            float v = fabsf(tensorrt_llm::common::cuda_cast<float>(in[i]));
+            localMax = fmaxf(localMax, v);
+        }
+        threadMaxFloat = localMax;
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        threadMaxFloat = fmaxf(threadMaxFloat, __shfl_xor_sync(0xffffffff, threadMaxFloat, offset));
+    }
+    float const eps = 1e-12f;
+    float const globalAbsMax = fmaxf(threadMaxFloat, eps);
+
+    // 2) Global scale
+    float const SFScaleVal = (448.0f * 6.0f) * (1.0f / globalAbsMax);
+
+    // 3) Output layout
+    int const numGroups = (numElems + WARP_SIZE * 16 - 1) / (WARP_SIZE * 16);
+
+    // 8 bytes for e2m1, 1 byte for scale
+    int const outputBlockSizeInBytes = 8 * WARP_SIZE + WARP_SIZE;
+    uint8_t* const globalScaleOutBytes = compact_ptr + numGroups * outputBlockSizeInBytes;
+
+    // 4) Per-16 group quantization
+    for (int groupStart = laneId * 16, groupId = 0; groupStart < numElems; groupStart += WARP_SIZE * 16, groupId++)
+    {
+        float vecMax;
+        if constexpr (std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>)
+        {
+            using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
+
+            int const numPairs = numElems / 2;
+            DType2 const* in2Ptr = reinterpret_cast<DType2 const*>(in);
+
+            int const pairIdxBase = groupStart >> 1;
+            DType2 localMax2 = tensorrt_llm::common::cuda_abs(in2Ptr[pairIdxBase]);
+
+#pragma unroll
+            for (int i = 1; i < 8; ++i)
+            {
+                if (pairIdxBase + i < numPairs)
+                {
+                    DType2 v2 = in2Ptr[pairIdxBase + i];
+                    localMax2 = tensorrt_llm::common::cuda_max(localMax2, tensorrt_llm::common::cuda_abs(v2));
+                }
+            }
+            vecMax = tensorrt_llm::common::cuda_cast<float>(tensorrt_llm::common::cuda_max<DType, DType2>(localMax2));
+        }
+        else
+        {
+            float localMax = fabsf(tensorrt_llm::common::cuda_cast<float>(in[groupStart]));
+#pragma unroll
+            for (int t = 0; t < 16; ++t)
+            {
+                int idx = groupStart + t;
+                if (idx < numElems)
+                {
+                    float v = tensorrt_llm::common::cuda_cast<float>(in[idx]);
+                    localMax = fmaxf(localMax, fabsf(v));
+                }
+            }
+            vecMax = localMax;
+        }
+
+        // SF from vecMax and global scale; write as E4M3
+        float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+        __nv_fp8_e4m3 sf8 = __nv_fp8_e4m3(SFValue);
+        float SFValueNarrow = static_cast<float>(sf8);
+        float const outputScale = (vecMax != 0.f)
+            ? reciprocal_approximate_ftz(SFValueNarrow * reciprocal_approximate_ftz(SFScaleVal))
+            : 0.0f;
+
+        // Pack 16 values -> 8 bytes e2m1
+        float2 fp2Vals[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            int idx = groupStart + (i << 1);
+            if (idx < numElems)
+            {
+                float x = tensorrt_llm::common::cuda_cast<float>(in[idx]) * outputScale;
+                float y = tensorrt_llm::common::cuda_cast<float>(in[idx + 1]) * outputScale;
+                fp2Vals[i] = make_float2(x, y);
+            }
+            else
+            {
+                fp2Vals[i] = make_float2(0.0f, 0.0f);
+            }
+        }
+        uint64_t const e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
+
+        uint8_t* const outValPtr = compact_ptr + groupId * outputBlockSizeInBytes + laneId * sizeof(uint64_t);
+        uint8_t* const outScalePtr
+            = compact_ptr + groupId * outputBlockSizeInBytes + WARP_SIZE * sizeof(uint64_t) + laneId * sizeof(uint8_t);
+
+        reinterpret_cast<uint64_t*>(outValPtr)[0] = e2m1Vec;
+        outScalePtr[0] = sf8.__x;
+    }
+
+    // Store global scale (fp32) once with a single 32-bit store. Use lane 0 to avoid races.
+    if (laneId == 0)
+    {
+        *reinterpret_cast<float*>(globalScaleOutBytes) = SFScaleVal;
+    }
+#endif
+}
+
+// Convert one lane's packed 16 e2m1 values (in a 64-bit word) into eight float2 values (16 floats).
+// Uses 8 cvt.rn.f16x2.e2m1x2 instructions, one per input byte, to produce eight half2 which are cast to float2.
+inline __device__ void e2m1_to_fp32_vec(uint64_t e2m1Vec, float2 (&array)[8])
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    uint32_t out_fp16[8];
+    asm volatile(
+        "{\n"
+        ".reg .b8 b0;\n"
+        ".reg .b8 b1;\n"
+        ".reg .b8 b2;\n"
+        ".reg .b8 b3;\n"
+        ".reg .b8 b4;\n"
+        ".reg .b8 b5;\n"
+        ".reg .b8 b6;\n"
+        ".reg .b8 b7;\n"
+        ".reg .b32 lo;\n"
+        ".reg .b32 hi;\n"
+        "mov.b64 {lo, hi}, %8;\n"
+        "mov.b32 {b0, b1, b2, b3}, lo;\n"
+        "mov.b32 {b4, b5, b6, b7}, hi;\n"
+        "cvt.rn.f16x2.e2m1x2   %0, b0;\n"
+        "cvt.rn.f16x2.e2m1x2   %1, b1;\n"
+        "cvt.rn.f16x2.e2m1x2   %2, b2;\n"
+        "cvt.rn.f16x2.e2m1x2   %3, b3;\n"
+        "cvt.rn.f16x2.e2m1x2   %4, b4;\n"
+        "cvt.rn.f16x2.e2m1x2   %5, b5;\n"
+        "cvt.rn.f16x2.e2m1x2   %6, b6;\n"
+        "cvt.rn.f16x2.e2m1x2   %7, b7;\n"
+        "}"
+        : "=r"(out_fp16[0]), "=r"(out_fp16[1]), "=r"(out_fp16[2]), "=r"(out_fp16[3]), "=r"(out_fp16[4]),
+        "=r"(out_fp16[5]), "=r"(out_fp16[6]), "=r"(out_fp16[7])
+        : "l"(e2m1Vec));
+
+    array[0] = __half22float2(reinterpret_cast<__half2&>(out_fp16[0]));
+    array[1] = __half22float2(reinterpret_cast<__half2&>(out_fp16[1]));
+    array[2] = __half22float2(reinterpret_cast<__half2&>(out_fp16[2]));
+    array[3] = __half22float2(reinterpret_cast<__half2&>(out_fp16[3]));
+    array[4] = __half22float2(reinterpret_cast<__half2&>(out_fp16[4]));
+    array[5] = __half22float2(reinterpret_cast<__half2&>(out_fp16[5]));
+    array[6] = __half22float2(reinterpret_cast<__half2&>(out_fp16[6]));
+    array[7] = __half22float2(reinterpret_cast<__half2&>(out_fp16[7]));
+#endif
+}
+
+template <typename DType>
+__device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr, int sizeInBytes, int laneId)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    int const numElems = sizeInBytes / sizeof(DType);
+    if (numElems <= 0)
+    {
+        return;
+    }
+
+    int const numGroups = (numElems + WARP_SIZE * 16 - 1) / (WARP_SIZE * 16);
+
+    // New layout matches quantize: per-group blocks of [8*WARP_SIZE bytes values][WARP_SIZE bytes scales],
+    // followed by a single 4-byte global scale at the end.
+    int const inputBlockSizeInBytes = 8 * WARP_SIZE + WARP_SIZE;
+    uint8_t* const globalScaleOutBytes = compact_ptr + numGroups * inputBlockSizeInBytes;
+    float const SFScaleVal = reciprocal_approximate_ftz(*reinterpret_cast<float const*>(globalScaleOutBytes));
+
+    DType* out = reinterpret_cast<DType*>(compact_ptr);
+
+    // Process groups in reverse order to avoid overwriting packed input before it is read
+    for (int groupId = numGroups - 1; groupId >= 0; --groupId)
+    {
+        int const groupStart = laneId * 16 + groupId * (WARP_SIZE * 16);
+        uint8_t const* const inValPtr = compact_ptr + groupId * inputBlockSizeInBytes + laneId * sizeof(uint64_t);
+        uint64_t const packed = reinterpret_cast<uint64_t const*>(inValPtr)[0];
+
+        uint8_t const* const inScalePtr
+            = compact_ptr + groupId * inputBlockSizeInBytes + WARP_SIZE * sizeof(uint64_t) + laneId * sizeof(uint8_t);
+        __nv_fp8_e4m3 sf8;
+        sf8.__x = inScalePtr[0];
+        float const SFValueNarrow = static_cast<float>(sf8);
+        float const dequantScale = SFScaleVal * SFValueNarrow;
+
+        float2 tmp[8];
+        e2m1_to_fp32_vec(packed, tmp);
+
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+        {
+            int idx0 = groupStart + (t << 1);
+            if (idx0 < numElems)
+            {
+                out[idx0] = tensorrt_llm::common::cuda_cast<DType>(tmp[t].x * dequantScale);
+                out[idx0 + 1] = tensorrt_llm::common::cuda_cast<DType>(tmp[t].y * dequantScale);
+            }
+        }
+    }
+#endif
+}
 
 static __device__ __forceinline__ uint32_t __as_ptr_smem(void const* __ptr)
 {
@@ -174,7 +421,8 @@ __device__ __forceinline__ void cp_async_bulk_wait_group_read()
 #endif
 }
 
-__host__ void MoeCommFieldInfo::fillFieldInfo(uint8_t* dataPtr, size_t elementSize, int vectorSize, int stride)
+__host__ void MoeCommFieldInfo::fillFieldInfo(
+    uint8_t* dataPtr, size_t elementSize, int vectorSize, int stride, cudaDataType_t dataType)
 {
     TLLM_CHECK(elementSize == 1 || elementSize == 2 || elementSize == 4 || elementSize == 8 || elementSize == 16);
 
@@ -212,6 +460,7 @@ __host__ void MoeCommFieldInfo::fillFieldInfo(uint8_t* dataPtr, size_t elementSi
 
     alignedUnitCount = vectorSize;
     alignedUnitStride = stride;
+    originalDataType = dataType;
 }
 
 class Ll128Proto
@@ -640,7 +889,7 @@ __device__ __forceinline__ void s2gAllFields(FusedMoeFieldInfo const& recvFieldI
     cp_async_bulk_commit_group();
 }
 
-template <int FIELD_COUNT, bool HAS_BASIC_FIELD = true>
+template <int FIELD_COUNT, bool HAS_BASIC_FIELD = true, bool LOW_PRECISION = false>
 class SingleChannelCommunicator
 {
 public:
@@ -657,6 +906,11 @@ public:
         , mSmemBar(smemBar)
         , mShmemBase(shmemBase)
     {
+        if constexpr (LOW_PRECISION)
+        {
+            static_assert(FIELD_COUNT == 1, "Low precision alltoall only support 1 field");
+        }
+
         mWarpId = threadIdx.x / WARP_SIZE;
         mLaneId = threadIdx.x % WARP_SIZE;
 
@@ -773,6 +1027,25 @@ public:
             tensorrt_llm::kernels::fused_moe_impl::packAllFields<FIELD_COUNT>(
                 mFieldInfo, tokenIndex, mShmemBase, mLaneId);
 
+            if constexpr (LOW_PRECISION)
+            {
+                // quantize here.
+                int alignedUnitBit = mFieldInfo.fieldsInfo[0].alignedUnitBit;
+                int alignedUnitCount = mFieldInfo.fieldsInfo[0].alignedUnitCount;
+                int sizeInBytes = alignedUnitCount * (1 << alignedUnitBit);
+                uint8_t* sharedMemoryCompact = mShmemBase + mFieldInfo.fieldsInfo[0].getCompactShmOffset();
+                cudaDataType_t originalDataType = mFieldInfo.fieldsInfo[0].originalDataType;
+
+                switch (originalDataType)
+                {
+                case CUDA_R_16BF:
+                    quantize_nvfp4_sharedmem<__nv_bfloat16>(sharedMemoryCompact, sizeInBytes, mLaneId);
+                    break;
+                case CUDA_R_16F: quantize_nvfp4_sharedmem<half>(sharedMemoryCompact, sizeInBytes, mLaneId); break;
+                default: break;
+                }
+            }
+
             FusedMoeProto::protoPack(
                 mShmemBase, mHead, mSingleCompactData128ByteCount, mFifoEntry128ByteIndexBase, mWarpId, mLaneId);
 
@@ -837,6 +1110,25 @@ public:
 
             FusedMoeProto::protoUnpack(mShmemBase, mTail, mSingleCompactData128ByteCount, mFifoEntry128ByteIndexBase,
                 loaded128ByteCount, mWarpId, mLaneId);
+
+            if constexpr (LOW_PRECISION)
+            {
+                int alignedUnitBit = mFieldInfo.fieldsInfo[0].alignedUnitBit;
+                int alignedUnitCount = mFieldInfo.fieldsInfo[0].alignedUnitCount;
+                int sizeInBytes = alignedUnitCount * (1 << alignedUnitBit);
+                uint8_t* sharedMemoryCompact = mShmemBase + mFieldInfo.fieldsInfo[0].getCompactShmOffset();
+                cudaDataType_t originalDataType = mFieldInfo.fieldsInfo[0].originalDataType;
+
+                switch (originalDataType)
+                {
+                case CUDA_R_16BF:
+                    dequantize_nvfp4_sharedmem<__nv_bfloat16>(sharedMemoryCompact, sizeInBytes, mLaneId);
+                    break;
+                case CUDA_R_16F: dequantize_nvfp4_sharedmem<half>(sharedMemoryCompact, sizeInBytes, mLaneId); break;
+                default: break;
+                }
+            }
+
             tensorrt_llm::kernels::fused_moe_impl::unpackAllFields<FIELD_COUNT>(
                 mFieldInfo, tokenIndex, mShmemBase, mLaneId);
             tensorrt_llm::kernels::fused_moe_impl::s2gAllFields<HAS_BASIC_FIELD, FIELD_COUNT>(
@@ -883,7 +1175,7 @@ private:
     int mFifoEntryIndex;
 };
 
-template <int FIELD_COUNT = MOE_COMM_FIELD_MAX_COUNT>
+template <int FIELD_COUNT = MOE_COMM_FIELD_MAX_COUNT, bool LOW_PRECISION = false>
 __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, bool hasBasicFields)
 {
     __shared__ uint64_t allWarpSmemBar[32];
@@ -917,16 +1209,16 @@ __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorksp
         int singleShmSize = params.sendCommMeta.getSingleShmSize();
         if (hasBasicFields)
         {
-            SingleChannelCommunicator<FIELD_COUNT, true> comm(params.sendFieldInfo, params.expertParallelInfo,
-                params.sendCommMeta, workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
-                reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
+            SingleChannelCommunicator<FIELD_COUNT, true, LOW_PRECISION> comm(params.sendFieldInfo,
+                params.expertParallelInfo, params.sendCommMeta, workspace, params.worldInfo, pairInfo,
+                allWarpSmemBar + group, reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
             comm.doSend(tokenCount, groupStartPtr);
         }
         else
         {
-            SingleChannelCommunicator<FIELD_COUNT, false> comm(params.sendFieldInfo, params.expertParallelInfo,
-                params.sendCommMeta, workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
-                reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
+            SingleChannelCommunicator<FIELD_COUNT, false, LOW_PRECISION> comm(params.sendFieldInfo,
+                params.expertParallelInfo, params.sendCommMeta, workspace, params.worldInfo, pairInfo,
+                allWarpSmemBar + group, reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
             comm.doSend(tokenCount, groupStartPtr);
         }
     }
@@ -935,16 +1227,16 @@ __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorksp
         int singleShmSize = params.recvCommMeta.getSingleShmSize();
         if (hasBasicFields)
         {
-            SingleChannelCommunicator<FIELD_COUNT, true> comm(params.recvFieldInfo, params.expertParallelInfo,
-                params.recvCommMeta, workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
-                reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
+            SingleChannelCommunicator<FIELD_COUNT, true, LOW_PRECISION> comm(params.recvFieldInfo,
+                params.expertParallelInfo, params.recvCommMeta, workspace, params.worldInfo, pairInfo,
+                allWarpSmemBar + group, reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
             comm.doReceive(tokenCount, groupStartPtr);
         }
         else
         {
-            SingleChannelCommunicator<FIELD_COUNT, false> comm(params.recvFieldInfo, params.expertParallelInfo,
-                params.recvCommMeta, workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
-                reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
+            SingleChannelCommunicator<FIELD_COUNT, false, LOW_PRECISION> comm(params.recvFieldInfo,
+                params.expertParallelInfo, params.recvCommMeta, workspace, params.worldInfo, pairInfo,
+                allWarpSmemBar + group, reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
             comm.doReceive(tokenCount, groupStartPtr);
         }
     }
@@ -965,10 +1257,35 @@ int computeMoeAlltoallMaxDynamicSharedMemorySize()
 } // namespace fused_moe_impl
 
 void FusedMoeFieldInfo::fillMetaInfo(
-    MoeSingleCommMeta* singleCommMeta, int topK, bool hasScales, bool hasBasicFields) const
+    MoeSingleCommMeta* singleCommMeta, int topK, bool hasScales, bool hasBasicFields, bool isLowPrecision) const
 {
-    singleCommMeta->singleCompactAlignedSize = computeSingleCompactSize(topK, hasScales, hasBasicFields);
     singleCommMeta->singleUncompactAlignedSize = computeSingleUncompactSize(topK, hasScales, hasBasicFields);
+
+    if (isLowPrecision)
+    {
+        assert(fieldCount == 1);
+        assert(fieldsInfo[0].originalDataType == CUDA_R_16F || fieldsInfo[0].originalDataType == CUDA_R_16BF);
+
+        auto alignment128 = MoeCommFieldInfo::BYTES_PER_128B_BLOCK;
+
+        auto alignedUnitBit = fieldsInfo[0].alignedUnitBit;
+        auto alignedUnitCount = fieldsInfo[0].alignedUnitCount;
+        auto originalFieldSize = alignedUnitCount * (1 << alignedUnitBit);
+
+        int numElements = originalFieldSize / 2;
+        int numGroups = (numElements + WARP_SIZE * 16 - 1) / (WARP_SIZE * 16);
+        int sizePerGroupInBytes = (WARP_SIZE * 16 / 2 + WARP_SIZE * 1);
+
+        int totalSize = numGroups * sizePerGroupInBytes + 4;
+        int compactSize = (totalSize + alignment128 - 1) / alignment128 * alignment128;
+
+        singleCommMeta->singleCompactAlignedSize = compactSize;
+        singleCommMeta->singleTransferAlignedSize
+            = FusedMoeProto::computeProtoTransfer128ByteAlignedSize(singleCommMeta->singleCompactAlignedSize);
+        return;
+    }
+
+    singleCommMeta->singleCompactAlignedSize = computeSingleCompactSize(topK, hasScales, hasBasicFields);
     singleCommMeta->singleTransferAlignedSize
         = FusedMoeProto::computeProtoTransfer128ByteAlignedSize(singleCommMeta->singleCompactAlignedSize);
 }
@@ -1029,11 +1346,17 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
     int groupCountPerCta = std::min(maxGroupCountPerCta, maxDynamicShmSize / warpShmSize);
 
     int maxFieldCount = std::max(params.sendFieldInfo.fieldCount, params.recvFieldInfo.fieldCount);
-    auto getFunc = [](int fieldCount)
+    TLLM_CHECK_WITH_INFO(params.isLowPrecision == false || maxFieldCount == 1, "low precision only support 1 field");
+
+    auto getFunc = [](int fieldCount, bool lowPrecision)
     {
         switch (fieldCount)
         {
-        case 1: return fused_moe_impl::moeAllToAllKernel<1>;
+        case 1:
+            if (lowPrecision)
+                return fused_moe_impl::moeAllToAllKernel<1, true>;
+            else
+                return fused_moe_impl::moeAllToAllKernel<1>;
         case 2: return fused_moe_impl::moeAllToAllKernel<2>;
         case 3: return fused_moe_impl::moeAllToAllKernel<3>;
         case 4: return fused_moe_impl::moeAllToAllKernel<4>;
@@ -1045,7 +1368,7 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
         }
         return fused_moe_impl::moeAllToAllKernel<8>;
     };
-    auto* kernelFn = getFunc(maxFieldCount);
+    auto* kernelFn = getFunc(maxFieldCount, params.isLowPrecision);
 
     if (groupCountPerCta * warpShmSize > 48 * 1024)
     {
@@ -1158,7 +1481,7 @@ void launchSingleG2S(FusedMoeFieldInfo const& sendFieldInfo, MoeExpertParallelIn
     dim3 gridDim((tokenCount + warpsPerBlock - 1) / warpsPerBlock, 1, 1);
     MoeSingleCommMeta singleCommMeta;
     sendFieldInfo.fillMetaInfo(
-        &singleCommMeta, expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields);
+        &singleCommMeta, expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields, false);
     TLLM_CUDA_CHECK(
         cudaFuncSetAttribute(g2sKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, warpShmSize * warpsPerBlock));
     g2sKernel<<<gridDim, blockDim, warpShmSize * warpsPerBlock, stream>>>(
@@ -1211,7 +1534,7 @@ void launchSingleS2G(FusedMoeFieldInfo const& recvFieldInfo, MoeExpertParallelIn
     dim3 gridDim((tokenCount + warpsPerBlock - 1) / warpsPerBlock, 1, 1);
     MoeSingleCommMeta singleCommMeta;
     recvFieldInfo.fillMetaInfo(
-        &singleCommMeta, expertParallelInfo.topK, recvFieldInfo.expertScales != nullptr, hasBasicFields);
+        &singleCommMeta, expertParallelInfo.topK, recvFieldInfo.expertScales != nullptr, hasBasicFields, false);
     TLLM_CUDA_CHECK(
         cudaFuncSetAttribute(s2gKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, warpShmSize * warpsPerBlock));
     s2gKernel<<<gridDim, blockDim, warpShmSize * warpsPerBlock, stream>>>(
@@ -1291,9 +1614,9 @@ void launchLoopback(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo co
 {
     MoeSingleCommMeta sendCommMeta, recvCommMeta;
     sendFieldInfo.fillMetaInfo(
-        &sendCommMeta, expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields);
+        &sendCommMeta, expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields, false);
     recvFieldInfo.fillMetaInfo(
-        &recvCommMeta, expertParallelInfo.topK, recvFieldInfo.expertScales != nullptr, hasBasicFields);
+        &recvCommMeta, expertParallelInfo.topK, recvFieldInfo.expertScales != nullptr, hasBasicFields, false);
     int warpSendShmSize = sendCommMeta.getSingleShmSize();
     int warpRecvShmSize = recvCommMeta.getSingleShmSize();
     int warpShmSize = warpSendShmSize;
@@ -1354,9 +1677,9 @@ void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFie
 {
     MoeSingleCommMeta sendCommMeta, recvCommMeta;
     sendFieldInfo.fillMetaInfo(
-        &sendCommMeta, expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields);
+        &sendCommMeta, expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields, false);
     recvFieldInfo.fillMetaInfo(
-        &recvCommMeta, expertParallelInfo.topK, recvFieldInfo.expertScales != nullptr, hasBasicFields);
+        &recvCommMeta, expertParallelInfo.topK, recvFieldInfo.expertScales != nullptr, hasBasicFields, false);
     int warpSendShmSize = sendCommMeta.getSingleShmSize();
     int warpRecvShmSize = recvCommMeta.getSingleShmSize();
     int warpShmSize = warpSendShmSize;
