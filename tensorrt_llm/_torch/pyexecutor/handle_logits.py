@@ -12,10 +12,15 @@ class HandleLogits:
 
     @torch.inference_mode()
     @nvtx_range("handle_logits")
-    def __call__(self, context_requests: List[LlmRequest],
-                 generation_requests: List[LlmRequest], logits: torch.Tensor,
-                 beam_width: int, num_context_logits_prefix_sum: list[int],
-                 is_generation_model: bool):
+    def __call__(
+        self,
+        context_requests: List[LlmRequest],
+        generation_requests: List[LlmRequest],
+        logits: torch.Tensor,
+        beam_width: int,
+        num_context_logits_prefix_sum: list[int],
+        is_generation_model: bool,
+    ):
         """Handles context and generation logits for a batch of requests.
 
         Args:
