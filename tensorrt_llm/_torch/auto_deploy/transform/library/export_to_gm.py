@@ -66,14 +66,21 @@ class ExportToGM(BaseTransform):
         cm.info.set_example_sequence(**factory.get_example_inputs())
 
         # export the model to a graph module
-        gm = torch_export_to_gm(
-            model,
-            args=cm.args,
-            dynamic_shapes=cm.dynamic_shapes,
-            clone=self.config.clone_state_dict,
-            strict=self.config.strict,
-            patch_list=self.config.patch_list,
-        )
+
+        # TODO: revert. this is just a hack to run export with debugger
+        # torch.export don't always work together nicely. But I can set a breakpoin here
+        # and then manually create the gm in the debugger console and then continue
+        if False:
+            gm = None
+        else:
+            gm = torch_export_to_gm(
+                model,
+                args=cm.args,
+                dynamic_shapes=cm.dynamic_shapes,
+                clone=self.config.clone_state_dict,
+                strict=self.config.strict,
+                patch_list=self.config.patch_list,
+            )
 
         # this is a clean graph by definition since it was just exported
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)

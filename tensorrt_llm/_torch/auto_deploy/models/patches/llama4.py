@@ -1,15 +1,13 @@
+"""A patch to handle vision branch in Llama4ForConditionalGeneration."""
+
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from _model_test_utils import _hf_model_dir_or_hub_id
-from PIL import Image
-from transformers import AutoConfig, AutoProcessor, Llama4ForConditionalGeneration
+from transformers import Llama4ForConditionalGeneration
 from transformers.models.llama4.modeling_llama4 import Llama4CausalLMOutputWithPast
-from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
 
 # Copy from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama4/modeling_llama4.py#L1651
@@ -161,84 +159,27 @@ def _forward_with_cond(
     )
 
 
-def test_build_run_llama4_vlm():
-    atol = 1e-3
-    rtol = 1e-3
+@ExportPatchRegistry.register("hf_llama4_vision")
+class Llama4VisionPatch(BaseExportPatch):
+    """Patch for Llama4ForConditionalGeneration to make it compatible with torch.export.
 
-    model_id = _hf_model_dir_or_hub_id(
-        f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
-        "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-    )
-    processor = AutoProcessor.from_pretrained(model_id)
+    This patch replaces the forward method of Llama4ForConditionalGeneration with
+    a version that uses the torch.cond to handle the optional vision branch.
+    """
 
-    config = AutoConfig.from_pretrained(model_id)
-    config.text_config.num_hidden_layers = 2
-    config.text_config.intermediate_size = 64
-    config.text_config.intermediate_size_mlp = 128
-    config.vision_config.num_hidden_layers = 2
-
-    # The returned cache <class 'transformers.cache_utils.HybridChunkedCache'> breaks torch.export
-    config.text_config.use_cache = False
-
-    model = Llama4ForConditionalGeneration(config).eval().to("cuda").bfloat16()
-
-    img1 = Image.new("RGB", (16, 16), color=(128, 128, 128))
-    img2 = Image.new("RGB", (16, 16), color=(64, 64, 64))
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img1},
-                {"type": "image", "image": img2},
-                {
-                    "type": "text",
-                    "text": "Describe what you see in the two images and their differences.",
-                },
-            ],
-        },
-    ]
-
-    inputs = (
-        processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
+    def _apply_patch(self):
+        """Apply the Llama4 vision patch."""
+        # Store original forward method
+        self.original_values["Llama4ForConditionalGeneration.forward"] = (
+            Llama4ForConditionalGeneration.forward
         )
-        .to(model.device)
-        .to(torch.bfloat16)
-    )
 
-    with torch.inference_mode():
-        # the original model queried with text-only
-        out_text_only = model(inputs["input_ids"], None, inputs["attention_mask"])
+        # Apply patch by replacing the forward method
+        Llama4ForConditionalGeneration.forward = _forward_with_cond
 
-    Llama4ForConditionalGeneration.forward = _forward_with_cond
-
-    with torch.inference_mode():
-        out_real = model(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
-        out_dummy = model(
-            inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
-        )
-        torch.testing.assert_close(out_dummy.logits, out_text_only.logits, rtol=rtol, atol=atol)
-
-    gm = torch_export_to_gm(
-        model,
-        (inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"]),
-        kwargs={},
-    )
-    move_to_device(gm, model.device)
-
-    with torch.inference_mode():
-        out_real_gm = gm(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
-        torch.testing.assert_close(out_real.logits, out_real_gm.logits, rtol=rtol, atol=atol)
-        out_dummy_gm = gm(
-            inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
-        )
-        torch.testing.assert_close(out_dummy.logits, out_dummy_gm.logits, rtol=rtol, atol=atol)
-        torch.testing.assert_close(out_dummy_gm.logits, out_text_only.logits, rtol=rtol, atol=atol)
-
-        assert not torch.allclose(out_real.logits, out_dummy.logits, rtol=rtol, atol=atol), (
-            "Expected outputs to differ between text only input and text+image input"
-        )
+    def _revert_patch(self):
+        """Revert the Llama4 vision patch."""
+        # Restore original forward method
+        Llama4ForConditionalGeneration.forward = self.original_values[
+            "Llama4ForConditionalGeneration.forward"
+        ]
