@@ -2445,10 +2445,12 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         [
             (8, 1, 8, True, True, True, "CUTLASS", False),
             (8, 1, 8, True, True, True, "TRTLLM", False),
+            (8, 1, 8, True, True, True, "TRTLLM", True),
         ],
         ids=[
             "latency_moe_cutlass",
             "latency_moe_trtllm",
+            "latency_moe_trtllm_eagle3",
         ],
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
