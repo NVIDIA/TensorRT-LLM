@@ -1264,20 +1264,19 @@ struct Gmem_tile_o_qgmma_fp32_16bits
 #else
         constexpr bool Scale = true;
 #endif
-#define STORE_COLUMNS()                                                                            \
-    {                                                                                              \
-        /* we assume M = 1. some shortcuts. */                                                     \
-        static_assert(M == 1);                                                                     \
-        uint4 _src = {                                                                             \
-            .x = acc[0][mma_ni].reg(((ci + 0) * ROWS_PER_THREAD + ri) * 2),                        \
-            .y = acc[0][mma_ni].reg(((ci + 1) * ROWS_PER_THREAD + ri) * 2),                        \
-            .z = acc[0][mma_ni].reg(((ci + 0) * ROWS_PER_THREAD + ri) * 2 + 1),                    \
-            .w = acc[0][mma_ni].reg(((ci + 1) * ROWS_PER_THREAD + ri) * 2 + 1),                    \
-        };                                                                                         \
-        uint2 _dst = Acc_packer<float, Output_type, Scale>::run(this, _src);                       \
-        int64_t _offset =                                                                          \
-            (int64_t)ri * step_m + (int64_t)(ci + mma_ni * COLS_PER_THREAD) * STEP_N;              \
-        fmha::stg(o_ptr_ + _offset, _dst);                                                         \
+#define STORE_COLUMNS()                                                                                                \
+    {                                                                                                                  \
+        /* we assume M = 1. some shortcuts. */                                                                         \
+        static_assert(M == 1);                                                                                         \
+        uint4 _src = {                                                                                                 \
+            .x = acc[0][mma_ni].reg(((ci + 0) * ROWS_PER_THREAD + ri) * 2),                                            \
+            .y = acc[0][mma_ni].reg(((ci + 1) * ROWS_PER_THREAD + ri) * 2),                                            \
+            .z = acc[0][mma_ni].reg(((ci + 0) * ROWS_PER_THREAD + ri) * 2 + 1),                                        \
+            .w = acc[0][mma_ni].reg(((ci + 1) * ROWS_PER_THREAD + ri) * 2 + 1),                                        \
+        };                                                                                                             \
+        uint2 _dst = Acc_packer<float, Output_type, Scale>::run(this, _src);                                           \
+        int64_t _offset = (int64_t) ri * step_m + (int64_t) (ci + mma_ni * COLS_PER_THREAD) * STEP_N;                  \
+        fmha::stg(o_ptr_ + _offset, _dst);                                                                             \
     }
 
 #pragma unroll
