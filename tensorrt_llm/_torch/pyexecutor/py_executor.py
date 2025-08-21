@@ -1181,6 +1181,17 @@ class PyExecutor:
 
     def _validate_request(self, request: LlmRequest):
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
+            # Only skip token‐range checks for Llama4 when the request has multimodal data
+            from ..models.modeling_llama import Llama4ForConditionalGeneration
+            if isinstance(self.model_engine.model,
+                          Llama4ForConditionalGeneration):
+                has_mm = bool(request.py_multimodal_data)
+                if has_mm:
+                    logger.debug(
+                        f"Skipping token-range validation for {type(self.model_engine.model).__name__} "
+                        "(multimodal request)")
+                    return
+
             # FIXME: This check is necessary because of how Qwen2ForProcessRewardModel
             #        subclasses DecoderModelForCausalLM. Perhaps the functionality
             #        of DecoderModelForCausalLM reused by Qwen2ForProcessRewardModel
