@@ -3,8 +3,8 @@ import json
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, Any, Callable, List, Literal, NamedTuple,
-                    Optional, TypeAlias, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
+                    NamedTuple, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
 import torch
@@ -178,6 +178,7 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
+        self._mm_embedding_handle: Optional[Dict[str, Any]] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -213,6 +214,10 @@ class GenerationResultBase:
     @property
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
+
+    @property
+    def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
+        return self._mm_embedding_handle
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -357,6 +362,10 @@ class GenerationResultBase:
 
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
+
+            if hasattr(response_result, 'mm_embedding_handle'
+                       ) and response_result.mm_embedding_handle is not None:
+                self._mm_embedding_handle = response_result.mm_embedding_handle
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -606,7 +615,7 @@ class GenerationResult(GenerationResultBase):
     def _repr_fields(self):
         return [
             'request_id', 'prompt_token_ids', 'outputs', 'finished',
-            "context_logits"
+            "context_logits", "mm_embedding_handle"
         ]
 
     def __repr__(self) -> str:
