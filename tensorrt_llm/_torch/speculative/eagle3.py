@@ -338,7 +338,7 @@ class Eagle3OneModelWorker(nn.Module):
                                                   draft_model.lm_head,
                                                   attn_metadata, True)
             if self.guided_worker is not None:
-                d2t = getattr(draft_model.model, 'dt2', None)
+                d2t = getattr(draft_model.model, "d2t", None)
                 self.guided_worker.execute_draft_batch(
                     logits,
                     d2t,
@@ -463,7 +463,7 @@ class Eagle3OneModelWorker(nn.Module):
         draft_tokens = torch.argmax(logits, dim=-1)
 
         # Apply d2t (offsets between draft model dictionary and main model dictionary).
-        if (d2t := getattr(draft_model.model, 'dt2', None)):
+        if (d2t := getattr(draft_model.model, "d2t", None)) is not None:
             draft_tokens = d2t[draft_tokens] + draft_tokens
 
         draft_tokens = draft_tokens.type(torch.int32)
