@@ -1840,6 +1840,77 @@ class BaseLlmArgs(StrictBaseModel):
     def set_tokenizer(self, tokenizer):
         self.tokenizer = tokenizer
 
+    def get_executor_config(self,
+                            _hf_model_dir: Optional[Path] = None
+                            ) -> _ExecutorConfig:
+        executor_config = _ExecutorConfig(
+            max_beam_width=self.max_beam_width,
+            scheduler_config=PybindMirror.maybe_to_pybind(
+                self.scheduler_config),
+            max_batch_size=self.max_batch_size,
+            max_num_tokens=self.max_num_tokens,
+            gather_generation_logits=self.gather_generation_logits,
+            fail_fast_on_attention_window_too_large=getattr(
+                self, 'fail_fast_on_attention_window_too_large', False),
+        )
+
+        if self.kv_cache_config is not None:
+            executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
+                self.kv_cache_config)
+        if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+            # Disable KV cache reuse for deterministic mode
+            executor_config.kv_cache_config.enable_block_reuse = False
+            executor_config.kv_cache_config.enable_partial_reuse = False
+        if self.peft_cache_config is not None:
+            executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
+                self.peft_cache_config)
+        if self.decoding_config is not None:
+            executor_config.decoding_config = self.decoding_config
+        if self.guided_decoding_backend == 'xgrammar':
+            executor_config.guided_decoding_config = _GuidedDecodingConfig(
+                backend=_GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+                **_xgrammar_tokenizer_info(self.tokenizer))
+        elif self.guided_decoding_backend == 'llguidance':
+            executor_config.guided_decoding_config = _GuidedDecodingConfig(
+                backend=_GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
+                **_llguidance_tokenizer_info(self.tokenizer))
+        elif self.guided_decoding_backend is not None:
+            raise ValueError(
+                f"Unsupported guided decoding backend {self.guided_decoding_backend}"
+            )
+
+        executor_config.enable_chunked_context = self.enable_chunked_prefill
+        executor_config.max_beam_width = self.max_beam_width
+        if self.cache_transceiver_config is not None:
+            executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
+                self.cache_transceiver_config)
+
+        from tensorrt_llm._torch.pyexecutor.config import update_executor_config
+
+        spec_config = self.speculative_config
+        max_batch_size = executor_config.max_batch_size
+
+        if spec_config is not None and spec_config.decoding_type == "AUTO":
+            from tensorrt_llm._torch.speculative import suggest_spec_config
+            spec_config = suggest_spec_config(max_batch_size)
+
+        update_executor_config(
+            executor_config,
+            backend=self.backend,
+            pytorch_backend_config=self.get_pytorch_backend_config()
+            if self.backend in ["pytorch", "_autodeploy"] else None,
+            mapping=self.parallel_config.to_mapping(),
+            speculative_config=spec_config,
+            hf_model_dir=_hf_model_dir,
+            max_input_len=self.max_input_len,
+            max_seq_len=self.max_seq_len,
+            checkpoint_format=None
+            if self.backend == "_autodeploy" else self.checkpoint_format,
+            checkpoint_loader=None
+            if self.backend == "_autodeploy" else self.checkpoint_loader)
+
+        return executor_config
+
 
 class TrtLlmArgs(BaseLlmArgs):
 
@@ -2392,73 +2463,8 @@ class TorchLlmArgs(BaseLlmArgs):
     def get_executor_config(self,
                             _hf_model_dir: Optional[Path] = None
                             ) -> _ExecutorConfig:
-        executor_config = _ExecutorConfig(
-            max_beam_width=self.max_beam_width,
-            scheduler_config=PybindMirror.maybe_to_pybind(
-                self.scheduler_config),
-            max_batch_size=self.max_batch_size,
-            max_num_tokens=self.max_num_tokens,
-            gather_generation_logits=self.gather_generation_logits,
-            fail_fast_on_attention_window_too_large=getattr(
-                self, 'fail_fast_on_attention_window_too_large', False),
-        )
-
-        if self.kv_cache_config is not None:
-            executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
-                self.kv_cache_config)
-        if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
-            # Disable KV cache reuse for deterministic mode
-            executor_config.kv_cache_config.enable_block_reuse = False
-            executor_config.kv_cache_config.enable_partial_reuse = False
-        if self.peft_cache_config is not None:
-            executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
-                self.peft_cache_config)
-        if self.decoding_config is not None:
-            executor_config.decoding_config = self.decoding_config
-        if self.guided_decoding_backend == 'xgrammar':
-            executor_config.guided_decoding_config = _GuidedDecodingConfig(
-                backend=_GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
-                **_xgrammar_tokenizer_info(self.tokenizer))
-        elif self.guided_decoding_backend == 'llguidance':
-            executor_config.guided_decoding_config = _GuidedDecodingConfig(
-                backend=_GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
-                **_llguidance_tokenizer_info(self.tokenizer))
-        elif self.guided_decoding_backend is not None:
-            raise ValueError(
-                f"Unsupported guided decoding backend {self.guided_decoding_backend}"
-            )
-
-        executor_config.enable_chunked_context = self.enable_chunked_prefill
-        executor_config.max_beam_width = self.max_beam_width
-        if self.cache_transceiver_config is not None:
-            executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
-                self.cache_transceiver_config)
-
-        from tensorrt_llm._torch.pyexecutor.config import update_executor_config
-
-        spec_config = self.speculative_config
-        max_batch_size = executor_config.max_batch_size
-
-        if spec_config is not None and spec_config.decoding_type == "AUTO":
-            from tensorrt_llm._torch.speculative import suggest_spec_config
-            spec_config = suggest_spec_config(max_batch_size)
-
-        update_executor_config(
-            executor_config,
-            backend=self.backend,
-            pytorch_backend_config=self.get_pytorch_backend_config()
-            if self.backend in ["pytorch", "_autodeploy"] else None,
-            mapping=self.parallel_config.to_mapping(),
-            speculative_config=spec_config,
-            hf_model_dir=_hf_model_dir,
-            max_input_len=self.max_input_len,
-            max_seq_len=self.max_seq_len,
-            checkpoint_format=None
-            if self.backend == "_autodeploy" else self.checkpoint_format,
-            checkpoint_loader=None
-            if self.backend == "_autodeploy" else self.checkpoint_loader,
-            mm_encoder_only=self.mm_encoder_only)
-
+        executor_config = super().get_executor_config(_hf_model_dir)
+        executor_config.mm_encoder_only = self.mm_encoder_only
         return executor_config
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
