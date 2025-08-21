@@ -2230,11 +2230,7 @@ class TorchLlmArgs(BaseLlmArgs):
             else:
                 config.max_batch_size = max(config.batch_sizes)
         else:
-            # Use the max batch size from:
-            #   1. cuda_graph_config.max_batch_size, if provided,
-            #   2. base_llm_args.max_batch_size, if provided,
-            #   3. default value 128.
-            max_batch_size = config.max_batch_size or self.max_batch_size or 128
+            max_batch_size = config.max_batch_size or 128
             generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
                 max_batch_size, config.enable_padding)
             config.batch_sizes = generated_sizes
