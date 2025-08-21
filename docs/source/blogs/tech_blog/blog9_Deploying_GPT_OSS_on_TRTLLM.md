@@ -21,9 +21,9 @@ In this section, we introduce several ways to install TensorRT-LLM.
 
 ###  NGC Docker Image
 
-Visit the [NGC TensorRT-LLM Release page](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release) to find the most up-to-date NGC container image to use. You can also check the latest [release notes](https://github.com/NVIDIA/TensorRT-LLM/releases) to keep track of the support status of latest releases.
+Visit the [NGC TensorRT-LLM Release page](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release) to find the most up-to-date NGC container image to use. You can also check the latest [release notes](https://github.com/NVIDIA/TensorRT-LLM/releases) to keep track of the support status of the latest releases.
 
-Run the following docker command to start the TensorRT-LLM container in interactive mode (change image tag to match latest release):
+Run the following Docker command to start the TensorRT-LLM container in interactive mode (change the image tag to match latest release):
 
 ```bash
 docker run --rm --ipc=host -it \
@@ -53,9 +53,9 @@ Additionally, the container mounts your user `.cache` directory to save the down
 Support for gpt-oss has been [merged](https://github.com/NVIDIA/TensorRT-LLM/pull/6645) into the **main branch** of TensorRT-LLM. As we continue to optimize gpt-oss performance, you can build TensorRT-LLM from source to get the latest features and support. Please refer to the [doc](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html) if you want to build from source yourself.
 
 
-### TensorRT-LLM PIP Wheel Install
+### TensorRT-LLM Python Wheel Install
 
-Regular releases of TensorRT-LLM are also provided as [pip Python wheels](https://pypi.org/project/tensorrt-llm/#history). You can find instructions on pip install [here](https://nvidia.github.io/TensorRT-LLM/installation/linux.html).
+Regular releases of TensorRT-LLM are also provided as [Python wheels](https://pypi.org/project/tensorrt-llm/#history). You can find instructions on the pip install [here](https://nvidia.github.io/TensorRT-LLM/installation/linux.html).
 
 
 ## Performance Benchmarking and Model Serving
