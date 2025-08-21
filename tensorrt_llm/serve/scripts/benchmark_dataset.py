@@ -563,7 +563,9 @@ class RandomDataset(BenchmarkDataset):
                     prompt, add_special_tokens=False)
                 while len(re_encoded_token_ids) < total_input_len_expected:
                     # Append a new random sequence to the existing sequence
-                    new_random_offset = np.random.randint(0, vocab_size)
+                    new_random_offset = int(
+                        torch.randint(0, vocab_size, (1, ),
+                                      generator=self.rng).item())
                     new_inner_seq = gen_inner_sequence(input_lens[i], i,
                                                        new_random_offset,
                                                        vocab_size)
