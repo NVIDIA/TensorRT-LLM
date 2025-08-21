@@ -28,113 +28,115 @@ namespace kernels
 {
 // clang-format off
 
-#define TLLM_GEN_COMMIT "744dc79e"
-#define TLLM_GEN_EXPORT_VERSION "6.0"
+#define TLLM_GEN_COMMIT "541a9315-dirty"
+#define TLLM_GEN_EXPORT_VERSION "7.0"
 
 static constexpr size_t tllmGenGemmListLen = 46;
 
 #ifndef EXCLUDE_SM_100
-extern unsigned char GemmKernel_Bfloat16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_Bfloat16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp32_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin[];
-extern unsigned char GemmKernel_Fp32_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char GemmKernel_MxE4m3_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x128x256u2_s3_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp32_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin[];
+extern unsigned char Gemm_Fp32_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin[];
+extern unsigned char Gemm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin[];
 #endif // EXCLUDE_SM_100
 
 #ifndef EXCLUDE_SM_100
-extern unsigned int GemmKernel_Bfloat16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_Bfloat16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp32_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len;
-extern unsigned int GemmKernel_Fp32_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int GemmKernel_MxE4m3_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x128x256u2_s3_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp32_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_Fp32_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len;
+extern unsigned int Gemm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len;
 #endif // EXCLUDE_SM_100
 
 
 static const gemm::GemmConfig tllmGenGemmList[] = {
 #ifndef EXCLUDE_SM_100
-{GemmKernel_Bfloat16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin, GemmKernel_Bfloat16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len, 150528, "gemmKernel_Bfloat16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a", 320, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin, Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len, 150528, "gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f", 320, "6a6c5cafe70ce06f400e64a3d186bb96a1dbd5a571f9aa054ca445fc9be3655e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -142,6 +144,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(17826818)
 , /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17826818)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -158,6 +162,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 64
 , /* mMmaKind */ trtllm::gen::MmaKind(4)
@@ -173,11 +179,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 0
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -191,12 +196,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 175104, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 175104, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "dea55bdf170fc6467274bebcf4307d20c5bc496238e7a8503a90d4553548cd43", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -204,6 +213,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -220,6 +231,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -235,11 +248,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -253,12 +265,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 175104, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 175104, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "8bfcfc8804ce3501f27798148d3fe15c5b1b2d5af72e5d8efc2b2a1aad197a8c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -266,6 +282,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -282,6 +300,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -297,11 +317,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -315,12 +334,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len, 168960, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len, 168960, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f", 224, "fcc46b3bdbe05256cf17cda8c1237b9542e48a77c99c6075f276bf3a072e19bd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -328,6 +351,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -344,6 +369,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -359,11 +386,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 0
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -377,12 +403,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 84992, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 84992, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "e25ad34790084c9db01bbc5a1846b6c9c4ada1b1bd06c877127b9564dfc7721d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -390,6 +420,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -406,6 +438,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -421,11 +455,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 16
@@ -439,12 +472,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 84992, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 84992, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "97e18b9a3f02a082084c0a6a0e4326d2c517fedb70b57fb407de9947aa50cc5f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -452,6 +489,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -468,6 +507,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -483,11 +524,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 16
@@ -501,12 +541,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 97280, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 97280, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "e93e07c9c6bc22d867701326816458185424689990ccdc2b11f3fb592da2f1ae", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -514,6 +558,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -530,6 +576,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -545,11 +593,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 32
@@ -563,12 +610,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 97280, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 97280, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "4635e52d2c0807c3c415e5615e6a3d050687797d31cb3f6e98d30017bc56b9e3", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -576,6 +627,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -592,6 +645,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -607,11 +662,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 32
@@ -625,12 +679,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 123904, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 123904, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "c08893f6ee51fb1c85e28ca5738cd77c03ff3ce27258a1616653eccac3bdce4c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -638,6 +696,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -654,6 +714,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -669,11 +731,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 64
@@ -687,12 +748,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 123904, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 123904, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "f91216aba20a3d6057eb57a866b1b13e4b5baef55d00d7625c8c76cb9cf3451d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -700,6 +765,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -716,6 +783,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -731,11 +800,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 64
@@ -749,12 +817,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 78848, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 78848, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "4c2099d87c5586924a39ef7b39d95aba1adcc2a12f69cb26ea505cb4b897cb9c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -762,6 +834,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -778,6 +852,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -793,11 +869,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -811,12 +886,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 78848, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 78848, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "a79225fceac1021256d4f5b0239d1bdcd7cf020d4e56b1abcc80d246d61a18f6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -824,6 +903,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -840,6 +921,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -855,11 +938,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -873,12 +955,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len, 217088, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len, 217088, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f", 224, "d716a4d68403dd2789c25a0e5c411d01b9405576fa65e9645be6b460ed0a5fd6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -886,6 +972,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -902,6 +990,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -917,11 +1007,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -935,12 +1024,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin_len, 215040, "gemmKernel_Bfloat16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin, Gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin_len, 215040, "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f", 224, "27a2b9b676e7f8839a02cb32727772ef9284d2339a9b53395f3d4076f5a3c4d9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 2
@@ -948,6 +1041,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -964,6 +1059,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -979,11 +1076,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(2)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -997,12 +1093,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Bfloat16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_Bfloat16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len, 225280, "gemmKernel_Bfloat16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin, Gemm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len, 225280, "gemm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f", 448, "11951614660da946b080c33c4c75e7cee5c5c4b6b5f8d91ca2657e506fd04054", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1010,6 +1110,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(17826828)
 , /* mDtypeB */ trtllm::gen::Dtype(17827853)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826828)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17827853)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1026,6 +1128,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(5)
@@ -1041,11 +1145,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -1059,12 +1162,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(1)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(1)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 158720, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 158720, "gemm_E4m3_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "049686d936f30c2878246522a039cd9b8a2e31c07e95957f3ca3c4785b171e6c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1072,6 +1179,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1088,6 +1197,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1103,11 +1214,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -1121,12 +1231,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 158720, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 158720, "gemm_E4m3_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "f3b165454b19252d9c9e7372687811691c166825d1f0974cfd6b91ac083adc8e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1134,6 +1248,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1150,6 +1266,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1165,11 +1283,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -1183,12 +1300,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len, 218112, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x128x256u2_s3_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x128x256u2_s3_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len, 218112, "gemm_E4m3_E4m3E4m3_Fp32_t128x128x256u2_s3_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f", 224, "6174bf15535fc5f7ce7b1a572ffd86467579ac19a5d6ae295c12d757563c6e38", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1196,6 +1317,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1212,6 +1335,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1227,11 +1352,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 0
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -1245,12 +1369,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 82944, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 82944, "gemm_E4m3_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "13425ef49b8f6cbba1a031a86b1e009c7f2368c1ff6d60fc7557ff34ce0c5ae2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1258,6 +1386,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1274,6 +1404,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1289,11 +1421,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 16
@@ -1307,12 +1438,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 82944, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 82944, "gemm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "21df46f86e6c45b8c7d58758a8b55d79b88b154481615e8139c1e092631b4085", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1320,6 +1455,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1336,6 +1473,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1351,11 +1490,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 16
@@ -1369,12 +1507,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 93184, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 93184, "gemm_E4m3_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "a214f011d83d838d386cc65f6c4f639621b237062dc2aac8a2d882bca88f26f2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1382,6 +1524,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1398,6 +1542,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1413,11 +1559,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 32
@@ -1431,12 +1576,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 93184, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 93184, "gemm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "cce8fb0dd84d88ae8f9700a64315e3ba1b664d5de0a6507e8d4e097240a97aa5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1444,6 +1593,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1460,6 +1611,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1475,11 +1628,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 32
@@ -1493,12 +1645,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 115712, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 115712, "gemm_E4m3_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "ce8e908e66a8d584fc3bb7a3c0073050e66c499e248f2d80b09c352115399e1d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1506,6 +1662,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1522,6 +1680,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1537,11 +1697,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 64
@@ -1555,12 +1714,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 115712, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 115712, "gemm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "16af86d09c64c4d122c675e7f8333a30bfc9ae338ada4452ca475ef665a13286", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1568,6 +1731,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1584,6 +1749,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1599,11 +1766,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 64
@@ -1617,12 +1783,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 78848, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 78848, "gemm_E4m3_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "5634903122177bfbccf3c552e7b61d57976c9a5d3ea3d79d14464b42800476e9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1630,6 +1800,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1646,6 +1818,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1661,11 +1835,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -1679,12 +1852,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 78848, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 78848, "gemm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "d676a657507b7cd3e3348c686d79074c35f315a95fa768a786ec8483b3a5498f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1692,6 +1869,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1708,6 +1887,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1723,11 +1904,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -1741,12 +1921,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len, 216064, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len, 216064, "gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f", 224, "b3371cdb3d1d99e8aa88505ac19ff761e526f6bd55fa02f0da76ac8bef3e7256", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1754,6 +1938,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1770,6 +1956,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1785,11 +1973,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -1803,12 +1990,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin_len, 215040, "gemmKernel_E4m3_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin, Gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin_len, 215040, "gemm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f", 224, "97f7ed8748a179679ca888a9ec40baef3a781630511c13de9489fa48f4f65ecd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 2
@@ -1816,6 +2007,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1832,6 +2025,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1847,11 +2042,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(2)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -1865,12 +2059,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin, GemmKernel_Fp16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len, 150528, "gemmKernel_Fp16_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a", 320, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin, Gemm_Fp16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len, 150528, "gemm_Fp16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f", 320, "4d21747578e473446ee26958f39273faa242e03ee696afee8c7ca3b6f5068c77", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1878,6 +2076,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(17826818)
 , /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17826818)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1894,6 +2094,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 64
 , /* mMmaKind */ trtllm::gen::MmaKind(4)
@@ -1909,11 +2111,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 0
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -1927,12 +2128,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 175104, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 175104, "gemm_Fp16_E4m3E4m3_Fp32_t128x128x128_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "04bd1a1ba2fe8048418649f0c900e2c92ab70a90550a3e4741db94a2c8eb08b7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -1940,6 +2145,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -1956,6 +2163,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -1971,11 +2180,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -1989,12 +2197,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 175104, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x128u2_epilogueTile64x128_mma64x128x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 175104, "gemm_Fp16_E4m3E4m3_Fp32_t128x128x128u2_s4_et64x128_m64x128x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "2967650e07a1f0d137e4faa4306ec383e779a16a5ecc9a62acb8277e0292ff9f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2002,6 +2214,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2018,6 +2232,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2033,11 +2249,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -2051,12 +2266,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len, 168960, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x32_cluster1x1x1_16dp256bit_TN_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len, 168960, "gemm_Fp16_E4m3E4m3_Fp32_t128x128x256u2_s2_et128x128_m128x128x32_cga1x1x1_16dp256b_TN_schedS_sm100f", 224, "1cb31f99134c388cbc48767f14b82e1b92cd558cfd12ebe8ad350d9d89024215", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2064,6 +2283,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2080,6 +2301,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2095,11 +2318,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 0
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -2113,12 +2335,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 84992, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 84992, "gemm_Fp16_E4m3E4m3_Fp32_t128x16x128_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "f0ac8cde4ba11ace4e451dce810027692e652a8dc309086819f5788b1a3eea49", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2126,6 +2352,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2142,6 +2370,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2157,11 +2387,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 16
@@ -2175,12 +2404,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 84992, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x16x128u2_epilogueTile64x16_mma64x16x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 84992, "gemm_Fp16_E4m3E4m3_Fp32_t128x16x128u2_s4_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "93b3ba0121830ead50023f286d9bb01c3f2200973ea83412405e74a94e6536a6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2188,6 +2421,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2204,6 +2439,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2219,11 +2456,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 16
@@ -2237,12 +2473,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 97280, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 97280, "gemm_Fp16_E4m3E4m3_Fp32_t128x32x128_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "68ecf606fde4c1aa61e29143eadd069d8172b3a857f3bb34dc29147ab58fa47d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2250,6 +2490,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2266,6 +2508,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2281,11 +2525,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 32
@@ -2299,12 +2542,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 97280, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x32x128u2_epilogueTile64x32_mma64x32x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 97280, "gemm_Fp16_E4m3E4m3_Fp32_t128x32x128u2_s4_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "1ece5aea6444e6f3d56feecd88ac84a95441f78a7cfa555b6e5cbfe0d9f69fb4", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2312,6 +2559,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2328,6 +2577,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2343,11 +2594,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 32
@@ -2361,12 +2611,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 123904, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 123904, "gemm_Fp16_E4m3E4m3_Fp32_t128x64x128_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "025b68f8ea96d1c763ac3dccb38a9478399a8adc4ee2bc03978772f6bd226823", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2374,6 +2628,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2390,6 +2646,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2405,11 +2663,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 64
@@ -2423,12 +2680,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 123904, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x64x128u2_epilogueTile64x64_mma64x64x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 123904, "gemm_Fp16_E4m3E4m3_Fp32_t128x64x128u2_s4_et64x64_m64x64x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "0a6b28744b0cfa4633f682d71de37f45c16787e48b1e30101607664f68ffff0a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2436,6 +2697,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2452,6 +2715,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2467,11 +2732,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 64
@@ -2485,12 +2749,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 78848, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 78848, "gemm_Fp16_E4m3E4m3_Fp32_t128x8x128_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "cdc4443b2bc1581e21fc805b08d65e6fe4e286d5643cfc4541d3a78163e31749", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2498,6 +2766,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2514,6 +2784,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2529,11 +2801,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -2547,12 +2818,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a_cubin_len, 78848, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x128u2_epilogueTile64x8_mma64x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_dsFp8_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f_cubin_len, 78848, "gemm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_s4_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_noShflA_dsFp8_schedS_sm100f", 416, "3a5301dc87a1a13813f2495acf064b194ff3e04845ba763f3d8f52960e63b76c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2560,6 +2835,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2576,6 +2853,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 1
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2591,11 +2870,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -2609,12 +2887,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 1
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len, 217088, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len, 217088, "gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f", 224, "c76857635a002e5f0a16cf68a6b198691ae1555c74e4db1f9d97be2a654fb76d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2622,6 +2904,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2638,6 +2922,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2653,11 +2939,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -2671,12 +2956,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a_cubin_len, 215040, "gemmKernel_Fp16_E4m3E4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x2_16dp256bit_splitK2_TN_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin, Gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f_cubin_len, 215040, "gemm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x2_16dp256b_splitK2_TN_transOut_schedS_sm100f", 224, "d8500046ca577f0938b9e9ed7fb14e7088c3cf8c1d83aa2b4270b49519b68bd9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 2
@@ -2684,6 +2973,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(1050629)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2700,6 +2991,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
@@ -2715,11 +3008,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(2)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -2733,12 +3025,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_Fp16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len, 225280, "gemmKernel_Fp16_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin, Gemm_Fp16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len, 225280, "gemm_Fp16_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f", 448, "678da9fae95a7f31222ab90d8543222f551a8d692f4bbc59951d94b9d2420765", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2746,6 +3042,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(17826828)
 , /* mDtypeB */ trtllm::gen::Dtype(17827853)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826828)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17827853)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2762,6 +3060,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(5)
@@ -2777,11 +3077,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -2795,12 +3094,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(1)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(1)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp32_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin, GemmKernel_Fp32_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a_cubin_len, 183296, "gemmKernel_Fp32_E2m1E2m1_Fp32_tile128x128x256u2_epilogueTile128x128_mma128x128x64_cluster1x1x1_16dp256bit_TN_sm100a", 320, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp32_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin, Gemm_Fp32_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin_len, 183296, "gemm_Fp32_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f", 320, "80b0b2032ed338e425a523ff15f18858a2dea42517b603e3b2b78018ecf55e44", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2808,6 +3111,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(17826818)
 , /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1056776)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17826818)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2824,6 +3129,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 64
 , /* mMmaKind */ trtllm::gen::MmaKind(4)
@@ -2839,11 +3146,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 0
 , /* mTileM */ 128
 , /* mTileN */ 128
@@ -2857,12 +3163,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_Fp32_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_Fp32_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len, 227328, "gemmKernel_Fp32_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_Fp32_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin, Gemm_Fp32_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len, 227328, "gemm_Fp32_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f", 448, "cee5ef22e2a09fe345e02f36a17a34efdfe0d169ee3cba1c35a1c87d4aa255cf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2870,6 +3180,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(17826828)
 , /* mDtypeB */ trtllm::gen::Dtype(17827853)
 , /* mDtypeC */ trtllm::gen::Dtype(1056776)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826828)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17827853)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2886,6 +3198,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(5)
@@ -2901,11 +3215,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -2919,12 +3232,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(1)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(1)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
-{GemmKernel_MxE4m3_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin, GemmKernel_MxE4m3_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a_cubin_len, 224256, "gemmKernel_MxE4m3_MxE2m1MxE4m3_Fp32_tile128x8x512u2_epilogueTile128x8_mma128x8x32_cluster1x1x1_16dp256bit_TN_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+ }, gemm::SmVersion::Sm100a},
+{Gemm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin, Gemm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f_cubin_len, 224256, "gemm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f", 448, "ac5115a0b5fee88e7ffc25313e0686ec1799d5d9132b2d99586909b4b3204247", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
@@ -2932,6 +3249,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mDtypeA */ trtllm::gen::Dtype(17826828)
 , /* mDtypeB */ trtllm::gen::Dtype(17827853)
 , /* mDtypeC */ trtllm::gen::Dtype(17827853)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826828)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17827853)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
@@ -2948,6 +3267,8 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(5)
@@ -2963,11 +3284,10 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
 , /* mUseShuffledMatrixA */ 1
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMatrixA */ 0
-, /* mTransposeMatrixB */ 1
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
@@ -2981,15 +3301,16 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
+, /* mSfBlockSizeA */ std::nullopt
 , /* mSfLayoutA */ trtllm::gen::SfLayout(3)
 , /* mSfLayoutB */ trtllm::gen::SfLayout(1)
 , /* mSfLayoutC */ trtllm::gen::SfLayout(1)
+, /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
- }, gemm::SmVersion::Sm100a },
+ }, gemm::SmVersion::Sm100a},
 #endif // EXCLUDE_SM_100
 };
 // clang-format on
-
 } // namespace kernels
 } // namespace tensorrt_llm
 } // namespace gemm
