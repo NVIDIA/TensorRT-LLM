@@ -668,12 +668,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 for buffer in candidate_buffers:
                     numel_buffer = buffer.numel()
 
-                    # Condition for 1D tensors: buffer just needs to be large enough.
+                    # buffer just needs to be large enough.
                     if numel_buffer >= numel_like:
                         return buffer  # Found a fit, return immediately.
 
             # If we get here, no suitable buffer was found in the cache. Create a new one.
             return torch.empty_like(like_tensor, device='cuda')
+
+        def find_or_create_buffer_by_shape(tensor_shape: list[int],
+                                           dtype: torch.dtype,
+                                           buffers: Optional[dict[
+                                               str, list[torch.Tensor]]],
+                                           cache_name: str) -> torch.Tensor:
+            tmp_cpu_tensor = torch.empty(tensor_shape,
+                                         device='cpu',
+                                         dtype=dtype)
+
+            return find_or_create_buffer(tmp_cpu_tensor, buffers, cache_name)
 
         self.prompt_lens_cpu = torch.empty(
             (self.max_num_sequences, ),
@@ -724,18 +735,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
-                tmp_cpu_tensor = torch.empty([
+                self.block_ids_per_seq = find_or_create_buffer_by_shape([
                     self.kv_cache_manager.max_batch_size,
                     self.kv_cache_manager.max_blocks_per_seq
-                ],
-                                             device='cpu',
-                                             dtype=torch.int32)
+                ], torch.int32, buffers, 'block_ids_per_seq')
 
-                self.block_ids_per_seq = find_or_create_buffer(
-                    tmp_cpu_tensor, buffers, "block_ids_per_seq")
-
-                self.kv_block_ids_per_seq = find_or_create_buffer(
-                    tmp_cpu_tensor, buffers, "kv_block_ids_per_seq")
+                self.kv_block_ids_per_seq = find_or_create_buffer_by_shape([
+                    self.kv_cache_manager.max_batch_size,
+                    self.kv_cache_manager.max_blocks_per_seq
+                ], torch.int32, buffers, 'kv_block_ids_per_seq')
 
             if self.enable_paged_context_mla:
                 # for kv cache reuse/chunked context in MLA
