@@ -37,7 +37,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
 {
 
     auto const sm = tensorrt_llm::common::getSMVersion();
-    TORCH_CHECK(sm == 100, "Only SM100 is supported by FP8 block scale MOE");
+    TORCH_CHECK(sm == 100 || sm == 103, "Only SM100f is supported by FP8 block scale MOE");
     if (use_routing_scales_on_input)
     {
         TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::BFloat16, "routing_logits must be bfloat16.");
