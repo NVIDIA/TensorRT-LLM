@@ -60,7 +60,7 @@ def verify_l0_test_lists(llm_src):
 
     subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --apply-test-list-correction --test-list={test_list} --co -q",
+        f"pytest --test-list={test_list} --output-dir={llm_src} -s --co -q",
         shell=True,
         check=True)
 
@@ -74,14 +74,26 @@ def verify_qa_test_lists(llm_src):
     for test_def_file in test_def_files:
         subprocess.run(
             f"cd {llm_src}/tests/integration/defs && "
-            f"pytest --apply-test-list-correction --test-list={test_def_file} --co -q",
+            f"pytest --test-list={test_def_file} --output-dir={llm_src} -s --co -q",
             shell=True,
             check=True)
+        # append all the test_def_file to qa_test.txt
+        with open(f"{llm_src}/qa_test.txt", "a") as f:
+            with open(test_def_file, "r") as test_file:
+                lines = test_file.readlines()
+                for line in lines:
+                    # Remove 'TIMEOUT' marker and strip spaces
+                    cleaned_line = line.split(" TIMEOUT ", 1)[0].strip()
+                    if cleaned_line:
+                        f.write(f"{cleaned_line}\n")
 
 
-def verify_waive_list(llm_src):
+def verify_waive_list(llm_src, args):
     waives_list_path = f"{llm_src}/tests/integration/test_lists/waives.txt"
+    dup_cases_record = f"{llm_src}/dup_cases.txt"
+    non_existent_cases_record = f"{llm_src}/nonexits_cases.json"
     # Remove prefix and markers in wavies.txt
+    dedup_lines = set()
     processed_lines = set()
     with open(waives_list_path, "r") as f:
         lines = f.readlines()
@@ -96,12 +108,39 @@ def verify_waive_list(llm_src):
         if "perf/test_perf.py" in line:
             continue
 
+        # Check for duplicate lines for the raw line
+        if line in dedup_lines:
+            with open(dup_cases_record, "a") as f:
+                f.write(f"Duplicate waive record found: {line}\n")
+        else:
+            dedup_lines.add(line)
+
         # Check for SKIP marker in waives.txt and split by the first occurrence
         line = line.split(" SKIP ", 1)[0].strip()
 
         # If the line starts with 'full:', process it
         if line.startswith("full:"):
             line = line.split("/", 1)[1].lstrip("/")
+
+        # Check waived cases also in l0_text.txt and qa_text.txt
+        found_in_l0_qa = False
+        if args.l0:
+            with open(f"{llm_src}/l0_test.txt", "r") as f:
+                l0_lines = f.readlines()
+                for l0_line in l0_lines:
+                    if line == l0_line.strip():
+                        found_in_l0_qa = True
+                        break
+        if args.qa:
+            with open(f"{llm_src}/qa_test.txt", "r") as f:
+                qa_lines = f.readlines()
+                for qa_line in qa_lines:
+                    if line == qa_line.strip():
+                        found_in_l0_qa = True
+                        break
+        if not found_in_l0_qa:
+            with open(non_existent_cases_record, "a") as f:
+                f.write(f"Non-existent test name found in waives.txt: {line}\n")
 
         processed_lines.add(line)
 
@@ -112,7 +151,7 @@ def verify_waive_list(llm_src):
 
     subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --apply-test-list-correction --test-list={tmp_waives_file} --co -q",
+        f"pytest --test-list={tmp_waives_file} --output-dir={llm_src} -s --co -q",
         shell=True,
         check=True)
 
@@ -134,26 +173,61 @@ def main():
     llm_src = os.path.abspath(os.path.join(script_dir, "../"))
 
     install_python_dependencies(llm_src)
+    pass_flag = True
     # Verify L0 test lists
     if args.l0:
-        print("Starting L0 test list verification...")
+        print("-----------Starting L0 test list verification...-----------")
         verify_l0_test_lists(llm_src)
     else:
-        print("Skipping L0 test list verification.")
+        print("-----------Skipping L0 test list verification.-----------")
 
     # Verify QA test lists
     if args.qa:
-        print("Starting QA test list verification...")
+        print("-----------Starting QA test list verification...-----------")
         verify_qa_test_lists(llm_src)
     else:
-        print("Skipping QA test list verification.")
+        print("-----------Skipping QA test list verification.-----------")
 
     # Verify waive test lists
     if args.waive:
-        print("Starting waive list verification...")
-        verify_waive_list(llm_src)
+        print("-----------Starting waive list verification...-----------")
+        verify_waive_list(llm_src, args)
     else:
-        print("Skipping waive list verification.")
+        print("-----------Skipping waive list verification.-----------")
+
+    invalid_json_file = os.path.join(llm_src, "invalid_tests.json")
+    if os.path.isfile(invalid_json_file) and os.path.getsize(
+            invalid_json_file) > 0:
+        print("Invalid cases:")
+        with open(invalid_json_file, "r") as f:
+            print(f.read())
+        print("Invalid test names found, please correct them first!!!\n")
+        pass_flag = False
+
+    duplicate_cases_file = os.path.join(llm_src, "dup_cases.txt")
+    if os.path.isfile(duplicate_cases_file) and os.path.getsize(
+            duplicate_cases_file) > 0:
+        print("Duplicate cases found:")
+        with open(duplicate_cases_file, "r") as f:
+            print(f.read())
+        print(
+            "Duplicate test names found in waives.txt, please correct them first!!!\n"
+        )
+        pass_flag = False
+
+    non_existent_cases_file = os.path.join(llm_src, "nonexits_cases.json")
+    if os.path.isfile(non_existent_cases_file) and os.path.getsize(
+            non_existent_cases_file) > 0:
+        print("Non-existent cases found in waives.txt:")
+        with open(non_existent_cases_file, "r") as f:
+            print(f.read())
+        print(
+            "Test name in waives.txt but not in l0 test list or qa list, please correct them first!!!\n"
+        )
+        pass_flag = False
+
+    if not pass_flag:
+        exit(1)
 
 
 if __name__ == "__main__":
