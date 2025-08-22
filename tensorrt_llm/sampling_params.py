@@ -339,10 +339,21 @@ class SamplingParams:
     def _need_return_generation_logits(self) -> bool:
         return self.return_generation_logits and not self._generation_logits_auto_enabled
 
-    def _setup(self, tokenizer, add_special_tokens: bool = False) -> "SamplingParams":
+    def _setup(
+        self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
+    ) -> "SamplingParams":
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
+            # kimi_k2 model uses the eos_token_id in generation config
+            if (
+                hf_model_config is not None
+                and hf_model_config.model_type == "kimi_k2"
+                and generation_config is not None
+                and isinstance(generation_config.eos_token_id, int)
+            ):
+                self.end_id = generation_config.eos_token_id
+
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
