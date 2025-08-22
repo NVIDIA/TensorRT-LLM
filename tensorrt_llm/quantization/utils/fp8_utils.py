@@ -448,6 +448,7 @@ def per_token_quant_and_transform(
     input: torch.Tensor,
     quant_group_size: int = 128,
     scale_ue8m0: bool = True,
+    swap_ab=False,
 ):
     """
     input shape [g, m, k]
@@ -467,18 +468,21 @@ def per_token_quant_and_transform(
     fp8_min = -fp8_max
 
     m, k = input.shape
+    m_padded = m if not swap_ab else align(m, 8)
 
     # Create output
-    output = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
+    output = torch.empty((m_padded, k),
+                         dtype=torch.float8_e4m3fn,
+                         device="cuda")
 
     # Create output scale
     alignment = 4
     scale_k = ceil_div(k, quant_group_size)
-    m_padded = align(m, alignment)
+    m_aligned = align(m_padded, alignment)
     scale_k_padded = align(scale_k, alignment)
-    output_scale = torch.zeros((scale_k_padded // 4, m_padded),
+    output_scale = torch.empty((scale_k_padded // 4, m_aligned),
                                dtype=torch.int32,
-                               device='cuda')
+                               device="cuda")
 
     # Get block/grid/stage/warp
     BLOCK_NUM_PER_EXPERT = 64
@@ -508,13 +512,67 @@ def per_token_quant_and_transform(
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
     )
-    output_scale = output_scale.transpose(0, 1)[:m, :]
+    output_scale = output_scale.transpose(0, 1)[:m_padded, :]
     check_sf_layout(
         output_scale,
-        m,
+        m_padded,
         k,
         (1, 128),
         num_groups=None,
         tma_stride_check=True,
     )
     return output, output_scale
+
+
+@triton.jit
+def _transpose_kernel(input_ptr, output_ptr, M, N, stride_in_m, stride_in_n,
+                      stride_out_m, stride_out_n, BLOCK_SIZE: tl.constexpr):
+    row_block = tl.program_id(0)
+    col_block = tl.program_id(1)
+
+    row = row_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    col = col_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    mask_row = row < M
+    mask_col = col < N
+    mask = mask_row[:, None] & mask_col[None, :]
+
+    input_idx = row[:, None] * stride_in_m + col[None, :] * stride_in_n
+    data = tl.load(input_ptr + input_idx, mask=mask, other=0)
+
+    output_idx = row[:, None] * stride_out_n + col[None, :] * stride_out_m
+    tl.store(output_ptr + output_idx, data, mask=mask)
+
+
+def masked_transpose(input: torch.Tensor, n_available: int) -> torch.Tensor:
+    """
+    Perform a masked transpose operation on a 2D tensor.
+
+    Args:
+        input: Input tensor of shape (M, N)
+        n_available: Number of columns to transpose (must be <= N)
+
+    Returns:
+        Transposed tensor of shape (n_available, M)
+    """
+    M, N = input.shape
+    assert n_available <= N, "n_available must be less than or equal to N"
+    BLOCK_SIZE = 32
+    output = torch.empty((n_available, M),
+                         dtype=input.dtype,
+                         device=input.device)
+
+    grid = ((M + BLOCK_SIZE - 1) // BLOCK_SIZE,
+            (n_available + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    _transpose_kernel[grid](
+        input,
+        output,
+        M,
+        n_available,
+        input.stride(0),
+        input.stride(1),
+        output.stride(0),
+        output.stride(1),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return output
