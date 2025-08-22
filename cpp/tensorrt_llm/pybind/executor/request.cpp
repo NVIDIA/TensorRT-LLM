@@ -526,11 +526,11 @@ void initRequestBindings(pybind11::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams());
+            self.getGuidedDecodingParams(), self.getCacheSaltID());
     };
     auto requestSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 33)
+        if (state.size() != 34)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -550,7 +550,8 @@ void initRequestBindings(pybind11::module_& m)
             state[25].cast<tle::RequestType>(), state[26].cast<std::optional<tle::ContextPhaseParams>>(),
             state[27].cast<std::optional<tle::Tensor>>(), state[28].cast<std::optional<SizeType32>>(),
             state[29].cast<std::optional<tle::Tensor>>(), 1, state[30].cast<std::optional<tle::EagleConfig>>(),
-            state[31].cast<std::optional<tle::Tensor>>(), state[32].cast<std::optional<tle::GuidedDecodingParams>>());
+            state[31].cast<std::optional<tle::Tensor>>(), state[32].cast<std::optional<tle::GuidedDecodingParams>>(),
+            state[33].cast<std::optional<tle::CacheSaltIDType>>());
     };
 
     py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
