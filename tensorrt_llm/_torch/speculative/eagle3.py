@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any, Dict
 
 import torch
 from torch import nn
@@ -176,8 +176,6 @@ class Eagle3SpecMetadata(SpecMetadata):
     def get_hidden_states(self):
         hidden_states = self.eagle3_resource_manager.hidden_states[
             self.hidden_states_read_indices[:self.num_tokens], :]
-        if not self.is_first_draft:
-            hidden_states = hidden_states[:, :self.hidden_size]
         return hidden_states
 
 
@@ -493,3 +491,86 @@ class Eagle3OneModelWorker(nn.Module):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
+
+
+class ChainDrafter(torch.nn.Module):
+
+    def __init__(self, max_draft_len: int, draft_model: torch.nn.Module):
+        super().__init__()
+        self.draft_model = draft_model
+        self.config = self.draft_model.config
+        self.model_config = self.draft_model.model_config
+        self.max_draft_len = max_draft_len
+
+    def forward(self, input_ids, position_ids, attn_metadata, spec_metadata,
+                **kwargs):
+        batch_size = attn_metadata.num_seqs
+
+        logits = self.draft_model.forward(input_ids=input_ids,
+                                          position_ids=position_ids,
+                                          attn_metadata=attn_metadata,
+                                          spec_metadata=spec_metadata)
+
+        new_draft_tokens = [self.sample(logits)]
+
+        if attn_metadata.is_cuda_graph:
+            seq_len = attn_metadata._seq_lens[:batch_size].clone()
+            seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
+
+        old_seqlens = torch.cumsum(attn_metadata.seq_lens_cuda,
+                                   dim=0,
+                                   dtype=torch.long)
+
+        last_tokens_idx = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        new_position_ids = position_ids[0, last_tokens_idx] + 1
+
+        attn_metadata._seq_lens[:batch_size].fill_(1)
+        attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+        attn_metadata.on_update()
+        attn_metadata.kv_lens_cuda[:batch_size] += 1
+
+        attn_metadata.host_request_types[:attn_metadata.num_contexts].fill_(1)
+        attn_metadata.num_contexts = 0
+
+        spec_metadata.eagle3_resource_manager.is_first_draft = False
+        spec_metadata.hidden_states_read_indices[:batch_size].copy_(
+            old_seqlens - 1)
+        spec_metadata.hidden_states_write_indices[:batch_size].copy_(
+            torch.arange(
+                batch_size,
+                dtype=spec_metadata.hidden_states_write_indices.dtype,
+                device=spec_metadata.hidden_states_write_indices.device))
+        spec_metadata.num_tokens = batch_size
+
+        for i in range(self.max_draft_len - 1):
+            logits = self.draft_model.forward(input_ids=new_draft_tokens[-1],
+                                              position_ids=new_position_ids,
+                                              attn_metadata=attn_metadata,
+                                              spec_metadata=spec_metadata)
+            new_draft_tokens.append(self.sample(logits))
+            new_position_ids += 1
+            attn_metadata.kv_lens_cuda[:batch_size] += 1
+
+        spec_metadata.eagle3_resource_manager.is_first_draft = True
+
+        if attn_metadata.is_cuda_graph:
+            attn_metadata._seq_lens[:batch_size].copy_(seq_len[:batch_size])
+            attn_metadata._seq_lens_cuda[:batch_size].copy_(
+                seq_len_cuda[:batch_size])
+
+        return torch.stack(new_draft_tokens)
+
+    def sample(self, logits: torch.Tensor) -> torch.Tensor:
+        tokens = torch.argmax(logits, dim=-1)
+        d2t = self.draft_model.model.d2t.data
+
+        return tokens + d2t[tokens]
+
+    def get_warmup_extra_inputs(self, batch_size: int,
+                                num_tokens: int) -> Dict[str, Any]:
+        return self.draft_model.get_warmup_extra_inputs(batch_size, num_tokens)
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        self.draft_model.load_weights_from_target_model(target_model)

@@ -388,7 +388,7 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
-            max_num_draft_tokens = self.spec_config.max_draft_len * batch_size
+            max_num_draft_tokens = self.spec_config.max_draft_len * batch_size if not self.is_draft_model else 0
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
@@ -402,9 +402,11 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
                                                              dtype=torch.int,
                                                              device='cuda')
+            # TODO undo this hack
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
-            )
-            self.max_draft_len = spec_config.max_draft_len
+            ) or (self.is_draft_model
+                  and self.spec_config.spec_dec_mode.is_eagle3())
+            self.max_draft_len = spec_config.max_draft_len if not self.is_draft_model else 0
         else:
             self.without_logits = False
             self.max_draft_len = 0
@@ -1153,6 +1155,9 @@ class PyTorchModelEngine(ModelEngine):
                 logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
+        if self.spec_config is not None and self.is_draft_model:
+            model = self.spec_config.get_draft_model_wrapper(model) or model
+
         return model
 
     def _call_load_weights(self, load_method, weights, weight_mapper):

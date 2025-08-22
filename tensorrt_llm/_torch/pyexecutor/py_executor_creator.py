@@ -252,9 +252,6 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-            # The draft model won't have any draft tokens attached to
-            # generation requests when we invoke it autoregressively
-            draft_spec_config.max_draft_len = 0
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
