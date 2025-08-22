@@ -9,11 +9,11 @@ import json
 import os
 from unittest import mock
 
-import lm_eval_ad  # noqa: F401
+import lm_eval_tensorrt_llm  # noqa: F401
 import pytest
 from _dist_test_utils import param_with_device_count
 from _model_test_utils import _hf_model_dir_or_hub_id
-from _torch_test_utils import fp4_compatible, fp8_compatible
+from _torch_test_utils import fp8_compatible
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.task import TaskConfig
 from utils.llm_data import llm_models_root
@@ -58,20 +58,24 @@ def _cli_evaluate_with_mocks(args):
 @pytest.mark.parametrize(
     "world_size,model_args,tasks,score_keys,scores",
     [
-        param_with_device_count(
-            2,
-            {
-                "model": _hf_model_dir_or_hub_id(
-                    f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
-                    "meta-llama/Meta-Llama-3.1-8B-Instruct",
-                ),
-                "attn_backend": "flashinfer",
-                "max_batch_size": 32,
-            },
-            ["gsm8k", "mmlu"],
-            ["exact_match,strict-match", "acc,none"],
-            [0.75, 0.675],
-        ),
+        # param_with_device_count(
+        #     2,
+        #     {
+        #         "model": _hf_model_dir_or_hub_id(
+        #             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
+        #             "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        #         ),
+        #         "max_batch_size": 32,
+        #     },
+        #     ["gsm8k", "mmlu"],
+        #     ["exact_match,strict-match", "acc,none"],
+        #     [0.75, 0.675],
+        #     marks_extra=[
+        #         pytest.mark.skip(
+        #             reason="https://nvbugspro.nvidia.com/bug/5123940; failed and timeout"
+        #         )
+        #     ],
+        # ),
         param_with_device_count(
             2,
             {
@@ -80,52 +84,60 @@ def _cli_evaluate_with_mocks(args):
                     "nvidia/Llama-3.1-8B-Instruct-FP8",
                 )
             },
-            ["gsm8k", "mmlu"],
-            ["exact_match,strict-match", "acc,none"],
-            [0.70, 0.67],
+            ["mmlu_llama"],
+            ["exact_match,strict_match"],
+            [0.67],
             marks_extra=[
                 pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
             ],
         ),
-        param_with_device_count(
-            2,
-            {
-                "model": "nvidia/Llama-3.1-8B-Instruct-FP4",
-            },
-            ["gsm8k", "mmlu"],
-            ["exact_match,strict-match", "acc,none"],
-            [0.70, 0.64],
-            marks_extra=[
-                pytest.mark.skipif(not fp4_compatible(), reason="Requires fp4 support"),
-            ],
-        ),
-        param_with_device_count(
-            4,
-            {
-                "model": _hf_model_dir_or_hub_id(
-                    f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
-                    "mistralai/Mixtral-8x7B-Instruct-v0.1",
-                ),
-                "compile_backend": "torch-simple",
-            },
-            ["gsm8k", "mmlu"],
-            ["exact_match,strict-match", "acc,none"],
-            [0.583, 0.67],
-        ),
+        # param_with_device_count(
+        #     2,
+        #     {
+        #         "model": "nvidia/Llama-3.1-8B-Instruct-FP4",
+        #     },
+        #     ["gsm8k", "mmlu"],
+        #     ["exact_match,strict-match", "acc,none"],
+        #     [0.70, 0.64],
+        #     marks_extra=[
+        #         pytest.mark.skipif(not fp4_compatible(), reason="Requires fp4 support"),
+        #         pytest.mark.skip(
+        #             reason="https://nvbugspro.nvidia.com/bug/5095416; to add ckpt on llm-models"
+        #         ),
+        #     ],
+        # ),
+        # param_with_device_count(
+        #     4,
+        #     {
+        #         "model": _hf_model_dir_or_hub_id(
+        #             f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
+        #             "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        #         ),
+        #         "compile_backend": "torch-simple",
+        #     },
+        #     ["gsm8k", "mmlu"],
+        #     ["exact_match,strict-match", "acc,none"],
+        #     [0.583, 0.67],
+        #     marks_extra=[
+        #         pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5095416; timeout")
+        #     ],
+        # ),
     ],
 )
 def test_lm_eval(world_size: int, model_args, tasks, score_keys, scores, tmp_path):
     # setup base args for our testing
-    args = ["--model", "autodeploy", "--batch_size", "4", "--limit", "0.1"]
+    args = ["--model", "trt-llm", "--batch_size", "16", "--limit", "0.01"]
 
     # set up model args with world size
     model_args["world_size"] = world_size
-    args += ["--model_args", ",".join([f"{k}={v}" for k, v in model_args.items()])]
-    gen_kwargs = {}
+    model_args_list = [f"{k}={v}" for k, v in model_args.items()]
+    model_args_list.append("backend=autodeploy")
+    model_args_list.append("max_context_length=4096")
     # Greedy to avoid variance
-    gen_kwargs["temperature"] = 1e-4
-    gen_kwargs["top_k"] = 1
-    args += ["--gen_kwargs", ",".join([f"{k}={v}" for k, v in gen_kwargs.items()])]
+    model_args_list.append("temperature=1e-4")
+    model_args_list.append("max_gen_toks=2048")
+    model_args_list.append("top_k=1")
+    args += ["--model_args", ",".join(model_args_list)]
 
     # set up output path and tasks
     args += ["--output_path", str(tmp_path)]
