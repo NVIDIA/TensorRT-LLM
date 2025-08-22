@@ -272,6 +272,9 @@ def create_py_executor(
                 checkpoint_loader=executor_config.checkpoint_loader,
                 is_draft_model=True,
             )
+            if draft_model_engine.model.model_config.pretrained_config.architectures[
+                    0] == "DeepseekV3ForCausalLM":
+                draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
