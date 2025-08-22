@@ -643,10 +643,9 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def hasMultipleGPUs = (gpuCount > 1)
         def memorySize = "${TESTER_MEMORY}"
         def storageSize = "300Gi"
-        def driverVersion = type.contains("rtx-pro-6000") ? "580.65.06-open" : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
+        def driverVersion = Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
-        // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
         if (hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
@@ -665,7 +664,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
-                    nvidia.com/driver_version: '${driverVersion}'
                     nvidia.com/gpu_type: ${gpuType}"""
         } else if (perfMode && !hasMultipleGPUs) {
         // Not using the "perf" node currently due to hardware resource constraint.
@@ -1270,6 +1268,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "nproc && free -g && hostname"
         echoNodeAndGpuInfo(pipeline, stageName)
         sh "cat ${MODEL_CACHE_DIR}/README"
+        sh "nvidia-smi -q"
         sh "nvidia-smi topo -m"
         sh "df -h"
 
