@@ -2267,7 +2267,15 @@ class TorchLlmArgs(BaseLlmArgs):
                     **moe_load_balancer_config)
             except Exception as e:
                 raise ValueError(
-                    f"Failed to load MoE load balancer config file: {self.load_balancer}"
+                    f"Failed to load MoE load balancer config file: {self.moe_config.load_balancer}"
+                ) from e
+        elif isinstance(self.moe_config.load_balancer, dict):
+            try:
+                self.moe_config.load_balancer = MoeLoadBalancerConfig(
+                    **self.moe_config.load_balancer)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"
                 ) from e
         return self
 
