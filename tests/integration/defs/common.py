@@ -744,12 +744,25 @@ def generate_dummy_loras(
     from transformers import AutoModelForCausalLM
 
     print("Creating pseudo LoRAs...")
-    model = AutoModelForCausalLM.from_pretrained(
-        hf_model_dir,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+
+    # Try to load with CPU offloading disabled first
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            hf_model_dir,
+            torch_dtype=torch.float16,
+            device_map=None,  # Load everything to CPU first
+            trust_remote_code=True,
+            low_cpu_mem_usage=False,
+        )
+    except Exception:
+        # Fallback to auto device mapping if CPU loading fails
+        model = AutoModelForCausalLM.from_pretrained(
+            hf_model_dir,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
     lora_config = LoraConfig(r=lora_rank,
                              target_modules=target_modules,
                              bias="none",
@@ -760,6 +773,7 @@ def generate_dummy_loras(
         if zero_weights:
             for param in lora_model.parameters():
                 param.data.zero_()
+
         pseudo_lora_dir = f"{lora_output_dir}/pseudo_lora_{lora_idx}"
         lora_model.save_pretrained(pseudo_lora_dir)
         lora_output_paths.append(pseudo_lora_dir)
