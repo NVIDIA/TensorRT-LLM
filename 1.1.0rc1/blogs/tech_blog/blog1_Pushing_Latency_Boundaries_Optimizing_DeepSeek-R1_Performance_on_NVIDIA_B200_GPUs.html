@@ -1,0 +1,1211 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc1';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="DeepSeek R1 MTP Implementation and Optimization" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html" />
+    <link rel="prev" title="New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget" href="../XQA-kernel.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.1.0rc1" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/dev-containers.html">Using Dev Containers</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus">
+<h1>Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs<a class="headerlink" href="#pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus" title="Link to this heading">#</a></h1>
+<p>by NVIDIA TensorRT-LLM team</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#background">Background</a></p></li>
+<li><p><a class="reference internal" href="#implementation-configuration">Implementation Configuration</a></p>
+<ul>
+<li><p><a class="reference internal" href="#workload-profile">Workload Profile</a></p></li>
+<li><p><a class="reference internal" href="#model-architecture">Model Architecture</a></p></li>
+<li><p><a class="reference internal" href="#precision-strategy">Precision Strategy</a></p></li>
+<li><p><a class="reference internal" href="#parallelism-strategy">Parallelism Strategy</a></p></li>
+<li><p><a class="reference internal" href="#everything-in-one-diagram">Everything in One Diagram</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#key-optimizations">Key Optimizations</a></p>
+<ul>
+<li><p><a class="reference internal" href="#system-level-optimizations">System Level optimizations</a></p>
+<ul>
+<li><p><a class="reference internal" href="#cuda-graph-programmatic-dependent-launch">CUDA Graph &amp; Programmatic Dependent Launch</a></p></li>
+<li><p><a class="reference internal" href="#mtp">MTP</a></p>
+<ul>
+<li><p><a class="reference internal" href="#autoregressive-mtp-layers"><span class="xref myst">Autoregressive MTP Layers</span></a></p></li>
+<li><p><a class="reference internal" href="#relax-acceptance-verification"><span class="xref myst">Relax Acceptance Verification</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#multi-streams">Multi-streams</a></p></li>
+<li><p><a class="reference internal" href="#sparse-experts-as-gemms-only-works-when-moe-backend-cutlass">Sparse Experts as GEMMs (only works when moe_backend=CUTLASS)</a></p></li>
+<li><p><a class="reference internal" href="#re-balanced-the-sparse-experts">Re-balanced the sparse experts</a></p>
+<ul>
+<li><p><a class="reference internal" href="#mixed-etp"><span class="xref myst">Mixed ETP</span></a></p></li>
+<li><p><a class="reference internal" href="#smart-router"><span class="xref myst">Smart Router</span></a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#kernel-level-optimizations">Kernel Level optimizations</a></p>
+<ul>
+<li><p><a class="reference internal" href="#attention-kernel">Attention Kernel</a></p></li>
+<li><p><a class="reference internal" href="#grouped-gemm">Grouped GEMM</a></p>
+<ul>
+<li><p><a class="reference internal" href="#cutlass-backend-default-backend"><span class="xref myst">CUTLASS Backend (default backend)</span></a></p></li>
+<li><p><a class="reference internal" href="#trtllm-backend"><span class="xref myst">TRTLLM Backend</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#communication-kernel">Communication Kernel</a></p></li>
+<li><p><a class="reference internal" href="#dense-gemm-optimization">Dense GEMM optimization</a></p>
+<ul>
+<li><p><a class="reference internal" href="#fuse-a-gemm"><span class="std std-ref">Fuse_A_GEMM</span></a></p></li>
+<li><p><a class="reference internal" href="#routergemm"><span class="std std-ref">RouterGEMM</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#kernel-fusion">Kernel fusion</a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#how-to-reproduce">How to reproduce</a></p></li>
+<li><p><a class="reference internal" href="#future-works">Future Works</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgment">Acknowledgment</a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="background">
+<h2>Background<a class="headerlink" href="#background" title="Link to this heading">#</a></h2>
+<p>Recent advancements in Large Language Reasoning Models have demonstrated remarkable success, while creating new deployment challenges. A critical challenge emerges from extended Output Sequence Lengths (OSL) due to complex “thinking and reasoning” processes. Longer OSL demands stricter Token-to-Token Latency (TTL) requirements, often forcing concurrency limitations. The most extreme case, single concurrency (min-latency scenario) , becomes particularly challenging for real-time applications.</p>
+<p>This article explores how TensorRT-LLM achieves record-breaking performance for <a class="reference external" href="https://huggingface.co/deepseek-ai/DeepSeek-R1">DeepSeek-R1</a> in min-latency scenarios on NVIDIA’s 8×B200 GPU configuration progressing from 67 tokens per second (TPS) to 253 before GTC 2025(<strong>3.7x</strong> speed-up), and to our current number is 368 TPS (<strong>5.5x</strong> speed-up).</p>
+</section>
+<section id="implementation-configuration">
+<h2>Implementation Configuration<a class="headerlink" href="#implementation-configuration" title="Link to this heading">#</a></h2>
+<section id="workload-profile">
+<h3>Workload Profile<a class="headerlink" href="#workload-profile" title="Link to this heading">#</a></h3>
+<p>Input Sequence Length (ISL): 1k tokens</p>
+<p>Output Sequence Length (OSL): 2k tokens</p>
+</section>
+<section id="model-architecture">
+<h3>Model Architecture<a class="headerlink" href="#model-architecture" title="Link to this heading">#</a></h3>
+<p>The base DeepSeek-R1 main model contains: 3x dense layers (initial) and 58x MoE layers, there is also 1x Multi-Tokens Prediction (MTP) layer (MoE-architecture equivalent) for speculative decoding.  Our optimized configuration extends the MTP layer to 3x layers using autoregressive styling for peak performance exploration.</p>
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_model_overview.png?raw=true" alt="tech_blog1_model_overview" width="500" height="auto">
+</section>
+<section id="precision-strategy">
+<h3>Precision Strategy<a class="headerlink" href="#precision-strategy" title="Link to this heading">#</a></h3>
+<p>We have explored a mixed precision recipe, which provides a better tradeoff between accuracy and performance.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Component</p></th>
+<th class="head text-center"><p>Precision</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>64x Attention Modules</p></td>
+<td class="text-center"><p>bf16*</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>3x Dense FFN Layers</p></td>
+<td class="text-center"><p>nvfp4**</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>58x MoE FFN Layers</p></td>
+<td class="text-center"><p>nvfp4</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>3x MTP Layers</p></td>
+<td class="text-center"><p>bf16</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>RouterGEMM***</p></td>
+<td class="text-center"><p>bf16</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>*TensorRT-LLM already supports <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#fp8-kv-cache-and-mla">FP8 Attention</a> while for this latency scenario low-precision attention computation doesn’t help with performance so we choose to use bf16 precision for the Attention Modules.</p>
+<p>** nvfp4 model checkpoint is generated by the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">NVIDIA TensorRT Model Optimizer toolkit</a>.</p>
+<p>*** RouterGEMM uses bf16 inputs/weights with fp32 outputs for numerical stability</p>
+</section>
+<section id="parallelism-strategy">
+<h3>Parallelism Strategy<a class="headerlink" href="#parallelism-strategy" title="Link to this heading">#</a></h3>
+<p>We have also explored and introduced mixed parallel strategy on 8xB200 GPUs. Specifically, the best strategy for this latency scenario is ‘TP8EP2’, the definition represents</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Component</p></th>
+<th class="head text-center"><p>Parallelism Patterns</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>Attention Modules</p></td>
+<td class="text-center"><p>Tensor Parallelism 8 (TP8)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>MoE Sparse Experts</p></td>
+<td class="text-center"><p>Mixed TP4 with Expert Parallelism 2 (EP2)</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>MoE Shared Experts</p></td>
+<td class="text-center"><p>TP8</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>Fuse_A GEMM</p></td>
+<td class="text-center"><p>Data Parallelism 8 (DP8)</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>RouterGEMM</p></td>
+<td class="text-center"><p>DP8</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="everything-in-one-diagram">
+<h3>Everything in One Diagram<a class="headerlink" href="#everything-in-one-diagram" title="Link to this heading">#</a></h3>
+<p>Now let’s put everything into one diagram, which represents a MoE layer from a decoding iteration.</p>
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_model_details.png?raw=true" alt="tech_blog1_model_details" width="1600" height="auto">
+<p>The modules in the diagram are:</p>
+<ul class="simple">
+<li><p>Input Module: A BF16 tensor with shape [m, 7168], where m is the number of tokens (for instance, m = 4 when using three MTP layers), and 7168 is the model’s hidden size.</p></li>
+<li><p>Module1: Fuse_A_GEMM Concatenates the weights for <a class="reference external" href="https://arxiv.org/pdf/2412.19437">WDQ, WDKV, and WKR</a> to reduce kernel launch overhead.</p></li>
+<li><p>Module2: 2× RMSNorm Performs normalization for Q/K tensors. These can be either overlapped on multiple streams or fused into a single grouped RMSNorm.</p></li>
+<li><p>Module3: UQ_QR_GEMM Concatenates WUQ and WQR weights to reduce kernel launch overhead.</p></li>
+<li><p>Module4: UK_BGEMM Uses WUK in a batched GEMM. We avoid absorbing Modules 3 and 4 to prevent weight-size inflation and extra loading costs.</p></li>
+<li><p>Module5: Concat KVCache &amp; applyRope Merges K/V cache and applies ROPE (Rotary Positional Encoding).</p></li>
+<li><p>Module6: genAttention Performs MLA during generation, acting like an MQA with num_q_heads = 128 / TP8 = 16.</p></li>
+<li><p>Module7: UV_GEMM Executes a batched GEMM with WUV weights.</p></li>
+<li><p>Module8: WO_GEMM Runs a dense GEMM using WO weights. We do not absorb Modules 7 and 8 to avoid increased weight loading overhead.</p></li>
+<li><p>Module9: Fused Kernels Incorporates oneshotAllReduce, Add_RMSNorm, and DynamicQuant (BF16-&gt;NVFP4) in a single kernel.</p></li>
+<li><p>Module10: routerGEMM &amp; topK Handles the router GEMM and topK selection.</p></li>
+<li><p>Module11: Shared Expert Overlaps partially with Module10 and Module 12.</p></li>
+<li><p>Module12: Sparse Experts Implements expert layers via grouped GEMM.</p></li>
+<li><p>Module13: Final Fused Kernels Performs localReduction, oneshotAllReduce, and Add_RMSNorm operations together.</p></li>
+</ul>
+</section>
+</section>
+<section id="key-optimizations">
+<h2>Key Optimizations<a class="headerlink" href="#key-optimizations" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Feature</p></th>
+<th class="head text-center"><p>TPS/User</p></th>
+<th class="head text-left"><p>Code Links / Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Baseline: CUDA Graph + EP8TP8</p></td>
+<td class="text-center"><p>67</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/models/modeling_deepseekv3.py">modeling_deepseekv3.py</a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Multi Stream to overlap shared expert with sparse experts</p></td>
+<td class="text-center"><p>73</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/14bfb5e0d6e81aec3306a1324cf074566646f886/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L506">modeling_deepseekv3.py#L506</a></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Optimize MLA Kernel</p></td>
+<td class="text-center"><p>80</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/3763">PR #3763</a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Optimize TopK Kernels</p></td>
+<td class="text-center"><p>84</p></td>
+<td class="text-left"><p>• <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingKernelTopK.cuh">RoutingKernelTopK.cuh</a><br/>• <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/noAuxTcKernels.cu">noAuxTcKernels.cu</a></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Optimize Fuse_A_GEMM</p></td>
+<td class="text-center"><p>89</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/d6b741ddfe7f8a80718c10d49773c42abc0a254f/tensorrt_llm/_torch/modules/attention.py#L345">attention.py#L345</a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>MTP3_Vanilla</p></td>
+<td class="text-center"><p>154</p></td>
+<td class="text-left"><p>evolve to MTP3_Autoregressive</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Evolve to MTP3_Autoregressive + Optimize Router GEMM</p></td>
+<td class="text-center"><p>164</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/d6b741ddfe7f8a80718c10d49773c42abc0a254f/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L304">modeling_deepseekv3.py#L304</a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Fuse oneshotAR + RMSNorm</p></td>
+<td class="text-center"><p>168</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/d6b741ddfe7f8a80718c10d49773c42abc0a254f/cpp/tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.cu#L440">allReduceFusionKernels.cu#L440</a></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Enable PDL</p></td>
+<td class="text-center"><p>173</p></td>
+<td class="text-left"><p>Set environment variable: <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">TRTLLM_ENABLE_PDL=1</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Multi-stream to overlap two RMS_norms</p></td>
+<td class="text-center"><p>180</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/d6b741ddfe7f8a80718c10d49773c42abc0a254f/tensorrt_llm/_torch/modules/attention.py#L546">attention.py#L546</a></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>MTP3_Autoregressive</p></td>
+<td class="text-center"><p>204</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/d6b741ddfe7f8a80718c10d49773c42abc0a254f/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L823">modeling_deepseekv3.py#L823</a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Finetune clock/power</p></td>
+<td class="text-center"><p>211</p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">sudo</span> <span class="pre">nvidia-smi</span> <span class="pre">-pm</span> <span class="pre">0;</span> <span class="pre">sudo</span> <span class="pre">nvidia-smi</span> <span class="pre">-pm</span> <span class="pre">1;</span> <span class="pre">sudo</span> <span class="pre">nvidia-smi</span> <span class="pre">boost-slider</span> <span class="pre">--vboost</span> <span class="pre">4</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Optimize CUTLASS Grouped GEMM Kernels</p></td>
+<td class="text-center"><p>236</p></td>
+<td class="text-left"><p>The code is not open-source yet due to the dependency with internal base environment and we are planning to make it decoupled from internal base environment thus to be able to open-source in the future.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Optimize CUTLASS Flow: Sparse Experts as GEMMs</p></td>
+<td class="text-center"><p>249</p></td>
+<td class="text-left"><p>The code is not open-source yet due to the dependency with internal base environment and we are planning to make it decoupled from internal base environment thus to be able to open-source in the future.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Introduce EP4TP2 for better workload balance</p></td>
+<td class="text-center"><p>253</p></td>
+<td class="text-left"><p>Use <code class="docutils literal notranslate"><span class="pre">--tp</span> <span class="pre">8</span> <span class="pre">--ep</span> <span class="pre">4</span></code> when benchmarking</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Introduce moe_backend=TRTLLM, EP2TP4 for better balance</p></td>
+<td class="text-center"><p>299</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/4280">PR #4280</a></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Optimize Fuse_A_GEMM and Router_GEMM</p></td>
+<td class="text-center"><p>340</p></td>
+<td class="text-left"><p>WIP</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Relax Acceptance</p></td>
+<td class="text-center"><p><strong>368</strong></p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#multi-token-prediction-mtp">deepseek_v3#multi-token-prediction-mtp</a></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="system-level-optimizations">
+<h3>System Level optimizations<a class="headerlink" href="#system-level-optimizations" title="Link to this heading">#</a></h3>
+<section id="cuda-graph-programmatic-dependent-launch">
+<h4>CUDA Graph &amp; Programmatic Dependent Launch<a class="headerlink" href="#cuda-graph-programmatic-dependent-launch" title="Link to this heading">#</a></h4>
+<p><a class="reference external" href="https://developer.nvidia.com/blog/cuda-graphs/">CUDA Graph</a> is necessary to overcome the CPU-overhead for small workloads, while <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html?highlight=Programmatic%2520Dependent%2520Launch#programmatic-dependent-launch-and-synchronization">Programmatic Dependent Launch</a> can be used to reduce the kernel launch latency furthermore.</p>
+</section>
+<section id="mtp">
+<h4>MTP<a class="headerlink" href="#mtp" title="Link to this heading">#</a></h4>
+<p>There are two optimizations based on MTP</p>
+<section id="autoregressive-mtp-layers">
+<h5>Autoregressive MTP Layers<a class="headerlink" href="#autoregressive-mtp-layers" title="Link to this heading">#</a></h5>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Version</p></th>
+<th class="head text-center"><p>Acceptance Rate</p></th>
+<th class="head text-center"><p>TPS/User</p></th>
+<th class="head text-center"><p>TPS/User Speedup</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>Without MTP</p></td>
+<td class="text-center"><p>1.00</p></td>
+<td class="text-center"><p>111</p></td>
+<td class="text-center"><p>1.00</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>MTP 1</p></td>
+<td class="text-center"><p>1.92</p></td>
+<td class="text-center"><p>198</p></td>
+<td class="text-center"><p>1.78</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>MTP 2</p></td>
+<td class="text-center"><p>2.58</p></td>
+<td class="text-center"><p>250</p></td>
+<td class="text-center"><p>2.25</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>MTP 3</p></td>
+<td class="text-center"><p>2.82</p></td>
+<td class="text-center"><p>253</p></td>
+<td class="text-center"><p>2.28</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>MTP 4</p></td>
+<td class="text-center"><p>2.99</p></td>
+<td class="text-center"><p>245</p></td>
+<td class="text-center"><p>2.21</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>MTP 5</p></td>
+<td class="text-center"><p>3.01</p></td>
+<td class="text-center"><p>239</p></td>
+<td class="text-center"><p>2.15</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Based on our exploration, 3x MTP layers configuration demonstrates optimal performance.</p>
+</section>
+<section id="relax-acceptance-verification">
+<h5>Relax Acceptance Verification<a class="headerlink" href="#relax-acceptance-verification" title="Link to this heading">#</a></h5>
+<p>For the reasoning model (such as DeepSeek R1), the generation may consist of two phases: thinking phase and actual output. During the thinking phase, when relaxed acceptance is enabled, the draft token can be accepted when it is in a candidate set. This candidate is generated based on the logits topN and probability threshold.</p>
+<ul class="simple">
+<li><p>topN: The topN tokens are sampled from logits.</p></li>
+<li><p>Probability threshold. Based on topN candidates, only those tokens with a probability greater than the Top1’s probability - delta can remain in the candidate set.</p></li>
+</ul>
+<p>During the non-thinking phase, we still use strict acceptance.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Version</p></th>
+<th class="head text-center"><p>Acceptance Rate</p></th>
+<th class="head text-center"><p>TPS/User Speedup</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>MTP3_top1, d0.0</p></td>
+<td class="text-center"><p>2.82</p></td>
+<td class="text-center"><p>1.00</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>MTP3_top10, d0.5</p></td>
+<td class="text-center"><p>3.06</p></td>
+<td class="text-center"><p>1.08</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>MTP3_top10, d0.6</p></td>
+<td class="text-center"><p>3.10</p></td>
+<td class="text-center"><p>1.09</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>MTP3_top15, d0.5</p></td>
+<td class="text-center"><p>3.07</p></td>
+<td class="text-center"><p>1.08</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>This is a relaxed way of verification and comparison, which can improve the acceptance rate and bring positive speedup with limited influence on accuracy.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Dataset</p></th>
+<th class="head text-center"><p>Test Size</p></th>
+<th class="head text-center"><p>w/o Relaxed accuracy</p></th>
+<th class="head text-center"><p>w/ Relaxed accuracy</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>MMLU-Pro</p></td>
+<td class="text-center"><p>12,032</p></td>
+<td class="text-center"><p>84.0%</p></td>
+<td class="text-center"><p>81.2%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>Humanity’s Last Exam</p></td>
+<td class="text-center"><p>2,684</p></td>
+<td class="text-center"><p>9.0%</p></td>
+<td class="text-center"><p>9.0%</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>GPQA Diamond</p></td>
+<td class="text-center"><p>198</p></td>
+<td class="text-center"><p>71.0%</p></td>
+<td class="text-center"><p>69.2%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>MATH-500</p></td>
+<td class="text-center"><p>500</p></td>
+<td class="text-center"><p>96.0%</p></td>
+<td class="text-center"><p>96.2%</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>AIME 2024</p></td>
+<td class="text-center"><p>30</p></td>
+<td class="text-center"><p>68.0%</p></td>
+<td class="text-center"><p>74.0%</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>SciCode</p></td>
+<td class="text-center"><p>338</p></td>
+<td class="text-center"><p>36.0%</p></td>
+<td class="text-center"><p>39.0%</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>LiveCodeBench</p></td>
+<td class="text-center"><p>315</p></td>
+<td class="text-center"><p>62.0%</p></td>
+<td class="text-center"><p>66.0%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For more information, please visit <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#multi-token-prediction-mtp">multi-token-prediction-mtp</a></p>
+</section>
+</section>
+<section id="multi-streams">
+<h4>Multi-streams<a class="headerlink" href="#multi-streams" title="Link to this heading">#</a></h4>
+<p>We have introduced multi-streams based optimizations to hide some kernels’ overhead, such as:</p>
+<ul class="simple">
+<li><p>Overlap shared experts with sparse experts</p></li>
+<li><p>Overlap Concat_KVCache kernel with GEMM</p></li>
+</ul>
+</section>
+<section id="sparse-experts-as-gemms-only-works-when-moe-backend-cutlass">
+<h4>Sparse Experts as GEMMs (only works when moe_backend=CUTLASS)<a class="headerlink" href="#sparse-experts-as-gemms-only-works-when-moe-backend-cutlass" title="Link to this heading">#</a></h4>
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_sparse_exp_as_a_gemm.png?raw=true" alt="tech_blog1_sparse_exp_as_a_gemm" width="800" height="auto">
+<p>The existing CUTLASS-based Sparse Experts flow (illustrated in the figure) dispatches input tokens to their designated experts, then applies indexed local reduction on each expert’s outputs before a global allreduce. Both dispatching and indexed local reduction incur high overhead in low-latency scenarios. To address this, we propose treating “Sparse Experts as GEMMs” by sending all tokens to each activated expert and masking out unneeded outputs before local reduction. Because grouped GEMMs are memory-bound, the extra computations from redundant tokens have minimal impact, effectively eliminating the costly dispatch and reduction overhead.</p>
+</section>
+<section id="re-balanced-the-sparse-experts">
+<h4>Re-balanced the sparse experts<a class="headerlink" href="#re-balanced-the-sparse-experts" title="Link to this heading">#</a></h4>
+<p>For sparse experts, two parallelization strategies are commonly used: Expert Parallel (EP) and Tensor Parallel (TP). Expert Parallel (EP) maps each expert to a distinct GPU, achieving high memory and computational efficiency. However, token placement is data-dependent, distributing workloads unevenly across GPUs and revealing overhead in the AllReduce step after the MoE module. Tensor Parallel (TP) shards each expert evenly across GPUs, creating a balanced workload but sacrificing math/memory efficiency.</p>
+<section id="mixed-etp">
+<h5>Mixed ETP<a class="headerlink" href="#mixed-etp" title="Link to this heading">#</a></h5>
+<p>A combined EP/TP approach can mitigate both challenges. In practice, our experiments show that a configuration of TP4EP2 offers the best performance.</p>
+</section>
+<section id="smart-router">
+<h5>Smart Router<a class="headerlink" href="#smart-router" title="Link to this heading">#</a></h5>
+<p>Alternatively, by storing all expert weights on a cluster of four GPUs and replicating them to another four-GPU cluster, a smart router can dynamically dispatch tokens across each cluster. This design keeps balanced workload distribution even without significantly impacting local memory and computation efficiency.</p>
+</section>
+</section>
+</section>
+<section id="kernel-level-optimizations">
+<h3>Kernel Level optimizations<a class="headerlink" href="#kernel-level-optimizations" title="Link to this heading">#</a></h3>
+<section id="attention-kernel">
+<h4>Attention Kernel<a class="headerlink" href="#attention-kernel" title="Link to this heading">#</a></h4>
+<p>We have developed a customized MLA attention kernel to better utilize GPU resources for latency scenarios.</p>
+</section>
+<section id="grouped-gemm">
+<h4>Grouped GEMM<a class="headerlink" href="#grouped-gemm" title="Link to this heading">#</a></h4>
+<section id="cutlass-backend-default-backend">
+<h5>CUTLASS Backend (default backend)<a class="headerlink" href="#cutlass-backend-default-backend" title="Link to this heading">#</a></h5>
+<p>Our default MoE backend is based on CUTLASS, which is flexible/robust but may not be the best performance case.</p>
+</section>
+<section id="trtllm-backend">
+<h5>TRTLLM Backend<a class="headerlink" href="#trtllm-backend" title="Link to this heading">#</a></h5>
+<p>The other MoE backend is TRTLLM, which provides better performance, and we are working to make it more flexible and robust, and in the future it will be switched as the default backend for Grouped GEMM computation for latency scenarios.</p>
+</section>
+</section>
+<section id="communication-kernel">
+<h4>Communication Kernel<a class="headerlink" href="#communication-kernel" title="Link to this heading">#</a></h4>
+<p>For small message sizes, regular NCCL latency-bound AllReduce kernels are inefficient, so we’ve developed a customized oneshot AllReduce kernel. It leverages the powerful NVSwitch HW capability by acting like an initial broadcast followed by local reduction, delivering better performance in min-latency scenarios.</p>
+</section>
+<section id="dense-gemm-optimization">
+<h4>Dense GEMM optimization<a class="headerlink" href="#dense-gemm-optimization" title="Link to this heading">#</a></h4>
+<p>We focus on optimizing two kinds of dense GEMMs: Fuse_A_GEMM and RouterGEMM, because they dominate the execution time, suffer from low memory efficiency, and cannot be easily sharded (they are DP-based).</p>
+<section id="fuse-a-gemm">
+<h5>Fuse_A_GEMM<a class="headerlink" href="#fuse-a-gemm" title="Link to this heading">#</a></h5>
+<p>We developed a custom Fuse_A_GEMM that prefetches the majority of its weights into shared memory (enabled by PDL and overlapped with oneshot-AllReduce), significantly enhancing performance. The kernel shows substantial improvements over default GEMM implementation when num_tokens &lt; 16.</p>
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_fuse_a_gemm.png?raw=true" alt="tech_blog1_fuse_a_gemm" width="500" height="auto">
+</section>
+<section id="routergemm">
+<h5>RouterGEMM<a class="headerlink" href="#routergemm" title="Link to this heading">#</a></h5>
+<p>By leveraging our internal AI code generator, we automatically generate an optimized RouterGEMM kernel, which delivers substantial improvements over the default GEMM implementation when num_tokens &lt;=30.</p>
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_router_gemm.png?raw=true" alt="tech_blog1_router_gemm" width="500" height="auto">
+</section>
+</section>
+<section id="kernel-fusion">
+<h4>Kernel fusion<a class="headerlink" href="#kernel-fusion" title="Link to this heading">#</a></h4>
+<p>Kernel fusion is necessary for min-latency scenario to reduce extra global memory write/read cost, and we support following fusion patterns now</p>
+<ul class="simple">
+<li><p>Fuse two overlapped RMS_Norms into one GroupedRMSNorm</p></li>
+<li><p>Fuse (LocalReduction) + AR+ RMS_Norm+ (Dynamic_Quant_bf16tonvfp4) into one kernel</p></li>
+<li><p>Fuse Grouped GEMM_FC1 + dot activation (when moe_backend=TRTLLM) into one kernel</p></li>
+</ul>
+</section>
+</section>
+</section>
+<section id="how-to-reproduce">
+<h2>How to reproduce<a class="headerlink" href="#how-to-reproduce" title="Link to this heading">#</a></h2>
+<p>https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md#b200-min-latency</p>
+<p>Of note, the Relaxed Acceptance is specific for Deepseek-R1 model, if you want to enable it, you need to set <code class="docutils literal notranslate"><span class="pre">add_generation_prompt</span> <span class="pre">=</span> <span class="pre">True</span></code> when preparing the benchmark dataset, the code demo likes</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">input_ids</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>It’s also needed to set <code class="docutils literal notranslate"><span class="pre">use_relaxed_acceptance_for_thinking:</span> <span class="pre">true</span></code>, <code class="docutils literal notranslate"><span class="pre">relaxed_topk:</span> <span class="pre">10</span></code> and <code class="docutils literal notranslate"><span class="pre">relaxed_delta:</span> <span class="pre">0.6</span></code> in speculative_config.</p>
+</section>
+<section id="future-works">
+<h2>Future Works<a class="headerlink" href="#future-works" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>More Fusions</p></li>
+<li><p>More Overlap</p></li>
+<li><p>More optimization of Attention Kernel</p></li>
+<li><p>More Exploration of MTP</p></li>
+</ul>
+</section>
+<section id="acknowledgment">
+<h2>Acknowledgment<a class="headerlink" href="#acknowledgment" title="Link to this heading">#</a></h2>
+<p>Pushing the performance boundaries of DeepSeek R1 for latency-sensitive applications has been a remarkable engineering journey. The optimizations detailed in this post represent an exceptional cross-functional collaboration across the entire AI technology stack - spanning kernel-level optimizations, runtime enhancements, model quantization techniques, algorithmic improvements, and systematic performance analysis and tuning. While we can’t individually acknowledge every contributor, we’re proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in TensorRT-LLM performance engineering.</p>
+<p>Through this collaborative endeavor, we’ve developed valuable insights into maximizing GPU utilization for large language model inference. We hope that the techniques and best practices shared in this blog will empower the developer community to better leverage NVIDIA GPU capabilities in their mission-critical LLM inference applications.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../XQA-kernel.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">DeepSeek R1 MTP Implementation and Optimization</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background">Background</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#implementation-configuration">Implementation Configuration</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#workload-profile">Workload Profile</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#model-architecture">Model Architecture</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#precision-strategy">Precision Strategy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#parallelism-strategy">Parallelism Strategy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#everything-in-one-diagram">Everything in One Diagram</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-optimizations">Key Optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#system-level-optimizations">System Level optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-programmatic-dependent-launch">CUDA Graph &amp; Programmatic Dependent Launch</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp">MTP</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#autoregressive-mtp-layers">Autoregressive MTP Layers</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#relax-acceptance-verification">Relax Acceptance Verification</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-streams">Multi-streams</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#sparse-experts-as-gemms-only-works-when-moe-backend-cutlass">Sparse Experts as GEMMs (only works when moe_backend=CUTLASS)</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#re-balanced-the-sparse-experts">Re-balanced the sparse experts</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#mixed-etp">Mixed ETP</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#smart-router">Smart Router</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-level-optimizations">Kernel Level optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-kernel">Attention Kernel</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#grouped-gemm">Grouped GEMM</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#cutlass-backend-default-backend">CUTLASS Backend (default backend)</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-backend">TRTLLM Backend</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#communication-kernel">Communication Kernel</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dense-gemm-optimization">Dense GEMM optimization</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#fuse-a-gemm">Fuse_A_GEMM</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#routergemm">RouterGEMM</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-fusion">Kernel fusion</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-reproduce">How to reproduce</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#future-works">Future Works</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#acknowledgment">Acknowledgment</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on August 19, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/7334f93">7334f93</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

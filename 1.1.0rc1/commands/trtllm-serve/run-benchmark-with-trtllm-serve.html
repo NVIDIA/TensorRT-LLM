@@ -1,0 +1,989 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Run benchmarking with trtllm-serve &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'commands/trtllm-serve/run-benchmark-with-trtllm-serve';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc1';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="TensorRT-LLM Architecture" href="../../architecture/overview.html" />
+    <link rel="prev" title="trtllm-serve" href="trtllm-serve.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.1.0rc1" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">trtllm-serve</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/dev-containers.html">Using Dev Containers</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="index.html" class="nav-link">trtllm-serve</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="run-benchmarking-with-trtllm-serve">
+<h1>Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code><a class="headerlink" href="#run-benchmarking-with-trtllm-serve" title="Link to this heading">#</a></h1>
+<p>TensorRT-LLM provides the OpenAI-compatiable API via <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command.
+A complete reference for the API is available in the <a class="reference external" href="https://platform.openai.com/docs/api-reference">OpenAI API Reference</a>.</p>
+<p>This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:</p>
+<ul class="simple">
+<li><p>Methodology Introduction</p></li>
+<li><p>Launch the OpenAI-Compatibale Server with NGC container</p></li>
+<li><p>Run the performance benchmark</p></li>
+<li><p>Using <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code></p></li>
+<li><p>Multimodal Serving and Benchmarking</p></li>
+</ul>
+<section id="methodology-introduction">
+<h2>Methodology Introduction<a class="headerlink" href="#methodology-introduction" title="Link to this heading">#</a></h2>
+<p>The overall performance benchmarking involves:</p>
+<ol class="arabic simple">
+<li><p>Launch the OpenAI-compatible service with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></p></li>
+<li><p>Run the benchmark with <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py">benchmark_serving.py</a></p></li>
+</ol>
+</section>
+<section id="launch-the-ngc-container">
+<h2>Launch the NGC container<a class="headerlink" href="#launch-the-ngc-container" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM distributes the pre-built container on <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Catalog</a>.</p>
+<p>You can launch the container using the following command:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>-it<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release
+</pre></div>
+</div>
+</section>
+<section id="start-the-trtllm-serve-service">
+<h2>Start the trtllm-serve service<a class="headerlink" href="#start-the-trtllm-serve-service" title="Link to this heading">#</a></h2>
+<blockquote>
+<div><p>[!WARNING]
+The commands and configurations presented in this document are for illustrative purposes only.
+They serve as examples and may not deliver the optimal performance for your specific use case.
+Users are encouraged to tune the parameters based on their hardware and workload.
+For benchmarking purposes, first create a bash script using the following code and name it start.sh.</p>
+</div></blockquote>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#! /bin/bash</span>
+<span class="nv">model_path</span><span class="o">=</span>/path/to/llama3.1_70B
+<span class="nv">extra_llm_api_file</span><span class="o">=</span>/tmp/extra-llm-api-config.yml
+
+cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${extra_llm_api_file}</span>
+<span class="s">enable_attention_dp: false</span>
+<span class="s">print_iter_log: true</span>
+<span class="s">cuda_graph_config:</span>
+<span class="s">  enable_padding: true</span>
+<span class="s">  max_batch_size: 1024</span>
+<span class="s">kv_cache_config:</span>
+<span class="s">  dtype: fp8</span>
+<span class="s">EOF</span>
+
+trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_num_tokens<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ep_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra_llm_api_options<span class="w"> </span><span class="si">${</span><span class="nv">extra_llm_api_file</span><span class="si">}</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p>[!NOTE]
+The trtllm-llmapi-launch is a script that launches the LLM-API code on
+Slurm-like systems, and can support multi-node and multi-GPU setups.
+e.g, trtllm-llmapi-launch trtllm-serve …..</p>
+</div></blockquote>
+<p>Run the start.sh script in the <strong>background</strong> with the following command:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>-x<span class="w"> </span>start.sh<span class="w"> </span><span class="p">&amp;</span>
+</pre></div>
+</div>
+<p>Once the serving is set up, it will generate the output log as shown below.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>INFO:<span class="w">     </span>Started<span class="w"> </span>server<span class="w"> </span>process<span class="w"> </span><span class="o">[</span><span class="m">80833</span><span class="o">]</span>
+INFO:<span class="w">     </span>Waiting<span class="w"> </span><span class="k">for</span><span class="w"> </span>application<span class="w"> </span>startup.
+INFO:<span class="w">     </span>Application<span class="w"> </span>startup<span class="w"> </span>complete.
+INFO:<span class="w">     </span>Uvicorn<span class="w"> </span>running<span class="w"> </span>on<span class="w"> </span>http://localhost:8000<span class="w"> </span><span class="o">(</span>Press<span class="w"> </span>CTRL+C<span class="w"> </span>to<span class="w"> </span>quit<span class="o">)</span>
+</pre></div>
+</div>
+</section>
+<section id="run-the-benchmark">
+<h2>Run the benchmark<a class="headerlink" href="#run-the-benchmark" title="Link to this heading">#</a></h2>
+<p>Similar to starting trtllm-serve, create a script to execute the benchmark using the following code and name it bench.sh.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">concurrency_list</span><span class="o">=</span><span class="s2">&quot;1 2 4 8 16 32 64 128 256&quot;</span>
+<span class="nv">multi_round</span><span class="o">=</span><span class="m">5</span>
+<span class="nv">isl</span><span class="o">=</span><span class="m">1024</span>
+<span class="nv">osl</span><span class="o">=</span><span class="m">1024</span>
+<span class="nv">result_dir</span><span class="o">=</span>/tmp/llama3.1_output
+<span class="nv">model_path</span><span class="o">=</span>/path/to/llama3.1_70B
+
+<span class="k">for</span><span class="w"> </span>concurrency<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="si">${</span><span class="nv">concurrency_list</span><span class="si">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nv">num_prompts</span><span class="o">=</span><span class="k">$((</span><span class="nv">concurrency</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">multi_round</span><span class="k">))</span>
+<span class="w">    </span>python<span class="w"> </span>-m<span class="w"> </span>tensorrt_llm.serve.scripts.benchmark_serving<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--model<span class="w"> </span><span class="si">${</span><span class="nv">model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--backend<span class="w"> </span>openai<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--dataset-name<span class="w"> </span><span class="s2">&quot;random&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--random-input-len<span class="w"> </span><span class="si">${</span><span class="nv">isl</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--random-output-len<span class="w"> </span><span class="si">${</span><span class="nv">osl</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--random-prefix-len<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--num-prompts<span class="w"> </span><span class="si">${</span><span class="nv">num_prompts</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--max-concurrency<span class="w"> </span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--ignore-eos<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--save-result<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--result-dir<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">result_dir</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--result-filename<span class="w"> </span><span class="s2">&quot;concurrency_</span><span class="si">${</span><span class="nv">concurrency</span><span class="si">}</span><span class="s2">.json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--percentile-metrics<span class="w"> </span><span class="s2">&quot;ttft,tpot,itl,e2el&quot;</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+<p>Then we can run the benchmark using the command below.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>-x<span class="w"> </span>bench.sh<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_bench.log
+</pre></div>
+</div>
+<p>Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">============</span> <span class="n">Serving</span> <span class="n">Benchmark</span> <span class="n">Result</span> <span class="o">============</span>
+<span class="n">Successful</span> <span class="n">requests</span><span class="p">:</span>                     <span class="mi">1</span>
+<span class="n">Benchmark</span> <span class="n">duration</span> <span class="p">(</span><span class="n">s</span><span class="p">):</span>                  <span class="mf">1.64</span>
+<span class="n">Total</span> <span class="nb">input</span> <span class="n">tokens</span><span class="p">:</span>                      <span class="mi">1024</span>
+<span class="n">Total</span> <span class="n">generated</span> <span class="n">tokens</span><span class="p">:</span>                  <span class="mi">1024</span>
+<span class="n">Request</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">req</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>              <span class="mf">0.61</span>
+<span class="n">Output</span> <span class="n">token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>         <span class="mf">622.56</span>
+<span class="n">Total</span> <span class="n">Token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>          <span class="mf">1245.12</span>
+<span class="n">User</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>                 <span class="mf">623.08</span>
+<span class="n">Mean</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                         <span class="mf">0.9980</span>
+<span class="n">Median</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                       <span class="mf">0.9980</span>
+<span class="o">---------------</span><span class="n">Time</span> <span class="n">to</span> <span class="n">First</span> <span class="n">Token</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">12.83</span>
+<span class="n">Median</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">12.83</span>
+<span class="n">P99</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">12.83</span>
+<span class="o">-----</span><span class="n">Time</span> <span class="n">per</span> <span class="n">Output</span> <span class="n">Token</span> <span class="p">(</span><span class="n">excl</span><span class="o">.</span> <span class="mi">1</span><span class="n">st</span> <span class="n">token</span><span class="p">)</span><span class="o">------</span>
+<span class="n">Mean</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">1.59</span>
+<span class="n">Median</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">1.59</span>
+<span class="n">P99</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">1.59</span>
+<span class="o">---------------</span><span class="n">Inter</span><span class="o">-</span><span class="n">token</span> <span class="n">Latency</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">1.59</span>
+<span class="n">Median</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                         <span class="mf">1.59</span>
+<span class="n">P99</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="mf">1.77</span>
+<span class="o">----------------</span><span class="n">End</span><span class="o">-</span><span class="n">to</span><span class="o">-</span><span class="n">end</span> <span class="n">Latency</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">E2EL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">1643.44</span>
+<span class="n">Median</span> <span class="n">E2EL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">1643.44</span>
+<span class="n">P99</span> <span class="n">E2EL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">1643.44</span>
+<span class="o">==================================================</span>
+</pre></div>
+</div>
+<section id="key-metrics">
+<h3>Key Metrics<a class="headerlink" href="#key-metrics" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Median Time to First Token (TTFT)</p>
+<ul>
+<li><p>The typical time elapsed from when a request is sent until the first output token is generated.</p></li>
+</ul>
+</li>
+<li><p>Median Time Per Output Token (TPOT)</p>
+<ul>
+<li><p>The typical time required to generate each token <em>after</em> the first one.</p></li>
+</ul>
+</li>
+<li><p>Median Inter-Token Latency (ITL)</p>
+<ul>
+<li><p>The typical time delay between the completion of one token and the completion of the next.</p></li>
+</ul>
+</li>
+<li><p>Median End-to-End Latency (E2EL)</p>
+<ul>
+<li><p>The typical total time from when a request is submitted until the final token of the response is received.</p></li>
+</ul>
+</li>
+<li><p>Total Token Throughput</p>
+<ul>
+<li><p>The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+</section>
+<section id="about-extra-llm-api-options">
+<h2>About <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code><a class="headerlink" href="#about-extra-llm-api-options" title="Link to this heading">#</a></h2>
+<p>trtllm-serve provides <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code> knob to <strong>overwrite</strong> the parameters specified by trtllm-serve.
+Generally, We create a YAML file that contains various performance switches.
+e.g</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="w">  </span><span class="nt">cuda_graph_config</span><span class="p">:</span>
+<span class="w">   </span><span class="nt">padding_enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">print_iter_log</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">kv_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
+<span class="w">  </span><span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>The following is a list of common performance switches.</p>
+<section id="kv-cache-config">
+<h3><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code><a class="headerlink" href="#kv-cache-config" title="Link to this heading">#</a></h3>
+<p> <strong>Description</strong>: A section for configuring the Key-Value (KV) cache.</p>
+<p> <strong>Options</strong>:</p>
+<p>  dtype: Sets the data type for the KV cache.</p>
+<p>  <strong>Default</strong>: auto (uses the data type specified in the model checkpoint).</p>
+</section>
+<section id="cuda-graph-config">
+<h3><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code><a class="headerlink" href="#cuda-graph-config" title="Link to this heading">#</a></h3>
+<p> <strong>Description</strong>: A section for configuring CUDA graphs to optimize performance.</p>
+<p> <strong>Options</strong>:</p>
+<p>  enable_padding: If true, input batches are padded to the nearest cuda_graph_batch_size. This can significantly improve performance.</p>
+<p>  <strong>Default</strong>: false</p>
+<p>  max_batch_size: Sets the maximum batch size for which a CUDA graph will be created.</p>
+<p>  <strong>Default</strong>: 0</p>
+<p>  <strong>Recommendation</strong>: Set this to the same value as the –max_batch_size command-line option.</p>
+<p>  batch_sizes: A specific list of batch sizes to create CUDA graphs for.</p>
+<p>  <strong>Default</strong>: None</p>
+</section>
+<section id="moe-config">
+<h3><code class="docutils literal notranslate"><span class="pre">moe_config</span></code><a class="headerlink" href="#moe-config" title="Link to this heading">#</a></h3>
+<p> <strong>Description</strong>: Configuration for Mixture-of-Experts (MoE) models.</p>
+<p> <strong>Options</strong>:</p>
+<p>  backend: The backend to use for MoE operations.</p>
+<p>  <strong>Default</strong>: CUTLASS</p>
+</section>
+<section id="attention-backend">
+<h3><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code><a class="headerlink" href="#attention-backend" title="Link to this heading">#</a></h3>
+<p> <strong>Description</strong>: The backend to use for attention calculations.</p>
+<p> <strong>Default</strong>: TRTLLM</p>
+<p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs">TorchLlmArgs class</a> for the full list of options which can be used in the extra_llm_api_options<code class="docutils literal notranslate"><span class="pre">.</span></code></p>
+</section>
+</section>
+<section id="multimodal-serving-and-benchmarking">
+<h2>Multimodal Serving and Benchmarking<a class="headerlink" href="#multimodal-serving-and-benchmarking" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM supports multimodal models for both serving and benchmarking. This section covers how to set up multimodal serving and run benchmarks for multimodal models.</p>
+<section id="setting-up-multimodal-serving">
+<h3>Setting up Multimodal Serving<a class="headerlink" href="#setting-up-multimodal-serving" title="Link to this heading">#</a></h3>
+<p>Here’s an example of setting up multimodal serving with Qwen2.5-VL:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="nv">model_path</span><span class="o">=</span>/path/to/qwen2.5vl-7B_model
+
+trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_num_tokens<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ep_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--trust_remote_code
+</pre></div>
+</div>
+</section>
+<section id="multimodal-benchmarking">
+<h3>Multimodal Benchmarking<a class="headerlink" href="#multimodal-benchmarking" title="Link to this heading">#</a></h3>
+<p>For multimodal serving benchmarks, you can use the <code class="docutils literal notranslate"><span class="pre">benchmark_serving.py</span></code> script with multimodal datasets:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>tensorrt_llm.serve.scripts.benchmark_serving<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span><span class="si">${</span><span class="nv">model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>openai-chat<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset-name<span class="w"> </span><span class="s2">&quot;random_image&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-input-len<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-output-len<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-image-width<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-image-height<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-num-images<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-prompts<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-concurrency<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ignore-eos
+</pre></div>
+</div>
+<p>Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">============</span> <span class="n">Serving</span> <span class="n">Benchmark</span> <span class="n">Result</span> <span class="o">============</span>
+<span class="n">Successful</span> <span class="n">requests</span><span class="p">:</span>                     <span class="mi">1</span>         
+<span class="n">Benchmark</span> <span class="n">duration</span> <span class="p">(</span><span class="n">s</span><span class="p">):</span>                  <span class="mf">0.83</span>      
+<span class="n">Total</span> <span class="nb">input</span> <span class="n">tokens</span><span class="p">:</span>                      <span class="mi">128</span>       
+<span class="n">Total</span> <span class="n">generated</span> <span class="n">tokens</span><span class="p">:</span>                  <span class="mi">128</span>       
+<span class="n">Request</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">req</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>              <span class="mf">1.20</span>      
+<span class="n">Output</span> <span class="n">token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>         <span class="mf">153.92</span>    
+<span class="n">Total</span> <span class="n">Token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>          <span class="mf">307.85</span>    
+<span class="n">User</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>                 <span class="mf">154.15</span>    
+<span class="n">Mean</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                         <span class="mf">0.9845</span>    
+<span class="n">Median</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                       <span class="mf">0.9845</span>    
+<span class="o">---------------</span><span class="n">Time</span> <span class="n">to</span> <span class="n">First</span> <span class="n">Token</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">84.03</span>     
+<span class="n">Median</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">84.03</span>     
+<span class="n">P99</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">84.03</span>     
+<span class="o">-----</span><span class="n">Time</span> <span class="n">per</span> <span class="n">Output</span> <span class="n">Token</span> <span class="p">(</span><span class="n">excl</span><span class="o">.</span> <span class="mi">1</span><span class="n">st</span> <span class="n">token</span><span class="p">)</span><span class="o">------</span>
+<span class="n">Mean</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">5.88</span>      
+<span class="n">Median</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">5.88</span>      
+<span class="n">P99</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">5.88</span>      
+<span class="o">---------------</span><span class="n">Inter</span><span class="o">-</span><span class="n">token</span> <span class="n">Latency</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">5.83</span>      
+<span class="n">Median</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                         <span class="mf">5.88</span>      
+<span class="n">P99</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="mf">6.14</span>      
+<span class="o">==================================================</span>
+</pre></div>
+</div>
+<p><strong>Notes for Multimodal Benchmarking:</strong></p>
+<ul class="simple">
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">--backend</span></code> as <code class="docutils literal notranslate"><span class="pre">openai-chat</span></code> since multimodal models are only supported on the chat API and require a chat template</p></li>
+<li><p>Control the number of images per request with <code class="docutils literal notranslate"><span class="pre">--random-num-images</span></code></p></li>
+<li><p>Use <code class="docutils literal notranslate"><span class="pre">--random-image-width</span></code> and <code class="docutils literal notranslate"><span class="pre">--random-image-height</span></code> to specify image dimensions or <code class="docutils literal notranslate"><span class="pre">--random-image-size</span></code> for squared image dimensions.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">random_image</span></code> dataset generates synthetic images for benchmarking</p></li>
+</ul>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="trtllm-serve.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">trtllm-serve</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../../architecture/overview.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">TensorRT-LLM Architecture</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#methodology-introduction">Methodology Introduction</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-ngc-container">Launch the NGC container</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#start-the-trtllm-serve-service">Start the trtllm-serve service</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-the-benchmark">Run the benchmark</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#key-metrics">Key Metrics</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#about-extra-llm-api-options">About <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-config"><code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-config"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-backend"><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-serving-and-benchmarking">Multimodal Serving and Benchmarking</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#setting-up-multimodal-serving">Setting up Multimodal Serving</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-benchmarking">Multimodal Benchmarking</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on August 19, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/7334f93">7334f93</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
