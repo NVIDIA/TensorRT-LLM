@@ -470,6 +470,7 @@ class ModelRunnerMixin:
                 prompt_table,
                 torch.Tensor), "Prompt table should be str or torch.Tensor"
             prompt_table_data = prompt_table.to(dtype=self.dtype)
+            torch.cuda.current_stream().synchronize()
 
         return prompt_table_data
 
