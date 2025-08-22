@@ -398,6 +398,10 @@ class LmEvalEvaluator(Evaluator):
             system_instruction=self.system_prompt)
         # Normalize scores to range 0~100
         scores = results["results"][self.task_name]
+        if self.task_name == "gsm8k":
+            print(f"scores: {scores}, results: {results}")
+            import sys
+            sys.stdout.flush()
         for metric in scores.keys():
             if isinstance(scores[metric], (float, int)):
                 scores[metric] *= 100
