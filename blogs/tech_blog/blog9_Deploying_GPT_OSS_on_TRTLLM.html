@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -69,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc0" />
+  <meta name="docsearch:version" content="1.1.0rc1" />
 
 
   </head>
@@ -511,220 +511,225 @@
                   
   <section id="running-a-high-performance-gpt-oss-120b-inference-server-with-tensorrt-llm">
 <h1>Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM<a class="headerlink" href="#running-a-high-performance-gpt-oss-120b-inference-server-with-tensorrt-llm" title="Link to this heading">#</a></h1>
-<p>In the guide below, we will walk you through how to launch your own
-high-performance TensorRT-LLM server for <strong>gpt-oss-120b</strong> for inference.
-This guide covers both low-latency and max-throughput cases.</p>
-<p>The typical use case for <strong>low-latency</strong>, is when we try to maximize the number of tokens per second per user with a limited concurrency (4, 8 or 16 users).</p>
-<p>For <strong>maximum throughput</strong>, the goal is to maximize the amount of tokens produced per GPU per second. The former is an indication of how fast a system can produce tokens, the latter measures how many tokens a “chip” can generate per unit of time.</p>
+<p>NVIDIA has <a class="reference external" href="https://developer.nvidia.com/blog/delivering-1-5-m-tps-inference-on-nvidia-gb200-nvl72-nvidia-accelerates-openai-gpt-oss-models-from-cloud-to-edge/">announced</a> day-0 support for OpenAI’s new open-source model series, <a class="reference external" href="https://openai.com/index/introducing-gpt-oss/">gpt-oss</a>. In the guide below, we will walk you through how to launch your own
+high-performance TensorRT-LLM server for <strong>gpt-oss-120b</strong> for inference.</p>
+<p><strong>Low-latency</strong> use cases aim to maximize the number of tokens per second per user (tps/user) with limited concurrency.</p>
+<p>For <strong>max-throughput</strong>, the goal is to maximize the tokens produced per GPU per second (tps/gpu). While tps/user indicates user experience quality, tps/gpu measures the economic efficiency of the system.</p>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p>1x NVIDIA B200/GB200/H200 GPU (8x NVIDIA B200/H200 GPUs or 4x GB200 GPUs in a single node recommended for higher performance)</p></li>
-<li><p>CUDA Toolkit 12.8 or later</p></li>
-<li><p>Docker with NVIDIA Container Toolkit installed</p></li>
+<li><p>1x NVIDIA B200/GB200/H200 GPU (more GPUs could be used for lower latency and higher throughput)</p></li>
 <li><p>Fast SSD storage for model weights</p></li>
 <li><p>Access to the gpt-oss-120b model checkpoint</p></li>
 </ul>
-<p>We have a forthcoming guide for getting great performance on H100, however this guide focuses on the above GPUs.</p>
+<p>We have a forthcoming guide for achieving great performance on H100; however, this guide focuses on the GPUs listed above.</p>
 </section>
-<section id="launching-the-tensorrt-llm-docker-container">
-<h2>Launching the TensorRT-LLM docker container<a class="headerlink" href="#launching-the-tensorrt-llm-docker-container" title="Link to this heading">#</a></h2>
-<p>The container image that you will use will be pulled from NVIDIA’s NGC. This container is multi-platform and will run on both x64 and arm64 architectures: <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev</span></code></p>
-<p>Run the follow docker command to start the TensorRT-LLM container in interactive mode:</p>
+<section id="install-tensorrt-llm">
+<h2>Install TensorRT-LLM<a class="headerlink" href="#install-tensorrt-llm" title="Link to this heading">#</a></h2>
+<p>In this section, we introduce several ways to install TensorRT-LLM.</p>
+<section id="ngc-docker-image-of-dev-branch">
+<h3>NGC Docker Image of dev branch<a class="headerlink" href="#ngc-docker-image-of-dev-branch" title="Link to this heading">#</a></h3>
+<p>Day-0 support for gpt-oss is provided via the NGC container image <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev</span></code>. This image was built on top of the pre-day-0 <strong>dev branch</strong>. This container is multi-platform and will run on both x64 and arm64 architectures.</p>
+<p>Run the following docker command to start the TensorRT-LLM container in interactive mode:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--ipc<span class="o">=</span>host<span class="w"> </span>-it<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--gpus<span class="w"> </span>all<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-e<span class="w"> </span><span class="nv">TRTLLM_ENABLE_PDL</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-e<span class="w"> </span><span class="nv">TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL</span><span class="o">=</span>True<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-v<span class="w"> </span>~/.cache:/root/.cache:rw<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>/bin/bash
 </pre></div>
 </div>
-<p>This command:</p>
+<p>Explanation of the command:</p>
 <ul class="simple">
 <li><p>Automatically removes the container when stopped (<code class="docutils literal notranslate"><span class="pre">--rm</span></code>)</p></li>
 <li><p>Allows container to interact with the host’s IPC resources and shared memory for optimal performance (<code class="docutils literal notranslate"><span class="pre">--ipc=host</span></code>)</p></li>
 <li><p>Runs the container in interactive mode (<code class="docutils literal notranslate"><span class="pre">-it</span></code>)</p></li>
 <li><p>Sets up shared memory and stack limits for optimal performance</p></li>
-<li><p>Maps port 8000 from the container to your host</p></li>
-<li><p>enables PDL for low-latency perf optimization</p></li>
-<li><p>disables parallel weight loading</p></li>
+<li><p>Maps port 8000 from the container to the host</p></li>
+<li><p>Enables PDL for performance optimization</p></li>
 </ul>
-<p>Lastly the container mounts your user <code class="docutils literal notranslate"><span class="pre">.cache</span></code> directory to save the downloaded model checkpoints which are saved to <code class="docutils literal notranslate"><span class="pre">~/.cache/huggingface/hub/</span></code> by default. This prevents having to redownload the weights each time you rerun the container.</p>
+<p>Additionally, the container mounts your user <code class="docutils literal notranslate"><span class="pre">.cache</span></code> directory to save the downloaded model checkpoints, which are stored in <code class="docutils literal notranslate"><span class="pre">~/.cache/huggingface/hub/</span></code> by default. This prevents having to redownload the weights each time you rerun the container. You can also download the weights to a custom location (we assume <code class="docutils literal notranslate"><span class="pre">${local_model_path}</span></code> is the path to the local model weights).</p>
 </section>
-<section id="running-the-tensorrt-llm-server">
-<h2>Running the TensorRT-LLM Server<a class="headerlink" href="#running-the-tensorrt-llm-server" title="Link to this heading">#</a></h2>
-<p>As pointed out in the introduction, this guide covers low-latency and max-throughput cases. Each requires a different configurations and commands to run. We will first cover the Low-Latency use-case, followed by the max throughput use-case.</p>
+<section id="build-from-source">
+<h3>Build from source<a class="headerlink" href="#build-from-source" title="Link to this heading">#</a></h3>
+<p>Support for gpt-oss has been <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6645">merged</a> into the <strong>main branch</strong> of TensorRT-LLM. As we continue to optimize gpt-oss performance, you can build TensorRT-LLM from source to get the latest features and support. Please refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html">doc</a> if you want to build from source yourself.</p>
+</section>
+<section id="regular-release-of-tensorrt-llm">
+<h3>Regular Release of TensorRT-LLM<a class="headerlink" href="#regular-release-of-tensorrt-llm" title="Link to this heading">#</a></h3>
+<p>Since gpt-oss has been supported on the main branch, you can get TensorRT-LLM out of the box through its regular release in the future. Please check the latest <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">release notes</a> to keep track of the support status. The release is provided as <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Container Image</a> or <a class="reference external" href="https://pypi.org/project/tensorrt-llm/#history">pip Python wheel</a>. You can find instructions on pip install <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/installation/linux.html">here</a>.</p>
+</section>
+</section>
+<section id="performance-benchmarking-and-model-serving">
+<h2>Performance Benchmarking and Model Serving<a class="headerlink" href="#performance-benchmarking-and-model-serving" title="Link to this heading">#</a></h2>
+<p>This guide covers how to configure for both low-latency and max-throughput cases, as well as how to benchmark end-to-end performance.</p>
+<section id="prepare-the-dataset">
+<h3>Prepare the dataset<a class="headerlink" href="#prepare-the-dataset" title="Link to this heading">#</a></h3>
+<p>Before getting started, we need to prepare a dataset of randomized tokens for benchmarking:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--stdout<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tokenizer<span class="w"> </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>token-norm-dist<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--input-mean<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-mean<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--num-requests<span class="w"> </span><span class="m">20000</span><span class="w"> </span>&gt;<span class="w"> </span>gpt-oss-120b-1k2k.txt
+</pre></div>
+</div>
+</section>
 <section id="low-latency-use-case">
-<h3>Low-latency Use-Case<a class="headerlink" href="#low-latency-use-case" title="Link to this heading">#</a></h3>
+<h3>Low-latency Use Case<a class="headerlink" href="#low-latency-use-case" title="Link to this heading">#</a></h3>
+<p>The low-latency configuration maximizes tps/user under limited concurrency (e.g., 1, 4, 8, or 16 users). Please set the number of GPUs and concurrency according to your specific situation and workload.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">num_gpus</span><span class="o">=</span><span class="m">8</span>
+<span class="nv">max_batch_size</span><span class="o">=</span><span class="m">1</span>
+</pre></div>
+</div>
 <section id="creating-the-extra-options-configuration">
 <h4>Creating the Extra Options Configuration<a class="headerlink" href="#creating-the-extra-options-configuration" title="Link to this heading">#</a></h4>
-<p>To run a server for low-latency workloads, create a YAML configuration file, <code class="docutils literal notranslate"><span class="pre">low_latency.yaml</span></code>, as follows:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="l l-Scalar l-Scalar-Plain">cat &lt;&lt;EOF &gt; low_latency.yaml</span>
-<span class="l l-Scalar l-Scalar-Plain">enable_attention_dp</span><span class="p p-Indicator">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
-<span class="nt">enable_mixed_sampler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="nt">cuda_graph_config</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
-<span class="w">    </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="nt">moe_config</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
-<span class="l l-Scalar l-Scalar-Plain">EOF</span>
+<p>Create a YAML configuration file, <code class="docutils literal notranslate"><span class="pre">low_latency.yaml</span></code>, as follows:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span><span class="s">&lt;&lt;EOF &gt; low_latency.yaml</span>
+<span class="s">enable_attention_dp: false</span>
+<span class="s">cuda_graph_config:</span>
+<span class="s">    max_batch_size: ${max_batch_size}</span>
+<span class="s">    enable_padding: true</span>
+<span class="s">moe_config:</span>
+<span class="s">    backend: TRTLLM</span>
+<span class="s">EOF</span>
 </pre></div>
 </div>
+<p>Key takeaways:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code> is set to <code class="docutils literal notranslate"><span class="pre">false</span></code> to use TP instead of DP for attention.
+s- <code class="docutils literal notranslate"><span class="pre">cuda_graph_config.max_batch_size</span></code> is the maximum batch size for CUDA graph.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cuda_graph_config.enable_padding</span></code> is set to <code class="docutils literal notranslate"><span class="pre">true</span></code> to enable CUDA graph padding.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code> is set to <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> to use the <code class="docutils literal notranslate"><span class="pre">trtllm-gen</span></code> MoE kernels which are optimized for low concurrency.</p></li>
+</ul>
 <blockquote>
-<div><p>Note: If you are using NVIDIA H200 GPUs it is highly recommended to set the <code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code> to TRITON to use the OpenAI Triton MoE kernel. See the section <a class="reference internal" href="#h200-only-using-openai-triton-kernels-for-moe">(H200 Only) Using OpenAI Triton Kernels for MoE</a> for more details.</p>
+<div><p>Note: If you are using NVIDIA H200 GPUs please set the <code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code> to <code class="docutils literal notranslate"><span class="pre">TRITON</span></code> to use the OpenAI Triton MoE kernel regardless of use case. See the section <a class="reference internal" href="#h200-h100-only-using-openai-triton-kernels-for-moe">(H200/H100 Only) Using OpenAI Triton Kernels for MoE</a> for more details.</p>
 </div></blockquote>
 </section>
-<section id="launching-tensorrt-llm-serve">
-<h4>Launching TensorRT-LLM Serve<a class="headerlink" href="#launching-tensorrt-llm-serve" title="Link to this heading">#</a></h4>
-<p>To launch the TensorRT-LLM Server to serve the model with the <strong>low latency</strong> config, run the following command. Commands for different GPU configurations are provided (1xGPU, 8xGPU, 4xGPU):</p>
-<details open> <summary>1x B200/GB200/H200</summary>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="w"> </span>--oversubscribe<span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
-trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--ep_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>low_latency.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.75
+<section id="run-the-benchmark">
+<h4>Run the benchmark<a class="headerlink" href="#run-the-benchmark" title="Link to this heading">#</a></h4>
+<p>Use <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> to benchmark the performance of your system:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_path<span class="w"> </span><span class="si">${</span><span class="nv">local_model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>throughput<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ep<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>low_latency.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset<span class="w"> </span>gpt-oss-120b-1k2k.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--concurrency<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num_requests<span class="w"> </span><span class="k">$((</span><span class="nv">max_batch_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">10</span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_free_gpu_mem_fraction<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--streaming<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--warmup<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--report_json<span class="w"> </span>low_latency_benchmark.json
 </pre></div>
 </div>
-</details>
-<details> <summary>8x B200/H200</summary>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="w"> </span>--oversubscribe<span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
-trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--tp_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--ep_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>low_latency.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.75
-</pre></div>
-</div>
-</details>
-<details> <summary>4x GB200/B200/H200</summary>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="w"> </span>--oversubscribe<span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
-trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--tp_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--ep_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>low_latency.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.75
-</pre></div>
-</div>
-</details>
+<p><code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code> controls the maximum batch size that the inference engine could serve, while <code class="docutils literal notranslate"><span class="pre">--concurrency</span></code> is the number of concurrent requests that the benchmarking client is sending. <code class="docutils literal notranslate"><span class="pre">--num_requests</span></code> is set to 10 times of <code class="docutils literal notranslate"><span class="pre">--concurrency</span></code> to run enough number of requests.</p>
+<p>Note that you can set <code class="docutils literal notranslate"><span class="pre">--ep</span></code> to a value larger than 1, which will enable mixed TP/EP for MoE. In minimum-latency scenarios, we recommend a small EP size to avoid load imbalance in MoE.</p>
+<p>For reference, we achieve <strong>420 tps/user</strong> with 8x B200 GPUs and batch size 1.</p>
 </section>
 </section>
 <section id="max-throughput-use-case">
-<h3>Max-Throughput Use-Case<a class="headerlink" href="#max-throughput-use-case" title="Link to this heading">#</a></h3>
+<h3>Max-Throughput Use Case<a class="headerlink" href="#max-throughput-use-case" title="Link to this heading">#</a></h3>
+<p>The max-throughput configuration maximizes tps/gpu at high concurrency levels. With increasing concurrency, we trade per-user latency for higher throughput that saturates the system’s GPUs. Using input sequence length (isl) of 1k and output sequence length (osl) of 2k, we can currently achieve a batch size of 640 with 8x B200 GPUs.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">num_gpus</span><span class="o">=</span><span class="m">8</span>
+<span class="nv">max_batch_size</span><span class="o">=</span><span class="m">640</span>
+</pre></div>
+</div>
 <section id="id1">
 <h4>Creating the Extra Options Configuration<a class="headerlink" href="#id1" title="Link to this heading">#</a></h4>
-<p>To run a server for max-throughput workloads, create a YAML configuration file,
-<code class="docutils literal notranslate"><span class="pre">max_throughput.yaml</span></code>, as follows:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="l l-Scalar l-Scalar-Plain">cat &lt;&lt;EOF &gt; max_throughput.yaml</span>
-<span class="l l-Scalar l-Scalar-Plain">enable_attention_dp</span><span class="p p-Indicator">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="nt">cuda_graph_config</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">640</span>
-<span class="w">    </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="nt">stream_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span>
-<span class="nt">moe_config</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTLASS</span>
-<span class="l l-Scalar l-Scalar-Plain">EOF</span>
+<p>Like before, create a YAML configuration file, <code class="docutils literal notranslate"><span class="pre">max_throughput.yaml</span></code>, as follows:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span><span class="s">&lt;&lt;EOF &gt; max_throughput.yaml</span>
+<span class="s">enable_attention_dp: true</span>
+<span class="s">cuda_graph_config:</span>
+<span class="s">    max_batch_size: ${max_batch_size}</span>
+<span class="s">    enable_padding: true</span>
+<span class="s">stream_interval: 10</span>
+<span class="s">moe_config:</span>
+<span class="s">    backend: CUTLASS</span>
+<span class="s">EOF</span>
 </pre></div>
 </div>
-<blockquote>
-<div><p>Note: If you are using NVIDIA H200 GPUs it is highly recommended to set the <code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code> to TRITON to use the OpenAI Triton MoE kernel. See the section <a class="reference internal" href="#h200-only-using-openai-triton-kernels-for-moe">(H200 Only) Using OpenAI Triton Kernels for MoE</a> for more details.</p>
-</div></blockquote>
+<p>Compared to the low-latency configuration, we:</p>
+<ul class="simple">
+<li><p>set <code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code> to <code class="docutils literal notranslate"><span class="pre">true</span></code> to use attention DP which is better for high throughput.</p></li>
+<li><p>set <code class="docutils literal notranslate"><span class="pre">stream_interval</span></code> to 10 to stream results to the client every 10 tokens. At high concurrency, the detokenization overhead of streaming mode cannot be hidden under GPU execution time, so <code class="docutils literal notranslate"><span class="pre">stream_interval</span></code> serves as a workaround to reduce this overhead.</p></li>
+<li><p>set <code class="docutils literal notranslate"><span class="pre">moe_config.backend</span></code> to <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> to use the <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> MoE kernels which are optimized for high throughput.</p></li>
+</ul>
 </section>
 <section id="id2">
-<h4>Launching TensorRT-LLM Serve<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
-<p>To launch the TensorRT-LLM Server to serve the model with the <strong>max throughput</strong> config, run the following command. Commands for different GPU configurations are provided (1xGPU, 8xGPU, 4xGPU):</p>
-<details open> <summary>1x B200/GB200/H200</summary>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="w"> </span>--oversubscribe<span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
-trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--ep_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--max_batch_size<span class="w"> </span><span class="m">640</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9
+<h4>Run the benchmark<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
+<p>Run the following command to benchmark the throughput of your system:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_path<span class="w"> </span><span class="si">${</span><span class="nv">local_model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>throughput<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ep<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset<span class="w"> </span>gpt-oss-120b-1k2k.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--concurrency<span class="w"> </span><span class="k">$((</span><span class="nv">max_batch_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">num_gpus</span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num_requests<span class="w"> </span><span class="k">$((</span><span class="nv">max_batch_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">num_gpus</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">3</span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_free_gpu_mem_fraction<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--streaming<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--warmup<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--report_json<span class="w"> </span>max_throughput_benchmark.json
 </pre></div>
 </div>
-</details>
-<details> <summary>8x B200/H200</summary>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="w"> </span>--oversubscribe<span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
-trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--tp_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--ep_size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--max_batch_size<span class="w"> </span><span class="m">640</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9
-</pre></div>
-</div>
-</details>
-<details> <summary>4x GB200/B200/H200</summary>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="w"> </span>--oversubscribe<span class="w"> </span>--allow-run-as-root<span class="w"> </span><span class="se">\</span>
-trtllm-serve<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--tp_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--ep_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--max_batch_size<span class="w"> </span><span class="m">640</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--trust_remote_code<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9
-</pre></div>
-</div>
-</details>
-<p>This command:</p>
+<p>Note:</p>
 <ul class="simple">
-<li><p>Maps port 8000 from the container to your host</p></li>
-<li><p>Uses the PyTorch backend and specifies the tensor and expert parallel sizes</p></li>
-<li><p>References the low latency or max throughput configuration file for extra options</p></li>
-<li><p>Configures memory settings for optimal performance</p></li>
-<li><p>Enables all GPUs with attention data parallelism for the max throughput scenario</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> MoE backend only supports pure EP for MoE, so we set <code class="docutils literal notranslate"><span class="pre">--ep</span></code> to <code class="docutils literal notranslate"><span class="pre">num_gpus</span></code>.</p></li>
+<li><p>When using <code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code>, <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> describes the maximum batch size for each local rank, so to saturate the system, we need to multiply <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> by <code class="docutils literal notranslate"><span class="pre">num_gpus</span></code> for <code class="docutils literal notranslate"><span class="pre">--concurrency</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--num_requests</span></code> is set to 3 times <code class="docutils literal notranslate"><span class="pre">--concurrency</span></code> to run enough number of requests.</p></li>
 </ul>
+<p>Currently, the best throughput <strong>19.5k tps/gpu</strong> is achieved with DP4EP4 using 4x B200 GPUs and over <strong>20k tps/gpu</strong> on GB200 GPUs due to slightly better performance of GB200, which translates to over <strong>1.5M tps</strong> on a GB200 NVL72 system. In theory, even better tps/gpu could be achieved with larger world size due to larger allowable batch size and smaller MoE weights per-GPU, but the communication implementation for &gt;4GPUs is suboptimal and we are actively working on improving it.</p>
+</section>
+</section>
+</section>
+<section id="launch-the-tensorrt-llm-server">
+<h2>Launch the TensorRT-LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h2>
+<p>We can use <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> to serve the model by translating the benchmark commands above. For low-latency configuration, run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>gpt-oss-120b<span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># Or ${local_model_path}</span>
+<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tp_size<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--ep_size<span class="w"> </span><span class="m">1</span><span class="w">  </span><span class="se">\</span>
+<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>low_latency.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># E.g., 1</span>
+<span class="w">  </span>--trust_remote_code
+</pre></div>
+</div>
 <p>The initialization may take several minutes as it loads and optimizes the models.</p>
-</section>
-</section>
-</section>
-<section id="h200-only-using-openai-triton-kernels-for-moe">
-<h2>(H200 Only) Using OpenAI Triton Kernels for MoE<a class="headerlink" href="#h200-only-using-openai-triton-kernels-for-moe" title="Link to this heading">#</a></h2>
-<p>OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper based GPUs like NVIDIA’s H200 for best performance. The NGC TensorRT-LLM container image mentioned above already includes the required kernels so you do not need to build or install them. It is highly recommended to enable them with the steps below:</p>
-<section id="selecting-triton-as-the-moe-backend">
-<h3>Selecting Triton as the MoE backend<a class="headerlink" href="#selecting-triton-as-the-moe-backend" title="Link to this heading">#</a></h3>
-<p>To use the Triton MoE backend with <strong>trtllm-serve</strong> (or other similar commands) add this snippet to the YAML file passed via <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code>:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">moe_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRITON</span>
+<p>For max-throughput configuration, run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>gpt-oss-120b<span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># Or ${local_model_path}</span>
+<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tp_size<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--ep_size<span class="w"> </span><span class="si">${</span><span class="nv">num_gpus</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>max_throughput.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># E.g., 640 </span>
+<span class="w">  </span>--trust_remote_code
 </pre></div>
 </div>
-<p>Alternatively the TRITON backend can be enabled by passing the CLI flag to the trtllm-server command at runtime:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>--moe_backend<span class="w"> </span>TRITON
-</pre></div>
-</div>
-</section>
-</section>
 <section id="test-the-server-with-a-sample-request">
-<h2>Test the Server with a Sample Request<a class="headerlink" href="#test-the-server-with-a-sample-request" title="Link to this heading">#</a></h2>
-<p>You can query the health/readiness of the server using</p>
+<h3>Test the Server with a Sample Request<a class="headerlink" href="#test-the-server-with-a-sample-request" title="Link to this heading">#</a></h3>
+<p>To check the server’s health and readiness:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;Status: %{http_code}\n&quot;</span><span class="w"> </span><span class="s2">&quot;http://localhost:8000/health&quot;</span>
 </pre></div>
 </div>
@@ -736,12 +741,12 @@ very first query may take longer due to initialization and compilation.</p>
 <span class="s1">    &quot;messages&quot;: [</span>
 <span class="s1">        {</span>
 <span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
-<span class="s1">            &quot;content&quot;: &quot;What is NVIDIAs advantage for inference?&quot;</span>
-<span class="s1">        }</span>
-<span class="s1">    ],</span>
-<span class="s1">    &quot;max_tokens&quot;: 1024,</span>
-<span class="s1">    &quot;top_p&quot;: 0.9</span>
-<span class="s1">}&#39;</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;\n&quot;</span>
+<span class="s1">            &quot;content&quot;: &quot;What is NVIDIA&#39;</span>s<span class="w"> </span>advantage<span class="w"> </span><span class="k">for</span><span class="w"> </span>inference?<span class="s2">&quot;</span>
+<span class="s2">        }</span>
+<span class="s2">    ],</span>
+<span class="s2">    &quot;</span>max_tokens<span class="s2">&quot;: 1024,</span>
+<span class="s2">    &quot;</span>top_p<span class="s2">&quot;: 0.9</span>
+<span class="s2">}&#39; -w &quot;</span><span class="se">\n</span><span class="s2">&quot;</span>
 </pre></div>
 </div>
 <details><summary><b>Show Example Output</b></summary>
@@ -816,24 +821,31 @@ very first query may take longer due to initialization and compilation.</p>
 requests. You can adjust parameters like <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">temperature</span></code>, and
 others according to your needs.</p>
 </section>
+</section>
+<section id="h200-h100-only-using-openai-triton-kernels-for-moe">
+<h2>(H200/H100 Only) Using OpenAI Triton Kernels for MoE<a class="headerlink" href="#h200-h100-only-using-openai-triton-kernels-for-moe" title="Link to this heading">#</a></h2>
+<p>OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper-based GPUs like NVIDIA’s H200 for optimal performance. <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> MoE backend is not supported on Hopper, and <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> backend support is still ongoing.  Please enable <code class="docutils literal notranslate"><span class="pre">TRITON</span></code> backend with the steps below if you are running on Hopper GPUs.</p>
+<section id="installing-openai-triton">
+<h3>Installing OpenAI Triton<a class="headerlink" href="#installing-openai-triton" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev</span></code> has prepared Triton already (<code class="docutils literal notranslate"><span class="pre">echo</span> <span class="pre">$TRITON_ROOT</span></code> could reveal the path). In other situations, you will need to build and install a specific version of Triton. Please follow the instructions in this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe">link</a>.</p>
+</section>
+<section id="selecting-triton-as-the-moe-backend">
+<h3>Selecting Triton as the MoE backend<a class="headerlink" href="#selecting-triton-as-the-moe-backend" title="Link to this heading">#</a></h3>
+<p>To use the Triton MoE backend with <strong>trtllm-serve</strong> (or other commands), add this snippet to the YAML file passed via <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRITON</span>
+</pre></div>
+</div>
+</section>
+</section>
 <section id="troubleshooting-tips">
 <h2>Troubleshooting Tips<a class="headerlink" href="#troubleshooting-tips" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p>If you encounter CUDA out-of-memory errors, try reducing <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, or <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></code></p></li>
-<li><p>Ensure your model checkpoints are compatible with the expected format</p></li>
-<li><p>For performance issues, check GPU utilization with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> while the server is running</p></li>
+<li><p>If you encounter CUDA out-of-memory errors, try reducing <code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code>, or <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></code>. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md">doc</a> for the explanation of these parameters.</p></li>
+<li><p>Add <code class="docutils literal notranslate"><span class="pre">print_iter_log:</span> <span class="pre">true</span></code> to extra LLM API options YAML file to inspect the per-iteration log.</p></li>
+<li><p>Check GPU utilization with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> while the server is running to inspect GPU status and memory usage.</p></li>
 <li><p>If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed</p></li>
 <li><p>For connection issues, make sure port 8000 is not being used by another application</p></li>
-</ul>
-</section>
-<section id="performance-tuning">
-<h2>Performance Tuning<a class="headerlink" href="#performance-tuning" title="Link to this heading">#</a></h2>
-<p>The configuration provided is optimized for 8xB200 GPUs, but you can adjust
-several parameters for your specific workload:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>: Controls how many requests can be batched together</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>: The number of tokens Eagle can speculate ahead</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_memory_fraction</span></code>: Controls memory allocation for the KV cache</p></li>
 </ul>
 </section>
 </section>
@@ -870,27 +882,36 @@ several parameters for your specific workload:</p>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launching-the-tensorrt-llm-docker-container">Launching the TensorRT-LLM docker container</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#running-the-tensorrt-llm-server">Running the TensorRT-LLM Server</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#low-latency-use-case">Low-latency Use-Case</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-tensorrt-llm">Install TensorRT-LLM</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ngc-docker-image-of-dev-branch">NGC Docker Image of dev branch</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#build-from-source">Build from source</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#regular-release-of-tensorrt-llm">Regular Release of TensorRT-LLM</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-benchmarking-and-model-serving">Performance Benchmarking and Model Serving</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-the-dataset">Prepare the dataset</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#low-latency-use-case">Low-latency Use Case</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#creating-the-extra-options-configuration">Creating the Extra Options Configuration</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#launching-tensorrt-llm-serve">Launching TensorRT-LLM Serve</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#run-the-benchmark">Run the benchmark</a></li>
 </ul>
 </li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#max-throughput-use-case">Max-Throughput Use-Case</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#max-throughput-use-case">Max-Throughput Use Case</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Creating the Extra Options Configuration</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Launching TensorRT-LLM Serve</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Run the benchmark</a></li>
 </ul>
 </li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#h200-only-using-openai-triton-kernels-for-moe">(H200 Only) Using OpenAI Triton Kernels for MoE</a><ul class="nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-tensorrt-llm-server">Launch the TensorRT-LLM Server</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#test-the-server-with-a-sample-request">Test the Server with a Sample Request</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#h200-h100-only-using-openai-triton-kernels-for-moe">(H200/H100 Only) Using OpenAI Triton Kernels for MoE</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#installing-openai-triton">Installing OpenAI Triton</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#selecting-triton-as-the-moe-backend">Selecting Triton as the MoE backend</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#test-the-server-with-a-sample-request">Test the Server with a Sample Request</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting-tips">Troubleshooting Tips</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-tuning">Performance Tuning</a></li>
 </ul>
   </nav></div>
 
@@ -985,9 +1006,9 @@ several parameters for your specific workload:</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 15, 2025.</p>
+  <p>Last updated on August 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/7334f93">7334f93</a>.</p>
   
 </div></div>
       
