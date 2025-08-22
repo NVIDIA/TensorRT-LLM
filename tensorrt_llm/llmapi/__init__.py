@@ -4,21 +4,24 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (AutoDecodingConfig, BatchingType, CacheTransceiverConfig,
-                       CalibConfig, CapacitySchedulerPolicy,
-                       ContextChunkingPolicy, CudaGraphConfig,
-                       DraftTargetDecodingConfig, DynamicBatchConfig,
-                       EagleDecodingConfig, ExtendedRuntimePerfKnobConfig,
-                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MoeConfig, MTPDecodingConfig,
-                       NGramDecodingConfig, SchedulerConfig, TorchCompileConfig,
-                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
+from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
+                       CacheTransceiverConfig, CalibConfig,
+                       CapacitySchedulerPolicy, ContextChunkingPolicy,
+                       CudaGraphConfig, DraftTargetDecodingConfig,
+                       DynamicBatchConfig, EagleDecodingConfig,
+                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
+                       UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
+from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
 
 __all__ = [
     'LLM',
+    'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
     'GuidedDecodingParams',
@@ -54,4 +57,5 @@ __all__ = [
     'TorchLlmArgs',
     'TrtLlmArgs',
     'AutoDecodingConfig',
+    'AttentionDpConfig',
 ]

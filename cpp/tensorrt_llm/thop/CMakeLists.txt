@@ -71,6 +71,8 @@ add_library(
   moeUtilOp.cpp
   moeCommOp.cpp
   moeLoadBalanceOp.cpp
+  mxFp4BlockScaleMoe.cpp
+  mxFp8Quantize.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
@@ -81,7 +83,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  renormMoeRoutingOp.cpp
+  customMoeRoutingOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
@@ -117,9 +119,9 @@ endif()
 
 if(NOT WIN32)
   set_target_properties(
-    th_common
-    PROPERTIES LINK_FLAGS
-               "-Wl,-rpath='$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+    th_common PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../nvidia/nccl/lib")
+  set_target_properties(
+    th_common PROPERTIES LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 else()
   target_link_libraries(th_common PRIVATE context_attention_src)
 endif()

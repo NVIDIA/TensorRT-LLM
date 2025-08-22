@@ -8,6 +8,7 @@ from tensorrt_llm._utils import get_sm_version
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
+from ..modules.multi_stream_utils import do_multi_stream
 from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
@@ -22,9 +23,12 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
-    tuning_config = TuningConfig(dynamic_tensor_specs=(
-        DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                          lambda x: min(last_positive_power_of_2(x), 8192)), ))
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+            lambda x: min(last_positive_power_of_2(x), 8192)), ),
+        tune_max_num_tokens=8192,
+    )
 
     def __init__(
         self,
@@ -39,9 +43,11 @@ class MoERunner(TunableRunner):
         cluster_size: int,
         cluster_rank: int,
         use_deepseek_fp8_block_scale: bool,
-        use_w4a8_group_scaling: bool,
+        use_w4_group_scaling: bool,
+        use_int8_woq_per_channel: bool,
         use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
+        use_fused_finalize: bool,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -56,27 +62,28 @@ class MoERunner(TunableRunner):
         # The best tactic is estimated as if alltoall is disabled
         self.enable_alltoall = False
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
-        self.use_w4a8_group_scaling = use_w4a8_group_scaling
+        self.use_w4_group_scaling = use_w4_group_scaling
+        self.use_int8_woq_per_channel = use_int8_woq_per_channel
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
+        self.use_fused_finalize = use_fused_finalize
+
         instance_key = (x_dtype, weight_dtype, output_dtype,
-                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
-                        use_mxfp8_act_scaling)
+                        use_deepseek_fp8_block_scale, use_w4_group_scaling,
+                        use_int8_woq_per_channel, use_mxfp8_act_scaling)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
                     x_dtype, weight_dtype, output_dtype,
-                    use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
-                    use_mxfp8_act_scaling)
+                    use_deepseek_fp8_block_scale, use_w4_group_scaling,
+                    use_int8_woq_per_channel, use_mxfp8_act_scaling,
+                    use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
-        return range(self.fused_moe_runner.get_tactic_num())
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
 
     def forward(
         self,
@@ -106,15 +113,6 @@ class MoERunner(TunableRunner):
             do_preparation,
         )
 
-    @classmethod
-    @lru_cache(maxsize=None)
-    def refine_tuning_config(cls, tune_max_num_tokens: int):
-        cls.tuning_config = TuningConfig(
-            dynamic_tensor_specs=(DynamicTensorSpec(
-                0, 0, get_last_power_of_2_num_tokens_buckets(
-                    tune_max_num_tokens), lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens)), ))
-
 
 @torch.library.custom_op("trtllm::fused_moe", mutates_args=())
 def fused_moe(
@@ -128,6 +126,10 @@ def fused_moe(
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
+    swizzled_input_sf: bool = True,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -136,16 +138,17 @@ def fused_moe(
     cluster_rank: int = 0,
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
-    use_w4a8_group_scaling: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-    MoERunner.refine_tuning_config(tune_max_num_tokens)
 
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
@@ -172,10 +175,14 @@ def fused_moe(
         cluster_size=cluster_size,
         cluster_rank=cluster_rank,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4a8_group_scaling=use_w4a8_group_scaling,
+        use_w4_group_scaling=use_w4_group_scaling,
+        use_int8_woq_per_channel=use_int8_woq_per_channel,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
+        use_fused_finalize=use_fused_finalize,
     )
+
+    MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
 
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
@@ -210,6 +217,10 @@ def fused_moe(
         fc2_expert_biases,
         quant_scales,
         input_sf,
+        swizzled_input_sf,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         tp_size,
         tp_rank,
         ep_size,
@@ -236,6 +247,10 @@ def _(
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
+    swizzled_input_sf: bool = True,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -244,13 +259,20 @@ def _(
     cluster_rank: int = 0,
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
-    use_w4a8_group_scaling: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
 ):
     seq_len = input.shape[0]
-    hidden_size = fc2_expert_weights.shape[1]
+    if use_int8_woq_per_channel:
+        # Note: The weight shape for INT8 weight only quantization is different, i.e.,
+        # fc2_expert_weights: [num_experts, inter_size, hidden_size]
+        hidden_size = fc2_expert_weights.shape[2]
+    else:
+        hidden_size = fc2_expert_weights.shape[1]
 
     if min_latency_mode:
         num_experts_on_rank = fc2_expert_weights.shape[0]
@@ -293,11 +315,8 @@ class FP8RowwiseGemmRunner(TunableRunner):
         self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp8_rowwise_gemm_runner.get_num_configs()))
 
     def forward(
@@ -378,11 +397,8 @@ class FP4GemmRunner(TunableRunner):
                     output_dtype, int(fp4_gemm_type))
         self.fp4_gemm_runner = FP4GemmRunner.runner_dict[instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp4_gemm_runner.get_num_configs()))
 
     def forward(
@@ -493,11 +509,8 @@ class FP8BatchedGemmRunner(TunableRunner):
 
         return out_tensors
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         mat1, mat2, _, _, _ = inputs
 
@@ -710,11 +723,8 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.weight_only_quant_gemm_runner.get_num_configs()))
 
     def forward(
@@ -788,11 +798,8 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
         self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(
             range(self._finegrained_mixed_dtype_gemm_runner.get_num_configs()))
 
@@ -901,6 +908,8 @@ def get_stream(stream_id: int):
 
 @torch.library.custom_op("trtllm::set_stream", mutates_args=())
 def set_stream(stream_id: int) -> None:
+    if not do_multi_stream():
+        return
     stream = get_stream(stream_id)
     assert stream is not None
     torch.cuda.set_stream(stream)
@@ -908,18 +917,24 @@ def set_stream(stream_id: int) -> None:
 
 @torch.library.custom_op("trtllm::record_event", mutates_args=())
 def record_event(event_idx: int) -> None:
+    if not do_multi_stream():
+        return
     event = get_event(event_idx)
     event.record()
 
 
 @torch.library.custom_op("trtllm::wait_event", mutates_args=())
 def wait_event(event_idx: int) -> None:
+    if not do_multi_stream():
+        return
     event = get_event(event_idx)
     event.wait()
 
 
 @torch.library.custom_op("trtllm::record_stream", mutates_args=())
 def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
+    if not do_multi_stream():
+        return
     stream = get_stream(stream_id)
     assert stream is not None
     tensor.record_stream(stream)

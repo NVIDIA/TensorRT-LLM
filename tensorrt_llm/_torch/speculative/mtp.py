@@ -268,8 +268,10 @@ class MTPSampler(TorchSampler):
             req.py_rewind_len = self.draft_len - (num_new_tokens - 1)
             self._request_common_handling(req, next_draft_tokens_list)
 
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     outputs: dict[str, torch.Tensor]) -> SampleStateMTP:
+    def sample_async(
+            self, scheduled_requests: ScheduledRequests,
+            outputs: dict[str, torch.Tensor],
+            num_context_logits_prefix_sum: list[int]) -> SampleStateMTP:
         # new_tokens_device: accepted tokens, device tensor, shape: batch_size, nextn + 1
         # new_tokens_lens_device: accepted lengths, device tensor, shape: batch_size
         # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
@@ -330,11 +332,9 @@ class MTPWorker(nn.Module):
         position_ids,
         hidden_states,
         logits,
-        lm_head,
-        embed_tokens,
         attn_metadata,
         spec_metadata,
-        mtp_layers,
+        draft_model,
     ):
         '''
         Example:
@@ -470,9 +470,10 @@ class MTPWorker(nn.Module):
         next_draft_tokens = []
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-        for _, mtp_layer in enumerate(mtp_layers):
-            hidden_states = mtp_layer(embed_tokens=embed_tokens, **draft_inputs)
-            logits = mtp_layer.shared_head(hidden_states, lm_head,
+        for _, mtp_layer in enumerate(draft_model.mtp_layers):
+            hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
+                                      **draft_inputs)
+            logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
                                            attn_metadata).float()
             new_draft_token = self.draft_sampler(logits)
             next_draft_tokens.append(new_draft_token)
@@ -517,11 +518,9 @@ class MTPWorker(nn.Module):
         position_ids,
         hidden_states,
         logits,
-        lm_head,
-        embed_tokens,
         attn_metadata,
         spec_metadata,
-        mtp_layers,
+        draft_model,
     ):
         batch_size = attn_metadata.num_seqs
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
@@ -1127,11 +1126,9 @@ class MTPEagleWorker(MTPWorker):
         position_ids,
         hidden_states,
         logits,
-        lm_head,
-        embed_tokens,
         attn_metadata,
         spec_metadata,
-        mtp_layers,
+        draft_model,
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -1153,24 +1150,27 @@ class MTPEagleWorker(MTPWorker):
             position_ids = position_ids.squeeze(0)
             last_tokens_idx = torch.cumsum(
                 attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            return position_ids, last_tokens_idx
+            last_tokens_idx_host = torch.cumsum(
+                attn_metadata.seq_lens, dim=0, dtype=torch.long) - 1
+            return position_ids, last_tokens_idx, last_tokens_idx_host
 
-        position_ids, last_tokens_idx = prepare_position_ids_and_last_tokens(
+        position_ids, last_tokens_idx, last_tokens_idx_host = prepare_position_ids_and_last_tokens(
             position_ids, attn_metadata)
-        inputs = self.prepare_drafter_inputs(input_ids=input_ids,
-                                             position_ids=position_ids,
-                                             last_tokens_idx=last_tokens_idx,
-                                             hidden_states=hidden_states,
-                                             accepted_tokens=accepted_tokens,
-                                             attn_metadata=attn_metadata,
-                                             spec_metadata=spec_metadata)
+        inputs = self.prepare_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            last_tokens_idx_host=last_tokens_idx_host,
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata)
 
         # Predict draft tokens
         next_draft_tokens = []
         for i in range(self.mtp_num_modules):
             if i == 0:
-                hidden_states = mtp_layers[0](
-                    embed_tokens=embed_tokens,
+                hidden_states = draft_model.mtp_layers[0](
+                    embed_tokens=draft_model.embed_tokens,
                     all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
                     all_rank_max_num_tokens=spec_metadata.
                     all_rank_max_num_tokens,
@@ -1183,8 +1183,8 @@ class MTPEagleWorker(MTPWorker):
                 gather_ids = torch.concat(
                     [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
             else:
-                hidden_states = mtp_layers[0](
-                    embed_tokens=embed_tokens,
+                hidden_states = draft_model.mtp_layers[0](
+                    embed_tokens=draft_model.embed_tokens,
                     all_rank_num_tokens=spec_metadata.
                     subseq_all_rank_num_tokens,
                     all_rank_max_num_tokens=max(
@@ -1194,8 +1194,9 @@ class MTPEagleWorker(MTPWorker):
                     **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
-            logits = mtp_layers[0].shared_head(hidden_states[gather_ids],
-                                               lm_head, attn_metadata, True)
+            logits = draft_model.mtp_layers[0].shared_head(
+                hidden_states[gather_ids], draft_model.lm_head, attn_metadata,
+                True)
             new_draft_token = self.draft_sampler(logits)
 
             hidden_states, position_ids = self.update_draft_tokens(
@@ -1277,7 +1278,7 @@ class MTPEagleWorker(MTPWorker):
         self,
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
-        last_tokens_idx: torch.LongTensor,
+        last_tokens_idx_host: torch.LongTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -1292,7 +1293,9 @@ class MTPEagleWorker(MTPWorker):
                                          device="cuda")
         input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
         input_ids_ctx[
-            last_tokens_idx[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+            last_tokens_idx_host[:
+                                 num_contexts]] = accepted_tokens[:num_contexts,
+                                                                  0]
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()

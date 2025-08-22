@@ -12,7 +12,12 @@ from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
 
-aux_stream_name_list = ['Attention', 'MoeShared', 'MoeChunkingOverlap']
+aux_stream_name_list = [
+    'Attention',
+    'MoeShared',
+    'MoeChunkingOverlap',
+    'MoeBalancer',
+]
 AuxStreamType = Enum(
     'AuxStreamType',
     aux_stream_name_list,
@@ -120,7 +125,7 @@ def swizzle_sf(sf: torch.Tensor,
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
-    return torch.ops.trtllm.nvfp4_block_scale_interleave(sf)
+    return torch.ops.trtllm.block_scale_interleave(sf)
 
 
 def unswizzle_sf(sf: torch.Tensor,
@@ -138,8 +143,7 @@ def unswizzle_sf(sf: torch.Tensor,
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
-    return torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(sf).view(
-        -1, sf_cols)
+    return torch.ops.trtllm.block_scale_interleave_reverse(sf).view(-1, sf_cols)
 
 
 @torch.library.custom_op("trtllm::reswizzle_sf", mutates_args=())
@@ -261,3 +265,13 @@ def set_piecewise_cuda_graph_flag(enable: bool):
 def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
+
+
+@contextlib.contextmanager
+def piecewise_cuda_graph(enable: bool):
+    prev_enable = get_piecewise_cuda_graph_flag()
+    set_piecewise_cuda_graph_flag(enable)
+    try:
+        yield
+    finally:
+        set_piecewise_cuda_graph_flag(prev_enable)

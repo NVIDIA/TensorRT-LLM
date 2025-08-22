@@ -31,6 +31,7 @@ option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
+option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
@@ -68,7 +69,7 @@ add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
 set(BINDING_TYPE
-    "pybind"
+    "nanobind"
     CACHE STRING
           "Binding type of Python bindings for C++ runtime and batch manager")
 
@@ -199,7 +200,9 @@ set(TRT_LIB TensorRT::NvInfer)
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
-if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+if(BINDING_TYPE STREQUAL "pybind"
+   OR BUILD_DEEP_EP
+   OR BUILD_DEEP_GEMM)
   add_subdirectory(${3RDPARTY_DIR}/pybind11
                    ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
 endif()
@@ -218,7 +221,9 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
-if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+if(BINDING_TYPE STREQUAL "pybind"
+   OR BUILD_DEEP_EP
+   OR BUILD_DEEP_GEMM)
   include_directories(${3RDPARTY_DIR}/pybind11/include)
 endif()
 if(BINDING_TYPE STREQUAL "nanobind")
@@ -490,6 +495,17 @@ if(ENABLE_UCX)
   if(NOT ${ucx_FOUND})
     set(ENABLE_UCX 0)
   else()
+    if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
+      if(EXISTS "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake")
+        file(READ "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" FILE_CONTENTS)
+        string(
+          REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
+                  "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
+                  FILE_CONTENTS "${FILE_CONTENTS}")
+        file(WRITE "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" "${FILE_CONTENTS}")
+        message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
+      endif()
+    endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
     # error, thus using their installation script to isolate the installation
     # process until the issue is understood. And always trigger the build so

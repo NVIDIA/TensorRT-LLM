@@ -198,6 +198,8 @@ struct TllmGenFmhaRunnerParams
     void const* kSfBasePtr;
     // The scaling factor pointer of V.
     void const* vSfBasePtr;
+    // The attention sinks pointer (additional value per head in the denominator of the softmax).
+    float const* attentionSinksPtr;
     // The custom mask ptr.
     uint32_t const* customMaskPtr;
     // The packed custom mask's offsets of each sequence.
@@ -236,6 +238,8 @@ struct TllmGenFmhaRunnerParams
     int mHeadDimQk;
     // Head dimension for V.
     int mHeadDimV;
+    // Head dimension for Q/K non-RoPE part, only used for MLA now.
+    int mHeadDimQkNope;
     // Number of heads for Q and K/V.
     int mNumHeadsQ, mNumHeadsKv, mNumHeadsQPerKv;
     // The batch size.

@@ -24,7 +24,9 @@ from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
                             print_traceback_on_error)
-from ..lora_manager import LoraConfig, LoraManager
+from ..lora_helper import LoraConfig
+from ..lora_manager import LoraManager
+from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -260,7 +262,7 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _iteration_result_task(self, it_result_queue: IterationResultQueue,
                                engine_get_result_api: Callable,
                                result_singleton: IterationResult,
-                               result_serializer: Callable):
+                               result_serializer: Callable) -> bool:
         time.sleep(0.2)
         async_queues = []
         queue = result_singleton.queue if self._is_llm_executor and result_singleton else it_result_queue.queue
@@ -372,6 +374,7 @@ class GenerationExecutorWorker(GenerationExecutor):
 
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
+        py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
             adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
                 request.lora_request.adapter_id)
@@ -381,8 +384,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 task_id=request.lora_request.adapter_id,
                 weights=self._lora_manager.cpp_lora_weights[uid]
                 if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid]
-                if not adapter_in_cache else None)
+                config=self._lora_manager.cpp_lora_config[uid])
+            py_lora_path = request.lora_request.lora_path
         else:
             lora_config = None
 
@@ -485,7 +488,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                #NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
+                # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
                 multimodal_embedding=None,
                 mrope_config=None,
                 logits_post_processor_name=(
@@ -497,20 +500,12 @@ class GenerationExecutorWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+            executor_request.py_lora_path = py_lora_path
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # Convert back to tensor, as opposite to `to_handle` in `llm.generate_async`
-                    # for values with non-selected keys, it's no-op
-                    request.multimodal_params.to_tensor(
-                        "multimodal_data", key="multimodal_embedding")
-                    embedding = request.multimodal_params.multimodal_data.get(
-                        "multimodal_embedding")
-                    if embedding is not None and embedding.is_cuda:
-                        # make sure the embedding resides on the local device
-                        request.multimodal_params.multimodal_data[
-                            "multimodal_embedding"] = embedding.to("cuda")
-
+                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
@@ -779,7 +774,7 @@ def worker_main(
         logger.error(traceback.format_exc())
         print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
-            worker_init_status_queue.put(e)
+            worker_init_status_queue.put((e, traceback.format_exc()))
         return
 
     with worker:
@@ -797,7 +792,7 @@ def worker_main(
                                                    mp_stats_queue)
                 worker._set_iteration_result_queue(worker.kv_events_queues,
                                                    kv_cache_events_queue)
-                worker_init_status_queue.put(ready_signal)
+                worker_init_status_queue.put((ready_signal, None))
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
@@ -897,10 +892,8 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
-            logprobs_result = _get_logprobs(self.worker, response,
+            response = _maybe_wrap_response(self.worker, response,
                                             self.worker._is_pytorch_backend)
-            if logprobs_result:
-                response = ResponseWrapper(response, logprobs_result)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
@@ -930,7 +923,9 @@ class AwaitResponseHelper:
 
         for response in responses:
 
-            if self.worker._has_background_error():
+            if isinstance(response, ErrorResponse):
+                pass  # send ErrorResponse directly
+            elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
                 # Convert to ErrorResponse, because tllm.Response cannot be
@@ -938,10 +933,8 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
             else:
-                logprobs_result = _get_logprobs(self.worker, response,
+                response = _maybe_wrap_response(self.worker, response,
                                                 self.worker._is_pytorch_backend)
-                if logprobs_result:
-                    response = ResponseWrapper(response, logprobs_result)
 
             _send_rsp(self.worker,
                       response,
@@ -1049,3 +1042,41 @@ def _send_rsp(
         worker._pop_result(response.client_id)
     else:
         raise ValueError(f"Unknown response type: {response}")
+
+
+def _get_metrics_dict(
+        response: tllm.Response) -> dict[RequestEventTiming, float]:
+    req_perf_metrics, metrics_dict = None, {}
+    res = response.result
+    if res:
+        if hasattr(res, '_result'):
+            if result := res.get_result():
+                req_perf_metrics = result.request_perf_metrics
+        else:
+            req_perf_metrics = res.request_perf_metrics
+        if req_perf_metrics and req_perf_metrics.timing_metrics:
+            metrics_dict = {
+                RequestEventTiming.ARRIVAL_TIME:
+                req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
+                RequestEventTiming.FIRST_TOKEN_TIME:
+                req_perf_metrics.timing_metrics.first_token_time.total_seconds(
+                ),
+                RequestEventTiming.FIRST_SCHEDULED_TIME:
+                req_perf_metrics.timing_metrics.first_scheduled_time.
+                total_seconds(),
+                RequestEventTiming.LAST_TOKEN_TIME:
+                req_perf_metrics.timing_metrics.last_token_time.total_seconds()
+            }
+    return metrics_dict
+
+
+def _maybe_wrap_response(
+        worker,
+        response: tllm.Response,
+        is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
+
+    logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
+    req_perf_metrics = _get_metrics_dict(response)
+    if logprobs_result or req_perf_metrics:
+        response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
+    return response

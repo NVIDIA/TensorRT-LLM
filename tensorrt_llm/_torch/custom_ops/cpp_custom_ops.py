@@ -57,12 +57,12 @@ def _register_fake():
 
     #MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
-    def _(input, buffer, buffer_flags, wait_for_results):
+    def _(input, buffer, buffer_flags, buffer_size, wait_for_results):
         output = input.new_empty(input.shape)
         return output
 
     @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
-    def _(comm_buf, gamma, eps, residual, buffer_flags):
+    def _(comm_buf, gamma, eps, residual, buffer_flags, buffer_size):
         output = residual.new_empty(residual.shape)
         residual_out = residual.new_empty(residual.shape)
         return [output, residual_out]
@@ -458,7 +458,7 @@ def _register_fake():
         gemm2_output: torch.Tensor,
         fc2_expert_biases: torch.Tensor,
         unpermuted_final_scales: torch.Tensor,
-        expanded_source_row_to_expanded_dest_row: torch.Tensor,
+        unpermuted_row_to_permuted_row: torch.Tensor,
         expert_for_source_row: torch.Tensor,
         expert_first_token_offset_tensor: torch.Tensor,
         num_rows: torch.SymInt,
@@ -501,7 +501,7 @@ def _register_fake():
             shape[0] = sizes[local_rank]
         return input.new_empty(shape)
 
-    @torch.library.register_fake("trtllm::nvfp4_block_scale_interleave")
+    @torch.library.register_fake("trtllm::block_scale_interleave")
     def _(sf: torch.Tensor):
         rows = sf.shape[-2]
         cols = sf.shape[-1]
@@ -511,7 +511,7 @@ def _register_fake():
         return sf.new_empty((num_experts * expert_out_size, ),
                             dtype=torch.uint8)
 
-    @torch.library.register_fake("trtllm::nvfp4_block_scale_interleave_reverse")
+    @torch.library.register_fake("trtllm::block_scale_interleave_reverse")
     def _(sf: torch.Tensor):
         return torch.empty_like(sf, dtype=torch.uint8)
 
@@ -525,6 +525,14 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
+    def _(router_logits, topk):
+        num_tokens = router_logits.shape[0]
+        sz = (num_tokens, topk)
+        return router_logits.new_empty(
+            sz, dtype=torch.int32), router_logits.new_empty(sz,
+                                                            dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::default_moe_routing_op")
     def _(router_logits, topk):
         num_tokens = router_logits.shape[0]
         sz = (num_tokens, topk)

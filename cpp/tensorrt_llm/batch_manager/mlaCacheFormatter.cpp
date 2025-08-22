@@ -236,7 +236,7 @@ void MLACacheFormatter::format(TransferSession& session)
         }
         double cacheTransferTime
             = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-        kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, delay, cacheTransferTime, size);
+        session.appendMeasure(delay, cacheTransferTime, size);
     };
 
     if (connections.size() > 1)
@@ -433,7 +433,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
             }
             double cacheTransferTime
                 = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-            kvCacheMeasureHelper.appendKVCacheTransfer(ctxReqId, delay, cacheTransferTime, size);
+            session.appendMeasure(delay, cacheTransferTime, size);
         };
 
         if (pickUpConnections.size() > 1)
@@ -558,16 +558,18 @@ void MLACacheFormatter::unformat(TransferSession& session)
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support MLA");
         return false;
     }
-
-    if (selfConfig.getAttentionConfig().mKvFactor != destConfig.getAttentionConfig().mKvFactor)
-    {
-        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support same kv factor");
-        return false;
-    }
     if (selfConfig.getParallelConfig().mEnableAttentionDP
         && (selfConfig.getParallelConfig().mTensorParallelism % selfConfig.getParallelConfig().mDPsize != 0))
     {
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be divisible by DP size");
+        return false;
+    }
+    if (selfConfig.getParallelConfig().mContextParallelism != 1
+        || destConfig.getParallelConfig().mContextParallelism != 1)
+    {
+        TLLM_LOG_WARNING(
+            "MLACacheFormatter::inquireSupport: context parallelism is not currently supported (selfCP=%d, destCP=%d).",
+            selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
         return false;
     }
     if (destConfig.getParallelConfig().mEnableAttentionDP
@@ -580,6 +582,28 @@ void MLACacheFormatter::unformat(TransferSession& session)
         && (destConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mDPsize))
     {
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be equal to DP size");
+        return false;
+    }
+
+    int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+    int selfPPSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    int destPPSize = destConfig.getParallelConfig().mPipelineParallelism;
+    int destNumLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+
+    if (selfPPSize == destPPSize)
+    {
+        return true;
+    }
+    if (selfNumLayers % selfPPSize != 0)
+    {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d",
+            selfNumLayers, selfPPSize);
+        return false;
+    }
+    if (destNumLayers % destPPSize != 0)
+    {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d ",
+            destNumLayers, destPPSize);
         return false;
     }
 

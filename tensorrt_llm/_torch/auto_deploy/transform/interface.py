@@ -15,6 +15,7 @@ from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..transformations._graph import canonicalize_graph, lift_to_meta
 from ..utils.logger import ad_logger
+from ..utils.sharding_utils import ShardingConfig
 
 
 class TransformError(Exception):
@@ -45,6 +46,15 @@ class Stages(Enum):
         if self.__class__ is other.__class__:
             return list(self.__class__).index(self) < list(other.__class__).index(other)
         return NotImplemented
+
+
+class SharedConfig(BaseModel):
+    """Global config shared between multiple transforms in the inference optimizer."""
+
+    sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
+    local_rank: int = Field(default=0)
+    world_size: int = Field(default=1)
+    attn_backend: str = Field(default="flashinfer", description="The attention backend to use.")
 
 
 class TransformConfig(BaseModel):
@@ -190,7 +200,11 @@ class BaseTransform(ABC):
 
     @final
     def __call__(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> GraphModule:
         """Apply the transform to the graph.
 
@@ -198,6 +212,7 @@ class BaseTransform(ABC):
             gm: The graph module to apply the transform to.
             cm: The cached sequence interface defining the sequence interface.
             factory: The model factory used to build the model.
+            shared_config: Global info shared between multiple transforms.
 
         Returns:
             GraphModule: The transformed graph module.
@@ -232,14 +247,14 @@ class BaseTransform(ABC):
             # run the transform in a error-handling wrapper if desired
             if self.config.skip_on_error:
                 try:
-                    gm, info = self._apply(gm, cm, factory)
+                    gm, info = self._apply(gm, cm, factory, shared_config)
                 except Exception as e:
                     error_msg = f"Transform {t_name} failed"
                     ad_logger.warning(f"{error_msg}: {e}")
                     info = TransformInfo(skipped=True, num_matches=0)
             else:
                 # handle this here normally to improve debugging and error message
-                gm, info = self._apply(gm, cm, factory)
+                gm, info = self._apply(gm, cm, factory, shared_config)
 
             # we cannot say it's clean if the previous wasn't clean even if this one is
             # create new info object with updated cleanup status
@@ -271,7 +286,10 @@ class BaseTransform(ABC):
         # update + store new meta data
         history[t_name] = info
         autodeploy_meta[self._history_key] = history
-        self._set_autodeploy_meta(gm, autodeploy_meta)
+
+        if isinstance(gm, GraphModule):
+            # After compilation, gm becomes type CapturedGraph with no meta data.
+            self._set_autodeploy_meta(gm, autodeploy_meta)
 
         # return the graph module
         return gm
@@ -346,7 +364,11 @@ class BaseTransform(ABC):
 
     @abstractmethod
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Apply the transform to the graph.
 

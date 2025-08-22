@@ -360,7 +360,7 @@ void CacheFormatter::format(TransferSession& session)
             }
             double cacheTransferTime
                 = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-            kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, delay, cacheTransferTime, size);
+            session.appendMeasure(delay, cacheTransferTime, size);
         };
 
         if (connections.size() > 1)
@@ -712,7 +712,7 @@ void CacheFormatter::unformat(TransferSession& session)
                 }
                 double cacheTransferTime
                     = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-                kvCacheMeasureHelper.appendKVCacheTransfer(ctxReqId, delay, cacheTransferTime, size);
+                session.appendMeasure(delay, cacheTransferTime, size);
             };
             if (pickUpConnections.size() > 1)
             {
@@ -822,6 +822,14 @@ void CacheFormatter::unformat(TransferSession& session)
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support non-MLA");
         return false;
     }
+    if (selfConfig.getParallelConfig().mContextParallelism != 1
+        || destConfig.getParallelConfig().mContextParallelism != 1)
+    {
+        TLLM_LOG_WARNING(
+            "CacheFormatter::inquireSupport: context parallelism is not currently supported (selfCP=%d, destCP=%d).",
+            selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
+        return false;
+    }
 
     std::unordered_set<int> setVecDest{
         destConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), destConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
@@ -846,16 +854,23 @@ void CacheFormatter::unformat(TransferSession& session)
     }
     int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();
     int selfPPSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    int destPPSize = destConfig.getParallelConfig().mPipelineParallelism;
+    int destNumLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+
+    if (selfPPSize == destPPSize)
+    {
+        return true;
+    }
     if (selfNumLayers % selfPPSize != 0)
     {
-        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers must be divisible by pipeline parallelism");
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d",
+            selfNumLayers, selfPPSize);
         return false;
     }
-    int destNumLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size();
-    int destPPSize = destConfig.getParallelConfig().mPipelineParallelism;
     if (destNumLayers % destPPSize != 0)
     {
-        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers must be divisible by pipeline parallelism");
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d ",
+            destNumLayers, destPPSize);
         return false;
     }
     return true;

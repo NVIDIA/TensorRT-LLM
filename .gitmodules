@@ -23,3 +23,9 @@
 [submodule "3rdparty/nanobind"]
 	path = 3rdparty/nanobind
 	url = https://github.com/wjakob/nanobind
+[submodule "3rdparty/cppzmq"]
+	path = 3rdparty/cppzmq
+	url = https://github.com/zeromq/cppzmq.git
+[submodule "3rdparty/DeepGEMM"]
+	path = 3rdparty/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git

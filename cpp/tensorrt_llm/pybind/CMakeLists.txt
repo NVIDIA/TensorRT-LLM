@@ -18,6 +18,7 @@ set(SRCS
     runtime/moeBindings.cpp
     userbuffers/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
+    thop/bindings.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
@@ -43,7 +44,9 @@ target_link_libraries(
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
          torch_python
-         ${CUDA_NVML_LIB})
+         ${CUDA_DRV_LIB}
+         ${CUDA_NVML_LIB}
+         th_common)
 target_compile_definitions(
   ${TRTLLM_PYBIND_MODULE} PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE}
                                  PYBIND11_DETAILED_ERROR_MESSAGES=1)
@@ -53,6 +56,6 @@ if(NOT WIN32)
     ${TRTLLM_PYBIND_MODULE}
     PROPERTIES
       LINK_FLAGS
-      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' -Wl,-rpath,'${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/stubs' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
+      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
   )
 endif()

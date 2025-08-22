@@ -99,15 +99,15 @@ __device__ struct __attribute__((aligned(32))) LamportFlags
     uint32_t* offset_access_ptr;
     uint32_t* buffer_flags;
 
-    __device__ explicit LamportFlags(uint32_t* buffer_flags)
+    __device__ explicit LamportFlags(uint32_t* buffer_flags, uint32_t buffer_size)
         : offset_access_ptr(&buffer_flags[4])
         , buffer_flags(buffer_flags)
+        , buffer_size(buffer_size)
     {
         uint4 flag = reinterpret_cast<uint4*>(buffer_flags)[0];
-        buffer_size = flag.z;
         input_offset = flag.x * (buffer_size << 1U);
         clear_offset = flag.y * (buffer_size << 1U);
-        num_tokens_prev = flag.w;
+        num_tokens_prev = flag.z;
     }
 
     __device__ void cta_arrive()
@@ -135,7 +135,7 @@ __device__ struct __attribute__((aligned(32))) LamportFlags
             uint4 flag = reinterpret_cast<uint4*>(buffer_flags)[0];
             buffer_flags[0] = (flag.x + 1) % 3;
             buffer_flags[1] = (flag.y + 1) % 3;
-            buffer_flags[3] = num_tokens;
+            buffer_flags[2] = num_tokens;
             *(offset_access_ptr) = 0;
         }
     }
@@ -144,7 +144,7 @@ __device__ struct __attribute__((aligned(32))) LamportFlags
 
 template <int WORLD_SIZE, typename T>
 __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_ptrs, T* mcast_ptr, int num_tokens,
-    int buffer_M, int token_dim, int rank, uint32_t* buffer_flags, bool wait_for_results)
+    int buffer_M, int token_dim, int rank, uint32_t buffer_size, uint32_t* buffer_flags, bool wait_for_results)
 {
     int elt = blockIdx.y * blockDim.x + threadIdx.x;
     if (elt >= token_dim)
@@ -155,7 +155,7 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
     cudaGridDependencySynchronize();
 #endif
 
-    LamportFlags flags(buffer_flags);
+    LamportFlags flags(buffer_flags, buffer_size);
 
     // Capture the number of tokens in previous iteration so that we can properly clear the buffer
     // The scatter stage will use the buffer in WORLD_SIZE granularity, thus we need to round up
@@ -217,15 +217,17 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-
-    // Similarly clear broadcast buffer here
-    for (int clr_tok = 0; clr_tok < clr_toks_cta; clr_tok++)
+    if (elt < token_dim)
     {
-        uint32_t clr_token_idx = token + clr_tok * gridDim.x;
-        if (clr_token_idx < buffer_M)
+        // Similarly clear broadcast buffer here
+        for (int clr_tok = 0; clr_tok < clr_toks_cta; clr_tok++)
         {
-            input_ptrs[rank][flags.clear_offset + buffer_M * token_dim + clr_token_idx * token_dim + elt]
-                = fromFloat<T>(-0.f);
+            uint32_t clr_token_idx = token + clr_tok * gridDim.x;
+            if (clr_token_idx < buffer_M)
+            {
+                input_ptrs[rank][flags.clear_offset + buffer_M * token_dim + clr_token_idx * token_dim + elt]
+                    = fromFloat<T>(-0.f);
+            }
         }
     }
 
@@ -240,20 +242,24 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
         // blockDim.x / ELTS_PER_LOAD should be at least the size of a warp (32)
         if (threadIdx.x < (blockDim.x / ELTS_PER_LOAD))
         {
-            uint64_t current_pos = blockIdx.x * token_dim + blockIdx.y * blockDim.x + threadIdx.x * ELTS_PER_LOAD;
+            uint64_t elt_load_offset = blockIdx.y * blockDim.x + threadIdx.x * ELTS_PER_LOAD;
+            if (elt_load_offset < token_dim)
+            {
+                uint64_t current_pos = blockIdx.x * token_dim + elt_load_offset;
 
-            void* lamport_ptr = (void*) &input_ptrs[rank][flags.input_offset + buffer_M * token_dim + current_pos];
-            // We have 2 assumptions here:
-            // 1. The write is atomic in 8B granularity -> Each buffer in the buffer group should be aligned to 8B
-            // 2. The num_token * token_dim is divisible by ELTS_PER_LOAD (4 for BF16 and 2 for FP32)
-            float2 val = loadfloat2(lamport_ptr);
-            while (isNegZero(*(T*) &val))
-            {
-                val = loadfloat2(lamport_ptr);
-            }
-            if (output_ptr)
-            {
-                *((float2*) &output_ptr[current_pos]) = val;
+                void* lamport_ptr = (void*) &input_ptrs[rank][flags.input_offset + buffer_M * token_dim + current_pos];
+                // We have 2 assumptions here:
+                // 1. The write is atomic in 8B granularity -> Each buffer in the buffer group should be aligned to 8B
+                // 2. The num_token * token_dim is divisible by ELTS_PER_LOAD (4 for BF16 and 2 for FP32)
+                float2 val = loadfloat2(lamport_ptr);
+                while (isNegZero(*(T*) &val))
+                {
+                    val = loadfloat2(lamport_ptr);
+                }
+                if (output_ptr)
+                {
+                    *((float2*) &output_ptr[current_pos]) = val;
+                }
             }
         }
 
@@ -263,10 +269,11 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
 }
 
 #define LAUNCH_ALL_REDUCE_KERNEL(WORLD_SIZE, T)                                                                        \
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &twoshot_allreduce_kernel<WORLD_SIZE, T>,                              \
-        reinterpret_cast<T*>(params.output), reinterpret_cast<T*>(params.input),                                       \
-        reinterpret_cast<T**>(params.buffer_ptrs_dev), (T*) params.multicast_ptr, params.num_tokens, params.buffer_M,  \
-        params.token_dim, params.rank, reinterpret_cast<uint32_t*>(params.buffer_flags), params.wait_for_results));
+    TLLM_CUDA_CHECK(                                                                                                   \
+        cudaLaunchKernelEx(&config, &twoshot_allreduce_kernel<WORLD_SIZE, T>, reinterpret_cast<T*>(params.output),     \
+            reinterpret_cast<T*>(params.input), reinterpret_cast<T**>(params.buffer_ptrs_dev),                         \
+            (T*) params.multicast_ptr, params.num_tokens, params.buffer_M, params.token_dim, params.rank,              \
+            params.buffer_size, reinterpret_cast<uint32_t*>(params.buffer_flags), params.wait_for_results));
 
 void twoshot_allreduce_op(AllReduceParams const& params)
 {
@@ -369,20 +376,33 @@ inline __device__ T add(T a, T b)
 }
 
 #define FINAL_MASK 0xffffffff
+#define WARP_SIZE 32
 
 template <typename T>
 __inline__ __device__ T warpReduceSum(T val)
 {
+    // Get the actual number of active threads in this warp
+    int active_warp_size = min(WARP_SIZE, blockDim.x - (threadIdx.x & ~(WARP_SIZE - 1)));
+    unsigned int mask = (1U << active_warp_size) - 1;
+
 #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        val = add<T>(val, __shfl_xor_sync(FINAL_MASK, val, mask, 32)); //__shfl_sync bf16 return float when sm < 80
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        if (offset < active_warp_size)
+        {
+            val = add<T>(val, __shfl_xor_sync(mask, val, offset, WARP_SIZE));
+        }
+    }
     return val;
 }
 
 inline __device__ float block_reduce_sum(float val)
 {
-    __shared__ float smem[32];
-    int lane_id = threadIdx.x % 32, warp_id = threadIdx.x / 32, warp_num = blockDim.x / 32;
+    __shared__ float smem[WARP_SIZE];
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int warp_num = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE; // Ceiling division to include partial warps
+
     val = warpReduceSum(val);
     if (lane_id == 0)
     {
@@ -391,6 +411,7 @@ inline __device__ float block_reduce_sum(float val)
     __syncthreads();
     val = lane_id < warp_num ? smem[lane_id] : 0.f;
     val = warpReduceSum(val);
+
     return val;
 }
 
@@ -410,7 +431,7 @@ __device__ float4 loadfloat4(void const* ptr)
 template <int DIM, int NUM_THREADS, int NUM_INPUTS, typename T_OUT, typename T_IN>
 __global__ void __launch_bounds__(128, 1)
     RMSNorm(T_IN* input_plus_residual, T_OUT* output_norm, T_IN const* buffer_input, T_IN const* gamma, float epsilon,
-        T_IN const* residual, int batch_size, uint32_t* buffer_flags)
+        T_IN const* residual, int batch_size, uint32_t buffer_size, uint32_t* buffer_flags)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     static bool const LAMPORT = true;
@@ -433,7 +454,7 @@ __global__ void __launch_bounds__(128, 1)
 
     int offsets[NUM_INPUTS][DIM / (1 * ELTS_PER_THREAD * NUM_THREADS)];
 
-    LamportFlags flags(buffer_flags);
+    LamportFlags flags(buffer_flags, buffer_size);
     T_IN const* input = &buffer_input[flags.input_offset + flags.buffer_size];
 
     cudaTriggerProgrammaticLaunchCompletion();
@@ -598,16 +619,15 @@ __global__ void __launch_bounds__(128, 1)
 #endif
 }
 
-template <typename T, int H_DIM>
+template <typename T, int H_DIM, int NUM_THREADS>
 void twoshot_rmsnorm(T* prenorm_output, T* normed_output, T const* input, T const* gamma, double epsilon,
-    T const* residual, uint32_t* buffer_flags, int batch, cudaStream_t stream)
+    T const* residual, uint32_t buffer_size, uint32_t* buffer_flags, int batch, cudaStream_t stream)
 {
 
     // input to rmsnorm is the buffer in the twoshot ar
     // We should use prenorm output to determine the actual used size
     float _epsilon{static_cast<float>(epsilon)};
 
-    static constexpr int NUM_THREADS = 128;
     static constexpr int CGA_THREADS = NUM_THREADS;
     constexpr int iters = H_DIM / CGA_THREADS;
 
@@ -628,28 +648,34 @@ void twoshot_rmsnorm(T* prenorm_output, T* normed_output, T const* input, T cons
         &RMSNorm<H_DIM, NUM_THREADS, 1, T, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
     config.dynamicSmemBytes = shmem_size;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &RMSNorm<H_DIM, NUM_THREADS, 1, T, T>, prenorm_output, normed_output,
-        input, gamma, _epsilon, residual, batch, buffer_flags));
+        input, gamma, _epsilon, residual, batch, buffer_size, buffer_flags));
 }
 
-#define LAUNCH_RMSNORM_KERNEL(T, H_DIM)                                                                                \
-    twoshot_rmsnorm<T, H_DIM>(static_cast<T*>(params.residual_output), static_cast<T*>(params.output),                 \
+#define LAUNCH_RMSNORM_KERNEL(T, H_DIM, NUM_THREADS)                                                                   \
+    twoshot_rmsnorm<T, H_DIM, NUM_THREADS>(static_cast<T*>(params.residual_output), static_cast<T*>(params.output),    \
         static_cast<T const*>(params.input), static_cast<T const*>(params.gamma), params.epsilon,                      \
-        static_cast<T const*>(params.residual), params.buffer_flags, params.batch, params.stream)
+        static_cast<T const*>(params.residual), params.buffer_size, params.buffer_flags, params.batch, params.stream)
 
 void twoshot_rmsnorm_op(RMSNormParams const& params)
 {
     auto dtype = params.dtype;
+
+#define CASE_DISPATCH_RMSNORM(T, H_DIM, NUM_THREADS)                                                                   \
+    case H_DIM: LAUNCH_RMSNORM_KERNEL(T, H_DIM, NUM_THREADS); break;
+
+#define TYPE_DISPATCH_RMSNORM(T)                                                                                       \
+    CASE_DISPATCH_RMSNORM(T, 2048, 128)                                                                                \
+    CASE_DISPATCH_RMSNORM(T, 2880, 120)                                                                                \
+    CASE_DISPATCH_RMSNORM(T, 4096, 128)                                                                                \
+    CASE_DISPATCH_RMSNORM(T, 5120, 128)                                                                                \
+    CASE_DISPATCH_RMSNORM(T, 7168, 128)                                                                                \
+    CASE_DISPATCH_RMSNORM(T, 8192, 128)
+
     if (dtype == nvinfer1::DataType::kFLOAT)
     {
         switch (params.hidden_dim)
         {
-        case 2048: LAUNCH_RMSNORM_KERNEL(float, 2048); break;
-        case 4096: LAUNCH_RMSNORM_KERNEL(float, 4096); break;
-        // Llama-4 Hidden Dimension
-        case 5120: LAUNCH_RMSNORM_KERNEL(float, 5120); break;
-        // DeepSeek Hidden Dimension
-        case 7168: LAUNCH_RMSNORM_KERNEL(float, 7168); break;
-        case 8192: LAUNCH_RMSNORM_KERNEL(float, 8192); break;
+            TYPE_DISPATCH_RMSNORM(float);
         default: TLLM_CHECK_WITH_INFO(false, "[MNNVL TwoShot RMSNorm]: unsupported hidden_dim.");
         }
     }
@@ -657,13 +683,7 @@ void twoshot_rmsnorm_op(RMSNormParams const& params)
     {
         switch (params.hidden_dim)
         {
-        case 2048: LAUNCH_RMSNORM_KERNEL(__nv_bfloat16, 2048); break;
-        case 4096: LAUNCH_RMSNORM_KERNEL(__nv_bfloat16, 4096); break;
-        // Llama-4 Hidden Dimension
-        case 5120: LAUNCH_RMSNORM_KERNEL(__nv_bfloat16, 5120); break;
-        // DeepSeek Hidden Dimension
-        case 7168: LAUNCH_RMSNORM_KERNEL(__nv_bfloat16, 7168); break;
-        case 8192: LAUNCH_RMSNORM_KERNEL(__nv_bfloat16, 8192); break;
+            TYPE_DISPATCH_RMSNORM(__nv_bfloat16);
         default: TLLM_CHECK_WITH_INFO(false, "[MNNVL TwoShot RMSNorm]: unsupported hidden_dim.");
         }
     }
@@ -671,13 +691,7 @@ void twoshot_rmsnorm_op(RMSNormParams const& params)
     {
         switch (params.hidden_dim)
         {
-        case 2048: LAUNCH_RMSNORM_KERNEL(__nv_half, 2048); break;
-        case 4096: LAUNCH_RMSNORM_KERNEL(__nv_half, 4096); break;
-        // Llama-4 Hidden Dimension
-        case 5120: LAUNCH_RMSNORM_KERNEL(__nv_half, 5120); break;
-        // DeepSeek Hidden Dimension
-        case 7168: LAUNCH_RMSNORM_KERNEL(__nv_half, 7168); break;
-        case 8192: LAUNCH_RMSNORM_KERNEL(__nv_half, 8192); break;
+            TYPE_DISPATCH_RMSNORM(__nv_half);
         default: TLLM_CHECK_WITH_INFO(false, "[MNNVL TwoShot RMSNorm]: unsupported hidden_dim.");
         }
     }
@@ -685,6 +699,8 @@ void twoshot_rmsnorm_op(RMSNormParams const& params)
     {
         TLLM_CHECK_WITH_INFO(false, "[MNNVL TwoShot RMSNorm]: unsupported dtype.");
     }
+#undef TYPE_DISPATCH_RMSNORM
+#undef CASE_DISPATCH_RMSNORM
 }
 
 } // namespace tensorrt_llm::kernels::mnnvl

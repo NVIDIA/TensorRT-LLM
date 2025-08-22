@@ -48,10 +48,10 @@ CONFIG_LINUX_AARCH64 = "linux_aarch64"
 def CONFIG_LINUX_AARCH64_LLVM = "linux_aarch64_LLVM"
 
 @Field
-def CONFIG_LINUX_X86_64_NANOBIND = "linux_x86_64_Nanobind"
+def CONFIG_LINUX_X86_64_PYBIND = "linux_x86_64_Pybind"
 
 @Field
-def CONFIG_LINUX_AARCH64_NANOBIND = "linux_aarch64_Nanobind"
+def CONFIG_LINUX_AARCH64_PYBIND = "linux_aarch64_Pybind"
 
 @Field
 def BUILD_CONFIGS = [
@@ -62,9 +62,9 @@ def BUILD_CONFIGS = [
     (TARNAME) : "TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
-  (CONFIG_LINUX_X86_64_NANOBIND) : [
-    (WHEEL_EXTRA_ARGS) : "--binding_type nanobind --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
-    (TARNAME) : "nanobind-TensorRT-LLM.tar.gz",
+  (CONFIG_LINUX_X86_64_PYBIND) : [
+    (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
+    (TARNAME) : "pybind-TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
@@ -82,9 +82,9 @@ def BUILD_CONFIGS = [
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
-  (CONFIG_LINUX_AARCH64_NANOBIND): [
-    (WHEEL_EXTRA_ARGS) : "--binding_type nanobind --extra-cmake-vars WARNING_IS_ERROR=ON",
-    (TARNAME) : "nanobind-TensorRT-LLM-GH200.tar.gz",
+  (CONFIG_LINUX_AARCH64_PYBIND): [
+    (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars WARNING_IS_ERROR=ON",
+    (TARNAME) : "pybind-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
@@ -542,8 +542,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
-        "Build TRT-LLM Nanobind": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_NANOBIND : CONFIG_LINUX_X86_64_NANOBIND),
+        "Build TRT-LLM Pybind": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
+            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_PYBIND : CONFIG_LINUX_X86_64_PYBIND),
     ]
 
     if (cpu_arch == X86_64_TRIPLE) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import click
@@ -12,6 +13,7 @@ from huggingface_hub import snapshot_download
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.build.build import get_model_config
+from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
@@ -20,7 +22,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.general import (
+    generate_warmup_dataset, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -49,12 +52,29 @@ from tensorrt_llm.sampling_params import SamplingParams
                  default="pytorch",
                  help="The backend to use when running benchmarking.")
 @optgroup.option(
+    "--custom_module_dirs",
+    type=click.Path(exists=True,
+                    readable=True,
+                    path_type=Path,
+                    resolve_path=True),
+    default=None,
+    multiple=True,
+    help="Paths to custom module directories to import.",
+)
+@optgroup.option(
     "--extra_llm_api_options",
     type=str,
     default=None,
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
 )
+@optgroup.option("--sampler_options",
+                 type=click.Path(exists=True,
+                                 readable=True,
+                                 path_type=Path,
+                                 resolve_path=True),
+                 default=None,
+                 help="Path to a YAML file that sets sampler options.")
 @optgroup.option(
     "--max_batch_size",
     type=int,
@@ -83,6 +103,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=.90,
     help="The percentage of memory to use for KV Cache after model load.",
 )
+@optgroup.option(
+    "--mamba_ssm_cache_dtype",
+    type=click.Choice(["auto", "float16", "bfloat16", "float32"]),
+    default="auto",
+    help="Data type for Mamba SSM cache. If 'auto', inferred from model config.",
+)
 @optgroup.group(
     "Engine Input Configuration",
     help="Input configuration for driving the engine.",
@@ -97,6 +123,16 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Pass in a dataset file for parsing instead of stdin.",
 )
+# For text models, tokenizer initialization is not needed when loading the model since the dataset is already tokenized.
+# For this reason, we skip tokenizer initialization by default.
+# However, for VLM models, tokenizer initialization is needed inside the model since the dataset contains texts and
+# raw media data. We cannot skip tokenizer initialization in this case.
+@optgroup.option(
+    "--no_skip_tokenizer_init",
+    is_flag=True,
+    default=False,
+    help="Do not skip tokenizer initialization when loading the model.",
+)
 @optgroup.option(
     "--eos_id",
     type=int,
@@ -110,6 +146,18 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=click.Choice(["image", "video"]),
     default=None,
     help="Modality of the multimodal requests.",
+)
+@optgroup.option(
+    "--image_data_format",
+    type=click.Choice(["pt", "pil"]),
+    default="pt",
+    help="Format of the image data for multimodal models.",
+)
+@optgroup.option(
+    "--data_device",
+    type=click.Choice(["cuda", "cpu"]),
+    default="cuda",
+    help="Device to load the multimodal data on.",
 )
 @optgroup.option(
     "--max_input_len",
@@ -233,10 +281,10 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where per request information is written to.",
 )
 @optgroup.option(
-    "--enable_chunked_context",
-    is_flag=True,
-    default=False,
-    help="Enable chunking in prefill stage for enhanced throughput benchmark.",
+    "--enable_chunked_context/--disable_chunked_context",
+    default=True,
+    help=
+    "Enable/disable chunking in prefill stage for enhanced throughput benchmark. "
 )
 @optgroup.option(
     "--scheduler_policy",
@@ -255,7 +303,17 @@ def throughput_command(
     logger.info("Preparing to run throughput benchmark...")
     # Parameters from CLI
     # Model, experiment, and engine params
+    custom_module_dirs: list[Path] = params.pop("custom_module_dirs", [])
+    for custom_module_dir in custom_module_dirs:
+        try:
+            import_custom_module_from_dir(custom_module_dir)
+        except Exception as e:
+            logger.error(
+                f"Failed to import custom module from {custom_module_dir}: {e}")
+            raise e
+
     dataset_path: Path = params.get("dataset")
+    no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
     eos_id: int = params.get("eos_id")
     warmup: int = params.get("warmup")
     num_requests: int = params.get("num_requests")
@@ -267,6 +325,8 @@ def throughput_command(
     backend: str = params.get("backend")
     modality: str = params.get("modality")
     max_input_len: int = params.get("max_input_len")
+    image_data_format: str = params.get("image_data_format", "pt")
+    data_device: str = params.get("data_device", "cpu")
     model_type = get_model_config(model, checkpoint_path).model_type
 
     # Reporting options
@@ -279,7 +339,7 @@ def throughput_command(
     # Runtime kwargs and option tracking.
     kwargs = {}
 
-    # Initialize the HF tokenizer for the specified model.
+    # Initialize the HF tokenizer for the specified model. This is only used for data preparation.
     tokenizer = initialize_tokenizer(checkpoint_path)
 
     # Dataset Loading and Preparation
@@ -291,6 +351,8 @@ def throughput_command(
             model_dir=checkpoint_path,
             model_type=model_type,
             modality=modality,
+            image_data_format=image_data_format,
+            data_device=data_device,
             max_input_seq_len_for_multimodal=max_input_len)
         metadata.dataset_path = dataset_path
         params["target_input_len"] = params.get(
@@ -385,6 +447,7 @@ def throughput_command(
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
+        kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
 
         if backend == "pytorch" and iteration_log is not None:
             kwargs["enable_iter_perf_stats"] = True
@@ -400,10 +463,16 @@ def throughput_command(
         else:
             llm = LLM(**kwargs)
 
-        sampling_params = SamplingParams(end_id=eos_id,
-                                         pad_id=eos_id,
-                                         n=beam_width,
-                                         use_beam_search=beam_width > 1)
+        sampler_args = {
+            "end_id": eos_id,
+            "pad_id": eos_id,
+            "n": beam_width,
+            "use_beam_search": beam_width > 1
+        }
+        sampler_args = update_sampler_args_with_extra_options(
+            sampler_args, params.pop("sampler_options"))
+        sampling_params = SamplingParams(**sampler_args)
+
         post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.
@@ -460,6 +529,10 @@ def throughput_command(
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")
+    except Exception:
+        import traceback
+        logger.error(f"Error during benchmarking:\n{traceback.format_exc()}")
+        sys.exit(1)
     finally:
         if llm is not None:
             llm.shutdown()

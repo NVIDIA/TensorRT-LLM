@@ -246,6 +246,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         return True  # success
 
     def dispatch_stats_task(self) -> bool:
+        if not self._iter_stats_result:
+            # This can happen temporarily because the WAR in tensorrt_llm/bench/benchmark/throughput.py
+            # is not synchronized with self.dispatch_stats_thread.
+            logger.debug(
+                f"Skipping stats dispatch while self._iter_stats_result=None")
+            return True  # Intended behavior, not an error
         return self._iteration_result_task(self.mp_stats_queue,
                                            self._iter_stats_result)
 
@@ -311,7 +317,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         while True:
             if self.worker_init_status_queue.poll(1):
-                ready_signal = self.worker_init_status_queue.get()
+                ready_signal, error_trace = self.worker_init_status_queue.get()
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
@@ -319,6 +325,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._handle_background_error()
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
+            logger.error(f"Executor worker initialization error: {error_trace}")
             self.mpi_session.shutdown_abort(reason=ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal

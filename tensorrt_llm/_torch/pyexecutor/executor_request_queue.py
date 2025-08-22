@@ -5,15 +5,17 @@ import queue
 import threading
 import time
 from collections import deque, namedtuple
-from typing import Dict, List, Optional, Tuple
+from itertools import repeat
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
-from .llm_request import ExecutorRequest, executor_request_to_llm_request
-from .sampler import Sampler, TorchSampler
+from .llm_request import (ExecutorRequest, LlmRequest,
+                          executor_request_to_llm_request)
 
 SHUTDOWN_REQUEST_ID = -1
 
@@ -22,6 +24,7 @@ SHUTDOWN_REQUEST_ID = -1
 class RequestQueueItem:
     id: int
     request: Optional[ExecutorRequest] = None
+    _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
@@ -41,12 +44,13 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 is_disaggregated: bool):
+                 batch_wait_timeout_ms: float, is_disaggregated: bool):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
         self.canceled_req_ids = []
         self.enable_attention_dp = enable_attention_dp
+        self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
         self.is_disaggregated = is_disaggregated
@@ -55,6 +59,7 @@ class ExecutorRequestQueue:
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
+        self.batch_wait_timeout_ms = batch_wait_timeout_ms
 
         # State tracking
         self.num_fetch_requests = 0
@@ -70,6 +75,7 @@ class ExecutorRequestQueue:
 
         items = []
         timeout_secs = timeout.total_seconds() if timeout is not None else None
+
         try:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
@@ -82,6 +88,26 @@ class ExecutorRequestQueue:
                     items.append(queue_item)
         except queue.Empty:
             pass
+
+        if self.batch_wait_timeout_ms == 0:
+            return items
+
+        if len(items) >= self.max_batch_size:
+            return items
+
+        deadline = time.monotonic() + self.batch_wait_timeout_ms / 1000.0
+        while len(items) < self.max_batch_size:
+            remaining_timeout = deadline - time.monotonic()
+
+            if remaining_timeout <= 0:
+                break
+
+            try:
+                item = self.request_queue.get(timeout=remaining_timeout)
+                items.append(item)
+            except queue.Empty:
+                break
+
         return items
 
     @staticmethod
@@ -182,70 +208,55 @@ class ExecutorRequestQueue:
 
         return child_req_ids
 
-    def enqueue_requests(self, requests: List[ExecutorRequest]):
+    def _enqueue_impl(
+        self, requests_and_queries: Iterable[Tuple[ExecutorRequest,
+                                                   Optional[List]]]
+    ) -> List[int]:
         req_ids = []
-        try:
-            self.enqueue_lock.acquire()
-            for request in requests:
+        with self.enqueue_lock:
+            assert self.active, "PyExecutor has already been shutdown."
+            start_time = time.time()
+            for request, query in requests_and_queries:
                 req_id = self._get_request_id()
-
                 if self.enable_iter_perf_stats:
-                    self.start_times[req_id] = time.time()
-
+                    self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
-                self.request_queue.put(
-                    RequestQueueItem(req_id, request, child_req_ids,
-                                     query=None))
 
+                self.request_queue.put(
+                    RequestQueueItem(req_id,
+                                     request,
+                                     child_req_ids=child_req_ids,
+                                     query=query))
                 req_ids.append(req_id)
-        finally:
-            self.enqueue_lock.release()
         return req_ids
 
-    def enqueue_cancel_request(self, req_id: int):
-        try:
-            self.enqueue_lock.acquire()
-            self.request_queue.put(
-                RequestQueueItem(req_id, is_canceled_request=True))
-        finally:
-            self.enqueue_lock.release()
-
-    def enqueue_shutdown_request(self):
-        try:
-            self.enqueue_lock.acquire()
-            self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
-            self.active = False
-        finally:
-            self.enqueue_lock.release()
+    def enqueue_requests(self, requests: List[ExecutorRequest]) -> List[int]:
+        """
+        Enqueue new requests
+        """
+        return self._enqueue_impl(zip(requests, repeat(None)))
 
     def enqueue_request(self,
                         request: ExecutorRequest,
-                        query: Optional[list] = None):
-        try:
-            self.enqueue_lock.acquire()
-            assert self.active, "PyExecutor has already been shutdown."
-            req_id = self._get_request_id()
-            if self.enable_iter_perf_stats:
-                self.start_times[req_id] = time.time()
+                        query: Optional[List] = None) -> int:
+        """
+        Enqueue a new request, query is only used in `StarAttention`.
+        """
+        return self._enqueue_impl([(request, query)])[0]
 
-            child_req_ids = self._generate_child_request_ids(request)
+    def enqueue_cancel_request(self, req_id: int):
+        with self.enqueue_lock:
             self.request_queue.put(
-                RequestQueueItem(
-                    req_id,
-                    request,
-                    child_req_ids=child_req_ids,
-                    query=query,
-                ))
-        finally:
-            self.enqueue_lock.release()
+                RequestQueueItem(req_id, is_canceled_request=True))
 
-        return req_id
+    def enqueue_shutdown_request(self):
+        with self.enqueue_lock:
+            self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
+            self.active = False
 
     def can_enqueue_request(self) -> bool:
-        self.enqueue_lock.acquire()
-        can_enqueue = self.active
-        self.enqueue_lock.release()
-        return can_enqueue and self.dist.rank == 0
+        with self.enqueue_lock:
+            return self.active and self.dist.rank == 0
 
     def _fetch_and_process_requests(
         self,
@@ -291,8 +302,7 @@ class ExecutorRequestQueue:
         return new_requests
 
     @nvtx_range("_fetch_new_requests")
-    def fetch_new_requests(self,
-                           num_active_requests: int) -> List[RequestQueueItem]:
+    def fetch_new_requests(self, num_active_requests: int) -> List[LlmRequest]:
 
         if self.enable_attention_dp:
             return self._fetch_new_requests_attention_dp(num_active_requests)
@@ -300,7 +310,7 @@ class ExecutorRequestQueue:
             return self._fetch_new_requests_attention_tp(num_active_requests)
 
     def _fetch_new_requests_attention_tp(
-            self, num_active_requests: int) -> List[RequestQueueItem]:
+            self, num_active_requests: int) -> List[LlmRequest]:
         """Handle standard (non-attention DP) request fetching."""
         total_num_active_requests = num_active_requests
         total_max_num_active_requests = self.max_num_active_requests
@@ -316,7 +326,7 @@ class ExecutorRequestQueue:
         return merged_requests
 
     def _fetch_new_requests_attention_dp(
-            self, num_active_requests: int) -> List[RequestQueueItem]:
+            self, num_active_requests: int) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
         # Get active request counts across all ranks
         all_ranks_num_active_requests = []
@@ -577,13 +587,14 @@ class ExecutorRequestQueue:
                         child_id)
 
     @nvtx_range("_merge_requests")
-    def _merge_requests(self, new_requests: list[RequestQueueItem]):
+    def _merge_requests(
+            self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == 'ring_attention':
+            elif cp_type == CpType.RING:
                 raise NotImplementedError("ring attention not implemented yet")
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
@@ -598,8 +609,8 @@ class ExecutorRequestQueue:
                     req_with_children.extend(req.child_requests)
             return req_with_children
 
-    def _merge_star_attention_requests(self,
-                                       new_requests: list[RequestQueueItem]):
+    def _merge_star_attention_requests(
+            self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
         result = []
         for req_item in new_requests:
             req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
@@ -695,21 +706,19 @@ class ExecutorRequestQueue:
 
     def set_exclude_last_generation_logits(self,
                                            disable_overlap_scheduler: bool,
-                                           sampler: Sampler) -> None:
+                                           pp_size: int) -> None:
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # sample_async is called twice before the first call to update_requests:
         # - 1st time as a context request that handles on the 1st generated token
         # - 2nd time as a generation request that handles on the 2nd generated token.
         # and only after these two calls the sampler's update_request method is called.
         # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async (TorchSampler is an anomaly that instead does that on
-        # update_requests), every update_request doesn't handle the newest token, but one
+        # sample_async, every update_request doesn't handle the newest token, but one
         # before it. Since all these calls work on the same request object, then its
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
-        # getter is required, when not using TorchSampler.
-        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and not isinstance(
-            sampler, TorchSampler)
+        # getter is required.
+        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and pp_size == 1
 
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits

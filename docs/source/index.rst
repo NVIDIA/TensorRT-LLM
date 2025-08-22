@@ -32,6 +32,17 @@ Welcome to TensorRT-LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
+   :caption: Deployment Guide
+   :name: Deployment Guide
+
+   deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.md
+   deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.md
+   deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.md
+   deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.md
+
+
+.. toctree::
+   :maxdepth: 2
    :caption: LLM API
    :hidden:
    :glob:
@@ -75,11 +86,11 @@ Welcome to TensorRT-LLM's Documentation!
 .. toctree::
    :maxdepth: 2
    :caption: Command-Line Reference
-   :hidden:
+   :name: Command-Line Reference
 
    commands/trtllm-bench
    commands/trtllm-build
-   commands/trtllm-serve
+   commands/trtllm-serve/index
 
 
 .. toctree::
