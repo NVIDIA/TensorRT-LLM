@@ -34,8 +34,8 @@ l0_rtx_pro_6000:
 - condition:
     ranges:
       system_gpu_count:
-        gte: 4
-        lte: 4
+        gte: 8
+        lte: 8
     wildcards:
       gpu:
       - '*6000*'
