@@ -156,6 +156,19 @@ setup_cuda_architectures()
 find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
                                                   cublas cublasLt curand nvml)
 
+option(PREFER_STATIC_CUDA_LIBS
+       "Link with static cuda libs (cublas, curand) (linux only)" OFF)
+if(${PREFER_STATIC_CUDA_LIBS})
+  message(STATUS "Linking with static cuda libs (cublas, cublasLt, curand,...)")
+  set(CUBLAS_LIB CUDA::cublas_static)
+  set(CUBLASLT_LIB CUDA::cublasLt_static)
+  set(CURAND_LIB CUDA::curand_static)
+else()
+  set(CUBLAS_LIB CUDA::cublas)
+  set(CUBLASLT_LIB CUDA::cublasLt)
+  set(CURAND_LIB CUDA::curand)
+endif()
+
 set(CUBLAS_LIB CUDA::cublas)
 set(CUBLASLT_LIB CUDA::cublasLt)
 set(CURAND_LIB CUDA::curand)
