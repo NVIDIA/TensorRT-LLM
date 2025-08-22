@@ -433,7 +433,7 @@ def apply_chat_template(
     if model_type in PLACEHOLDER_EXCEPTIONS:
         # flattened content do not work for these models, so go back to other formats as needed
         conversation = handle_placeholder_exceptions(model_type, conversation,
-                                                     mm_placeholder_counts)
+                                                     [mm_placeholder_counts])
 
     return tokenizer.apply_chat_template(
         conversation=conversation,
