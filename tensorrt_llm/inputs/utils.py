@@ -616,4 +616,9 @@ def default_multimodal_input_loader(
 def get_cache_salt_id(cache_salt: str) -> int:
     b = cache_salt.encode("utf-8")
     h = default_hasher(b).digest(length=8)
-    return int.from_bytes(h, "little", signed=False)
+    cache_salt_id = int.from_bytes(h, "little", signed=False)
+    if cache_salt_id < 0 or cache_salt_id >= (1 << 64):
+        raise ValueError(
+            f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
+
+    return cache_salt_id

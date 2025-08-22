@@ -573,11 +573,11 @@ void initRequestBindings(nb::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams());
+            self.getGuidedDecodingParams(), self.getCacheSaltID());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 33)
+        if (state.size() != 34)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -601,7 +601,8 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<SizeType32>>(state[28]),
             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
             nb::cast<std::optional<tle::Tensor>>(state[31]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]));
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]),
+            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]));
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
