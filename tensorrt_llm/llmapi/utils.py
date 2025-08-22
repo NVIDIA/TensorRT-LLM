@@ -1,6 +1,8 @@
 import asyncio
 import collections
+import datetime
 import hashlib
+import inspect
 import io
 import os
 import re
@@ -64,8 +66,61 @@ def print_colored(message,
 def print_colored_debug(message,
                         color: Optional[str] = None,
                         writer: io.TextIOWrapper = sys.stderr):
-    if enable_llm_debug():
+    if enable_llmapi_debug():
         print_colored(message, color, writer)
+
+
+def get_current_location(skip_frames: int = 2) -> str:
+    """
+    Get the current execution location in format 'module.class.function'.
+
+    Args:
+        skip_frames: Number of stack frames to skip (default 2 to skip this function and its caller)
+
+    Returns:
+        String in format 'module.class.function' or 'module.function' if not in a class
+    """
+    stack = inspect.stack()
+    if len(stack) <= skip_frames:
+        return "unknown"
+
+    frame = stack[skip_frames]
+    module_name = frame.frame.f_globals.get('__name__', 'unknown')
+    function_name = frame.function
+
+    # Try to determine if we're in a class method
+    class_name = None
+    if 'self' in frame.frame.f_locals:
+        # This is likely an instance method
+        obj = frame.frame.f_locals['self']
+        class_name = obj.__class__.__name__
+    elif 'cls' in frame.frame.f_locals:
+        # This might be a class method
+        cls = frame.frame.f_locals['cls']
+        if inspect.isclass(cls):
+            class_name = cls.__name__
+
+    # Build the location string
+    if class_name:
+        return f"{module_name}.{class_name}.{function_name}"
+    else:
+        return f"{module_name}.{function_name}"
+
+
+def logger_debug(message,
+                 color: Optional[str] = None,
+                 writer: io.TextIOWrapper = sys.stderr):
+    """ Print the message if the llmapi debug mode is enabled. Fallback to logger.debug if not. """
+    if enable_llmapi_debug():
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        location = get_current_location()
+        cur_dualname = "..." + location[-47:] if len(
+            location) > 50 else location
+        print_colored(f"{timestamp} [{cur_dualname}]", "bold_green", writer)
+        print_colored(f" {message}\n", color, writer)
+    else:
+        # Fallback to logger.debug
+        logger.debug(message)
 
 
 def file_with_glob_exists(directory, glob) -> bool:
@@ -288,6 +343,17 @@ def enable_llm_debug() -> bool:
     if _enable_llm_debug_ is None:
         _enable_llm_debug_ = os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"
     return _enable_llm_debug_
+
+
+_enable_llmapi_debug_ = None
+
+
+def enable_llmapi_debug() -> bool:
+    global _enable_llmapi_debug_
+    if _enable_llmapi_debug_ is None:
+        _enable_llmapi_debug_ = os.environ.get("TLLM_LLMAPI_ENABLE_DEBUG",
+                                               "0") == "1"
+    return _enable_llmapi_debug_
 
 
 @cache

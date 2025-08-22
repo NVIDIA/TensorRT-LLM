@@ -3,11 +3,15 @@ import sys
 import time
 
 import pytest
+import torch
+
+from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession, set_mpi_session_cpp
 
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
-from tensorrt_llm.bindings import executor as tllm
 # isort: on
 
 from tensorrt_llm._torch.pyexecutor.config import update_executor_config
@@ -82,11 +86,16 @@ class TestWorkerBase:
             assert results is None
 
 
-def create_fake_executor_config(model_path):
+def create_fake_executor_config(model_path, tp_size=1):
     llm_args = LlmArgs(model=model_path, cuda_graph_config=None)
 
     executor_config = tllm.ExecutorConfig(1)
     executor_config.max_batch_size = 1
+    executor_config.model_world_size = tp_size
+
+    # For PyTorch backend with TP > 1, we need proper parallel config
+    if tp_size > 1:
+        llm_args.parallel_config.tp_size = tp_size
 
     update_executor_config(
         executor_config,
@@ -102,6 +111,70 @@ def create_fake_executor_config(model_path):
     )
 
     return executor_config
+
+
+class TestRpcWorkerBaseTP2:
+
+    def setup_method(self):
+        self.executor_config = create_fake_executor_config(model_path,
+                                                           tp_size=2)
+        self.session = self.create_worker_session()
+        # No need to sleep here - the session is ready immediately
+
+    def create_worker_session(self):
+        session = MpiPoolSession(n_workers=2)
+        return session
+
+    def test_create_executor(self):
+        futures = self.session.submit(TestRpcWorkerBaseTP2.create_executor,
+                                      engine=model_path,
+                                      executor_config=self.executor_config)
+        # Wait for completion
+        for future in futures:
+            future.result()
+
+        self.session.shutdown()
+
+    @staticmethod
+    def create_executor(engine, executor_config):
+        # Set MPI session for C++ backend
+        set_mpi_session_cpp(mpi_comm())
+
+        # Set CUDA device for this rank
+        rank = mpi_rank()
+        world_size = mpi_world_size()
+        device_id = rank % torch.cuda.device_count()
+        torch.cuda.set_device(device_id)
+
+        # Don't set CUDA_VISIBLE_DEVICES as it interferes with MPI multi-GPU setup
+
+        print(f"[Test] Rank {rank}/{world_size} using device {device_id}")
+
+        # Synchronize all workers before creating executor
+        mpi_comm().barrier()
+
+        try:
+            print(f"[Test] Rank {rank} creating WorkerBase...")
+            executor = WorkerBase(engine=engine,
+                                  executor_config=executor_config)
+
+            # For PyTorch backend, all ranks need to participate in setup
+            print(f"[Test] Rank {rank} calling setup_engine...")
+
+            # Setup the engine which contains another barrier
+            executor.setup_engine()
+
+            print(f"[Test] Rank {rank} setup_engine completed successfully")
+
+            executor.shutdown()
+
+        except Exception as e:
+            print(f"[Test] Rank {rank} failed with error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+        return None  # executor cannot be picked and returned
 
 
 if __name__ == "__main__":
