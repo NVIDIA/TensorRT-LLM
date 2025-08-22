@@ -859,7 +859,7 @@ size_t Serialization::serializedSize(Tensor const& tensor)
     auto memoryType = tensor.getMemoryType();
     totalSize += sizeof(memoryType); // memory type
 
-    totalSize += sizeof(size_t); // Size in bytes
+    totalSize += sizeof(size_t);     // Size in bytes
     totalSize += tensor.getSizeInBytes();
     return totalSize;
 }
