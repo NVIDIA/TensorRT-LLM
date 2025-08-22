@@ -401,8 +401,10 @@ class TransformerBlock(DecoderLayer):
 
         x, residual = self.mlp(x, attn_metadata, residual)
 
-        if spec_metadata is not None and spec_metadata.is_layer_capture(
-                self.layer_idx):
+        if spec_metadata is not None and hasattr(
+                spec_metadata,
+                "is_layer_capture") and spec_metadata.is_layer_capture(
+                    self.layer_idx):
             # In eagle3 mode, we capture the value in the boundary of decoder layer.
             # If fusing rms in the next layer, the value is not correct. Thus, if
             # this layer will be captured, we should not fuse the rms in the next
