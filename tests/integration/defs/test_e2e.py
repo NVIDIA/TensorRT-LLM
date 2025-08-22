@@ -2486,15 +2486,15 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     }
     expected_keywords = {
         "image": [
-            ["image", "depicts", "mountain", "half", "rock"],
-            ["road", "car", "lane", "traffic", "bus"],
+            ["object", "mountain", "weather", "clear", "clouds"],
+            ["traffic", "road", "vehicles", "cars", "bus"],
         ],
         "audio": [
             ["what", "is", "the", "traffic", "sign", "in", "image"],
             ["what", "is", "shown", "in", "this", "image"],
         ],
         "image_audio": [
-            ["image", "depicts", "Grand", "rock", "scene"],
+            ["image", "depicts", "scenic", "famous", "landmark"],
         ],
     }
 
