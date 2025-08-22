@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc0" />
+  <meta name="docsearch:version" content="1.1.0rc1" />
 
 
   </head>
@@ -585,10 +585,11 @@
 <li><p><strong>moe_config</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.MoeConfig" title="tensorrt_llm.llmapi.llm_args.MoeConfig"><em>tensorrt_llm.llmapi.llm_args.MoeConfig</em></a>) – MoE config. Defaults to None.</p></li>
 <li><p><strong>attn_backend</strong> (<em>str</em>) – Attention backend to use. Defaults to TRTLLM.</p></li>
 <li><p><strong>enable_mixed_sampler</strong> (<em>bool</em>) – If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc. Defaults to False.</p></li>
-<li><p><strong>use_torch_sampler</strong> (<em>bool</em>) – If true, will use the Torch sampler instead of the TRTLLM sampler. Defaults to False.</p></li>
+<li><p><strong>sampler_type</strong> (<em>Union</em><em>[</em><em>str</em><em>, </em><em>tensorrt_llm.llmapi.llm_args.SamplerType</em><em>]</em>) – The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested. Defaults to auto.</p></li>
 <li><p><strong>enable_iter_perf_stats</strong> (<em>bool</em>) – Enable iteration performance statistics. Defaults to False.</p></li>
 <li><p><strong>enable_iter_req_stats</strong> (<em>bool</em>) – If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats. Defaults to False.</p></li>
 <li><p><strong>print_iter_log</strong> (<em>bool</em>) – Print iteration logs. Defaults to False.</p></li>
+<li><p><strong>batch_wait_timeout_ms</strong> (<em>float</em>) – If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs. Defaults to 0.</p></li>
 <li><p><strong>torch_compile_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.TorchCompileConfig" title="tensorrt_llm.llmapi.llm_args.TorchCompileConfig"><em>tensorrt_llm.llmapi.llm_args.TorchCompileConfig</em></a><em>]</em>) – Torch compile config. Defaults to None.</p></li>
 <li><p><strong>enable_autotuner</strong> (<em>bool</em>) – Enable autotuner only when torch compile is enabled. Defaults to True.</p></li>
 <li><p><strong>enable_layerwise_nvtx_marker</strong> (<em>bool</em>) – If true, enable layerwise nvtx marker. Defaults to False.</p></li>
@@ -14634,6 +14635,7 @@ a subset of the possible backends.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_fullgraph</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_inductor</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_piecewise_cuda_graph</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">capture_num_tokens</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_userbuffers</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_num_streams</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>,</dd>
 </dl>
@@ -14641,6 +14643,12 @@ a subset of the possible backends.</p>
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchCompileConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">StrictBaseModel</span></code></p>
 <p>Configuration for torch.compile.</p>
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.capture_num_tokens">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">capture_num_tokens</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.capture_num_tokens" title="Link to this definition">#</a></dt>
+<dd><p>List of num of tokens to capture the piecewise CUDA graph for. If not provided, the number of tokens will be the same as cuda_graph_config.batch_sizes.</p>
+</dd></dl>
+
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.enable_fullgraph">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_fullgraph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_fullgraph" title="Link to this definition">#</a></dt>
@@ -15234,6 +15242,11 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
 <dd></dd></dl>
 
 <dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.validate_capture_num_tokens">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_capture_num_tokens</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">capture_num_tokens</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchCompileConfig.validate_capture_num_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.validate_capture_num_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.validate_torch_compile_max_num_streams">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_torch_compile_max_num_streams</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_num_streams</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchCompileConfig.validate_torch_compile_max_num_streams"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.validate_torch_compile_max_num_streams" title="Link to this definition">#</a></dt>
 <dd><p>Validate torch_compile_config.max_num_streams &gt;= 1.</p>
@@ -15263,7 +15276,7 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.model_fields">
-<span class="sig-name descname"><span class="pre">model_fields</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'enable_fullgraph':</span> <span class="pre">FieldInfo(annotation=bool,</span> <span class="pre">required=False,</span> <span class="pre">default=True,</span> <span class="pre">description='Enable</span> <span class="pre">full</span> <span class="pre">graph</span> <span class="pre">compilation</span> <span class="pre">in</span> <span class="pre">torch.compile.'),</span> <span class="pre">'enable_inductor':</span> <span class="pre">FieldInfo(annotation=bool,</span> <span class="pre">required=False,</span> <span class="pre">default=False,</span> <span class="pre">description='Enable</span> <span class="pre">inductor</span> <span class="pre">backend</span> <span class="pre">in</span> <span class="pre">torch.compile.'),</span> <span class="pre">'enable_piecewise_cuda_graph':</span> <span class="pre">FieldInfo(annotation=bool,</span> <span class="pre">required=False,</span> <span class="pre">default=False,</span> <span class="pre">description='Enable</span> <span class="pre">piecewise</span> <span class="pre">CUDA</span> <span class="pre">graph</span> <span class="pre">in</span> <span class="pre">torch.compile.'),</span> <span class="pre">'enable_userbuffers':</span> <span class="pre">FieldInfo(annotation=bool,</span> <span class="pre">required=False,</span> <span class="pre">default=True,</span> <span class="pre">description='When</span> <span class="pre">torch</span> <span class="pre">compile</span> <span class="pre">is</span> <span class="pre">enabled,</span> <span class="pre">userbuffers</span> <span class="pre">is</span> <span class="pre">enabled</span> <span class="pre">by</span> <span class="pre">default.'),</span> <span class="pre">'max_num_streams':</span> <span class="pre">FieldInfo(annotation=int,</span> <span class="pre">required=False,</span> <span class="pre">default=1,</span> <span class="pre">description='The</span> <span class="pre">maximum</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">CUDA</span> <span class="pre">streams</span> <span class="pre">to</span> <span class="pre">use</span> <span class="pre">for</span> <span class="pre">torch.compile.')}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.model_fields" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">model_fields</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'capture_num_tokens':</span> <span class="pre">FieldInfo(annotation=Union[List[int],</span> <span class="pre">NoneType],</span> <span class="pre">required=False,</span> <span class="pre">default=None,</span> <span class="pre">description='List</span> <span class="pre">of</span> <span class="pre">num</span> <span class="pre">of</span> <span class="pre">tokens</span> <span class="pre">to</span> <span class="pre">capture</span> <span class="pre">the</span> <span class="pre">piecewise</span> <span class="pre">CUDA</span> <span class="pre">graph</span> <span class="pre">for.</span> <span class="pre">If</span> <span class="pre">not</span> <span class="pre">provided,</span> <span class="pre">the</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">tokens</span> <span class="pre">will</span> <span class="pre">be</span> <span class="pre">the</span> <span class="pre">same</span> <span class="pre">as</span> <span class="pre">cuda_graph_config.batch_sizes.'),</span> <span class="pre">'enable_fullgraph':</span> <span class="pre">FieldInfo(annotation=bool,</span> <span class="pre">required=False,</span> <span class="pre">default=True,</span> <span class="pre">description='Enable</span> <span class="pre">full</span> <span class="pre">graph</span> <span class="pre">compilation</span> <span class="pre">in</span> <span class="pre">torch.compile.'),</span> <span class="pre">'enable_inductor':</span> <span class="pre">FieldInfo(annotation=bool,</span> <span class="pre">required=False,</span> <span class="pre">default=False,</span> <span class="pre">description='Enable</span> <span class="pre">inductor</span> <span class="pre">backend</span> <span class="pre">in</span> <span class="pre">torch.compile.'),</span> <span class="pre">'enable_piecewise_cuda_graph':</span> <span class="pre">FieldInfo(annotation=bool,</span> <span class="pre">required=False,</span> <span class="pre">default=False,</span> <span class="pre">description='Enable</span> <span class="pre">piecewise</span> <span class="pre">CUDA</span> <span class="pre">graph</span> <span class="pre">in</span> <span class="pre">torch.compile.'),</span> <span class="pre">'enable_userbuffers':</span> <span class="pre">FieldInfo(annotation=bool,</span> <span class="pre">required=False,</span> <span class="pre">default=True,</span> <span class="pre">description='When</span> <span class="pre">torch</span> <span class="pre">compile</span> <span class="pre">is</span> <span class="pre">enabled,</span> <span class="pre">userbuffers</span> <span class="pre">is</span> <span class="pre">enabled</span> <span class="pre">by</span> <span class="pre">default.'),</span> <span class="pre">'max_num_streams':</span> <span class="pre">FieldInfo(annotation=int,</span> <span class="pre">required=False,</span> <span class="pre">default=1,</span> <span class="pre">description='The</span> <span class="pre">maximum</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">CUDA</span> <span class="pre">streams</span> <span class="pre">to</span> <span class="pre">use</span> <span class="pre">for</span> <span class="pre">torch.compile.')}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.model_fields" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
@@ -16019,10 +16032,11 @@ a subset of the possible backends.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">moe_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MoeConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">attn_backend:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'TRTLLM'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_mixed_sampler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">use_torch_sampler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sampler_type:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.SamplerType</span> <span class="pre">=</span> <span class="pre">SamplerType.auto</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_perf_stats:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_req_stats:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">print_iter_log:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">batch_wait_timeout_ms:</span> <span class="pre">float</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.TorchCompileConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_autotuner:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_layerwise_nvtx_marker:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
@@ -16066,6 +16080,12 @@ a subset of the possible backends.</p>
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.backend">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">backend</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.backend" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag deprecated docutils literal notranslate"><span class="pre">deprecated</span></code> The backend to use for this LLM instance.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.batch_wait_timeout_ms">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">batch_wait_timeout_ms</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.batch_wait_timeout_ms" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -16363,6 +16383,12 @@ a subset of the possible backends.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.sampler_type">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">sampler_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">SamplerType</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">SamplerType.auto</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.sampler_type" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.scheduler_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">scheduler_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.SchedulerConfig" title="tensorrt_llm.llmapi.SchedulerConfig"><span class="pre">SchedulerConfig</span></a></em><em class="property"> <span class="pre">[Optional]</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.scheduler_config" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Scheduler config.</p>
@@ -16420,12 +16446,6 @@ a subset of the possible backends.</p>
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.trust_remote_code">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">trust_remote_code</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.trust_remote_code" title="Link to this definition">#</a></dt>
 <dd><p>Whether to trust the remote code.</p>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.use_torch_sampler">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_torch_sampler</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_torch_sampler" title="Link to this definition">#</a></dt>
-<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> If true, will use the Torch sampler instead of the TRTLLM sampler.</p>
 </dd></dl>
 
 <dl class="py class">
@@ -16534,6 +16554,12 @@ validated to form a valid model.</p>
 <p>Ensures that:
 1. If attention_dp_config.enable_balance is true, attention_dp_config.batching_wait_iters must be greater or equal to 0
 2. If attention_dp_config.enable_balance is true, attention_dp_config.timeout_iters must be greater or equal to 0</p>
+</dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_batch_wait_timeout_ms">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_batch_wait_timeout_ms</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_batch_wait_timeout_ms"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_batch_wait_timeout_ms" title="Link to this definition">#</a></dt>
+<dd><p>Validate batch wait timeout.</p>
 </dd></dl>
 
 <dl class="py method pydantic_validator">
@@ -19873,6 +19899,7 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig"><code class="docutils literal notranslate"><span class="pre">TorchCompileConfig</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.capture_num_tokens"><code class="docutils literal notranslate"><span class="pre">capture_num_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_fullgraph"><code class="docutils literal notranslate"><span class="pre">enable_fullgraph</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_inductor"><code class="docutils literal notranslate"><span class="pre">enable_inductor</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_piecewise_cuda_graph"><code class="docutils literal notranslate"><span class="pre">enable_piecewise_cuda_graph</span></code></a></li>
@@ -19906,6 +19933,7 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.schema_json"><code class="docutils literal notranslate"><span class="pre">schema_json()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.update_forward_refs"><code class="docutils literal notranslate"><span class="pre">update_forward_refs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.validate"><code class="docutils literal notranslate"><span class="pre">validate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.validate_capture_num_tokens"><code class="docutils literal notranslate"><span class="pre">validate_capture_num_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.validate_torch_compile_max_num_streams"><code class="docutils literal notranslate"><span class="pre">validate_torch_compile_max_num_streams</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.model_computed_fields"><code class="docutils literal notranslate"><span class="pre">model_computed_fields</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
@@ -19963,6 +19991,7 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.attention_dp_config"><code class="docutils literal notranslate"><span class="pre">attention_dp_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.attn_backend"><code class="docutils literal notranslate"><span class="pre">attn_backend</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.backend"><code class="docutils literal notranslate"><span class="pre">backend</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.batch_wait_timeout_ms"><code class="docutils literal notranslate"><span class="pre">batch_wait_timeout_ms</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.batched_logits_processor"><code class="docutils literal notranslate"><span class="pre">batched_logits_processor</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.build_config"><code class="docutils literal notranslate"><span class="pre">build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cache_transceiver_config"><code class="docutils literal notranslate"><span class="pre">cache_transceiver_config</span></code></a></li>
@@ -20012,6 +20041,7 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.request_stats_max_iterations"><code class="docutils literal notranslate"><span class="pre">request_stats_max_iterations</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.return_perf_metrics"><code class="docutils literal notranslate"><span class="pre">return_perf_metrics</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.revision"><code class="docutils literal notranslate"><span class="pre">revision</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.sampler_type"><code class="docutils literal notranslate"><span class="pre">sampler_type</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.scheduler_config"><code class="docutils literal notranslate"><span class="pre">scheduler_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.skip_tokenizer_init"><code class="docutils literal notranslate"><span class="pre">skip_tokenizer_init</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.speculative_config"><code class="docutils literal notranslate"><span class="pre">speculative_config</span></code></a></li>
@@ -20022,7 +20052,6 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.tokenizer_revision"><code class="docutils literal notranslate"><span class="pre">tokenizer_revision</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_config"><code class="docutils literal notranslate"><span class="pre">torch_compile_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.trust_remote_code"><code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_torch_sampler"><code class="docutils literal notranslate"><span class="pre">use_torch_sampler</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.Config"><code class="docutils literal notranslate"><span class="pre">Config</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.Config.extra"><code class="docutils literal notranslate"><span class="pre">extra</span></code></a></li>
 </ul>
@@ -20039,6 +20068,7 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.to_dict"><code class="docutils literal notranslate"><span class="pre">to_dict()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_and_init_tokenizer"><code class="docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_attention_dp_config"><code class="docutils literal notranslate"><span class="pre">validate_attention_dp_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_batch_wait_timeout_ms"><code class="docutils literal notranslate"><span class="pre">validate_batch_wait_timeout_ms</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_remaining"><code class="docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_with_runtime_params"><code class="docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format"><code class="docutils literal notranslate"><span class="pre">validate_checkpoint_format</span></code></a></li>
@@ -20356,9 +20386,9 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 15, 2025.</p>
+  <p>Last updated on August 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/7334f93">7334f93</a>.</p>
   
 </div></div>
       

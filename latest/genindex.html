@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc0" />
+  <meta name="docsearch:version" content="1.1.0rc1" />
 
 
   </head>
@@ -912,6 +912,15 @@
 </li>
       </ul></li>
       <li>
+    --sampler_options
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-sampler_options">trtllm-bench-latency command line option</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-sampler_options">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
     --scheduler_policy
 
       <ul>
@@ -1320,6 +1329,8 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.batch_sizes">batch_sizes (tensorrt_llm.llmapi.CudaGraphConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.batch_wait_timeout_ms">batch_wait_timeout_ms (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.batched_logits_processor">batched_logits_processor (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 
       <ul>
@@ -1434,6 +1445,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.capitalize">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.capture_num_tokens">capture_num_tokens (tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.casefold">casefold() (tensorrt_llm.llmapi.BatchingType method)</a>
 
       <ul>
@@ -5426,6 +5439,8 @@
 <h2 id="S">S</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.sampler_type">sampler_type (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Input.sampling_params">sampling_params (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Input attribute)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig">SamplingConfig (class in tensorrt_llm.runtime)</a>
@@ -8057,6 +8072,8 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor6Result17additionalOutputsE">tensorrt_llm::executor::Result::additionalOutputs (C++ member)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor6Result23avgDecodedTokensPerIterE">tensorrt_llm::executor::Result::avgDecodedTokensPerIter (C++ member)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor6Result13contextLogitsE">tensorrt_llm::executor::Result::contextLogits (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor6Result18contextPhaseParamsE">tensorrt_llm::executor::Result::contextPhaseParams (C++ member)</a>
@@ -8861,10 +8878,10 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunkD0Ev">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::~CUDAVirtualMemoryChunk (C++ function)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManagerE">tensorrt_llm::runtime::CudaVirtualMemoryManager (C++ class)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IDpEN12tensorrt_llm7runtime24CudaVirtualMemoryManager3addEv9uintptr_tNSt6stringERRN22CUDAVirtualMemoryChunk10CreatorPtrEDpRR13Configurators">tensorrt_llm::runtime::CudaVirtualMemoryManager::add (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager3addE9uintptr_tNSt6stringERR22CUDAVirtualMemoryChunk">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager3addE9uintptr_tNSt6stringERRN22CUDAVirtualMemoryChunk10CreatorPtrERRN22CUDAVirtualMemoryChunk13ConfiguratorsE">[2]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager12addBadHandleE9uintptr_t">tensorrt_llm::runtime::CudaVirtualMemoryManager::addBadHandle (C++ function)</a>
@@ -11687,6 +11704,8 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-report_json">--report_json</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-sampler_options">--sampler_options</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-tp">--tp</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-warmup">--warmup</a>
@@ -11751,6 +11770,8 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-report_json">--report_json</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-request_json">--request_json</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-sampler_options">--sampler_options</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-scheduler_policy">--scheduler_policy</a>
 </li>
@@ -12012,8 +12033,6 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.use_strip_plan">use_strip_plan (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.use_torch_sampler">use_torch_sampler (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
-</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.use_uvm">use_uvm (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.SpeculativeDecodingMode.USER_PROVIDED">USER_PROVIDED (tensorrt_llm.models.SpeculativeDecodingMode attribute)</a>
@@ -12076,6 +12095,8 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_auto_parallel">validate_auto_parallel() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_batch_wait_timeout_ms">validate_batch_wait_timeout_ms() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_remaining">validate_build_config_remaining() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 
       <ul>
@@ -12088,6 +12109,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_with_runtime_params">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.validate_capture_num_tokens">validate_capture_num_tokens() (tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format">validate_checkpoint_format() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config">validate_cuda_graph_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
@@ -12102,14 +12125,14 @@
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache">validate_enable_build_cache() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_gpus_per_node">validate_gpus_per_node() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_gpus_per_node">(tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_kv_cache_dtype">validate_kv_cache_dtype() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_load_balancer">validate_load_balancer() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
@@ -12406,9 +12429,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 15, 2025.</p>
+  <p>Last updated on August 19, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/7334f93">7334f93</a>.</p>
   
 </div></div>
       
