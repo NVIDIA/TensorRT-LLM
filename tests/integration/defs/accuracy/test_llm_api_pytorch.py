@@ -2347,6 +2347,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             # task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            assert False
 
     def test_eagle3(self):
         pytorch_config = dict(
