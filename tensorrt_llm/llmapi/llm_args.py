@@ -447,6 +447,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self):
+        """
+        Returns the number of layers to capture of the target model.
+        If eagle3_layers_to_capture is not None, return the length of the set.
+        Otherwise, assume Eagle3 base set and return 3.
+        """
         if self.eagle3_layers_to_capture is not None:
             return len(self.eagle3_layers_to_capture)
         return 3
