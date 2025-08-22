@@ -14,6 +14,9 @@ There are multiple ways to install and run TensorRT-LLM. For most users, the opt
 
 1. [Building from source](installation/build-from-source-linux)
 
+The following examples can most easily be executed using the prebuilt [Docker release container available on NGC](https://registry.ngc.nvidia.com/orgs/nvstaging/teams/tensorrt-llm/containers/release) (see also [release.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/release.md) on GitHub).
+
+
 ## LLM API
 
 The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.
@@ -39,7 +42,7 @@ trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
 After the server starts, you can access familiar OpenAI endpoints such as `v1/chat/completions`.
-You can run inference such as the following example:
+You can run inference such as the following example from another terminal:
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \

@@ -137,8 +137,9 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-use_cuda_graph: true
-moe_backend: TRTLLM
+cuda_graph_config: {}
+moe_config:
+  backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -195,23 +196,22 @@ We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers
 #### Benchmark
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-  cuda_graph_config:
-    padding_enabled: true
-    batch_sizes:
-    - 896
-    - 512
-    - 256
-    - 128
-    - 64
-    - 32
-    - 16
-    - 8
-    - 4
-    - 2
-    - 1
-  print_iter_log: true
-  kv_cache_dtype: fp8
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 896
+  - 512
+  - 256
+  - 128
+  - 64
+  - 32
+  - 16
+  - 8
+  - 4
+  - 2
+  - 1
+print_iter_log: true
+kv_cache_dtype: fp8
 enable_attention_dp: true
 EOF
 trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
@@ -263,21 +263,20 @@ python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
 YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    cuda_graph_config:
-      padding_enabled: true
-      batch_sizes:
-      - 1
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
-      - 64
-      - 128
-      - 256
-      - 384
-    print_iter_log: ${PRINT_ITER_LOG}
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+  - 384
+print_iter_log: ${PRINT_ITER_LOG}
 enable_attention_dp: true
 EOF
 
@@ -319,7 +318,7 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-use_cuda_graph: true
+cuda_graph_config: {}
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -368,9 +367,9 @@ python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
 YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml<<EOF
-use_cuda_graph: true
-cuda_graph_batch_sizes:
-- 128
+cuda_graph_config:
+  batch_sizes:
+  - 128
 enable_attention_dp: true
 EOF
 

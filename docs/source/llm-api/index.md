@@ -2,27 +2,10 @@
 
 The LLM API is a high-level Python API designed to streamline LLM inference workflows.
 
-It supports a broad range of use cases, from single-GPU setups to multi-GPU and multi-node deployments, with built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA [Dynamo](https://github.com/ai-dynamo/dynamo) and the [Triton Inference Server](https://github.com/triton-inference-server/server).
+It supports a broad range of use cases, from single-GPU setups to multi-GPU and multi-node deployments, with built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA [Dynamo](https://github.com/ai-dynamo/dynamo).
 
 While the LLM API simplifies inference workflows with a high-level interface, it is also designed with flexibility in mind. Under the hood, it uses a PyTorch-native and modular backend, making it easy to customize, extend, or experiment with the runtime.
 
-
-## Supported Models
-
-* DeepSeek variants
-* Llama (including variants Mistral, Mixtral, InternLM)
-* GPT (including variants Starcoder-1/2, Santacoder)
-* Gemma-1/2/3
-* Phi-1/2/3/4
-* ChatGLM (including variants glm-10b, chatglm, chatglm2, chatglm3, glm4)
-* QWen-1/1.5/2/3
-* Falcon
-* Baichuan-1/2
-* GPT-J
-* Mamba-1/2
-
-
-> **Note:** For the most up-to-date list of supported models, you may refer to the [TensorRT-LLM model definitions](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/models).
 
 ## Quick Start Example
 A simple inference example with TinyLlama using the LLM API:
@@ -31,7 +14,8 @@ A simple inference example with TinyLlama using the LLM API:
     :language: python
     :linenos:
 ```
-More examples can be found [here]().
+
+For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this [README](../../../examples/llm-api/README.md).
 
 ## Model Input
 
@@ -63,7 +47,6 @@ llm = LLM(model=<local_path_to_model>)
 ```
 
 > **Note:** Some models require accepting specific [license agreements]((https://ai.meta.com/resources/models-and-libraries/llama-downloads/)). Make sure you have agreed to the terms and authenticated with Hugging Face before downloading.
-
 
 
 ## Tips and Troubleshooting

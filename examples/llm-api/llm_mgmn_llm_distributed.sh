@@ -8,7 +8,9 @@
 #SBATCH -e logs/llmapi-distributed.err
 #SBATCH -J llmapi-distributed-task
 
-### Run LLM-API with pytorch backend on Slurm
+### :section Slurm
+### :title Run LLM-API with pytorch backend on Slurm
+### :order 0
 
 # NOTE, this feature is experimental and may not work on all systems.
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on
@@ -34,7 +36,7 @@
 #      the LOCAL_MODEL directory.
 
 # Adjust the paths to run
-export script=$SOURCE_ROOT/examples/pytorch/quickstart_advanced.py
+export script=$SOURCE_ROOT/examples/llm-api/quickstart_advanced.py
 
 # Just launch the PyTorch example with trtllm-llmapi-launch command.
 srun -l \

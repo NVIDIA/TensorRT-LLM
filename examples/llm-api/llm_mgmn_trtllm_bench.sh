@@ -8,7 +8,9 @@
 #SBATCH -e logs/trtllm-bench.err
 #SBATCH -J trtllm-bench
 
-### Run trtllm-bench with pytorch backend on Slurm
+### :title Run trtllm-bench with pytorch backend on Slurm
+### :order 1
+### :section Slurm
 
 # NOTE, this feature is experimental and may not work on all systems.
 # The trtllm-llmapi-launch is a script that launches the LLM-API code on

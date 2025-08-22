@@ -29,3 +29,17 @@ Note:
 - L: Language only
 - L + V: Language and Vision multimodal support
 - Llama 3.2 accepts Vision input, but our support is currently limited to Language only.
+
+## Model-Feature Support Matrix(Key Models)
+
+Note: Support for other models may vary. Features marked "N/A" are not applicable to the model architecture.
+
+| Model Architecture/Feature     | Overlap Scheduler | CUDA Graph | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | MTP | EAGLE-3(One Model Engine) | EAGLE-3(Two Model Engine) | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding |
+| ------------------------------ | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ------------------------- | ------------------------- | ------------- | ---------------- | -------------- | ------------------------ | --------------------- | --------------- |
+| DeepseekV3ForCausalLM          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | Yes | No                        | No                        | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
+| Qwen3MoeForCausalLM            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
+| Llama4ForConditionalGeneration | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                       | Yes                       | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
+
+
+[^1]: Chunked Prefill for MLA can only be enabled on SM100.
+[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100 and in BF16/FP8 KV cache dtype.

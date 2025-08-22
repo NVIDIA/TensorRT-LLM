@@ -1,8 +1,9 @@
-### Generate Text in Streaming
+### :section Basics
+### :title Generate text in streaming
+### :order 2
 import asyncio
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM, SamplingParams
 
 
 def main():
@@ -13,7 +14,6 @@ def main():
     # Sample prompts.
     prompts = [
         "Hello, my name is",
-        "The president of the United States is",
         "The capital of France is",
         "The future of AI is",
     ]
