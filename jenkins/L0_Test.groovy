@@ -257,7 +257,7 @@ def getPytestBaseCommandLine(
             "--perf-log-formats yaml"
         ]
     }
-    return testCmdLine
+    return testCmdLine as String[]
 }
 
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
@@ -371,7 +371,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     "__PLACEHOLDER_TRTLLM_WHL_PATH__",
                     "__PLACEHOLDER_coverageConfigFile__",
                     pytestUtil
-                )
+                ).join(" ")
 
                 def scriptContent = """#!/bin/bash
                     export jobWorkspace=$jobWorkspace
@@ -382,7 +382,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     export perfMode=$perfMode
                     export resourcePathNode=$resourcePathNode
                     export nodeCount=$nodeCount
-                    export pytestCommand="${pytestCommand.join(" ")}"
+                    export pytestCommand="$pytestCommand"
                     export NVIDIA_IMEX_CHANNELS=0
                     chmod +x $scriptRunNode
                 """
@@ -1476,14 +1476,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         """
         echoNodeAndGpuInfo(pipeline, stageName)
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
-        def pytestCommand = getPytestBaseCommand(
+        def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
             testDBList,
             splits,
             splitId,
             perfMode,
-            ${WORKSPACE}/${stageName},
+            "${WORKSPACE}/${stageName}",
             TRTLLM_WHL_PATH,
             coverageConfigFile
         )
