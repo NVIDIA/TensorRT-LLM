@@ -846,8 +846,8 @@ class PyExecutor:
 
                         self._handle_canceled_requests()
 
-                        # Handle logits communication between pipeline parallel ranks
-                        self._handle_logits_communication(previous_batch, prev_microbatch_id)
+                        self._handle_logits_communication(
+                            previous_batch, prev_microbatch_id)
 
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
@@ -1700,10 +1700,10 @@ class PyExecutor:
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.
-        
-        If logits were requested, the last PP rank sends to the first PP rank (who sends responses) 
+
+        If logits were requested, the last PP rank sends to the first PP rank (who sends responses)
         the logits of the requests that have finished.
-        
+
         Args:
             previous_batch: The previous batch state
             prev_microbatch_id: The microbatch ID for the previous batch
@@ -1711,33 +1711,27 @@ class PyExecutor:
         # NOTE: If the rank processing the logits ever becomes the same as
         # the rank sending the responses, this code can be removed.
         finished_reqs = [
-            r for r in previous_batch.sample_state.
-            scheduled_requests.all_requests()
-            if r.state == LlmRequestState.GENERATION_COMPLETE
-            and (r.py_return_context_logits
-                 or r.py_return_generation_logits)
+            r for r in
+            previous_batch.sample_state.scheduled_requests.all_requests()
+            if r.state == LlmRequestState.GENERATION_COMPLETE and (
+                r.py_return_context_logits or r.py_return_generation_logits)
         ]
         if self.dist.is_first_pp_rank and len(finished_reqs):
-            finished_reqs_py_results = [
-                r.py_result for r in finished_reqs
-            ]
+            finished_reqs_py_results = [r.py_result for r in finished_reqs]
             finished_reqs_py_results = self.dist.recv_object(
                 src=self.dist.prev_pp_rank,
                 tag=prev_microbatch_id,
             )
-            for req, py_result in zip(finished_reqs,
-                                      finished_reqs_py_results):
+            for req, py_result in zip(finished_reqs, finished_reqs_py_results):
                 req.py_result = py_result
 
         elif self.dist.is_last_pp_rank and len(finished_reqs):
-            if self.send_handles[
-                    prev_microbatch_id] is not None:
+            if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].wait()
-            self.send_handles[
-                prev_microbatch_id] = self.dist.isend_object(
-                    [r.py_result for r in finished_reqs],
-                    dest=self.dist.next_pp_rank,
-                    tag=prev_microbatch_id)
+            self.send_handles[prev_microbatch_id] = self.dist.isend_object(
+                [r.py_result for r in finished_reqs],
+                dest=self.dist.next_pp_rank,
+                tag=prev_microbatch_id)
 
     def _await_any_response(self,
                             timeout: Optional[float] = None
