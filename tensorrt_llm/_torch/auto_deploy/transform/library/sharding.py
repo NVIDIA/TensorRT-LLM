@@ -109,8 +109,8 @@ def _append_simple_shard(
     for node_group in nodes_linear.values():
         for n in node_group:
             tp_shards.append(
-                TPShardingInfo(
-                    target_node=n.name,
+                TPShardingInfo.from_node(
+                    n,
                     split_dim=SplitDimension.COLUMN,
                     rank=rank,
                     world_size=world_size,
@@ -312,8 +312,8 @@ def detect_sharding_from_factory_config(
                 config = tp_plan[key]
                 if config == "colwise":
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.COLUMN,
                             rank=rank,
                             world_size=world_size,
@@ -323,8 +323,8 @@ def detect_sharding_from_factory_config(
                     )
                 elif config == "rowwise":
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.ROW,
                             rank=rank,
                             world_size=world_size,
@@ -342,8 +342,8 @@ def detect_sharding_from_factory_config(
                 elif "gather" in config:
                     # Simple shard (row + all_gather)
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.COLUMN,
                             rank=rank,
                             world_size=world_size,
@@ -540,8 +540,8 @@ def detect_column_row_shard(
                 else:
                     dist_op = None
                 sharding_config.tp_transforms.append(
-                    TPShardingInfo(
-                        target_node=n.name,
+                    TPShardingInfo.from_node(
+                        n,
                         split_dim=i,
                         rank=rank,
                         world_size=world_size,

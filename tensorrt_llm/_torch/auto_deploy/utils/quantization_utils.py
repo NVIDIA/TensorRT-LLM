@@ -100,7 +100,7 @@ class QuantizationImpl:
             FP8QuantizationImpl,
             FP8BMMQuantizationImpl,
         ]:
-            if is_op(quant_type_or_node, q.target_op()):
+            if is_op(quant_type_or_node, q.custom_op()):
                 return q
         return None
 
