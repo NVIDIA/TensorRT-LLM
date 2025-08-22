@@ -176,6 +176,7 @@ FROM wheel AS tritonbuild
 WORKDIR /src/tensorrt_llm
 RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
 COPY ./triton_backend/ ./triton_backend/
+ARG TRITON_BASE_TAG
 RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh -s "r${TRITON_BASE_TAG%-py3}"
 
 
