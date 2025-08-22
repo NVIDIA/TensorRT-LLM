@@ -127,7 +127,8 @@ class SequenceInfo:
         # sanity check
         assert self.num_pages >= self.max_batch_size, "num_pages can't be less than max_batch_size"
 
-        # keep a list-like object of sequence lengths for simplicity as well
+        # keep a list-like object of sequence lengths to use host for certain operations
+        self._input_positions = [0] * self.max_batch_size
         self._sequence_lengths = [0] * self.max_batch_size
 
         # indicator if extra args are activated that are needed for cached attention backends
@@ -245,6 +246,8 @@ class SequenceInfo:
 
     @property
     def input_positions(self) -> List[int]:
+        # TODO: correctly set _input_positions and use it here
+        # return self._input_positions
         return self.input_pos[: self.num_sequences].tolist()
 
     @property
@@ -268,6 +271,7 @@ class SequenceInfo:
     @property
     def page_assignments(self) -> List[List[int]]:
         """Return the page assignments for each sequence."""
+        # TODO: see how we can cache this as list of lists directly on the host
         pages_per_seq = self.pages_per_seq[: self.num_sequences].tolist()
         return [
             c_loc_one_seq.tolist()
@@ -365,15 +369,13 @@ class SequenceInfo:
         After reset the sequence information should correspond to a "generate-only" batch of
         sequences (b, s==1) without cache history.
         """
-        # reset input_pos
-        self.input_pos.zero_()
-
         # set a dummy sequence corresponding to a generate-only batch (will also reset position_ids)
-        self.nest_sequences(torch.zeros(self.max_batch_size, 1, dtype=torch.int))
+        self.nest_sequences([[1]] * self.max_batch_size, input_pos=0)
 
-        # reset cache information
-        self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
-        self.pages_per_seq.fill_(1)
+        # reset cache information in a non-blocking way
+        cache_loc_host = torch.arange(self.num_pages, dtype=torch.int, pin_memory=True)
+        self.cache_loc.copy_(cache_loc_host, non_blocking=True)
+        self.pages_per_seq.fill_(0)
 
     def set_example_sequence(self, input_ids: Optional[torch.Tensor] = None, **kwargs) -> None:
         """Set an example sequence useful for testing and export purposes."""
@@ -416,8 +418,8 @@ class SequenceInfo:
         NOTE: this batch is already formatted as [b, 1] in both original and in the cached attention
         mode. So we don't need to do anything mode-specific here.
         """
+        # reset will already set the generate-only batch
         self.reset()
-        self.nest_sequences([[1]] * self.max_batch_size)
 
     def _update_position_ids(self) -> None:
         # set new position_ids as new tensor from input_pos and seq_len via torch.arange
@@ -443,15 +445,22 @@ class SequenceInfo:
         ]
         return torch.tensor(position_ids_list, dtype=torch.long).to(self.device)
 
-    def _update_input_pos(self, seq_len: Union[torch.Tensor, List[int], int]) -> None:
-        """Update the starting position for each sequence in the cache.
+    def _update_input_pos(self, input_pos: Union[List[int], int]) -> None:
+        """Set the starting position (input position) for each sequence in the cache.
 
-        If ``reset=True`, ``input_pos`` will be reset to zero before updating.
+        We assume sequence length information is up-to-date when this function is called.
         """
-        if not isinstance(seq_len, torch.Tensor):
-            seq_len = torch.tensor(seq_len, dtype=torch.int)
-        bs = len(seq_len) if seq_len.dim() > 0 else self.max_batch_size
-        self.input_pos[:bs] = seq_len.to(self.device)
+
+        # store a list object as future reference
+        if isinstance(input_pos, int):
+            self._input_positions = [input_pos] * self.num_sequences
+        else:
+            assert self.num_sequences == len(input_pos), "Unexpected number of input positions"
+            self._input_positions = input_pos.copy()
+
+        # non-blocking copy to device-side tensor via pinned memory
+        input_pos_host = torch.tensor(input_pos, dtype=torch.int, pin_memory=True)
+        self.input_pos[: self.num_sequences].copy_(input_pos_host, non_blocking=True)
 
     def _assign_pages_per_seq(self, page_assignments: Sequence[Sequence[int]]) -> None:
         """Set the cache location and pages_per_seq tensors from page assignments."""
@@ -498,7 +507,7 @@ class SequenceInfo:
         self,
         input_ids: Sequence[Sequence[int]],
         position_ids: Optional[Sequence[Sequence[int]]] = None,
-        input_pos: Optional[Union[torch.Tensor, Sequence[int], int]] = None,
+        input_pos: Optional[Union[Sequence[int], int]] = None,
         page_assignments: Optional[Sequence[Sequence[int]]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
@@ -528,6 +537,8 @@ class SequenceInfo:
         self.input_ids = self._shape_for_forward(self.input_ids)
 
         # check for position_ids/input_pos update
+        # TODO (lucaslie): is this true??? I think you can have both
+        # one denotes cache position, the other denotes the semantic position for things like rope
         assert position_ids is None or input_pos is None, (
             "Cannot provide both position_ids and input_pos"
         )
@@ -573,7 +584,7 @@ class SequenceInfo:
                         arg = torch.cat(arg)
                     else:
                         arg = arg[0]
-                self._extra_args[name] = arg.to(self.device)
+                self._extra_args[name] = arg.to(self.device, non_blocking=True)
             else:
                 self._extra_args[name] = none_input
 
