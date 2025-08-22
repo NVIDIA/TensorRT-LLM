@@ -357,7 +357,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
     };
 
-    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 15;
+    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 20;
     uint32_t idxNextParam = 0;
     void* kernelParams[kMAX_NB_KERNEL_PARAMS];
     auto appendParam = [&](auto* p) mutable
