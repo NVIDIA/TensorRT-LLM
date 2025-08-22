@@ -12,7 +12,8 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
                                       get_draft_token_length)
-from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
+from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
+                                           ResourceManagerType)
 from ..pyexecutor.sampler import Sampler, SampleState, TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
@@ -262,8 +263,12 @@ class ModelDrafter(Drafter):
 
         return outputs
 
-    def _sample_async(self, draft_batch: ScheduledRequests,
-                      outputs: Dict[str, Any]) -> Optional[SampleState]:
+    def _sample_async(
+        self,
+        draft_batch: ScheduledRequests,
+        outputs: Dict[str, Any],
+        resource_manager: Optional[ResourceManager] = None
+    ) -> Optional[SampleState]:
         """Sample tokens from draft model outputs."""
         try:
             if self.sampler is not None:
@@ -281,7 +286,8 @@ class ModelDrafter(Drafter):
                     self.sampler.is_generation_model())
 
                 return self.sampler.sample_async(draft_batch, outputs,
-                                                 num_context_logits_prefix_sum)
+                                                 num_context_logits_prefix_sum,
+                                                 resource_manager)
             return None
         except Exception as e:
             logger.error(f"Error in sampling: {str(e)}")
@@ -296,10 +302,13 @@ class ModelDrafter(Drafter):
             if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
-    def _update_requests(self, sample_state: SampleState) -> None:
+    def _update_requests(
+            self,
+            sample_state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
         """Update requests with sample state."""
         if self.sampler is not None:
-            self.sampler.update_requests(sample_state)
+            self.sampler.update_requests(sample_state, resource_manager)
 
     def _process_decoded_tokens(
             self, draft_batch: ScheduledRequests,
@@ -343,6 +352,19 @@ class ModelDrafter(Drafter):
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits, d2t=d2t)
 
+    def update_cur_eagle_layer_idx(
+            self,
+            cur_eagle_layer_idx: int,
+            resource_manager: Optional[ResourceManager] = None):
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is None:
+            return None
+
+        spec_tree_manager = spec_resource_manager.spec_tree_manager
+        if spec_tree_manager is not None:
+            spec_tree_manager.cur_eagle_layer_idx = cur_eagle_layer_idx
+
     @nvtx_range("prepare_draft_tokens")
     def prepare_draft_tokens(
         self,
@@ -363,6 +385,7 @@ class ModelDrafter(Drafter):
             raise ValueError("Resource manager is required")
 
         try:
+
             draft_batch = self._prepare_draft_batch(scheduled_requests)
 
             if draft_batch.batch_size == 0:
@@ -376,11 +399,15 @@ class ModelDrafter(Drafter):
             }
 
             # Initial forward pass
+            self.update_cur_eagle_layer_idx(
+                0, resource_manager
+            )  # Update the current eagle layer index in the resource manager.
             outputs = self._forward_draft_model(draft_batch, resource_manager)
             self._execute_guided_decoder(draft_batch,
                                          outputs['logits'],
                                          d2t=outputs.get('d2t'))
-            sample_state = self._sample_async(draft_batch, outputs)
+            sample_state = self._sample_async(draft_batch, outputs,
+                                              resource_manager)
             previous_batch = sample_state
 
             self._update_request_states(draft_batch)
@@ -390,19 +417,21 @@ class ModelDrafter(Drafter):
             draft_batch.context_requests = []
 
             # Generate remaining draft tokens iteratively
-            for i in range(self.max_draft_tokens - 1):
+            for i in range(self.spec_config.num_eagle_layers - 1):
                 if len(draft_batch.generation_requests) == 0:
                     break
 
+                self.update_cur_eagle_layer_idx(i + 1, resource_manager)
                 outputs = self._forward_draft_model(draft_batch,
                                                     resource_manager,
                                                     previous_batch)
                 if previous_batch is not None:
-                    self._update_requests(previous_batch)
+                    self._update_requests(previous_batch, resource_manager)
                 self._execute_guided_decoder(draft_batch,
                                              outputs['logits'],
                                              d2t=outputs.get('d2t'))
-                sample_state = self._sample_async(draft_batch, outputs)
+                sample_state = self._sample_async(draft_batch, outputs,
+                                                  resource_manager)
                 self._update_request_states(draft_batch)
                 if previous_batch is not None:
                     new_requests = self._process_decoded_tokens(
@@ -414,8 +443,11 @@ class ModelDrafter(Drafter):
                 previous_batch = sample_state
 
             # Final cleanup
+            self.update_cur_eagle_layer_idx(
+                self.spec_config.num_eagle_layers, resource_manager
+            )  # Update for the `_update_requests()` to extract the number of draft tokens of the last layer.
             if previous_batch is not None:
-                self._update_requests(previous_batch)
+                self._update_requests(previous_batch, resource_manager)
                 self._process_decoded_tokens(previous_batch.scheduled_requests,
                                              req_id_to_old_request)
             self._pad_to_max_draft_tokens(scheduled_requests)

@@ -1,3 +1,4 @@
+import ast
 import copy
 import functools
 import json
@@ -427,6 +428,50 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
 
+    def __init__(self, **kwargs):
+        super().__init__()
+        for attr_name, attr_value in kwargs.items():
+            if attr_name == 'max_draft_len':
+                self.num_eagle_layers = attr_value
+            # Convert the data type of Eagle choice from str to List[List[int]]
+            if attr_name == 'eagle_choices' and not isinstance(
+                    attr_value, list):
+                print(
+                    "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+                )
+                if isinstance(attr_value, str):
+                    attr_value = ast.literal_eval(attr_value.replace(" ", ""))
+                else:
+                    assert "Wrong eagle choices type"
+            setattr(self, attr_name, attr_value)
+
+        # Checks whether the input eagle choices is valid
+        # and reset the max_draft_len and num_eagle_layers if necessary
+        if self.eagle_choices is not None:
+            # If eagle_choices is provided, use_dynamic_tree will not be used
+            if self.use_dynamic_tree:
+                self.use_dynamic_tree = False
+                logger.warning(
+                    "If eagle_choices is provided, use_dynamic_tree will be set to False"
+                )
+
+            # Get num_eagle_layers from eagle_choices
+            num_eagle_layers_from_choices = self.check_eagle_choices()
+            if num_eagle_layers_from_choices != self.num_eagle_layers:
+                logger.warning(
+                    f"Base on the input choices, reset the num_eagle_layers from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
+                )
+                self.num_eagle_layers = num_eagle_layers_from_choices
+
+            # Each draft node has a path(choice) from the root to it.
+            # So the number of choices also represents the number of draft nodes.
+            max_draft_len_from_choices = len(self.eagle_choices)
+            if max_draft_len_from_choices != self.max_draft_len:
+                logger.warning(
+                    f"Base on the input choices, reset the max_draft_len from {self.max_draft_len} to {max_draft_len_from_choices}"
+                )
+                self.max_draft_len = max_draft_len_from_choices
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -436,6 +481,27 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate(self) -> None:
         if self.speculative_model_dir is None:
             raise ValueError("Draft model must be provided for EAGLE")
+
+    def check_eagle_choices(self):
+        # 1) Check connectivity
+        unique_choices = set(
+            tuple(sub_choice)
+            for sub_choice in self.eagle_choices)  # remove repeated choices
+        self.eagle_choices = sorted([list(t) for t in unique_choices],
+                                    key=lambda x: (len(x), x))  # sort choices
+        for choice in self.eagle_choices:
+            if len(choice) > 1:
+                assert choice[
+                    0:
+                    -1] in self.eagle_choices, f"Error: choice {choice} is not connected"
+
+        # 2) Get num_eagle_layers_from_choices
+        num_eagle_layers_from_choices = 0
+        for choice in self.eagle_choices:
+            num_eagle_layers_from_choices = max(num_eagle_layers_from_choices,
+                                                len(choice))
+
+        return num_eagle_layers_from_choices
 
     @functools.cached_property
     def spec_dec_mode(self):
