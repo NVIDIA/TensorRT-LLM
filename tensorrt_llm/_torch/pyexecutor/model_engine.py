@@ -425,6 +425,7 @@ class PyTorchModelEngine(ModelEngine):
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_dummy_request = None
+        self.cuda_graph_meta_buffers: dict[str, list[torch.Tensor]] = {}
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -970,15 +971,16 @@ class PyTorchModelEngine(ModelEngine):
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, draft_len)
+            num_sequences_in_batch, False, draft_len,
+            self.cuda_graph_meta_buffers)
+
         assert attn_metadata.is_cuda_graph
 
+        spec_metadata = None
         if self.enable_spec_decode:
             spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
                 num_sequences_in_batch)
             spec_metadata.draft_tokens = self.draft_tokens_cuda
-        else:
-            spec_metadata = None
 
         # Initialize nested dictionary if needed
         if batch_size not in self._cuda_graphs:
@@ -1143,9 +1145,10 @@ class PyTorchModelEngine(ModelEngine):
             for draft_len, graph in draft_graphs.items():
                 del graph
         self._cuda_graphs.clear()
-        torch.cuda.empty_cache()
         del self._cuda_graph_mem_pool
         self._cuda_graph_mem_pool = None
+        self.cuda_graph_meta_buffers.clear()
+        torch.cuda.empty_cache()
 
     def get_max_num_sequences(self) -> int:
         """
