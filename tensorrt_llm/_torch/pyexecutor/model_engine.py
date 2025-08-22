@@ -46,7 +46,7 @@ from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..metadata import KVCacheParams
-from ..model_config import ModelConfig, MoeLoadBalancerConfig
+from ..model_config import ModelConfig, MoeLoadBalancerConfig, MoEPrefetchConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
@@ -310,6 +310,7 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
             moe_load_balancer=pytorch_backend_config.moe_load_balancer,
+            moe_prefetch_config=pytorch_backend_config.moe_prefetch_config,
             lora_config=lora_config)
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -1049,6 +1050,7 @@ class PyTorchModelEngine(ModelEngine):
                     max_num_tokens: int,
                     moe_max_num_tokens: Optional[int] = None,
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
+                    moe_prefetch_config: Optional[MoEPrefetchConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs) -> DecoderModelForCausalLM:
         config = checkpoint_loader.load_config(
@@ -1063,6 +1065,7 @@ class PyTorchModelEngine(ModelEngine):
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
+            moe_prefetch_config=moe_prefetch_config,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,
