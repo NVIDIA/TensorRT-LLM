@@ -78,7 +78,7 @@ protected:
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
-        const BlocksPerWindow blocksPerWindow
+        BlocksPerWindow const blocksPerWindow
             = {{maxAttentionWindow, std::make_tuple(totalNumBlocks, blocksInSecondaryPool)}};
 
         mCacheManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock,
@@ -90,7 +90,8 @@ protected:
 
         size_t maxNumTokens = 1024;
         mTransBufferManager = std::make_unique<CacheTransBufferManager>(mCacheManager.get(), maxNumTokens);
-        mCacheState = std::make_unique<CacheState>(numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, 1, dataType);
+        mCacheState = std::make_unique<CacheState>(
+            numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, 1, std::vector<SizeType32>{numLayers}, dataType);
     }
 
     void TearDown() override
