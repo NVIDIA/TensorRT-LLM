@@ -103,8 +103,8 @@ def _append_simple_shard(
     for node_group in nodes_linear.values():
         for n in node_group:
             tp_shards.append(
-                TPShardingInfo(
-                    target_node=n.name,
+                TPShardingInfo.from_node(
+                    n,
                     split_dim=SplitDimension.ROW,
                     rank=rank,
                     world_size=world_size,
@@ -305,8 +305,8 @@ class ColumnRowShard(BaseTransform):
                     else:
                         dist_op = None
                     shared_config.sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=n.name,
+                        TPShardingInfo.from_node(
+                            n,
                             split_dim=i,
                             rank=local_rank,
                             world_size=world_size,
