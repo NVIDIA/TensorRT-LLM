@@ -18,6 +18,10 @@ TODO: Can duration_ms be set to None to signal retention policy does not expire?
 TODO: What is default priority? 35?
 TODO: What does transfer_mode do? Is it just a vestigial appendage from the days when we were toying around with offloading to SSD?
 
+### Speculative Decoding
+
+Reuse across requests is only supported for one model MTP, all other [speculative decoding](speculative-decoding.md) algorithms must disable block reuse.
+
 ## Limited Attention Window Size
 
 TensorRT-LLM takes advantage of layers with limited attention window size in order to reduce computations and memory usage. Blocks that leave the attention window are freed and placed on the radix search tree so they can be reused. 
