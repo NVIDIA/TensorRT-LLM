@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from queue import Queue
 from typing import Iterable, List, Optional, Tuple
 
@@ -7,7 +7,8 @@ import torch
 import xgrammar
 
 from ..._utils import nvtx_range
-from ...bindings.executor import GuidedDecodingConfig, GuidedDecodingParams
+from ...bindings.executor import (ContextPhaseParams, GuidedDecodingConfig,
+                                  GuidedDecodingParams)
 from ...logger import logger
 from ..hostfunc import hostfunc
 from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
@@ -22,18 +23,21 @@ class GuidedRequest:
 
     The instances of this class should be produced on the host and consumed on the device (by hostfunc).
     """
-    guided_decoding_params: Optional[GuidedDecodingParams] = field(default=None)
+    guided_decoding_params: Optional[GuidedDecodingParams] = None
 
-    request_id: Optional[int] = field(default=None)
-    seq_slot: Optional[int] = field(default=None)
-    is_context_init_state: bool = field(default=False)
-    is_last_context_chunk: bool = field(default=False)
-    is_generation_in_progress_state: bool = field(default=False)
+    request_id: Optional[int] = None
+    seq_slot: Optional[int] = None
+    is_context_init_state: bool = False
+    is_last_context_chunk: bool = False
+    is_generation_in_progress_state: bool = False
 
-    new_token: Optional[int] = field(default=None)
-    is_draft: bool = field(default=False)
-    draft_tokens: Optional[List[int]] = field(default=None)
-    num_accepted_draft_tokens: Optional[int] = field(default=None)
+    new_token: Optional[int] = None
+    is_draft: bool = False
+    draft_tokens: Optional[List[int]] = None
+    num_accepted_draft_tokens: Optional[int] = None
+
+    context_phase_params: Optional[ContextPhaseParams] = None
+    decoding_iter: int = 0
 
     def require_matcher_init(self) -> bool:
         if self.guided_decoding_params is None:
@@ -56,7 +60,7 @@ class GuidedRequest:
         return self.is_generation_in_progress_state
 
     @classmethod
-    def from_request(cls, request: LlmRequest):
+    def from_llm_request(cls, request: LlmRequest):
         return cls(
             guided_decoding_params=request.guided_decoding_params,
             request_id=request.py_request_id,
@@ -70,7 +74,9 @@ class GuidedRequest:
             new_token=request.get_last_tokens(0),
             is_draft=request.py_is_draft,
             draft_tokens=request.py_draft_tokens,
-            num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
+            num_accepted_draft_tokens=request.py_num_accepted_draft_tokens,
+            context_phase_params=request.context_phase_params,
+            decoding_iter=request.py_decoding_iter)
 
     def cast_to_draft(self) -> None:
         self.is_draft = True
@@ -88,11 +94,11 @@ class GuidedRequests:
     def from_scheduled_requests(cls,
                                 scheduled_requests: ScheduledRequests,
                                 max_num_draft_tokens: int = 0):
-        batch = [
-            GuidedRequest.from_request(req)
+        requests = [
+            GuidedRequest.from_llm_request(req)
             for req in scheduled_requests.all_requests()
         ]
-        return cls(batch,
+        return cls(requests,
                    num_contexts=len(scheduled_requests.context_requests),
                    num_generations=len(scheduled_requests.generation_requests),
                    max_num_draft_tokens=max_num_draft_tokens)
@@ -169,6 +175,8 @@ class GuidedDecoder:
         # Whether is guided drafting is terminated because of unacceptable drafted tokens.
         self.is_draft_terminated: List[bool] = [False] * self.max_num_sequences
 
+        self.requests: Optional[GuidedRequests] = None
+
         self._stream = torch.cuda.Stream()
 
     @property
@@ -243,15 +251,19 @@ class GuidedDecoder:
                 self.num_advanced_draft_tokens[
                     slot] += self.num_advanced_tokens[slot]
 
-    def copy_bitmask(self, requests: GuidedRequests) -> None:
+    def _copy_bitmask(self, requests: GuidedRequests) -> None:
         self.bitmask[:requests.num_bitmask_tokens].copy_(
             self.bitmask_host[:requests.num_bitmask_tokens], non_blocking=True)
 
     @torch.inference_mode()
-    def apply_bitmask(self,
-                      requests: GuidedRequests,
-                      logits: torch.Tensor,
-                      d2t: Optional[torch.Tensor] = None) -> None:
+    def _apply_bitmask(self,
+                       requests: GuidedRequests,
+                       logits: torch.Tensor,
+                       d2t: Optional[torch.Tensor] = None) -> None:
+        """Apply the bitmask to the corresponding logits for requests with guided decoding enabled.
+
+        This method inplace modifies the logits tensor so that any tokens that violate the grammar constraints are masked out.
+        """
         # TODO: Fuse index_copy and index_select to logits_bitmask.
         if d2t is not None:
             draft_logits = logits
@@ -269,26 +281,46 @@ class GuidedDecoder:
         if d2t is not None:
             torch.index_select(logits, -1, d2t_mapping, out=draft_logits)
 
-    @nvtx_range("GuidedDecoder.execute")
+    @nvtx_range("GuidedDecoder.add_batch")
+    def add_batch(self, scheduled_requests: ScheduledRequests) -> None:
+        self.requests = GuidedRequests.from_scheduled_requests(
+            scheduled_requests, self.max_num_draft_tokens)
+
+    @nvtx_range("GuideDecoder.build")
+    def build(self) -> None:
+        self._build(self.requests)
+
+    @nvtx_range("GuideDecoder.copy_bitmask")
+    def copy_bitmask(self) -> None:
+        self._copy_bitmask(self.requests)
+
+    @nvtx_range("GuidedDecoder.apply_bitmask")
+    def apply_bitmask(self,
+                      logits: torch.Tensor,
+                      d2t: Optional[torch.Tensor] = None) -> None:
+        self._apply_bitmask(self.requests, logits, d2t=d2t)
+
     def execute(self,
-                scheduled_requests: ScheduledRequests,
                 logits: torch.Tensor,
                 d2t: Optional[torch.Tensor] = None) -> None:
-        """Apply the bitmask to the corresponding logits for requests with guided decoding enabled.
-
-        This method inplace modifies the logits tensor so that any tokens that violate the grammar constraints are masked out.
-        """
-        requests = GuidedRequests.from_scheduled_requests(
-            scheduled_requests, self.max_num_draft_tokens)
-        self._build(requests)
+        self.build()
 
         with torch.cuda.stream(self._stream):
-            self.copy_bitmask(requests)
+            self.copy_bitmask()
 
         torch.cuda.current_stream().wait_stream(self._stream)
-        self.apply_bitmask(requests, logits, d2t=d2t)
+        self.apply_bitmask(logits, d2t=d2t)
 
     def _rollback_rejected_tokens(self, requests: GuidedRequests) -> None:
+        """Rollback the grammar matcher for rejected tokens.
+
+        This method should be called:
+        - after the verification (so that the accepted tokens are ready) and
+        - before the first guided decoding build of the next drafting loop.
+        """
+        if self.max_num_draft_tokens <= 0:
+            return
+
         for req in requests:
             if (slot := req.seq_slot) is None:
                 continue
@@ -306,6 +338,15 @@ class GuidedDecoder:
             self.grammar_matchers[slot].rollback(num_rollback_tokens)
 
     def _rollback_draft_tokens(self, requests: GuidedRequests) -> None:
+        """Rollback the grammar matcher for draft tokens.
+
+        This method should be called:
+        - after the the drafting loop and
+        - before the guided decoding build of the target model.
+        """
+        if self.max_num_draft_tokens <= 0:
+            return
+
         for req in requests:
             if (slot := req.seq_slot) is None:
                 continue
@@ -318,50 +359,30 @@ class GuidedDecoder:
             self.is_draft_terminated[slot] = False
 
     @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
-    def rollback_rejected_tokens(self,
-                                 scheduled_requests: ScheduledRequests) -> None:
-        """Rollback the grammar matcher for rejected tokens.
-
-        This method should be called:
-        - after the verification (so that the accepted tokens are ready) and
-        - before the first guided decoding build of the next drafting loop.
-        """
-        if self.max_num_draft_tokens <= 0:
-            return
-        requests = GuidedRequests.from_scheduled_requests(
-            scheduled_requests, self.max_num_draft_tokens)
-        self._rollback_rejected_tokens(requests)
+    def rollback_rejected_tokens(self) -> None:
+        self._rollback_rejected_tokens(self.requests)
 
     @nvtx_range("GuidedDecoder.rollback_draft_tokens")
-    def rollback_draft_tokens(self,
-                              scheduled_requests: ScheduledRequests) -> None:
-        """Rollback the grammar matcher for draft tokens.
+    def rollback_draft_tokens(self) -> None:
+        self._rollback_draft_tokens(self.requests)
 
-        This method should be called:
-        - after the the drafting loop and
-        - before the guided decoding build of the target model.
-        """
-        if self.max_num_draft_tokens <= 0:
-            return
-        requests = GuidedRequests.from_scheduled_requests(
-            scheduled_requests, self.max_num_draft_tokens)
-        self._rollback_rejected_tokens(requests)
-
-    @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
-    def init_disagg_gen_requests(self,
-                                 scheduled_requests: ScheduledRequests) -> None:
+    def _init_disagg_gen_requests(self, requests: GuidedRequests) -> None:
         """Initialize the grammar matchers for disagg gen requests.
         """
-        for llm_req in scheduled_requests.generation_requests:
-            if llm_req.guided_decoding_params is None:
+        for req in requests:
+            if req.guided_decoding_params is None:
                 continue
-            assert not llm_req.py_is_draft
-            slot: int = llm_req.py_seq_slot
-            if llm_req.context_phase_params is not None and llm_req.py_decoding_iter == 1:
+            if (slot := req.seq_slot) is None:
+                continue
+            if req.context_phase_params is not None and req.py_decoding_iter == 1:
                 # The request is in the first generation forward step at the disagg gen instance.
                 self.grammar_matchers[
                     slot] = self.grammar_matcher_factory.create(
-                        llm_req.guided_decoding_params)
+                        req.guided_decoding_params)
+
+    @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
+    def init_disagg_gen_requests(self) -> None:
+        self._init_disagg_gen_requests(self.requests)
 
     @hostfunc
     def inc_bitmask_host(self):
@@ -385,7 +406,6 @@ class GuidedWorker(GuidedDecoder):
                  max_num_draft_tokens: int = 0):
         super().__init__(guided_decoding_config, max_num_sequences,
                          vocab_size_padded, max_num_draft_tokens)
-        self.requests: Optional[GuidedRequests] = None
         self.requests_hostfunc: Optional[GuidedRequests] = None
         self.queue = Queue()
 
@@ -400,6 +420,7 @@ class GuidedWorker(GuidedDecoder):
         self.token_event = torch.cuda.Event()
         self.bitmask_event = torch.cuda.Event()
 
+    @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
                   new_tokens: Optional[torch.Tensor] = None) -> None:
@@ -408,15 +429,16 @@ class GuidedWorker(GuidedDecoder):
         if new_tokens is not None:
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))
-        # self.token_event.record() should be called in PyTorchModelEngine._preprocess_inputs
+        # self.token_event.record() should be called inside CUDA graph capturing;
+        # currently, it is in PyTorchModelEngine._preprocess_inputs.
 
     @hostfunc
-    def next_batch(self) -> None:
-        # Fix it.
+    def fetch_batch(self) -> None:
+        # CUDA graph warmup calls model forward for multiple times for one prepared inputs
         if self.queue.empty():
             return
-        self.requests_hostfunc, has_new_tensors = self.queue.get()
-        if not has_new_tensors:
+        self.requests_hostfunc, has_new_tokens = self.queue.get()
+        if not has_new_tokens:
             return
 
         for req in self.requests_hostfunc:
@@ -433,26 +455,23 @@ class GuidedWorker(GuidedDecoder):
                 d2t: Optional[torch.Tensor] = None) -> None:
         with torch.cuda.stream(self._stream):
             torch.cuda.current_stream().wait_event(self.token_event)
-            self.next_batch()
+            self.fetch_batch()
             self.build()
-            self.copy_bitmask(self.requests)
+            self.copy_bitmask()
             self.bitmask_event.record()
 
         torch.cuda.current_stream().wait_event(self.bitmask_event)
-        self.apply_bitmask(self.requests, logits, d2t=d2t)
+        self.apply_bitmask(logits, d2t=d2t)
 
     @hostfunc
     def rollback_rejected_tokens(self) -> None:
-        if self.max_num_draft_tokens <= 0:
-            return
         self._rollback_rejected_tokens(self.requests_hostfunc)
 
     @hostfunc
     def rollback_draft_tokens(self) -> None:
-        if self.max_num_draft_tokens <= 0:
-            return
         self._rollback_draft_tokens(self.requests_hostfunc)
 
+    @nvtx_range("GuidedDecoder.add_draft_batch")
     def add_draft_batch(self,
                         new_tokens: torch.Tensor,
                         num_accepted_tokens: torch.Tensor,
@@ -467,7 +486,7 @@ class GuidedWorker(GuidedDecoder):
         self.token_event.record()
 
     @hostfunc
-    def next_draft_batch(self, is_first_step: bool = False) -> None:
+    def fetch_draft_batch(self, is_first_step: bool = False) -> None:
         batch_size = len(self.requests_hostfunc)
         new_tokens_list = self.new_tokens[0, :batch_size].tolist()
         if is_first_step:
@@ -492,14 +511,14 @@ class GuidedWorker(GuidedDecoder):
                             is_last_step: bool = False) -> None:
         with torch.cuda.stream(self._stream):
             torch.cuda.current_stream().wait_event(self.token_event)
-            self.next_draft_batch(is_first_step=is_first_step)
+            self.fetch_draft_batch(is_first_step=is_first_step)
             if is_first_step:
                 self.rollback_rejected_tokens()
             self.build()
             if is_last_step:
                 self.rollback_draft_tokens()
-            self.copy_bitmask(self.requests)
+            self.copy_bitmask()
             self.bitmask_event.record()
 
         torch.cuda.current_stream().wait_event(self.bitmask_event)
-        self.apply_bitmask(self.requests, logits, d2t=d2t)
+        self.apply_bitmask(logits, d2t=d2t)

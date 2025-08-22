@@ -773,11 +773,13 @@ class PyExecutor:
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
                             batch_outputs = self._forward_step(scheduled_batch)
-                            if self.kv_cache_transceiver and self.guided_decoder:
-                                self.guided_decoder.init_disagg_gen_requests(
-                                    scheduled_batch)
-                            self._execute_guided_decoder(
-                                scheduled_batch, batch_outputs['logits'])
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.add_batch(scheduled_batch)
+                                if self.kv_cache_transceiver:
+                                    self.guided_decoder.init_disagg_gen_requests(
+                                    )
+                                self.guided_decoder.execute(
+                                    batch_outputs['logits'])
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
@@ -944,11 +946,6 @@ class PyExecutor:
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
 
-    def _execute_guided_decoder(self, scheduled_batch: ScheduledRequests,
-                                logits: torch.Tensor):
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(scheduled_batch, logits)
-
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -982,22 +979,23 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    if self.kv_cache_transceiver and self.guided_decoder:
-                        self.guided_decoder.init_disagg_gen_requests(
-                            scheduled_batch)
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.add_batch(scheduled_batch)
+                        if self.kv_cache_transceiver:
+                            self.guided_decoder.init_disagg_gen_requests()
+
                     if self.drafter is not None and self.use_spec_decode:
                         with request_context(
                                 is_draft=True,
                                 scheduled_requests=scheduled_batch):
                             if self.guided_decoder is not None:
-                                self.guided_decoder.rollback_rejected_tokens(
-                                    scheduled_batch)
+                                self.guided_decoder.rollback_rejected_tokens()
                             self.drafter.prepare_draft_tokens(
                                 scheduled_batch, self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
-                    self._execute_guided_decoder(scheduled_batch,
-                                                 batch_outputs['logits'])
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.execute(batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
@@ -1112,11 +1110,11 @@ class PyExecutor:
                     if self.previous_batch is not None:
                         self._update_requests(self.previous_batch.sample_state)
 
-                    if self.kv_cache_transceiver and self.guided_decoder:
-                        self.guided_decoder.init_disagg_gen_requests(
-                            scheduled_batch)
-                    self._execute_guided_decoder(scheduled_batch,
-                                                 batch_outputs['logits'])
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.add_batch(scheduled_batch)
+                        if self.kv_cache_transceiver:
+                            self.guided_decoder.init_disagg_gen_requests()
+                        self.guided_decoder.execute(batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
