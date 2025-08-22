@@ -15,6 +15,8 @@ l0_dgx_h200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - examples/test_llama.py::test_llama_3_x_with_bf16_lora_torch_8_gpus[llama-3.3-70b-instruct]
+  - examples/test_nemotron_nas.py::test_nemotron_ultra_253b_lora_torch[Llama-3_1-Nemotron-Ultra-253B-v1]
   # - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput] # OOM
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[latency] # 1h
   - accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[True]
