@@ -356,11 +356,31 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
         """Returns True if the adapter was loaded by this call, False if it was already loaded"""
         adapter_id = str(lora_request.adapter_id)
+
+        # Create runtime_mapping from executor_config.mapping
+        from tensorrt_llm.mapping import Mapping
+        if hasattr(self._executor_config,
+                   "mapping") and self._executor_config.mapping is not None:
+            mapping = self._executor_config.mapping
+            # Calculate world_size to satisfy the constraint: world_size = tp_size * pp_size * cp_size
+            world_size = mapping.tp_size * mapping.pp_size * mapping.cp_size
+
+            runtime_mapping = Mapping(
+                world_size=world_size,  # ← Add world_size
+                tp_size=mapping.tp_size,
+                pp_size=mapping.pp_size,
+                cp_size=mapping.cp_size,
+                rank=mapping.rank,
+                gpus_per_node=mapping.gpus_per_node)
+        else:
+            # Fallback to default mapping
+            runtime_mapping = Mapping()
+
         newly_loaded_uids = self._lora_manager.load_from_ckpt(
             [lora_request.path],
             model_config=self._runtime_model_config if
             self._runtime_model_config is not None else self._lora_model_config,
-            runtime_mapping=None,
+            runtime_mapping=runtime_mapping,  # ← Pass the correct runtime_mapping
             uids=[adapter_id],
             ckpt_source=lora_request.ckpt_source)
         return adapter_id in newly_loaded_uids

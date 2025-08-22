@@ -243,6 +243,7 @@ class LoraModelConfig:
     trtllm_modules_to_hf_modules: dict[str, str]
     hidden_size: int
     dtype: str
+    coarse_mlp_hidden_size: Optional[int] = None
 
 
 class HfLoraLoader:
@@ -1133,14 +1134,107 @@ class LoraManager(object):
                         )
                     )
 
-            max_weight_size = max(w.size(0) for w in self._cpp_lora_weights[uid])
-            self._cpp_lora_weights[uid] = torch.stack(
-                [
-                    torch.nn.functional.pad(w, (0, max_weight_size - w.size(0)))
-                    for w in self._cpp_lora_weights[uid]
-                ]
+            # Handle both ModelConfig and LoraModelConfig types
+            print(f"DEBUG: model_config type: {type(model_config)}")
+            print(
+                f"DEBUG: model_config has coarse_mlp_hidden_size: {hasattr(model_config, 'coarse_mlp_hidden_size')}"
             )
+            print(
+                f"DEBUG: model_config.coarse_mlp_hidden_size value: {model_config.coarse_mlp_hidden_size}"
+            )
+            print(
+                f"DEBUG: model_config.coarse_mlp_hidden_size is None: {model_config.coarse_mlp_hidden_size is None}"
+            )
+
+            # Handle both ModelConfig and LoraModelConfig types
+            if (
+                hasattr(model_config, "coarse_mlp_hidden_size")
+                and model_config.coarse_mlp_hidden_size is not None
+            ):
+                print(
+                    f"DEBUG: INSIDE load_from_hf: model_config.coarse_mlp_hidden_size: "
+                    f"{model_config.coarse_mlp_hidden_size}"
+                )
+                M_coarse = model_config.coarse_mlp_hidden_size
+                H = model_config.hidden_size
+                rank = int(hf_config["r"])
+
+                print(f"DEBUG: load_from_hf - M_coarse: {M_coarse}")
+                print(f"DEBUG: load_from_hf - tp_size: {tp_size}")
+                print(f"DEBUG: load_from_hf - H (hidden_size): {H}")
+                print(f"DEBUG: load_from_hf - rank: {rank}")
+
+                M_coarse_tp = M_coarse * tp_size
+                max_weight_size = rank * M_coarse_tp + rank * H
+
+                print(f"DEBUG: load_from_hf - M_coarse_tp: {M_coarse_tp}")
+                print(
+                    f"DEBUG: load_from_hf - max_weight_size calculation: "
+                    f"{rank} * {M_coarse_tp} + {rank} * {H} = {max_weight_size}"
+                )
+
+                # Debug actual weights before padding
+                print(
+                    f"DEBUG: load_from_hf - Number of weight tensors: {len(self._cpp_lora_weights[uid])}"
+                )
+                for i, w in enumerate(self._cpp_lora_weights[uid]):
+                    print(
+                        f"DEBUG: load_from_hf - Weight {i} shape: {w.shape}, size(0): {w.size(0)}"
+                    )
+
+                # Debug the actual maximum weight size
+                actual_max_weight_size = max(w.size(0) for w in self._cpp_lora_weights[uid])
+                print(f"DEBUG: load_from_hf - Actual max weight size: {actual_max_weight_size}")
+                print(f"DEBUG: load_from_hf - Calculated max_weight_size: {max_weight_size}")
+                print(
+                    f"DEBUG: load_from_hf - Difference: {max_weight_size - actual_max_weight_size}"
+                )
+
+                # Debug module-specific sizes
+                print(
+                    f"DEBUG: load_from_hf - Number of modules: {len(self._cpp_lora_weights[uid])}"
+                )
+                print("DEBUG: load_from_hf - Module sizes by index:")
+                for i, w in enumerate(self._cpp_lora_weights[uid]):
+                    print(f"DEBUG: load_from_hf - Module {i}: {w.size(0)}")
+
+                # Debug which modules are failing
+                print("DEBUG: load_from_hf - Checking which modules might fail validation:")
+                for i, w in enumerate(self._cpp_lora_weights[uid]):
+                    if w.size(0) < max_weight_size:
+                        print(
+                            f"DEBUG: load_from_hf - Module {i} will be padded: {w.size(0)} -> {max_weight_size}"
+                        )
+                    else:
+                        print(f"DEBUG: load_from_hf - Module {i} no padding needed: {w.size(0)}")
+
+            else:
+                # Final fallback: use the maximum size of actual weights
+                max_weight_size = max(w.size(0) for w in self._cpp_lora_weights[uid])
+                print(f"DEBUG: load_from_hf - Using fallback max_weight_size: {max_weight_size}")
+
+            print(f"DEBUG: load_from_hf - Final max_weight_size: {max_weight_size}")
+
+            # Debug padding process
+            padded_weights = []
+            for i, w in enumerate(self._cpp_lora_weights[uid]):
+                padding_needed = max_weight_size - w.size(0)
+                print(
+                    f"DEBUG: load_from_hf - Weight {i}: original size {w.size(0)}, padding {padding_needed}"
+                )
+                padded_w = torch.nn.functional.pad(w, (0, padding_needed))
+                print(f"DEBUG: load_from_hf - Weight {i}: padded size {padded_w.size(0)}")
+                padded_weights.append(padded_w)
+
+            self._cpp_lora_weights[uid] = torch.stack(padded_weights)
+            print(
+                f"DEBUG: load_from_hf - Final stacked weights shape: {self._cpp_lora_weights[uid].shape}"
+            )
+
             self._cpp_lora_config[uid] = torch.stack([c for c in self._cpp_lora_config[uid]])
+            print(
+                f"DEBUG: load_from_hf - Final stacked config shape: {self._cpp_lora_config[uid].shape}"
+            )
 
         for uid, model_dir, hf_config in zip(new_uids, new_model_dirs, lora_hf_configs):
             load_from_model_dir(uid, model_dir, hf_config)

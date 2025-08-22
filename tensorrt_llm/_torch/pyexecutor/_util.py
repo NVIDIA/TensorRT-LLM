@@ -468,6 +468,7 @@ def create_py_executor_instance(
             # all layers have the same number of KV heads
             num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
 
+        # THEN UPDATE THE LoraModule.create_lora_modules CALL:
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,
             hidden_size=model_binding_config.hidden_size,
