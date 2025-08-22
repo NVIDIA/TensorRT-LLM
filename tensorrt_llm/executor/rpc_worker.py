@@ -1,14 +1,16 @@
+import asyncio
 from pathlib import Path
 from queue import Queue
 from threading import Event
-from typing import Optional, Union
+from typing import AsyncGenerator, Optional, Union
 
-from tensorrt_llm.llmapi.utils import enable_llm_debug
+from tensorrt_llm._utils import mpi_comm
+from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
-from ..logger import logger, set_level
+from ..logger import set_level
 from ..lora_manager import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
 from .postproc_worker import PostprocWorkerConfig
@@ -50,16 +52,44 @@ class RpcWorker(WorkerBase):
     def fetch_stats(self) -> list:
         return super().fetch_stats()
 
-    def fetch_responses(self) -> list:
-        logger.debug(f"RpcWorker {mpi_rank()} is fetching responses")
+    def fetch_responses(self, timeout: Optional[float] = None) -> list:
+        logger_debug(f"RpcWorker {mpi_rank()} is fetching responses",
+                     color="yellow")
         # NOTE: This is a blocking call, it will wait for the responses to be available.
-        super().await_responses()
-        logger.debug(f"RpcWorker returning responses")
+        super().await_responses(timeout)
+        logger_debug(f"RpcWorker returning responses", color="yellow")
         qsize = self._response_queue.qsize()
         return [self._response_queue.get() for _ in range(qsize)]
 
+    async def fetch_responses_async(self) -> list:
+        return await asyncio.to_thread(self.fetch_responses)
+
+    # for streaming performance
+    async def fetch_responses_loop_async(self) -> AsyncGenerator[list, None]:
+        while not self.shutdown_event.is_set():
+            responses = await asyncio.to_thread(self.fetch_responses
+                                                )  # run blocking call in thread
+            if responses:  # Only yield if there are actual responses
+                logger_debug(
+                    f"RpcWorker {mpi_rank()} is yielding responses: {responses}",
+                    color="yellow")
+                yield responses  # batching the responses to opt IPC performance
+            else:
+                # Small delay to prevent busy waiting when no responses
+                await asyncio.sleep(0)
+        logger_debug(
+            f"RpcWorker {mpi_rank()} quitting fetch_responses_loop_async",
+            color="yellow")
+
+    def setup_engine(self):
+        # Force all the ranks to wait here, and start creating the executor simultaneously.
+        mpi_comm().barrier()
+
+        super().setup_engine()
+
     def shutdown(self):
-        logger.debug(f"RPC worker {mpi_rank()} is shutting down")
+        logger_debug(f"RPC worker {mpi_rank()} is shutting down",
+                     color="yellow")
         self.shutdown_event.set()
         super().shutdown()
 
@@ -88,22 +118,24 @@ class RpcWorker(WorkerBase):
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
 
         if mpi_rank() != 0:
-            logger.debug(f"Worker {mpi_rank()} is setting up the engine")
             # The non-leader worker will setup the engine immediately.
             # The leader worker will wait for the RPC call to propagate the
             # potential error.
-            logger.debug(f"Worker {mpi_rank()} is setting up the engine")
+            logger_debug(f"Worker {mpi_rank()} is setting up the engine",
+                         color="yellow")
             worker.setup_engine()
 
         if mpi_rank() == 0:
-            logger.debug(f"Worker {mpi_rank()} is creating the RPC service")
+            logger_debug(f"Worker {mpi_rank()} is creating the RPC service",
+                         color="yellow")
             # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client
-            rpc_server = RPCServer(worker)
+            # Set num_workers to larger than 1 since there are some streaming tasks runs infinitely, such as await_responses_async.
+            rpc_server = RPCServer(worker, num_workers=6)
             rpc_server.bind(rpc_addr)
             rpc_server.start()
 
             # Step 3: Wait for the worker to shutdown
-            logger.debug(
+            logger_debug(
                 f"Worker {mpi_rank()} is waiting for the worker to shutdown")
             worker.shutdown_event.wait()
             rpc_server.shutdown()

@@ -1,3 +1,4 @@
+import asyncio
 import atexit
 import os
 import threading
@@ -6,7 +7,7 @@ from typing import Optional
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import (_SyncQueue, print_colored_debug,
+from ..llmapi.utils import (_SyncQueue, logger_debug, print_colored_debug,
                             print_traceback_on_error)
 from ..logger import logger
 from .executor import GenerationExecutor
@@ -14,6 +15,7 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
+from .rpc.rpc_common import RPCParams
 from .rpc_worker import RpcWorker
 from .utils import (ErrorResponse, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response)
@@ -83,24 +85,23 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                                 **self.worker_kwargs)
 
     @print_traceback_on_error
-    def main_loop_task(self):
+    async def main_loop_task(self):
         """
         Main loop of the proxy, it will invoke the actions periodically.
         """
-        clock = 0
-        while not self._shutdown_event.is_set():
-            if clock % 1 == 0:
-                responses = self.fetch_responses_remote()
-                self.handle_responses(responses)
-            if clock % 10 == 0:
-                stats = self.fetch_stats_remote()  # TODO
-                self.handle_stats(stats)
-
-            clock += 1
-            time.sleep(self.clock_unit)
+        async for responses in self.rpc_client.fetch_responses_loop_async.call_streaming(
+        ):
+            if self._shutdown_event.is_set():
+                return
+            self.handle_responses(responses)
 
     def setup_mainloop(self):
-        self.main_loop_thread = threading.Thread(target=self.main_loop_task,
+
+        def _run_main_loop_task():
+            """Local method to run the main loop task."""
+            asyncio.run(self.main_loop_task())
+
+        self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
                                                  daemon=True)
         self.main_loop_thread.start()
         atexit.register(self.shutdown)
@@ -144,7 +145,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         logprob_params = self._get_logprob_params(request)
 
         # submit is a fire-and-forget operation, don't need to wait for response
-        self.rpc_client.submit(request, __rpc_need_response=False)
+        self.rpc_client.submit(request,
+                               __rpc_params=RPCParams(need_response=False))
 
         result = GenerationResult(
             request,
@@ -157,16 +159,19 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         return result
 
     def fetch_responses_remote(self):
-        return self.rpc_client.fetch_responses(__rpc_timeout=20)
+        return self.rpc_client.fetch_responses(__rpc_params=RPCParams(
+            timeout=20))
 
     def fetch_stats_remote(self):
         return self.rpc_client.fetch_stats()
 
     def setup_engine_remote(self):
-        return self.rpc_client.setup_engine(__rpc_timeout=60 * 20)  # 20 min
+        return self.rpc_client.setup_engine(__rpc_params=RPCParams(
+            need_response=True))
 
     def shutdown_remote(self):
-        self.rpc_client.shutdown(__rpc_timeout=60 * 20)  # 20 min
+        logger_debug(f"Shutting down rpc remote", color="yellow")
+        self.rpc_client.shutdown()
 
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id)
@@ -174,13 +179,15 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
     def shutdown(self):
         if self._shutdown_event.is_set():
             return
+        logger_debug(f"Shutting down GenerationExecutorRpcProxy",
+                     color="yellow")
 
-        # 1. stop the main loop, so that no new rpc requests
+        # 1. shutdown the rpc server (PyExecutor Rank 0 + RPC server)
+        self.shutdown_remote()
+
+        # 2. stop the main loop, so that no new rpc requests
         self._shutdown_event.set()
         self.main_loop_thread.join()
-
-        # 2. shutdown the rpc server (PyExecutor Rank 0 + RPC server)
-        self.shutdown_remote()
 
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
