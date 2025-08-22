@@ -561,13 +561,57 @@ class MnnvlMoe:
         ep_size: int,
         top_k: int,
         token_count: int,
+        x_sf: torch.Tensor = None,
+        is_sf_swizzled: bool = False,
+        low_precision_global_scale: torch.Tensor = None,
     ):
         assert x.dim() == 2, "2D tensor supported, please reshape."
+        hidden_dim = x.shape[1]
+        hidden_dim_in_bytes = hidden_dim * x.element_size()
+
+        if x_sf is not None:
+            assert x_sf.dim() == 2, "2D tensor supported, please reshape."
+            hidden_dim *= 2
+            hidden_dim_in_bytes += x_sf.shape[1] * x_sf.element_size()
+            assert low_precision_global_scale is not None, (
+                "low_precision_global_scale is required when x_sf is not None"
+            )
+            assert low_precision_global_scale.dtype == torch.float32, (
+                "low_precision_global_scale should be float32"
+            )
+            assert low_precision_global_scale.numel() == x.shape[0], (
+                "low_precision_global_scale should have the same number of elements as x.shape[0]"
+            )
+            hidden_dim_in_bytes += 4
+            hidden_dim_in_bytes_pad = hidden_dim_in_bytes + 15 & ~15
+            concat_tensors = [
+                x.view(torch.uint8),
+                x_sf.view(torch.uint8),
+                low_precision_global_scale.view(torch.uint8).view(-1, 4),
+            ]
+            if hidden_dim_in_bytes_pad != hidden_dim_in_bytes:
+                concat_tensors.append(
+                    torch.zeros(
+                        x.shape[0],
+                        hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                        dtype=torch.uint8,
+                        device=x.device,
+                    )
+                )
+            input = torch.cat(concat_tensors, dim=1)
+        else:
+            hidden_dim_in_bytes_pad = hidden_dim_in_bytes
+            input = x.view(torch.uint8)
+
         output_tensor = torch.zeros(
-            token_count * top_k, x.shape[1], dtype=x.dtype, device=torch.device("cuda")
+            token_count * top_k,
+            hidden_dim_in_bytes_pad,
+            dtype=torch.uint8,
+            device=torch.device("cuda"),
         )
+
         torch.ops.trtllm.moe_comm(
-            x,
+            input,
             alltoall_info.recv_rank_count_cumsum,
             alltoall_info.recv_rank_local_indices,
             output_tensor,
@@ -577,6 +621,29 @@ class MnnvlMoe:
             ep_rank,
             ep_size,
         )
+
+        if x_sf is not None:
+            x, x_sf, output_global_scale, _ = output_tensor.split(
+                [
+                    x.shape[1] * x.element_size(),
+                    x_sf.shape[1] * x_sf.element_size(),
+                    4,
+                    hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                ],
+                dim=1,
+            )
+            output_tensor = torch.ops.trtllm.fp4_dequantize(
+                x.contiguous(),
+                x_sf.contiguous(),
+                1.0 / output_global_scale.view(torch.float32).contiguous(),
+                16,
+                False,
+                is_sf_swizzled,
+                "bfloat16",
+            )
+        else:
+            output_tensor = output_tensor.view(x.dtype)
+
         return torch.sum(
-            output_tensor.reshape(token_count, top_k, x.shape[1]), dim=1, keepdim=False
+            output_tensor.reshape(token_count, top_k, hidden_dim), dim=1, keepdim=False
         )
