@@ -5,6 +5,10 @@
         "url": "https://nvidia.github.io/TensorRT-LLM/latest/"
     },
     {
+        "version": "1.1.0rc1",
+        "url": "https://nvidia.github.io/TensorRT-LLM/1.1.0rc1/"
+    },
+    {
         "version": "1.1.0rc0",
         "url": "https://nvidia.github.io/TensorRT-LLM/1.1.0rc0/"
     },
