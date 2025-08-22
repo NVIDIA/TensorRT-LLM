@@ -179,7 +179,7 @@ class GenerationExecutorWorker(GenerationExecutor):
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
-        if getattr(executor_config, "backend",
+        if getattr(self._executor_config, "backend",
                    "") == "pytorch" and lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
                 ResourceManagerType
