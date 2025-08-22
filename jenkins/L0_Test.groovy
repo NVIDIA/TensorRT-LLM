@@ -2444,26 +2444,28 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
 
     parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values -> [key, {
-        trtllm_utils.llmStageWithRetry(pipeline, key, {
-            if (key in testFilter[REUSE_STAGE_LIST]) {
-                stage("Skip - reused") {
-                    echo "Skip - Passed in the last pipeline."
-                }
-            } else if (values instanceof List && dockerNode == null) {
-                trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
-                    values[1]()
-                })
-            } else if (values instanceof List && dockerNode != null) {
-                node(dockerNode) {
-                    deleteDir()
-                    docker.image(LLM_DOCKER_IMAGE).inside(dockerArgs) {
-                        values[1]()
+        stage(key) {
+            trtllm_utils.llmStageWithRetry(pipeline, key, {
+                if (key in testFilter[REUSE_STAGE_LIST]) {
+                    stage("Skip - reused") {
+                        echo "Skip - Passed in the last pipeline."
                     }
+                } else if (values instanceof List && dockerNode == null) {
+                    trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
+                        values[1]()
+                    })
+                } else if (values instanceof List && dockerNode != null) {
+                    node(dockerNode) {
+                        deleteDir()
+                        docker.image(LLM_DOCKER_IMAGE).inside(dockerArgs) {
+                            values[1]()
+                        }
+                    }
+                } else {
+                    values()
                 }
-            } else {
-                values()
-            }
-        })
+            })
+        }
     }]}
 
     return parallelJobsFiltered
