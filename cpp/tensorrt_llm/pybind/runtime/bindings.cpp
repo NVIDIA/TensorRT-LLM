@@ -29,7 +29,6 @@
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
