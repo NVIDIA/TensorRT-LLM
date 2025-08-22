@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import queue
 import threading
 import time
@@ -9,7 +10,8 @@ from typing import Optional
 from ...llmapi.utils import ManagedThread
 from ...logger import logger
 from ..ipc import ZeroMqQueue
-from .rpc_common import RPCError, RPCRequest, RPCResponse, RPCTimeout
+from .rpc_common import (RPCError, RPCRequest, RPCResponse, RPCStreamingError,
+                         RPCTimeout)
 
 
 class RPCServer:
@@ -51,8 +53,8 @@ class RPCServer:
         }
         self._dispatcher_thread: Optional[ManagedThread] = None
         if async_run_task:
-            self._executor = ThreadPoolExecutor(max_workers=num_workers,
-                                                thread_name_prefix="rpc_worker")
+            self._executor = ThreadPoolExecutor(
+                max_workers=num_workers, thread_name_prefix="rpc_server_worker")
         else:
             self._executor = None
 
@@ -208,32 +210,64 @@ class RPCServer:
                 await asyncio.sleep(0)
                 continue
 
-            response = await self._process_request(req)
+            # Check if this is a streaming request
+            if req.is_streaming and req.method_name in self._functions:
+                func = self._functions[req.method_name]
+                if inspect.isasyncgenfunction(func):
+                    # Process streaming request
+                    await self._process_streaming_request(req)
+                else:
+                    # Non-streaming function called with streaming flag
+                    response = RPCResponse(
+                        req.request_id,
+                        None,
+                        RPCStreamingError(
+                            f"Method '{req.method_name}' is not a streaming function."
+                        ),
+                        # need to redirect the error to the client's streaming queue
+                        is_streaming=True,
+                        stream_status='error',
+                    )
+                    await self._client_socket.put_async(response)
+            else:
+                # Process regular request
+                response = await self._process_request(req)
 
-            # Some tasks don't need response, e.g. submit_request or shutdown
-            if req.need_response:
-                logger.debug(f"RPC Server sending response for request {req}")
-                await self._client_socket.put_async(response)
-                logger.debug(f"RPC Server sent response for request {req}")
+                # Some tasks don't need response, e.g. submit_request or shutdown
+                if req.need_response and response is not None:
+                    logger.debug(
+                        f"RPC Server sending response for request {req}")
+                    await self._client_socket.put_async(response)
+                    logger.debug(f"RPC Server sent response for request {req}")
 
             self._num_pending_requests -= 1
 
-    async def _process_request(self, req: RPCRequest) -> RPCResponse:
+    async def _process_request(self, req: RPCRequest) -> Optional[RPCResponse]:
+        """Process a request. Returns None for streaming requests (handled separately)."""
         if req.method_name not in self._functions:
             return RPCResponse(
                 req.request_id, None,
                 RPCError(f"Method '{req.method_name}' not found in RPC server.",
                          traceback=traceback.format_exc()))
 
+        func = self._functions[req.method_name]
+
         try:
-            loop = asyncio.get_running_loop()
+            if inspect.iscoroutinefunction(func):
+                # Execute async function directly in event loop, no need to run in executor due to the GIL
+                result = await asyncio.wait_for(func(*req.args, **req.kwargs),
+                                                timeout=req.timeout)
+            else:
+                # Execute sync function in thread executor
+                loop = asyncio.get_running_loop()
 
-            def call_with_kwargs():
-                return self._functions[req.method_name](*req.args, **req.kwargs)
+                def call_with_kwargs():
+                    return func(*req.args, **req.kwargs)
 
-            result = await asyncio.wait_for(loop.run_in_executor(
-                self._executor, call_with_kwargs),
-                                            timeout=req.timeout)
+                result = await asyncio.wait_for(loop.run_in_executor(
+                    self._executor, call_with_kwargs),
+                                                timeout=req.timeout)
+
             logger.debug(f"RPC Server returned result for request {req}")
             response = RPCResponse(req.request_id, result)
 
@@ -250,6 +284,72 @@ class RPCServer:
                 RPCError(str(e), cause=e, traceback=traceback.format_exc()))
 
         return response
+
+    async def _process_streaming_request(self, req: RPCRequest):
+        """Process a streaming request by sending multiple responses."""
+        if req.method_name not in self._functions:
+            await self._client_socket.put_async(
+                RPCResponse(
+                    req.request_id,
+                    None,
+                    RPCStreamingError(
+                        f"Method '{req.method_name}' not found in RPC server.",
+                        traceback=traceback.format_exc()),
+                    stream_status='error'))
+            return
+
+        func = self._functions[req.method_name]
+
+        if not inspect.isasyncgenfunction(func):
+            await self._client_socket.put_async(
+                RPCResponse(
+                    req.request_id,
+                    None,
+                    RPCStreamingError(
+                        f"Method '{req.method_name}' is not an async generator.",
+                        traceback=traceback.format_exc()),
+                    # need to redirect the error to the client's streaming queue
+                    stream_status='error'))
+            return
+
+        sequence_number = 0
+
+        try:
+            # Send start signal
+            await self._client_socket.put_async(
+                RPCResponse(req.request_id, None, None, True, sequence_number,
+                            'start'))
+            sequence_number += 1
+
+            # Stream the results
+            async for result in func(*req.args, **req.kwargs):
+                await self._client_socket.put_async(
+                    RPCResponse(req.request_id, result, None, True,
+                                sequence_number, 'data'))
+                sequence_number += 1
+
+            # Send end signal
+            await self._client_socket.put_async(
+                RPCResponse(req.request_id, None, None, True, sequence_number,
+                            'end'))
+
+        except asyncio.TimeoutError:
+            await self._client_socket.put_async(
+                RPCResponse(
+                    req.request_id, None,
+                    RPCTimeout(
+                        f"Streaming method '{req.method_name}' timed out",
+                        traceback=traceback.format_exc()), True,
+                    sequence_number, 'error'))
+
+        except Exception as e:
+            await self._client_socket.put_async(
+                RPCResponse(
+                    req.request_id, None,
+                    RPCStreamingError(str(e),
+                                      cause=e,
+                                      traceback=traceback.format_exc()), True,
+                    sequence_number, 'error'))
 
     def start(self):
         """Binds sockets, starts workers, and begins proxying messages."""

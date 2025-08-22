@@ -2,10 +2,12 @@ import asyncio
 import concurrent.futures
 import threading
 import uuid
+from typing import Any, AsyncIterator, Dict
 
 from ...logger import logger
 from ..ipc import ZeroMqQueue
-from .rpc_common import RPCCancelled, RPCRequest, RPCResponse, RPCTimeout
+from .rpc_common import (RPCCancelled, RPCRequest, RPCResponse,
+                         RPCStreamingError, RPCTimeout)
 
 
 class RPCClient:
@@ -31,11 +33,15 @@ class RPCClient:
                                           is_async=True,
                                           use_hmac_encryption=False)
         self._pending_futures = {}
+        # map request_id to the queue for streaming responses
+        self._streaming_queues: Dict[str, asyncio.Queue] = {}
         self._reader_task = None
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=num_workers, thread_name_prefix="rpc_client")
+            max_workers=num_workers, thread_name_prefix="rpc_client_worker")
 
         self._server_stopped = False
+        self._closed = False
+        self._stop_event = None
         self._loop = None
         self._loop_thread = None
 
@@ -52,9 +58,30 @@ class RPCClient:
 
     def close(self):
         """Gracefully close the client, cleaning up background tasks."""
+
+        if self._closed:
+            return
+        # stop the main loop
+        self._closed = True
+
+        logger.debug("RPC Client closing")
+
+        if self._stop_event and self._loop:
+            # Use call_soon_threadsafe since set() is not a coroutine
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+
         if self._reader_task:
-            self._reader_task.cancel()
+            try:
+                self._reader_task.result(timeout=1.0)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "Reader task did not exit gracefully, cancelling")
+                self._reader_task.cancel()
+            except Exception as e:
+                # Task might have already finished or been cancelled
+                logger.debug(f"Reader task cleanup: {e}")
             self._reader_task = None
+
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._loop_thread:
@@ -63,23 +90,55 @@ class RPCClient:
         if self._executor:
             self._executor.shutdown(wait=True)
 
+        if self._client_socket:
+            self._client_socket.close()
+            self._client_socket = None
+
+        logger.debug("RPC Client closed")
+
     async def _response_reader(self):
         """Task to read responses from the socket and set results on futures."""
 
-        while True:
+        while not self._stop_event.is_set():
             try:
-                response: RPCResponse = await self._client_socket.get_async()
+                # Use wait_for with a short timeout to periodically check stop event
+                try:
+                    response: RPCResponse = await asyncio.wait_for(
+                        self._client_socket.get_async(),
+                        timeout=0.1  # Check stop event every 100ms
+                    )
+                except asyncio.TimeoutError:
+                    # Timeout is expected - just check stop event and continue
+                    continue
+
                 logger.debug(f"RPC Client received response: {response}")
-                future = self._pending_futures.get(response.request_id)
-                if future and not future.done():
-                    if response.error is None:
-                        future.set_result(response.result)
-                    else:
-                        # Use the original RPCError from the response
-                        future.set_exception(response.error)
-                self._pending_futures.pop(response.request_id, None)
+
+                # Handle streaming responses
+                if response.is_streaming:
+                    assert response.stream_status in [
+                        'start', 'data', 'end', 'error'
+                    ], f"Invalid stream status: {response.stream_status}"
+                    queue = self._streaming_queues.get(response.request_id)
+                    if queue:
+                        await queue.put(response)
+                        # Clean up if stream ended
+                        if response.stream_status in ['end', 'error']:
+                            self._streaming_queues.pop(response.request_id,
+                                                       None)
+                else:
+                    # Handle regular responses
+                    future = self._pending_futures.get(response.request_id)
+                    if future and not future.done():
+                        if response.error is None:
+                            future.set_result(response.result)
+                        else:
+                            # Use the original RPCError from the response
+                            future.set_exception(response.error)
+                    self._pending_futures.pop(response.request_id, None)
 
             except asyncio.CancelledError:
+                # Still handle cancellation for backward compatibility
+                logger.debug("Response reader cancelled")
                 break
             except Exception as e:
                 logger.error(f"Exception in RPC response reader: {e}")
@@ -87,10 +146,12 @@ class RPCClient:
                 for future in self._pending_futures.values():
                     if not future.done():
                         future.set_exception(e)
+                # Also signal error to streaming queues
+                for queue in self._streaming_queues.values():
+                    await queue.put(RPCResponse("", None, e, False, 0, 'error'))
                 break
 
-            await asyncio.sleep(0)
-
+        logger.debug("Response reader exiting gracefully")
         self._reader_task = None
 
     def _start_response_reader_lazily(self):
@@ -168,9 +229,12 @@ class RPCClient:
 
             def run_loop():
                 asyncio.set_event_loop(self._loop)
+                self._stop_event = asyncio.Event()
                 self._loop.run_forever()
 
-            self._loop_thread = threading.Thread(target=run_loop, daemon=True)
+            self._loop_thread = threading.Thread(target=run_loop,
+                                                 daemon=True,
+                                                 name="rpc_client_loop")
             self._loop_thread.start()
 
             # Give the loop a moment to start
@@ -246,6 +310,72 @@ class RPCClient:
         """
         return self._call_sync(name, *args, **kwargs)
 
+    async def call_streaming(self, name: str, *args,
+                             **kwargs) -> AsyncIterator[Any]:
+        """
+        Call a remote async generator method and get streaming results.
+
+        Args:
+            name: Method name to call
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+
+        Yields:
+            Results from the remote async generator
+
+        Example:
+            async for result in client.call_streaming('streaming_task'):
+                print(result)
+        """
+        if self._server_stopped:
+            raise RPCCancelled("Server is shutting down, request cancelled")
+
+        self._start_response_reader_lazily()
+        timeout = kwargs.pop("__rpc_timeout", self._timeout)
+
+        request_id = uuid.uuid4().hex
+        queue = asyncio.Queue()
+        self._streaming_queues[request_id] = queue
+
+        try:
+            # Send streaming request
+            request = RPCRequest(request_id,
+                                 name,
+                                 args,
+                                 kwargs,
+                                 need_response=True,
+                                 timeout=timeout,
+                                 is_streaming=True)
+            await self._client_socket.put_async(request)
+
+            # Read streaming responses
+            while True:
+                response = await asyncio.wait_for(queue.get(),
+                                                  timeout=timeout + 1)
+
+                if response.stream_status == 'start':
+                    # Start of stream
+                    continue
+                elif response.stream_status == 'data':
+                    # Yield data
+                    yield response.result
+                elif response.stream_status == 'end':
+                    # End of stream
+                    break
+                elif response.stream_status == 'error':
+                    # Error in stream
+                    if response.error:
+                        raise response.error
+                    else:
+                        raise RPCStreamingError("Unknown streaming error")
+
+        except asyncio.TimeoutError:
+            raise RPCTimeout(
+                f"Streaming request '{name}' timed out after {timeout}s")
+        finally:
+            # Clean up
+            self._streaming_queues.pop(request_id, None)
+
     def get_server_attr(self, name: str):
         """ Get the attribute of the RPC server.
         This is mainly used for testing. """
@@ -287,6 +417,11 @@ class RPCClient:
                 """Future call - returns Future object"""
                 return self.client.call_future(self.method_name, *args,
                                                **kwargs)
+
+            def call_streaming(self, *args, **kwargs) -> AsyncIterator[Any]:
+                """Streaming call - returns async iterator"""
+                return self.client.call_streaming(self.method_name, *args,
+                                                  **kwargs)
 
         return MethodProxy(self, name)
 

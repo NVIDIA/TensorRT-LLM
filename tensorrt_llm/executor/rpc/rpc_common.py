@@ -1,4 +1,4 @@
-from typing import Any, NamedTuple, Optional
+from typing import Any, Literal, NamedTuple, Optional
 
 
 # --- Custom Exceptions ---
@@ -31,6 +31,10 @@ class RPCCancelled(RPCError):
     """
 
 
+class RPCStreamingError(RPCError):
+    """Exception for streaming-related errors."""
+
+
 class RPCRequest(NamedTuple):
     request_id: str
     method_name: str
@@ -38,9 +42,13 @@ class RPCRequest(NamedTuple):
     kwargs: dict
     need_response: bool = True
     timeout: float = 0.5
+    is_streaming: bool = False
 
 
 class RPCResponse(NamedTuple):
     request_id: str
     result: Any
     error: Optional[RPCError] = None
+    is_streaming: bool = False  # True if more responses coming
+    sequence_number: int = 0  # For ordering streaming responses
+    stream_status: Literal['start', 'data', 'end', 'error'] = 'data'
