@@ -10,9 +10,13 @@ The KV cache is a pool of blocks that can hold KV state for a fixed number of to
 
 Blocks containing KV state computed for previous requests are stored in a radix search tree as soon as they are filled. A search is performed when a new request is added, matched blocks are reused instead of calculated. Blocks that are reused can be shared among multiple requests, thus reuse saves memory as well as computations. Blocks remain reusable until they are evicted from the search tree. Eviction happens when a new (blank) block is needed. The core eviction scheme is prioritized LRU. All blocks are assigned a priority between 0 and 100 (100 being most important), all blocks of the lowest priority must be evicted before any blocks of the next priority can be evicted. If all blocks have the same priority, the least recently used block is evicted. When a block is evicted from primary memory, it's KV state is copied to a block in secondary memory. The secondary memory block remains in the search tree, hence the block remains reusable until it is evicted from secondary memory. Eviction from secondary memory happens when a new block in secondary memory is needed to offload a primary block. The eviction scheme is the same for primary and secondary blocks.
 
-### Partial Reuse
+### Retention Policy
 
-Blocks can be partially reused. For instance a block contains 64 reusable tokens but only the first 5 are a match. In this situation, KV cache manager will create a new block and copy the 5 matched tokens into it. The partially matched block remains reusable, the new block with the 5 matched tokens is assigned to the new request.
+Blocks are assigned priority in line with the [retention policy](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [token range retention config](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.KvCacheRetentionConfig) objects, each specifying the priority to assign to a specific range of tokens, i.e. "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect, priority will revert to the default after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect. 
+
+TODO: Can duration_ms be set to None to signal retention policy does not expire?
+TODO: What is default priority? 35?
+TODO: What does transfer_mode do? Is it just a vestigial appendage from the days when we were toying around with offloading to SSD?
 
 ## Limited Attention Window Size
 
@@ -28,7 +32,8 @@ Many of the features in the KV cache system are optional or have user defined pr
 
 ### Datatype
 
-Perhaps the most important property is ```dtype``` which specifics which data type is held in KV cache. The default is 'auto' which matches the datatype of the weights in the model engine.
+Perhaps the most important property is ```dtype``` which specifices which data type is held in KV cache. The default is 'auto' which matches the datatype of the weights in the model engine.
+
 TODO: Is description of 'auto' correct?
 TODO: dtype is a string, what options other than 'auto' are there?
 
@@ -49,7 +54,7 @@ When offloading is enabled, client can prevent specific blocks from being offloa
 
 ### Partial Reuse
 
-Partial reuse of a block is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False. Partial reuse happens when some but not all tokens are matched.
+Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False.
 
 The property ```copy_on_partial_reuse``` specifies whether a block should be copied or not in order to allow partial reuse. If copying is disabled, a partially matched block can only be reused if no other request is using it. If copying is enabled, partially matched blocks are not reused directly, instead a new block is created and the matched tokens are copied into the new block. This allows multiple requests to partially reuse a block.
 
