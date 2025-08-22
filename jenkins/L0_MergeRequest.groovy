@@ -937,14 +937,15 @@ def getCommonParameters()
     ]
 }
 
-def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
+def triggerJob(jobName, parameters)
 {
-    if (jenkinsUrl == "" && env.localJobCredentials) {
+    def jenkinsUrl = env.downstreamJenkinsUrl
+    def credentials = env.downstreamJobCredentials
+    if (!jenkinsUrl && credentials) {
         jenkinsUrl = env.JENKINS_URL
-        credentials = env.localJobCredentials
     }
     def status = ""
-    if (jenkinsUrl != "") {
+    if (jenkinsUrl) {
         def jobPath = trtllm_utils.resolveFullJobName(jobName).replace('/', '/job/').substring(1)
         def handle = triggerRemoteJob(
             job: "${jenkinsUrl}${jobPath}/",
@@ -1023,7 +1024,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     ]
                     launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
-                def testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def testStageName = "[Test-x86_64-Single-GPU] ${env.downstreamJobCredentials ? "Remote Run" : "Run"}"
                 def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -1080,7 +1081,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                testStageName = "[Test-x86_64-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                testStageName = "[Test-x86_64-Multi-GPU] ${env.downstreamJobCredentials ? "Remote Run" : "Run"}"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
@@ -1117,7 +1118,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def jenkinsUrl = ""
                 def credentials = ""
-                def testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def testStageName = "[Test-SBSA-Single-GPU] ${env.downstreamJobCredentials ? "Remote Run" : "Run"}"
                 def singleGpuTestFailed = false
 
                 if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
@@ -1184,7 +1185,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                testStageName = "[Test-SBSA-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                testStageName = "[Test-SBSA-Multi-GPU] ${env.downstreamJobCredentials ? "Remote Run" : "Run"}"
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
