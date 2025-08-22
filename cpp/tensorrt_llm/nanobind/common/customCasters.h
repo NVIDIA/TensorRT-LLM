@@ -285,5 +285,35 @@ struct type_caster<std::vector<std::reference_wrapper<T const>>>
         return make_caster<std::vector<T>>::from_cpp(result, policy, cleanup);
     }
 };
+
+template <>
+struct type_caster<torch::ScalarType>
+{
+    NB_TYPE_CASTER(torch::ScalarType, const_name("torch.dtype"));
+
+    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup) noexcept
+    {
+        std::string dtype_name = nb::cast<std::string>(nb::str(src));
+        if (dtype_name.substr(0, 6) == "torch.")
+        {
+            dtype_name = dtype_name.substr(6);
+        }
+
+        auto const& dtype_map = c10::getStringToDtypeMap();
+        auto it = dtype_map.find(dtype_name);
+        if (it != dtype_map.end())
+        {
+            value = it->second;
+            return true;
+        }
+
+        return false;
+    }
+
+    static handle from_cpp(torch::ScalarType src, rv_policy policy, cleanup_list* cleanup)
+    {
+        throw std::runtime_error("from_cpp for torch::ScalarType is not implemented");
+    }
+};
 } // namespace detail
 } // namespace NB_NAMESPACE
