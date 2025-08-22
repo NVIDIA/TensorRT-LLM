@@ -174,9 +174,8 @@ FROM wheel AS tritonbuild
 WORKDIR /src/tensorrt_llm
 RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
 COPY ./triton_backend/ ./triton_backend/
-COPY ./jenkins/scripts/get_triton_tag.sh ./jenkins/scripts/get_triton_tag.sh
-COPY ./docker/Dockerfile.multi ./docker/Dockerfile.multi
-RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh
+ARG TRITON_BASE_TAG
+RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh -s "r${TRITON_BASE_TAG%-py3}"
 
 
 FROM release AS tritonrelease
