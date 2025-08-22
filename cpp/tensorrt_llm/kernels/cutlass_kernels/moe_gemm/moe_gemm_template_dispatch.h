@@ -567,6 +567,17 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
                 return config;
             });
     }
+    if (!use_w4_groupwise)
+    {
+        auto swap_ab_configs = tma_ws_configs;
+        std::transform(swap_ab_configs.begin(), swap_ab_configs.end(), std::back_inserter(tma_ws_configs),
+            [](auto& config)
+            {
+                config.swap_ab = true;
+                return config;
+            });
+    }
+
     return tma_ws_configs;
 }
 
