@@ -3,6 +3,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.logger import logger
+from tensorrt_llm.profiler import device_memory_info
+
 from ..attention_backend.interface import AttentionMetadata
 from ..speculative.interface import SpecMetadata
 from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
@@ -80,6 +83,31 @@ class DecodingCUDAGraphRunner:
         forward_fn: Callable[[Dict[str, Any]], torch.Tensor],
         pool: Optional[Tuple[int, int]] = None,
     ) -> Tuple[int, int]:
+        # Memory statistics at capture start
+        mem_used_start, mem_free_start, mem_total = device_memory_info()
+        mem_used_inside_torch_start = torch.cuda.memory_stats(
+        )["allocated_bytes.all.current"]
+
+        # Method 1: device_memory_info
+        mem_used_outside_torch_method1_start = (
+            mem_used_start - mem_used_inside_torch_start
+        ) if mem_used_start > mem_used_inside_torch_start else 0
+
+        # Method 2: torch.cuda.mem_get_info
+        mem_free_cuda_start, total_gpu_memory_start = torch.cuda.mem_get_info()
+        total_used_bytes_start = total_gpu_memory_start - mem_free_cuda_start
+        mem_used_outside_torch_method2_start = (
+            total_used_bytes_start - mem_used_inside_torch_start
+        ) if total_used_bytes_start > mem_used_inside_torch_start else 0
+
+        logger.info(
+            f"CUDA graph capture START (batch_size={self.batch_size}): "
+            f"inside torch: {mem_used_inside_torch_start / 1024**3:.2f} GB, "
+            f"outside torch (method1): {mem_used_outside_torch_method1_start / 1024**3:.2f} GB, "
+            f"outside torch (method2): {mem_used_outside_torch_method2_start / 1024**3:.2f} GB, "
+            f"total: {mem_used_start / 1024**3:.2f} GB, free: {mem_free_start / 1024**3:.2f} GB"
+        )
+
         self._graph = torch.cuda.CUDAGraph()
         inputs = {
             "attn_metadata": self.attn_metadata,
@@ -90,6 +118,11 @@ class DecodingCUDAGraphRunner:
             "mrope_position_deltas": self.mrope_position_deltas,
         }
 
+        # Memory statistics before warmup
+        mem_used_before_warmup, _, _ = device_memory_info()
+        mem_used_inside_torch_before_warmup = torch.cuda.memory_stats(
+        )["allocated_bytes.all.current"]
+
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
@@ -98,12 +131,114 @@ class DecodingCUDAGraphRunner:
         set_piecewise_cuda_graph_flag(False)
         for _ in range(2):
             forward_fn(inputs)
+
+        # Memory statistics after warmup
+        mem_used_after_warmup, mem_free_after_warmup, _ = device_memory_info()
+        mem_used_inside_torch_after_warmup = torch.cuda.memory_stats(
+        )["allocated_bytes.all.current"]
+
+        # Method 1: device_memory_info
+        mem_used_outside_torch_method1_after_warmup = (
+            mem_used_after_warmup - mem_used_inside_torch_after_warmup
+        ) if mem_used_after_warmup > mem_used_inside_torch_after_warmup else 0
+
+        # Method 2: torch.cuda.mem_get_info
+        mem_free_cuda_after_warmup, total_gpu_memory_after_warmup = torch.cuda.mem_get_info(
+        )
+        total_used_bytes_after_warmup = total_gpu_memory_after_warmup - mem_free_cuda_after_warmup
+        mem_used_outside_torch_method2_after_warmup = (
+            total_used_bytes_after_warmup - mem_used_inside_torch_after_warmup
+        ) if total_used_bytes_after_warmup > mem_used_inside_torch_after_warmup else 0
+
+        warmup_mem_change = mem_used_after_warmup - mem_used_before_warmup
+        warmup_inside_torch_change = mem_used_inside_torch_after_warmup - mem_used_inside_torch_before_warmup
+
+        logger.info(
+            f"CUDA graph warmup completed: "
+            f"CURRENT - inside torch: {mem_used_inside_torch_after_warmup / 1024**3:.2f} GB, "
+            f"outside torch (method1): {mem_used_outside_torch_method1_after_warmup / 1024**3:.2f} GB, "
+            f"outside torch (method2): {mem_used_outside_torch_method2_after_warmup / 1024**3:.2f} GB, "
+            f"total: {mem_used_after_warmup / 1024**3:.2f} GB, free: {mem_free_after_warmup / 1024**3:.2f} GB | "
+            f"CHANGES - total: {warmup_mem_change / 1024**3:.2f} GB, "
+            f"inside torch: {warmup_inside_torch_change / 1024**3:.2f} GB")
+
+        # Memory statistics before graph capture
+        mem_used_before_capture, _, _ = device_memory_info()
+        mem_used_inside_torch_before_capture = torch.cuda.memory_stats(
+        )["allocated_bytes.all.current"]
+
         with torch.cuda.graph(self._graph, pool=pool):
             output = forward_fn(inputs)
+
+        # Memory statistics after graph capture
+        mem_used_after_capture, mem_free_after_capture, _ = device_memory_info()
+        mem_used_inside_torch_after_capture = torch.cuda.memory_stats(
+        )["allocated_bytes.all.current"]
+
+        # Method 1: device_memory_info
+        mem_used_outside_torch_method1_after_capture = (
+            mem_used_after_capture - mem_used_inside_torch_after_capture
+        ) if mem_used_after_capture > mem_used_inside_torch_after_capture else 0
+
+        # Method 2: torch.cuda.mem_get_info
+        mem_free_cuda_after_capture, total_gpu_memory_after_capture = torch.cuda.mem_get_info(
+        )
+        total_used_bytes_after_capture = total_gpu_memory_after_capture - mem_free_cuda_after_capture
+        mem_used_outside_torch_method2_after_capture = (
+            total_used_bytes_after_capture - mem_used_inside_torch_after_capture
+        ) if total_used_bytes_after_capture > mem_used_inside_torch_after_capture else 0
+
+        capture_mem_change = mem_used_after_capture - mem_used_before_capture
+        capture_inside_torch_change = mem_used_inside_torch_after_capture - mem_used_inside_torch_before_capture
+
+        logger.info(
+            f"CUDA graph capture completed: "
+            f"CURRENT - inside torch: {mem_used_inside_torch_after_capture / 1024**3:.2f} GB, "
+            f"outside torch (method1): {mem_used_outside_torch_method1_after_capture / 1024**3:.2f} GB, "
+            f"outside torch (method2): {mem_used_outside_torch_method2_after_capture / 1024**3:.2f} GB, "
+            f"total: {mem_used_after_capture / 1024**3:.2f} GB, free: {mem_free_after_capture / 1024**3:.2f} GB | "
+            f"CHANGES - total: {capture_mem_change / 1024**3:.2f} GB, "
+            f"inside torch: {capture_inside_torch_change / 1024**3:.2f} GB")
+
         set_graph_capturing(False)
         set_piecewise_cuda_graph_flag(True)
         # Mark weak ref here. The output tensor should be freed properly.
         self._output = make_weak_ref(output)
+
+        # Memory statistics at capture end
+        mem_used_end, mem_free_end, mem_total = device_memory_info()
+        mem_used_inside_torch_end = torch.cuda.memory_stats(
+        )["allocated_bytes.all.current"]
+
+        # Method 1: device_memory_info
+        mem_used_outside_torch_method1_end = (
+            mem_used_end - mem_used_inside_torch_end
+        ) if mem_used_end > mem_used_inside_torch_end else 0
+
+        # Method 2: torch.cuda.mem_get_info
+        mem_free_cuda_end, total_gpu_memory_end = torch.cuda.mem_get_info()
+        total_used_bytes_end = total_gpu_memory_end - mem_free_cuda_end
+        mem_used_outside_torch_method2_end = (
+            total_used_bytes_end - mem_used_inside_torch_end
+        ) if total_used_bytes_end > mem_used_inside_torch_end else 0
+
+        # Calculate total changes
+        total_mem_change = mem_used_end - mem_used_start
+        total_inside_torch_change = mem_used_inside_torch_end - mem_used_inside_torch_start
+        total_outside_torch_change_method1 = mem_used_outside_torch_method1_end - mem_used_outside_torch_method1_start
+        total_outside_torch_change_method2 = mem_used_outside_torch_method2_end - mem_used_outside_torch_method2_start
+
+        logger.info(
+            f"CUDA graph capture COMPLETE (batch_size={self.batch_size}): "
+            f"FINAL CURRENT - inside torch: {mem_used_inside_torch_end / 1024**3:.2f} GB, "
+            f"outside torch (method1): {mem_used_outside_torch_method1_end / 1024**3:.2f} GB, "
+            f"outside torch (method2): {mem_used_outside_torch_method2_end / 1024**3:.2f} GB, "
+            f"total: {mem_used_end / 1024**3:.2f} GB, free: {mem_free_end / 1024**3:.2f} GB | "
+            f"TOTAL CHANGES - inside torch: {total_inside_torch_change / 1024**3:.2f} GB, "
+            f"outside torch (method1): {total_outside_torch_change_method1 / 1024**3:.2f} GB, "
+            f"outside torch (method2): {total_outside_torch_change_method2 / 1024**3:.2f} GB, "
+            f"total memory: {total_mem_change / 1024**3:.2f} GB")
+
         return self._graph.pool()
 
     def needs_capture(self) -> bool:
