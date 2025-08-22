@@ -52,29 +52,30 @@ public:
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2)
         : mModelConfig(std::move(modelConfig))
         , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism(),
-              worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(), worldConfig.getTensorParallelism()}
+              worldConfig.getContextParallelism(), worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(),
+              worldConfig.getTensorParallelism()}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
     }
 
     CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType,
-        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
-        int DPrank = 0, int DPsize = 0)
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
+        nvinfer1::DataType dataType, AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2,
+        bool enableAttentionDP = false, int DPrank = 0, int DPsize = 0)
         : mModelConfig{std::move(nbKvHeadPerLayer), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
     }
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType,
-        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
-        int DPrank = 0, int DPsize = 0)
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
+        nvinfer1::DataType dataType, AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2,
+        bool enableAttentionDP = false, int DPrank = 0, int DPsize = 0)
         : mModelConfig{std::vector(nbAttentionLayers, nbKvHeads), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
@@ -83,7 +84,7 @@ public:
     [[nodiscard]] bool operator==(kv_cache::CacheState const& other) const noexcept
     {
         return mModelConfig == other.mModelConfig && mParallelConfig == other.mParallelConfig
-            && mDataType == other.mDataType;
+            && mAttentionConfig == other.mAttentionConfig && mDataType == other.mDataType;
     }
 
     struct ModelConfig
@@ -103,6 +104,7 @@ public:
     {
         SizeType32 mTensorParallelism;
         SizeType32 mPipelineParallelism;
+        SizeType32 mContextParallelism;
         bool mEnableAttentionDP;
         SizeType32 mDPrank;
         SizeType32 mDPsize;
@@ -110,8 +112,8 @@ public:
         [[nodiscard]] bool operator==(ParallelConfig const& other) const noexcept
         {
             return mTensorParallelism == other.mTensorParallelism && mPipelineParallelism == other.mPipelineParallelism
-                && mEnableAttentionDP == other.mEnableAttentionDP && mDPrank == other.mDPrank
-                && mDPsize == other.mDPsize;
+                && mContextParallelism == other.mContextParallelism && mEnableAttentionDP == other.mEnableAttentionDP
+                && mDPrank == other.mDPrank && mDPsize == other.mDPsize;
         }
     };
 
@@ -123,6 +125,11 @@ public:
             , mKvFactor(kvFactor)
 
         {
+        }
+
+        [[nodiscard]] bool operator==(AttentionConfig const& other) const noexcept
+        {
+            return mAttentionType == other.mAttentionType && mKvFactor == other.mKvFactor;
         }
 
         // attentionType ;
@@ -162,6 +169,7 @@ public:
         sstring << "mTokensPerBlock:" << mModelConfig.mTokensPerBlock << "\n";
         sstring << "tp:" << mParallelConfig.mTensorParallelism << "\n";
         sstring << "pp:" << mParallelConfig.mPipelineParallelism << "\n";
+        sstring << "cp:" << mParallelConfig.mContextParallelism << "\n";
         sstring << "enableAttentionDP:" << mParallelConfig.mEnableAttentionDP << "\n";
         sstring << "datatype:" << static_cast<int32_t>(mDataType) << "\n";
         sstring << "attentionType:" << static_cast<int32_t>(mAttentionConfig.mAttentionType) << "\n";
