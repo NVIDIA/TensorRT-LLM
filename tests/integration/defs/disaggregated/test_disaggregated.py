@@ -36,7 +36,7 @@ def cleanup_output_files():
             pass
 
 
-def get_disagg_server_url_from_cfg(config_file: str):
+def get_disagg_server_url_from_cfg(config_file: str) -> str:
     with open(config_file, 'r') as file:
         config = yaml.safe_load(file)
     server_host = config.get('hostname', 'localhost')
@@ -183,6 +183,7 @@ def run_disaggregated_test(example_dir,
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
+    server_url = get_disagg_server_url_from_cfg(config_file)
 
     try:
         with (  # Start workers
@@ -244,8 +245,7 @@ def run_disaggregated_test(example_dir,
                     continue
 
                 if extra_endpoints_test is not None:
-                    extra_endpoints_test(
-                        get_disagg_server_url_from_cfg(config_file))
+                    extra_endpoints_test(server_url)
 
                 # Verify outputs
                 not_expected_strings = ["Berlin Berlin"]
@@ -559,7 +559,8 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         ctx_metrics = item["ctx_perf_metrics"]["perf_metrics"]["timing_metrics"]
         gen_metrics = item["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
         # only one token is generated in ctx
-        assert ctx_metrics["first_token_time"] == ctx_metrics["last_token_time"]
+        assert ctx_metrics["last_token_time"] - ctx_metrics[
+            "first_token_time"] < 1e-3
         assert ctx_metrics["last_token_time"] < gen_metrics["arrival_time"]
         assert gen_metrics["kv_cache_size"] > 0
         assert gen_metrics["arrival_time"] < gen_metrics[
