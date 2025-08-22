@@ -4,11 +4,15 @@ The KV cache stores previously computed key-value pairs for reuse during generat
 
 ## The Basics
 
-The KV cache is a pool of blocks that can hold KV state for a fixed number of tokens. Multiple layers are packed within a single block, which requires all the layers to have the same number of heads and the same attention window size. A separate pool is created for each combination of attention window size and number of heads in order to support variable attention window size and optimization techniques like GQA. Number of tokens that can be stored in a single block must be a power of two greater than 1. Blocks are assigned to requests as needed.
+The KV cache is a pool of blocks that can hold KV state for a fixed number of tokens. Multiple layers are packed within a single block, which requires all the layers to have the same number of heads and the same attention window size. A separate pool is created for each combination of attention window size and number of heads in order to support variable attention window size and optimization techniques like GQA. Number of tokens that can be stored in a single block can be set by user when the model engine is created. It must be a power of two greater than 1. Blocks are assigned to requests as needed.
 
 ## Reuse Across Requests
 
 Blocks containing KV state computed for previous requests are stored in a radix search tree as soon as they are filled. A search is performed when a new request is added, matched blocks are reused instead of calculated. Blocks that are reused can be shared among multiple requests, thus reuse saves memory as well as computations. Blocks remain reusable until they are evicted from the search tree. Eviction happens when a new (blank) block is needed. The core eviction scheme is prioritized LRU. All blocks are assigned a priority between 0 and 100 (100 being most important), all blocks of the lowest priority must be evicted before any blocks of the next priority can be evicted. If all blocks have the same priority, the least recently used block is evicted. When a block is evicted from primary memory, it's KV state is copied to a block in secondary memory. The secondary memory block remains in the search tree, hence the block remains reusable until it is evicted from secondary memory. Eviction from secondary memory happens when a new block in secondary memory is needed to offload a primary block. The eviction scheme is the same for primary and secondary blocks.
+
+### Partial Reuse
+
+Blocks can be partially reused. For instance a block contains 64 reusable tokens but only the first 5 are a match. In this situation, KV cache manager will create a new block and copy the 5 matched tokens into it. The partially matched block remains reusable, the new block with the 5 matched tokens is assigned to the new request.
 
 ## Limited Attention Window Size
 
@@ -17,4 +21,44 @@ TensorRT-LLM takes advantage of layers with limited attention window size in ord
 ## MQA / GQA
 
 TensorRT-LLM takes advantage of grouped query attention in order to save memory. KV cache will create blocks with only enough space to store state for the discrete query head groups. For MHA, there is one group per head, for MQA there is a single group for all the heads. GQA strikes a balance between these two.
+
+## Controling KV Cache Behavior
+
+Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of KV cache system.
+
+### Datatype
+
+Perhaps the most important property is ```dtype``` which specifics which data type is held in KV cache. The default is 'auto' which matches the datatype of the weights in the model engine.
+TODO: Is description of 'auto' correct?
+TODO: dtype is a string, what options other than 'auto' are there?
+
+### How Much Memory is Allocated to KV Cache
+
+Property ```free_gpu_memory_fraction``` is a ratio > 0 and < 1 that specifies how much of free GPU memory should be allocated to KV cache. The default is 90% (ratio of 0.9). If ```max_tokens``` is also set, KV cache will determine how much memory is needed to hold ```max_tokens``` and will allocate the lesser of ```max_tokens``` and ```free_gpu_memory_fraction```.
+TODO: Why is GPU memory and host specified in two very different ways?
+
+### Enable/Disable Cross Request Reuse
+
+Block reuse across requests is enabled by default, but can be disabled by setting ```enable_block_reuse``` to False. Note that block reuse requires the model engine to support paged context attention, which is enabled by default, but can be enabled or disabled explicitly when the model engine is built: ```trtllm-build --use_paded_context_fmha enable```.
+
+### Enable Offloading to Host Memory
+
+Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.
+
+When offloading is enabled, client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded, they are evicted directly from GPU memory in order to reduced traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
+
+### Partial Reuse
+
+Partial reuse of a block is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False. Partial reuse happens when some but not all tokens are matched.
+
+The property ```copy_on_partial_reuse``` specifies whether a block should be copied or not in order to allow partial reuse. If copying is disabled, a partially matched block can only be reused if no other request is using it. If copying is enabled, partially matched blocks are not reused directly, instead a new block is created and the matched tokens are copied into the new block. This allows multiple requests to partially reuse a block.
+
+### Attention Window Size
+
+Property ```max_attention_window``` specifies the maximum attention window size for each layer in the model as a list of integer values. If the length of this list is less than number of layers, the list is repeated as many times as necessary. For instance, if the model has only full attention layers and maximum sequence length is 4096, you can specify this as ```max_attention_window = [4096]```. If every odd layer is a sliding window layer with attention size 256, you specify this as ```max_attention_window = [4096,256]```.
+
+### Deprecated Properties
+
+Property ```use_uvm``` has been deprecated and will be removed in a future release. Changing this does nothing.
+Property ```sink_token_length``` has been deprecated and will be removed in a future release. Changing this does nothing.
 
