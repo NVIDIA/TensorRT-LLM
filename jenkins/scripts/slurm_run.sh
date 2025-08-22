@@ -47,9 +47,6 @@ fi
 
 export UCX_TLS=^gdr_copy
 cd $llmSrcNode/tests/integration/defs
-if [ $nodeCount -gt 1 ]; then
-    pytestCommand=$(set_value_in_command "pytest" "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch" "$pytestCommand")
-fi
 
 # get trtllm wheel path and add to pytest command
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
