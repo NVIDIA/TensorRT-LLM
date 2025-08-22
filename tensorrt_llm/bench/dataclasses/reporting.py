@@ -286,7 +286,7 @@ class ReportUtility:
             raise ValueError(
                 f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
 
-        kv_cache_mem_percent = (kv_cache_mem_percent * 100.0) \
+        kv_cache_mem_percent = f"{kv_cache_mem_percent * 100.0:.2f}%" \
              if kv_cache_mem_percent is not None else "None"
 
         # Engine/Backend details
@@ -532,7 +532,7 @@ class ReportUtility:
             f"Max Runtime Batch Size: {world_info['max_batch_size']}\n"
             f"Max Runtime Tokens:     {world_info['max_num_tokens']}\n"
             f"Scheduling Policy:      {world_info['scheduling_policy']}\n"
-            f"KV Memory Percentage:   {world_info['kv_cache_percentage']:.2f}%\n"
+            f"KV Memory Percentage:   {world_info['kv_cache_percentage']}\n"
             f"Issue Rate (req/sec):   {world_info['issue_rate']:.4E}\n"
             f"\n")
 
