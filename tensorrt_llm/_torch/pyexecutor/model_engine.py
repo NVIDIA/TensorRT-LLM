@@ -9,7 +9,7 @@ import traceback
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import torch
 import torch._dynamo.config
@@ -63,6 +63,74 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
 from .scheduler import ScheduledRequests
 
 MAX_UINT64 = (1 << 64) - 1
+
+
+class MemoryStats(NamedTuple):
+    """Memory usage statistics"""
+    inside_torch: int
+    outside_torch_method1: int
+    outside_torch_method2: int
+    total_used: int
+    total_free: int
+
+
+def get_memory_stats() -> MemoryStats:
+    """Get current GPU memory usage statistics"""
+    # Get memory info from device_memory_info
+    mem_used, mem_free, mem_total = device_memory_info()
+
+    # Get PyTorch allocated memory
+    mem_inside_torch = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+    # Method 1: using device_memory_info
+    mem_outside_torch_method1 = (
+        mem_used - mem_inside_torch) if mem_used > mem_inside_torch else 0
+
+    # Method 2: using torch.cuda.mem_get_info
+    mem_free_cuda, total_gpu_memory = torch.cuda.mem_get_info()
+    total_used_bytes = total_gpu_memory - mem_free_cuda
+    mem_outside_torch_method2 = (
+        total_used_bytes -
+        mem_inside_torch) if total_used_bytes > mem_inside_torch else 0
+
+    return MemoryStats(inside_torch=mem_inside_torch,
+                       outside_torch_method1=mem_outside_torch_method1,
+                       outside_torch_method2=mem_outside_torch_method2,
+                       total_used=mem_used,
+                       total_free=mem_free)
+
+
+def log_memory_stats(description: str, stats: MemoryStats):
+    """Log memory statistics with a description"""
+    logger.info(
+        f"{description}: "
+        f"inside torch: {stats.inside_torch / 1024**3:.2f} GB, "
+        f"outside torch (method1): {stats.outside_torch_method1 / 1024**3:.2f} GB, "
+        f"outside torch (method2): {stats.outside_torch_method2 / 1024**3:.2f} GB, "
+        f"total: {stats.total_used / 1024**3:.2f} GB, "
+        f"free: {stats.total_free / 1024**3:.2f} GB")
+
+
+def log_memory_comparison(description: str, before: MemoryStats,
+                          after: MemoryStats):
+    """Log memory statistics comparison with current values and changes"""
+    # Calculate changes
+    inside_torch_change = after.inside_torch - before.inside_torch
+    outside_torch_change_method1 = after.outside_torch_method1 - before.outside_torch_method1
+    outside_torch_change_method2 = after.outside_torch_method2 - before.outside_torch_method2
+    total_change = after.total_used - before.total_used
+
+    logger.info(
+        f"{description}: "
+        f"CURRENT - inside torch: {after.inside_torch / 1024**3:.2f} GB, "
+        f"outside torch (method1): {after.outside_torch_method1 / 1024**3:.2f} GB, "
+        f"outside torch (method2): {after.outside_torch_method2 / 1024**3:.2f} GB, "
+        f"total: {after.total_used / 1024**3:.2f} GB, "
+        f"free: {after.total_free / 1024**3:.2f} GB | "
+        f"CHANGES - inside torch: {inside_torch_change / 1024**3:.2f} GB, "
+        f"outside torch (method1): {outside_torch_change_method1 / 1024**3:.2f} GB, "
+        f"outside torch (method2): {outside_torch_change_method2 / 1024**3:.2f} GB, "
+        f"total: {total_change / 1024**3:.2f} GB")
 
 
 class ModelEngine(ABC):
@@ -324,6 +392,11 @@ class PyTorchModelEngine(ModelEngine):
 
         try:
             if pytorch_backend_config.torch_compile_enabled:
+                # Memory statistics before torch compile
+                stats_before_compile = get_memory_stats()
+                log_memory_stats("Memory stats BEFORE torch compile",
+                                 stats_before_compile)
+
                 set_torch_compiling(True)
                 use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
                     self.model.config.hidden_size)
@@ -336,6 +409,7 @@ class PyTorchModelEngine(ModelEngine):
                     cuda_graph_batch_sizes,
                     max_num_streams=pytorch_backend_config.
                     torch_compile_max_num_streams)
+
                 if isinstance(self.model, DecoderModelForCausalLM):
                     self.model.model = torch.compile(
                         self.model.model,
@@ -349,6 +423,11 @@ class PyTorchModelEngine(ModelEngine):
                         fullgraph=pytorch_backend_config.torch_compile_fullgraph
                     )
                 torch._dynamo.config.cache_size_limit = 16
+
+                # Memory statistics after torch compile
+                stats_after_compile = get_memory_stats()
+                log_memory_comparison("Memory stats AFTER torch compile",
+                                      stats_before_compile, stats_after_compile)
             else:
                 set_torch_compiling(False)
         except Exception as e:
@@ -672,6 +751,11 @@ class PyTorchModelEngine(ModelEngine):
 
                 # Disable cuda graph capture here so that we can properly capture it later
                 with self.no_cuda_graph():
+                    # Memory statistics before torch compile warmup
+                    stats_before_warmup = get_memory_stats()
+                    log_memory_stats("Memory stats BEFORE torch compile warmup",
+                                     stats_before_warmup)
+
                     available_tokens = kv_cache_manager.get_num_available_tokens(
                         self.max_draft_len)
                     warmup_batch_size = [1, self.batch_size // 2]
@@ -697,7 +781,18 @@ class PyTorchModelEngine(ModelEngine):
                                              resource_manager=resource_manager)
                                 torch.cuda.synchronize()
 
+                    # Memory statistics after torch compile warmup
+                    stats_after_warmup = get_memory_stats()
+                    log_memory_comparison(
+                        "Memory stats AFTER torch compile warmup",
+                        stats_before_warmup, stats_after_warmup)
+
             if self.pytorch_backend_config.enable_autotuner:
+                # Memory statistics before autotuner
+                stats_before_autotuner = get_memory_stats()
+                log_memory_stats("Memory stats BEFORE autotuner",
+                                 stats_before_autotuner)
+
                 with self.no_cuda_graph(), autotune():
                     result = get_autotune_warmup_request()
                     with release_batch(result) as batch:
@@ -715,6 +810,12 @@ class PyTorchModelEngine(ModelEngine):
                     )
 
                 AutoTuner.get().print_profiling_cache()
+
+                # Memory statistics after autotuner
+                stats_after_autotuner = get_memory_stats()
+                log_memory_comparison("Memory stats AFTER autotuner",
+                                      stats_before_autotuner,
+                                      stats_after_autotuner)
 
             if not (self._run_cuda_graphs
                     or self._torch_compile_piecewise_cuda_graph):
@@ -752,32 +853,10 @@ class PyTorchModelEngine(ModelEngine):
                         )
 
                         # Memory statistics before CUDA graph capture
-                        mem_used_before, mem_free_before, mem_total = device_memory_info(
-                        )
-                        mem_used_inside_torch_before = torch.cuda.memory_stats(
-                        )["allocated_bytes.all.current"]
-
-                        # Method 1: device_memory_info
-                        mem_used_outside_torch_method1_before = (
-                            mem_used_before - mem_used_inside_torch_before
-                        ) if mem_used_before > mem_used_inside_torch_before else 0
-
-                        # Method 2: torch.cuda.mem_get_info
-                        mem_free_cuda_before, total_gpu_memory_before = torch.cuda.mem_get_info(
-                        )
-                        total_used_bytes_before = total_gpu_memory_before - mem_free_cuda_before
-                        mem_used_outside_torch_method2_before = (
-                            total_used_bytes_before -
-                            mem_used_inside_torch_before
-                        ) if total_used_bytes_before > mem_used_inside_torch_before else 0
-
-                        logger.info(
-                            f"Memory stats BEFORE graph capture forward (batch_size={bs}, draft_len={draft_len}): "
-                            f"memory used inside torch: {mem_used_inside_torch_before / 1024**3:.2f} GB, "
-                            f"memory used outside torch (method1 - device_memory_info): {mem_used_outside_torch_method1_before / 1024**3:.2f} GB, "
-                            f"memory used outside torch (method2 - mem_get_info): {mem_used_outside_torch_method2_before / 1024**3:.2f} GB, "
-                            f"total memory used: {mem_used_before / 1024**3:.2f} GB, "
-                            f"free memory: {mem_free_before / 1024**3:.2f} GB")
+                        stats_before_graph_capture = get_memory_stats()
+                        log_memory_stats(
+                            f"Memory stats BEFORE graph capture forward (batch_size={bs}, draft_len={draft_len})",
+                            stats_before_graph_capture)
 
                         self.enable_spec_decode = draft_len > 0 or self.is_draft_model
                         self.forward(batch,
@@ -786,46 +865,19 @@ class PyTorchModelEngine(ModelEngine):
                         torch.cuda.synchronize()
 
                         # Memory statistics after CUDA graph capture
-                        mem_used_after, mem_free_after, mem_total = device_memory_info(
-                        )
-                        mem_used_inside_torch_after = torch.cuda.memory_stats(
-                        )["allocated_bytes.all.current"]
-
-                        # Method 1: device_memory_info
-                        mem_used_outside_torch_method1_after = (
-                            mem_used_after - mem_used_inside_torch_after
-                        ) if mem_used_after > mem_used_inside_torch_after else 0
-
-                        # Method 2: torch.cuda.mem_get_info
-                        mem_free_cuda_after, total_gpu_memory_after = torch.cuda.mem_get_info(
-                        )
-                        total_used_bytes_after = total_gpu_memory_after - mem_free_cuda_after
-                        mem_used_outside_torch_method2_after = (
-                            total_used_bytes_after - mem_used_inside_torch_after
-                        ) if total_used_bytes_after > mem_used_inside_torch_after else 0
-
-                        mem_change = mem_used_after - mem_used_before
-                        inside_torch_change = mem_used_inside_torch_after - mem_used_inside_torch_before
-                        outside_torch_change_method1 = mem_used_outside_torch_method1_after - mem_used_outside_torch_method1_before
-                        outside_torch_change_method2 = mem_used_outside_torch_method2_after - mem_used_outside_torch_method2_before
-
-                        logger.info(
-                            f"Memory stats AFTER graph capture forward (batch_size={bs}, draft_len={draft_len}): "
-                            f"memory used inside torch: {mem_used_inside_torch_after / 1024**3:.2f} GB, "
-                            f"memory used outside torch (method1 - device_memory_info): {mem_used_outside_torch_method1_after / 1024**3:.2f} GB, "
-                            f"memory used outside torch (method2 - mem_get_info): {mem_used_outside_torch_method2_after / 1024**3:.2f} GB, "
-                            f"total memory used: {mem_used_after / 1024**3:.2f} GB, "
-                            f"free memory: {mem_free_after / 1024**3:.2f} GB")
-
-                        logger.info(
-                            f"Memory CHANGES during forward (batch_size={bs}, draft_len={draft_len}): "
-                            f"inside torch change: {inside_torch_change / 1024**3:.2f} GB, "
-                            f"outside torch change (method1): {outside_torch_change_method1 / 1024**3:.2f} GB, "
-                            f"outside torch change (method2): {outside_torch_change_method2 / 1024**3:.2f} GB, "
-                            f"total memory change: {mem_change / 1024**3:.2f} GB"
-                        )
+                        stats_after_graph_capture = get_memory_stats()
+                        log_memory_comparison(
+                            f"Memory stats AFTER graph capture forward (batch_size={bs}, draft_len={draft_len})",
+                            stats_before_graph_capture,
+                            stats_after_graph_capture)
 
             if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
+                # Memory statistics before piecewise CUDA graph warmup
+                stats_before_piecewise = get_memory_stats()
+                log_memory_stats(
+                    "Memory stats BEFORE piecewise CUDA graph warmup",
+                    stats_before_piecewise)
+
                 for seq_lens in cuda_graph_batch_sizes:
                     set_enable_piecewise_cuda_graph_capture_flag(True)
                     with self.no_cuda_graph():
@@ -847,6 +899,12 @@ class PyTorchModelEngine(ModelEngine):
                             gc.collect()
                             torch.cuda.empty_cache()
                     set_enable_piecewise_cuda_graph_capture_flag(False)
+
+                # Memory statistics after piecewise CUDA graph warmup
+                stats_after_piecewise = get_memory_stats()
+                log_memory_comparison(
+                    "Memory stats AFTER piecewise CUDA graph warmup",
+                    stats_before_piecewise, stats_after_piecewise)
 
         # Set the value back to the original value
         self.enable_spec_decode = self.is_spec_decode
@@ -1163,6 +1221,10 @@ class PyTorchModelEngine(ModelEngine):
                 logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
+
+            # Memory statistics after model loading
+            log_memory_stats("Model loading completed - Memory usage",
+                             get_memory_stats())
         return model
 
     def _call_load_weights(self, load_method, weights, weight_mapper):
@@ -2175,22 +2237,7 @@ class PyTorchModelEngine(ModelEngine):
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         # Memory statistics before forward
-        mem_used_before, mem_free_before, mem_total = device_memory_info()
-        mem_used_inside_torch_before = torch.cuda.memory_stats(
-        )["allocated_bytes.all.current"]
-
-        # Method 1: device_memory_info
-        mem_used_outside_torch_method1_before = (
-            mem_used_before - mem_used_inside_torch_before
-        ) if mem_used_before > mem_used_inside_torch_before else 0
-
-        # Method 2: torch.cuda.mem_get_info
-        mem_free_cuda_before, total_gpu_memory_before = torch.cuda.mem_get_info(
-        )
-        total_used_bytes_before = total_gpu_memory_before - mem_free_cuda_before
-        mem_used_outside_torch_method2_before = (
-            total_used_bytes_before - mem_used_inside_torch_before
-        ) if total_used_bytes_before > mem_used_inside_torch_before else 0
+        stats_before_forward = get_memory_stats()
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -2230,42 +2277,11 @@ class PyTorchModelEngine(ModelEngine):
                                              gather_context_logits)
 
             # Memory statistics after forward (no cache path)
-            mem_used_after, mem_free_after, mem_total = device_memory_info()
-            mem_used_inside_torch_after = torch.cuda.memory_stats(
-            )["allocated_bytes.all.current"]
-
-            # Method 1: device_memory_info
-            mem_used_outside_torch_method1_after = (
-                mem_used_after - mem_used_inside_torch_after
-            ) if mem_used_after > mem_used_inside_torch_after else 0
-
-            # Method 2: torch.cuda.mem_get_info
-            mem_free_cuda_after, total_gpu_memory_after = torch.cuda.mem_get_info(
-            )
-            total_used_bytes_after = total_gpu_memory_after - mem_free_cuda_after
-            mem_used_outside_torch_method2_after = (
-                total_used_bytes_after - mem_used_inside_torch_after
-            ) if total_used_bytes_after > mem_used_inside_torch_after else 0
-
-            # Calculate memory changes
-            mem_change = mem_used_after - mem_used_before
-            inside_torch_change = mem_used_inside_torch_after - mem_used_inside_torch_before
-            outside_torch_change_method1 = mem_used_outside_torch_method1_after - mem_used_outside_torch_method1_before
-            outside_torch_change_method2 = mem_used_outside_torch_method2_after - mem_used_outside_torch_method2_before
-
+            stats_after_forward = get_memory_stats()
             batch_size = len(scheduled_requests.all_requests())
-
-            logger.info(
-                f"Forward memory stats [no_cache] (batch_size={batch_size}): "
-                f"CURRENT - inside torch: {mem_used_inside_torch_after / 1024**3:.2f} GB, "
-                f"outside torch (method1): {mem_used_outside_torch_method1_after / 1024**3:.2f} GB, "
-                f"outside torch (method2): {mem_used_outside_torch_method2_after / 1024**3:.2f} GB, "
-                f"total: {mem_used_after / 1024**3:.2f} GB, "
-                f"free: {mem_free_after / 1024**3:.2f} GB | "
-                f"CHANGES - inside torch: {inside_torch_change / 1024**3:.2f} GB, "
-                f"outside torch (method1): {outside_torch_change_method1 / 1024**3:.2f} GB, "
-                f"outside torch (method2): {outside_torch_change_method2 / 1024**3:.2f} GB, "
-                f"total: {mem_change / 1024**3:.2f} GB")
+            log_memory_comparison(
+                f"Forward memory stats [no_cache] (batch_size={batch_size})",
+                stats_before_forward, stats_after_forward)
 
             return outputs
         with self._maybe_pad_batch(scheduled_requests, kv_cache_manager,
@@ -2317,44 +2333,12 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             # Memory statistics after forward
-            mem_used_after, mem_free_after, mem_total = device_memory_info()
-            mem_used_inside_torch_after = torch.cuda.memory_stats(
-            )["allocated_bytes.all.current"]
-
-            # Method 1: device_memory_info
-            mem_used_outside_torch_method1_after = (
-                mem_used_after - mem_used_inside_torch_after
-            ) if mem_used_after > mem_used_inside_torch_after else 0
-
-            # Method 2: torch.cuda.mem_get_info
-            mem_free_cuda_after, total_gpu_memory_after = torch.cuda.mem_get_info(
-            )
-            total_used_bytes_after = total_gpu_memory_after - mem_free_cuda_after
-            mem_used_outside_torch_method2_after = (
-                total_used_bytes_after - mem_used_inside_torch_after
-            ) if total_used_bytes_after > mem_used_inside_torch_after else 0
-
-            # Calculate memory changes
-            mem_change = mem_used_after - mem_used_before
-            inside_torch_change = mem_used_inside_torch_after - mem_used_inside_torch_before
-            outside_torch_change_method1 = mem_used_outside_torch_method1_after - mem_used_outside_torch_method1_before
-            outside_torch_change_method2 = mem_used_outside_torch_method2_after - mem_used_outside_torch_method2_before
-
-            # Determine execution path
+            stats_after_forward = get_memory_stats()
             execution_path = "cuda_graph" if maybe_graph is not None else "regular"
             batch_size = len(scheduled_requests.all_requests())
-
-            logger.info(
-                f"Forward memory stats [{execution_path}] (batch_size={batch_size}): "
-                f"CURRENT - inside torch: {mem_used_inside_torch_after / 1024**3:.2f} GB, "
-                f"outside torch (method1): {mem_used_outside_torch_method1_after / 1024**3:.2f} GB, "
-                f"outside torch (method2): {mem_used_outside_torch_method2_after / 1024**3:.2f} GB, "
-                f"total: {mem_used_after / 1024**3:.2f} GB, "
-                f"free: {mem_free_after / 1024**3:.2f} GB | "
-                f"CHANGES - inside torch: {inside_torch_change / 1024**3:.2f} GB, "
-                f"outside torch (method1): {outside_torch_change_method1 / 1024**3:.2f} GB, "
-                f"outside torch (method2): {outside_torch_change_method2 / 1024**3:.2f} GB, "
-                f"total: {mem_change / 1024**3:.2f} GB")
+            log_memory_comparison(
+                f"Forward memory stats [{execution_path}] (batch_size={batch_size})",
+                stats_before_forward, stats_after_forward)
 
             return outputs
 
