@@ -151,7 +151,8 @@ def test_autotuner_try_block():
     class PartialCrashedRunner(TunableRunner):
 
         def get_valid_tactics(self, inputs: List[FakeTensor],
-                              profile: OptimizationProfile) -> List[int]:
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
             return [-1, 0, 1]
 
         def forward(self,
@@ -226,7 +227,7 @@ class GemmRunnerWithAttributes(TunableRunner):
         self.num_warps = num_warps
 
     def get_valid_tactics(self, inputs: List[FakeTensor],
-                          profile: OptimizationProfile) -> List[int]:
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return [-1, 0, 1]
 
     def forward(self,
@@ -313,11 +314,9 @@ def test_multiple_dynamic_shapes_cache():
 class GemmRunnerWithTacticConfigs(TunableRunner):
     valid_tactic_ids = [-1, 0, 1]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[FakeTensor],
-        profile: OptimizationProfile,
-    ) -> List[Dict[str, int]]:
+    def get_valid_tactics(self, inputs: List[FakeTensor],
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[Dict[str, int]]:
         # The simulated delay is not deterministic, so we need to return specific tactics here
         return [{
             "block_size": block_size,
