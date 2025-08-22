@@ -13,7 +13,12 @@ import math
 from typing import Optional, Tuple
 
 import torch.nn.functional as F
-from cuda import cudart
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
+
 from huggingface_hub import hf_hub_download
 from PIL import Image, UnidentifiedImageError
 from safetensors import safe_open
