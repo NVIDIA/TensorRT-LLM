@@ -389,21 +389,26 @@ class MultimodalParams:
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_config and removes all other multimodal data
+        Keeps only mrope_position_deltas and removes all other multimodal data
         (embeddings, images, etc.) as they're not needed during generation.
         """
         if not self.multimodal_data:
             return
 
-        # Extract mrope_config before clearing
-        mrope_config = None
+        # Extract mrope_position_deltas before clearing
+        mrope_position_deltas = None
         if 'mrope_config' in self.multimodal_data:
             mrope_config = self.multimodal_data['mrope_config']
+            if isinstance(mrope_config,
+                          dict) and 'mrope_position_deltas' in mrope_config:
+                mrope_position_deltas = mrope_config['mrope_position_deltas']
 
-        # Clear all data and restore only mrope_config if it exists
+        # Clear all data and restore only position deltas if they exist
         self.multimodal_data = {}
-        if mrope_config is not None:
-            self.multimodal_data['mrope_config'] = mrope_config
+        if mrope_position_deltas is not None:
+            self.multimodal_data['mrope_config'] = {
+                'mrope_position_deltas': mrope_position_deltas
+            }
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
