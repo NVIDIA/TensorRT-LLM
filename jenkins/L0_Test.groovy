@@ -1641,8 +1641,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         ${testCmdLine.join(" ")}
                     """
                     throw new Exception("Infrastructure error")
+                } catch (InterruptedException e) {
+                    throw e
                 } catch (Exception e) {
-                    throw new Exception("Infrastructure error")
+                    isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
+                    if (isRerunFailed) {
+                        error "The tests still failed after rerun attempt. ${e.message}"
+                    }
                 }
             }
         }
