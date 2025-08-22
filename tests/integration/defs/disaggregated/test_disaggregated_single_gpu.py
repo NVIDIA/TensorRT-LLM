@@ -56,12 +56,11 @@ def mpi_initialize_intercomm(port_name):
     try:
         intercomm = MPI.COMM_SELF.Accept(port_name)
     except MPI.Exception as e:
-        print(f"Error accepting intercomm: {e}")
-        raise e
+        print(f"Error accepting intercomm: {e}", flush=True)
+        raise
     except Exception as e:
-        print(f"Unexpected error accepting intercomm: {e}")
-        raise e
-
+        print(f"Unexpected error accepting intercomm: {e}", flush=True)
+        raise
     return intercomm
 
 
@@ -195,6 +194,7 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             print(f"Error in worker {worker_arg}: {e}")
             raise e
 
+        intercomm = None
         try:
             print("Launched all the workers.", flush=True)
             intercomm = mpi_initialize_intercomm(port_name)
@@ -340,6 +340,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             print(f"Error in worker {worker_arg}: {e}")
             raise e
 
+        intercomm = None
         try:
             print("Launched all the workers.")
             intercomm = mpi_initialize_intercomm(port_name)
@@ -442,6 +443,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
             print(f"Error in worker {worker_arg}: {e}")
             raise e
 
+        intercomm = None
         try:
             print("Launched all the workers.")
             intercomm = mpi_initialize_intercomm(port_name)
