@@ -143,12 +143,20 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
 
     std::vector<int32_t> sortedIndices = mPassingConfigIndices;
     std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&configs](int32_t idx0, int32_t idx1)
+        [&configs, &gemmData](int32_t idx0, int32_t idx1)
         {
             auto const& optionsA = configs[idx0].mOptions;
             auto const& optionsB = configs[idx1].mOptions;
 
-            // Sort by tileK sizes first
+            // Choose the tileN that is closest to the problem N
+            // This is the batch size dimension for low latency (transposeMmaOutput) case;
+            if (optionsA.mTileN != optionsB.mTileN)
+            {
+                return abs(gemmData.mProblemDimensions.mN - optionsA.mTileN)
+                    < abs(gemmData.mProblemDimensions.mN - optionsB.mTileN);
+            }
+
+            // Sort by tileK sizes
             if (optionsA.mTileK != optionsB.mTileK)
             {
                 return optionsA.mTileK > optionsB.mTileK;
@@ -158,6 +166,13 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
             if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma)
             {
                 return optionsA.mUseUnrollLoop2xForMma;
+            }
+
+            // Sort by tileM sizes
+            // This is the batch size dimension for throughput (non-transposeMmaOutput) case;
+            if (optionsA.mTileM != optionsB.mTileM)
+            {
+                return optionsA.mTileM > optionsB.mTileM;
             }
 
             // Then by splitK sizes
