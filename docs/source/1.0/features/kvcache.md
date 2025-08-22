@@ -6,17 +6,19 @@ The KV cache stores previously computed key-value pairs for reuse during generat
 
 The KV cache is a pool of blocks that can hold KV state for a fixed number of tokens. Multiple layers are packed within a single block, which requires all the layers to have the same number of heads and the same attention window size. A separate pool is created for each combination of attention window size and number of heads in order to support variable attention window size and optimization techniques like GQA. Number of tokens that can be stored in a single block can be set by user when the model engine is created. It must be a power of two greater than 1. Blocks are assigned to requests as needed.
 
+If more than one pool is created, available memory is divided among the pools. The fraction to assign to each pool is determined during initialization and is static. This is not optimal and we are working on providing a better solution.
+
 ## Reuse Across Requests
 
 Blocks containing KV state computed for previous requests are stored in a radix search tree as soon as they are filled. A search is performed when a new request is added, matched blocks are reused instead of calculated. Blocks that are reused can be shared among multiple requests, thus reuse saves memory as well as computations. Blocks remain reusable until they are evicted from the search tree. Eviction happens when a new (blank) block is needed. The core eviction scheme is prioritized LRU. All blocks are assigned a priority between 0 and 100 (100 being most important), all blocks of the lowest priority must be evicted before any blocks of the next priority can be evicted. If all blocks have the same priority, the least recently used block is evicted. When a block is evicted from primary memory, it's KV state is copied to a block in secondary memory. The secondary memory block remains in the search tree, hence the block remains reusable until it is evicted from secondary memory. Eviction from secondary memory happens when a new block in secondary memory is needed to offload a primary block. The eviction scheme is the same for primary and secondary blocks.
 
 ### Retention Policy
 
-Blocks are assigned priority in line with the [retention policy](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [TokenRangeRetentionConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.KvCacheRetentionConfig) objects, each specifying the priority to assign to a specific range of tokens, i.e. "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect, priority will revert to the default after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect. 
+Blocks are assigned priority in line with the [retention policy](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [TokenRangeRetentionConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.KvCacheRetentionConfig) objects, each specifying the priority to assign to a specific range of tokens, i.e. "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect, priority will revert to the default after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect, after which priority will revert to the default.
 
-TODO: Can duration_ms be set to None to signal retention policy does not expire?
-TODO: What is default priority? 35?
-TODO: What does transfer_mode do? Is it just a vestigial appendage from the days when we were toying around with offloading to SSD?
+Default priority is 35. Any property that expects a duration can be set to None, which indicates retention policy never expires.
+
+Not in use: ```transfer_mode``` is a debug option and should not be used.
 
 ### Speculative Decoding
 
@@ -36,15 +38,11 @@ Many of the features in the KV cache system are optional or have user defined pr
 
 ### Datatype
 
-Perhaps the most important property is ```dtype``` which specifices which data type is held in KV cache. The default is 'auto' which matches the datatype of the weights in the model engine.
-
-TODO: Is description of 'auto' correct?
-TODO: dtype is a string, what options other than 'auto' are there?
+Perhaps the most important property is ```dtype``` which specifices what data type is held in KV cache. The default 'auto' specifies that data type should be infered from model config. 
 
 ### How Much Memory is Allocated to KV Cache
 
 Property ```free_gpu_memory_fraction``` is a ratio > 0 and < 1 that specifies how much of free GPU memory should be allocated to KV cache. The default is 90% (ratio of 0.9). If ```max_tokens``` is also set, KV cache will determine how much memory is needed to hold ```max_tokens``` and will allocate the lesser of ```max_tokens``` and ```free_gpu_memory_fraction```.
-TODO: Why is GPU memory and host specified in two very different ways?
 
 ### Enable/Disable Cross Request Reuse
 
@@ -68,6 +66,5 @@ Property ```max_attention_window``` specifies the maximum attention window size 
 
 ### Deprecated Properties
 
-Property ```use_uvm``` has been deprecated and will be removed in a future release. Changing this does nothing.
-Property ```sink_token_length``` has been deprecated and will be removed in a future release. Changing this does nothing.
+Properties ```use_uvm``` and ```sink_token_length``` have been deprecated and will be removed in a future release.
 
