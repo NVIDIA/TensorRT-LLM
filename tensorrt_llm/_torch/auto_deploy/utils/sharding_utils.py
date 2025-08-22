@@ -59,6 +59,9 @@ def _insert_sharded_matmul(
     world_size: int,
     add_dist: bool = False,
     min_local_shape: int = 1,
+    quantization_cb: Optional[
+        Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
+    ] = None,
 ) -> None:
     """Replace the matmul node with a new matmul node that accepts sharded weights.
 
@@ -66,8 +69,6 @@ def _insert_sharded_matmul(
     """
     assert dim in [0, 1], "Only dim 0 and 1 are supported for sharding"
     assert add_dist or dim == 0, "For dim=1 sharding, dist_op is required."
-
-    quantization_impl = QuantizationImpl.create(node)
 
     def split_tensor(
         t: torch.Tensor,
@@ -105,8 +106,7 @@ def _insert_sharded_matmul(
             None
             if remove
             else nn.Parameter(
-                split_tensor(gm.get_parameter(param_key)).detach().clone(),
-                requires_grad=quantization_impl is None,
+                split_tensor(gm.get_parameter(param_key)).detach().clone(), requires_grad=False
             )
         )
 
@@ -142,24 +142,16 @@ def _insert_sharded_matmul(
         set_new_param(submod, bias_key, remove=True)
         gm._register_load_state_dict_pre_hook(partial(_load_hook_remove, param_key=bias_key))
 
-    if quantization_impl:
-        scales = {}
-        for scale_name in quantization_impl.scale_names():
-            scales[scale_name] = submod.get_buffer(scale_name)
-        scales["weight_shape"] = weight_new_shape
-        sharded_scales = quantization_impl.shard_scales(dim, rank, world_size, **scales)
-        for k, v in sharded_scales.items():
-            submod.register_buffer(k, v)
-
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                quantization_impl.shard_load_hook,
-                weight_name=weight_key,
-                weight_shape=weight_new_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
-            )
+    if quantization_cb is not None:
+        quantization_cb(
+            gm=gm,
+            submod=submod,
+            node=node,
+            weight_key=weight_key,
+            weight_new_shape=weight_new_shape,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
         )
 
     # no comm node needed for single device
@@ -234,6 +226,14 @@ class TPShardingInfo(ShardingTransformInfo):
     dist_op: Optional[Literal["all_reduce", "all_gather"]] = None
     min_local_shape: int = 1
 
+    @classmethod
+    def from_node(cls, node: Node, **kwargs) -> "TPShardingInfo":
+        """
+        Create the correct TPShardingInfo subclass (FP8/FP4/base) based on `node`.
+        """
+        subcls = _resolve_tp_cls_from_node(node)
+        return subcls(target_node=node.name, **kwargs)
+
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
         if self.dist_op is not None:
@@ -263,6 +263,94 @@ class TPShardingInfo(ShardingTransformInfo):
             add_dist=self.dist_op is not None,
             min_local_shape=self.min_local_shape,
         )
+
+
+class QuantizationShardingMixin:
+    """
+    Mixin that provides a callback to handle quantization-aware sharding:
+      - shards/rewrites scale buffers
+      - registers the quantized shard load hook
+    """
+
+    def quantization_cb(
+        self,
+        gm: GraphModule,
+        submod: nn.Module,
+        node: Node,
+        weight_key: str,
+        weight_new_shape: torch.Size,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        quantization_impl = QuantizationImpl.create(node)
+
+        scales = {}
+        for scale_name in quantization_impl.scale_names():
+            scales[scale_name] = submod.get_buffer(scale_name)
+        scales["weight_shape"] = weight_new_shape
+        sharded_scales = quantization_impl.shard_scales(dim, rank, world_size, **scales)
+        for k, v in sharded_scales.items():
+            submod.register_buffer(k, v)
+
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                quantization_impl.shard_load_hook,
+                weight_name=weight_key,
+                weight_shape=weight_new_shape,
+                dim=dim,
+                rank=rank,
+                world_size=world_size,
+            )
+        )
+
+
+class FP8TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
+    """Tensor-parallel sharding for FP8-quantized linears."""
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_matmul(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            rank=self.rank,
+            world_size=self.world_size,
+            add_dist=self.dist_op is not None,
+            min_local_shape=self.min_local_shape,
+            quantization_cb=self.quantization_cb,  # quant callback
+        )
+
+
+class FP4TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
+    """Tensor-parallel sharding for FP4-quantized linears."""
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_matmul(
+            gm=gm,
+            node=node,
+            dim=self.split_dim.value,
+            rank=self.rank,
+            world_size=self.world_size,
+            add_dist=self.dist_op is not None,
+            min_local_shape=self.min_local_shape,
+            quantization_cb=self.quantization_cb,  # quant callback
+        )
+
+
+TP_SHARDING_RULES = [
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_linear_fp8), FP8TPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_linear_fp4), FP4TPShardingInfo),
+]
+
+
+def _resolve_tp_cls_from_node(node: Node):
+    for pred, cls in TP_SHARDING_RULES:
+        try:
+            if pred(node):
+                return cls
+        except Exception:
+            pass
+    return TPShardingInfo
 
 
 class BMMShardingInfo(ShardingTransformInfo):
