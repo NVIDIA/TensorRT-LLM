@@ -16,7 +16,6 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
-from .sampler import Sampler, TorchSampler
 
 SHUTDOWN_REQUEST_ID = -1
 
@@ -707,21 +706,19 @@ class ExecutorRequestQueue:
 
     def set_exclude_last_generation_logits(self,
                                            disable_overlap_scheduler: bool,
-                                           sampler: Sampler) -> None:
+                                           pp_size: int) -> None:
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # sample_async is called twice before the first call to update_requests:
         # - 1st time as a context request that handles on the 1st generated token
         # - 2nd time as a generation request that handles on the 2nd generated token.
         # and only after these two calls the sampler's update_request method is called.
         # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async (TorchSampler is an anomaly that instead does that on
-        # update_requests), every update_request doesn't handle the newest token, but one
+        # sample_async, every update_request doesn't handle the newest token, but one
         # before it. Since all these calls work on the same request object, then its
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
-        # getter is required, when not using TorchSampler.
-        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and not isinstance(
-            sampler, TorchSampler)
+        # getter is required.
+        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and pp_size == 1
 
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits
