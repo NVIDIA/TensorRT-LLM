@@ -135,9 +135,8 @@ public:
             if (common::getEnvParallelCacheSend())
             {
                 // TODO: Use a thread pool and check for thread safety.
-                std::thread(
-                    &DataResponder::Impl::sendAndRemoveResponse, this, reqId, std::move(readyResponseIt->second))
-                    .detach();
+                mSendThreads.emplace_back(
+                    &DataResponder::Impl::sendAndRemoveResponse, this, reqId, std::move(readyResponseIt->second));
             }
             else
             {
@@ -177,6 +176,11 @@ public:
 
     ~Impl()
     {
+        for (auto& thread : mSendThreads)
+        {
+            thread.join();
+        }
+        mSendThreads.clear();
         terminate();
     }
 
@@ -220,10 +224,8 @@ private:
                 {
                     break;
                 }
-                std::vector<size_t> blockHashes;
                 auto const& requestInfo = mSender->recvRequestInfo();
                 auto reqId = requestInfo.getRequestId();
-                blockHashes = requestInfo.getBlockHashes();
                 {
                     std::unique_lock lk(mSendMutex);
                     mRequestInfoMap[reqId] = std::move(requestInfo);
@@ -276,6 +278,7 @@ private:
     std::condition_variable mResponderCv;
     std::future<void> mResponseFuture;
     std::unique_ptr<DataSender> mSender;
+    std::vector<std::thread> mSendThreads;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
     std::unordered_map<LlmRequest::RequestIdType, RequestInfo> mRequestInfoMap;
     int mDeviceId{-1};
