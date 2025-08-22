@@ -45,6 +45,10 @@ option(ENABLE_MULTI_DEVICE
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
 option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
+option(CUBLAS_DYNAMIC_LINKING
+       "Link against the dynamic cublas/cublasLt libraries" ON)
+option(CURAND_DYNAMIC_LINKING "Link against the dynamic curand library" ON)
+
 option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
@@ -153,12 +157,51 @@ enable_language(C CXX CUDA)
 # after that CMake handles it just fine.
 setup_cuda_architectures()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
-                                                  cublas cublasLt curand nvml)
+if(CUBLAS_DYNAMIC_LINKING)
+  set(CUBLAS_COMP cublas cublasLt)
+else()
+  if(WIN32)
+    message(FATAL_ERROR "Static cublas not available on windows")
+  endif()
+  message(DEBUG "Linking with static cublas libs")
+  set(CUBLAS_COMP cublas_static cublasLt_static)
+endif()
 
-set(CUBLAS_LIB CUDA::cublas)
-set(CUBLASLT_LIB CUDA::cublasLt)
-set(CURAND_LIB CUDA::curand)
+if(CURAND_DYNAMIC_LINKING)
+  set(CURAND_COMP curand)
+else()
+  if(WIN32)
+    message(FATAL_ERROR "Static curand not available on windows")
+  endif()
+  message(DEBUG "Linking with static curand lib")
+  set(CURAND_COMP curand_static)
+endif()
+
+if(NVRTC_DYNAMIC_LINKING)
+  set(NVRTC_COMP nvrtc)
+else()
+  set(NVRTC_COMP nvrtc_static)
+endif()
+
+find_package(
+  CUDAToolkit 11.2 REQUIRED
+  COMPONENTS cudart_static cuda_driver nvml ${CUBLAS_COMP} ${CURAND_COMP}
+             ${NVRTC_COMP})
+
+if(CUBLAS_DYNAMIC_LINKING)
+  set(CUBLAS_LIB CUDA::cublas)
+  set(CUBLASLT_LIB CUDA::cublasLt)
+else()
+  set(CUBLAS_LIB CUDA::cublas_static)
+  set(CUBLASLT_LIB CUDA::cublasLt_static)
+endif()
+
+if(CURAND_DYNAMIC_LINKING)
+  set(CURAND_LIB CUDA::curand)
+else()
+  set(CURAND_LIB CUDA::curand_static)
+endif()
+
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
