@@ -25,8 +25,10 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
 
+from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .resource_manager import ResourceManager, ResourceManagerType
 from .scheduler import ScheduledRequests
 
 
@@ -65,7 +67,10 @@ class Sampler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def update_requests(self, state: SampleState) -> None:
+    def update_requests(
+            self,
+            state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
         raise NotImplementedError
 
     @staticmethod
@@ -90,7 +95,11 @@ class EarlyStopSampler(Sampler):
         host = SampleStateTensors(new_tokens=torch.empty(0))
         return SampleState(scheduled_requests=scheduled_requests, host=host)
 
-    def update_requests(self, state: SampleState) -> None:
+    def update_requests(
+            self,
+            state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
+        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleState)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
@@ -132,7 +141,11 @@ class EarlyStopWithMMResult(Sampler):
         return SampleStateWithMMResult(scheduled_requests=scheduled_requests,
                                        data=data)
 
-    def update_requests(self, state: SampleStateWithMMResult) -> None:
+    def update_requests(
+            self,
+            state: SampleStateWithMMResult,
+            resource_manager: Optional[ResourceManager] = None) -> None:
+        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateWithMMResult)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
@@ -361,12 +374,13 @@ def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
 
 class TorchStore:
 
-    def __init__(self, *, max_draft_len: int, max_num_sequences: int,
-                 max_beam_width: int):
+    def __init__(self, *, max_draft_len: int, max_total_draft_tokens: int,
+                 max_num_sequences: int, max_beam_width: int):
         self.max_draft_len = max_draft_len
+        self.max_total_draft_tokens = max_total_draft_tokens
         self.max_num_sequences = max_num_sequences
         self.max_beam_width = max_beam_width
-        self.max_tokens = max_draft_len + 1
+        self.max_tokens = max_total_draft_tokens + 1
         assert max_beam_width == SINGLE_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.new_tokens = int_tensor(
             (self.max_tokens, max_num_sequences, max_beam_width))
@@ -415,6 +429,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         enable_mixed_sampler: bool
+        max_total_draft_tokens: int
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -424,9 +439,11 @@ class TorchSampler(Sampler):
         # which would disallow in-place mutating of new_tokens.
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
-            self.store = TorchStore(max_draft_len=args.max_draft_len,
-                                    max_num_sequences=args.max_num_sequences,
-                                    max_beam_width=args.max_beam_width)
+            self.store = TorchStore(
+                max_draft_len=args.max_draft_len,
+                max_total_draft_tokens=args.max_total_draft_tokens,
+                max_num_sequences=args.max_num_sequences,
+                max_beam_width=args.max_beam_width)
         self.max_num_sequences = args.max_num_sequences
         self.max_tokens = self.store.max_tokens
 
@@ -448,6 +465,16 @@ class TorchSampler(Sampler):
             self._generator = torch.Generator(device=device)
             self._generator.manual_seed(self._global_seed)
         return self._generator
+
+    def get_spec_tree_manager(self, resource_manager: ResourceManager):
+        if resource_manager is None:
+            return None
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is None or not hasattr(spec_resource_manager,
+                                                        "spec_tree_manager"):
+            return None
+        return spec_resource_manager.spec_tree_manager
 
     def handle_logprobs(self, request: LlmRequest, state: SampleStateTorch, *,
                         beam: int, count: int):
@@ -502,6 +529,101 @@ class TorchSampler(Sampler):
                 break
         return num_accepted
 
+    def _process_draft_tokens_tree(self, request: LlmRequest,
+                                   new_tokens: torch.Tensor,
+                                   spec_tree_manager: SpecTreeManager,
+                                   finish_reasons: FinishReasons) -> int:
+        """ Tree verification for draft token tree based speculative decoding. This function will only be called for the target model.
+        Verification logic:
+            Find the longest prefix match. Since each node in the tree has a related path,
+            we can find the longest match by comparing all the paths.
+        Args:
+            request: LlmRequest. The request with draft tokens.
+            new_tokens: torch.Tensor. [max_draft_len + 1, max_num_sequences, MAX_BEAM_WIDTH], host buffer. The tokens generated by the target model
+                        The relationship between [max_draft_len + 1] and the draft token tree:
+                        If the current node is accepted, what is the NEXT token_id that the target model will generate?
+                        For example, new_tokens[0, req_idx, 1] indicates the NEXT token_id sampled from the root node in the draft token tree if it is accepted.
+                        We know that the root node in the draft token tree is always accepted. Therefore, new_tokens[0, req_idx, 1] indicates the token_id following the root node,
+                        corresponding to the first layer in the draft token tree (the root node is the 0th layer).
+                        Similarly, new_tokens[1, req_idx, 1] represents the NEXT token_id if the first token in the first layer of the draft tokens tree is accepted.
+            spec_tree_manager: SpecTreeManager. which contains the tree structure and other meta information of the tree.
+        """
+        # handle the drafter model request
+        # For the drafter model, we do not execute the tree verification logic,
+        # but only add the draft tokens of the previous layer.
+        if get_draft_token_length(request) == 0:
+            cur_draft_layer_idx = spec_tree_manager.cur_draft_layer_idx
+
+            # TODO: For the last layer of the dynamic tree, we need to resampling all the draft tokens.
+            cur_layer_num_nodes = sum(
+                spec_tree_manager.get_topK_list(cur_draft_layer_idx))
+            for i in range(cur_layer_num_nodes):
+                new_token = add_token(request, new_tokens, beam=BEAM_0, step=i)
+            return 0
+        else:
+            # handle the target model request
+            # For the target model, we will do the tree verification logic.
+            seq_slot = request.py_seq_slot
+            assert seq_slot is not None
+            eagle_paths = spec_tree_manager.get_eagle_paths(seq_slot)
+
+            all_draft_tokens = request.py_draft_tokens  # [max_total_draft_tokens]
+            all_target_tokens = new_tokens[:, seq_slot, :].squeeze(
+                -1)  # [max_total_draft_tokens]
+            assert all_target_tokens.shape[
+                0] == spec_tree_manager.max_total_draft_tokens + 1
+
+            longest_accepted_len = 0
+            longest_match_path_idx = -1
+
+            for path_idx, path in enumerate(eagle_paths):
+                path_exclude_root = path[
+                    1:] - 1  # [max_draft_len], '[1:]' since the new_tokens does not contain the root node.
+                # '-1' is the index shift after exclude the root node.
+                draft_tokens_indices = path_exclude_root[path_exclude_root >=
+                                                         0]  # [max_draft_len]
+                target_tokens_indices = path[path >= 0]  # [max_draft_len + 1]
+
+                assert len(
+                    draft_tokens_indices) == len(target_tokens_indices) - 1
+
+                cur_draft_tokens = all_draft_tokens[draft_tokens_indices]
+                cur_target_tokens = all_target_tokens[target_tokens_indices]
+
+                cur_accepted_len = torch.cumprod(
+                    (cur_draft_tokens == cur_target_tokens[:-1]).int(),
+                    dim=-1).sum()
+
+                # Accepted one more token from the target model.
+                cur_accepted_len += 1
+
+                if cur_accepted_len > longest_accepted_len:
+                    longest_accepted_len = cur_accepted_len
+                    longest_match_path_idx = path_idx
+
+            if longest_accepted_len == 0:
+                # No draft tokens are accepted.
+                # Take the top-1 token of the first layer as the next new token.
+                new_token = add_token(request, new_tokens, beam=BEAM_0, step=0)
+                return 0
+            else:
+                # Take the longest accepted path as the next new token.
+                num_accepted_draft_tokens = 0
+                for idx in eagle_paths[
+                        longest_match_path_idx][:longest_accepted_len]:
+                    new_token = add_token(request,
+                                          new_tokens,
+                                          beam=BEAM_0,
+                                          step=idx)
+                    num_accepted_draft_tokens += 1
+                    if self.finish_if_reason(request,
+                                             finish_reasons,
+                                             step=num_accepted_draft_tokens -
+                                             1):
+                        break
+
+                return num_accepted_draft_tokens - 1
+
     def _process_draft_tokens_rejection_sampling(
             self, request: LlmRequest, new_tokens: torch.Tensor) -> int:
         """We cannot use finish_if_reason in _process_draft_tokens_rejection_sampling because it *writes to new_tokens*,
@@ -550,7 +672,78 @@ class TorchSampler(Sampler):
 
         return num_accepted
 
-    def update_requests(self, state: SampleStateTorch) -> None:
+    def tree_sampling(self, requests: list[LlmRequest], beam_width: int,
+                      model_outputs: dict[str, torch.Tensor],
+                      spec_tree_manager: SpecTreeManager,
+                      seq_slots: torch.Tensor, new_tokens: torch.Tensor):
+        """ Tree sampling for draft token tree based speculative decoding. Each node may expand to multiple child nodes.
+        Args:
+            requests: list[LlmRequest]. List of LlmRequest.
+            beam_width: int. Currently only support beam_width = 1 for speculative decoding.
+            model_outputs: dict[str, torch.Tensor]. Model outputs, including logits, d2t.
+                logits: [N, vocab_size], N = num_logits_per_request * len(requests). num_logits_per_request: The number of nodes that has child nodes in the current layer.
+                d2t: [draft_vocab_size]
+            spec_tree_manager: SpecTreeManager. which contains the tree structure and other meta information of the tree.
+            seq_slots: torch.Tensor. [max_num_sequences]. The sequence slots of the requests.
+            new_tokens: torch.Tensor. [max_draft_len + 1, max_num_sequences, MAX_BEAM_WIDTH], device buffer. The output buffer for new generated draft tokens.
+        """
+        assert beam_width == 1, "speculative decoding only supports beam_width = 1"
+        raw_logits = model_outputs["logits"]
+
+        # For static tree, all requests share a same tree and have the same behavior for each draft layer.
+        # Therefore, have the same number of logits per request.
+        # For dynamic tree, each layer always have the same number of topK value (dynamic_tree_max_topK).
+        # Therefore, each request will have dynamic_tree_max_topK logits.
+        # (The premise is that we pass in the correct gather_ids and only get the required logits.)
+        assert raw_logits.shape[0] % len(requests) == 0
+        num_logits_per_request = raw_logits.shape[0] // len(requests)
+        request_index = torch.arange(len(requests))
+
+        draft_layer_id = spec_tree_manager.cur_draft_layer_idx
+
+        # 1) Get the topK list for the specific draft layer.
+        topK_list = spec_tree_manager.get_topK_list(draft_layer_id)
+        assert len(topK_list) == num_logits_per_request
+
+        # TODO: this tensor can be optimized
+        new_draft_tokens_cuda = torch.zeros(
+            (len(requests), spec_tree_manager.max_total_draft_tokens + 1),
+            dtype=torch.int64,
+            device='cuda')
+        topK_list_cumsum = torch.cumsum(topK_list, dim=0)
+        # Different nodes have different topK value.
+        for i in range(len(topK_list)):
+            # 2) Extract the logits needed for this layer.
+            logits = raw_logits[request_index * num_logits_per_request + i, :]
+            assert logits.shape[0] == len(requests)
+            # 3) Sample the logits according to the topK value.
+            indices = torch.topk(logits, k=topK_list[i], dim=-1).indices
+            # 4) Write to the temporary output tensor.
+            new_draft_tokens_cuda[
+                request_index, topK_list_cumsum[i] -
+                topK_list[i]:topK_list_cumsum[i]] = indices[request_index]
+
+        # 5) Append eagle3 d2t.
+        self.append_eagle3(new_draft_tokens_cuda, model_outputs)
+
+        # 6) Copy back to the output tensor.
+        int_new_draft_tokens = new_draft_tokens_cuda.transpose(0, 1).to(
+            torch.int, non_blocking=True)
+        int_new_draft_tokens = int_new_draft_tokens.unsqueeze(
+            dim=-1)  # [max_total_draft_tokens + 1, max_num_sequences, 1]
+        # new_tokens: device buffer, shape:[max_total_draft_tokens + 1, max_num_sequences, MAX_BEAM_WIDTH]
+        # new_tokens just store the new draft tokens for each layer.
+        new_tokens.index_copy_(1, seq_slots, int_new_draft_tokens)
+
+        if spec_tree_manager.use_dynamic_tree and draft_layer_id == spec_tree_manager.max_draft_len - 1:
+            # TODO: Re-sample the draft tokens for the last layer.
+            assert False, "Dynamic tree is not fully supported yet."
+        return
+
+    def update_requests(
+            self,
+            state: SampleStateTorch,
+            resource_manager: Optional[ResourceManager] = None) -> None:
         assert isinstance(state, SampleStateTorch)
         if state.sampler_event:
             state.sampler_event.synchronize()
@@ -570,8 +763,18 @@ class TorchSampler(Sampler):
                 continue
             processed = 1
             if req.py_draft_logits is None:
-                num_accepted = self._process_draft_tokens_greedy(
-                    req, new_tokens=new_tokens, finish_reasons=finish_reasons)
+                spec_tree_manager = self.get_spec_tree_manager(resource_manager)
+                if spec_tree_manager is not None:
+                    num_accepted = self._process_draft_tokens_tree(
+                        req,
+                        new_tokens=new_tokens,
+                        spec_tree_manager=spec_tree_manager,
+                        finish_reasons=finish_reasons)
+                else:
+                    num_accepted = self._process_draft_tokens_greedy(
+                        req,
+                        new_tokens=new_tokens,
+                        finish_reasons=finish_reasons)
             else:
                 num_accepted = self._process_draft_tokens_rejection_sampling(
                     req, new_tokens)
@@ -593,9 +796,12 @@ class TorchSampler(Sampler):
         return None
 
     def sample_async(
-            self, scheduled_requests: ScheduledRequests,
+            self,
+            scheduled_requests: ScheduledRequests,
             model_outputs: dict[str, torch.Tensor],
-            num_context_logits_prefix_sum: list[int]) -> SampleStateTorch:
+            num_context_logits_prefix_sum: list[int],
+            resource_manager: Optional[ResourceManager] = None
+    ) -> SampleStateTorch:
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
         finish_reasons = self.store.finish_reasons
@@ -611,7 +817,8 @@ class TorchSampler(Sampler):
                                num_context_logits_prefix_sum,
                                seq_slots=seq_slots,
                                seq_slots_host=seq_slots_host,
-                               log_probs_host=log_probs_host)
+                               log_probs_host=log_probs_host,
+                               resource_manager=resource_manager)
         self._write_finish_reasons(requests,
                                    finish_reasons=finish_reasons,
                                    seq_slots=seq_slots,
@@ -885,7 +1092,8 @@ class TorchSampler(Sampler):
                           *,
                           seq_slots: torch.Tensor,
                           seq_slots_host: torch.Tensor,
-                          log_probs_host: torch.Tensor | None = None):
+                          log_probs_host: torch.Tensor | None = None,
+                          resource_manager: Optional[ResourceManager] = None):
 
         # raw_logits should contain only the logits from the gen requests.
         # If return context logits is requested, fetch only the logits from gen requests.
@@ -911,14 +1119,26 @@ class TorchSampler(Sampler):
         fast_path = not self.enable_mixed_sampler and no_draft_tokens and log_probs_host is None
 
         if fast_path:
-            logits = raw_logits[:len(requests)]
-            logits = self._apply_embedding_bias(logits, requests)
-            next_tokens = torch.argmax(logits, dim=-1)
-            self.append_eagle3(next_tokens, model_outputs)
-            int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
-            next_tokens = int_next_tokens.view(1, -1, SINGLE_BEAM_WIDTH)
-            new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
-            return
+            spec_tree_manager = self.get_spec_tree_manager(resource_manager)
+            if spec_tree_manager is None:
+                # Non-spec_dec or using linear tree
+                logits = raw_logits[:len(requests)]
+                logits = self._apply_embedding_bias(logits, requests)
+                next_tokens = torch.argmax(logits, dim=-1)
+                self.append_eagle3(next_tokens, model_outputs)
+                int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
+                next_tokens = int_next_tokens.view(1, -1, SINGLE_BEAM_WIDTH)
+                new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
+                return
+            else:
+                # Using tree sampling
+                self.tree_sampling(requests=requests,
+                                   beam_width=beam_width,
+                                   model_outputs=model_outputs,
+                                   spec_tree_manager=spec_tree_manager,
+                                   seq_slots=seq_slots,
+                                   new_tokens=new_tokens)
+                return
 
         strategies = sampling_strategies(requests)
         batched_next_tokens, batched_softmax = None, None
@@ -1244,7 +1464,10 @@ class TRTLLMSampler(Sampler):
                                  finalize_events=finalize_events)
 
     @torch.inference_mode()
-    def update_requests(self, state: SampleStateTRTLLM):
+    def update_requests(self,
+                        state: SampleStateTRTLLM,
+                        resource_manager: Optional[ResourceManager] = None):
+        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateTRTLLM)
         if state.scheduled_requests.batch_size == 0:
             return

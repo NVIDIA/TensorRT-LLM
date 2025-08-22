@@ -250,7 +250,11 @@ class MTPSampler(Sampler):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
         request.py_decoding_iter += 1
 
-    def update_requests(self, state: SampleStateMTP) -> None:
+    def update_requests(
+            self,
+            state: SampleStateMTP,
+            resource_manager: Optional[BaseResourceManager] = None) -> None:
+        # resource_manager will be not be used in this function
         assert isinstance(state, SampleStateMTP)
 
         state.sampler_event.synchronize()
