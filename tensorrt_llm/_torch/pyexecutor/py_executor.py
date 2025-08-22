@@ -46,6 +46,7 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse)
 from .model_engine import ModelEngine
+from .resource_manager import ResourceManager
 from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
 
@@ -1084,7 +1085,7 @@ class PyExecutor:
                                                       batch_outputs)
 
                     self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state)
+                    self._update_requests(sample_state, self.resource_manager)
 
                     if self.kv_cache_transceiver:
                         ctx_transmission_reqs = self._send_disagg_ctx_cache(
@@ -1703,9 +1704,11 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self, sample_state: SampleState):
+    def _update_requests(self,
+                         sample_state: SampleState,
+                         resource_manager: Optional[ResourceManager] = None):
         try:
-            self.sampler.update_requests(sample_state)
+            self.sampler.update_requests(sample_state, resource_manager)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
