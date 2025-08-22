@@ -181,7 +181,7 @@ class MoeConfig(StrictBaseModel):
     load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, dict, str]"})
 
     disable_finalize_fusion: bool = Field(
         default=False,
