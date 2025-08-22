@@ -320,7 +320,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         while True:
             if self.worker_init_status_queue.poll(1):
-                ready_signal = self.worker_init_status_queue.get()
+                ready_signal, error_trace = self.worker_init_status_queue.get()
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
@@ -328,6 +328,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._handle_background_error()
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
+            logger.error(f"Executor worker initialization error: {error_trace}")
             self.mpi_session.shutdown_abort(reason=ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal

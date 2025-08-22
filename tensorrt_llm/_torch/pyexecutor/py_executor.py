@@ -40,6 +40,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
+from .handle_logits import HandleLogits
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
@@ -248,7 +249,7 @@ class PyExecutor:
             is_disaggregated=kv_cache_transceiver is not None,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
-            self.disable_overlap_scheduler, self.sampler)
+            self.disable_overlap_scheduler, self.dist.pp_size)
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -718,24 +719,6 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
-    def _need_return_logits(self, scheduled_requests: ScheduledRequests):
-        for req in scheduled_requests.context_requests:
-            if req.py_return_context_logits:
-                return True
-        for req in scheduled_requests.generation_requests:
-            if req.py_return_generation_logits:
-                return True
-        return False
-
-    def _need_return_log_probs(self, scheduled_requests: ScheduledRequests):
-        for req in scheduled_requests.context_requests:
-            if req.py_return_log_probs:
-                return True
-        for req in scheduled_requests.generation_requests:
-            if req.py_return_log_probs:
-                return True
-        return False
-
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
@@ -827,10 +810,6 @@ class PyExecutor:
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
                             batch_outputs = self._forward_step(scheduled_batch)
-                            logits_host = None
-                            if self._need_return_logits(scheduled_batch):
-                                logits_host = batch_outputs["logits"].to(
-                                    "cpu", non_blocking=True)
                             if self.kv_cache_transceiver and self.guided_decoder:
                                 self.guided_decoder.init_disagg_gen_requests(
                                     scheduled_batch)
@@ -839,7 +818,6 @@ class PyExecutor:
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
-                            sample_state.host.logits = logits_host
                             self._update_request_states(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
@@ -869,18 +847,10 @@ class PyExecutor:
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        (
-                            logits,
-                            sample_state.host,
-                        ) = self.dist.recv_object(
+                        sample_state.host = self.dist.recv_object(
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id,
                         )
-                        if logits is not None:
-                            logits_host = torch.from_numpy(logits)
-                            sample_state.host.logits = logits_host
-                            sample_state.device.logits = logits_host.to(
-                                self.device_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
                         sample_state.sampler_event.synchronize()
@@ -890,18 +860,9 @@ class PyExecutor:
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].wait()
-                        needs_logits = (
-                            self._need_return_logits(scheduled_batch)
-                            or (self._need_return_log_probs(scheduled_batch)
-                                and sample_state.host.log_probs is not None))
-                        serialized_logits = sample_state.host.logits.numpy(
-                        ) if needs_logits else None
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
-                                (
-                                    serialized_logits,
-                                    sample_state.host,
-                                ),
+                                sample_state.host,
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -921,6 +882,40 @@ class PyExecutor:
                                 previous_batch.scheduled_ctx_reqs)
 
                         self._handle_canceled_requests()
+
+                        # If logits were requested last PP rank has to send to first PP rank (who sends responses) the
+                        # logits of the requests that have finished.
+                        # NOTE: If the rank processing the logits ever becomes the same as
+                        # the rank sending the responses, this code can be removed.
+                        finished_reqs = [
+                            r for r in previous_batch.sample_state.
+                            scheduled_requests.all_requests()
+                            if r.state == LlmRequestState.GENERATION_COMPLETE
+                            and (r.py_return_context_logits
+                                 or r.py_return_generation_logits)
+                        ]
+                        if self.dist.is_first_pp_rank and len(finished_reqs):
+                            finished_reqs_py_results = [
+                                r.py_result for r in finished_reqs
+                            ]
+                            finished_reqs_py_results = self.dist.recv_object(
+                                src=self.dist.prev_pp_rank,
+                                tag=prev_microbatch_id,
+                            )
+                            for req, py_result in zip(finished_reqs,
+                                                      finished_reqs_py_results):
+                                req.py_result = py_result
+
+                        elif self.dist.is_last_pp_rank and len(finished_reqs):
+                            if self.send_handles[
+                                    prev_microbatch_id] is not None:
+                                self.send_handles[prev_microbatch_id].wait()
+                            self.send_handles[
+                                prev_microbatch_id] = self.dist.isend_object(
+                                    [r.py_result for r in finished_reqs],
+                                    dest=self.dist.next_pp_rank,
+                                    tag=prev_microbatch_id)
+
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
                         self.resource_manager.update_resources(
@@ -1609,7 +1604,22 @@ class PyExecutor:
                       batch_outputs) -> SampleState | None:
         try:
             if batch_outputs is not None:
-                return self.sampler.sample_async(scheduled_batch, batch_outputs)
+                num_context_logits_prefix_sum = [0]
+                prefix_sum = 0
+                for request in scheduled_batch.context_requests:
+                    prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
+                    num_context_logits_prefix_sum.append(prefix_sum)
+
+                HandleLogits()(scheduled_batch.context_requests,
+                               scheduled_batch.generation_requests,
+                               batch_outputs["logits"],
+                               self.sampler.beam_width(
+                                   scheduled_batch.all_requests()),
+                               num_context_logits_prefix_sum,
+                               self.sampler.is_generation_model())
+
+                return self.sampler.sample_async(scheduled_batch, batch_outputs,
+                                                 num_context_logits_prefix_sum)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -1669,7 +1679,9 @@ class PyExecutor:
                 cache_block_ids = self.kv_cache_manager.get_cache_indices(
                     request)
             except IndexError:
-                pass
+                # If the request has not yet been added to the kv cache manager,
+                # we still need to free resources corresponding to other resource managers.
+                self.resource_manager.free_resources(request)
             else:
                 if not self.kv_connector_manager.request_finished(
                         request, cache_block_ids):

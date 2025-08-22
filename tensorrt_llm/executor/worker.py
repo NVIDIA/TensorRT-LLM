@@ -782,7 +782,7 @@ def worker_main(
         logger.error(traceback.format_exc())
         print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
-            worker_init_status_queue.put(e)
+            worker_init_status_queue.put((e, traceback.format_exc()))
         return
 
     with worker:
@@ -800,7 +800,7 @@ def worker_main(
                                                    mp_stats_queue)
                 worker._set_iteration_result_queue(worker.kv_events_queues,
                                                    kv_cache_events_queue)
-                worker_init_status_queue.put(ready_signal)
+                worker_init_status_queue.put((ready_signal, None))
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)

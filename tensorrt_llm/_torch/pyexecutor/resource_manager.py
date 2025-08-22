@@ -1062,7 +1062,8 @@ class PeftCacheManager(BaseResourceManager):
         self._lora_model_config = LoraModelConfig(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
-            binding_to_str_dtype(model_config.data_type))
+            binding_to_str_dtype(model_config.data_type),
+            lora_config.swap_gate_up_proj_lora_b_weight)
         self._lora_manager = LoraManager()
 
     def add_request_peft(self, request: LlmRequest):

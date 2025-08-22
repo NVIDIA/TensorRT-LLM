@@ -119,6 +119,9 @@ google/gemma-3-1b-it:
     accuracy: 37.5
 google/gemma-3-27b-it:
   - accuracy: 77.80
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 76.80
 Qwen/Qwen2-0.5B-Instruct:
   - accuracy: 45.30
   - quant_algo: FP8
