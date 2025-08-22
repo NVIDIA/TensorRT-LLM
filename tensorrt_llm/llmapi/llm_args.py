@@ -2259,10 +2259,10 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    mm_encoder_only: Optional[bool] = Field(
+    mm_encoder_only: bool = Field(
         default=False,
         description=
-        "Only load/execute the vision encoder part of the full model.",
+        "Only load/execute the vision encoder part of the full model. Defaults to False.",
         status="prototype",
     )
 

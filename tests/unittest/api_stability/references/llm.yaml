@@ -95,6 +95,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mm_encoder_only:
+        annotation: bool
+        default: False
+        status: prototype
       disable_overlap_scheduler:
         annotation: bool
         default: False
