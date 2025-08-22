@@ -8,7 +8,7 @@ disable_overlap_scheduler: True
 context_servers:
   num_instances: 1
   max_num_tokens: 512
-  max_batch_size: 256
+  max_batch_size: 64
   cache_transceiver_config:
     backend: DEFAULT
   urls:
@@ -16,7 +16,7 @@ context_servers:
 generation_servers:
   num_instances: 1
   max_num_tokens: 256
-  max_batch_size: 128
+  max_batch_size: 32
   cache_transceiver_config:
     backend: DEFAULT
   urls:
