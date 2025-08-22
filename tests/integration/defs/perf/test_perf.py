@@ -266,6 +266,8 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Average time-to-first-token \[TTFT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
     re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
+    PerfMetricType.KV_CACHE_SIZE:
+    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
 }
 # (Relative threshold, Absolute threshold) for all metric types
 PERF_METRIC_THRESHOLD = {
@@ -325,6 +327,7 @@ BENCH_INFERENCE_METRICS = [
     PerfMetricType.INFERENCE_TIME,
     PerfMetricType.TOKEN_THROUGHPUT,
     PerfMetricType.SEQ_THROUGHPUT,
+    PerfMetricType.KV_CACHE_SIZE,
 ]
 
 
