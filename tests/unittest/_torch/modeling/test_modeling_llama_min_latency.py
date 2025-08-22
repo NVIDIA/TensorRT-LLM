@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 import transformers
-from _torch.helpers import DecodingCUDAGraphRunner
+from _torch.helpers import create_mock_engine
 from parameterized import parameterized
 from transformers import Llama4Config
 from transformers import \
@@ -21,6 +21,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.llama4_weight_mapper import \
 from tensorrt_llm._torch.models.modeling_llama import \
     Llama4ForConditionalGeneration
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -402,6 +403,10 @@ class TestLlama4MinLatency(unittest.TestCase):
                          input_ids.size(-1) + gen_input_ids.size(-1))
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
+        graph_runner = None
+        if scenario.use_cuda_graph:
+            mock_engine = create_mock_engine(1)
+            graph_runner = CUDAGraphRunner(mock_engine)
 
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
@@ -410,19 +415,19 @@ class TestLlama4MinLatency(unittest.TestCase):
                                      position_ids=position_ids,
                                      attn_metadata=attn_metadata)
             else:
-                graph_runner = DecodingCUDAGraphRunner(
-                    attn_metadata.max_num_requests, "cuda", attn_metadata)
-                graph_runner.capture(lambda inputs: llama.forward(**inputs))
+                inputs = {
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                    "attn_metadata": attn_metadata,
+                }
+                graph_runner.capture(1, lambda inputs: llama.forward(**inputs),
+                                     inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.run({
-                        "input_ids": input_ids,
-                        "position_ids": position_ids,
-                        "attn_metadata": attn_metadata,
-                    })
+                    logits = graph_runner.replay(1, inputs)
                 return logits
 
         if scenario.use_cuda_graph:
