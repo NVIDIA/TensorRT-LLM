@@ -563,6 +563,8 @@ class Mapping(object):
         }
 
     def _build_mesh(self):
+        if self.world_size == 1:
+            return
         if Mapping.device_mesh is not None:
             return
         if not torch.distributed.is_initialized():
