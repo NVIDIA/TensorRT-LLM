@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, NoReturn, Optional, Union
 import torch
 import torch.fx
 import torch.utils._pytree as pytree
+from torch._guards import TracingContext
 from torch._inductor import lowering
 from torch._inductor.pattern_matcher import (
     CallFunction,
@@ -31,6 +32,48 @@ from torch._inductor.pattern_matcher import (
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+
+
+def ad_detect_fake_mode(inputs: Any = None):
+    """
+    Attempts to "detect" what the current fake mode is.  If there is one ambiently
+    available from TracingContext, we preferentially use that.  Otherwise, we
+    heuristically detect the fake mode via the following sources, in order of
+    priority:
+
+        - Currently active fake mode on stack
+        - Fake mode associated with passed in tensors (inputs does not
+          have to be flattened)
+    """
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    fake_modes = []
+
+    if context := TracingContext.try_get():
+        fake_mode = context.fake_mode
+        if fake_mode is not None:
+            fake_modes.append((fake_mode, "tracing context", 0))
+
+    from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
+
+    for i, m in enumerate(reversed(_get_current_dispatch_mode_stack())):
+        if isinstance(m, FakeTensorMode):
+            fake_modes.append((m, "active fake mode", i))
+
+    flat_inputs = pytree.tree_leaves(inputs)
+    for i, flat_input in enumerate(flat_inputs):
+        if isinstance(flat_input, FakeTensor):
+            fake_modes.append((flat_input.fake_mode, "fake tensor input", i))
+
+    if fake_modes:
+        fake_mode, _, _ = fake_modes[0]
+        return fake_mode
+    else:
+        return None
+
+
+# Replace the function used as a context manager
+torch._dynamo.utils.detect_fake_mode = ad_detect_fake_mode
 
 
 @contextlib.contextmanager
