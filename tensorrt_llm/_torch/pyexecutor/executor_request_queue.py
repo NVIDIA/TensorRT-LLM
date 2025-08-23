@@ -302,12 +302,13 @@ class ExecutorRequestQueue:
         return new_requests
 
     @nvtx_range("_fetch_new_requests")
-    def fetch_new_requests(self, num_active_requests: int) -> List[LlmRequest]:
+    def fetch_new_requests(
+            self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
 
         if self.enable_attention_dp:
-            return self._fetch_new_requests_attention_dp(num_active_requests)
+            return self._fetch_new_requests_attention_dp(activate_requests)
         else:
-            return self._fetch_new_requests_attention_tp(num_active_requests)
+            return self._fetch_new_requests_attention_tp(len(activate_requests))
 
     def _fetch_new_requests_attention_tp(
             self, num_active_requests: int) -> List[LlmRequest]:
@@ -326,13 +327,18 @@ class ExecutorRequestQueue:
         return merged_requests
 
     def _fetch_new_requests_attention_dp(
-            self, num_active_requests: int) -> List[LlmRequest]:
+            self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
         # Get active request counts across all ranks
         all_ranks_num_active_requests = []
-        responses_list = self.dist.tp_allgather(num_active_requests)
-        for num_active_requests in responses_list:
+        all_ranks_num_active_tokens = []
+        num_active_tokens = sum(
+            [len(req.input_token_ids) for req in activate_requests])
+        responses_list = self.dist.tp_allgather(
+            [len(activate_requests), num_active_tokens])
+        for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
+            all_ranks_num_active_tokens.append(num_active_tokens)
 
         total_num_active_requests = sum(all_ranks_num_active_requests)
         total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
@@ -346,7 +352,8 @@ class ExecutorRequestQueue:
 
         # Schedule attention dp requests
         all_ranks_new_requests = self._schedule_attention_dp_requests(
-            new_requests, all_ranks_num_active_requests)
+            new_requests, all_ranks_num_active_requests,
+            all_ranks_num_active_tokens)
         new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
         # Update performance metrics
@@ -364,7 +371,8 @@ class ExecutorRequestQueue:
 
     def _schedule_attention_dp_requests(
             self, new_requests: List[RequestQueueItem],
-            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
+            all_ranks_num_active_requests: List[int],
+            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
         """Schedule attention dp requests."""
 
         # Map from ranks to new requests
@@ -411,7 +419,7 @@ class ExecutorRequestQueue:
 
         all_ranks_new_requests = self._balance_requests_across_ranks(
             remaining_unscheduled, all_ranks_new_requests,
-            all_ranks_num_active_requests)
+            all_ranks_num_active_requests, all_ranks_num_active_tokens)
 
         return all_ranks_new_requests
 
@@ -469,7 +477,8 @@ class ExecutorRequestQueue:
     def _balance_requests_across_ranks(
             self, new_requests: List[RequestQueueItem],
             all_ranks_new_requests: Dict[int, List[RequestQueueItem]],
-            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
+            all_ranks_num_active_requests: List[int],
+            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
         """Balance requests across ranks for attention DP."""
         if new_requests:
             # Balance context tokens across ranks using heap
@@ -478,7 +487,7 @@ class ExecutorRequestQueue:
                 ['num_tokens', 'num_requests', 'rank', 'request_list'])
 
             all_ranks_new_requests_heap = [
-                HeapVal(0, val, tp_rank, [])
+                HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
                 for tp_rank, val in enumerate(all_ranks_num_active_requests)
             ]
 
@@ -503,6 +512,10 @@ class ExecutorRequestQueue:
 
             # Distribute requests across ranks
             for req_item in new_requests:
+                # Check if there are any ranks with capacity
+                if not all_ranks_new_requests_heap:
+                    break
+
                 val = heapq.heappop(all_ranks_new_requests_heap)
                 token_count = len(
                     getattr(req_item.request, 'input_token_ids',
