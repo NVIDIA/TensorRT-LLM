@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
+from ...models.factory import ModelFactory
+from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
@@ -14,7 +16,7 @@ from ...utils.node_utils import (
     is_linear_op,
 )
 from ...utils.quantization_utils import QuantizationImpl
-from .._graph import canonicalize_graph
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
 def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]):
@@ -116,30 +118,36 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     gm.delete_all_unused_submodules()
 
 
-def fuse_gemms(gm: GraphModule) -> None:
-    ad_logger.info("GEMM fusion")
-    ad_logger.debug("Before GEMM fusion: " + str(gm))
-    # sort linear nodes by parent node
-    linear_nodes = defaultdict(list)
-    for node in gm.graph.nodes:
-        # TODO: we don't handle bias for now...
-        if is_linear_op(node, include_quantization=True) and node.args[2] is None:
-            linear_nodes[node.args[0]].append(node)
+@TransformRegistry.register("fuse_gemms")
+class FuseGemms(BaseTransform):
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        # sort linear nodes by parent node
+        linear_nodes = defaultdict(list)
+        for node in gm.graph.nodes:
+            # TODO: we don't handle bias for now...
+            if is_linear_op(node, include_quantization=True) and node.args[2] is None:
+                linear_nodes[node.args[0]].append(node)
 
-    # fuse linear nodes
-    idx = -1
-    with cuda_memory_tracker():
-        for parent_node, lin_children in linear_nodes.items():
-            if len(lin_children) < 2:
-                continue
-            # linear nodes to fuse
-            ad_logger.debug(
-                f"Found linear nodes to fuse: {lin_children} with parent node: {parent_node}"
-            )
-            _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
+        # fuse linear nodes
+        idx = -1
+        num_matches = 0
+        with cuda_memory_tracker():
+            for parent_node, lin_children in linear_nodes.items():
+                if len(lin_children) < 2:
+                    continue
+                # linear nodes to fuse
+                _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
+                num_matches += 1
 
-        # clean up and return
-        canonicalize_graph(gm)
+        torch.cuda.empty_cache()
 
-    ad_logger.debug("After GEMM fusion: " + str(gm))
-    torch.cuda.empty_cache()
+        info = TransformInfo(
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+        )
+        return gm, info

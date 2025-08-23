@@ -564,6 +564,19 @@ def tiny_llama_model_root():
     return tiny_llama_model_root
 
 
+@pytest.fixture(scope="session")
+def mistral_small_3_1_24b_model_root():
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    model_root = os.path.join(models_root,
+                              "Mistral-Small-3.1-24B-Instruct-2503")
+
+    assert os.path.exists(
+        model_root
+    ), f"{model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    return model_root
+
+
 # Returns an array of total memory for each available device
 @pytest.fixture(scope="session")
 def total_gpu_memory_mib():

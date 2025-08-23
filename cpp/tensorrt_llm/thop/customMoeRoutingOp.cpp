@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/renormMoeRoutingKernels.h"
+#include "tensorrt_llm/kernels/customMoeRoutingKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 namespace th = torch;
@@ -25,7 +25,8 @@ namespace tk = tensorrt_llm::kernels;
 namespace torch_ext
 {
 
-std::tuple<at::Tensor, at::Tensor> renorm_moe_routing_op(th::Tensor const& router_logits, int64_t topk)
+template <bool DoSoftmaxBeforeTopK>
+std::tuple<at::Tensor, at::Tensor> custom_moe_routing_op(th::Tensor const& router_logits, int64_t topk)
 {
     auto data_type = router_logits.scalar_type();
     auto input_size = router_logits.sizes();
@@ -44,20 +45,22 @@ std::tuple<at::Tensor, at::Tensor> renorm_moe_routing_op(th::Tensor const& route
     {
     case torch::kFloat32:
         // Handle Float32
-        tk::invokeRenormMoeRouting<float, float, int32_t>(reinterpret_cast<float*>(router_logits.mutable_data_ptr()),
+        tk::invokeRenormMoeRouting<float, float, int32_t, DoSoftmaxBeforeTopK>(
+            reinterpret_cast<float*>(router_logits.mutable_data_ptr()),
             reinterpret_cast<float*>(topk_values.mutable_data_ptr()),
             reinterpret_cast<int32_t*>(topk_indices.mutable_data_ptr()), num_tokens, num_experts, topk, stream);
         break;
     case torch::kBFloat16:
         // Handle BFloat16
-        tk::invokeRenormMoeRouting<__nv_bfloat16, float, int32_t>(
+        tk::invokeRenormMoeRouting<__nv_bfloat16, float, int32_t, DoSoftmaxBeforeTopK>(
             reinterpret_cast<__nv_bfloat16*>(router_logits.mutable_data_ptr()),
             reinterpret_cast<float*>(topk_values.mutable_data_ptr()),
             reinterpret_cast<int32_t*>(topk_indices.mutable_data_ptr()), num_tokens, num_experts, topk, stream);
         break;
     case torch::kHalf:
         // Handle Half
-        tk::invokeRenormMoeRouting<half, float, int32_t>(reinterpret_cast<half*>(router_logits.mutable_data_ptr()),
+        tk::invokeRenormMoeRouting<half, float, int32_t, DoSoftmaxBeforeTopK>(
+            reinterpret_cast<half*>(router_logits.mutable_data_ptr()),
             reinterpret_cast<float*>(topk_values.mutable_data_ptr()),
             reinterpret_cast<int32_t*>(topk_indices.mutable_data_ptr()), num_tokens, num_experts, topk, stream);
         break;
@@ -69,6 +72,15 @@ std::tuple<at::Tensor, at::Tensor> renorm_moe_routing_op(th::Tensor const& route
     return {topk_indices, topk_values};
 }
 
+std::tuple<at::Tensor, at::Tensor> renorm_moe_routing_op(th::Tensor const& router_logits, int64_t topk)
+{
+    return custom_moe_routing_op<false>(router_logits, topk);
+}
+
+std::tuple<at::Tensor, at::Tensor> default_moe_routing_op(th::Tensor const& router_logits, int64_t topk)
+{
+    return custom_moe_routing_op<true>(router_logits, topk);
+}
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -81,4 +93,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("renorm_moe_routing_op", &torch_ext::renorm_moe_routing_op);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "default_moe_routing_op(Tensor router_logits, SymInt topk"
+        ") -> (Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("default_moe_routing_op", &torch_ext::default_moe_routing_op);
 }
