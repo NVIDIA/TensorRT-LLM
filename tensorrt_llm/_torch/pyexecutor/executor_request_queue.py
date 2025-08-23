@@ -333,7 +333,7 @@ class ExecutorRequestQueue:
         all_ranks_num_active_requests = []
         all_ranks_num_active_tokens = []
         num_active_tokens = sum(
-            [len(req.input_token_ids) for req in activate_requests])
+            [req.py_orig_prompt_len for req in activate_requests])
         responses_list = self.dist.tp_allgather(
             [len(activate_requests), num_active_tokens])
         for num_active_requests, num_active_tokens in responses_list:
@@ -512,9 +512,6 @@ class ExecutorRequestQueue:
 
             # Distribute requests across ranks
             for req_item in new_requests:
-                # Check if there are any ranks with capacity
-                if not all_ranks_new_requests_heap:
-                    break
 
                 val = heapq.heappop(all_ranks_new_requests_heap)
                 token_count = len(
