@@ -140,11 +140,6 @@ class QuantizationImpl:
         pass
 
     @staticmethod
-    def custom_op():
-        """Unified custom kernel entry-point for quantized linear."""
-        return torch.ops.auto_deploy.custom_quant_linear
-
-    @staticmethod
     def build_custom_kwargs_for_linear(
         scale_getattrs: Dict[str, Node],
     ) -> Dict[str, object]:
