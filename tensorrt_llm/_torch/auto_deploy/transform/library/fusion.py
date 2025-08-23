@@ -102,7 +102,7 @@ class QuantizationFusionMixin:
     that share the same input activation (parent node).
 
     Subclasses must define:
-      - target_op: the torch op identifying the quantized linear (e.g., torch.ops.auto_deploy.torch_quant_linear_fp8)
+      - target_op: the torch op identifying the quantized linear
       - scale_groups: List[List[str]] describing how kwargs should be grouped, e.g.
             FP8 -> [["input_scale"], ["weight_scale"]]
             FP4 -> [["input_scale"], ["weight_scale", "alpha"]]
@@ -260,7 +260,7 @@ class FuseGemms(BaseTransform):
 
 @TransformRegistry.register("fuse_fp8_gemms")
 class FuseFP8Gemms(QuantizationFusionMixin, BaseTransform):
-    target_op = torch.ops.auto_deploy.torch_quant_linear_fp8
+    target_op = torch.ops.auto_deploy.torch_fake_quant_fp8_linear
     scale_groups = [["input_scale"], ["weight_scale"]]
 
     def fuse_rule(
@@ -298,7 +298,7 @@ class FuseFP8Gemms(QuantizationFusionMixin, BaseTransform):
 
 @TransformRegistry.register("fuse_fp4_gemms")
 class FuseFP4Gemms(QuantizationFusionMixin, BaseTransform):
-    target_op = torch.ops.auto_deploy.torch_quant_linear_fp4
+    target_op = torch.ops.auto_deploy.torch_fake_quant_fp4_linear
     scale_groups = [["input_scale"], ["weight_scale", "alpha"]]
 
     def fuse_rule(
