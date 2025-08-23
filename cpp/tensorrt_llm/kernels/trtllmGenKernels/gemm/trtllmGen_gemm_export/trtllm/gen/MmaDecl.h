@@ -16,7 +16,7 @@
  */
 #pragma once
 
-#include "trtllm/gen/CommonUtils.h"
+#include "CommonUtils.h"
 #include <cassert>
 #include <cstdint>
 #include <string>
