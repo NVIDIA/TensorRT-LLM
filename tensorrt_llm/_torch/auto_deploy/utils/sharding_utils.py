@@ -15,7 +15,11 @@ from torch.fx import GraphModule, Node
 from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
 from .node_utils import extract_param_names_from_lin_node, is_op, num_users_of_weight_node
-from .quantization_utils import QuantizationImpl
+from .quantization_utils import (
+    QuantizationImpl,
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
+    modelopt_fp4_scale_to_cutlass_fp4_scale,
+)
 
 
 def _load_hook(
@@ -265,12 +269,38 @@ class TPShardingInfo(ShardingTransformInfo):
         )
 
 
-class QuantizationShardingMixin:
+class QuantizationShardingMixin(ABC):
     """
     Mixin that provides a callback to handle quantization-aware sharding:
       - shards/rewrites scale buffers
       - registers the quantized shard load hook
     """
+
+    @abstractmethod
+    def scale_names(self) -> List[str]: ...
+
+    @abstractmethod
+    def shard_scales(
+        self,
+        dim: int,
+        rank: int,
+        world_size: int,
+        weight_shape: torch.Size,
+        **scales: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]: ...
+
+    @abstractmethod
+    def shard_load_hook(
+        self,
+        state_dict,
+        prefix,
+        *args,
+        weight_name: str,
+        weight_shape: torch.Size,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> None: ...
 
     def quantization_cb(
         self,
@@ -283,19 +313,17 @@ class QuantizationShardingMixin:
         rank: int,
         world_size: int,
     ) -> None:
-        quantization_impl = QuantizationImpl.create(node)
-
         scales = {}
-        for scale_name in quantization_impl.scale_names():
+        for scale_name in self.scale_names():
             scales[scale_name] = submod.get_buffer(scale_name)
         scales["weight_shape"] = weight_new_shape
-        sharded_scales = quantization_impl.shard_scales(dim, rank, world_size, **scales)
+        sharded_scales = self.shard_scales(dim, rank, world_size, **scales)
         for k, v in sharded_scales.items():
             submod.register_buffer(k, v)
 
         gm._register_load_state_dict_pre_hook(
             partial(
-                quantization_impl.shard_load_hook,
+                self.shard_load_hook,
                 weight_name=weight_key,
                 weight_shape=weight_new_shape,
                 dim=dim,
@@ -307,6 +335,37 @@ class QuantizationShardingMixin:
 
 class FP8TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
     """Tensor-parallel sharding for FP8-quantized linears."""
+
+    def scale_names(self) -> List[str]:
+        return ["input_scale", "weight_scale"]
+
+    def shard_scales(
+        self,
+        dim: int,
+        rank: int,
+        world_size: int,
+        weight_shape: torch.Size,
+        *,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            "input_scale": input_scale,
+            "weight_scale": weight_scale,
+        }
+
+    def shard_load_hook(
+        self,
+        state_dict,
+        prefix,
+        *args,
+        weight_name: str,
+        weight_shape: torch.Size,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        return
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_matmul(
@@ -321,8 +380,60 @@ class FP8TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
         )
 
 
+def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
+    assert weight_scale.dim() == 1
+    weight_shape_original = list(sharded_uint8_weight_shape)
+    weight_shape_original[dim] = weight_shape_original[dim] * world_size
+    weight_shape_original[-1] *= 2
+    modelopt_weight_scale = cutlass_fp4_scale_to_modelopt_fp4_scale(
+        weight_scale, tuple(weight_shape_original)
+    )
+    return modelopt_fp4_scale_to_cutlass_fp4_scale(
+        modelopt_weight_scale.tensor_split(world_size, dim=dim)[rank]
+    )
+
+
 class FP4TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
     """Tensor-parallel sharding for FP4-quantized linears."""
+
+    def scale_names(self) -> List[str]:
+        return ["input_scale", "weight_scale", "alpha"]
+
+    def shard_scales(
+        self,
+        dim: int,
+        rank: int,
+        world_size: int,
+        weight_shape: torch.Size,
+        *,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        input_scale: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            "alpha": alpha,
+            "input_scale": input_scale,
+            "weight_scale": _shard_fp4_weight_scale(
+                weight_scale, weight_shape, dim, rank, world_size
+            ),
+        }
+
+    def shard_load_hook(
+        self,
+        state_dict,
+        prefix,
+        *args,
+        weight_name: str,
+        weight_shape: torch.Size,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        key = weight_name + "_scale"
+        if key in state_dict:
+            state_dict[key] = _shard_fp4_weight_scale(
+                state_dict[key], weight_shape, dim, rank, world_size
+            )
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         _insert_sharded_matmul(
