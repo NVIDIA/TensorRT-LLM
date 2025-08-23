@@ -1,3 +1,4 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Optional
