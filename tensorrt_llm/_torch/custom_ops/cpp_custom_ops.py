@@ -179,6 +179,12 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::calculate_nvfp4_global_scale")
+    def _(input: torch.Tensor, tokens_per_batch: Optional[torch.Tensor]):
+        shape = list(input.shape)
+        shape[-1] = 1
+        return input.new_empty(shape, dtype=torch.float32)
+
     @torch.library.register_fake("trtllm::moe_comm_prepare_indices")
     def _(
         gathered_target_rank_ids: torch.Tensor,
