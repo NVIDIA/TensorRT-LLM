@@ -45,6 +45,9 @@ class Qwen3Attention(Attention):
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
 
+        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712)
+        disable_deep_gemm = True
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -58,6 +61,7 @@ class Qwen3Attention(Attention):
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
             config=model_config,
+            disable_deep_gemm=disable_deep_gemm,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
@@ -128,13 +132,18 @@ class Qwen3DecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
+        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712)
+        disable_deep_gemm = True
+
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             bias=config.mlp_bias if hasattr(config, "mlp_bias") else False,
             dtype=config.torch_dtype,
             config=model_config,
+            disable_deep_gemm=disable_deep_gemm,
         )
+
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
