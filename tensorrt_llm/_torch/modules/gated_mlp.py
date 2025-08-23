@@ -30,6 +30,7 @@ class GatedMLP(nn.Module):
                  reduce_output: bool = True,
                  layer_idx: Optional[int] = None,
                  use_cute_dsl_blockscaling_mm: bool = False):
+
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -101,7 +102,7 @@ class GatedMLP(nn.Module):
 
     def _apply_activation(self, x, *, has_lora: bool = False):
         if self.activation == F.silu:
-            if self.down_proj.has_fp8_qdq:
+            if self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8:
                 if has_lora:
                     # NOTE: This is a WAR, since LoRA grouped_gemm does not support FP8 yet.
                     # TODO: Remove this path when LoRA grouped_gemm supports FP8
