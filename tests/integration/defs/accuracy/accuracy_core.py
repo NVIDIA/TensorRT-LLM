@@ -297,7 +297,7 @@ class GSM8K(AccuracyTask):
     ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
-    NUM_SAMPLES = 2  # Full sample
+    NUM_SAMPLES = 1319  # Full sample
 
     MAX_INPUT_LEN = 4096
     MAX_OUTPUT_LEN = 256
