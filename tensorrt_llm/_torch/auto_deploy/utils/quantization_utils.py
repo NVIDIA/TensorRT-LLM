@@ -146,6 +146,12 @@ class QuantizationImpl:
         """Default: no extra kwargs. Each impl overrides to pass the right inputs/scales/zps/format."""
         return {}
 
+    @staticmethod
+    def build_custom_args_for_linear(  # renamed to reflect args
+        scale_getattrs: Dict[str, Node],
+    ) -> Tuple[object, ...]:
+        return ()
+
 
 class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
@@ -155,7 +161,7 @@ class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
     def custom_op():
         """Unified custom kernel entry-point for quantized linear."""
-        return torch.ops.auto_deploy.torch_fake_quant_fp8_linear
+        return torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
@@ -186,6 +192,24 @@ class FP8QuantizationImpl(QuantizationImpl):
         )
 
     @staticmethod
+    def build_custom_args_for_linear(  # renamed to reflect args
+        scale_getattrs: Dict[str, Node],
+    ) -> Tuple[object, ...]:
+        """
+        Build the *positional* tail for torch_fake_quant_fp8_linear:
+            (..., bias, input_scale(list), weight_scale(list), input_zp(list), weight_zp(list))
+
+        We pass bias=None to match the exported pattern:
+        torch_fake_quant_fp8_linear(args_0, args_1, args_2, [args_2_0], [args_3_0], [], [])
+        """
+        return (
+            [scale_getattrs["input_scale"]],  # input_scale list
+            [scale_getattrs["weight_scale"]],  # weight_scale list
+            [],  # input_zp
+            [],  # weight_zp
+        )
+
+    @staticmethod
     def load_hook(state_dict, prefix, *args, weight_name):
         if weight_name in state_dict:
             weight = state_dict[weight_name]
@@ -211,7 +235,7 @@ class FP4QuantizationImpl(QuantizationImpl):
     @staticmethod
     def custom_op():
         """Unified custom kernel entry-point for quantized linear."""
-        return torch.ops.auto_deploy.torch_fake_quant_fp4_linear
+        return torch.ops.auto_deploy.torch_fake_quant_fp4_linear.default
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
@@ -261,6 +285,24 @@ class FP4QuantizationImpl(QuantizationImpl):
             input_zp=[],
             weight_zp=[],
             # format_type=FORMAT_NVFP4,
+        )
+
+    @staticmethod
+    def build_custom_args_for_linear(  # renamed to reflect args
+        scale_getattrs: Dict[str, Node],
+    ) -> Tuple[object, ...]:
+        """
+        Build the *positional* tail for torch_fake_quant_fp8_linear:
+            (..., bias, input_scale(list), weight_scale(list), input_zp(list), weight_zp(list))
+
+        We pass bias=None to match the exported pattern:
+        torch_fake_quant_fp8_linear(args_0, args_1, args_2, [args_2_0], [args_3_0], [], [])
+        """
+        return (
+            [scale_getattrs["input_scale"]],  # input_scale list
+            [scale_getattrs["weight_scale"], scale_getattrs["alpha"]],  # weight_scale list
+            [],  # input_zp
+            [],  # weight_zp
         )
 
     @staticmethod

@@ -77,12 +77,10 @@ def _insert_quantized_linear(
         for scale_name in quantization_impl.scale_names():
             scales[scale_name] = gm.graph.create_node("get_attr", modname + "." + scale_name)
 
-    custom_kwargs = quantization_impl.build_custom_kwargs_for_linear(
-        scales,
-    )
+    custom_args = quantization_impl.build_custom_args_for_linear(scales)
 
     node.target = quantization_impl.custom_op()
-    node.kwargs = {**node.kwargs, **custom_kwargs}
+    node.args = (*node.args, *custom_args)
 
 
 def _insert_quantized_bmm(

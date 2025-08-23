@@ -89,6 +89,8 @@ transforms:
   fuse_rmsnorm:
     stage: post_load_fusion
     backend: flashinfer
+  fuse_quant:
+    stage: post_load_fusion
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
