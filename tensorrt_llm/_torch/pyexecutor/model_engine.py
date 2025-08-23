@@ -438,13 +438,16 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.cache_indirection_attention = None
 
-    def set_lora_model_config(self, lora_target_modules: list[str],
-                              trtllm_modules_to_hf_modules: dict[str, str]):
+    def set_lora_model_config(self,
+                              lora_target_modules: list[str],
+                              trtllm_modules_to_hf_modules: dict[str, str],
+                              swap_gate_up_proj_lora_b_weight: bool = True):
         self.lora_model_config = LoraModelConfig(
             lora_target_modules=lora_target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
             hidden_size=self.model.config.hidden_size,
-            dtype=torch_dtype_to_str(self.model.config.torch_dtype))
+            dtype=torch_dtype_to_str(self.model.config.torch_dtype),
+            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
 
     @property
     def use_mrope(self):
