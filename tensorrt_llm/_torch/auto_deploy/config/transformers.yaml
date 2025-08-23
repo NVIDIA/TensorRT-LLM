@@ -13,12 +13,10 @@ transforms:
     run_graph_cleanup: false
     requires_clean_graph: false
 
-  load_weights:
+  load_factory_model_weights:
     stage: weight_load
     run_graph_cleanup: false
     requires_clean_graph: false
-    #We need this argument to load weights for the factory model.
-    load_factoy_model: true
 
   initialize_cache:
     stage: cache_init

@@ -51,6 +51,12 @@ class InferenceOptimizer:
             ].checkpoint_device = self.ad_config.checkpoint_device
             self.ad_config.transforms["load_weights"].device = cm.device
 
+        if "load_factory_model_weights" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "load_factory_model_weights"
+            ].checkpoint_device = self.ad_config.checkpoint_device
+            self.ad_config.transforms["load_factory_model_weights"].device = cm.device
+
         if "resize_kv_cache" in self.ad_config.transforms:
             self.ad_config.transforms[
                 "resize_kv_cache"
