@@ -125,6 +125,10 @@ class QuantizationFusionMixin:
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         raise NotImplementedError
 
+    def build_custom_args_for_linear(self, scale_getattrs: Dict[str, Node]) -> Tuple[object, ...]:
+        """Return the *positional* tail after bias for the fused call."""
+        raise NotImplementedError
+
     def _insert_fused_quant_gemm(
         self, gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]
     ):
@@ -163,16 +167,17 @@ class QuantizationFusionMixin:
 
             # For each kwarg group (e.g., input_scale, weight_scale[, alpha]),
             # create a list of get_attr nodes in the same structure the op expects.
-            for group, kwarg_name in zip(self.scale_groups, ["input_scale", "weight_scale"]):
-                fused_kwargs[kwarg_name] = [
-                    gm.graph.create_node("get_attr", f"{key_fused}_{name}") for name in group
-                ]
+            scale_getattrs: Dict[str, Node] = {
+                name: gm.graph.create_node("get_attr", f"{key_fused}_{name}")
+                for name in flat_scale_names
+            }
+            custom_tail_args = self.build_custom_args_for_linear(scale_getattrs)
 
         # add new linear node + split node
         with gm.graph.inserting_before(linear_nodes[0]):
             fused_linear_node = gm.graph.call_function(
                 get_op_overload_packet(linear_nodes[0].target),
-                args=(parent_node, get_param_node, None),
+                args=(parent_node, get_param_node, None, *custom_tail_args),
                 kwargs=fused_kwargs,
             )
             split_node = gm.graph.call_function(split_output, args=(fused_linear_node,))
@@ -286,6 +291,15 @@ class FuseFP8Gemms(QuantizationFusionMixin, BaseTransform):
             "input_scale": input_scale[0].clone(),
         }
 
+    def build_custom_args_for_linear(self, scale_getattrs: Dict[str, Node]) -> Tuple[object, ...]:
+        # (..., bias, input_scale(list), weight_scale(list), input_zp(list), weight_zp(list))
+        return (
+            [scale_getattrs["input_scale"]],
+            [scale_getattrs["weight_scale"]],
+            [],
+            [],
+        )
+
     def _apply(
         self,
         gm: GraphModule,
@@ -322,6 +336,15 @@ class FuseFP4Gemms(QuantizationFusionMixin, BaseTransform):
             "alpha": alpha[0],
             "input_scale": input_scale[0].clone(),
         }
+
+    def build_custom_args_for_linear(self, scale_getattrs: Dict[str, Node]) -> Tuple[object, ...]:
+        # (..., bias, input_scale(list), weight_scale(list-with-alpha), input_zp(list), weight_zp(list))
+        return (
+            [scale_getattrs["input_scale"]],
+            [scale_getattrs["weight_scale"], scale_getattrs["alpha"]],
+            [],
+            [],
+        )
 
     def _apply(
         self,
