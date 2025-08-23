@@ -1812,6 +1812,7 @@ void KVCacheManager::addSequenceWithEviction(
 {
     TLLM_CHECK_WITH_INFO(length <= mMaxBlocksPerSeq * mTokensPerBlock, 
         "Do not accept delta length %d, %d x %d.", length, mMaxBlocksPerSeq, mTokensPerBlock);
+    mBlockManager.markSequenceRetained(requestId);
 
     auto const oldSeqIt = mSequences.find(requestId);
     if (mSequences.end() != oldSeqIt) {
@@ -1844,7 +1845,6 @@ void KVCacheManager::addSequenceWithEviction(
             curLength = 0;
         }
         else {
-            mBlockManager.markSequenceRetained(requestId);
             auto& sequence = mSequences.at(requestId);
             mBlockManager.evictBlocks(sequence, numBlocksSelfEvict);
             // cacheBlockOffsets(sequence);
@@ -1877,7 +1877,6 @@ void KVCacheManager::addSequenceWithEviction(
     SizeType32 numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
     SizeType32 numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
 
-    mBlockManager.markSequenceRetained(requestId);
     if (mSequences.end() == mSequences.find(requestId)) {
         auto kvCacheRetentionConfig = llmRequest
             ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
