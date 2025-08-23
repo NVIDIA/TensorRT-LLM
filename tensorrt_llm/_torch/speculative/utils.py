@@ -64,7 +64,7 @@ def get_spec_metadata(spec_config,
             dtype=model_config.torch_dtype,
             is_draft_model=is_draft_model,
             eagle3_resource_manager=spec_resource_manager,
-            num_capture_layers=spec_config.num_capture_layers,
+            layers_to_capture=spec_config.eagle3_layers_to_capture,
             save_last_layer_post_norm=spec_config.save_last_layer_post_norm,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
@@ -117,7 +117,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesResourceManager(
             spec_config,
-            draft_model_engine.model.config.torch_dtype,
+            model_engine.model.config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
             max_seq_len,

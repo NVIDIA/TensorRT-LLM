@@ -463,7 +463,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     write_interval: int = 20
     file_prefix: str = "data"
     eagle3_layers_to_capture: Optional[Set[int]] = None
-    save_last_layer_post_norm: bool = False
+    save_last_layer_post_norm: bool = True
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -481,6 +481,17 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.SAVE_HIDDEN_STATES
+
+    @functools.cached_property
+    def num_capture_layers(self):
+        """
+        Returns the number of layers to capture of the target model.
+        If eagle3_layers_to_capture is not None, return the length of the set.
+        Otherwise, assume Eagle3 base set and return 3.
+        """
+        if self.eagle3_layers_to_capture is not None:
+            return len(self.eagle3_layers_to_capture)
+        return 3
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -962,7 +973,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
-    SaveHiddenStateDecodingConfig,
+    SaveHiddenStatesDecodingConfig,
     AutoDecodingConfig,
 ]]
 
@@ -1740,13 +1751,13 @@ class BaseLlmArgs(StrictBaseModel):
             elif isinstance(self.speculative_config,
                             SaveHiddenStatesDecodingConfig):
                 assert self.backend in ['pytorch']
-                assert self.speculative_config.max_draft_len > 0
                 self.build_config.max_batch_size = 1
                 self.max_batch_size = 1
                 self.disable_overlap_scheduler = True
                 self.cuda_graph_config = None
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.SAVE_HIDDEN_STATES
                 self.build_config.max_draft_len = 1
+                self.speculative_config.max_draft_len = 1
 
             else:
                 raise ValueError(
