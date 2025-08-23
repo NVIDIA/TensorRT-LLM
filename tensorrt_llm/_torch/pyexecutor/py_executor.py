@@ -923,7 +923,7 @@ class PyExecutor:
             self.use_spec_decode = self.drafter.should_use_spec_decode(
                 self.active_requests, self.max_batch_size,
                 self.model_engine.max_num_tokens,
-                self.model_engine.max_draft_len)
+                self.model_engine.spec_config.max_draft_len)
             self.model_engine.enable_spec_decode = self.use_spec_decode
             # If speculation is off, this function sets py_draft_tokens to None
             # for all active requests. If it's on, we initialize py_draft_tokens

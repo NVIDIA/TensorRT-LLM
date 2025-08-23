@@ -35,10 +35,13 @@ class Drafter(ABC):
         assumes that speculation is always on if max_concurrency
         is not specified by the user's spec config.
         """
+
+        # Inputs validated upstream: max_batch_size>0, max_num_tokens>0, max_draft_len>0
+
         if self.max_concurrency is None:
             return True
 
-        tokens_per_request = 1 + max_draft_len
-        token_cap = max_num_tokens // tokens_per_request
-        num_effective_requests = min(max_batch_size, len(requests), token_cap)
-        return num_effective_requests <= self.max_concurrency
+        token_cap = max_num_tokens // (1 + max_draft_len)
+        num_effective_requests = min(len(requests), max_batch_size, token_cap)
+
+        return 0 < num_effective_requests <= self.max_concurrency
