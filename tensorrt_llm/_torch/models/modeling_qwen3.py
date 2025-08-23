@@ -48,6 +48,9 @@ class Qwen3Attention(QKNormRoPEAttention):
                 rope=RopeParams.from_config(config),
             )
 
+        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712)
+        # TODO: Consider adding disable_deep_gemm support to QKNormRoPEAttention if accuracy still remains
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -85,6 +88,7 @@ class Qwen3DecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
             config=model_config,
         )
+
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
