@@ -55,7 +55,14 @@ input [
     {
         name: "IMAGE_URL"
         data_type: TYPE_STRING
-        dims: [ 1 ]
+        dims: [ -1 ]
+        optional: true
+    },
+    # Required for pixtral
+    {
+        name: "IMAGE_SIZES"
+        data_type: TYPE_INT64
+        dims: [ -1, 2 ]
         optional: true
     },
     {
@@ -188,11 +195,11 @@ output [
         data_type: TYPE_INT64
         dims: [ -1, -1, -1 ]
     },
-    # Required for image postprocessing in the llava_onevision model
+    # Required for image postprocessing in the llava_onevision and pixtral models
     {
         name: "IMAGE_SIZES"
         data_type: TYPE_INT64
-        dims: [ 2 ]
+        dims: [ -1, 2 ]
     },
     # Indicates if the input is video in the llava_onevision model
     {
