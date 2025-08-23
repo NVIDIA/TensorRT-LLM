@@ -162,8 +162,8 @@ def _dequantize_nvfp4(
     return vals.view(N, K).to(orig_dtype)
 
 
-@torch.library.custom_op("auto_deploy::torch_quant_linear_fp8", mutates_args=())
-def torch_quant_linear_fp8(
+@torch.library.custom_op("auto_deploy::torch_fake_quant_fp8_linear", mutates_args=())
+def torch_fake_quant_fp8_linear(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
     bias: torch.Tensor,  # Optional, no default
@@ -198,8 +198,8 @@ def torch_quant_linear_fp8(
     return out.reshape(*input.shape[:-1], out_features)
 
 
-@torch_quant_linear_fp8.register_fake
-def torch_quant_linear_fp8(
+@torch_fake_quant_fp8_linear.register_fake
+def torch_fake_quant_fp8_linear(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
     bias: torch.Tensor,
@@ -212,8 +212,8 @@ def torch_quant_linear_fp8(
     return torch.ops.aten.linear(input, w, bias)
 
 
-@torch.library.custom_op("auto_deploy::torch_quant_linear_fp4", mutates_args=())
-def torch_quant_linear_fp4(
+@torch.library.custom_op("auto_deploy::torch_fake_quant_fp4_linear", mutates_args=())
+def torch_fake_quant_fp4_linear(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
     bias: torch.Tensor,  # Optional, no default
@@ -274,8 +274,8 @@ def torch_quant_linear_fp4(
     return out_2d.reshape(*input_shape[:-1], N)
 
 
-@torch_quant_linear_fp4.register_fake
-def torch_quant_linear_fp4(
+@torch_fake_quant_fp4_linear.register_fake
+def torch_fake_quant_fp4_linear(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
     bias: torch.Tensor,

@@ -128,7 +128,7 @@ def test_quant_linear_fp8_matches_fused_op(bias):
         weight_scale=weight_scale,
     )
 
-    out_unified = torch.ops.auto_deploy.custom_quant_linear(
+    out_unified = torch.ops.auto_deploy.torch_fake_quant_fp8_linear(
         input,
         weight_fp8,
         bias,
@@ -136,7 +136,6 @@ def test_quant_linear_fp8_matches_fused_op(bias):
         [weight_scale],
         [],
         [],
-        format_type=FORMAT_FP8,
     )
 
     assert out_unified.shape == out_fused.shape
@@ -184,7 +183,7 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
         alpha=alpha_fused,
     )
 
-    out_unified = torch.ops.auto_deploy.custom_quant_linear(
+    out_unified = torch.ops.auto_deploy.torch_fake_quant_fp4_linear(
         x,
         weight_fp4,
         bias,
@@ -195,7 +194,6 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
         ],  # weight_scale list: [per-block vector, combined alpha]
         [],  # input_zp
         [],  # weight_zp
-        format_type=FORMAT_NVFP4,
     )
 
     assert out_unified.shape == out_fused.shape

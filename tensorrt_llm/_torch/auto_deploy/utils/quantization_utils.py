@@ -155,7 +155,7 @@ class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
     def custom_op():
         """Unified custom kernel entry-point for quantized linear."""
-        return torch.ops.auto_deploy.torch_quant_linear_fp8
+        return torch.ops.auto_deploy.torch_fake_quant_fp8_linear
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
@@ -211,7 +211,7 @@ class FP4QuantizationImpl(QuantizationImpl):
     @staticmethod
     def custom_op():
         """Unified custom kernel entry-point for quantized linear."""
-        return torch.ops.auto_deploy.torch_quant_linear_fp4
+        return torch.ops.auto_deploy.torch_fake_quant_fp4_linear
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
