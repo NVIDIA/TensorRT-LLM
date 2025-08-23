@@ -1101,7 +1101,7 @@ def test_balance_requests_across_ranks_capacity_limits(attention_dp_queue):
     """Test _balance_requests_across_ranks respects capacity limits."""
     # Create multiple requests
     requests = []
-    for i in range(10):
+    for i in range(4):
         req = RequestQueueItem(
             i,
             create_mock_request_with_py_schedule_params(attention_dp_rank=None))

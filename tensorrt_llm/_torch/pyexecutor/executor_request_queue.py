@@ -513,9 +513,6 @@ class ExecutorRequestQueue:
 
             # Distribute requests across ranks
             for req_item in new_requests:
-                # Check if there are any ranks with capacity
-                if not all_ranks_new_requests_heap:
-                    break
 
                 val = heapq.heappop(all_ranks_new_requests_heap)
                 token_count = len(
