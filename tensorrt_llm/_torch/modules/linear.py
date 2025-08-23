@@ -572,7 +572,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        if get_sm_version() == 100:
+        if get_sm_version() == 100 and not module.disable_deep_gemm:
             from tensorrt_llm import deep_gemm
             a, a_sf = fp8_utils.per_token_quant_and_transform(input)
             output = torch.empty((input.shape[0], module.weight.shape[0]),
@@ -1481,6 +1481,7 @@ class Linear(nn.Module):
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
+        disable_deep_gemm: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -1497,6 +1498,7 @@ class Linear(nn.Module):
         self.tp_mode = tensor_parallel_mode
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
+        self.disable_deep_gemm = disable_deep_gemm
 
         local_in_features = in_features
         local_out_features = out_features
