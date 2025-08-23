@@ -24,9 +24,6 @@ class LoadWeightsToDeviceConfig(TransformConfig):
     adconfig_checkpoint_device: Optional[str] = Field(
         default=None, description="Optional checkpoint device argument from adconfig."
     )
-    load_factoy_model: bool = Field(
-        default=False, description="Whether to load the factory model in addition to main gm."
-    )
 
 
 @TransformRegistry.register("load_weights")
@@ -49,9 +46,31 @@ class LoadWeightsToDevice(BaseTransform):
         factory.load_or_random_init(
             gm,
             device=self.config.adconfig_checkpoint_device or self.config.device,
-            load_factoy_model=self.config.load_factoy_model,
         )
         move_to_device(gm, self.config.device)
+        cm.to(self.config.device)
+
+        info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
+
+        return gm, info
+
+
+@TransformRegistry.register("load_factory_model_weights")
+class LoadFactoryModelWeights(LoadWeightsToDevice):
+    """Load weights for the factory model in the transformers mode."""
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        factory.load_or_random_init(
+            gm.factory_model,
+            device=self.config.adconfig_checkpoint_device or self.config.device,
+        )
+        move_to_device(gm.factory_model, self.config.device)
         cm.to(self.config.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)

@@ -165,9 +165,7 @@ class ModelFactory(ABC):
         """
         return model_name_or_path
 
-    def load_or_random_init(
-        self, model: nn.Module, device: DeviceLikeType, load_factoy_model: bool = False
-    ):
+    def load_or_random_init(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model or randomly initialize the model.
 
         Args:
@@ -207,7 +205,7 @@ class ModelFactory(ABC):
         self._to_maybe_random(model, device)
         if not self.skip_loading_weights:
             self.prefetch_checkpoint(force=True)
-            self._load_checkpoint(model, device, load_factoy_model=load_factoy_model)
+            self._load_checkpoint(model, device)
 
     @staticmethod
     def _to_maybe_random(model: nn.Module, device: DeviceLikeType):
