@@ -49,6 +49,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
+from .harmony_adapter import (HarmonyAdapter, handle_non_streaming_response,
+                              handle_streaming_response)
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -97,6 +99,10 @@ class OpenAIServer:
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+        # gpt-oss
+        self.harmony_adapter = HarmonyAdapter()
+        self.use_harmony = self.model_config.model_type == "gpt_oss"
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -158,7 +164,6 @@ class OpenAIServer:
         return JSONResponse(content=error_response.model_dump(),
                             status_code=error_response.code)
 
-
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
@@ -173,7 +178,7 @@ class OpenAIServer:
                                self.openai_completion,
                                methods=["POST"])
         self.app.add_api_route("/v1/chat/completions",
-                               self.openai_chat,
+                               self.openai_chat if not self.use_harmony else self.chat_harmony,
                                methods=["POST"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
@@ -660,6 +665,76 @@ class OpenAIServer:
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+
+    async def chat_harmony(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+        """
+        Chat Completion API with harmony format support.
+        Supports both streaming and non-streaming modes.
+        """
+        try:
+            # 1. RAW INPUT REQUEST (before harmony adapter)
+            # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
+            tools_dict = None
+            if request.tools:
+                tools_dict = [tool.model_dump() for tool in request.tools]
+
+            # Reasoning effort precedence: request.reasoning_effort > system message parsing > serving default
+            reasoning_effort = request.reasoning_effort
+
+            # Get tool_choice from request
+            tool_choice = getattr(request, 'tool_choice', None)
+
+            try:
+                harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+                    request.messages,
+                    tools_dict,
+                    reasoning_effort=reasoning_effort,
+                    tool_choice=tool_choice
+                )
+            except Exception as e:
+                logger.error(f"messages_dict: {request.messages}")
+                logger.error(f"tools_dict: {tools_dict}")
+                logger.error(f"request: {request}")
+                raise e
+
+            # Get harmony stop tokens
+            harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
+            if request.stop_token_ids:
+                request.stop_token_ids.extend(harmony_stop_tokens)
+            else:
+                request.stop_token_ids = harmony_stop_tokens
+
+            sampling_params = request.to_sampling_params(
+                vocab_size=self.tokenizer.tokenizer.vocab_size)
+            sampling_params.detokenize = False  # Harmony adapter handles detokenization
+
+            # Generate
+            promise = self.llm.generate_async(
+                inputs=harmony_tokens,
+                sampling_params=sampling_params,
+                streaming=bool(request.stream),
+                lora_request=request.lora_request,
+            )
+            # Disconnect cancellation
+            asyncio.create_task(self.await_disconnected(raw_request, promise))
+
+            # Handle streaming
+            if request.stream:
+                return StreamingResponse(
+                    handle_streaming_response(
+                        self.harmony_adapter, promise,
+                        str(promise.request_id), request,
+                    ),
+                    media_type="text/event-stream"
+                )
+            else:
+                response = await handle_non_streaming_response(self.harmony_adapter, promise, request)
+                return JSONResponse(response.model_dump())
+
+        except Exception as e:
+            logger.error("Error in harmony chat completion: %s", e)
+            logger.debug("Error details: %s", traceback.format_exc())
+            return self.create_error_response(message=str(e), err_type="internal_error")
 
     async def __call__(self, host, port):
         # Store the binding address for server registration

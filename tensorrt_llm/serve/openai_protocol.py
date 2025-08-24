@@ -6,10 +6,12 @@ import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import \
     ChatCompletionMessageParam as OpenAIChatCompletionMessageParam
+from openai_harmony import ReasoningEffort
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
@@ -327,6 +329,11 @@ class FunctionCall(OpenAIBaseModel):
     arguments: str
 
 
+class DeltaFunctionCall(BaseModel):
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
 class ToolCall(OpenAIBaseModel):
     id: str = Field(
         default_factory=lambda: f"chatcmpl-tool-{str(uuid.uuid4().hex)}")
@@ -334,10 +341,18 @@ class ToolCall(OpenAIBaseModel):
     function: FunctionCall
 
 
+class DeltaToolCall(OpenAIBaseModel):
+    id: Optional[str] = None
+    type: Optional[Literal["function"]] = None
+    index: int
+    function: Optional[DeltaFunctionCall] = None
+
+
 class ChatMessage(OpenAIBaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
     reasoning_content: Optional[str] = None
+    reasoning: Optional[str] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
 
 
@@ -378,8 +393,14 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     """
 
 
+class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
+    """Assistant message that includes reasoning tokens."""
+    reasoning: Optional[str]
+
+
 ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
-                                   CustomChatCompletionMessageParam]
+                                   CustomChatCompletionMessageParam,
+                                   ReasoningAssistantMessage]
 
 
 class ChatCompletionLogProbs(OpenAIBaseModel):
@@ -416,7 +437,9 @@ class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
-    tool_calls: List[ToolCall] = Field(default_factory=list)
+    # For GPT-OSS style reasoning
+    reasoning: Optional[str] = None
+    tool_calls: Optional[List[DeltaToolCall]] = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -469,8 +492,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
     top_logprobs: Optional[int] = 0
-    max_completion_tokens: int = Field(default=None,
-                                       validation_alias='max_tokens')
+    max_completion_tokens: Optional[int] = Field(default=None,
+                                                 validation_alias='max_tokens')
     n: int = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -481,9 +504,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none"],
+    tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
+    reasoning_effort: Optional[ReasoningEffort] = Field(
+        default=ReasoningEffort.LOW,
+        description=("The level of reasoning effort to use. Controls how much "
+                     "reasoning is shown in the model's response. Options: "
+                     "'low', 'medium', 'high'."),
+    )
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
@@ -610,9 +639,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_tool_choice(cls, data):
+        if "tool_choice" not in data and data.get("tools"):
+            data["tool_choice"] = "auto"
         if "tool_choice" in data and data["tool_choice"] != "none":
-            if not isinstance(data["tool_choice"], dict):
-                raise ValueError("Currently only named tools are supported.")
             if "tools" not in data or data["tools"] is None:
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")

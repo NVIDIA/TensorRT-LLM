@@ -466,8 +466,6 @@ class GenerationExecutorWorker(GenerationExecutor):
 
         def _deduce_max_tokens(request: GenerationRequest,
                                executor_config: tllm.ExecutorConfig) -> int:
-            if request.sampling_params.max_tokens:
-                return request.sampling_params.max_tokens
             # deduce max_tokens when it's not set by user
             query_token_len = len(
                 request.query_token_ids) if request.query_token_ids else 0
@@ -484,6 +482,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                     f"Deduced max_tokens {default_max_tokens} is less than 0, because"
                     f"prompt length {splited_prompt_len} plus query length {query_token_len} "
                     f"is larger than max_seq_len {executor_config.max_seq_len}")
+            # default_max_tokens is the biggest available value
+            if (max_tokens := request.sampling_params.max_tokens
+                ) and max_tokens < default_max_tokens:
+                return max_tokens
             return default_max_tokens
 
         try:
