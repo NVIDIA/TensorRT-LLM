@@ -3,8 +3,8 @@ from typing import List
 import torch
 from torch import nn
 
-from ..attention_backend import IS_FLASHINFER_AVAILABLE
 from ..attention_backend.interface import RopeParams
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 
 class RotaryEmbedding(nn.Module):
