@@ -204,7 +204,7 @@ class TorchDist(Distributed):
 
         self.local_comm = None
         for ranks in ip_to_ranks.values():
-            # all global ranks from the default process group to participate in the call,
+            # All global ranks from the default process group to participate in the call,
             # even if some ranks are not part of the new process group being created
             pg = dist.new_group(ranks=ranks, backend='cuda:nccl,cpu:gloo')
             if int(self.rank) in ranks:

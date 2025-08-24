@@ -881,16 +881,6 @@ private:
                 [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg) { return getLocalGroupTorch(mGroup); }},
             mNcclComm);
 
-        for (auto it = local_group.begin(); it != local_group.end(); ++it)
-        {
-            std::cout << "local_group: " << *it << std::endl;
-        }
-
-        for (auto it = mGroup.begin(); it != mGroup.end(); ++it)
-        {
-            std::cout << "mGroup: " << *it << std::endl;
-        }
-
         if (mGroup.size() != local_group.size())
         {
             mIsP2PSupported = false;
@@ -1397,27 +1387,6 @@ std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::
 
     return {normed_output, prenorm_output};
 }
-
-void cpp_dbg(torch::Tensor const& dbg, c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_)
-{
-    // # opts = dist.AllreduceOptions()
-    // # opts.reduceOp = dist.ReduceOp.SUM
-    // # cpu_test = torch.tensor([1.0])
-    // # self.tp_group.allreduce([cpu_test], opts).wait()
-    // # print(cpu_test)
-    // # gpu_test = torch.tensor([1.0]).cuda()
-    // # self.tp_group.allreduce([gpu_test], opts).wait()
-    // # print(gpu_test)
-    c10d::AllreduceOptions opts{c10d::ReduceOp::SUM};
-
-    std::vector gpu_inputs{dbg.clone()};
-
-    process_group_->allreduce(gpu_inputs, opts)->wait();
-
-    std::cout << "<cpp> gpu_test: " << flatten(gpu_inputs[0].to(torch::kFloat).cpu())[0].item().to<float>()
-              << std::endl;
-}
-
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -1481,7 +1450,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int rank,"
         "int nranks,"
         "float eps) -> Tensor[]");
-    // m.def("cpp_dbg(Tensor dbg, __torch__.torch.classes.c10d.ProcessGroup process_group) -> ()", &torch_ext::cpp_dbg);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

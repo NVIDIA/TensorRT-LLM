@@ -9,7 +9,7 @@ import time
 import traceback
 import weakref
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -18,7 +18,7 @@ try:
 except ImportError:
     from cuda import cudart
 
-from ray.util.queue import Queue as RayQueue
+import ray
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
@@ -317,9 +317,11 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
-    def enqueue_requests(self,
-                         requests: List[ExecutorRequest],
-                         result_wait_queue: Optional[Any] = None) -> List[int]:
+    def enqueue_requests(
+            self,
+            requests: List[ExecutorRequest],
+            result_wait_queue: Optional[ray.actor.ActorHandle] = None
+    ) -> List[int]:
         """
         Enqueue new requests
         """
@@ -414,10 +416,11 @@ class PyExecutor:
     def wait_shutdown(self):
         self.shutdown_event.wait()
 
-    def enqueue_request(self,
-                        request: ExecutorRequest,
-                        query: Optional[List] = None,
-                        result_wait_queue: Optional[RayQueue] = None) -> int:
+    def enqueue_request(
+            self,
+            request: ExecutorRequest,
+            query: Optional[List] = None,
+            result_wait_queue: Optional[ray.actor.ActorHandle] = None) -> int:
         """
         Enqueue a new request, query is only used in `StarAttention`.
         """
@@ -505,6 +508,7 @@ class PyExecutor:
                     "%Y-%m-%d %H:%M:%S")
                 logger.info(
                     f"iter = {self.model_engine.iter_counter}, "
+                    f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
                     f"{self.executor_request_queue.num_fetch_requests}, "

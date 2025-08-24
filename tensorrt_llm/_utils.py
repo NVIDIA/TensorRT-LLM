@@ -477,8 +477,7 @@ def mpi_comm():
     return comm
 
 
-# TODO: need cleanup
-local_comm = comm.Split_type(split_type=OMPI_COMM_TYPE_HOST)
+local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
 
 
 def local_mpi_comm():

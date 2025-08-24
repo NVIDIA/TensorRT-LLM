@@ -1,6 +1,5 @@
 import asyncio
 import json
-import pickle  # nosec B403
 import threading
 import weakref
 from dataclasses import dataclass, field
@@ -9,11 +8,9 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
                     NamedTuple, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
-import numpy as np
 import ray
 import torch
 import torch.nn.functional as F
-from ray.util.queue import Empty
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -443,7 +440,6 @@ class GenerationResultBase:
                 response_result.deserialize()
 
             self._done = response_result.is_final
-
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
@@ -667,18 +663,10 @@ class GenerationResult(GenerationResultBase):
             del self._logprob_params
 
     def _handle_ray_response(self, response: Any):
-        if isinstance(response, bytes):
-            response = pickle.loads(response)  # nosec B301
-        if isinstance(response, np.ndarray):
-            response = pickle.loads(response.tobytes())  # nosec B301
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
         if isinstance(self.queue, ray.actor.ActorHandle):
-            # TODO: validate if this is efficient and has side effects.
-            # async def get_response(request_id):
-            #     return await self.queue.get_async.remote(request_id)
-            # response = asyncio.run(get_response(self.request_id))
             response = ray.get(self.queue.get.remote(self.request_id))
             response = self._handle_ray_response(response)
         else:
