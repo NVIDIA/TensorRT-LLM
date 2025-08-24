@@ -1831,14 +1831,14 @@ public:
         }
     }
 
-    void setRequestedBlockHashes(std::vector<size_t> hashes)
+    void setRequestedBlockHashes(std::unordered_map<SizeType32, std::vector<size_t>>&& hashesPerWindow)
     {
-        mRequestedBlockHashes = std::move(hashes);
+        mRequestedBlockHashesPerWindow = std::move(hashesPerWindow);
     }
 
-    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const
+    [[nodiscard]] std::unordered_map<SizeType32, std::vector<size_t>> const& getRequestedBlockHashesPerWindow() const
     {
-        return mRequestedBlockHashes;
+        return mRequestedBlockHashesPerWindow;
     }
 
     void setIsDummyRequest(bool isDummyRequest)
@@ -2033,7 +2033,7 @@ protected:
     TensorMap mAdditionalGenerationOutputTensors;
 
     // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
-    std::vector<size_t> mRequestedBlockHashes;
+    std::unordered_map<SizeType32, std::vector<size_t>> mRequestedBlockHashesPerWindow;
 
     bool mIsDummyRequest{false};
 

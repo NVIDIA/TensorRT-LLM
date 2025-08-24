@@ -100,5 +100,6 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), nb::arg("cache_manager"),
             nb::arg("max_num_tokens") = std::nullopt)
         .def_static("pre_alloc_buffer_size", &tb::kv_cache_manager::CacheTransBufferManager::preAllocBufferSize,
-            nb::arg("cache_size_bytes_per_token_per_window"), nb::arg("cache_transceiver_config") = nb::none());
+            nb::arg("cache_size_bytes_per_token_per_window"), nb::arg("tokens_per_block"),
+            nb::arg("cache_transceiver_config") = nb::none());
 }

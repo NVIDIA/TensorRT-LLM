@@ -292,7 +292,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         auto const cacheSizeBytesPerTokenPerWindow = calculateCacheSizePerToken(
             mModelConfig, mWorldConfig, getMaxAttentionWindowVec(), mModelConfig.useCrossAttention(), 2);
         auto cacheTransPreAllocaSize = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(
-            cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
+            cacheSizeBytesPerTokenPerWindow, mModelConfig.getTokensPerBlock(), cacheTransceiverConfig);
 
         auto const [freePrimaryMemBytes, freeSecondaryMemBytes]
             = BaseKVCacheManager::calculateFreeMemBytes(mRuntime->getBufferManager(), kvCacheConfig);
