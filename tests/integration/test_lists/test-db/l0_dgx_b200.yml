@@ -103,4 +103,5 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-TRITON]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-fp8]
+  # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
