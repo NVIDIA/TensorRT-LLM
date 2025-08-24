@@ -623,7 +623,7 @@ def trtllm_bench_unified_comparison(
     num_hidden_layers=2,
     max_batch_size=32,  # below this value the kv cache resizing is skipped
     golden_tokens_per_sec=1400,
-    backend_relative_tolerance=0.3,
+    backend_relative_tolerance=0.23,
     backend_absolute_tolerance=250.0,
     golden_relative_tolerance=0.1,
     golden_absolute_tolerance=5.0,
