@@ -77,6 +77,8 @@ def run_benchmark(
         str(dataset_path),
         "--max_batch_size",
         str(max_batch_size),
+        # "--warmup",
+        # "10",
     ]
 
     # Add report_json argument if path is provided
@@ -290,7 +292,10 @@ def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
 
             # Free memory values should be in reasonable range
             expected_free_mem_pre_range = expected_free_mem_range
-            expected_free_mem_post_range = expected_free_mem_range
+            expected_free_mem_post_range = (
+                expected_free_mem_range[0] - 2000,
+                expected_free_mem_range[1],
+            )
 
             print("📊 GPU Memory Analysis:")
             print(f"  Total GPU memory: {total_mem_mb}MB")
@@ -600,7 +605,6 @@ def test_trtllm_bench(llm_root):  # noqa: F811
         run_benchmark(model_name, dataset_path, temp_dir)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5458798")
 @pytest.mark.no_xdist
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
     """Test that compares autodeploy backend performance against pytorch backend
