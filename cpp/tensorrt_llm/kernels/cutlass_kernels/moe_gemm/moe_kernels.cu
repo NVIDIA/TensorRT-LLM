@@ -3858,9 +3858,6 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
         gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 
-        int total_experts = num_experts_per_node * parallelism_config.ep_size;
-        int estimated_tokens_per_expert = expanded_num_rows / total_experts;
-
         gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
         gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
 
@@ -4501,7 +4498,6 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
                 && mWType == nvinfer1::DataType::kUINT8);
             bool const use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
-            int estimated_tokens_per_expert = num_expanded_tokens / mNumExperts;
             gemm1_tma_ws_input.swap_ab = swap_ab;
             gemm2_tma_ws_input.swap_ab = swap_ab;
 
