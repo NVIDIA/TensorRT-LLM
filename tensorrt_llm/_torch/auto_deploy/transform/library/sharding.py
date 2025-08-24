@@ -185,6 +185,9 @@ class Sharding(BaseTransform):
         shared_config.sharding_config.use_sharding_from_factory = (
             self.config.use_sharding_from_factory
         )
+        shared_config.sharding_config.sharing_dims = self.config.sharing_dims
+        ad_logger.info(f"Sharing dims: {shared_config.sharding_config.sharing_dims}")
+        exit()
 
         sharding_config = shared_config.sharding_config
         sharding_config.validate_config()
@@ -199,13 +202,28 @@ class Sharding(BaseTransform):
 
         ad_logger.info("Running autodeploy sharding heuristics")
         # run TP sharding across ranks
-        tp_info = detect_column_row_shard(gm, sharding_config)
+        if "tp" in shared_config.sharding_config.sharing_dims:
+            tp_info = detect_column_row_shard(gm, sharding_config)
+        else:
+            tp_info = TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         # run EP sharding across ranks
-        ep_info = detect_ep_shard(gm, sharding_config)
+        if "ep" in shared_config.sharding_config.sharing_dims:
+            ep_info = detect_ep_shard(gm, sharding_config)
+        else:
+            ep_info = TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         # run BMM sharding across ranks
-        dp_bmm_info = detect_dp_bmm_shard(gm, sharding_config)
+        if "bmm" in shared_config.sharding_config.sharing_dims:
+            dp_bmm_info = detect_dp_bmm_shard(gm, sharding_config)
+        else:
+            dp_bmm_info = TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         info = TransformInfo(
             skipped=tp_info.skipped and ep_info.skipped and dp_bmm_info.skipped,
