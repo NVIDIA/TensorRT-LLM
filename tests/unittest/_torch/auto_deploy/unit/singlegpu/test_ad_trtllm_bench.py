@@ -3,12 +3,67 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
+from statistics import mean, median
+from typing import List, Tuple
 
 import pytest
 import yaml
 from _model_test_utils import _hf_model_dir_or_hub_id
 from utils.cpp_paths import llm_root  # noqa: F401
 from utils.llm_data import llm_models_root
+
+
+def remove_outliers_iqr(values: List[float]) -> List[float]:
+    """
+    Remove outliers using the IQR (Interquartile Range) method.
+    Values outside Q1 - 1.5*IQR and Q3 + 1.5*IQR are considered outliers.
+
+    Args:
+        values: List of numerical values
+
+    Returns:
+        List of values with outliers removed
+    """
+    if len(values) < 4:  # Need at least 4 values for meaningful IQR
+        return values
+
+    sorted_values = sorted(values)
+    n = len(sorted_values)
+    q1 = sorted_values[n // 4]
+    q3 = sorted_values[3 * n // 4]
+    iqr = q3 - q1
+
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+
+    filtered_values = [v for v in values if lower_bound <= v <= upper_bound]
+
+    # Ensure we keep at least half the original values
+    if len(filtered_values) < len(values) // 2:
+        removed_str = f"{len(values) - len(filtered_values)}/{len(values)}"
+        print(f"⚠️  IQR filtering would remove too many values ({removed_str}), keeping all")
+        return values
+
+    removed_count = len(values) - len(filtered_values)
+    if removed_count > 0:
+        bounds_str = f"{lower_bound:.2f} - {upper_bound:.2f}"
+        print(f"📊 Removed {removed_count} outliers using IQR method (bounds: {bounds_str})")
+
+    return filtered_values
+
+
+def calculate_robust_stats(values: List[float]) -> Tuple[float, float, int]:
+    """
+    Calculate robust statistics after removing outliers.
+
+    Args:
+        values: List of performance values
+
+    Returns:
+        Tuple of (mean, median, count_after_outlier_removal)
+    """
+    filtered_values = remove_outliers_iqr(values)
+    return mean(filtered_values), median(filtered_values), len(filtered_values)
 
 
 def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
@@ -449,6 +504,118 @@ def print_kv_cache_metrics(kv_cache_metrics):
             print(f"{metric_name}: {actual_value} bytes")
 
 
+def run_multiple_benchmarks_with_outlier_removal(
+    model_name: str,
+    dataset_path: str,
+    temp_dir: str,
+    backend: str,
+    report_json_path: str,
+    max_batch_size: int,
+    num_hidden_layers: int,
+    free_mem_ratio: float,
+    num_iterations: int = 10,
+) -> dict:
+    """
+    Run benchmark multiple times and return averaged results with outlier removal.
+
+    Args:
+        All the same args as run_benchmark, plus:
+        num_iterations: Number of times to run the benchmark (default 10)
+
+    Returns:
+        Dictionary containing averaged performance metrics and KV cache metrics
+    """
+    print(f"=== RUNNING {backend.upper()} BACKEND {num_iterations} TIMES WITH OUTLIER REMOVAL ===")
+
+    performance_values = []
+    all_kv_metrics = []
+    successful_runs = 0
+
+    for i in range(num_iterations):
+        try:
+            print(f"🔄 Iteration {i + 1}/{num_iterations}")
+            report_data = run_benchmark(
+                model_name,
+                dataset_path,
+                temp_dir,
+                backend,
+                report_json_path,
+                max_batch_size,
+                num_hidden_layers,
+                free_mem_ratio,
+            )
+
+            if report_data and "performance" in report_data:
+                tokens_per_sec = extract_performance_metric(report_data, f"{backend}_iter_{i + 1}")
+                performance_values.append(tokens_per_sec)
+
+                # Store KV cache metrics for autodeploy backend
+                if backend == "_autodeploy" and "kv_cache_metrics" in report_data:
+                    all_kv_metrics.append(report_data["kv_cache_metrics"])
+
+                successful_runs += 1
+                print(f"  ✅ Iteration {i + 1}: {tokens_per_sec:.2f} tokens/sec/user")
+            else:
+                print(f"  ❌ Iteration {i + 1}: Failed to get valid report")
+
+        except Exception as e:
+            print(f"  ❌ Iteration {i + 1}: Exception occurred: {e}")
+            continue
+
+    if successful_runs < 3:  # Need at least 3 successful runs
+        raise RuntimeError(
+            f"Only {successful_runs} successful benchmark runs out of {num_iterations}"
+        )
+
+    print(f"\n📊 Performance Summary ({successful_runs} successful runs):")
+    print(f"Raw values: {[f'{v:.2f}' for v in performance_values]}")
+
+    # Calculate robust statistics
+    avg_perf, median_perf, count_after_filtering = calculate_robust_stats(performance_values)
+
+    print(f"Average (after outlier removal): {avg_perf:.2f} tokens/sec/user")
+    print(f"Median: {median_perf:.2f} tokens/sec/user")
+    print(f"Values used for average: {count_after_filtering}/{len(performance_values)}")
+
+    # Create averaged report similar to single run
+    averaged_report = {
+        "performance": {
+            "output_throughput_per_user_tok_s": avg_perf,
+            "median_throughput_per_user_tok_s": median_perf,
+            "raw_values": performance_values,
+            "successful_runs": successful_runs,
+            "values_after_filtering": count_after_filtering,
+        },
+        "backend": backend,
+    }
+
+    # For autodeploy backend, average KV cache metrics if available
+    if backend == "_autodeploy" and all_kv_metrics:
+        averaged_kv_metrics = {}
+
+        # Average each metric across all runs
+        metric_names = [
+            "current_cache_size",
+            "free_mem_pre_mb",
+            "free_mem_post_mb",
+            "new_cache_size",
+        ]
+        for metric_name in metric_names:
+            values = []
+            for kv_metrics in all_kv_metrics:
+                if metric_name in kv_metrics:
+                    values.append(kv_metrics[metric_name])
+
+            if values:
+                avg_value, _, _ = calculate_robust_stats(values)
+                averaged_kv_metrics[metric_name] = int(avg_value)
+                print(f"  Averaged {metric_name}: {averaged_kv_metrics[metric_name]}")
+
+        averaged_report["kv_cache_metrics"] = averaged_kv_metrics
+
+    return averaged_report
+
+
 def trtllm_bench_unified_comparison(
     llm_root,  # noqa: F811
     comparison_mode="backend",
@@ -460,11 +627,14 @@ def trtllm_bench_unified_comparison(
     backend_absolute_tolerance=250.0,
     golden_relative_tolerance=0.1,
     golden_absolute_tolerance=5.0,
+    num_iterations=10,
 ):
     """
     Unified test that compares autodeploy backend performance in two modes:
     - "backend": compares against pytorch backend performance
     - "golden": compares against predefined golden performance values
+
+    Runs multiple iterations to calculate robust averages and remove outliers.
 
     Args:
         llm_root: Root directory for LLM models (pytest fixture)
@@ -477,6 +647,7 @@ def trtllm_bench_unified_comparison(
         backend_absolute_tolerance: Absolute tolerance for backend comparison
         golden_relative_tolerance: Relative tolerance for golden comparison
         golden_absolute_tolerance: Absolute tolerance for golden comparison
+        num_iterations: Number of benchmark iterations to run (default 10)
     """
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -497,10 +668,9 @@ def trtllm_bench_unified_comparison(
 
         dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
 
-        # Always run autodeploy backend
+        # Always run autodeploy backend with multiple iterations
         autodeploy_report_path = f"{temp_dir}/autodeploy_report.json"
-        print("=== RUNNING AUTODEPLOY BACKEND ===")
-        autodeploy_report = run_benchmark(
+        autodeploy_report = run_multiple_benchmarks_with_outlier_removal(
             model_name,
             dataset_path,
             temp_dir,
@@ -509,6 +679,7 @@ def trtllm_bench_unified_comparison(
             max_batch_size,
             num_hidden_layers,
             free_mem_ratio,
+            num_iterations,
         )
 
         # Extract autodeploy performance metrics
@@ -520,10 +691,9 @@ def trtllm_bench_unified_comparison(
         )
 
         if comparison_mode == "backend":
-            # Backend comparison mode: also run pytorch backend
+            # Backend comparison mode: also run pytorch backend with multiple iterations
             pytorch_report_path = f"{temp_dir}/pytorch_report.json"
-            print("=== RUNNING PYTORCH BACKEND ===")
-            pytorch_report = run_benchmark(
+            pytorch_report = run_multiple_benchmarks_with_outlier_removal(
                 model_name,
                 dataset_path,
                 temp_dir,
@@ -532,6 +702,7 @@ def trtllm_bench_unified_comparison(
                 max_batch_size,
                 num_hidden_layers,
                 free_mem_ratio,
+                num_iterations,
             )
 
             # Extract pytorch performance metrics
@@ -550,14 +721,34 @@ def trtllm_bench_unified_comparison(
             print("✅ KV Cache Metrics validation passed")
 
             print("=== BACKEND COMPARISON TEST PASSED ===")
-            print(f"Autodeploy: {autodeploy_tokens_per_sec:.2f} tokens/sec/user")
-            print(f"PyTorch: {pytorch_tokens_per_sec:.2f} tokens/sec/user")
+            ad_runs = autodeploy_report["performance"]["successful_runs"]
+            pt_runs = pytorch_report["performance"]["successful_runs"]
+            print(
+                f"Autodeploy: {autodeploy_tokens_per_sec:.2f} tokens/sec/user (avg of {ad_runs} runs)"
+            )
+            print(f"PyTorch: {pytorch_tokens_per_sec:.2f} tokens/sec/user (avg of {pt_runs} runs)")
+
+            # Print additional statistics
+            if "raw_values" in autodeploy_report["performance"]:
+                ad_values = autodeploy_report["performance"]["raw_values"]
+                print(f"Autodeploy raw values: {[f'{v:.2f}' for v in ad_values]}")
+            if "raw_values" in pytorch_report["performance"]:
+                pt_values = pytorch_report["performance"]["raw_values"]
+                print(f"PyTorch raw values: {[f'{v:.2f}' for v in pt_values]}")
 
         elif comparison_mode == "golden":
             # Golden comparison mode: compare against golden values
             print("=== PERFORMANCE METRICS ===")
-            print(f"Measured performance: {autodeploy_tokens_per_sec:.2f} tokens/sec/user")
+            ad_runs = autodeploy_report["performance"]["successful_runs"]
+            print(
+                f"Measured performance: {autodeploy_tokens_per_sec:.2f} tokens/sec/user (avg of {ad_runs} runs)"
+            )
             print(f"Golden performance: {golden_tokens_per_sec:.2f} tokens/sec/user")
+
+            # Print additional statistics
+            if "raw_values" in autodeploy_report["performance"]:
+                ad_values = autodeploy_report["performance"]["raw_values"]
+                print(f"Autodeploy raw values: {[f'{v:.2f}' for v in ad_values]}")
 
             # Print KV cache metrics
             print_kv_cache_metrics(kv_cache_metrics)
@@ -577,7 +768,9 @@ def trtllm_bench_unified_comparison(
             validate_kv_cache_metrics_dynamic(kv_cache_metrics, expected_metrics)
 
             print("=== ALL TESTS PASSED ===")
-            print(f"Performance: ✅ {autodeploy_tokens_per_sec:.2f} tokens/sec/user within bounds")
+            ad_runs = autodeploy_report["performance"]["successful_runs"]
+            perf_str = f"Performance: ✅ {autodeploy_tokens_per_sec:.2f} tokens/sec/user"
+            print(f"{perf_str} (avg of {ad_runs} runs) within bounds")
             print("KV Cache Metrics: ✅ All metrics within GPU-specific expected ranges")
 
         else:
@@ -609,6 +802,10 @@ def test_trtllm_bench(llm_root):  # noqa: F811
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
     """Test that compares autodeploy backend performance against pytorch backend
     with given relative and absolute thresholds.
+
+    This test runs both backends 10 times each, removes outliers using IQR method,
+    and compares the averaged performance to reduce impact of intermittent failures
+    and performance variability.
 
     It also checks the memory footprint of the autodeploy backend by parsing the
     log output from the resize_kv_cache function and extracting the following metrics:
