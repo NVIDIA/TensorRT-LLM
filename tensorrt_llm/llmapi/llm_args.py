@@ -436,13 +436,15 @@ class EagleDecodingConfig(DecodingBaseConfig):
             # Convert the data type of Eagle choice from str to List[List[int]]
             if attr_name == 'eagle_choices' and not isinstance(
                     attr_value, list):
-                print(
+                logger.warning(
                     "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
                 )
                 if isinstance(attr_value, str):
                     attr_value = ast.literal_eval(attr_value.replace(" ", ""))
                 else:
-                    assert "Wrong eagle choices type"
+                    raise ValueError(
+                        "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
+                    )
             setattr(self, attr_name, attr_value)
 
         # Checks whether the input eagle choices is valid
