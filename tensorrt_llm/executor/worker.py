@@ -20,6 +20,7 @@ from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror, TorchLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
+from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
@@ -61,6 +62,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[TorchLlmArgs] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
@@ -102,7 +104,8 @@ class GenerationExecutorWorker(GenerationExecutor):
 
         def _create_py_executor(executor_config):
             assert executor_config is None, "expect an empty executor_config is _create_py_executor"
-            executor_config = llm_args.get_executor_config(hf_model_dir)
+            executor_config = llm_args.get_executor_config(
+                hf_model_dir, tokenizer)
             # Persist so downstream code (e.g., default max_tokens deduction) has access
             self._executor_config = executor_config
             executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
@@ -662,6 +665,7 @@ def worker_main(
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
     hf_model_dir: Optional[Path] = None,
+    tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[TorchLlmArgs] = None,
 ) -> None:
     mpi_comm().barrier()
@@ -790,6 +794,7 @@ def worker_main(
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
             hf_model_dir=hf_model_dir,
+            tokenizer=tokenizer,
             llm_args=llm_args)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")

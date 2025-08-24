@@ -56,8 +56,6 @@ class MultimodalEncoder(_TorchLLM):
         self._tokenizer = self.input_processor.tokenizer
 
         assert isinstance(self.args, TorchLlmArgs)
-        # Update the tokenizer in TorchLlmArgs, so it can be used in GenerationExecutorWorker to init executor_config
-        self.args.set_tokenizer(self.tokenizer)
         self.args.set_mm_encoder_only(True)
 
         self._executor = self._executor_cls.create(
@@ -69,6 +67,7 @@ class MultimodalEncoder(_TorchLLM):
                 self.args.parallel_config.world_size),
             is_llm_executor=True,  # TODO: check if this is correct or needed
             hf_model_dir=self._hf_model_dir,
+            tokenizer=self.tokenizer,
             llm_args=self.args)
 
     def _validate_mm_args_for_torch_backend(self, kwargs: dict) -> None:

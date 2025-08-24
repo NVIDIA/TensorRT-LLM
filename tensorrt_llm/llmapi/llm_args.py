@@ -1837,12 +1837,11 @@ class BaseLlmArgs(StrictBaseModel):
                 moe_tp_size=moe_tp_size,
                 moe_ep_size=moe_ep_size)
 
-    def set_tokenizer(self, tokenizer):
-        self.tokenizer = tokenizer
-
-    def get_executor_config(self,
-                            _hf_model_dir: Optional[Path] = None
-                            ) -> _ExecutorConfig:
+    def get_executor_config(
+        self,
+        _hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+    ) -> _ExecutorConfig:
         executor_config = _ExecutorConfig(
             max_beam_width=self.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
@@ -1867,13 +1866,15 @@ class BaseLlmArgs(StrictBaseModel):
         if self.decoding_config is not None:
             executor_config.decoding_config = self.decoding_config
         if self.guided_decoding_backend == 'xgrammar':
+            assert tokenizer is not None
             executor_config.guided_decoding_config = _GuidedDecodingConfig(
                 backend=_GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
-                **_xgrammar_tokenizer_info(self.tokenizer))
+                **_xgrammar_tokenizer_info(tokenizer))
         elif self.guided_decoding_backend == 'llguidance':
+            assert tokenizer is not None
             executor_config.guided_decoding_config = _GuidedDecodingConfig(
                 backend=_GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
-                **_llguidance_tokenizer_info(self.tokenizer))
+                **_llguidance_tokenizer_info(tokenizer))
         elif self.guided_decoding_backend is not None:
             raise ValueError(
                 f"Unsupported guided decoding backend {self.guided_decoding_backend}"
@@ -2460,10 +2461,12 @@ class TorchLlmArgs(BaseLlmArgs):
     def set_mm_encoder_only(self, mm_encoder_only):
         self.mm_encoder_only = mm_encoder_only
 
-    def get_executor_config(self,
-                            _hf_model_dir: Optional[Path] = None
-                            ) -> _ExecutorConfig:
-        executor_config = super().get_executor_config(_hf_model_dir)
+    def get_executor_config(
+        self,
+        _hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+    ) -> _ExecutorConfig:
+        executor_config = super().get_executor_config(_hf_model_dir, tokenizer)
         executor_config.mm_encoder_only = self.mm_encoder_only
         return executor_config
 

@@ -966,9 +966,6 @@ class _TorchLLM(BaseLLM):
                                                       self.tokenizer)
         self._tokenizer = self.input_processor.tokenizer
 
-        # Update the tokenizer in TorchLlmArgs, so it can be used in GenerationExecutorWorker to init executor_config
-        self.args.set_tokenizer(self.tokenizer)
-
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(
@@ -987,6 +984,7 @@ class _TorchLLM(BaseLLM):
             is_llm_executor=True,
             lora_config=self.args.lora_config,
             hf_model_dir=self._hf_model_dir,
+            tokenizer=self.tokenizer,
             llm_args=self.args)
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:

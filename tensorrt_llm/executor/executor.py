@@ -25,6 +25,7 @@ from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
+from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
@@ -356,6 +357,7 @@ class GenerationExecutor(ABC):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[TorchLlmArgs] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
@@ -384,6 +386,7 @@ class GenerationExecutor(ABC):
             "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
             "hf_model_dir": hf_model_dir,
+            "tokenizer": tokenizer,
             "llm_args": llm_args,
         }
 
