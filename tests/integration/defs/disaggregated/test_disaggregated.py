@@ -1276,8 +1276,8 @@ def test_disaggregated_benchmark_on_diff_backends(
     if "DeepSeek-V3-Lite" in benchmark_model_root and "fp8" in benchmark_model_root and get_sm_version(
     ) != 90:
         pytest.skip("The test should only run on Hopper")
-    nixl_config = get_config_for_benchmark(benchmark_model_root, "nixl")
-    ucx_config = get_config_for_benchmark(benchmark_model_root, "ucx")
+    nixl_config = get_config_for_benchmark(benchmark_model_root, "NIXL")
+    ucx_config = get_config_for_benchmark(benchmark_model_root, "UCX")
     temp_dir = tempfile.TemporaryDirectory()
     nixl_config_path = os.path.join(temp_dir.name, "nixl_config.yaml")
     ucx_config_path = os.path.join(temp_dir.name, "ucx_config.yaml")
