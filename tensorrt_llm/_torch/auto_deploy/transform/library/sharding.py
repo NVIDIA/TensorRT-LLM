@@ -126,6 +126,8 @@ class ShardingTransformConfig(TransformConfig):
 
     simple_shard_only: bool = Field(default=False)
     use_sharding_from_factory: bool = Field(default=False)
+    # Which sharding families to run: any subset of {"tp", "ep", "bmm"}
+    sharding_dims: List[str] = Field(default_factory=lambda: ["tp", "ep", "bmm"])
 
 
 @TransformRegistry.register("detect_sharding")
