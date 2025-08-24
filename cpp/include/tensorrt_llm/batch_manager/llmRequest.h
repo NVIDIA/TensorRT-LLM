@@ -1831,16 +1831,6 @@ public:
         }
     }
 
-    void setRequestedBlockHashes(std::vector<size_t> hashes)
-    {
-        mRequestedBlockHashes = std::move(hashes);
-    }
-
-    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const
-    {
-        return mRequestedBlockHashes;
-    }
-
     void setIsDummyRequest(bool isDummyRequest)
     {
         mIsDummyRequest = isDummyRequest;

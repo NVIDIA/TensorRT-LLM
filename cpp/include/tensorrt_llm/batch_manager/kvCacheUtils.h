@@ -48,6 +48,28 @@ public:
         return BlockRange(cacheManager, blockIds, requestId);
     }
 
+    static BlockRange fromReuseTree(BaseKVCacheManager const& cacheManager, std::vector<size_t> const& allBlockHashes,
+        std::vector<size_t> const& requestedBlockHashes)
+    {
+        auto const windowSize = firstWindowSize(cacheManager);
+        auto lastBlock = *cacheManager.findBlocksInReuseTreeByHashes(allBlockHashes, windowSize);
+        // TODO: handle the case where the last block is not found
+        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
+        // Assume the the last block is the requested block
+        std::vector<SizeType32> blockIds;
+        for (auto const& hash : requestedBlockHashes)
+        {
+            if (lastBlock->getHash() != hash)
+            {
+                return BlockRange(cacheManager, {}, 0);
+            }
+            blockIds.emplace_back(lastBlock->getBlockId());
+            lastBlock = lastBlock->getPrevBlock();
+            TLLM_CHECK_WITH_INFO(lastBlock, "Last block is not found");
+        }
+        return BlockRange(cacheManager, blockIds, 0);
+    }
+
     BlockRange(runtime::ITensor::SharedPtr pool, std::vector<SizeType32> const& blockIds) // Only used in tests
         : mManager{nullptr}
         , mPool{std::move(pool)}
