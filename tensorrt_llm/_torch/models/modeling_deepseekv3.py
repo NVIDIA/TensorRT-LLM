@@ -58,8 +58,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
                                  MoEWeightLoadingMode, TRTLLMGenFusedMoE,
-                                 create_moe,
-                                 moe_load_balancer_set_repeated_for_next_layer)
+                                 create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -1159,7 +1158,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
-                moe_load_balancer_set_repeated_for_next_layer(model_nextn)
+                pass
             else:
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
