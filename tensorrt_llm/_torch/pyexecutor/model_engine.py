@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import copy
 import functools
 import gc
 import inspect
@@ -467,13 +468,16 @@ class PyTorchModelEngine(ModelEngine):
     def runtime_draft_len(self):
         return self.max_draft_len if self.enable_spec_decode else 0
 
-    def set_lora_model_config(self, lora_target_modules: list[str],
-                              trtllm_modules_to_hf_modules: dict[str, str]):
+    def set_lora_model_config(self,
+                              lora_target_modules: list[str],
+                              trtllm_modules_to_hf_modules: dict[str, str],
+                              swap_gate_up_proj_lora_b_weight: bool = True):
         self.lora_model_config = LoraModelConfig(
             lora_target_modules=lora_target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
             hidden_size=self.model.config.hidden_size,
-            dtype=torch_dtype_to_str(self.model.config.torch_dtype))
+            dtype=torch_dtype_to_str(self.model.config.torch_dtype),
+            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
 
     @property
     def use_mrope(self):
@@ -1061,6 +1065,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
+            mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,
             **kwargs)
 
         validate_and_set_kv_cache_quant(
@@ -1078,9 +1083,12 @@ class PyTorchModelEngine(ModelEngine):
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
+
             try:
+                # config will be modified in-place for some models, like Qwen2
+                config_copy = copy.deepcopy(config)
                 with MetaInitMode():
-                    model = AutoModelForCausalLM.from_config(config)
+                    model = AutoModelForCausalLM.from_config(config_copy)
 
                 memo = dict()
 
@@ -1092,6 +1100,7 @@ class PyTorchModelEngine(ModelEngine):
                     return memo[t]
 
                 model._apply(init_meta_tensor)
+                config = config_copy
 
             except Exception:
                 logger.info(
@@ -1126,6 +1135,12 @@ class PyTorchModelEngine(ModelEngine):
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)
 
+            elif load_format == LoadFormat.VISION_ONLY:
+                # Vision weights are already loaded within the model.
+                logger.info(
+                    "LoadFormat.VISION_ONLY: skipping weight loading; using preloaded vision weights."
+                )
+
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
@@ -1151,7 +1166,12 @@ class PyTorchModelEngine(ModelEngine):
             load_method(weights)
 
     def _init_max_seq_len(self):
-        inferred_max_seq_len = self.model.infer_max_seq_len()
+        # For mm_encoder_only mode, infer_max_seq_len() is for LLM decoder models
+        if hasattr(self.model, 'infer_max_seq_len'):
+            inferred_max_seq_len = self.model.infer_max_seq_len()
+        else:
+            inferred_max_seq_len = self._infer_max_seq_len_from_config()
+
         if self.max_seq_len is None:
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
@@ -1166,6 +1186,46 @@ class PyTorchModelEngine(ModelEngine):
                 f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
             )
             self.max_seq_len = inferred_max_seq_len
+
+    def _infer_max_seq_len_from_config(self) -> int:
+
+        if hasattr(self.model, 'model_config') and self.model.model_config:
+            model_config = self.model.model_config.pretrained_config
+            rope_scaling = getattr(model_config, 'rope_scaling', None)
+            rope_factor = 1
+            if rope_scaling is not None:
+                rope_type = rope_scaling.get('type',
+                                             rope_scaling.get('rope_type'))
+                if rope_type not in ("su", "longrope", "llama3", "yarn"):
+                    rope_factor = rope_scaling.get('factor', 1.0)
+
+            # Step 1: Find the upper bound of max_seq_len
+            inferred_max_seq_len = 2048
+            max_position_embeddings = getattr(model_config,
+                                              'max_position_embeddings', None)
+            if max_position_embeddings is None and hasattr(
+                    model_config, 'text_config'):
+                max_position_embeddings = getattr(model_config.text_config,
+                                                  'max_position_embeddings',
+                                                  None)
+            if max_position_embeddings is not None:
+                inferred_max_seq_len = max_position_embeddings
+
+            # Step 2: Scale max_seq_len with rotary scaling
+            if rope_factor != 1:
+                inferred_max_seq_len = int(
+                    math.ceil(inferred_max_seq_len * rope_factor))
+                logger.warning(
+                    f'max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}'
+                )
+
+            return inferred_max_seq_len
+
+        default_max_seq_len = 8192
+        logger.warning(
+            f"Could not infer max_seq_len from model config, using default value: {default_max_seq_len}"
+        )
+        return default_max_seq_len
 
     def _init_max_num_tokens(self):
         # Modified from tensorrt_llm/_common.py check_max_num_tokens
@@ -1677,6 +1737,7 @@ class PyTorchModelEngine(ModelEngine):
         multi_modal_data = []
         draft_lens = []
         request_ids = []
+        multimodal_params_list = []
 
         for request in scheduled_requests.context_requests:
             prompt_tokens = request.get_tokens(0)
@@ -1692,6 +1753,17 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_embedding = request.multimodal_embedding
             if multimodal_embedding is not None:
                 multi_modal_data.append(multimodal_embedding)
+
+            # Multimodal
+            if request.py_multimodal_data is not None:
+                multimodal_params = MultimodalParams(
+                    multimodal_data=request.py_multimodal_data, )
+                multimodal_params.to_device("multimodal_data",
+                                            "cuda",
+                                            pin_memory=True)
+                multimodal_params_list.append(multimodal_params)
+
+            request.py_batch_idx = request.py_seq_slot
 
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
@@ -1744,7 +1816,7 @@ class PyTorchModelEngine(ModelEngine):
             'input_ids': self.input_ids_cuda[:num_tokens],
             'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
             'inputs_embeds': None,
-            'multi_modal_data': multi_modal_data
+            "multimodal_params": multimodal_params_list
         }
 
         if bool(lora_params):
@@ -2184,8 +2256,13 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests, attn_metadata, spec_metadata)
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
-                return self._forward_step(inputs, gather_ids,
-                                          gather_context_logits)
+                # Special handling for multimodal encoder only mode
+                if self.pytorch_backend_config.mm_encoder_only:
+                    return self._forward_step_mm_encoder_only(
+                        inputs, scheduled_requests)
+                else:
+                    return self._forward_step(inputs, gather_ids,
+                                              gather_context_logits)
         with self._maybe_pad_batch(scheduled_requests, kv_cache_manager,
                                    spec_resource_manager) as scheduled_requests:
             maybe_graph = self._maybe_get_cuda_graph(scheduled_requests)
@@ -2278,6 +2355,44 @@ class PyTorchModelEngine(ModelEngine):
             return {'logits': logits[gather_ids]}
         else:
             return {'logits': logits}
+
+    @nvtx_range("_forward_step_mm_encoder_only")
+    def _forward_step_mm_encoder_only(
+            self, inputs: Dict[str, Any],
+            scheduled_requests: ScheduledRequests) -> Dict[str, Any]:
+        """Forward step for multimodal encoder only mode - returns mm_embeddings instead of logits."""
+        # Get multimodal parameters from inputs
+        multimodal_params = inputs.get("multimodal_params", [])
+        if not multimodal_params or len(multimodal_params) == 0:
+            # Return empty embeddings if no multimodal data
+            return {'mm_embeddings': []}
+        if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
+                   None) is None:
+            multimodal_chunks = None
+        else:
+            multimodal_chunks = [
+                sum(request.multimodal_lengths)
+                for request in scheduled_requests.context_requests
+                if request.multimodal_lengths is not None
+            ]
+        # For mm_encoder_only mode, we only run the vision encoder part
+        # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
+        mm_embeddings = self.model.forward(multimodal_params)
+        assert len(
+            mm_embeddings
+        ) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
+
+        if multimodal_chunks is None or len(multimodal_chunks) != len(
+                multimodal_params):
+            mm_embeddings = list(
+                torch.chunk(mm_embeddings[0],
+                            len(scheduled_requests.context_requests),
+                            dim=0))
+        else:
+            mm_embeddings = list(
+                torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
+
+        return {'mm_embeddings': mm_embeddings, 'logits': None}
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1:

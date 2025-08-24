@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,17 +13,35 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <stdint.h>
 
-#include "tensorrt_llm/common/cudaUtils.h"
-
-namespace tensorrt_llm::kernels
+namespace tensorrt_llm
 {
-template <typename InputT, typename OutputT, typename IdxT>
-void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
-    int64_t const numExperts, int64_t const topK, cudaStream_t const stream);
-} // namespace tensorrt_llm::kernels
+namespace kernels
+{
+
+#ifdef __CUDACC__
+#define ALIGN_256 __align__(256)
+#else
+#define ALIGN_256 alignas(256)
+#endif
+
+constexpr int WARP_SIZE = 32;
+constexpr uint32_t WARP_MASK = 0xffffffff;
+
+struct MoeEpWorldInfo
+{
+    int epSize;
+    int epRank;
+};
+
+struct MoeExpertParallelInfo
+{
+    int expertCount = -1;
+    int topK = 1;
+};
+
+} // namespace kernels
+} // namespace tensorrt_llm

@@ -106,6 +106,9 @@ class PyTorchConfig:
 
     force_dynamic_quantization: bool = False
 
+    # If true, ONLY the vision encoder part of the full model is loaded/executed.
+    mm_encoder_only: bool = False
+
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.
@@ -119,6 +122,7 @@ EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'tokens_per_block',
     'mapping',
     'hf_model_dir',
+    'mm_encoder_only',
 ]
 
 
@@ -133,7 +137,8 @@ def update_executor_config(
         max_input_len: Optional[int] = None,
         max_seq_len: Optional[int] = None,
         checkpoint_format: Optional[str] = None,
-        checkpoint_loader: Optional[BaseCheckpointLoader] = None):
+        checkpoint_loader: Optional[BaseCheckpointLoader] = None,
+        mm_encoder_only: bool = False):
     if backend is None:
         return
 
@@ -147,6 +152,7 @@ def update_executor_config(
     executor_config.pytorch_backend_config = pytorch_backend_config
     executor_config.mapping = mapping
     executor_config.speculative_config = speculative_config
+    executor_config.mm_encoder_only = mm_encoder_only
 
     logger.info(f"{executor_config.pytorch_backend_config}")
 
