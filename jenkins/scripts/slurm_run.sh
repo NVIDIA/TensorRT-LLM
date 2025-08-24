@@ -34,7 +34,7 @@ else
     done
 fi
 testList="$testList_$splitId"
-export CPP_TEST_TIMEOUT_OVERRIDDEN=7200
+export CPP_TEST_TIMEOUT_OVERRIDDEN=$pytestTestTimeout
 export LLM_ROOT=$llmSrcNode
 export LLM_MODELS_ROOT=$MODEL_CACHE_DIR
 export UCX_TLS=^gdr_copy
@@ -43,6 +43,7 @@ testCmdLines=(
     "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
     "pytest"
     "-v"
+    "--timeout-method=thread"
     "--timeout=$pytestTestTimeout"
     "--test-list=$testListPathNode"
     "--waives-file=$waivesListPathNode"

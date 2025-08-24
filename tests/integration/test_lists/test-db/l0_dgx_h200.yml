@@ -168,3 +168,19 @@ l0_dgx_h200:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:2-pp:2-nb:1-disable_fp8]
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp2]
   - unittest/llmapi/apps/_test_openai_multi_gpu.py -m "part0"
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: triton
+  tests:
+  # ------------- Triton tests ---------------
+  - triton_server/test_triton_llm.py::test_llmapi_backend[4-0-disableDecoupleMode-tensorrt_llm]
