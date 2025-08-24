@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yanchaol-empty-partition', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1894,14 +1894,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
-        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 4, 4],
-        "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 4, 4],
-        "DGX_B200-4_GPUs-PyTorch-3": ["b200-x4", "l0_dgx_b200", 3, 4, 4],
-        "DGX_B200-4_GPUs-PyTorch-4": ["b200-x4", "l0_dgx_b200", 4, 4, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 4, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4", "l0_dgx_b200", 2, 4, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["b200-x4", "l0_dgx_b200", 3, 4, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["b200-x4", "l0_dgx_b200", 4, 4, 4],
+        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
+        "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -2161,7 +2157,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
                             sh "env | sort"
-                            timeout(time: 1, unit: 'HOURS') {
+                            timeout(time: 30, unit: 'MINUTES') {
                                 checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
                             }
                         }
