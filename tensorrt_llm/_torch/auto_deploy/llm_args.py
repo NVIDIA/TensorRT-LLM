@@ -167,7 +167,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     sharding_dims: List[str] = Field(
         default=["tp", "ep", "dp"],
-        description="The dimensions to use for sharding. If None, use all dimensions.",
+        description="The sharding methods to apply by the heuristic sharding stage.",
     )
 
     compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
