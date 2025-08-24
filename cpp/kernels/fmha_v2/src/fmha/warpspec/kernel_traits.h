@@ -617,8 +617,12 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
         Traits_o::GMMA_A_RF, Traits_o::GMMA_B_RF>;
 
     // The global memory tile for O.
-    using Gmem_tile_o
-        = fmha::v2::Gmem_tile_o_hopper_32bit_8bit<Traits_o, Cta_tile_o, Cta_tile_o::WARPS_K, USE_TMA_STORE>;
+    using Gmem_tile_o = std::conditional_t<
+        std::is_same_v<OutputType, e4m3_t>,
+        // e4m3 output
+        fmha::v2::Gmem_tile_o_hopper_32bit_8bit<Traits_o, Cta_tile_o, Cta_tile_o::WARPS_K, USE_TMA_STORE>,
+        // fp16/bf16 output
+        fmha::v2::Gmem_tile_o_qgmma_fp32_16bits<Traits_o, Cta_tile_o, OutputType>>;
 
     // Inherit Buffer qkv class.
     using Buffer_q_t = typename Base::Buffer_q_t;
