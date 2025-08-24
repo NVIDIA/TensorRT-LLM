@@ -2346,6 +2346,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.apply_chat_template = False
             task.evaluate(llm)
             assert False
 
