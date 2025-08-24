@@ -268,6 +268,7 @@ def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
 
+
 @contextlib.contextmanager
 def piecewise_cuda_graph(enable: bool):
     prev_enable = get_piecewise_cuda_graph_flag()
@@ -276,7 +277,8 @@ def piecewise_cuda_graph(enable: bool):
         yield
     finally:
         set_piecewise_cuda_graph_flag(prev_enable)
-        
+
+
 @contextlib.contextmanager
 def nvml_context() -> Generator[None, None, None]:
     """Context manager for NVML initialization and shutdown.

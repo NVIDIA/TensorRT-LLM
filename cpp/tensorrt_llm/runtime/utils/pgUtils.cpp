@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
-#include <iostream>
+#include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::pg_utils
 {
@@ -43,7 +43,7 @@ using namespace tensorrt_llm::pg_utils;
 void init_pg(c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_world,
     c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_local)
 {
-    std::cout << "init_pg on rank " << process_group_world->getRank() << std::endl;
+    TLLM_LOG_DEBUG(process_group_world->getRank(), "Init process group on rank %d", process_group_world->getRank());
     pg_world = process_group_world;
     pg_local = process_group_local;
 }
@@ -51,7 +51,7 @@ void init_pg(c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_world,
 void init_store(c10::intrusive_ptr<c10d::Store> const& default_store)
 {
     (void) default_store; // TODO
-    std::cout << "init_store on rank " << pg_world->getRank() << std::endl;
+    TLLM_LOG_DEBUG(pg_world->getRank(), "Init store on rank %d", pg_world->getRank());
 }
 
 } // namespace tensorrt_llm::pg_broker
