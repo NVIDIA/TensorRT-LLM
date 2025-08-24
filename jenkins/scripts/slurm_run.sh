@@ -3,7 +3,8 @@ cd $resourcePathNode
 llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
 # generate .coveragerc in workspace
-cat << EOF > $jobWorkspace/.coveragerc
+coverageConfigFile="$jobWorkspace/.coveragerc"
+cat << EOF > "$coverageConfigFile"
 [run]
 branch = True
 data_file = $jobWorkspace/.coverage.$stageName
