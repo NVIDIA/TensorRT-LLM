@@ -651,11 +651,13 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
 
     cga_shapes = [[1, 1, 1]]
 
+    swap_ab = [True, False]
+
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mnk, cga_shapes)
+                           cta_shapes_mnk, cga_shapes, swap_ab)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape in partial_args:
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape, swap_ab in partial_args:
 
         # Ignored
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
@@ -666,10 +668,23 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cta_shape_mnk, warp_shape, stages, cga_shape,
-                mainloop_schedule, epi_schedule, epi_fusion)
+            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
+                                                     arch,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     otype,
+                                                     quant_op,
+                                                     epi_tag,
+                                                     cta_shape_mnk,
+                                                     warp_shape,
+                                                     stages,
+                                                     cga_shape,
+                                                     mainloop_schedule,
+                                                     epi_schedule,
+                                                     epi_fusion,
+                                                     swap_ab=swap_ab)
 
             operations.append(moe_gemm_operation)
     return operations
