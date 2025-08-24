@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch.fx import GraphModule, Node
 
 from ..models.factory import ShardingConfigSource
@@ -488,32 +488,20 @@ class ShardingConfig(BaseModel):
     predefined_config: Optional[Dict[str, Any]] = None
     simple_shard_only: bool = Field(default=False)
     use_sharding_from_factory: bool = False
+    sharding_dims: List[str] = Field(default_factory=list)
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
 
-    def __init__(
-        self,
-        rank: int = 0,
-        world_size: int = 1,
-        factory_source: ShardingConfigSource = ShardingConfigSource.UNKNOWN,
-        sharding_config: Dict[str, Any] = None,
-        simple_shard_only: bool = False,
-        use_sharding_from_factory: bool = False,
-    ):
-        super().__init__(
-            factory_source=factory_source,
-            rank=rank,
-            world_size=world_size,
-            predefined_config=sharding_config,
-            simple_shard_only=simple_shard_only,
-            use_sharding_from_factory=use_sharding_from_factory,
-        )
-
-        self.predefined_config = sharding_config
-        # Validate the config after initialization
+    @model_validator(mode="after")
+    def _validate_and_normalize(self):
+        # Normalize empty dict to None for "no config"
+        if isinstance(self.predefined_config, dict) and not self.predefined_config:
+            self.predefined_config = None
+        # Validate only if provided
         if self.predefined_config is not None:
             self.validate_config()
+        return self
 
     def validate_config(self) -> bool:
         if self.factory_source != ShardingConfigSource.HUGGINGFACE:
