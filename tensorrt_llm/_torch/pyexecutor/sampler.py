@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import chain
 from typing import Literal, Optional
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
@@ -616,6 +618,95 @@ class TorchSampler(Sampler):
 
         return logits
 
+    EMPTY_STOP_WORDS_LIST: list[list[int]] = [[], []]
+
+    def request_stopwords(self, request: LlmRequest) -> list[int]:
+        return (request.py_stop_words_list or self.EMPTY_STOP_WORDS_LIST)[0]
+
+    @staticmethod
+    def request_stopwords_cumsum(request: LlmRequest) -> list[int]:
+        if request.py_stop_words_list is None:
+            return []
+        lst = request.py_stop_words_list[1]
+        try:
+            cut = lst.index(-1)
+            return lst[:cut]
+        except ValueError:
+            return lst
+
+    def parse_trtllm_wordlist(
+            self, trtllm_wordlist: tuple[list[int], list[int]] | None
+    ) -> list[list[int]]:
+        if trtllm_wordlist is None:
+            return []
+        tokens, prefix = trtllm_wordlist
+        out = []
+        start = 0
+        for p in prefix:
+            if p == -1:
+                break
+            out.append(tokens[start:p])
+            start = p
+        return out
+
+    def schmoob(self, requests: list[LlmRequest],
+                new_tokens_device: torch.Tensor,
+                seq_slots: torch.Tensor) -> None:
+        tt = new_tokens_device[:, seq_slots, self.BEAM]
+
+        end_ids_tensor = torch.tensor(
+            [([req.py_end_id] * self.max_tokens) for req in requests],
+            pin_memory=True,
+            dtype=new_tokens_device.dtype).to(device="cuda", non_blocking=True)
+        assert tt.shape == end_ids_tensor.shape
+        torch.eq(tt, end_ids_tensor)
+
+        lengths_tensor = torch.tensor([[
+            ((req.get_num_tokens(self.BEAM) + num_tokens) -
+             req.py_orig_prompt_len)
+            for num_tokens in range(1, self.max_tokens + 1)
+        ] for req in requests])
+        max_lengths_tensor = torch.tensor([
+            ([min(req.py_max_new_tokens, self.max_seq_len)] * self.max_tokens)
+            for req in requests
+        ])
+        assert lengths_tensor.shape == max_lengths_tensor.shape
+        are_length = lengths_tensor >= max_lengths_tensor
+
+        stop_words_lengths = [
+            np.diff(self.request_stopwords_cumsum(req) or [0], prepend=0)
+            for req in requests
+        ]
+        longest_stop_word_len = max(chain.from_iterable(stop_words_lengths))
+
+        if longest_stop_word_len == 0:
+            return
+
+        stop_words_per_request = []
+
+        for ri, request in enumerate(requests):
+            lookback = longest_stop_word_len - 1
+            old_tokens = request.get_tokens(self.BEAM)[-lookback:]
+            per_step = []
+            for i in range(1, self.max_tokens + 1):
+                stop_words_list = self.parse_trtllm_wordlist(
+                    request.py_stop_words_list)
+                for stop_seq in stop_words_list:
+                    if len(stop_seq) <= 0:
+                        break
+                    old = old_tokens + tt[:i, ri].tolist()
+                    if len(old) < len(stop_seq):
+                        continue
+                    older = old[-len(stop_seq):]
+                    if older == stop_seq:
+                        per_step.append(True)
+                        break
+                per_step.append(False)
+            stop_words_per_request.append(per_step)
+
+        are_stop_words = torch.tensor(stop_words_per_request,
+                                      device=tt.device).T
+
     def _process_requests(self,
                           requests: list[LlmRequest],
                           model_outputs: dict[str, torch.Tensor],
@@ -633,6 +724,8 @@ class TorchSampler(Sampler):
 
         seq_slots_host = torch.as_tensor([r.py_seq_slot for r in requests])
         seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
+
+        self.schmoob(requests, new_tokens, seq_slots)
 
         if fast_path:
             logits = raw_logits[:len(requests)]
