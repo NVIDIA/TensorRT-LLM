@@ -726,7 +726,7 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
     {
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
-        state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, nvinfer1::DataType::kFLOAT});
+        state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, nvinfer1::DataType::kFLOAT});
         auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 0, state.release(), VecTokens{10, 20});
         auto stats2 = serializeDeserialize(stats);
         EXPECT_EQ(stats, stats2);
