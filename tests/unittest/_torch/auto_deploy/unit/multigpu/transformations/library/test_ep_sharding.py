@@ -119,7 +119,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
-@pytest.mark.parametrize("num_experts", [4, 8])
+@pytest.mark.parametrize("num_experts", [3, 8])
 def test_ep_shard(device_count: int, num_experts: int):
     dist_common.spawn_multiprocess_job(
         job=partial(_run_ep_shard_job, num_experts),
