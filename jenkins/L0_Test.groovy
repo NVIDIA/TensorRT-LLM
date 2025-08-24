@@ -1864,14 +1864,14 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 8, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4", "l0_dgx_b200", 2, 8, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["b200-x4", "l0_dgx_b200", 3, 8, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["b200-x4", "l0_dgx_b200", 4, 8, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-5": ["b200-x4", "l0_dgx_b200", 5, 8, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-6": ["b200-x4", "l0_dgx_b200", 6, 8, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-7": ["b200-x4", "l0_dgx_b200", 7, 8, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-8": ["b200-x4", "l0_dgx_b200", 8, 8, 4],
+        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 4, 4],
+        "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 4, 4],
+        "DGX_B200-4_GPUs-PyTorch-3": ["b200-x4", "l0_dgx_b200", 3, 4, 4],
+        "DGX_B200-4_GPUs-PyTorch-4": ["b200-x4", "l0_dgx_b200", 4, 4, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 4, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4", "l0_dgx_b200", 2, 4, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["b200-x4", "l0_dgx_b200", 3, 4, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["b200-x4", "l0_dgx_b200", 4, 4, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
