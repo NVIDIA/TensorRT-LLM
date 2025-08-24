@@ -501,11 +501,8 @@ TEST(Kernel_AllReduceFusion, AllReduceAccuracyRandomTokenNum)
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-    {
-        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
-        return;
-    }
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+
     int iter = 100;
     std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
     int min_token_num = 1;
@@ -537,11 +534,8 @@ TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-    {
-        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
-        return;
-    }
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+
     int iter = 10;
     std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
     int min_token_num = 1;
@@ -603,11 +597,8 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentHiddenDim)
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-    {
-        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
-        return;
-    }
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+
     int const arch = tensorrt_llm::common::getSMVersion();
     if (arch >= 100)
     {
@@ -647,11 +638,8 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-    {
-        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
-        return;
-    }
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+
     std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
     int min_token_num = 1;
     int max_token_num = 2048;
@@ -683,53 +671,52 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
 TEST(Kernel_AllReduceFusion, Perf)
 {
     int const arch = tensorrt_llm::common::getSMVersion();
-    if (arch >= 100)
+    if (arch < 100)
     {
-        using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant>;
-        auto& comm = mpi::MpiComm::world();
-        auto world_size = comm.getSize();
-        auto rank = comm.getRank();
-        if (world_size % 2)
+        GTEST_SKIP() << "Skipping test for SM < 100";
+    }
+
+    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant>;
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+
+    int warmup = 100, iter = 300;
+    int hidden_dim = 7168;
+    std::vector<int> candidate_token_num{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
+    int max_token_num = 2048;
+    Runner runner(max_token_num, hidden_dim);
+    for (auto token_num : candidate_token_num)
+    {
+        auto latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
         {
-            TLLM_LOG_WARNING("world size is not a multiple of 2, return");
-            return;
+            TLLM_LOG_INFO(
+                "token_num %-4d, hidden_dim %-4d, fusion kernel latency %4.4fus", token_num, hidden_dim, latency);
         }
-        int warmup = 100, iter = 300;
-        int hidden_dim = 7168;
-        std::vector<int> candidate_token_num{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
-        int max_token_num = 2048;
-        Runner runner(max_token_num, hidden_dim);
-        for (auto token_num : candidate_token_num)
+        auto nccl_latency = runner.benchmark(&Runner::run_nccl_allreduce, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
         {
-            auto latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO(
-                    "token_num %-4d, hidden_dim %-4d, fusion kernel latency %4.4fus", token_num, hidden_dim, latency);
-            }
-            auto nccl_latency = runner.benchmark(&Runner::run_nccl_allreduce, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("nccl allreduce latency %4.4fus", nccl_latency);
-            }
-            auto residual_latency = runner.benchmark(&Runner::run_residual_add, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("residual add latency %4.4fus", residual_latency);
-            }
-            auto rms_latency = runner.benchmark(&Runner::run_rms_norm, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("rms norm latency %4.4fus", rms_latency);
-            }
-            auto quant_latency = runner.benchmark(&Runner::run_fp4_quant, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("fp4 quant latency %4.4fus", quant_latency);
-                auto tot_latency = nccl_latency + residual_latency + rms_latency + quant_latency;
-                TLLM_LOG_INFO("fusion kernel latency %4.4fus, nccl + ops latency %4.4fus, total speedup %2.4fx",
-                    latency, tot_latency, tot_latency / latency);
-            }
+            TLLM_LOG_INFO("nccl allreduce latency %4.4fus", nccl_latency);
+        }
+        auto residual_latency = runner.benchmark(&Runner::run_residual_add, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            TLLM_LOG_INFO("residual add latency %4.4fus", residual_latency);
+        }
+        auto rms_latency = runner.benchmark(&Runner::run_rms_norm, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            TLLM_LOG_INFO("rms norm latency %4.4fus", rms_latency);
+        }
+        auto quant_latency = runner.benchmark(&Runner::run_fp4_quant, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            TLLM_LOG_INFO("fp4 quant latency %4.4fus", quant_latency);
+            auto tot_latency = nccl_latency + residual_latency + rms_latency + quant_latency;
+            TLLM_LOG_INFO("fusion kernel latency %4.4fus, nccl + ops latency %4.4fus, total speedup %2.4fx", latency,
+                tot_latency, tot_latency / latency);
         }
     }
 }
