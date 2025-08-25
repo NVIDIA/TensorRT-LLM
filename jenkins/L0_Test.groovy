@@ -245,6 +245,8 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh",)
 
+                Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
+
                 Utils.exec(
                     pipeline,
                     timeout: false,
@@ -295,8 +297,10 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
         }
     } finally {
-        cleanUpNodeResources(pipeline, cluster, nodeName)
+        Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
         CloudManager.destroyNode(nodeName)
+        Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
+        cleanUpNodeResources(pipeline, cluster, nodeName)
     }
 }
 
@@ -315,7 +319,11 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
-    def jobUID = "${cluster.host}-multi_node_test-${UUID.randomUUID().toString()}"
+    // Create a unique suffix for the job name
+    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
+
+    Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -359,6 +367,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}",)
+                Utils.exec(pipeline, script: "cat ${scriptRunLocalPath}")
 
                 // Upload waives.txt to Frontend node
                 def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
@@ -416,6 +425,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 pipeline.writeFile(file: scriptLaunchDestPath, text: scriptContent)
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}",)
+                Utils.exec(pipeline, script: "cat ${scriptLaunchDestPath}")
             }
             stage('Run Test') {
                 def scriptLaunch = "${jobWorkspace}/slurm_launch.sh"
@@ -2155,10 +2165,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             libEnv += ["LD_LIBRARY_PATH+nvrtc=/usr/local/lib/python${pyver}/dist-packages/nvidia/cuda_nvrtc/lib"]
                         }
                         echo "###### Check pip install Start ######"
+                        def sleepTime = 20
                         withEnv(libEnv) {
-                            sh "env | sort"
-                            timeout(time: 30, unit: 'MINUTES') {
-                                checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                            retry(2) {
+                                try {
+                                    sh "env | sort"
+                                    timeout(time: 30, unit: 'MINUTES') {
+                                        sleep(sleepTime * 60)
+                                        sleepTime = 1
+                                        checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                                    }
+                                } catch (org.jenkinsci.plugins.workflow.steps.TimeoutStepExecution.ExceededTimeout e) {
+                                    error "Timeout occurred, retrying..."
+                                }
                             }
                         }
                         echo "###### Run LLMAPI tests Start ######"
