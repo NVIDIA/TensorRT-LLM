@@ -1195,7 +1195,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     }
 
     // Rerun tests
-    isRerunFailed = false
+    def isRerunFailed = false
     for (times in [1, 2]) {
         def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
         if (!fileExists(currentRerunTestList)) {
@@ -1203,14 +1203,14 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
             continue
         }
         sh "cat ${currentRerunTestList}"
-        xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
+        def xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
-        noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
-        needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
-        testCmdLine = testCmdLine.findAll { cmd ->
+        def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
+        def needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
+        def newTestCmdLine = testCmdLine.findAll { cmd ->
             !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
         }
-        testCmdLine += [
+        newTestCmdLine += [
             "--test-list=${currentRerunTestList}",
             "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
             "--junit-xml ${xmlFile}",
@@ -1237,9 +1237,9 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
 
     // Generate rerun report
-    inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
-                  "${WORKSPACE}/${stageName}/rerun_results_1.xml",
-                  "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
+    def inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
+                      "${WORKSPACE}/${stageName}/rerun_results_1.xml",
+                      "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_report \
