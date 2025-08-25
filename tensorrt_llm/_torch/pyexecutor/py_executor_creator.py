@@ -459,8 +459,8 @@ def create_py_executor(
             # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             executor_config.max_seq_len = max_seq_len
-            if kwargs_py_executor and "kwargs_py_executor" in kwargs_py_executor:
-                kwargs_py_executor["kwargs_py_executor"] = max_seq_len
+            if kwargs_py_executor and "max_seq_len" in kwargs_py_executor:
+                kwargs_py_executor["max_seq_len"] = max_seq_len
 
             kv_cache_creator.build_managers(resources)
 
