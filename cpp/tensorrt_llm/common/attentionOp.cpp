@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
@@ -120,9 +121,6 @@ struct FusedQKVMaskedAttentionDispatchParams
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params;
     int32_t const* mrope_position_deltas;
-    int32_t const* sparse_attn_indices;
-    int32_t const* sparse_attn_offsets;
-    int32_t num_sparse_attn_indices;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -203,10 +201,6 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
-    // Sparse attention parameters for XQA
-    xqaParams.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
-    xqaParams.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
-    xqaParams.num_sparse_attn_indices = mRuntimeSparseAttentionParams.num_sparse_attn_indices;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -294,6 +288,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.output_sf = generationsParams.context_buf_sf;
     xqaParams.fp4_out_sf_scale = generationsParams.attention_output_sf_scale;
     xqaParams.start_token_idx_sf = generationsParams.start_token_idx_sf;
+    // Parameters for sparse attention
+    xqaParams.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
+    xqaParams.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
 
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
@@ -676,11 +673,6 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
 
     params.multi_processor_count = input_params.multi_processor_count;
 
-    // sparse indices and offsets for attention
-    params.sparse_attn_indices = input_params.sparse_attn_indices;
-    params.sparse_attn_offsets = input_params.sparse_attn_offsets;
-    params.num_sparse_attn_indices = input_params.num_sparse_attn_indices;
-
     // cross attn
     params.memory_length_per_sample = input_params.memory_length_per_sample;
 
@@ -825,7 +817,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 }
 
 size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
-    int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
+    int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -908,14 +900,19 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     size_t const cpMaxPaddedSequenceLength = (batch_beam + mCpSize - 1) / mCpSize * mCpSize;
     size_t const cpWorkspaceSize
         = mCpSize == 1 ? 0 : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
+    // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
+    size_t const sparse_attn_cache_size = (mUseSparseAttention && mEnableXQA)
+        ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence * mNumKVHeads)
+        : 0;
 
-    int const NUM_BUFFERS = 5;
+    int const NUM_BUFFERS = 6;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = partial_out_size;
     workspaces[1] = partial_sum_size;
     workspaces[2] = partial_max_size;
     workspaces[3] = shift_k_cache_size;
     workspaces[4] = cpWorkspaceSize;
+    workspaces[5] = sparse_attn_cache_size;
     generation_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     size_t xqa_workspace_size = 0;
@@ -2275,6 +2272,17 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
                 xqaParams.output = mhaOutput;
                 xqaParams.qkv = attention_input;
             }
+            if (mUseSparseAttention && std::is_same_v<KVCacheBuffer, KVBlockArray>)
+            {
+                size_t kv_block_offsets_size = batch_beam * 2 * params.max_blocks_per_sequence * mNumKVHeads;
+                size_t seq_lengths_size = batch_beam;
+                int* sparse_kv_block_offsets
+                    = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, kv_block_offsets_size));
+                int* sparse_seq_lengths
+                    = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, seq_lengths_size));
+                xqaParams.sparse_kv_block_offsets = sparse_kv_block_offsets;
+                xqaParams.sparse_seq_lengths = sparse_seq_lengths;
+            }
             mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
             if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
             {
@@ -2427,9 +2435,6 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.block_sparse_attention = mMaskType == AttentionMaskType::BLOCKSPARSE;
     dispatch_params.block_sparse_params = mBlockSparseParams;
     dispatch_params.mrope_position_deltas = params.mrope_position_deltas;
-    dispatch_params.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
-    dispatch_params.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
-    dispatch_params.num_sparse_attn_indices = mRuntimeSparseAttentionParams.num_sparse_attn_indices;
 
     using DataType = typename SATypeConverter<T>::Type;
     if (!isCrossAttention())

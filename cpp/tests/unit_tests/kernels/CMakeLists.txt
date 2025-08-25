@@ -40,6 +40,7 @@ add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(stopCriteriaKernelsTest stopCriteriaKernelsTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
+add_gtest(sparseAttentionKernelsTest sparseAttentionKernelsTest.cpp)
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 

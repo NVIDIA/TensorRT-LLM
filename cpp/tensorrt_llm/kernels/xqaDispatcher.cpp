@@ -17,6 +17,7 @@
 #include "xqaDispatcher.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <cstdint>
 
@@ -404,11 +405,30 @@ void XqaDispatcher::runImpl(
         // Otherwise, always enable the persistent scheduler for better performance.
         tllmRunnerParams.mTileScheduler = params.multi_block_mode ? TileScheduler::Static : TileScheduler::Persistent;
 
+        // The sequence lengths for K/V.
+        tllmRunnerParams.seqLensKvPtr = params.cross_attention ? params.encoder_input_lengths : params.sequence_lengths;
+
         // Q buffer.
         tllmRunnerParams.qPtr = xqa_q_input_ptr;
         // KV buffer
+        bool use_sparse_attention = (params.sparse_attn_indices != nullptr && params.sparse_attn_offsets != nullptr);
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
+            // Gather kv page offsets for sparse attention.
+            if (use_sparse_attention)
+            {
+                SparseAttentionParams sparse_params;
+                sparse_params.sparse_attn_indices = params.sparse_attn_indices;
+                sparse_params.sparse_attn_offsets = params.sparse_attn_offsets;
+                sparse_params.batch_size = batch_beam_size;
+                sparse_params.num_head_kv = num_kv_heads;
+                sparse_params.tokens_per_page = kv_cache_buffer.mTokensPerBlock;
+                sparse_params.max_num_pages_per_seq = kv_cache_buffer.mMaxBlocksPerSeq;
+                invokeGatherKvPageOffsets(params.sparse_kv_block_offsets, params.sparse_seq_lengths,
+                    launchParams.cu_kv_seq_lens, params.sequence_lengths, sparse_params, params.stream);
+                sync_check_cuda_error(params.stream);
+            }
+
             // Paged KV
             tllmRunnerParams.mQkvLayout = QkvLayout::PagedKv;
             tllmRunnerParams.kvPtr = kv_cache_buffer.mPrimaryPoolPtr;
@@ -419,6 +439,7 @@ void XqaDispatcher::runImpl(
         }
         else
         {
+            TLLM_CHECK_WITH_INFO(!use_sparse_attention, "Sparse attention is not supported for KVLinearBuffer.");
             static_assert(std::is_same_v<KVCacheBuffer, KVLinearBuffer>);
             // Contiguous KV
             tllmRunnerParams.mQkvLayout = QkvLayout::ContiguousKv;
@@ -437,8 +458,6 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.scaleSoftmaxLog2Ptr
             = reinterpret_cast<float const*>(launchParams.bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr);
         tllmRunnerParams.oSfScalePtr = params.fp4_out_sf_scale;
-        // The sequence lengths for K/V.
-        tllmRunnerParams.seqLensKvPtr = params.cross_attention ? params.encoder_input_lengths : params.sequence_lengths;
 
         tllmRunnerParams.oPtr = params.output;
         tllmRunnerParams.oSfPtr = params.output_sf;
