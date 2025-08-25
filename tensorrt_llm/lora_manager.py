@@ -456,7 +456,8 @@ def load_torch_hf_lora(lora_config: LoraConfig):
     pivot model config is the transformer's one.
     """
     # TODO smor- need to comibe with load_hf_lora
-    lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
+    if not lora_config.trtllm_modules_to_hf_modules:
+        lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
     lora_loader = HfLoraLoader(lora_config.lora_dir)
