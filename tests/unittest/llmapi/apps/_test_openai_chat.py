@@ -14,7 +14,6 @@ from .openai_server import RemoteOpenAIServer
 from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
                     make_server_with_custom_sampler_fixture)
 
-pytestmark = pytest.mark.skip(reason="https://nvbugs/5477444")
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 

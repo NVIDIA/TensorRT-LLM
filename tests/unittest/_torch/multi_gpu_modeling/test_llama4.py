@@ -8,7 +8,6 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
 
-@pytest.mark.skip(reason="https://nvbugs/5418673")
 @pytest.mark.parametrize(
     "model_name",
     ["Llama-4-Maverick-17B-128E-Instruct", "Llama-4-Scout-17B-16E-Instruct"],
