@@ -374,7 +374,7 @@ class GuidedDecoder:
                 continue
             if (slot := req.seq_slot) is None:
                 continue
-            if req.context_phase_params is not None and req.py_decoding_iter == 1:
+            if req.context_phase_params is not None and req.decoding_iter == 1:
                 # The request is in the first generation forward step at the disagg gen instance.
                 self.grammar_matchers[
                     slot] = self.grammar_matcher_factory.create(
