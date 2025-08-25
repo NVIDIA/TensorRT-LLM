@@ -1,0 +1,17 @@
+version: 0.0.1
+l0_dgx_b300:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb110*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # ------------- PyTorch tests ---------------
+  - unittest/_torch/multi_gpu_modeling -k "deepseek"
