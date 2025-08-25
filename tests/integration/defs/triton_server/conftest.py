@@ -655,10 +655,10 @@ def install_root_requirements(llm_backend_root):
 
 @pytest.fixture(scope="session")
 def output_dir(request):
-    if USE_TURTLE:
-        return request.config._trt_config["output_dir"]
-    else:
-        return request.config.getoption("--output-dir")
+    output = request.config.getoption("--output-dir")
+    if output:
+        os.makedirs(str(output), exist_ok=True)
+    return output
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):
