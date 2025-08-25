@@ -514,7 +514,8 @@ def create_py_executor_instance(
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules)
+            lora_config.trtllm_modules_to_hf_modules,
+            lora_config.swap_gate_up_proj_lora_b_weight)
 
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
 

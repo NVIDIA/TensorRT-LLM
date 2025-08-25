@@ -23,7 +23,7 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
-from .config import PyTorchConfig
+from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .guided_decoder import GuidedDecoder
 from .model_engine import PyTorchModelEngine
@@ -252,13 +252,16 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
+            draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
+            if spec_config.load_format == "dummy":
+                draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
             # The draft model won't have any draft tokens attached to
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
-                pytorch_backend_config=pytorch_backend_config,
+                pytorch_backend_config=draft_pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_beam_width=executor_config.max_beam_width,
                 max_num_tokens=executor_config.max_num_tokens,

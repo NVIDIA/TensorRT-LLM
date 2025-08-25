@@ -21,6 +21,8 @@ from einops import rearrange, repeat
 from utils.torch_ref import (selective_state_update_ref,
                              ssd_chunk_scan_combined_ref)
 
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import \
+    cu_seqlens_to_chunk_indices_offsets
 from tensorrt_llm._torch.modules.mamba.selective_state_update import \
     selective_state_update
 from tensorrt_llm._torch.modules.mamba.ssd_combined import \
@@ -30,51 +32,58 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
 @pytest.mark.parametrize(
-    "dim, headdim, ngroups, dstate, req_type, dtype, batch_size, max_seq_len, has_z, remove_padding, paged_cache",
+    "dim, headdim, ngroups, dstate, req_type, dtype, batch_size, max_seq_len, has_z, remove_padding, paged_cache, use_initial_states",
     # dim parametrization
     list(
         product([1024, 2048, 5120], [64], [1], [128], ['context', 'generation'],
-                ['bfloat16'], [3], [16], [False], [True], [False])) +
+                ['bfloat16'], [3], [16], [False], [True], [False], [False])) +
     # headdim parametrization
     list(
         product([2048], [32, 64, 128, 256], [1], [128],
                 ['context', 'generation'], ['bfloat16'], [3], [16], [False],
-                [True], [False])) +
+                [True], [False], [False])) +
     # ngroups parametrization
     list(
         product([2048], [64], [1, 4], [128], ['context', 'generation'],
-                ['bfloat16'], [3], [16], [False], [True], [False])) +
+                ['bfloat16'], [3], [16], [False], [True], [False], [False])) +
     # dstate parametrization
     list(
         product([2048], [64], [1], [64, 96, 128, 256],
                 ['context', 'generation'], ['bfloat16'], [3], [16], [False],
-                [True], [False])) +
+                [True], [False], [False])) +
     # dtype parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
                 ['float16', 'bfloat16', 'float32'], [3], [16], [False], [True],
-                [False])) +
+                [False], [False])) +
     # batch_size parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
-                ['bfloat16'], [1, 2, 8, 16], [16], [False], [True], [False])) +
+                ['bfloat16'], [1, 2, 8, 16], [16], [False], [True], [False],
+                [False])) +
     # max_seq_len parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
                 ['bfloat16'], [3], [32, 64, 256, 2048, 16384], [False], [True],
-                [False])) +
+                [False], [False])) +
     # has_z parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
-                ['bfloat16'], [3], [32], [True, False], [True], [False])) +
+                ['bfloat16'], [3], [32], [True, False], [True], [False],
+                [False])) +
     # remove_padding parametrization
     list(
         product([2048], [64], [1], [128], ['context', 'generation'],
-                ['bfloat16'], [3], [32], [False], [True, False], [False])) +
+                ['bfloat16'], [3], [32], [False], [True, False], [False],
+                [False])) +
     # paged_cache parametrization (relevant for generation only)
     list(
         product([2048], [64], [1], [128], ['generation'], ['bfloat16'], [3],
-                [32], [False], [False], [True, False])) +
+                [32], [False], [False], [True, False], [False])) +
+    # use_initial_states parametrization (relevant for context only and remove_padding=True)
+    list(
+        product([2048], [64], [1], [128], ['context'], ['bfloat16'], [3], [32],
+                [False], [True], [False], [True, False])) +
     # long sequence test to cover the int overflow issue
     [
         pytest.param(
@@ -89,6 +98,7 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
             False,
             False,
             False,
+            False,
             marks=pytest.mark.skipif(
                 get_total_gpu_memory(0) < 68 * 1024**3,
                 reason=
@@ -97,7 +107,8 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                                                   req_type, dtype, batch_size,
                                                   max_seq_len, has_z,
-                                                  remove_padding, paged_cache):
+                                                  remove_padding, paged_cache,
+                                                  use_initial_states):
     # configs
     device = "cuda"
     seq_len = max_seq_len if req_type == 'context' else 1
@@ -168,6 +179,8 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
     D = torch.randn(nheads, device=device)
     if has_z:
         z = torch.randn_like(x)
+    if use_initial_states:
+        initial_states = state.clone()
 
     if req_type == 'generation':
         # remove the seqlen dimension
@@ -193,8 +206,13 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
     C_ref = C.detach().clone()
     D_ref = D.detach().clone()
     z_ref = z.detach().clone() if has_z else None
+    initial_states_ref = state_ref.clone() if use_initial_states else None
 
     if req_type == "context":
+        if use_initial_states:
+            assert remove_padding
+            chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
+                cu_seqlens, chunk_size)
         out, ssm_state = mamba_chunk_scan_combined(
             x,
             dt,
@@ -205,6 +223,9 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
             D=D,
             z=z if has_z else None,
             dt_bias=dt_bias,
+            initial_states=initial_states if use_initial_states else None,
+            chunk_indices=chunk_indices if use_initial_states else None,
+            chunk_offsets=chunk_offsets if use_initial_states else None,
             seq_idx=seq_idx if remove_padding else None,
             cu_seqlens=cu_seqlens if remove_padding else None,
             dt_softplus=delta_softplus,
@@ -273,7 +294,10 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                     D=D_ref,
                     z=z_ref[:, start:end, ...] if has_z else None,
                     dt_bias=dt_bias_ref,
-                    dt_softplus=delta_softplus)
+                    dt_softplus=delta_softplus,
+                    initial_states=initial_states_ref[i:i + 1, ...]
+                    if use_initial_states else None,
+                )
                 out_ref[0, start:end, ...] = part_out_ref.squeeze(0)
                 state_ref[i, ...] = part_state_ref.squeeze(0)
         elif long_context:
@@ -295,7 +319,10 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                     D=D_ref,
                     z=z_ref[i:i + 1, ...] if has_z else None,
                     dt_bias=dt_bias_ref,
-                    dt_softplus=delta_softplus)
+                    dt_softplus=delta_softplus,
+                    initial_states=initial_states_ref[i:i + 1, ...]
+                    if use_initial_states else None,
+                )
                 out_ref[i, ...] = part_out_ref.squeeze(0)
                 state_ref[i, ...] = part_state_ref.squeeze(0)
         else:
@@ -309,7 +336,10 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                 D=D_ref,
                 z=z_ref if has_z else None,
                 dt_bias=dt_bias_ref,
-                dt_softplus=delta_softplus)
+                dt_softplus=delta_softplus,
+                initial_states=initial_states_ref
+                if use_initial_states else None,
+            )
     elif req_type == 'generation':
         out_ref = selective_state_update_ref(state_ref,
                                              x_ref,
@@ -330,3 +360,231 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                                state_ref,
                                rtol=1e-2,
                                atol=atol[dtype])
+
+
+@pytest.mark.parametrize("mamba_chunk_size", [8, 256])
+@pytest.mark.parametrize("seqlens", [
+    (16, 2, 8, 13),
+    (270, 88, 212, 203),
+    (16, 20),
+])
+def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
+    if mamba_chunk_size == 8 and seqlens == (270, 88, 212, 203):
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5477332")
+    dim = 1024
+    headdim = 64
+    ngroups = 1
+    dstate = 128
+
+    # test in high precision to distinguish between numeric instabilities and actual errors
+    dtype = 'float32'
+
+    num_sequences = len(seqlens)
+    has_z = True
+
+    device = "cuda"
+    nheads = dim // headdim
+    delta_softplus = True
+    mean = 0.0
+    std_dev = 0.1
+
+    torch_dtype = str_dtype_to_torch(dtype)
+
+    seqlens = torch.tensor(seqlens, dtype=torch.int32, device=device)
+    cu_seqlens = torch.cat([
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.cumsum(seqlens, dim=0, dtype=torch.int32)
+    ],
+                           dim=0)
+    seq_idx = torch.repeat_interleave(torch.arange(len(seqlens),
+                                                   dtype=torch.int32,
+                                                   device=device),
+                                      seqlens,
+                                      output_size=cu_seqlens[-1]).unsqueeze(0)
+    input_batch_size = 1
+    input_seq_len = cu_seqlens[-1]
+
+    # test data
+    torch.random.manual_seed(0)
+    x = torch.empty(input_batch_size,
+                    input_seq_len,
+                    nheads,
+                    headdim,
+                    device=device,
+                    dtype=torch_dtype)
+    x.normal_(mean, std_dev)
+    dt = torch.randn(input_batch_size,
+                     input_seq_len,
+                     nheads,
+                     device=device,
+                     dtype=torch_dtype)
+    dt_bias = torch.rand(nheads, device=device) - 4.0
+    A = -torch.rand(nheads, device=device) - 1.0
+    B = torch.randn(input_batch_size,
+                    input_seq_len,
+                    ngroups,
+                    dstate,
+                    device=device,
+                    dtype=torch_dtype)
+    C = torch.randn_like(B)
+    D = torch.randn(nheads, device=device)
+
+    z = torch.randn_like(x)
+
+    ## full seqlen computation
+    out_ref, state_ref = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size=mamba_chunk_size,
+        D=D,
+        z=z if has_z else None,
+        dt_bias=dt_bias,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        dt_softplus=delta_softplus,
+        return_final_states=False,
+        return_varlen_states=True,
+    )
+
+    ## chunked seqlen computation
+    # first chunk
+    chunked_seqlens = seqlens // 2
+    chunked_cu_seqlens = torch.cat([
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.cumsum(chunked_seqlens, dim=0, dtype=torch.int32)
+    ],
+                                   dim=0)
+    chunked_seq_idx = torch.repeat_interleave(
+        torch.arange(len(chunked_seqlens), dtype=torch.int32, device=device),
+        chunked_seqlens,
+        output_size=chunked_cu_seqlens[-1]).unsqueeze(0)
+    chunked_input_seq_len = chunked_cu_seqlens[-1]
+    x_chunked = torch.zeros_like(x)[:, :chunked_input_seq_len, ...]
+    dt_chunked = torch.zeros_like(dt)[:, :chunked_input_seq_len, ...]
+    B_chunked = torch.zeros_like(B)[:, :chunked_input_seq_len, ...]
+    C_chunked = torch.zeros_like(C)[:, :chunked_input_seq_len, ...]
+    z_chunked = torch.zeros_like(z)[:, :chunked_input_seq_len, ...]
+    for i in range(num_sequences):
+        # yapf: disable
+        chunk_f = lambda x, i: x[:, cu_seqlens[i]:cu_seqlens[i] + chunked_seqlens[i], ...]
+
+        x_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(x, i)
+        dt_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(dt, i)
+        B_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(B, i)
+        C_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(C, i)
+        z_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(z, i)
+        # yapf: enable
+
+    partial_out, partial_state = mamba_chunk_scan_combined(
+        x_chunked,
+        dt_chunked,
+        A,
+        B_chunked,
+        C_chunked,
+        chunk_size=mamba_chunk_size,
+        D=D,
+        z=z_chunked,
+        dt_bias=dt_bias,
+        seq_idx=chunked_seq_idx,
+        cu_seqlens=chunked_cu_seqlens,
+        dt_softplus=delta_softplus,
+        return_final_states=False,
+        return_varlen_states=True,
+    )
+
+    # remaining chunk
+    remaining_chunked_seqlens = seqlens - chunked_seqlens
+    remaining_chunked_cu_seqlens = torch.cat([
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.cumsum(remaining_chunked_seqlens, dim=0, dtype=torch.int32)
+    ],
+                                             dim=0)
+    remaining_chunked_seq_idx = torch.repeat_interleave(
+        torch.arange(len(remaining_chunked_seqlens),
+                     dtype=torch.int32,
+                     device=device),
+        remaining_chunked_seqlens,
+        output_size=remaining_chunked_cu_seqlens[-1]).unsqueeze(0)
+    remaining_chunked_input_seq_len = remaining_chunked_cu_seqlens[-1]
+    # yapf: disable
+    remaining_x_chunked = torch.zeros_like(x)[:, :remaining_chunked_input_seq_len, ...]
+    remaining_dt_chunked = torch.zeros_like(dt)[:, :remaining_chunked_input_seq_len, ...]
+    remaining_B_chunked = torch.zeros_like(B)[:, :remaining_chunked_input_seq_len, ...]
+    remaining_C_chunked = torch.zeros_like(C)[:, :remaining_chunked_input_seq_len, ...]
+    remaining_z_chunked = torch.zeros_like(z)[:, :remaining_chunked_input_seq_len, ...]
+    for i in range(num_sequences):
+        remaining_chunk_f = lambda x, i: x[:, cu_seqlens[i] + chunked_seqlens[i]:cu_seqlens[i+1], ...]
+
+        remaining_x_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(x, i)
+        remaining_dt_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(dt, i)
+        remaining_B_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(B, i)
+        remaining_C_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(C, i)
+        remaining_z_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(z, i)
+
+    # assert input chunking is correct
+    concat_chunk_f = lambda pt1, pt2, i: torch.cat([
+        pt1[:,chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1],...],
+        pt2[:,remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1],...],
+        ],
+        dim=1)
+    concat_batch_f = lambda pt1, pt2: torch.cat([concat_chunk_f(pt1, pt2, i) for i in range(num_sequences)], dim=1)
+
+    assert concat_batch_f(x_chunked, remaining_x_chunked).equal(x)
+    assert concat_batch_f(dt_chunked, remaining_dt_chunked).equal(dt)
+    assert concat_batch_f(B_chunked, remaining_B_chunked).equal(B)
+    assert concat_batch_f(C_chunked, remaining_C_chunked).equal(C)
+    assert concat_batch_f(z_chunked, remaining_z_chunked).equal(z)
+    # yapf: enable
+
+    chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
+        remaining_chunked_cu_seqlens, mamba_chunk_size)
+
+    out_chunked, state_chunked = mamba_chunk_scan_combined(
+        remaining_x_chunked,
+        remaining_dt_chunked,
+        A,
+        remaining_B_chunked,
+        remaining_C_chunked,
+        chunk_size=mamba_chunk_size,
+        D=D,
+        z=remaining_z_chunked,
+        dt_bias=dt_bias,
+        initial_states=partial_state,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        seq_idx=remaining_chunked_seq_idx,
+        cu_seqlens=remaining_chunked_cu_seqlens,
+        dt_softplus=delta_softplus,
+        return_final_states=False,
+        return_varlen_states=True,
+    )
+    out = concat_batch_f(partial_out, out_chunked)
+
+    # kernel chunked is same as kernel overall
+    # tight tolerance to find subtle correctness issues
+    rtol = 1e-2
+    atol = 2e-3
+    for i in range(num_sequences):
+        out_seq = out[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]
+        out_seq_ref = out_ref[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]
+        torch.testing.assert_close(out_seq[:, :chunked_seqlens[i], ...],
+                                   out_seq_ref[:, :chunked_seqlens[i], ...],
+                                   rtol=rtol,
+                                   atol=atol,
+                                   msg=lambda x: f"seq{i} output part1 " + x)
+        torch.testing.assert_close(out_seq[:, chunked_seqlens[i]:, ...],
+                                   out_seq_ref[:, chunked_seqlens[i]:, ...],
+                                   rtol=rtol,
+                                   atol=atol,
+                                   msg=lambda x: f"seq{i} output part2 " + x)
+
+        state_seq = state_chunked[i]
+        state_seq_ref = state_ref[i]
+        torch.testing.assert_close(state_seq,
+                                   state_seq_ref,
+                                   rtol=rtol,
+                                   atol=atol,
+                                   msg=lambda x: f"seq{i} state " + x)

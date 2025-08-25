@@ -17,7 +17,7 @@ import os
 import platform
 import sys
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Union
 
 import pynvml
 import torch
@@ -366,6 +366,10 @@ class MnnvlMoe:
         )
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(torch.uint64)
+        torch.ops.trtllm.moe_initialize_workspace(
+            MnnvlMoe.moe_workspace_tensor, mapping.tp_rank, mapping.tp_size
+        )
+        MnnvlMoe.moe_workspace.comm.barrier()
         return MnnvlMoe.moe_workspace_tensor
 
     @staticmethod
@@ -394,7 +398,6 @@ class MnnvlMoe:
     @staticmethod
     def mnnvl_moe_alltoallv_prepare_without_allgather(
         expert_ids: torch.Tensor,
-        scales: torch.Tensor,
         expert_statics: Optional[torch.Tensor],
         workspace: torch.Tensor,
         max_token_count_per_rank: int,
@@ -405,8 +408,6 @@ class MnnvlMoe:
         top_k: int,
     ):
         (
-            prepared_local_experts,
-            prepared_local_scales,
             local_send_rank_count_cumsum,
             local_send_rank_indices,
             local_recv_rank_count_cumsum,
@@ -415,7 +416,6 @@ class MnnvlMoe:
             gathered_expert_statics,
         ) = torch.ops.trtllm.mnnvl_moe_alltoallv_prepare_without_allgather(
             expert_ids,
-            scales,
             expert_statics,
             workspace,
             max_token_count_per_rank,
@@ -440,7 +440,7 @@ class MnnvlMoe:
             local_token_allocation_count,
         )
 
-        return alltoall_info, prepared_local_experts, prepared_local_scales, gathered_expert_statics
+        return alltoall_info, gathered_expert_statics
 
     @staticmethod
     def mnnvl_moe_expert_static_allgather(
@@ -526,31 +526,67 @@ class MnnvlMoe:
 
     @staticmethod
     def mnnvl_moe_alltoallv(
-        x: torch.Tensor,
+        x: Union[torch.Tensor, List[Optional[torch.Tensor]]],
         alltoall_info: MoEAlltoallInfo,
         workspace: torch.Tensor,
         ep_rank: int,
         ep_size: int,
-    ):
-        assert x.dim() == 2, "only 2D tensor supported, please reshape."
-        output_tensor = torch.empty(
-            alltoall_info.local_token_allocation_count,
-            x.shape[1],
-            dtype=x.dtype,
-            device=torch.device("cuda"),
-        )
-        torch.ops.trtllm.moe_comm(
-            x,
-            alltoall_info.send_rank_count_cumsum,
-            alltoall_info.send_rank_local_indices,
-            output_tensor,
-            alltoall_info.recv_rank_count_cumsum,
-            alltoall_info.recv_rank_local_indices,
-            workspace,
-            ep_rank,
-            ep_size,
-        )
-        return output_tensor
+    ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
+        # Convert single tensor to list for unified handling
+        is_single_tensor = not isinstance(x, list)
+        if is_single_tensor:
+            assert x.dim() == 2, "only 2D tensor supported, please reshape."
+            x = [x]
+
+        assert len(x) > 0, "Empty tensor list not supported"
+
+        # Filter out None values
+        valid_list = [tensor is not None for tensor in x]
+        valid_tensors = [tensor for tensor in x if tensor is not None]
+
+        if len(valid_tensors) == 0:
+            # All tensors are None, return list of None
+            result = [None] * len(x)
+        else:
+            first_dim = None
+            for tensor in valid_tensors:
+                # Validate dimensions of valid tensors
+                assert tensor.dim() == 2, "only 2D tensor supported, please reshape."
+                if first_dim is None:
+                    first_dim = tensor.shape[0]
+                else:
+                    assert tensor.shape[0] == first_dim, (
+                        f"All tensors must have the same first dimension, got {tensor.shape[0]} vs {first_dim}"
+                    )
+
+            # Process only valid tensors
+            output_tensors = torch.ops.trtllm.moe_comm(
+                valid_tensors,
+                alltoall_info.send_rank_count_cumsum,
+                alltoall_info.send_rank_local_indices,
+                alltoall_info.recv_rank_count_cumsum,
+                alltoall_info.recv_rank_local_indices,
+                workspace,
+                alltoall_info.local_token_allocation_count,
+                ep_rank,
+                ep_size,
+            )
+
+            # Restore None positions in output
+            idx = 0
+            result = []
+            for is_valid in valid_list:
+                if is_valid:
+                    result.append(output_tensors[idx])
+                    idx += 1
+                else:
+                    result.append(None)
+
+        # If input was a single tensor, return a single tensor
+        if is_single_tensor:
+            result = result[0]
+
+        return result
 
     @staticmethod
     def mnnvl_moe_alltoallv_combine(
@@ -563,20 +599,19 @@ class MnnvlMoe:
         token_count: int,
     ):
         assert x.dim() == 2, "2D tensor supported, please reshape."
-        output_tensor = torch.zeros(
-            token_count * top_k, x.shape[1], dtype=x.dtype, device=torch.device("cuda")
-        )
-        torch.ops.trtllm.moe_comm(
-            x,
+        output_tensors = torch.ops.trtllm.moe_comm(
+            [x],
             alltoall_info.recv_rank_count_cumsum,
             alltoall_info.recv_rank_local_indices,
-            output_tensor,
             alltoall_info.send_rank_count_cumsum,
             alltoall_info.backward_recv_rank_local_indices,
             workspace,
+            token_count * top_k,
             ep_rank,
             ep_size,
+            [True],
         )
+        output_tensor = output_tensors[0]
         return torch.sum(
             output_tensor.reshape(token_count, top_k, x.shape[1]), dim=1, keepdim=False
         )
