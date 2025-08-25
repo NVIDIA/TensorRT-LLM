@@ -214,6 +214,7 @@ def create_py_executor(
     lora_config: Optional[LoraConfig] = None,
     logits_post_processor_config: Optional[LogitsPostProcessorConfig] = None,
     parallel_config: Optional[ParallelConfig] = None,
+    kwargs_py_executor: Optional[dict] = None,
 ) -> PyExecutor:
 
     executor_config = llm_args.get_executor_config(checkpoint_dir, tokenizer)
@@ -309,6 +310,8 @@ def create_py_executor(
         max_seq_len += spec_config.max_draft_len
 
     executor_config.max_seq_len = max_seq_len
+    if kwargs_py_executor and "max_seq_len" in kwargs_py_executor:
+        kwargs_py_executor["max_seq_len"] = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
 
     config = model_engine.model.model_config.pretrained_config
@@ -456,6 +459,9 @@ def create_py_executor(
             # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             executor_config.max_seq_len = max_seq_len
+            if kwargs_py_executor and "kwargs_py_executor" in kwargs_py_executor:
+                kwargs_py_executor["kwargs_py_executor"] = max_seq_len
+
             kv_cache_creator.build_managers(resources)
 
             for eng in [model_engine, draft_model_engine]:

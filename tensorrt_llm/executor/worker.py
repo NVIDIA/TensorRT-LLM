@@ -107,6 +107,9 @@ class GenerationExecutorWorker(GenerationExecutor):
             assert hasattr(
                 self.llm_args, "backend"
             ), "llm_args should be with backend in _create_py_executor"
+            # Some variables like executor_config.max_seq_len might be updated in
+            # create_py_executor and further used in the worker like _deduce_max_tokens
+            kwargs_py_executor = {"max_seq_len": self.llm_args.max_seq_len}
             if self.llm_args.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
@@ -122,6 +125,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 comm_ranks, device_ids = _get_comm_ranks_device_id()
                 args["parallel_config"] = tllm.ParallelConfig(
                     participant_ids=comm_ranks, device_ids=device_ids)
+                args["kwargs_py_executor"] = kwargs_py_executor
             elif self.llm_args.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs
@@ -143,7 +147,11 @@ class GenerationExecutorWorker(GenerationExecutor):
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend, self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format)
-            return create_executor(**args)
+
+            _executor = create_executor(**args)
+            # Define it after create_executor, since the kwargs_py_executor["max_seq_len"] might be updated inside.
+            self.max_seq_len = kwargs_py_executor["max_seq_len"]
+            return _executor
 
         def _create_engine(executor_config):
             if executor_config is None:
@@ -489,11 +497,11 @@ class GenerationExecutorWorker(GenerationExecutor):
                 if hasattr(self,
                            "mapping") and self.mapping.cp_size is not None:
                     cp_size = self.mapping.cp_size
-                if not hasattr(llm_args, "max_seq_len"):
+                if not hasattr(self, "max_seq_len"):
                     raise RuntimeError(
                         "max_tokens for sampling is not set and cannot be deduced by llm args"
                     )
-                max_seq_len = llm_args.max_seq_len
+                max_seq_len = self.max_seq_len
             else:
                 # deduce max_tokens by executor config
                 if hasattr(executor_config, "mapping"
