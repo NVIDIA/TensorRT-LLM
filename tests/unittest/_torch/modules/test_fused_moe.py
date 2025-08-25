@@ -212,11 +212,14 @@ def test_fused_moe_alltoall(alltoall_method_type):
         weights = {}
         for expert_id in range(NUM_EXPERTS):
             w1_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             w2_weight = torch.empty((HIDDEN_SIZE, INTERMEDIATE_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             w3_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             torch.nn.init.xavier_uniform_(w1_weight)
             torch.nn.init.xavier_uniform_(w2_weight)
             torch.nn.init.xavier_uniform_(w3_weight)
