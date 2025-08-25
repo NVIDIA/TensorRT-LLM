@@ -1644,7 +1644,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
-                    throw new Exception("Infrastructure error")
+                    echo "error: ${e.message}"
                     isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
                     if (isRerunFailed) {
                         error "The tests still failed after rerun attempt. ${e.message}"
@@ -2465,7 +2465,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 } else {
                     values()
                 }
-            })
+            }, sleepTimeInSecs: 120)
         }
     }]}
 
@@ -2532,21 +2532,25 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
         if (values.wheelInstalled) {
             stage(values.name) {
-                echo "Run ${values.name} sanity test."
-                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
-                    sh "env | sort"
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                trtllm_utils.llmStageWithRetry(pipeline, values.name, {
+                    echo "Run ${values.name} sanity test."
+                    imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                    trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                        sh "env | sort"
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
+                        runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                    })
                 })
             }
         } else {
             stage(values.name) {
-                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
-                    sh "env | sort"
-                    def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
-                    runLLMBuild(pipeline, cpuArch, false, "imageTest/")
+                trtllm_utils.llmStageWithRetry(pipeline, values.name, {
+                    imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                    trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                        sh "env | sort"
+                        def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
+                        runLLMBuild(pipeline, cpuArch, false, "imageTest/")
+                    })
                 })
             }
         }
