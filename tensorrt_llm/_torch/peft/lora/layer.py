@@ -107,8 +107,6 @@ class LoraLayer(torch.nn.Module):
                 module_idx = int(module_idx)
                 if module_idx in lora_params[layer_idx]:
                     active_lora_module_ids.append(module_idx)
-                    # TODO (dafrimi): needs to pass this is_dora arg
-                    lora_params[layer_idx][module_idx]['is_dora']
                     lora_ranks.append(
                         lora_params[layer_idx][module_idx]['adapter_size'])
                     lora_weight_pointers.append(
