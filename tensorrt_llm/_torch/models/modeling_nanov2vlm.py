@@ -70,9 +70,22 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         self.mlp1 = self.mlp1.to(config.torch_dtype)
 
         # self.img_context_token_id = None
-        self.vision_model = transformers.AutoModel.from_config(
-            config.vision_config, trust_remote_code=True)
-        self.vision_model.to(config.torch_dtype)
+        WITH_HF_CODES = False
+        if WITH_HF_CODES:
+            self.vision_model = transformers.AutoModel.from_config(
+                config.vision_config, trust_remote_code=True)
+            self.vision_model.to(config.torch_dtype)
+
+            with open("hf_vision_encoder_arch.txt", "w") as f:
+                f.write(str(self.vision_model))
+        else:
+            # Update the vision model with customized one.
+            from .modeling_radio import RADIOModel
+            self.vision_model = RADIOModel(config.vision_config)
+            self.vision_model.to(config.torch_dtype)
+
+            with open("user_vision_encoder_arch.txt", "w") as f:
+                f.write(str(self.vision_model))
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
