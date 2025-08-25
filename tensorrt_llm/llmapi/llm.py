@@ -134,7 +134,7 @@ class BaseLLM:
                 logger.info("Using LLM with PyTorch backend")
                 llm_args_cls = TorchLlmArgs
                 if self._executor_type == "ray":
-                    os.environ["DISABLE_MPI"] = "1"
+                    os.environ["TLLM_DISABLE_MPI"] = "1"
             elif backend == '_autodeploy':
                 logger.info("Using LLM with AutoDeploy backend")
                 from .._torch.auto_deploy.llm_args import \
@@ -1111,8 +1111,7 @@ class _TorchLLM(BaseLLM):
             garbage_collection_gen0_threshold,
             executor_type=self._executor_type,
             tp_size=self.args.tensor_parallel_size,
-            worker_extension_cls=getattr(self.args, 'worker_extension_cls',
-                                         None))
+        )
 
     @property
     def _on_trt_backend(self) -> bool:

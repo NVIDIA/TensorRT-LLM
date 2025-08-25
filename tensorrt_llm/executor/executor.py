@@ -345,21 +345,16 @@ class GenerationExecutor(ABC):
         return self._iter_kv_events_result
 
     @staticmethod
-    def _create_ray_executor(worker_kwargs: Dict,
-                             model_world_size: int,
+    def _create_ray_executor(worker_kwargs: Dict, model_world_size: int,
                              postproc_worker_config: PostprocWorkerConfig,
-                             is_llm_executor: bool,
-                             tp_size: int,
-                             worker_extension_cls: Optional[str] = None):
+                             is_llm_executor: bool, tp_size: int):
         from .ray_executor import RayExecutor
 
-        # TODO: model_world_size needs to be extended to parallel state.
         return RayExecutor(worker_kwargs,
                            model_world_size=model_world_size,
                            postproc_worker_config=postproc_worker_config,
                            is_llm_executor=is_llm_executor,
-                           tp_size=tp_size,
-                           worker_extension_cls=worker_extension_cls)
+                           tp_size=tp_size)
 
     @staticmethod
     def create(
@@ -376,7 +371,6 @@ class GenerationExecutor(ABC):
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
         executor_type: Optional[str] = None,
-        worker_extension_cls: Optional[str] = None,
         **args,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
@@ -415,8 +409,7 @@ class GenerationExecutor(ABC):
                 model_world_size,
                 postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                tp_size=args.get("tp_size", 1),
-                worker_extension_cls=worker_extension_cls)
+                tp_size=args.get("tp_size", 1))
         elif executor_type is not None:
             assert False, "Invalid executor type"
 

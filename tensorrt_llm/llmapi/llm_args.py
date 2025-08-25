@@ -2111,12 +2111,6 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.",
         status="prototype")
 
-    worker_extension_cls: Optional[str] = Field(
-        default=None,
-        description="The full worker extension class name."
-        "Allows users to dynamically extend the functionality of the RayGPUWorker class."
-    )
-
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")

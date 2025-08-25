@@ -214,7 +214,7 @@ def create_py_executor(
 
     mapping = _get_mapping(executor_config)
 
-    if os.environ.get("DISABLE_MPI") == "1":
+    if os.environ.get("TLLM_DISABLE_MPI") == "1":
         dist = TorchDist(mapping=mapping)
     else:
         dist = MPIDist(mapping=mapping)

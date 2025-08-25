@@ -217,7 +217,7 @@ class PyExecutor:
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
-        self._disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+        self._disable_mpi = os.environ.get("TLLM_DISABLE_MPI") == "1"
 
         # list of requests in each PP micro batch
         self.num_micro_batches = self.dist.pp_size

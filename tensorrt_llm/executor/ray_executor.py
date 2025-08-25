@@ -15,8 +15,8 @@ from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
 from .request import GenerationRequest
-from .result import (GenerationResult, IterationResult, ResponseRaySharedQueue,
-                     ResponseSyncRaySharedQueue)
+from .result import (GenerationResult, IterationResult, RayAsyncQueue,
+                     RaySyncQueue)
 
 __all__ = [
     "RayExecutor",
@@ -38,8 +38,7 @@ class RayExecutor(GenerationExecutor):
                  model_world_size: int,
                  postproc_worker_config: PostprocWorkerConfig,
                  is_llm_executor: bool,
-                 tp_size=1,
-                 worker_extension_cls: Optional[str] = None):
+                 tp_size=1):
         os.environ['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = '1'
         os.environ["RAY_DEDUP_LOGS"] = "0"  # for debug
 
@@ -73,8 +72,8 @@ class RayExecutor(GenerationExecutor):
         self.tp_size = tp_size
         self.master_address = ray.util.get_node_ip_address()
         self.master_port = get_free_port()
-        self.response_queue = ResponseRaySharedQueue.options().remote()
-        self.response_sync_queue = ResponseSyncRaySharedQueue.options().remote()
+        self.response_queue = RayAsyncQueue.options().remote()
+        self.response_sync_queue = RaySyncQueue.options().remote()
         self.async_response_queue_weakref = self.create_actor_weak_ref(
             self.response_queue)
         self.sync_response_queue_weakref = self.create_actor_weak_ref(
@@ -83,7 +82,7 @@ class RayExecutor(GenerationExecutor):
         self.response_queue.warmup.remote()
         self.response_sync_queue.warmup.remote()
 
-        self.create_workers(RayGPUWorker, worker_kwargs, worker_extension_cls)
+        self.create_workers(RayGPUWorker, worker_kwargs)
 
     @staticmethod
     def create_actor_weak_ref(actor_handle: ray.actor.ActorHandle):
@@ -94,10 +93,7 @@ class RayExecutor(GenerationExecutor):
     def use_ray_queue(self) -> bool:
         return True
 
-    def create_workers(self,
-                       worker_cls,
-                       worker_kwargs,
-                       worker_extension_cls: Optional[str] = None):
+    def create_workers(self, worker_cls, worker_kwargs):
         # If this is set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
         num_gpus = float(os.getenv("TRTLLM_RAY_PER_WORKER_GPUS", "1.0"))
@@ -106,7 +102,7 @@ class RayExecutor(GenerationExecutor):
         runtime_env = ray.runtime_env.RuntimeEnv()
         runtime_env["env_vars"] = os.environ.copy()
         runtime_env["env_vars"].update({
-            "DISABLE_MPI": "1",
+            "TLLM_DISABLE_MPI": "1",
             "MASTER_ADDR": self.master_address,  # head-IP for NCCL/Gloo
             "MASTER_PORT": str(self.master_port)
         })
@@ -121,8 +117,7 @@ class RayExecutor(GenerationExecutor):
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=self.placement_group,
                     placement_group_bundle_index=self.bundle_indices[rank],
-                )).remote(worker_cls, worker_kwargs, self.world_size, rank,
-                          worker_extension_cls)
+                )).remote(worker_cls, worker_kwargs, self.world_size, rank)
             for rank in range(self.world_size)
         ]
 
@@ -321,7 +316,7 @@ class RayExecutor(GenerationExecutor):
         nodes = ray.nodes()
         gpus_per_node = int(nodes[0]["Resources"].get(
             "GPU", 0))  # assume symmetric across nodes
-        # Don't set bundle_cpu to be bundle_gpu * 2, because ResponseRaySharedQueue
+        # Don't set bundle_cpu to be bundle_gpu * 2, because RayAsyncQueue
         # currently requires 2 CPUs.
         bundle_cpu = bundle_gpu = min(tp_size, gpus_per_node)
 

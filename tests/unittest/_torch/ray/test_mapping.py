@@ -79,7 +79,7 @@ class TestMapping(unittest.TestCase):
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["LOCAL_RANK"] = str(rank)
-        os.environ["DISABLE_MPI"] = "1"
+        os.environ["TLLM_DISABLE_MPI"] = "1"
         torch.cuda.set_device(rank)
 
         dist.init_process_group("nccl", rank=rank, world_size=world_size)

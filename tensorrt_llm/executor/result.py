@@ -153,9 +153,9 @@ def warmup_tensorrt_llm():
           tensorrt_llm.version.__version__)
 
 
-# Async queue for response
 @ray.remote(max_concurrency=1000000, num_cpus=2)
-class ResponseRaySharedQueue:
+class RayAsyncQueue:
+    """Ray actor for async response handling."""
 
     def __init__(self):
         self.data = {}
@@ -198,7 +198,8 @@ SYNC_QUEUE_MAX_CONCURRENCY = 2
 
 @ray.remote(max_concurrency=SYNC_QUEUE_MAX_CONCURRENCY,
             num_cpus=SYNC_QUEUE_MAX_CONCURRENCY)
-class ResponseSyncRaySharedQueue:
+class RaySyncQueue:
+    """Ray actor for sync response handling."""
 
     def __init__(self):
         self.data = {}
@@ -243,7 +244,7 @@ class GenerationResultBase:
     def __init__(self,
                  id: int,
                  sampling_params: SamplingParams,
-                 queue: Optional[ResponseRaySharedQueue] = None,
+                 queue: Optional[RayAsyncQueue] = None,
                  background_error_handler: Optional[Callable] = None,
                  postproc_params: "Optional[PostprocParams]" = None):
         self.id = id

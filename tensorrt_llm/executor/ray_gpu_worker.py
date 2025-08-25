@@ -1,10 +1,9 @@
 import copy
-import importlib
 import json
 import os
 from pathlib import Path
 from queue import Queue
-from typing import Any, Dict, Optional, Type, Union
+from typing import Dict, Optional, Union
 
 import ray
 import torch
@@ -31,22 +30,10 @@ __all__ = [
 ]
 
 
-def resolve_obj_by_qualname(qualname: str) -> Any:
-    """Resolve an object by its fully qualified name."""
-    module_name, obj_name = qualname.rsplit(".", 1)
-    module = importlib.import_module(module_name)
-    return getattr(module, obj_name)
-
-
 @ray.remote
 class RayWorkerWrapper:
 
-    def __init__(self,
-                 worker_cls,
-                 worker_kwargs,
-                 world_size,
-                 rank,
-                 worker_extension_cls: Optional[str] = None):
+    def __init__(self, worker_cls, worker_kwargs, world_size, rank):
         self.master_address = os.environ["MASTER_ADDR"]
         self.master_port = os.environ["MASTER_PORT"]
 
@@ -76,8 +63,6 @@ class RayWorkerWrapper:
 
         torch.cuda.set_device(local_gpu)
 
-        worker_cls = self._inject_worker_extension(worker_cls,
-                                                   worker_extension_cls)
         self.worker = worker_cls(**worker_kwargs)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -125,39 +110,6 @@ class RayWorkerWrapper:
         else:
             raise AttributeError(
                 f"Underlying worker has no method '{method_name}'")
-
-    def _inject_worker_extension(
-            self, worker_class: Type['GenerationExecutor'],
-            extension_cls_name: Optional[str]) -> Type['GenerationExecutor']:
-        """Inject worker extension into the worker class if specified."""
-        if not extension_cls_name:
-            return worker_class
-
-        try:
-            from tensorrt_llm.logger import logger
-            extension_cls = resolve_obj_by_qualname(extension_cls_name)
-            # Check for conflicts
-            for attr in dir(extension_cls):
-                if attr.startswith("__"):
-                    continue
-                if hasattr(worker_class, attr):
-                    logger.warning(
-                        f"Worker class {worker_class.__name__} already has attribute '{attr}', "
-                        f"which conflicts with extension {extension_cls.__name__}. "
-                        f"Extension method will override.")
-
-            if extension_cls not in worker_class.__bases__:
-                worker_class.__bases__ = worker_class.__bases__ + (
-                    extension_cls, )
-                logger.debug(
-                    f"Finished injection of {extension_cls.__name__} into {worker_class.__name__}."
-                )
-
-            return worker_class
-
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load worker extension '{extension_cls_name}': {e}")
 
 
 class RayGPUWorker(GenerationExecutor):

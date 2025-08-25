@@ -182,7 +182,7 @@ def allgather(
                 if val is not None
             ])
 
-    disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+    disable_mpi = os.environ.get("TLLM_DISABLE_MPI") == "1"
 
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
@@ -267,7 +267,7 @@ def reducescatter(
             x = torch.cat([x.reshape(-1, x_info['numel_base']) for x in x_list])
         return x
 
-    disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+    disable_mpi = os.environ.get("TLLM_DISABLE_MPI") == "1"
 
     if isinstance(input, torch.Tensor):
         if disable_mpi:
@@ -464,7 +464,7 @@ class AllReduce(nn.Module):
         self.workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
-        self._disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+        self._disable_mpi = os.environ.get("TLLM_DISABLE_MPI") == "1"
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 

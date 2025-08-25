@@ -62,7 +62,7 @@ inline void pgCheckHelper(bool success, char const* const file, int const line, 
 inline bool useMPI()
 {
     bool useMPI = true;
-    char* val = std::getenv("DISABLE_MPI");
+    char* val = std::getenv("TLLM_DISABLE_MPI");
     if (val != nullptr && std::string(val) == "1")
     {
         useMPI = false;

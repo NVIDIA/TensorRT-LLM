@@ -102,7 +102,7 @@ class IpcMemory:
         Returns a list of buffer pointers, buffers[i] is a handle to the corresponding buffer residing on GPU #i.
         Call close_ipc_handle with the *buffer*.
         """
-        disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+        disable_mpi = os.environ.get("TLLM_DISABLE_MPI") == "1"
 
         def align_size(size, alignment):
             if (size % alignment) != 0:

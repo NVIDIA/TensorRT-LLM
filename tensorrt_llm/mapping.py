@@ -240,7 +240,7 @@ class Mapping(object):
 
         # For Ray path. store a reference to TorchDist
         self._dist = None
-        self._disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+        self._disable_mpi = os.environ.get("TLLM_DISABLE_MPI") == "1"
 
         # TODO: can deprecate if moving to DeviceMesh
         self._pp_groups = []
@@ -296,7 +296,8 @@ class Mapping(object):
             raise RuntimeError(f"Mapping.dist is already set to {dist}")
         if not self._disable_mpi:
             logger.warning(
-                "No affect on setting dist for Mapping, unless DISABLE_MPI=1.")
+                "No affect on setting dist for Mapping, unless TLLM_DISABLE_MPI=1."
+            )
             return
         self._build_mesh()
         self._dist = dist

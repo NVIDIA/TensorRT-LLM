@@ -70,7 +70,7 @@ class ExecutorRequestQueue:
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
 
-        self._disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+        self._disable_mpi = os.environ.get("TLLM_DISABLE_MPI") == "1"
 
     def _get_from_request_queue(
             self,
@@ -272,7 +272,7 @@ class ExecutorRequestQueue:
         # Calculate timeout
         idle = (total_num_active_requests == 0) and len(self.waiting_queue) == 0
         if idle:
-            # In Ray path (DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
+            # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
             timeout = datetime.timedelta(
                 seconds=1200) if self._disable_mpi else None

@@ -485,7 +485,7 @@ def local_mpi_comm():
 
 
 def mpi_rank():
-    if os.environ.get("DISABLE_MPI") == "1":
+    if os.environ.get("TLLM_DISABLE_MPI") == "1":
         try:
             return torch.distributed.get_rank()
         except ValueError:
@@ -496,7 +496,7 @@ def mpi_rank():
 
 def global_mpi_rank():
     # TODO WAR for controller to work in slurm pmix env
-    if os.environ.get("DISABLE_MPI") == "1":
+    if os.environ.get("TLLM_DISABLE_MPI") == "1":
         assert not (dist.is_available() and dist.is_initialized()), (
             "Please deprceate all usages of global_mpi_rank() in Ray migration except in controller,"
             "which will be cleaned up later.")

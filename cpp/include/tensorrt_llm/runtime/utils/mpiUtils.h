@@ -430,7 +430,7 @@ public:
     {
         if (!mDisableMPI.has_value())
         {
-            char* val = std::getenv("DISABLE_MPI");
+            char* val = std::getenv("TLLM_DISABLE_MPI");
             ;
             bool disable_mpi = false;
             if (val != NULL && std::string(val) == "1")

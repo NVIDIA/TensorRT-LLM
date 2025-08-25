@@ -528,7 +528,7 @@ _pp_comm = None
 def init_pp_comm(mapping):
     """Initialize PPComm once at startup"""
     global _pp_comm
-    if os.environ.get("DISABLE_MPI") == "1":
+    if os.environ.get("TLLM_DISABLE_MPI") == "1":
         _pp_comm = PPCommTorch(mapping)
     else:
         _pp_comm = PPComm(mapping)
