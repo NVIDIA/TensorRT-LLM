@@ -181,7 +181,7 @@ class MoeConfig(StrictBaseModel):
     load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, dict, str]"})
 
     disable_finalize_fusion: bool = Field(
         default=False,
@@ -2267,7 +2267,15 @@ class TorchLlmArgs(BaseLlmArgs):
                     **moe_load_balancer_config)
             except Exception as e:
                 raise ValueError(
-                    f"Failed to load MoE load balancer config file: {self.load_balancer}"
+                    f"Failed to load MoE load balancer config file: {self.moe_config.load_balancer}"
+                ) from e
+        elif isinstance(self.moe_config.load_balancer, dict):
+            try:
+                self.moe_config.load_balancer = MoeLoadBalancerConfig(
+                    **self.moe_config.load_balancer)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"
                 ) from e
         return self
 
