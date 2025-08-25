@@ -10,6 +10,23 @@ l0_gb200_multi_nodes:
       gpu:
       - '*gb200*'
     terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp]
+- condition:
+    ranges:
+      # 2 nodes with each node has 4 GPUs
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb200*'
+    terms:
       stage: post_merge
       backend: pytorch
   tests:
