@@ -186,7 +186,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
     {
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManager.get());
+            mCacheTransBufferManager.get(), *mCacheState);
         TLLM_LOG_INFO("NIXL Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
