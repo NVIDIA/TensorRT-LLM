@@ -640,11 +640,6 @@ class TorchSampler(Sampler):
 
         return logits
 
-    EMPTY_STOP_WORDS_LIST: list[list[int]] = [[], []]
-
-    def request_stopwords(self, request: LlmRequest) -> list[int]:
-        return (request.py_stop_words_list or self.EMPTY_STOP_WORDS_LIST)[0]
-
     @staticmethod
     def longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
         max_stop_word_len = 0
