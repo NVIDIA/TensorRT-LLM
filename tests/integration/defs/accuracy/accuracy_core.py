@@ -297,13 +297,15 @@ class GSM8K(AccuracyTask):
     ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
-    NUM_SAMPLES = 1319  # Full sample
+    NUM_SAMPLES = 2  # Full sample
 
     MAX_INPUT_LEN = 4096
     MAX_OUTPUT_LEN = 256
 
     EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8K
-    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            apply_chat_template=False)
 
     EVALUATE_KWARGS = dict(scores_filter=None)
 

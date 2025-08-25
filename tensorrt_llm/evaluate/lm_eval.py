@@ -311,6 +311,11 @@ class LmEvalEvaluator(Evaluator):
             ) from e
         import lm_eval.tasks
         self.MULTIMODAL = is_multimodal
+        print(
+            f"LmEvalEvaluator::__init__: apply_chat_template: {apply_chat_template}"
+        )
+        if apply_chat_template:
+            assert False
         if self.MULTIMODAL:
             apply_chat_template = True
             logger.info(
@@ -389,6 +394,9 @@ class LmEvalEvaluator(Evaluator):
                  scores_filter: str = None) -> float:
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
+        print(
+            f"LmEvalEvaluator::evaluate: apply_chat_template: {self.apply_chat_template}"
+        )
         results = lm_eval.evaluate(
             lm=lm_cls(llm, sampling_params, streaming),
             task_dict=self.task_dict,
@@ -398,6 +406,11 @@ class LmEvalEvaluator(Evaluator):
             system_instruction=self.system_prompt)
         # Normalize scores to range 0~100
         scores = results["results"][self.task_name]
+        if self.task_name == "gsm8k":
+            print(f"scores: {scores}, results: {results}")
+            print(f"scores_filter: {scores_filter}")
+            import sys
+            sys.stdout.flush()
         for metric in scores.keys():
             if isinstance(scores[metric], (float, int)):
                 scores[metric] *= 100
