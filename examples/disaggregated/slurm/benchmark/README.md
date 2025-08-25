@@ -4,13 +4,15 @@ This directory contains scripts to run disaggregated inference benchmarks using 
 
 ## Overview
 
-The benchmarking process is orchestrated through a set of shell scripts and a Python script that work together:
+The benchmarking process is orchestrated through a set of shell scripts and Python scripts that work together:
 
 1.  `submit.sh`: The main entry point for submitting benchmark jobs to SLURM. It runs a parameter sweep by calling `sbatch` with different configurations.
-2.  `disaggr_torch.slurm`: The SLURM script that sets up and runs a single benchmark experiment. It launches a container, generates a configuration file, starts the server and workers, and runs the benchmark client.
-3.  `gen_yaml.py`: A Python script that generates the `config.yaml` file needed by `trtllm-serve`. It determines the server and worker configuration based on SLURM environment variables and script arguments.
-4.  `start_worker.sh`: A shell script responsible for starting a `trtllm-serve disaggregated_mpi_worker` on each allocated machine.
-5.  `run_benchmark.sh`: A shell script that waits for the server to be healthy and then runs the actual benchmark client (`run_benchmark.py`, not included in this directory).
+2.  `disaggr_torch.slurm`: The SLURM script that sets up and runs a single benchmark experiment. It launches a container, generates configuration files, starts the server and workers, and runs the benchmark client.
+3.  `gen_worker_config.py`: A Python script that generates the worker configuration YAML file needed by `trtllm-serve`. It determines the worker configuration based on SLURM environment variables and script arguments.
+4.  `gen_server_config.py`: A Python script that generates the server configuration YAML file needed by `trtllm-serve`. It determines the server configuration based on the number of context and generation servers.
+5.  `start_worker.sh`: A shell script responsible for starting disaggregated workers using `trtllm-serve` on each allocated machine.
+6.  `start_server.sh`: A shell script responsible for starting disaggregated server using `trtllm-serve` on each allocated machine.
+7.  `run_benchmark.sh`: A shell script that waits for the server to be healthy and then runs the actual benchmark client (`run_benchmark.py`, not included in this directory).
 
 ## File Descriptions
 
@@ -46,13 +48,21 @@ It takes the following arguments in order:
 12. `concurrency_list`: A space-separated list of concurrencies to test (e.g., "1 2 4 8").
 13. `sub_file`: A subdirectory name for logs.
 
-### `gen_yaml.py`
+### `gen_worker_config.py`
 
-This Python script generates the `config.yaml` file that configures the `trtllm-serve` application. It reads SLURM environment variables (`SLURM_JOB_NODELIST`, `SLURM_TASKS_PER_NODE`) to distribute workers across nodes.
+This Python script generates the worker configuration YAML file that configures the `trtllm-serve` workers. It creates separate configurations for context and generation workers with different tensor parallelism, batch sizes, and other parameters.
 
 **Usage:**
 
-The script is called from within `disaggr_torch.slurm`. It takes numerous arguments to define the model, parallelism, and server configurations.
+The script is called from within `disaggr_torch.slurm`. It takes numerous arguments to define the model, parallelism, and worker configurations for both context and generation phases.
+
+### `gen_server_config.py`
+
+This Python script generates the server configuration YAML file that configures the `trtllm-serve` disaggregated server. It reads hostname information from the work directory and creates a configuration that specifies the URLs for context and generation servers.
+
+**Usage:**
+
+The script is called from within `start_server.sh`. It takes arguments for the number of context and generation servers and the work directory.
 
 ### `start_worker.sh`
 
@@ -60,14 +70,30 @@ This script starts a `trtllm-serve disaggregated_mpi_worker`. It is launched by 
 
 **Arguments:**
 
-1.  `config_file`: Path to the `config.yaml` file.
-2.  `enable_pdl`: `true` or `false`.
-3.  `ctx_gpus`: Number of GPUs used for the context phase.
-4.  `work_dir`: (Optional) Directory to store nsys profiling output.
+1.  `worker_type`: Either "CTX" or "GEN" to specify the worker type.
+2.  `worker_index`: Index of the worker instance.
+3.  `model_dir`: Path to the model directory.
+4.  `worker_port`: Port for the worker to listen on.
+5.  `benchmark_mode`: Benchmark mode setting.
+6.  `concurrency`: Concurrency level.
+7.  `enable_pdl`: `true` or `false`.
+8.  `work_dir`: Work directory for logs and configuration.
+9.  `nsys_on`: Whether to enable nsys profiling.
+
+### `start_server.sh`
+
+This script starts the `trtllm-serve disaggregated` server. It first generates the server configuration using `gen_server_config.py`, then starts the server process.
+
+**Arguments:**
+
+1.  `num_ctx_servers`: Number of context servers.
+2.  `num_gen_servers`: Number of generation servers.
+3.  `work_dir`: Work directory for logs and configuration.
+4.  `script_dir`: Directory containing the scripts.
 
 ### `run_benchmark.sh`
 
-This script orchestrates the execution of the benchmark client. It waits for the `config.yaml` to be created and for the server's `/health` endpoint to respond, then it runs the benchmark.
+This script orchestrates the execution of the benchmark client. It waits for the configuration files to be created and for the server's `/health` endpoint to respond, then it runs the benchmark.
 
 **Arguments:**
 
@@ -85,9 +111,9 @@ This script orchestrates the execution of the benchmark client. It waits for the
 2.  The user runs `./submit.sh`.
 3.  `submit.sh` submits one or more jobs to SLURM by calling `sbatch disaggr_torch.slurm` with different parameters.
 4.  For each job, SLURM allocates resources and runs `disaggr_torch.slurm`.
-5.  `disaggr_torch.slurm` runs `gen_yaml.py` to create a `config.yaml`.
-6.  `disaggr_torch.slurm` uses `srun` to launch `start_worker.sh` on all nodes, starting the MPI workers.
-7.  `disaggr_torch.slurm` starts the main `trtllm-serve` process.
+5.  `disaggr_torch.slurm` runs `gen_worker_config.py` to create worker configuration files.
+6.  `disaggr_torch.slurm` uses `srun` to launch `start_worker.sh` on all nodes, starting the MPI workers for both context and generation phases.
+7.  `disaggr_torch.slurm` starts the main `trtllm-serve` process using `start_server.sh`, which generates the server configuration using `gen_server_config.py`.
 8.  `disaggr_torch.slurm` runs `run_benchmark.sh` which waits for the server to be ready.
 9.  `run_benchmark.sh` executes the benchmark for each concurrency level specified.
 10.  After the benchmark, `run_benchmark.sh` and `disaggr_torch.slurm` attempt to kill the server and worker processes.

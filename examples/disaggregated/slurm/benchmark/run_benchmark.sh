@@ -1,8 +1,7 @@
 #!/bin/bash
-
-# Add error handling
-set -e
 set -u
+set -e
+set -x
 trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
 # Add parameter validation
@@ -26,10 +25,7 @@ if [[ ${SLURM_PROCID} != "0" ]]; then
     exit 0
 fi
 
-echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
-
-set -x
-config_file=${log_path}/config.yaml
+config_file=${log_path}/server_config.yaml
 
 # check if the config file exists every 10 seconds timeout 1800 seconds
 timeout=1800
@@ -82,14 +78,26 @@ done
 # try client
 
 do_get_logs(){
-    worker_log_path=$1
+    log_path=$1
     output_folder=$2
-    grep -a "'num_ctx_requests': 0, 'num_ctx_tokens': 0" ${worker_log_path} > ${output_folder}/gen_only.txt || true
-    grep -a "'num_generation_tokens': 0" ${worker_log_path} > ${output_folder}/ctx_only.txt || true
+
+    for gen_file in ${log_path}/output_gen_*.log; do
+        if [ -f "$gen_file" ]; then
+            index=$(basename "$gen_file" | sed 's/output_gen_\(.*\)\.log/\1/')
+            grep -a "'num_ctx_requests': 0, 'num_ctx_tokens': 0" "$gen_file" > "${output_folder}/gen_only_${index}.txt" || true
+        fi
+    done
+
+    for ctx_file in ${log_path}/output_ctx_*.log; do
+        if [ -f "$ctx_file" ]; then
+            index=$(basename "$ctx_file" | sed 's/output_ctx_\(.*\)\.log/\1/')
+            grep -a "'num_generation_tokens': 0" "$ctx_file" > "${output_folder}/ctx_only_${index}.txt" || true
+        fi
+    done
 }
 
 # run the loadgen
-cp ${log_path}/output_workers.log ${log_path}/workers_start.log
+echo "Starting benchmark..."
 for concurrency in ${concurrency_list}; do
     mkdir -p ${log_path}/concurrency_${concurrency}
     max_count=$((${concurrency} * ${multi_round}))
@@ -110,8 +118,7 @@ for concurrency in ${concurrency_list}; do
         --no-test-input \
         $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
 
-    do_get_logs ${log_path}/output_workers.log ${log_path}/concurrency_${concurrency}
-    echo "" > ${log_path}/output_workers.log
+    do_get_logs ${log_path} ${log_path}/concurrency_${concurrency}
     echo "done for ${concurrency} in folder ${log_path}/concurrency_${concurrency}"
 done
 
