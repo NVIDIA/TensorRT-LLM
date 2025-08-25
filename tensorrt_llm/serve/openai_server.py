@@ -304,7 +304,7 @@ class OpenAIServer:
             async for stat in self.llm.get_stats_async(2):
                 stats.append(stat)
         except IndexError:
-            # queue is empty, no more events
+            # queue is empty, no more stats
             pass
         return JSONResponse(content=stats)
 
