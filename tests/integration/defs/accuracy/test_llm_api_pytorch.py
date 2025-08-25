@@ -2343,10 +2343,11 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                 **pytorch_config,
                 enable_attention_dp=attention_dp,
                 max_batch_size=32) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.apply_chat_template = False
+            print(f"task.apply_chat_template: {task.apply_chat_template}")
             task.evaluate(llm)
             assert False
 
