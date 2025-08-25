@@ -63,12 +63,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="The percentage of memory to use for KV Cache after model load.",
 )
 @optgroup.option(
-    "--mamba_ssm_cache_dtype",
-    type=click.Choice(["auto", "float16", "bfloat16", "float32"]),
-    default="auto",
-    help="Data type for Mamba SSM cache. If 'auto', inferred from model config.",
-)
-@optgroup.option(
     "--max_seq_len",
     type=int,
     default=None,
