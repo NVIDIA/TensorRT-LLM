@@ -400,6 +400,7 @@ class LmEvalEvaluator(Evaluator):
         scores = results["results"][self.task_name]
         if self.task_name == "gsm8k":
             print(f"scores: {scores}, results: {results}")
+            print(f"scores_filter: {scores_filter}")
             import sys
             sys.stdout.flush()
         for metric in scores.keys():
