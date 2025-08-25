@@ -369,6 +369,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
         auto selfAttentionLayerNum
             = selfConfig.getParallelConfig()
                   .mAttentionLayerNumPerPP[selfIdx / selfConfig.getParallelConfig().mTensorParallelism];
+        TLLM_CHECK_WITH_INFO(selfAttentionLayerNum != 0, "selfAttentionLayerNum should not be 0");
         auto getBufferSizeForTarget = [&]()
         {
             std::vector<size_t> bufferEleSizes(targetNum, 0);

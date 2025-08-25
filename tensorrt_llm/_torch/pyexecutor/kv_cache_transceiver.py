@@ -102,6 +102,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         head_dim = kv_cache_manager.head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         dtype = kv_cache_manager.dtype
+        # get the layer num per pp rank, which is required by cache transceiver.
         pp_layer_num = len(kv_cache_manager.pp_layers)
         pp_layer_num_per_pp_rank = dist.pp_allgather(pp_layer_num)
         self.impl = CacheTransceiverCpp(kv_cache_manager.impl,
