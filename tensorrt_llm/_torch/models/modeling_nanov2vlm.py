@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import transformers
+from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -190,6 +191,14 @@ class NanoV2VLInputProcessor(InputProcessor):
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
             "multi_modal_data", {})
         images = mm_data.get("image", None)
+
+        if images is not None:
+            if isinstance(images[0], torch.Tensor):
+                # NanoV2VL can only support PIL images. Convert normalized tensors (0-1) to PIL images (0-255).
+                images = [
+                    Image.fromarray((image.permute(1, 2, 0) * 255).to(
+                        torch.uint8).cpu().numpy()) for image in images
+                ]
 
         # Processing for multimodal data.
         processed_images = self.image_processor(images=images,
