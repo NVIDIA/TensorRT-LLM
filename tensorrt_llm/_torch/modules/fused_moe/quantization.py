@@ -8,6 +8,8 @@ from torch import nn
 
 import tensorrt_llm.logger as trtllm_logger
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.quantization.functional import \
+    preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
     float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices)
@@ -61,6 +63,11 @@ class FusedMoEQuantScalesW4A8(NamedTuple):
     zero_2: torch.Tensor
     alpha_1: torch.Tensor
     alpha_2: torch.Tensor
+
+
+class FusedMoEQuantScalesINT8WoqPerChannel(NamedTuple):
+    fc31_weight_scale: torch.Tensor
+    fc2_weight_scale: torch.Tensor
 
 
 class FusedMoEQuantScalesW4A16MXFP4(NamedTuple):
@@ -336,7 +343,7 @@ class FusedMoEMethodBase(ABC):
               **kwargs) -> torch.Tensor:
         """
         Apply the quantization method to the input tensor.
-        This isn’t necessary for all quantization methods, but it’s useful for
+        This isn't necessary for all quantization methods, but it's useful for
         certain backends that can encapsulate the MoE forward function.
         """
         raise NotImplementedError
@@ -654,7 +661,6 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
             self, module: torch.nn.Module, weights: Dict,
             load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
             dst_w2_weight_scale: torch.Tensor, device):
-        assert device.type == "cuda"
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             if module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w3_scale = weights['gate_up_proj_weight_scale'][
@@ -773,6 +779,146 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
             module.w2_weight_scaling_factor = nn.Parameter(transfromed_w2_scale,
                                                            requires_grad=False)
             self.setup_quant_scales(module)
+
+
+class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
+
+    def create_weights(self, module: torch.nn.Module):
+        module.sm_version = get_sm_version()
+        module.sm_version = 80 if module.sm_version >= 90 else module.sm_version
+        module.preprocessor = preprocess_weights_for_mixed_gemm
+
+        weight_dtype = torch.int8
+        if not module.quant_config.layer_quant_mode.is_int8_weight_only():
+            raise NotImplementedError(
+                f"Weight Only Quantization currently only supports INT8. Got: {module.quant_config.layer_quant_mode}."
+            )
+
+        # notice the weight shape for int8 weight-only is different from the original shape,
+        # since the quantized weights have their own layout
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              module.hidden_size,
+                              module.intermediate_size_per_partition * 2)
+        w2_weight_shape = (module.expert_size_per_partition,
+                           module.intermediate_size_per_partition,
+                           module.hidden_size)
+
+        fc31_weight_scale = nn.Parameter(torch.empty(
+            module.expert_size_per_partition,
+            module.intermediate_size_per_partition * 2,
+            dtype=module.dtype),
+                                         requires_grad=False)
+        module.register_parameter("fc31_weight_scale", fc31_weight_scale)
+
+        fc2_weight_scale = nn.Parameter(torch.empty(
+            module.expert_size_per_partition,
+            module.hidden_size,
+            dtype=module.dtype),
+                                        requires_grad=False)
+        module.register_parameter("fc2_weight_scale", fc2_weight_scale)
+
+        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
+                               w2_weight_shape)
+        self.setup_quant_scales(module)
+
+    def setup_quant_scales(self, module: torch.nn.Module):
+        module.quant_scales = FusedMoEQuantScalesINT8WoqPerChannel(
+            fc31_weight_scale=module.fc31_weight_scale,
+            fc2_weight_scale=module.fc2_weight_scale,
+        )
+
+    def get_quant_scales(self, module: torch.nn.Module, slot_start,
+                         slot_end) -> tuple[torch.Tensor, ...]:
+        assert module.smart_router
+        return FusedMoEQuantScalesINT8WoqPerChannel(
+            fc31_weight_scale=module.fc31_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+            fc2_weight_scale=module.fc2_weight_scale.narrow(
+                0, slot_start, slot_end - slot_start),
+        )
+
+    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor):
+        """
+        Load w1 and w3 weights for each expert.
+        """
+        w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN)
+        w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
+
+        weight_dtype = torch.int8
+
+        assert module.dtype in [torch.float16, torch.bfloat16], \
+            f"activation dtype should be float16 or bfloat16, got {module.dtype}"
+        if not module.quant_config.layer_quant_mode.is_int8_weight_only():
+            raise NotImplementedError(
+                f"weight dtype should be INT8. Got: {module.quant_config.layer_quant_mode}."
+            )
+        # preprocess the weights for mixed gemm
+        w31_weight_shard = module.preprocessor(w31_weight_shard.T.contiguous(),
+                                               weight_dtype, module.dtype,
+                                               module.sm_version).contiguous()
+        dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
+                               non_blocking=True)
+
+    def load_expert_w2_weight(self, module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor):
+        """
+        Load w2 weight for each expert.
+        """
+        w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW)
+
+        weight_dtype = torch.int8
+        if not module.quant_config.layer_quant_mode.is_int8_weight_only():
+            raise NotImplementedError(
+                f"Weight Only Quantization currently only supports INT8. Got: {module.quant_config.layer_quant_mode}."
+            )
+
+        # preprocess the weights for mixed gemm
+        w2_weight_shard = module.preprocessor(w2_weight_shard.T.contiguous(),
+                                              weight_dtype, module.dtype,
+                                              module.sm_version).contiguous()
+        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
+                            non_blocking=True)
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
+        # fc31 scales
+        all_w3_scales = [
+            load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
+                              module.tp_size, module.tp_rank,
+                              TensorParallelMode.COLUMN)
+            for expert_id in module.initial_local_expert_ids
+        ]
+        all_w1_scales = [
+            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
+                              module.tp_size, module.tp_rank,
+                              TensorParallelMode.COLUMN)
+            for expert_id in module.initial_local_expert_ids
+        ]
+        w3_w1_scales = torch.cat(
+            [torch.stack(all_w3_scales),
+             torch.stack(all_w1_scales)], dim=-1)
+        w3_w1_scales = w3_w1_scales.to(module.dtype)
+        module.fc31_weight_scale.data.copy_(w3_w1_scales.contiguous())
+
+        # fc2 scales
+        all_w2_scales = [
+            load_weight_shard(weights[f"{expert_id}.w2.weight_scale"],
+                              module.tp_size, module.tp_rank,
+                              TensorParallelMode.ROW)
+            for expert_id in module.initial_local_expert_ids
+        ]
+        w2_scales = torch.stack(all_w2_scales).to(module.dtype)
+        module.fc2_weight_scale.data.copy_(w2_scales.contiguous())
 
 
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
@@ -896,7 +1042,6 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         """
         device = dst_w3_w1_weight.device
         self.device = device
-        assert device.type == "cuda"
 
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
@@ -914,9 +1059,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
         # SM89
         if module.sm_version == 89:
-            import tensorrt_llm.quantization.functional as trtllm_f
-
-            preprocessor = trtllm_f.preprocess_weights_for_mixed_gemm
+            preprocessor = preprocess_weights_for_mixed_gemm
 
             w31_weight_shard = packer(
                 unpacker(w31_weight_shard.cpu()).T.contiguous()).to(
@@ -953,7 +1096,6 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w2_weight.device
-        assert device.type == "cuda"
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -963,9 +1105,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
         unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
         if module.sm_version == 89:
-            import tensorrt_llm.quantization.functional as trtllm_f
-
-            preprocessor = trtllm_f.preprocess_weights_for_mixed_gemm
+            preprocessor = preprocess_weights_for_mixed_gemm
 
             w2_weight_shard = packer(
                 unpacker(w2_weight_shard.cpu()).T.contiguous()).to(
@@ -1258,7 +1398,6 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w3_w1_weight.device
-        assert device.type == "cuda"
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1298,7 +1437,6 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w2_weight.device
-        assert device.type == "cuda"
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1322,7 +1460,6 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         device = module.fc31_weight_scale.data.device
-        assert device.type == "cuda"
 
         # fc31 scales
         assert (len(module.interleave) == 2)
@@ -2175,7 +2312,6 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             w3_weight_scale: torch.Tensor,
             dst_w3_w1_weight_scale: torch.Tensor):
         device = dst_w3_w1_weight_scale.device
-        assert device.type == "cuda"
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
@@ -2214,7 +2350,6 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           w2_weight_scale: torch.Tensor,
                                           dst_w2_weight_scale: torch.Tensor):
         device = dst_w2_weight_scale.device
-        assert device.type == "cuda"
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
