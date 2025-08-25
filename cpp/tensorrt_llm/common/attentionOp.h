@@ -94,6 +94,8 @@ public:
         kernels::KVBlockArray::DataType* block_offsets = nullptr;
         void* host_primary_pool_pointer = nullptr;
         void* host_secondary_pool_pointer = nullptr;
+        void* host_primary_block_scale_pool_pointer = nullptr;
+        void* host_secondary_block_scale_pool_pointer = nullptr;
         int32_t num_tokens = 0;
         int32_t total_kv_len = 0;
         int32_t max_blocks_per_sequence = 0;
@@ -231,6 +233,20 @@ public:
         int sm_cnt = mMultiProcessorCount;
         int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
         return num_sm_parts;
+    }
+
+    template <typename T>
+    int getKvCacheElemSizeInBits() const
+    {
+        if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
+        {
+            return 8;
+        }
+        else if (mKVCacheQuantMode.hasFp4KvCache())
+        {
+            return 4;
+        }
+        return sizeof(T) * 8;
     }
 
     // Called in configurePlugin().
