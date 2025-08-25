@@ -354,7 +354,7 @@ class AutoTuner:
                 # Only log once for each custom op and only when cache is not empty
                 logger.warning_once(
                     f"[AutoTunner] Using the fallback tactic, due to cache miss on input shapes={input_shapes}",
-                    key=(custom_op))
+                    key=custom_op)
             return runner, tactic
 
         assert len(runners) > 0, "At least one runner is required"
