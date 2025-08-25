@@ -1763,3 +1763,75 @@ def prepare_rcca_nvbug_4714193_engine(tensorrt_llm_example_root,
 
     assert os.path.exists(engine_dir), f"{engine_dir} does not exists."
     return engine_dir
+
+
+def prepare_mistral3_pixtral_engine(tensorrt_llm_multimodal_example_root,
+                                    tensorrt_llm_llama_example_root,
+                                    mistral_small_model_root):
+    # Convert Mistral3 from HF
+    model_base_name = os.path.basename(mistral_small_model_root.rstrip("/"))
+    ckpt_dir = os.path.join(tensorrt_llm_multimodal_example_root, "model_dir",
+                            model_base_name)
+    convert_cmd = [
+        "python3",
+        f"{tensorrt_llm_llama_example_root}/convert_checkpoint.py",
+        "--dtype=bfloat16",
+        f"--model_dir={mistral_small_model_root}",
+        f"--output_dir={ckpt_dir}",
+    ]
+
+    # Build Mistral3 LLM engine
+    engine_dir = os.path.join(tensorrt_llm_multimodal_example_root,
+                              "engine_dir", model_base_name)
+
+    build_cmd = [
+        "trtllm-build",
+        f"--checkpoint_dir={ckpt_dir}",
+        "--max_batch_size=4",
+        "--max_input_len=8192",
+        "--max_seq_len=8192",
+        # Allow an arbitrary number of image tokens by setting:
+        # max_multimodal_len = max_batch_size * max_input_len
+        "--max_multimodal_len=32768",
+        "--use_paged_context_fmha=enable",
+        f"--output_dir={engine_dir}",
+    ]
+
+    # Build Pixtral visual encoder engine
+    multimodal_engine_dir = os.path.join(tensorrt_llm_multimodal_example_root,
+                                         "tmp", "trt_engines", model_base_name,
+                                         "multimodal_encoder")
+    build_visual_engine_cmd = [
+        "python3",
+        "build_multimodal_engine.py",
+        "--model_type=pixtral",
+        f"--model_path={mistral_small_model_root}",
+        f"--output_dir={multimodal_engine_dir}",
+        "--max_batch_size=2",
+    ]
+
+    append_timing_cache_args(build_cmd)
+    convert_cmd = " ".join(convert_cmd)
+    build_cmd = " ".join(build_cmd)
+    build_visual_engine_cmd = " ".join(build_visual_engine_cmd)
+    if not os.path.exists(engine_dir) or not os.path.exists(
+            multimodal_engine_dir):
+        check_call(install_requirement_cmd,
+                   shell=True,
+                   cwd=tensorrt_llm_llama_example_root)
+        check_call(convert_cmd, shell=True)
+        check_call(build_cmd, shell=True)
+        check_call(build_visual_engine_cmd,
+                   shell=True,
+                   cwd=tensorrt_llm_multimodal_example_root)
+
+    else:
+        print_info(f"Reusing engine: {engine_dir}")
+        print_info(f"Skipped: {convert_cmd}")
+        print_info(f"Skipped: {build_cmd}")
+        print_info(f"Skipped: {build_visual_engine_cmd}")
+
+    assert os.path.exists(engine_dir), f"{engine_dir} does not exists."
+    assert os.path.exists(
+        multimodal_engine_dir), f"{multimodal_engine_dir} does not exists."
+    return engine_dir, multimodal_engine_dir

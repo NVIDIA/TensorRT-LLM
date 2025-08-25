@@ -18,9 +18,10 @@ isl=1024
 osl=1024
 multi_round=10
 streaming=true
+benchmark_mode=e2e
 
 args=(
-    1 4 4 4480 true          # Context servers arguments
+    1 4 4 4480 true "0.75"          # Context servers arguments
     1 8 1024 1024 true "0.8" # Generation servers arguments
     0 0                      # Other arguments
     $concurrency             # Benchmarking arguments
@@ -32,6 +33,7 @@ args=(
     $mounts
     $workdir
     $model_dir
+    $benchmark_mode
     $repo_dir
 )
 
