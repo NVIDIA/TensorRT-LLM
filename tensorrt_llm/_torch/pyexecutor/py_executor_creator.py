@@ -431,7 +431,7 @@ def create_py_executor(
         assert kv_cache_creator is not None
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_EXTRA):
-            kv_cache_creator.estimate_max_tokens(py_executor)
+            kv_cache_creator.configure_kv_cache_capacity(py_executor)
         kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
 
