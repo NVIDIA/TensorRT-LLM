@@ -34,7 +34,10 @@ MPI.pickle.__init__(
 def run_single_rank(dtype, strategy, message_size):
     import numpy as np
     import torch
-    from cuda import cuda
+    try:
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        from cuda import cuda
 
     import tensorrt_llm
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy

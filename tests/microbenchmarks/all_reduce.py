@@ -18,7 +18,10 @@ from argparse import ArgumentParser
 # isort: off
 import torch
 # isort: on
-from cuda import cuda, cudart
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor

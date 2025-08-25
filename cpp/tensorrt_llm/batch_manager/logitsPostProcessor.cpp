@@ -37,7 +37,7 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
     bool replicateLogitsPostProcessor, std::vector<TensorPtr>& seqSlotLogits, tr::WorldConfig const& worldConfig,
-    tr::TllmRuntime& runtime, std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched) const
+    tr::TllmRuntime& runtime, std::optional<LogitsPostProcessorBatched> const& logitsPostProcessorBatched) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(LogitsPostProcessor);

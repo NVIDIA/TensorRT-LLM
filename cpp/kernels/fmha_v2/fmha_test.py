@@ -1,7 +1,12 @@
 import subprocess
 
 import pytest
-from cuda import cuda, nvrtc
+
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
+except ImportError:
+    from cuda import cuda, nvrtc
 
 
 def ASSERT_DRV(err):
