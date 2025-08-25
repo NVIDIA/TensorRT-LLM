@@ -2089,7 +2089,6 @@ class PyTorchModelEngine(ModelEngine):
                 module_id: dict
                 {
                     adapter_size: torch tensor: int
-                    is_dora: torch tensor: bool
                     weight_pointers: torch tensor: int64
                 }
             }
@@ -2108,88 +2107,63 @@ class PyTorchModelEngine(ModelEngine):
             for module in request.py_lora_task_layer_module_configs:
                 module_id = module.module_id
                 layer_id = module.layer_id
-                adapter_size = module.adapter_size
-                is_dora = module.scaling_vec_pointer == 0
-                weights_in_pointer = module.weights_in_pointer
-                weights_out_pointer = module.weights_out_pointer
-                scaling_vec_pointer = module.scaling_vec_pointer
-                if weights_in_pointer is None:
-                    weights_in_pointer = 0
-                if weights_out_pointer is None:
-                    weights_out_pointer = 0
-                if scaling_vec_pointer is None:
-                    scaling_vec_pointer = 0
 
                 if layer_id not in lora_params:
                     lora_params[layer_id] = {}
                 if module_id not in lora_params[layer_id]:
-                    lora_params[layer_id][module_id] = {}
+                    lora_params[layer_id][module_id] = {
+                        'adapter_size': [],
+                        'weight_pointers': [],
+                    }
 
-                if 'adapter_size' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['adapter_size'] = []
-                if 'is_dora' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['is_dora'] = []
-                if 'weight_pointers' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['weight_pointers'] = []
-
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size'] = [
-                        adapter_size
-                    ]
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora'] = [
-                        is_dora
-                    ]
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer'] = [
-                        weights_in_pointer, weights_out_pointer,
-                        scaling_vec_pointer
-                    ]
+                scaling_vec_pointer = module.scaling_vec_pointer
+                if scaling_vec_pointer is None:
+                    scaling_vec_pointer = 0
+                tmp_lora_params[(request.py_request_id, layer_id,
+                                 module_id)] = {
+                                     'adapter_size': [module.adapter_size],
+                                     'weight_pointers': [
+                                         module.weights_in_pointer,
+                                         module.weights_out_pointer,
+                                         scaling_vec_pointer
+                                     ],
+                                 }
 
         for request in request_list:
             # Need to set default values for this case
             if request.py_lora_task_layer_module_configs is None:
                 for layer_id in lora_params:
                     for module_id in lora_params[layer_id]:
-                        lora_params[layer_id][module_id]['adapter_size'].append(
-                            0)
-                        lora_params[layer_id][module_id]['is_dora'].append(
-                            False)
-                        lora_params[layer_id][module_id]['weight_pointers'] += [
-                            0, 0, 0
-                        ]
+                        current_lora_params = lora_params[layer_id][module_id]
+                        current_lora_params['adapter_size'].append(0)
+                        current_lora_params['weight_pointers'] += [0, 0, 0]
 
             else:
                 for layer_id in lora_params:
                     for module_id in lora_params[layer_id]:
-                        if f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size' not in tmp_lora_params:
-                            lora_params[layer_id][module_id][
-                                'adapter_size'].append(0)
-                            lora_params[layer_id][module_id]['is_dora'].append(
-                                False)
-                            lora_params[layer_id][module_id][
-                                'weight_pointers'] += [0, 0, 0]
+                        current_tmp_lora_params = tmp_lora_params.get(
+                            (request.py_request_id, layer_id, module_id), None)
+                        current_lora_params = lora_params[layer_id][module_id]
+                        if current_tmp_lora_params is None:
+                            current_lora_params['adapter_size'].append(0)
+                            current_lora_params['weight_pointers'] += [0, 0, 0]
                         else:
-                            lora_params[layer_id][module_id][
-                                'adapter_size'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size']
-                            lora_params[layer_id][module_id][
-                                'is_dora'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora']
-                            lora_params[layer_id][module_id][
-                                'weight_pointers'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer']
+                            current_lora_params[
+                                'adapter_size'] += current_tmp_lora_params[
+                                    'adapter_size']
+                            current_lora_params[
+                                'weight_pointers'] += current_tmp_lora_params[
+                                    'weight_pointers']
 
         for layer_id in lora_params:
             for module_id in lora_params[layer_id]:
-                lora_params[layer_id][module_id][
-                    'adapter_size'] = torch.IntTensor(
-                        lora_params[layer_id][module_id]['adapter_size'])
-                lora_params[layer_id][module_id][
-                    'weight_pointers'] = torch.LongTensor(
-                        lora_params[layer_id][module_id]['weight_pointers'])
+                current_lora_params = lora_params[layer_id][module_id]
+                current_lora_params['adapter_size'] = torch.IntTensor(
+                    current_lora_params['adapter_size'])
+                current_lora_params['weight_pointers'] = torch.LongTensor(
+                    current_lora_params['weight_pointers'])
 
-        if bool(lora_params):
+        if lora_params:
             lora_params['host_request_types'] = attn_metadata.host_request_types
             lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
             lora_params['num_seqs'] = attn_metadata.num_seqs
