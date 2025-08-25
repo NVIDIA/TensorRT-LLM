@@ -30,8 +30,10 @@ struct NixlHelper
     [[nodiscard]] static nixl_mem_t convert(MemoryType type);
     [[nodiscard]] static nixlBasicDesc convert(MemoryDesc const& desc);
     [[nodiscard]] static nixl_reg_dlist_t convertRegDlist(RegisterDescs const& descs);
+    [[nodiscard]] static nixl_reg_dlist_t convertRegDlist(FileDescs const& descs);
     [[nodiscard]] static nixl_xfer_op_t convert(TransferOp const& op);
     [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(TransferDescs const& descs);
+    [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(FileDescs const& descs);
 };
 
 class NixlTransferStatus final : public TransferStatus
@@ -97,6 +99,30 @@ private:
     std::vector<char> mDRamDstBuffer;
 };
 
+class NixlLoopbackAgent final : public BaseLoopbackAgent
+{
+public:
+    NixlLoopbackAgent(BaseAgentConfig const& config);
+    ~NixlLoopbackAgent();
+
+    virtual void registerMemory(MemoryDescs const& descs) override;
+    virtual void deregisterMemory(MemoryDescs const& descs) override;
+    virtual void registerFiles(FileDescs const& descs) override;
+    virtual void deregisterFiles(FileDescs const& descs) override;
+
+    [[nodiscard]] virtual std::unique_ptr<TransferStatus> submitLoopbackRequests(
+        MemoryDescs const& memoryDescs, FileDescs const& filedescs, bool isOffload) override;
+
+    [[nodiscard]] nixlAgent* getRawAgent() const noexcept
+    {
+        return mRawAgent.get();
+    }
+
+private:
+    std::unique_ptr<nixlAgent> mRawAgent;
+    std::string mName;
+};
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
@@ -105,6 +131,11 @@ private:
 extern "C"
 {
     [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(BaseAgentConfig const* config);
+}
+
+extern "C"
+{
+    [[nodiscard]] std::unique_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config);
 }
 
 #if defined(__clang__)

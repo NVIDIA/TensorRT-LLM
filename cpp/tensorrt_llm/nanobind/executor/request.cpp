@@ -394,7 +394,7 @@ void initRequestBindings(nb::module_& m)
         new (&kvCacheRetentionConfig) tle::KvCacheRetentionConfig(
             nb::cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(state[0]),
             nb::cast<tle::RetentionPriority>(state[1]), nb::cast<std::optional<std::chrono::milliseconds>>(state[2]),
-            nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::optional<std::string>>(state[4]));
+            nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::string>(state[4]));
     };
 
     auto kvCacheRetentionConfig = nb::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
