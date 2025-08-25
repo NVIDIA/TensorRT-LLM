@@ -39,6 +39,7 @@ from ..models.modeling_utils import DecoderModelForCausalLM
 from ..speculative.drafter import Drafter
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
+from .handle_logits import HandleLogits
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse)
@@ -161,7 +162,6 @@ class PyExecutor:
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
         self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
-        self.is_warmup = False  # During warmup, we don't enable the profiler
 
         # related modules
         self.resource_manager = resource_manager
@@ -187,6 +187,7 @@ class PyExecutor:
         self.attention_dp_enable_balance = model_engine.pytorch_backend_config.attention_dp_enable_balance
         self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
         self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
+        self.batch_wait_timeout_ms = model_engine.pytorch_backend_config.batch_wait_timeout_ms
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -220,9 +221,12 @@ class PyExecutor:
 
         self.inflight_req_ids = ReqIdsSet()
 
+        # During warmup, we don't enable the profiler
+        self.is_warmup = True
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
             self.draft_model_engine.warmup(self.resource_manager)
+        self.is_warmup = False
 
         self.is_shutdown = False
         self.max_batch_size = max_batch_size
@@ -237,10 +241,11 @@ class PyExecutor:
             max_beam_width=self.max_beam_width,
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
-            self.disable_overlap_scheduler, self.sampler)
+            self.disable_overlap_scheduler, self.dist.pp_size)
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -279,6 +284,18 @@ class PyExecutor:
             raise e
         finally:
             self._executor_loop_cleanup()
+
+    @property
+    def is_warmup(self) -> bool:
+        return getattr(self, "_is_warmup", False)
+
+    @is_warmup.setter
+    def is_warmup(self, value: bool):
+        self._is_warmup = value
+        # Set warmup flag in model engine to trigger torch compile and avoid moe load balancer statistics update
+        self.model_engine.is_warmup = value
+        if self.draft_model_engine is not None:
+            self.draft_model_engine.is_warmup = value
 
     def start_worker(self):
         with self.worker_lock:
@@ -403,6 +420,16 @@ class PyExecutor:
         it = -1
         enabled = False
         start_time = None
+
+        # These events are used to record the time of the previous batch.
+        # We need two set of the start-end events to record the time through
+        # a ping-pong way so that it works with overlap scheduler.
+        start_event_1 = None
+        end_event_1 = torch.cuda.Event(enable_timing=True)
+        start_event_2 = None
+        end_event_2 = torch.cuda.Event(enable_timing=True)
+        prev_device_step_time = None
+
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
                                             None)
@@ -425,7 +452,7 @@ class PyExecutor:
                                                     with_modules=True)
 
         def profile_step():
-            nonlocal it, enabled, start_time
+            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
             if it in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
@@ -438,7 +465,24 @@ class PyExecutor:
 
             if start_time is not None and self.print_log and self.dist.rank == 0:
                 end_time = time.time()
+                if it % 2 == 0:
+                    end_event_1.record()
+                    if start_event_2 is not None:
+                        end_event_2.synchronize()
+                        prev_device_step_time = start_event_2.elapsed_time(
+                            end_event_2)
+                else:
+                    end_event_2.record()
+                    if start_event_1 is not None:
+                        end_event_1.synchronize()
+                        prev_device_step_time = start_event_1.elapsed_time(
+                            end_event_1)
 
+                if prev_device_step_time is None:
+                    prev_device_step_time = "N/A"  # Handle first iteration
+                else:
+                    prev_device_step_time = f"{prev_device_step_time}ms"
+                host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
                 logger.info(
@@ -447,7 +491,8 @@ class PyExecutor:
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
                     f"{self.executor_request_queue.num_fetch_requests}, "
-                    f"elapsed_time = {end_time - start_time}s, "
+                    f"host_step_time = {host_step_time}ms, "
+                    f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
@@ -462,6 +507,14 @@ class PyExecutor:
                 logger.info(f"Profiling started at iteration {it}.")
                 enabled = True
             start_time = time.time()
+            if it % 2 == 0:
+                if start_event_1 is None:
+                    start_event_1 = torch.cuda.Event(enable_timing=True)
+                start_event_1.record()
+            else:
+                if start_event_2 is None:
+                    start_event_2 = torch.cuda.Event(enable_timing=True)
+                start_event_2.record()
 
         try:
             yield profile_step
@@ -629,24 +682,6 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
-    def _need_return_logits(self, scheduled_requests: ScheduledRequests):
-        for req in scheduled_requests.context_requests:
-            if req.py_return_context_logits:
-                return True
-        for req in scheduled_requests.generation_requests:
-            if req.py_return_generation_logits:
-                return True
-        return False
-
-    def _need_return_log_probs(self, scheduled_requests: ScheduledRequests):
-        for req in scheduled_requests.context_requests:
-            if req.py_return_log_probs:
-                return True
-        for req in scheduled_requests.generation_requests:
-            if req.py_return_log_probs:
-                return True
-        return False
-
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
@@ -738,10 +773,6 @@ class PyExecutor:
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
                             batch_outputs = self._forward_step(scheduled_batch)
-                            logits_host = None
-                            if self._need_return_logits(scheduled_batch):
-                                logits_host = batch_outputs["logits"].to(
-                                    "cpu", non_blocking=True)
                             if self.kv_cache_transceiver and self.guided_decoder:
                                 self.guided_decoder.init_disagg_gen_requests(
                                     scheduled_batch)
@@ -750,7 +781,6 @@ class PyExecutor:
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
-                            sample_state.host.logits = logits_host
                             self._update_request_states(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
@@ -780,18 +810,10 @@ class PyExecutor:
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        (
-                            logits,
-                            sample_state.host,
-                        ) = self.dist.recv_object(
+                        sample_state.host = self.dist.recv_object(
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id,
                         )
-                        if logits is not None:
-                            logits_host = torch.from_numpy(logits)
-                            sample_state.host.logits = logits_host
-                            sample_state.device.logits = logits_host.to(
-                                self.device_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
                         sample_state.sampler_event.synchronize()
@@ -801,18 +823,9 @@ class PyExecutor:
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].wait()
-                        needs_logits = (
-                            self._need_return_logits(scheduled_batch)
-                            or (self._need_return_log_probs(scheduled_batch)
-                                and sample_state.host.log_probs is not None))
-                        serialized_logits = sample_state.host.logits.numpy(
-                        ) if needs_logits else None
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
-                                (
-                                    serialized_logits,
-                                    sample_state.host,
-                                ),
+                                sample_state.host,
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -832,6 +845,40 @@ class PyExecutor:
                                 previous_batch.scheduled_ctx_reqs)
 
                         self._handle_canceled_requests()
+
+                        # If logits were requested last PP rank has to send to first PP rank (who sends responses) the
+                        # logits of the requests that have finished.
+                        # NOTE: If the rank processing the logits ever becomes the same as
+                        # the rank sending the responses, this code can be removed.
+                        finished_reqs = [
+                            r for r in previous_batch.sample_state.
+                            scheduled_requests.all_requests()
+                            if r.state == LlmRequestState.GENERATION_COMPLETE
+                            and (r.py_return_context_logits
+                                 or r.py_return_generation_logits)
+                        ]
+                        if self.dist.is_first_pp_rank and len(finished_reqs):
+                            finished_reqs_py_results = [
+                                r.py_result for r in finished_reqs
+                            ]
+                            finished_reqs_py_results = self.dist.recv_object(
+                                src=self.dist.prev_pp_rank,
+                                tag=prev_microbatch_id,
+                            )
+                            for req, py_result in zip(finished_reqs,
+                                                      finished_reqs_py_results):
+                                req.py_result = py_result
+
+                        elif self.dist.is_last_pp_rank and len(finished_reqs):
+                            if self.send_handles[
+                                    prev_microbatch_id] is not None:
+                                self.send_handles[prev_microbatch_id].wait()
+                            self.send_handles[
+                                prev_microbatch_id] = self.dist.isend_object(
+                                    [r.py_result for r in finished_reqs],
+                                    dest=self.dist.next_pp_rank,
+                                    tag=prev_microbatch_id)
+
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
                         self.resource_manager.update_resources(
@@ -1129,6 +1176,17 @@ class PyExecutor:
 
     def _validate_request(self, request: LlmRequest):
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
+            # Only skip token‐range checks for Llama4 when the request has multimodal data
+            from ..models.modeling_llama import Llama4ForConditionalGeneration
+            if isinstance(self.model_engine.model,
+                          Llama4ForConditionalGeneration):
+                has_mm = bool(request.py_multimodal_data)
+                if has_mm:
+                    logger.debug(
+                        f"Skipping token-range validation for {type(self.model_engine.model).__name__} "
+                        "(multimodal request)")
+                    return
+
             # FIXME: This check is necessary because of how Qwen2ForProcessRewardModel
             #        subclasses DecoderModelForCausalLM. Perhaps the functionality
             #        of DecoderModelForCausalLM reused by Qwen2ForProcessRewardModel
@@ -1400,7 +1458,7 @@ class PyExecutor:
                       new_tensors_device: Optional[SampleStateTensors] = None):
 
         @nvtx_range(
-            f"[Executor] _forward_step {self.model_engine.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            f"[Executor] _forward_step {self.model_engine.iter_counter + 1}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer):
@@ -1475,7 +1533,22 @@ class PyExecutor:
                       batch_outputs) -> SampleState | None:
         try:
             if batch_outputs is not None:
-                return self.sampler.sample_async(scheduled_batch, batch_outputs)
+                num_context_logits_prefix_sum = [0]
+                prefix_sum = 0
+                for request in scheduled_batch.context_requests:
+                    prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
+                    num_context_logits_prefix_sum.append(prefix_sum)
+
+                HandleLogits()(scheduled_batch.context_requests,
+                               scheduled_batch.generation_requests,
+                               batch_outputs["logits"],
+                               self.sampler.beam_width(
+                                   scheduled_batch.all_requests()),
+                               num_context_logits_prefix_sum,
+                               self.sampler.is_generation_model())
+
+                return self.sampler.sample_async(scheduled_batch, batch_outputs,
+                                                 num_context_logits_prefix_sum)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)

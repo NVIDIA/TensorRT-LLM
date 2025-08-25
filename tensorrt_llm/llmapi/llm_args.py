@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+                    Set, Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -352,6 +352,7 @@ class DecodingBaseConfig(StrictBaseModel):
     # When specified, speculation will be disabled at batch sizes above
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
+    load_format: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -424,6 +425,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
+    eagle3_layers_to_capture: Optional[Set[int]] = None
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -442,6 +444,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_one_model:
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
+
+    @functools.cached_property
+    def num_capture_layers(self):
+        """
+        Returns the number of layers to capture of the target model.
+        If eagle3_layers_to_capture is not None, return the length of the set.
+        Otherwise, assume Eagle3 base set and return 3.
+        """
+        if self.eagle3_layers_to_capture is not None:
+            return len(self.eagle3_layers_to_capture)
+        return 3
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -523,7 +536,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @classmethod
     def from_dict(cls, data: dict):
-        return cls(**data)
+        out = cls(**data)
+        out.max_draft_len = out.num_nextn_predict_layers
+        return out
 
     decoding_type: ClassVar[str] = "MTP"
 
@@ -1966,6 +1981,8 @@ class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
     DUMMY = 1
+    # Only load the multimodal(vision) encoder weights
+    VISION_ONLY = 2
 
 
 class SamplerType(StrEnum):
@@ -1989,6 +2006,21 @@ class TorchCompileConfig(StrictBaseModel):
     enable_piecewise_cuda_graph: bool = Field(
         default=False,
         description="Enable piecewise CUDA graph in torch.compile.")
+
+    capture_num_tokens: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "List of num of tokens to capture the piecewise CUDA graph for. If not provided, the number of tokens will be the same as cuda_graph_config.batch_sizes."
+    )
+
+    @field_validator('capture_num_tokens')
+    @classmethod
+    def validate_capture_num_tokens(cls, v):
+        if v is None:
+            return v
+        if any(t <= 0 for t in v):
+            raise ValueError("capture_num_tokens must contain positive ints.")
+        return sorted(set(v), reverse=True)
 
     enable_userbuffers: bool = Field(
         default=True,
@@ -2082,6 +2114,12 @@ class TorchLlmArgs(BaseLlmArgs):
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
+
+    batch_wait_timeout_ms: float = Field(
+        default=0,
+        description=
+        "If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs.",
+        status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
@@ -2329,6 +2367,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 )
         return self
 
+    @model_validator(mode='after')
+    def validate_batch_wait_timeout_ms(self) -> 'TorchLlmArgs':
+        """Validate batch wait timeout."""
+        if self.batch_wait_timeout_ms < 0:
+            raise ValueError("batch_wait_timeout_ms must be greater than 0")
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -2368,6 +2413,10 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_piecewise_cuda_graph
             if self.torch_compile_config is not None else TorchCompileConfig.
             model_fields['enable_piecewise_cuda_graph'].default,
+            torch_compile_piecewise_cuda_graph_num_tokens=self.
+            torch_compile_config.capture_num_tokens
+            if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['capture_num_tokens'].default,
             torch_compile_enable_userbuffers=self.torch_compile_config.
             enable_userbuffers if self.torch_compile_config is not None else
             TorchCompileConfig.model_fields['enable_userbuffers'].default,
@@ -2390,7 +2439,8 @@ class TorchLlmArgs(BaseLlmArgs):
             AttentionDpConfig.model_fields['timeout_iters'].default,
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
-            AttentionDpConfig.model_fields['batching_wait_iters'].default)
+            AttentionDpConfig.model_fields['batching_wait_iters'].default,
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
 
 
 def update_llm_args_with_extra_dict(

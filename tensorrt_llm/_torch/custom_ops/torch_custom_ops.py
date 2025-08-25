@@ -8,6 +8,7 @@ from tensorrt_llm._utils import get_sm_version
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
+from ..modules.multi_stream_utils import do_multi_stream
 from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
@@ -80,12 +81,9 @@ class MoERunner(TunableRunner):
                     use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
-        return range(self.fused_moe_runner.get_tactic_num())
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
 
     def forward(
         self,
@@ -317,11 +315,8 @@ class FP8RowwiseGemmRunner(TunableRunner):
         self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp8_rowwise_gemm_runner.get_num_configs()))
 
     def forward(
@@ -402,11 +397,8 @@ class FP4GemmRunner(TunableRunner):
                     output_dtype, int(fp4_gemm_type))
         self.fp4_gemm_runner = FP4GemmRunner.runner_dict[instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp4_gemm_runner.get_num_configs()))
 
     def forward(
@@ -517,11 +509,8 @@ class FP8BatchedGemmRunner(TunableRunner):
 
         return out_tensors
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         mat1, mat2, _, _, _ = inputs
 
@@ -734,11 +723,8 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.weight_only_quant_gemm_runner.get_num_configs()))
 
     def forward(
@@ -812,11 +798,8 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
         self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(
             range(self._finegrained_mixed_dtype_gemm_runner.get_num_configs()))
 
@@ -925,6 +908,8 @@ def get_stream(stream_id: int):
 
 @torch.library.custom_op("trtllm::set_stream", mutates_args=())
 def set_stream(stream_id: int) -> None:
+    if not do_multi_stream():
+        return
     stream = get_stream(stream_id)
     assert stream is not None
     torch.cuda.set_stream(stream)
@@ -932,18 +917,24 @@ def set_stream(stream_id: int) -> None:
 
 @torch.library.custom_op("trtllm::record_event", mutates_args=())
 def record_event(event_idx: int) -> None:
+    if not do_multi_stream():
+        return
     event = get_event(event_idx)
     event.record()
 
 
 @torch.library.custom_op("trtllm::wait_event", mutates_args=())
 def wait_event(event_idx: int) -> None:
+    if not do_multi_stream():
+        return
     event = get_event(event_idx)
     event.wait()
 
 
 @torch.library.custom_op("trtllm::record_stream", mutates_args=())
 def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
+    if not do_multi_stream():
+        return
     stream = get_stream(stream_id)
     assert stream is not None
     tensor.record_stream(stream)

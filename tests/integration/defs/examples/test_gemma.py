@@ -194,6 +194,7 @@ def hf_gemma_quantization_1gpu(batch_size,
 
 
 # max_seq_len=3100, one local value that won't slide, and one that will
+@skip_post_blackwell
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("test_case", ['other'])

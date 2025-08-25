@@ -51,7 +51,7 @@ from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
-from .llmapi import LLM, LlmArgs
+from .llmapi import LLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
@@ -105,6 +105,7 @@ __all__ = [
     'quantization',
     'tools',
     'LLM',
+    'MultimodalEncoder',
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',

@@ -53,6 +53,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
+        mm_embedding_handle (Dict[str, Any], optional): The multimodal embedding handle of the request.
         finished (bool): Whether the whole request is finished.
     """
 
@@ -81,7 +82,8 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     def _repr_fields(self):
         return [
-            "request_id", "prompt", "prompt_token_ids", "outputs", "finished"
+            "request_id", "prompt", "prompt_token_ids", "outputs", "finished",
+            "mm_embedding_handle"
         ]
 
 
@@ -122,15 +124,21 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._llm_id = None
 
+        log_level = logger.level
+        logger.set_level("info")  # force display the backend
+
         try:
             backend = kwargs.get('backend', None)
-            if backend == 'pytorch':
+            if backend == "pytorch":
+                logger.info("Using LLM with PyTorch backend")
                 llm_args_cls = TorchLlmArgs
             elif backend == '_autodeploy':
+                logger.info("Using LLM with AutoDeploy backend")
                 from .._torch.auto_deploy.llm_args import \
                     LlmArgs as AutoDeployLlmArgs
                 llm_args_cls = AutoDeployLlmArgs
             else:
+                logger.info("Using LLM with TensorRT backend")
                 llm_args_cls = TrtLlmArgs
 
             # check the kwargs and raise ValueError directly
@@ -159,6 +167,9 @@ class BaseLLM:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
+
+        finally:
+            logger.set_level(log_level)  # restore the log level
 
         print_colored_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                             "yellow")
@@ -789,7 +800,7 @@ class _TrtLLM(BaseLLM):
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
-        self.tokenizer = self.input_processor.tokenizer
+        self._tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size
         max_num_tokens = self.args.max_num_tokens
@@ -954,7 +965,7 @@ class _TorchLLM(BaseLLM):
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
-        self.tokenizer = self.input_processor.tokenizer
+        self._tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size
         max_num_tokens = self.args.max_num_tokens

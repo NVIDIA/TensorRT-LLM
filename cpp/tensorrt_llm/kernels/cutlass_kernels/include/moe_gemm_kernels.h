@@ -289,15 +289,20 @@ public:
     void moeGemm(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
         TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
-    std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(int sm);
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getBlackwellConfigs(int sm);
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getHopperConfigs(int sm);
+    std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(bool supports_finalize_fusion) const;
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm, bool supports_finalize_fusion);
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(
+        int sm, bool supports_finalize_fusion);
     static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
 
     [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
-    [[nodiscard]] bool supportsTmaWarpSpecialized() const;
+
+    [[nodiscard]] bool supportsTmaWarpSpecialized() const
+    {
+        return supportsTmaWarpSpecialized(sm_);
+    }
+
+    [[nodiscard]] static bool supportsTmaWarpSpecialized(int sm);
     [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
         ActivationType activation_type, int gemm_n, int gemm_k) const;
     [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n, int gemm_k) const;

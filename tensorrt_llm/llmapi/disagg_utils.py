@@ -19,6 +19,7 @@ __all__ = [
 class ServerRole(Enum):
     CONTEXT = 0
     GENERATION = 1
+    MM_ENCODER = 2
 
 
 @dataclass

@@ -20,8 +20,8 @@ import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
-from ..evaluate import (GSM8K, MMLU, CnnDailymail, GPQADiamond, GPQAExtended,
-                        GPQAMain, JsonModeEval)
+from ..evaluate import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
+                        GPQAExtended, GPQAMain, JsonModeEval)
 from ..llmapi import BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
@@ -152,6 +152,7 @@ main.add_command(GPQADiamond.command)
 main.add_command(GPQAMain.command)
 main.add_command(GPQAExtended.command)
 main.add_command(JsonModeEval.command)
+main.add_command(MMMU.command)
 
 if __name__ == "__main__":
     main()
