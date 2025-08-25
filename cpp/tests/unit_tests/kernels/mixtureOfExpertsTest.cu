@@ -2072,19 +2072,17 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##GptOss120b)                                                      \
     {                                                                                                                  \
-        if (std::string(#ParallelismType) != "ExpertParallel")                                                         \
-        {                                                                                                              \
-            GTEST_SKIP()                                                                                               \
-                << "Only ExpertParallel is supported for GptOss120b. TensorParallel and MixedParallel are "            \
-                   "not supported since the inter_size after splitting does not fulfill the alignment requirements "   \
-                   "for MXFP4 weights";                                                                                \
-        }                                                                                                              \
-                                                                                                                       \
         this->mIsLongTest = true;                                                                                      \
         this->mUseBias = true;                                                                                         \
         this->mActType = ActivationType::Swiglu;                                                                       \
         size_t hidden_size = 2944;                                                                                     \
         size_t inter_size = 2944;                                                                                      \
+        if (std::string(#ParallelismType) != "ExpertParallel")                                                         \
+        {                                                                                                              \
+            /* If with TP, the inter_size should also be padded, */                                                    \
+            /* so that after TP split the alignment requirement is still met */                                        \
+            inter_size = 3072;                                                                                         \
+        }                                                                                                              \
         float inter_size_fraction = float(inter_size) / hidden_size;                                                   \
         this->mUnpaddedHiddenSize = 2880;                                                                              \
                                                                                                                        \
