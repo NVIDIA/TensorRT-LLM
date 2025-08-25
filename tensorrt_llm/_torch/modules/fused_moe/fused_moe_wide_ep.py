@@ -650,35 +650,7 @@ class WideEPMoE(MoE):
                 )
 
         # Original fused_moe call (preserved as reference)
-        final_hidden_states = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_slots,
-            token_final_scales,
-            w3_w1_weight.view(weight_dtype),
-            None,  # w3_w1_bias
-            w2_weight.view(weight_dtype),
-            None,  # w2_bias
-            output_dtype,
-            quant_scales=quant_scales,
-            input_sf=x_sf,
-            swizzled_input_sf=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            enable_alltoall=use_all_to_all,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
-            min_latency_mode=False,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
-        )
-
-        # Use the selected backend to compute MoE with the same parameters as fused_moe
-        # final_hidden_states = self.moe_backend.run_moe(
+        # final_hidden_states = torch.ops.trtllm.fused_moe(
         #     x,
         #     token_selected_slots,
         #     token_final_scales,
@@ -703,8 +675,37 @@ class WideEPMoE(MoE):
         #     tune_max_num_tokens=self.tune_max_num_tokens,
         #     tuner_num_tokens=tuner_num_tokens,
         #     tuner_top_k=tuner_top_k,
-        #     module=self,  # Additional parameter for backend to access module properties
         # )
+
+        # Use the selected backend to compute MoE with the same parameters as fused_moe
+        final_hidden_states = self.moe_backend.run_moe(
+            x,
+            token_selected_slots,
+            token_final_scales,
+            w3_w1_weight.view(weight_dtype),
+            None,  # w3_w1_bias
+            w2_weight.view(weight_dtype),
+            None,  # w2_bias
+            output_dtype,
+            quant_scales=quant_scales,
+            input_sf=x_sf,
+            swizzled_input_sf=False,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
+            enable_alltoall=use_all_to_all,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            min_latency_mode=False,
+            tune_max_num_tokens=self.tune_max_num_tokens,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
+            module=
+            self,  # Additional parameter for backend to access module properties
+        )
 
         if self.layer_load_balancer and is_last_call:
             self.layer_load_balancer.start_set_cpu_stage()

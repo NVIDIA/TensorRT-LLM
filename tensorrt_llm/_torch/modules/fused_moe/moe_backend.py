@@ -98,7 +98,6 @@ class MoEBackend(ABC):
             Computed MoE output tensor
         """
 
-    @abstractmethod
     def run_moe(
             self,
             # Positional arguments (same order as torch.ops.trtllm.fused_moe)
