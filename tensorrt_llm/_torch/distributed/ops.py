@@ -240,6 +240,11 @@ def reducescatter(
         if isinstance(input, torch.Tensor):
             assert input.shape[dim] == sum_split_size
         else:
+            for val in input:
+                if val is not None and val.shape[dim] != sum_split_size:
+                    print(
+                        f"[reducescatter] val.shape={val.shape}, dim={dim}, val.shape[dim]={val.shape[dim]}, sum_split_size={sum_split_size}, sizes={sizes}"
+                    )
             assert all([
                 val.shape[dim] == sum_split_size for val in input
                 if val is not None

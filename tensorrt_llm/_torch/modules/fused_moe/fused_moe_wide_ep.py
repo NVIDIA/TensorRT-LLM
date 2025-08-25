@@ -308,13 +308,20 @@ class WideEPMoE(MoE):
     def can_use_alltoall(self, all_rank_num_tokens, all_rank_max_num_tokens):
         # Disable alltoall when chunking is used
         if self.calculate_num_chunks(all_rank_num_tokens) > 1:
+            print(
+                f"can not use alltoall due to chunking {self.calculate_num_chunks(all_rank_num_tokens)}"
+            )
             return False
 
         # For DeepEPLowLatency, check if tokens exceed the threshold
         if (self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency
                 and all_rank_max_num_tokens > self.deep_ep_max_num_tokens):
+            print(
+                f"can not use alltoall due to deep_ep_max_num_tokens {all_rank_max_num_tokens} > {self.deep_ep_max_num_tokens}"
+            )
             return False
 
+        print(f"all to all type {self.alltoall_method_type}")
         return self.enable_alltoall
 
     def _get_quant_method(self):
@@ -323,9 +330,18 @@ class WideEPMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
+                print(
+                    f"wide_ep _get_quant_method: get_sm_version()={get_sm_version()}"
+                )
                 if get_sm_version() == 100:
+                    print(
+                        f"wide_ep _get_quant_method: use DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm"
+                    )
                     return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
                 else:
+                    print(
+                        f"wide_ep _get_quant_method: use DeepSeekFP8BlockScalesFusedMoEMethod"
+                    )
                     return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
@@ -398,6 +414,10 @@ class WideEPMoE(MoE):
             output_dtype = x.dtype
 
         is_first_call, is_last_call = repeating_info
+
+        # print(
+        #     f"xxi shape 1: enter wide_ep forward_chunk: layer_load_balancer={self.layer_load_balancer}, is_first_call={is_first_call}, is_last_call={is_last_call}, x shape: {getattr(x, 'shape', None)}, router_logits shape: {getattr(router_logits, 'shape', None)}, use_all_to_all: {use_all_to_all}, all_rank_num_tokens: {all_rank_num_tokens}, all_rank_max_num_tokens: {all_rank_max_num_tokens}, use_dp_padding: {use_dp_padding}, repeating_info: {repeating_info}"
+        # )
 
         if self.layer_load_balancer and is_first_call:
             self.layer_load_balancer.start_wait_gpu_stage()
@@ -475,7 +495,7 @@ class WideEPMoE(MoE):
                     self.dummy_allreduce()
                 token_count = x.shape[0]
                 alltoall_info = None
-                if is_last_call:
+                if self.layer_load_balancer and is_last_call:
                     loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
                     )
                 else:
@@ -650,35 +670,7 @@ class WideEPMoE(MoE):
                 )
 
         # Original fused_moe call (preserved as reference)
-        final_hidden_states = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_slots,
-            token_final_scales,
-            w3_w1_weight.view(weight_dtype),
-            None,  # w3_w1_bias
-            w2_weight.view(weight_dtype),
-            None,  # w2_bias
-            output_dtype,
-            quant_scales=quant_scales,
-            input_sf=x_sf,
-            swizzled_input_sf=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            enable_alltoall=use_all_to_all,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
-            min_latency_mode=False,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
-        )
-
-        # Use the selected backend to compute MoE with the same parameters as fused_moe
-        # final_hidden_states = self.moe_backend.run_moe(
+        # final_hidden_states = torch.ops.trtllm.fused_moe(
         #     x,
         #     token_selected_slots,
         #     token_final_scales,
@@ -703,7 +695,40 @@ class WideEPMoE(MoE):
         #     tune_max_num_tokens=self.tune_max_num_tokens,
         #     tuner_num_tokens=tuner_num_tokens,
         #     tuner_top_k=tuner_top_k,
-        #     module=self,  # Additional parameter for backend to access module properties
+        # )
+
+        # Use the selected backend to compute MoE with the same parameters as fused_moe
+        final_hidden_states = self.moe_backend.run_moe(
+            x,
+            token_selected_slots,
+            token_final_scales,
+            w3_w1_weight.view(weight_dtype),
+            None,  # w3_w1_bias
+            w2_weight.view(weight_dtype),
+            None,  # w2_bias
+            output_dtype,
+            quant_scales=quant_scales,
+            input_sf=x_sf,
+            swizzled_input_sf=False,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
+            enable_alltoall=use_all_to_all,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            min_latency_mode=False,
+            tune_max_num_tokens=self.tune_max_num_tokens,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
+            module=
+            self,  # Additional parameter for backend to access module properties
+        )
+
+        # print(
+        #     f"xxi shape 4 after moe backend : {getattr(x, 'shape', None)}, final_hidden_states shape: {getattr(final_hidden_states, 'shape', None)}, token_selected_slots shape: {getattr(token_selected_slots, 'shape', None)}, token_final_scales shape: {getattr(token_final_scales, 'shape', None)}, w3_w1_weight shape: {getattr(w3_w1_weight, 'shape', None)}, w2_weight shape: {getattr(w2_weight, 'shape', None)}, quant_scales: {getattr(quant_scales, 'shape', None)}, input_sf: {getattr(x_sf, 'shape', None)}, swizzled_input_sf: False, tp_size: {self.tp_size}, tp_rank: {self.tp_rank}, ep_size: {ep_size}, ep_rank: {ep_rank}, cluster_size: {cluster_size}, cluster_rank: {cluster_rank}, enable_alltoall: {use_all_to_all}, use_deepseek_fp8_block_scale: {use_deepseek_fp8_block_scale}, use_w4_group_scaling: {use_w4_group_scaling}, min_latency_mode: False, tune_max_num_tokens: {self.tune_max_num_tokens}, tuner_num_tokens: {tuner_num_tokens}, tuner_top_k: {tuner_top_k}"
         # )
 
         if self.layer_load_balancer and is_last_call:
@@ -784,6 +809,10 @@ class WideEPMoE(MoE):
                 all_rank_max_num_tokens=all_rank_max_num_tokens,
                 use_dp_padding=use_dp_padding,
                 repeating_info=(is_first_call, is_last_call))
+            # 一行打印所有信息
+            # print(
+            #     f"xxi x.shape: {getattr(x, 'shape', None)}, use_all_to_all: {use_all_to_all}, all_rank_num_tokens: {all_rank_num_tokens}, all_rank_num_tokens_padded: {all_rank_num_tokens_padded}, all_rank_max_num_tokens: {all_rank_max_num_tokens}, use_dp_padding: {use_dp_padding}, outputs.shape: {getattr(outputs, 'shape', None)}, use_dp_padding(again): {use_dp_padding}"
+            # )
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 use_all_to_all,

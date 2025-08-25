@@ -960,6 +960,9 @@ def maybe_create_moe_load_balancer(
     in_supported_model_arch = model_arch in moe_model_arch_list
     using_smart_router = mapping and mapping.moe_cluster_size > 1
     moe_load_balancer = nullcontext()
+    print(
+        f"maybe_create_moe_load_balancer: in_supported_model_arch={in_supported_model_arch}, using_ep={using_ep}, using_smart_router={using_smart_router}, model_config.moe_load_balancer={model_config.moe_load_balancer}"
+    )
     if in_supported_model_arch and using_ep and not using_smart_router and model_config.moe_load_balancer is not None:
         model_config.moe_load_balancer.setup(ep_rank=ep_rank, ep_size=ep_size)
         if model_config.moe_load_balancer.layer_updates_per_iter > 0:

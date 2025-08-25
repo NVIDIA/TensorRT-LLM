@@ -98,7 +98,6 @@ class MoEBackend(ABC):
             Computed MoE output tensor
         """
 
-    @abstractmethod
     def run_moe(
             self,
             # Positional arguments (same order as torch.ops.trtllm.fused_moe)
@@ -542,9 +541,10 @@ class MoeDeepGemmBackend(MoEBackend):
         super().__init__()
         # Import DeepGemm specific functions
         import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-        from tensorrt_llm import deep_gemm
-        self.deep_gemm = deep_gemm
         self.fp8_utils = fp8_utils
+
+        from .fused_moe_deepgemm import deepgemm_fp8_group_blockwise_gemm
+        self.deepgemm_fp8_group_blockwise_gemm = deepgemm_fp8_group_blockwise_gemm
 
     def finalize_tactic(
         self,
@@ -664,6 +664,7 @@ class MoeDeepGemmBackend(MoEBackend):
         Note: This assumes the data has already been gathered/alltoall'd
         by the WideEP forward_chunk method.
         """
+
         # Import necessary functions for DeepGemm
         from .fused_moe_deepgemm import (masked_index_copy_group_quant_fp8,
                                          preprocess_after_permute, set_strides,
@@ -683,6 +684,8 @@ class MoeDeepGemmBackend(MoEBackend):
         expert_size_per_partition = module.expert_size_per_partition
         intermediate_size = module.intermediate_size
         hidden_size = x.shape[1]
+
+        # print(f"xxi compute_moe: deepgemm backend")
 
         # Permute the data for expert-parallel processing
         (
@@ -710,6 +713,20 @@ class MoeDeepGemmBackend(MoEBackend):
             min_latency_mode=min_latency_mode,
             use_fp8_block_scaling=True,  # Always use block scaling for DeepGemm
         )
+
+        # print(
+        #     "xxi shape 2: enter deepgemm backend compute_moe \n"
+        #     f"x.shape: {getattr(x, 'shape', None)}, \n"
+        #     f"input_sf.shape: {getattr(input_sf, 'shape', None)}, \n"
+        #     f"token_selected_slots.shape: {getattr(token_selected_slots, 'shape', None)}, \n"
+        #     f"token_final_scales.shape: {getattr(token_final_scales, 'shape', None)}, \n"
+        #     f"permuted_row_to_unpermuted_row_tensor.shape: {getattr(permuted_row_to_unpermuted_row_tensor, 'shape', None)}, \n"
+        #     f"permuted_token_selected_experts_tensor.shape: {getattr(permuted_token_selected_experts_tensor, 'shape', None)}, \n"
+        #     f"permuted_data_tensor.shape: {getattr(permuted_data_tensor, 'shape', None)}, \n"
+        #     f"expert_first_token_offset_tensor.shape: {getattr(expert_first_token_offset_tensor, 'shape', None)}, \n"
+        #     f"permuted_token_final_scales_tensor.shape: {getattr(permuted_token_final_scales_tensor, 'shape', None)}, \n"
+        #     f"unpermuted_row_to_permuted_row_tensor.shape: {getattr(unpermuted_row_to_permuted_row_tensor, 'shape', None)}\n"
+        # )
 
         if permuted_data_tensor.numel() == 0:
             return torch.zeros_like(x)
@@ -750,7 +767,7 @@ class MoeDeepGemmBackend(MoEBackend):
         h1 = set_strides(workspace["workspace_1"], expert_size_per_partition,
                          m_max, intermediate_size * 2)
 
-        self.deep_gemm.deepgemm_fp8_group_blockwise_gemm(
+        self.deepgemm_fp8_group_blockwise_gemm(
             d=h1,
             a=act_input_fp8,
             b=w3_w1_weight,
@@ -783,7 +800,7 @@ class MoeDeepGemmBackend(MoEBackend):
         h3 = set_strides(workspace["workspace_1"], expert_size_per_partition,
                          m_max, hidden_size)
 
-        self.deep_gemm.deepgemm_fp8_group_blockwise_gemm(
+        self.deepgemm_fp8_group_blockwise_gemm(
             d=h3,
             a=act_input_fp8,
             b=w2_weight,
@@ -817,8 +834,19 @@ class MoeDeepGemmBackend(MoEBackend):
             ep_size,
             ep_rank,
         )
+        # print(
+        #     "xxi shape 3: exit deepgemm backend compute_moe \n"
+        #     f"final_hidden_states.shape: {getattr(final_hidden_states, 'shape', None)}\n"
+        #     f"permuted_data_tensor.shape: {getattr(permuted_data_tensor, 'shape', None)}, \n"
+        #     f"token_final_scales.shape: {getattr(token_final_scales, 'shape', None)}, \n"
+        #     f"unpermuted_row_to_permuted_row_tensor.shape: {getattr(unpermuted_row_to_permuted_row_tensor, 'shape', None)}, \n"
+        #     f"permuted_row_to_unpermuted_row_tensor.shape: {getattr(permuted_row_to_unpermuted_row_tensor, 'shape', None)}, \n"
+        #     f"expert_first_token_offset_tensor.shape: {getattr(expert_first_token_offset_tensor, 'shape', None)}, \n"
+        #     f"x.shape: {getattr(x, 'shape', None)}, \n")
 
-        return final_hidden_states
+        return final_hidden_states if min_latency_mode else [
+            final_hidden_states
+        ]
 
 
 class MoEBackendSelection:
@@ -859,9 +887,12 @@ class MoEBackendSelection:
         has_block_fp8 = (hasattr(module, 'has_deepseek_fp8_block_scales')
                          and module.has_deepseek_fp8_block_scales)
 
+        # print(f"xxi select backend: is_blackwell: {is_blackwell}, has_block_fp8: {has_block_fp8}")
         if is_blackwell and has_block_fp8:
             # Use DeepGemm backend for Blackwell with block FP8
+            print("xxi select backend: use deepgemm backend")
             return MoeDeepGemmBackend()
         else:
             # Use Cutlass backend for all other cases
+            print("xxi select backend: use cutlass backend")
             return MoeCutlassBackend()
