@@ -708,120 +708,130 @@ class PyTorchModelEngine(ModelEngine):
         if cp_type == CpType.STAR:
             return
 
-        if self._torch_compile_enabled:
+        with contextlib.ExitStack() as stack:
 
-            # Disable cuda graph capture here so that we can properly capture it later
-            with self.no_cuda_graph():
-                available_tokens = kv_cache_manager.get_num_available_tokens(
-                    self.runtime_draft_len)
-                warmup_batch_size = [1, self.batch_size // 2]
-                if self.batch_size < 2:
-                    warmup_batch_size = [1]
-                for bs in warmup_batch_size:
-                    for num_tokens_per_request in [
-                            1,
-                            min(self.max_num_tokens // max(bs, 1),
-                                min(available_tokens, self.max_seq_len - 1))
-                    ]:
-                        with release_batch(
-                                get_torch_compile_warmup_request(
-                                    bs, num_tokens_per_request)) as batch:
-                            if batch is None:
-                                # No KV cache space!
-                                continue
-                            logger.info(
-                                f"Run warmup for batch size={bs}, pure {'context' if num_tokens_per_request > 1 else 'generation'} phase"
-                            )
+            def clean_up_kv_cache():
+                # Zero the KV cache; NaNs may be introduced during warmup
+                for layer_idx in kv_cache_manager.layer_offsets.keys():
+                    kv_cache_manager.get_buffers(layer_idx).zero_()
+
+            stack.callback(clean_up_kv_cache)
+
+            if self._torch_compile_enabled:
+                # Disable cuda graph capture here so that we can properly capture it later
+                with self.no_cuda_graph():
+                    available_tokens = kv_cache_manager.get_num_available_tokens(
+                        self.runtime_draft_len)
+                    warmup_batch_size = [1, self.batch_size // 2]
+                    if self.batch_size < 2:
+                        warmup_batch_size = [1]
+                    for bs in warmup_batch_size:
+                        for num_tokens_per_request in [
+                                1,
+                                min(self.max_num_tokens // max(bs, 1),
+                                    min(available_tokens, self.max_seq_len - 1))
+                        ]:
+                            with release_batch(
+                                    get_torch_compile_warmup_request(
+                                        bs, num_tokens_per_request)) as batch:
+                                if batch is None:
+                                    # No KV cache space!
+                                    continue
+                                logger.info(
+                                    f"Run warmup for batch size={bs}, pure {'context' if num_tokens_per_request > 1 else 'generation'} phase"
+                                )
+                                self.forward(batch,
+                                             new_tensors_device=None,
+                                             resource_manager=resource_manager)
+                                torch.cuda.synchronize()
+
+            if self.pytorch_backend_config.enable_autotuner:
+                with self.no_cuda_graph(), autotune():
+                    result = get_autotune_warmup_request()
+                    with release_batch(result) as batch:
+                        if batch is None:
+                            # No KV cache space!
+                            pass
+                        else:
                             self.forward(batch,
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
 
-        if self.pytorch_backend_config.enable_autotuner:
-            with self.no_cuda_graph(), autotune():
-                result = get_autotune_warmup_request()
-                with release_batch(result) as batch:
-                    if batch is None:
-                        # No KV cache space!
-                        pass
-                    else:
+                    logger.info(
+                        f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
+                    )
+
+                AutoTuner.get().print_profiling_cache()
+
+            if not (self._run_cuda_graphs
+                    or self._torch_compile_piecewise_cuda_graph):
+                return
+
+            logger.info(
+                f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
+            )
+            # Reverse the order of the cuda graph batch sizes to make smaller batch size graph could reuse larger batch size graph memory
+            cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
+                                            reverse=True)
+            # Create CUDA graphs for different draft lengths
+            draft_lengths = [self.max_draft_len]
+            # For non-draft model, we also capture the CUDA graph instance for draft length 0,
+            # so that when we disable spec decode at runtime, we can still run the captured graph.
+            # Note that for one engine mode, we are not able to turn off spec decode at runtime.
+            if (not self.is_draft_model and self.max_draft_len > 0
+                    and not self.spec_config.spec_dec_mode.use_one_engine()
+                    # Assume that speculation is always on if the user didn't give us a max_concurrency
+                    # value. This will save on memory.
+                    and self.spec_config.max_concurrency is not None):
+                draft_lengths.append(0)
+
+            for bs in cuda_graph_batch_sizes:
+                if bs > self.batch_size:
+                    # skip batch size larger than self.batch_size
+                    continue
+
+                for draft_len in draft_lengths:
+                    with release_batch(
+                            get_cuda_graph_warmup_request(bs,
+                                                          draft_len)) as batch:
+                        if batch is None:
+                            # No KV cache space!
+                            return
+                        logger.info(
+                            f"Run generation only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
+                        )
+                        self.enable_spec_decode = draft_len > 0 or self.is_draft_model
                         self.forward(batch,
                                      new_tensors_device=None,
                                      resource_manager=resource_manager)
                         torch.cuda.synchronize()
 
-                logger.info(
-                    f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
-                )
+            if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
+                piecewise_cuda_graph_num_tokens = sorted(
+                    self._piecewise_cuda_graph_num_tokens, reverse=True)
 
-            AutoTuner.get().print_profiling_cache()
+                with capture_piecewise_cuda_graph(True):
+                    for num_tokens in piecewise_cuda_graph_num_tokens:
+                        with self.no_cuda_graph():
+                            with release_batch(
+                                    get_torch_compile_warmup_request(
+                                        1, num_tokens)) as batch:
+                                logger.info(
+                                    f"Run piecewise CUDA graph warmup for num tokens={num_tokens}"
+                                )
 
-        if not (self._run_cuda_graphs
-                or self._torch_compile_piecewise_cuda_graph):
-            return
-
-        logger.info(
-            f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
-        )
-        # Reverse the order of the cuda graph batch sizes to make smaller batch size graph could reuse larger batch size graph memory
-        cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
-                                        reverse=True)
-        # Create CUDA graphs for different draft lengths
-        draft_lengths = [self.max_draft_len]
-        # For non-draft model, we also capture the CUDA graph instance for draft length 0,
-        # so that when we disable spec decode at runtime, we can still run the captured graph.
-        # Note that for one engine mode, we are not able to turn off spec decode at runtime.
-        if (not self.is_draft_model and self.max_draft_len > 0
-                and not self.spec_config.spec_dec_mode.use_one_engine()
-                # Assume that speculation is always on if the user didn't give us a max_concurrency
-                # value. This will save on memory.
-                and self.spec_config.max_concurrency is not None):
-            draft_lengths.append(0)
-
-        for bs in cuda_graph_batch_sizes:
-            if bs > self.batch_size:
-                # skip batch size larger than self.batch_size
-                continue
-
-            for draft_len in draft_lengths:
-                with release_batch(get_cuda_graph_warmup_request(
-                        bs, draft_len)) as batch:
-                    if batch is None:
-                        # No KV cache space!
-                        return
-                    logger.info(
-                        f"Run generation only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
-                    )
-                    self.enable_spec_decode = draft_len > 0 or self.is_draft_model
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
-
-        if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
-            piecewise_cuda_graph_num_tokens = sorted(
-                self._piecewise_cuda_graph_num_tokens, reverse=True)
-
-            with capture_piecewise_cuda_graph(True):
-                for num_tokens in piecewise_cuda_graph_num_tokens:
-                    with self.no_cuda_graph():
-                        with release_batch(
-                                get_torch_compile_warmup_request(
-                                    1, num_tokens)) as batch:
-                            logger.info(
-                                f"Run piecewise CUDA graph warmup for num tokens={num_tokens}"
-                            )
-
-                            for _ in range(3):
+                                for _ in range(3):
+                                    self.forward(
+                                        batch,
+                                        new_tensors_device=None,
+                                        resource_manager=resource_manager)
                                 self.forward(batch,
                                              new_tensors_device=None,
                                              resource_manager=resource_manager)
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
-                            torch.cuda.synchronize()
-                            gc.collect()
-                            torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                                gc.collect()
+                                torch.cuda.empty_cache()
 
         # Set the value back to the original value
         self.enable_spec_decode = self.is_spec_decode
