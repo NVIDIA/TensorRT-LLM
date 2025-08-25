@@ -1962,19 +1962,15 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
         with LLM(self.MODEL_PATH,
-                 max_batch_size=32,
+                 max_batch_size=8,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
                  cuda_graph_config=CudaGraphConfig()
                  if cuda_graph else None) as llm:
+            # Run only one eval as maximal BS is not large
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            # task = GPQADiamond(self.MODEL_NAME)
-            # task.evaluate(llm,
-            #                 extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(8)
@@ -1986,6 +1982,7 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
     def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, ep_size):
         model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
         with LLM(model_path,
+                 max_batch_size=8,
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
@@ -1993,13 +1990,9 @@ class TestNemotronUltra(LlmapiAccuracyTestHarness):
                  kv_cache_config=KvCacheConfig(
                      free_gpu_memory_fraction=0.85)) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            # Run only one eval as maximal BS is not large
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
