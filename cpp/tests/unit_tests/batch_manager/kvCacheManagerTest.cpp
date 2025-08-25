@@ -397,10 +397,11 @@ TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFP8)
 }
 #endif
 
+// type - Data type for KV cache
 // windowSize - Attention window size
 // seqLen0 - Sequence length of first and last sequence
 // numMatching - Number of matching tokens in second sequence (< seqLen0)
-template <int windowSize, int seqLen0, int numMatching>
+template <nvinfer1::DataType type, int windowSize, int seqLen0, int numMatching>
 void runSlidingWindowAttentionTest()
 {
     auto constexpr numLayers = 12;
@@ -448,7 +449,7 @@ void runSlidingWindowAttentionTest()
     auto constexpr numBlocks = (seqLen0 + tokensPerBlock - 1) / tokensPerBlock;
     std::vector<int> expectedBlocks(numBlocks);
     std::iota(expectedBlocks.begin(), expectedBlocks.end(), 0);
-    EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray(expectedBlocks));
+    EXPECT_THAT(cacheBlockIds0, ::testing::ElementsAreArray(expectedBlocks));
     // Offload blocks before storage
     for (auto cacheBlockId : cacheBlockIds0)
     {
@@ -464,18 +465,18 @@ void runSlidingWindowAttentionTest()
     // Add second sequence
     VecTokens secondSequenceTokens(seqLen0);
     std::iota(secondSequenceTokens.begin(), secondSequenceTokens.end(), 1);
-    for (int i = numMatching; i < seqLen0) secondSequenceTokens[i] += 1;
+    for (int i = numMatching; i < seqLen0; ++i) secondSequenceTokens[i] += 1;
     auto inputTokens1 = std::make_shared<VecTokens>(secondSequenceTokens);
     auto inputLength1 = static_cast<SizeType32>(inputTokens1->size());
+    LlmRequest::RequestIdType requestId1{1};
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     GenerationRequest seq1{requestId1, inputLength1, beamWidth, blockManager.getWindowSizesMetadata()};
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
     blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
-    auto constexpr reusedBlocks = (numMatched + tokensPerBlock - 1) / tokensPerBlock;
-    auto constexpr firstOnboardedBlock = std::max(0, ((numMatched - windowSize) + tokensPerBlock - 1) / tokensPerBlock);
-    auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    auto constexpr reusedBlocks = (numMatching + tokensPerBlock - 1) / tokensPerBlock;
+    auto constexpr firstOnboardedBlock = std::max(0, ((numMatching - windowSize) + tokensPerBlock - 1) / tokensPerBlock);
     std::vector<int> expectedBlocks1(numBlocks); // both sequences are same length
     for (int i = 0; i < reusedBlocks; ++i) expectedBlocks1[i] = i;
     for (int i = reusedBlocks; i < numBlocks; ++i) expectedBlocks1[i] = numBlocks + i - reusedBlocks;
@@ -494,19 +495,19 @@ void runSlidingWindowAttentionTest()
 TEST_F(KVCacheManagerTest, BlockManagerTestOnboardFullAttention)
 {
     // attention window size, sequence length, num reused tokens second request
-    runSlidingWindowAttentionTest<4096, 25, 14>();
+    runSlidingWindowAttentionTest<nvinfer1::DataType::kHALF, 4096, 25, 14>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestOnboardSWAFullReuse)
 {
     // attention window size, sequence length, num reused tokens second request
-    runSlidingWindowAttentionTest<8, 25, 24>();
+    runSlidingWindowAttentionTest<nvinfer1::DataType::kHALF, 8, 25, 24>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestOnboardSWAHalfReuse)
 {
     // attention window size, sequence length, num reused tokens second request
-    runSlidingWindowAttentionTest<8, 25, 13>();
+    runSlidingWindowAttentionTest<nvinfer1::DataType::kHALF, 8, 25, 13>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare)
