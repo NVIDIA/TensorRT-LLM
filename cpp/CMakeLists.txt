@@ -495,6 +495,17 @@ if(ENABLE_UCX)
   if(NOT ${ucx_FOUND})
     set(ENABLE_UCX 0)
   else()
+    if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
+      if(EXISTS "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake")
+        file(READ "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" FILE_CONTENTS)
+        string(
+          REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
+                  "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
+                  FILE_CONTENTS "${FILE_CONTENTS}")
+        file(WRITE "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" "${FILE_CONTENTS}")
+        message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
+      endif()
+    endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
     # error, thus using their installation script to isolate the installation
     # process until the issue is understood. And always trigger the build so

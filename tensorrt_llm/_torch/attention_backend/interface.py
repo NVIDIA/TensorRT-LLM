@@ -137,6 +137,7 @@ class AttentionMetadata:
 
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
+    cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -282,7 +283,8 @@ class AttentionMetadata:
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0) -> Self:
+                                   max_draft_tokens: int = 0,
+                                   buffers=None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
@@ -294,6 +296,7 @@ class AttentionMetadata:
 
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
+        cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)

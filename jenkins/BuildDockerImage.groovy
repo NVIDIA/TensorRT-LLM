@@ -258,7 +258,7 @@ def buildImage(config, imageKeyToTag)
     // Step 2: Build the images
     stage ("Install packages") {
         sh "pwd && ls -alh"
-        sh "env"
+        sh "env | sort"
         sh "apk add make git"
         sh "git config --global --add safe.directory '*'"
 
@@ -281,12 +281,12 @@ def buildImage(config, imageKeyToTag)
     try {
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
-        def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
-        def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
-        def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+        def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep '^ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
 
         if (target == "rockylinux8") {
-            BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+            BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^jenkins-rockylinux8_%: BASE_IMAGE =' docker/Makefile | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         }
 
         // Replace the base image and triton image with the internal mirror
@@ -295,7 +295,8 @@ def buildImage(config, imageKeyToTag)
 
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
-                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: 300, shortCommondRunTimeMax: 7200)
+                def randomSleep = (Math.random() * 300 + 300).toInteger()
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, shortCommondRunTimeMax: 7200)
                 trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
                 BASE_IMAGE=${BASE_IMAGE} \
@@ -304,7 +305,7 @@ def buildImage(config, imageKeyToTag)
                 IMAGE_WITH_TAG=${dependentImageWithTag} \
                 STAGE=${dependent.dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-                """, sleepInSecs: 300, shortCommondRunTimeMax: 7200)
+                """, sleepInSecs: randomSleep, numRetries: 3, shortCommondRunTimeMax: 7200)
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
@@ -322,7 +323,9 @@ def buildImage(config, imageKeyToTag)
             }
         }
         stage ("make ${target}_${action} (${arch})") {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: 300, shortCommondRunTimeMax: 7200)
+            sh "env | sort"
+            def randomSleep = (Math.random() * 300 + 300).toInteger()
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, shortCommondRunTimeMax: 7200)
             trtllm_utils.llmExecStepWithRetry(this, script: """
             cd ${LLM_ROOT} && make -C docker ${target}_${action} \
             BASE_IMAGE=${BASE_IMAGE} \
@@ -331,7 +334,7 @@ def buildImage(config, imageKeyToTag)
             IMAGE_WITH_TAG=${imageWithTag} \
             STAGE=${dockerfileStage} \
             BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-            """, sleepInSecs: 300, shortCommondRunTimeMax: 7200)
+            """, sleepInSecs: randomSleep, numRetries: 3, shortCommondRunTimeMax: 7200)
             if (target == "ngc-release") {
                 imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
             }

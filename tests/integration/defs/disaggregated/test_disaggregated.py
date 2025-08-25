@@ -20,7 +20,8 @@ import tempfile
 
 import pytest
 import yaml
-from defs.conftest import llm_models_root, skip_arm, skip_no_hopper
+from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
+                           skip_no_hopper)
 from defs.trt_test_alternative import check_call, check_output, popen
 
 from tensorrt_llm.logger import logger
@@ -47,6 +48,8 @@ def get_test_config(test_desc, example_dir, test_root):
         "gen_only": (2, f"{test_configs_root}/disagg_config_gen_only.yaml"),
         "gen_only_trt_backend":
         (2, f"{test_configs_root}/disagg_config_gen_only_trt_backend.yaml"),
+        "gen_only_bs1":
+        (4, f"{test_configs_root}/disagg_config_gen_only_bs1.yaml"),
         "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
         "4_ranks_trt_backend":
         (4,
@@ -384,6 +387,29 @@ def test_disaggregated_benchmark_gen_only_trt_backend(
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_trt_backend",
                            env=env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_genbs1(disaggregated_test_root,
+                              disaggregated_example_root, llm_venv,
+                              llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    run_disaggregated_test(disaggregated_example_root,
+                           "gen_only_bs1",
+                           env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1212,7 +1238,7 @@ def get_config_for_benchmark(model_root, backend):
             "num_instances": 1,
             "max_batch_size": 2,
             "max_num_tokens": 384,
-            "max_seq_len": 320,
+            "max_seq_len": 384,
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "disable_overlap_scheduler": True,
@@ -1228,7 +1254,7 @@ def get_config_for_benchmark(model_root, backend):
             "pipeline_parallel_size": 1,
             "max_batch_size": 2,
             "max_num_tokens": 384,
-            "max_seq_len": 320,
+            "max_seq_len": 384,
             "cache_transceiver_config": {
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
@@ -1247,6 +1273,9 @@ def get_config_for_benchmark(model_root, backend):
 def test_disaggregated_benchmark_on_diff_backends(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         benchmark_model_root, benchmark_root, shared_gpt_path):
+    if "DeepSeek-V3-Lite" in benchmark_model_root and "fp8" in benchmark_model_root and get_sm_version(
+    ) != 90:
+        pytest.skip("The test should only run on Hopper")
     nixl_config = get_config_for_benchmark(benchmark_model_root, "nixl")
     ucx_config = get_config_for_benchmark(benchmark_model_root, "ucx")
     temp_dir = tempfile.TemporaryDirectory()

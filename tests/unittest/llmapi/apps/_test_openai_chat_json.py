@@ -26,11 +26,7 @@ def temp_extra_llm_api_options_file(request):
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
-        extra_llm_api_options_dict = {
-            "guided_decoding_backend": "xgrammar",
-            "disable_overlap_scheduler":
-            True,  # Guided decoding is not supported with overlap scheduler
-        }
+        extra_llm_api_options_dict = {"guided_decoding_backend": "xgrammar"}
 
         with open(temp_file_path, "w") as f:
             yaml.dump(extra_llm_api_options_dict, f)

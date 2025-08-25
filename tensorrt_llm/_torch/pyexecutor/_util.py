@@ -509,7 +509,8 @@ def create_py_executor_instance(
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules)
+            lora_config.trtllm_modules_to_hf_modules,
+            lora_config.swap_gate_up_proj_lora_b_weight)
 
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
 
@@ -524,8 +525,14 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
+    # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
+    # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
+    scheduler_capacity = max_num_sequences
+    if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
+        scheduler_capacity += 1
+
     capacity_scheduler = BindCapacityScheduler(
-        max_num_sequences,
+        scheduler_capacity,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         peft_cache_manager.impl if peft_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,

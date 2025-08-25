@@ -81,7 +81,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  renormMoeRoutingOp.cpp
+  customMoeRoutingOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp

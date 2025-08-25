@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 
 namespace tensorrt_llm::kernels
 {
-template <typename InputT, typename OutputT, typename IdxT>
+template <typename InputT, typename OutputT, typename IdxT, bool DoSoftmaxBeforeTopK>
 void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream);
 } // namespace tensorrt_llm::kernels

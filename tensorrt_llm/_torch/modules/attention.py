@@ -92,7 +92,7 @@ def attn_custom_op_inplace(
                           mrope_position_deltas,
                           attention_window_size,
                           attention_mask_data,
-                          False,
+                          enable_attn_nvfp4_output=False,
                           output=output)
 
 
@@ -114,6 +114,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
+        disable_deep_gemm: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -132,6 +133,7 @@ class Attention(nn.Module):
             config (Optional[ModelConfig]): The model configuration.
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
+            disable_deep_gemm (bool): Whether to disable deep_gemm for linear layers.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -211,7 +213,9 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            disable_deep_gemm=disable_deep_gemm,
+        )
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
@@ -226,7 +230,9 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.o_lora,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            disable_deep_gemm=disable_deep_gemm,
+        )
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -372,6 +378,58 @@ class Attention(nn.Module):
             return attn_output[0], attn_output[1]
         return attn_output, None
 
+    def forward_impl(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        attention_mask: AttentionMask,
+        attention_window_size: Optional[int],
+        attention_mask_data: Optional[torch.Tensor],
+        mrope_config: Optional[dict],
+    ):
+        mrope_rotary_cos_sin = None
+        mrope_position_deltas = None
+        if mrope_config is not None:
+            if "mrope_rotary_cos_sin" in mrope_config:
+                mrope_rotary_cos_sin = mrope_config["mrope_rotary_cos_sin"]
+            if "mrope_position_deltas" in mrope_config:
+                mrope_position_deltas = mrope_config["mrope_position_deltas"]
+
+        # Currently only TRTLLM and FLASHINFER are torch compile compatible backends.
+        # Only enable custom inplace op when torch compiling.
+        use_custom_inplace_op = (self.register_to_config
+                                 and (self.attn_backend == "TRTLLM"
+                                      or self.attn_backend == "FLASHINFER")
+                                 and is_torch_compiling())
+
+        if use_custom_inplace_op:
+            output = self.create_output(q)
+            attn_custom_op_inplace(
+                q,
+                k,
+                v,
+                attention_mask,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                attention_window_size,
+                attention_mask_data,
+                self.layer_idx_str,
+                output,
+            )
+        else:
+            output, output_sf = self._attn_impl(q, k, v, attn_metadata,
+                                                attention_mask,
+                                                mrope_rotary_cos_sin,
+                                                mrope_position_deltas,
+                                                attention_window_size,
+                                                attention_mask_data)
+            if output_sf is not None:
+                output = Fp4QuantizedTensor(output, output_sf)
+
+        return output
+
     def forward(
         self,
         position_ids: Optional[torch.IntTensor],
@@ -414,54 +472,18 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        mrope_rotary_cos_sin = None
-        mrope_position_deltas = None
-        if mrope_config is not None:
-            if "mrope_rotary_cos_sin" in mrope_config:
-                mrope_rotary_cos_sin = mrope_config["mrope_rotary_cos_sin"]
-            if "mrope_position_deltas" in mrope_config:
-                mrope_position_deltas = mrope_config["mrope_position_deltas"]
-
-        output = None
-
         q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
-        # Currently only TRTLLM and FLASHINFER are torch compile compatible backends.
-        # Only enable custom inplace op when torch compiling.
-        use_custom_inplace_op = (self.register_to_config
-                                 and (self.attn_backend == "TRTLLM"
-                                      or self.attn_backend == "FLASHINFER")
-                                 and is_torch_compiling())
-        if use_custom_inplace_op:
-            output = self.create_output(q)
-            attn_custom_op_inplace(
-                q,
-                k,
-                v,
-                attention_mask,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                attention_window_size,
-                attention_mask_data,
-                self.layer_idx_str,
-                output=output,
-            )
-        else:
-            output, output_sf = self._attn_impl(
-                q,
-                k,
-                v,
-                attn_metadata,
-                attention_mask,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                attention_window_size,
-                attention_mask_data,
-            )
-            if output_sf is not None:
-                output = Fp4QuantizedTensor(output, output_sf)
+        output = self.forward_impl(q,
+                                   k,
+                                   v,
+                                   attn_metadata,
+                                   attention_mask,
+                                   attention_window_size,
+                                   attention_mask_data,
+                                   mrope_config=mrope_config)
 
         attn_output = self.o_proj(output,
                                   all_reduce_params=all_reduce_params,
