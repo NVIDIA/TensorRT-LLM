@@ -27,6 +27,10 @@ try:
 except ImportError:
     float4_sf_dtype = None
 
+# TODO: put the ENUMs in the same place and import it
+FORMAT_FP8 = 0
+FORMAT_NVFP4 = 1
+
 
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:
     """Converts the modelopt FP4 per-block weight scale to the cutlass format (padded and swizzled)."""
@@ -81,6 +85,7 @@ class QuantizationImpl:
                 quantization_impl_map = {
                     "": None,
                     "FP8": FP8BMMQuantizationImpl,
+                    "NVFP4": None,  # BMM NVFP4 is not supported yet
                 }
             else:
                 quantization_impl_map = {
@@ -95,7 +100,7 @@ class QuantizationImpl:
             FP8QuantizationImpl,
             FP8BMMQuantizationImpl,
         ]:
-            if is_op(quant_type_or_node, q.target_op()):
+            if is_op(quant_type_or_node, q.custom_op()):
                 return q
         return None
 
@@ -135,36 +140,28 @@ class QuantizationImpl:
         pass
 
     @staticmethod
-    def shard_scales(dim, rank, world_size, **kwargs) -> Dict[str, torch.Tensor]:
-        """Returns a dict of sharded quantization scales."""
+    def build_custom_kwargs_for_linear(
+        scale_getattrs: Dict[str, Node],
+    ) -> Dict[str, object]:
+        """Default: no extra kwargs. Each impl overrides to pass the right inputs/scales/zps/format."""
         return {}
 
     @staticmethod
-    def shard_load_hook(
-        state_dict,
-        prefix,
-        *args,
-        weight_name: str,
-        weight_shape: Tuple,
-        dim: int,
-        rank: int,
-        world_size: int,
-    ):
-        """Load hook for state_dict quantized sharding pre-processing.
-
-        This load_hook handles the sharding of the quantization scales.
-        """
-        pass
-
-    @staticmethod
-    def fuse_linear_weights(weights, **kwargs) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        pass
+    def build_custom_args_for_linear(  # renamed to reflect args
+        scale_getattrs: Dict[str, Node],
+    ) -> Tuple[object, ...]:
+        return ()
 
 
 class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
     def target_op():
         return torch.ops.auto_deploy.torch_quant_fp8_linear
+
+    @staticmethod
+    def custom_op():
+        """Unified custom kernel entry-point for quantized linear."""
+        return torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
@@ -179,6 +176,38 @@ class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
     def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
         return {"input_scale": torch.tensor(1.0), "weight_scale": torch.tensor(1.0)}
+
+    @staticmethod
+    def build_custom_kwargs_for_linear(
+        scale_getattrs: Dict[str, Node],
+    ) -> Dict[str, object]:
+        # FP8 custom op contract:
+        #   input_scale=[tensor], weight_scale=[tensor], input_zp=[], weight_zp=[], format_type=FORMAT_FP8
+        return dict(
+            input_scale=[scale_getattrs["input_scale"]],
+            weight_scale=[scale_getattrs["weight_scale"]],
+            input_zp=[],
+            weight_zp=[],
+            # format_type=FORMAT_FP8,
+        )
+
+    @staticmethod
+    def build_custom_args_for_linear(  # renamed to reflect args
+        scale_getattrs: Dict[str, Node],
+    ) -> Tuple[object, ...]:
+        """
+        Build the *positional* tail for torch_fake_quant_fp8_linear:
+            (..., bias, input_scale(list), weight_scale(list), input_zp(list), weight_zp(list))
+
+        We pass bias=None to match the exported pattern:
+        torch_fake_quant_fp8_linear(args_0, args_1, args_2, [args_2_0], [args_3_0], [], [])
+        """
+        return (
+            [scale_getattrs["input_scale"]],  # input_scale list
+            [scale_getattrs["weight_scale"]],  # weight_scale list
+            [],  # input_zp
+            [],  # weight_zp
+        )
 
     @staticmethod
     def load_hook(state_dict, prefix, *args, weight_name):
@@ -197,45 +226,16 @@ class FP8QuantizationImpl(QuantizationImpl):
             scale = amax / FP8_MAX
             state_dict[scale_name] = scale
 
-    @staticmethod
-    def fuse_linear_weights(
-        weights, weight_scale, input_scale
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if not all(s == input_scale[0] for s in input_scale):
-            raise NotImplementedError(f"Cannot fuse due to mismatched input_scale {input_scale}")
-
-        # Handle quantized weights with weight_scale.
-        # First we upcast to FP32 precision and then downcast back to the original precision (FP8)
-        assert weights[0].dtype == torch.float8_e4m3fn, "Only support FP8 quantized weights fusion."
-        fused_fp32_weights = torch.cat(
-            [t.to(torch.float) * s for t, s in zip(weights, weight_scale)], dim=0
-        )
-        new_weight_scale = torch.max(torch.stack(weight_scale))
-        fused_fp8_weights = (fused_fp32_weights / new_weight_scale).to(weights[0].dtype)
-
-        return fused_fp8_weights, {
-            "weight_scale": new_weight_scale,
-            "input_scale": input_scale[0].clone(),
-        }
-
-
-def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
-    assert weight_scale.dim() == 1
-    weight_shape_original = list(sharded_uint8_weight_shape)
-    weight_shape_original[dim] = weight_shape_original[dim] * world_size
-    weight_shape_original[-1] *= 2
-    modelopt_weight_scale = cutlass_fp4_scale_to_modelopt_fp4_scale(
-        weight_scale, tuple(weight_shape_original)
-    )
-    return modelopt_fp4_scale_to_cutlass_fp4_scale(
-        modelopt_weight_scale.tensor_split(world_size, dim=dim)[rank]
-    )
-
 
 class FP4QuantizationImpl(QuantizationImpl):
     @staticmethod
     def target_op():
         return torch.ops.auto_deploy.torch_quant_fp4_linear
+
+    @staticmethod
+    def custom_op():
+        """Unified custom kernel entry-point for quantized linear."""
+        return torch.ops.auto_deploy.torch_fake_quant_fp4_linear.default
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
@@ -263,6 +263,47 @@ class FP4QuantizationImpl(QuantizationImpl):
             "weight_scale": torch.empty((padded_m * padded_n), dtype=torch.uint8),
             "alpha": torch.tensor(1.0 / 6.0),
         }
+
+    @staticmethod
+    def build_custom_kwargs_for_linear(
+        scale_getattrs: Dict[str, Node],
+    ) -> Dict[str, object]:
+        """
+        Contract:
+          custom_quant_linear(
+              x, Wq, bias,
+              input_scale=[s_in2],
+              weight_scale=[weight_scale_cutlass_uint8, alpha_fused],
+              input_zp=[],
+              weight_zp=[],
+              format_type=FORMAT_NVFP4
+          )
+        """
+        return dict(
+            input_scale=[scale_getattrs["input_scale"]],
+            weight_scale=[scale_getattrs["weight_scale"], scale_getattrs["alpha"]],
+            input_zp=[],
+            weight_zp=[],
+            # format_type=FORMAT_NVFP4,
+        )
+
+    @staticmethod
+    def build_custom_args_for_linear(  # renamed to reflect args
+        scale_getattrs: Dict[str, Node],
+    ) -> Tuple[object, ...]:
+        """
+        Build the *positional* tail for torch_fake_quant_fp8_linear:
+            (..., bias, input_scale(list), weight_scale(list), input_zp(list), weight_zp(list))
+
+        We pass bias=None to match the exported pattern:
+        torch_fake_quant_fp8_linear(args_0, args_1, args_2, [args_2_0], [args_3_0], [], [])
+        """
+        return (
+            [scale_getattrs["input_scale"]],  # input_scale list
+            [scale_getattrs["weight_scale"], scale_getattrs["alpha"]],  # weight_scale list
+            [],  # input_zp
+            [],  # weight_zp
+        )
 
     @staticmethod
     def load_hook(state_dict, prefix, *args, weight_name):
@@ -318,46 +359,6 @@ class FP4QuantizationImpl(QuantizationImpl):
             amax = state_dict[amax_name]
             scale = ((448 * 6) / amax).float()
             state_dict[scale_name] = scale
-
-    @staticmethod
-    def shard_scales(dim, rank, world_size, weight_scale, alpha, input_scale, weight_shape):
-        result = {}
-        result["alpha"] = alpha
-        result["input_scale"] = input_scale
-        result["weight_scale"] = _shard_fp4_weight_scale(
-            weight_scale, weight_shape, dim, rank, world_size
-        )
-
-        return result
-
-    @staticmethod
-    def shard_load_hook(
-        state_dict, prefix, *args, weight_name, weight_shape, dim, rank, world_size
-    ):
-        if weight_name + "_scale" in state_dict:
-            weight_scale = state_dict[weight_name + "_scale"]
-            state_dict[weight_name + "_scale"] = _shard_fp4_weight_scale(
-                weight_scale, weight_shape, dim, rank, world_size
-            )
-
-    @staticmethod
-    def fuse_linear_weights(
-        weights, weight_scale, alpha, input_scale
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if not all(s == input_scale[0] for s in input_scale):
-            raise NotImplementedError(f"Cannot fuse due to mismatched input_scale {input_scale}")
-
-        if not all(s == alpha[0] for s in alpha):
-            raise NotImplementedError(f"Cannot fuse due to mismatched alpha {alpha}")
-
-        fused_weights = torch.cat(weights, dim=0)
-        fused_weight_scale = torch.cat(weight_scale, dim=0)
-
-        return fused_weights, {
-            "weight_scale": fused_weight_scale,
-            "alpha": alpha[0],
-            "input_scale": input_scale[0].clone(),
-        }
 
 
 def is_quantized_graph(gm: GraphModule):
