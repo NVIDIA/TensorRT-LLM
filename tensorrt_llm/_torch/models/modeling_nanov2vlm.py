@@ -118,12 +118,37 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
 
     def forward(self, multimodal_params: List[MultimodalParams]):
         mm_embedding = []
-        for multimodal_param in multimodal_params:
-            pixel_values = multimodal_param.multimodal_data["pixel_values"]
-            image_embeds = self.extract_feature(pixel_values)
-            image_embeds = image_embeds.reshape(-1, self.llm_hidden_size)
-            # -> [num_patches*num_image_token, hidden_size]
-            mm_embedding.append(image_embeds)
+
+        BATCH_INFERENCE = True
+        if BATCH_INFERENCE:
+            # Batch data.
+            batched_pixel_values = torch.cat([
+                multimodal_param.multimodal_data["pixel_values"]
+                for multimodal_param in multimodal_params
+            ],
+                                             dim=0)
+            batched_num_patches = [
+                multimodal_param.multimodal_data["num_patches"]
+                for multimodal_param in multimodal_params
+            ]
+            # -> [num_patches, num_image_token, hidden_size]
+            batched_image_embeds = self.extract_feature(batched_pixel_values)
+            mm_embedding = torch.split(batched_image_embeds,
+                                       batched_num_patches,
+                                       dim=0)
+            mm_embedding = [
+                m.reshape(-1, self.llm_hidden_size) for m in mm_embedding
+            ]
+            # -> list of [num_patches*num_image_token, hidden_size]
+        else:
+            # Inference per sample.
+            for multimodal_param in multimodal_params:
+                pixel_values = multimodal_param.multimodal_data["pixel_values"]
+                image_embeds = self.extract_feature(pixel_values)
+                # -> [num_patches, num_image_token, hidden_size]
+                image_embeds = image_embeds.reshape(-1, self.llm_hidden_size)
+                # -> [num_patches*num_image_token, hidden_size]
+                mm_embedding.append(image_embeds)
         return mm_embedding
 
 
