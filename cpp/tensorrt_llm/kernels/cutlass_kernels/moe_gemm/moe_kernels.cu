@@ -2847,9 +2847,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     expert_first_token_offset_ = getWsPtr(int64_t{}, "expert_first_token_offset");
 
     // We check if the provided config uses fused finalize and disable it if it does not
-    bool const gemm2_using_tma_ws = moe_gemm_runner_.isTmaWarpSpecialized(*gemm2_config_);
+    bool gemm2_using_finalize_fusion
+        = gemm2_config_->epilogue_fusion_type == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
     permuted_token_final_scales_
-        = (gemm2_using_tma_ws && mayHaveFinalizeFused()) ? getWsPtr(float{}, "permuted_token_final_scales") : nullptr;
+        = gemm2_using_finalize_fusion ? getWsPtr(float{}, "permuted_token_final_scales") : nullptr;
 
     bool const is_gated_activation = isGatedActivation(activation_type);
     bool const gemm1_using_fused_moe
@@ -4006,8 +4007,12 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
         bool apply_bias = parallelism_config.tp_rank == 0;
         auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;
+        bool gemm2_using_finalize_fusion = gemm2_config_->epilogue_fusion_type
+            == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
         bool using_fused_finalize
-            = use_fused_finalize_ && gemm2_config_->sm_version >= 90 && !use_w4_groupwise && !use_lora;
+            = use_fused_finalize_ && gemm2_using_finalize_fusion && !use_w4_groupwise && !use_lora;
+        TLLM_CHECK_WITH_INFO(using_fused_finalize == gemm2_using_finalize_fusion,
+            "GEMM2 tactic requests finalize fusion, but the runner is not configured to use it");
         if (using_fused_finalize)
         {
             assert(min_latency_mode == false);
@@ -4550,10 +4555,22 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
     }
 }
 
-void GemmProfilerBackend::prepareTmaWsInputs(
-    int num_tokens, char* workspace_ptr_char, void const* expert_weights, cudaStream_t stream)
+void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr_char, void const* expert_weights,
+    TmaWarpSpecializedGroupedGemmInput::EpilogueFusion fusion, cudaStream_t stream)
 {
     if (mSM < 90)
+    {
+        return;
+    }
+
+    bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
+    bool use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
+        && mWType == nvinfer1::DataType::kUINT8);
+    bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
+    bool const use_finalize_fusion = fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
+    bool const finalize_fusion_not_supported = !mInterface->use_fused_finalize_ || mMinLatencyMode || use_w4_groupwise
+        || mGemmToProfile != GemmToProfile::GEMM_2;
+    if (use_finalize_fusion && finalize_fusion_not_supported)
     {
         return;
     }
@@ -4596,28 +4613,24 @@ void GemmProfilerBackend::prepareTmaWsInputs(
     size_t num_expanded_tokens = num_tokens * mK;
     for (int64_t i = 0; i < NUM_ROUTING_SAMPLES; i++)
     {
-        mTmaInputCache[i].configureWorkspace(tma_ws_input_workspace, mNumExpertsPerNode, gemm_workspace,
+        // Note: Even though we have separate TMA WS inputs for finalize fusion on/off we reuse the same pointers to
+        // save space.
+        auto& cache_element = mTmaInputCache[i][use_finalize_fusion];
+        cache_element.configureWorkspace(tma_ws_input_workspace, mNumExpertsPerNode, gemm_workspace,
             workspaces.at("gemm_workspace").first, mScalingType);
         tma_ws_input_workspace += tma_ws_size;
 
         int64_t* expert_first_token_offset = expert_first_token_offset_base + i * (mNumExpertsPerNode + 1);
         int* permuted_row_to_unpermuted_row = permuted_row_to_unpermuted_row_base + i * num_expanded_tokens;
 
-        auto& gemm1_tma_ws_input = mGemmToProfile == GemmToProfile::GEMM_1 ? mTmaInputCache[i] : dummy_tma_ws_input;
-        auto& gemm2_tma_ws_input = mGemmToProfile == GemmToProfile::GEMM_2 ? mTmaInputCache[i] : dummy_tma_ws_input;
+        auto& gemm1_tma_ws_input = mGemmToProfile == GemmToProfile::GEMM_1 ? cache_element : dummy_tma_ws_input;
+        auto& gemm2_tma_ws_input = mGemmToProfile == GemmToProfile::GEMM_2 ? cache_element : dummy_tma_ws_input;
         if (mSM >= 90)
         {
             /* GEMM1 */
             gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
             gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
-
-            bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
-            bool use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
-                && mWType == nvinfer1::DataType::kUINT8);
-            bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
-            bool using_fused_finalize
-                = mInterface->use_fused_finalize_ && mSM >= 90 && !mMinLatencyMode && !use_w4_groupwise;
-            if (using_fused_finalize)
+            if (use_finalize_fusion)
             {
                 assert(!mMinLatencyMode);
                 gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
@@ -4652,7 +4665,6 @@ void GemmProfilerBackend::prepareTmaWsInputs(
 void GemmProfilerBackend::prepare(
     int num_tokens, char* workspace_ptr_char, void const* expert_weights, cudaStream_t stream)
 {
-    mAllTacticsSaved = mInterface->getTactics();
     mSampleIndex = 0;
 
     auto workspace_size = getWorkspaceSize(num_tokens);
@@ -4660,7 +4672,10 @@ void GemmProfilerBackend::prepare(
 
     prepareRouting(num_tokens, workspace_ptr_char, stream);
     prepareQuantParams(num_tokens, workspace_ptr_char, stream);
-    prepareTmaWsInputs(num_tokens, workspace_ptr_char, expert_weights, stream);
+    prepareTmaWsInputs(num_tokens, workspace_ptr_char, expert_weights,
+        TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE, stream);
+    prepareTmaWsInputs(num_tokens, workspace_ptr_char, expert_weights,
+        TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE, stream);
 }
 
 size_t GemmProfilerBackend::getWorkspaceSize(int maxM)
@@ -4724,7 +4739,9 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
     TmaWarpSpecializedGroupedGemmInput tma_ws_input_template;
     if (tactic.is_tma_warp_specialized)
     {
-        tma_ws_input_template = mTmaInputCache[mSampleIndex];
+        tma_ws_input_template = mTmaInputCache[mSampleIndex][tactic.epilogue_fusion_type
+            == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE];
+        TLLM_CHECK_WITH_INFO(tma_ws_input_template.isValid(), "TMA WS input template is not initialized");
     }
 
     mInterface->is_profiler = true;

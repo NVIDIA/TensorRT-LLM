@@ -1,5 +1,5 @@
-import bisect
 import contextlib
+import copy
 import functools
 import gc
 import inspect
@@ -56,7 +56,7 @@ from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
-from .cuda_graph_runner import DecodingCUDAGraphRunner
+from .cuda_graph_runner import CUDAGraphRunner
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -421,7 +421,6 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states = {}
         self._cuda_graphs = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
-        self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
 
@@ -450,7 +449,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self.cuda_graph_dummy_request = None
+        self.cuda_graph_runner = CUDAGraphRunner(self)
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -467,13 +466,16 @@ class PyTorchModelEngine(ModelEngine):
     def runtime_draft_len(self):
         return self.max_draft_len if self.enable_spec_decode else 0
 
-    def set_lora_model_config(self, lora_target_modules: list[str],
-                              trtllm_modules_to_hf_modules: dict[str, str]):
+    def set_lora_model_config(self,
+                              lora_target_modules: list[str],
+                              trtllm_modules_to_hf_modules: dict[str, str],
+                              swap_gate_up_proj_lora_b_weight: bool = True):
         self.lora_model_config = LoraModelConfig(
             lora_target_modules=lora_target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
             hidden_size=self.model.config.hidden_size,
-            dtype=torch_dtype_to_str(self.model.config.torch_dtype))
+            dtype=torch_dtype_to_str(self.model.config.torch_dtype),
+            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
 
     @property
     def use_mrope(self):
@@ -537,12 +539,12 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextlib.contextmanager
     def no_cuda_graph(self):
-        _run_cuda_graphs = self._run_cuda_graphs
-        self._run_cuda_graphs = False
+        _run_cuda_graphs = self.cuda_graph_runner.enabled
+        self.cuda_graph_runner.enabled = False
         try:
             yield
         finally:
-            self._run_cuda_graphs = _run_cuda_graphs
+            self.cuda_graph_runner.enabled = _run_cuda_graphs
 
     @with_warmup_flag
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -557,7 +559,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy request to None in warmup.
-        self.cuda_graph_dummy_request = None
+        self.cuda_graph_runner.padding_dummy_request = None
 
         def get_cuda_graph_warmup_request(batch_size, draft_len):
             # Divide by max_beam_width to get an approximation of the number of requests that can be run in parallel.
@@ -752,7 +754,7 @@ class PyTorchModelEngine(ModelEngine):
 
             AutoTuner.get().print_profiling_cache()
 
-        if not (self._run_cuda_graphs
+        if not (self.cuda_graph_runner.enabled
                 or self._torch_compile_piecewise_cuda_graph):
             return
 
@@ -823,7 +825,7 @@ class PyTorchModelEngine(ModelEngine):
         self.enable_spec_decode = self.is_spec_decode
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
-        enable_paged_context_mla = is_mla(
+        enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
@@ -837,7 +839,8 @@ class PyTorchModelEngine(ModelEngine):
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla,
+                enable_context_mla_with_cached_kv=
+                enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection)
 
         if self.attn_metadata is not None:
@@ -854,7 +857,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_paged_context_mla=enable_paged_context_mla,
+            enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection)
 
         return self.attn_metadata
@@ -883,152 +886,6 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager=spec_resource_manager,
             is_draft_model=self.is_draft_model)
         return self.spec_metadata
-
-    def _get_padded_batch(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager,
-            spec_resource_manager: Optional[BaseResourceManager] = None) -> int:
-        can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
-        batch_size = scheduled_requests.batch_size
-        new_batch_size = batch_size
-
-        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            graph_batch_size = self.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            all_can_graph = all(graph_batch[0]
-                                for graph_batch in graph_batch_size)
-            if all_can_graph:
-                new_batch_size = max(gen_only_batch[1]
-                                     for gen_only_batch in graph_batch_size)
-
-        if (not self._run_cuda_graphs or not self._cuda_graph_padding_enabled
-                or not can_run_cuda_graph
-                or new_batch_size > self._max_cuda_graph_batch_size):
-            return 0
-
-        padded_batch_size = self._round_up_batch_size(new_batch_size)
-        if batch_size == padded_batch_size:
-            return 0
-
-        padding_size = padded_batch_size - batch_size
-        if padding_size + scheduled_requests.batch_size > self.batch_size:
-            return 0
-
-        # No padding if it would create too many concurrent requests.
-        # This is not strictly required, but we should probably
-        # respect the requirement just in case that changes in the future.
-        if self.cuda_graph_dummy_request is None:
-            available_blocks = kv_cache_manager.get_num_free_blocks()
-            # No padding if not enough KV cache space
-            if available_blocks < 1:
-                return 0
-
-            cuda_graph_dummy_request_ids = [MAX_UINT64 - 1]
-            self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
-                cuda_graph_dummy_request_ids,
-                is_gen=True,
-                max_num_draft_tokens=self.runtime_draft_len,
-                use_mrope=self.use_mrope,
-                max_beam_width=self.max_beam_width)[0]
-            self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(
-                    request_ids=cuda_graph_dummy_request_ids)
-
-        scheduled_requests.generation_requests.extend(
-            [self.cuda_graph_dummy_request] * padding_size)
-
-        return padding_size
-
-    @contextlib.contextmanager
-    def _maybe_pad_batch(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
-        """
-        CUDA graphs can only be used for specific batch sizes.
-
-        If using CUDA graphs, this method will add dummy requests to the given
-        batch so we can always use a CUDA graph. It is a context manager
-        because the padded requests will be removed from scheduled requests.
-        """
-        padding_size = self._get_padded_batch(scheduled_requests,
-                                              kv_cache_manager,
-                                              spec_resource_manager)
-        try:
-            yield scheduled_requests
-        finally:
-            if padding_size > 0:
-                scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
-                                                                                                -padding_size]
-
-    def _round_up_batch_size(self, batch_size: int) -> int:
-        """
-        Round up the given batch size to the nearest batch size that is
-        associated with a CUDA graph.
-        """
-        idx = bisect.bisect_left(self._cuda_graph_batch_sizes, batch_size)
-        return self._cuda_graph_batch_sizes[idx]
-
-    def _maybe_get_cuda_graph(
-        self,
-        batch: ScheduledRequests,
-    ) -> Optional[DecodingCUDAGraphRunner]:
-        """
-        Get a CUDA graph runner or return None (e.g. if CUDA graphs are disabled
-        or if the batch size is too big).
-        """
-        # disable when doing statistic
-        if ExpertStatistic.set_iter(self.iter_counter):
-            return None
-
-        draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
-        can_run_cuda_graph = batch.can_run_cuda_graph
-        batch_size = len(batch.generation_requests)
-        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            all_can_graph_batch = self.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            is_all_gen_only = all(all_can_graph[0]
-                                  for all_can_graph in all_can_graph_batch)
-            all_batch_size_equal = all(
-                all_gen_only[1] == all_can_graph_batch[0][1]
-                for all_gen_only in all_can_graph_batch)
-
-            if not is_all_gen_only or not all_batch_size_equal:
-                return None
-
-        if not self._run_cuda_graphs or not can_run_cuda_graph:
-            return None
-
-        if batch_size in self._cuda_graphs and draft_len in self._cuda_graphs[
-                batch_size]:
-            return self._cuda_graphs[batch_size][draft_len]
-
-        if batch_size not in self._cuda_graph_batch_sizes:
-            return None
-
-        num_sequences_in_batch = batch_size * self.max_beam_width
-        attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, draft_len)
-        assert attn_metadata.is_cuda_graph
-
-        if self.enable_spec_decode:
-            spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
-                num_sequences_in_batch)
-            spec_metadata.draft_tokens = self.draft_tokens_cuda
-        else:
-            spec_metadata = None
-
-        # Initialize nested dictionary if needed
-        if batch_size not in self._cuda_graphs:
-            self._cuda_graphs[batch_size] = {}
-
-        self._cuda_graphs[batch_size][draft_len] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope,
-            self.max_beam_width)
-        return self._cuda_graphs[batch_size][draft_len]
 
     def __del__(self) -> None:
         if getattr(self, 'ub_buffers', None):
@@ -1060,6 +917,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
+            mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,
             **kwargs)
 
         validate_and_set_kv_cache_quant(
@@ -1077,9 +935,12 @@ class PyTorchModelEngine(ModelEngine):
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
+
             try:
+                # config will be modified in-place for some models, like Qwen2
+                config_copy = copy.deepcopy(config)
                 with MetaInitMode():
-                    model = AutoModelForCausalLM.from_config(config)
+                    model = AutoModelForCausalLM.from_config(config_copy)
 
                 memo = dict()
 
@@ -1091,6 +952,7 @@ class PyTorchModelEngine(ModelEngine):
                     return memo[t]
 
                 model._apply(init_meta_tensor)
+                config = config_copy
 
             except Exception:
                 logger.info(
@@ -1125,6 +987,12 @@ class PyTorchModelEngine(ModelEngine):
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)
 
+            elif load_format == LoadFormat.VISION_ONLY:
+                # Vision weights are already loaded within the model.
+                logger.info(
+                    "LoadFormat.VISION_ONLY: skipping weight loading; using preloaded vision weights."
+                )
+
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
@@ -1150,7 +1018,12 @@ class PyTorchModelEngine(ModelEngine):
             load_method(weights)
 
     def _init_max_seq_len(self):
-        inferred_max_seq_len = self.model.infer_max_seq_len()
+        # For mm_encoder_only mode, infer_max_seq_len() is for LLM decoder models
+        if hasattr(self.model, 'infer_max_seq_len'):
+            inferred_max_seq_len = self.model.infer_max_seq_len()
+        else:
+            inferred_max_seq_len = self._infer_max_seq_len_from_config()
+
         if self.max_seq_len is None:
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
@@ -1165,6 +1038,46 @@ class PyTorchModelEngine(ModelEngine):
                 f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
             )
             self.max_seq_len = inferred_max_seq_len
+
+    def _infer_max_seq_len_from_config(self) -> int:
+
+        if hasattr(self.model, 'model_config') and self.model.model_config:
+            model_config = self.model.model_config.pretrained_config
+            rope_scaling = getattr(model_config, 'rope_scaling', None)
+            rope_factor = 1
+            if rope_scaling is not None:
+                rope_type = rope_scaling.get('type',
+                                             rope_scaling.get('rope_type'))
+                if rope_type not in ("su", "longrope", "llama3", "yarn"):
+                    rope_factor = rope_scaling.get('factor', 1.0)
+
+            # Step 1: Find the upper bound of max_seq_len
+            inferred_max_seq_len = 2048
+            max_position_embeddings = getattr(model_config,
+                                              'max_position_embeddings', None)
+            if max_position_embeddings is None and hasattr(
+                    model_config, 'text_config'):
+                max_position_embeddings = getattr(model_config.text_config,
+                                                  'max_position_embeddings',
+                                                  None)
+            if max_position_embeddings is not None:
+                inferred_max_seq_len = max_position_embeddings
+
+            # Step 2: Scale max_seq_len with rotary scaling
+            if rope_factor != 1:
+                inferred_max_seq_len = int(
+                    math.ceil(inferred_max_seq_len * rope_factor))
+                logger.warning(
+                    f'max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}'
+                )
+
+            return inferred_max_seq_len
+
+        default_max_seq_len = 8192
+        logger.warning(
+            f"Could not infer max_seq_len from model config, using default value: {default_max_seq_len}"
+        )
+        return default_max_seq_len
 
     def _init_max_num_tokens(self):
         # Modified from tensorrt_llm/_common.py check_max_num_tokens
@@ -1183,13 +1096,7 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_num_tokens()
 
     def _release_cuda_graphs(self):
-        for batch_size, draft_graphs in self._cuda_graphs.items():
-            for draft_len, graph in draft_graphs.items():
-                del graph
-        self._cuda_graphs.clear()
-        torch.cuda.empty_cache()
-        del self._cuda_graph_mem_pool
-        self._cuda_graph_mem_pool = None
+        self.cuda_graph_runner.clear()
 
     def get_max_num_sequences(self) -> int:
         """
@@ -1676,6 +1583,7 @@ class PyTorchModelEngine(ModelEngine):
         multi_modal_data = []
         draft_lens = []
         request_ids = []
+        multimodal_params_list = []
 
         for request in scheduled_requests.context_requests:
             prompt_tokens = request.get_tokens(0)
@@ -1691,6 +1599,17 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_embedding = request.multimodal_embedding
             if multimodal_embedding is not None:
                 multi_modal_data.append(multimodal_embedding)
+
+            # Multimodal
+            if request.py_multimodal_data is not None:
+                multimodal_params = MultimodalParams(
+                    multimodal_data=request.py_multimodal_data, )
+                multimodal_params.to_device("multimodal_data",
+                                            "cuda",
+                                            pin_memory=True)
+                multimodal_params_list.append(multimodal_params)
+
+            request.py_batch_idx = request.py_seq_slot
 
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
@@ -1743,7 +1662,7 @@ class PyTorchModelEngine(ModelEngine):
             'input_ids': self.input_ids_cuda[:num_tokens],
             'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
             'inputs_embeds': None,
-            'multi_modal_data': multi_modal_data
+            "multimodal_params": multimodal_params_list
         }
 
         if bool(lora_params):
@@ -2016,7 +1935,6 @@ class PyTorchModelEngine(ModelEngine):
                 module_id: dict
                 {
                     adapter_size: torch tensor: int
-                    is_dora: torch tensor: bool
                     weight_pointers: torch tensor: int64
                 }
             }
@@ -2035,88 +1953,63 @@ class PyTorchModelEngine(ModelEngine):
             for module in request.py_lora_task_layer_module_configs:
                 module_id = module.module_id
                 layer_id = module.layer_id
-                adapter_size = module.adapter_size
-                is_dora = module.scaling_vec_pointer == 0
-                weights_in_pointer = module.weights_in_pointer
-                weights_out_pointer = module.weights_out_pointer
-                scaling_vec_pointer = module.scaling_vec_pointer
-                if weights_in_pointer is None:
-                    weights_in_pointer = 0
-                if weights_out_pointer is None:
-                    weights_out_pointer = 0
-                if scaling_vec_pointer is None:
-                    scaling_vec_pointer = 0
 
                 if layer_id not in lora_params:
                     lora_params[layer_id] = {}
                 if module_id not in lora_params[layer_id]:
-                    lora_params[layer_id][module_id] = {}
+                    lora_params[layer_id][module_id] = {
+                        'adapter_size': [],
+                        'weight_pointers': [],
+                    }
 
-                if 'adapter_size' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['adapter_size'] = []
-                if 'is_dora' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['is_dora'] = []
-                if 'weight_pointers' not in lora_params[layer_id][module_id]:
-                    lora_params[layer_id][module_id]['weight_pointers'] = []
-
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size'] = [
-                        adapter_size
-                    ]
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora'] = [
-                        is_dora
-                    ]
-                tmp_lora_params[
-                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer'] = [
-                        weights_in_pointer, weights_out_pointer,
-                        scaling_vec_pointer
-                    ]
+                scaling_vec_pointer = module.scaling_vec_pointer
+                if scaling_vec_pointer is None:
+                    scaling_vec_pointer = 0
+                tmp_lora_params[(request.py_request_id, layer_id,
+                                 module_id)] = {
+                                     'adapter_size': [module.adapter_size],
+                                     'weight_pointers': [
+                                         module.weights_in_pointer,
+                                         module.weights_out_pointer,
+                                         scaling_vec_pointer
+                                     ],
+                                 }
 
         for request in request_list:
             # Need to set default values for this case
             if request.py_lora_task_layer_module_configs is None:
                 for layer_id in lora_params:
                     for module_id in lora_params[layer_id]:
-                        lora_params[layer_id][module_id]['adapter_size'].append(
-                            0)
-                        lora_params[layer_id][module_id]['is_dora'].append(
-                            False)
-                        lora_params[layer_id][module_id]['weight_pointers'] += [
-                            0, 0, 0
-                        ]
+                        current_lora_params = lora_params[layer_id][module_id]
+                        current_lora_params['adapter_size'].append(0)
+                        current_lora_params['weight_pointers'] += [0, 0, 0]
 
             else:
                 for layer_id in lora_params:
                     for module_id in lora_params[layer_id]:
-                        if f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size' not in tmp_lora_params:
-                            lora_params[layer_id][module_id][
-                                'adapter_size'].append(0)
-                            lora_params[layer_id][module_id]['is_dora'].append(
-                                False)
-                            lora_params[layer_id][module_id][
-                                'weight_pointers'] += [0, 0, 0]
+                        current_tmp_lora_params = tmp_lora_params.get(
+                            (request.py_request_id, layer_id, module_id), None)
+                        current_lora_params = lora_params[layer_id][module_id]
+                        if current_tmp_lora_params is None:
+                            current_lora_params['adapter_size'].append(0)
+                            current_lora_params['weight_pointers'] += [0, 0, 0]
                         else:
-                            lora_params[layer_id][module_id][
-                                'adapter_size'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size']
-                            lora_params[layer_id][module_id][
-                                'is_dora'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora']
-                            lora_params[layer_id][module_id][
-                                'weight_pointers'] += tmp_lora_params[
-                                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer']
+                            current_lora_params[
+                                'adapter_size'] += current_tmp_lora_params[
+                                    'adapter_size']
+                            current_lora_params[
+                                'weight_pointers'] += current_tmp_lora_params[
+                                    'weight_pointers']
 
         for layer_id in lora_params:
             for module_id in lora_params[layer_id]:
-                lora_params[layer_id][module_id][
-                    'adapter_size'] = torch.IntTensor(
-                        lora_params[layer_id][module_id]['adapter_size'])
-                lora_params[layer_id][module_id][
-                    'weight_pointers'] = torch.LongTensor(
-                        lora_params[layer_id][module_id]['weight_pointers'])
+                current_lora_params = lora_params[layer_id][module_id]
+                current_lora_params['adapter_size'] = torch.IntTensor(
+                    current_lora_params['adapter_size'])
+                current_lora_params['weight_pointers'] = torch.LongTensor(
+                    current_lora_params['weight_pointers'])
 
-        if bool(lora_params):
+        if lora_params:
             lora_params['host_request_types'] = attn_metadata.host_request_types
             lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
             lora_params['num_seqs'] = attn_metadata.num_seqs
@@ -2183,14 +2076,21 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests, attn_metadata, spec_metadata)
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
-                return self._forward_step(inputs, gather_ids,
-                                          gather_context_logits)
-        with self._maybe_pad_batch(scheduled_requests, kv_cache_manager,
-                                   spec_resource_manager) as scheduled_requests:
-            maybe_graph = self._maybe_get_cuda_graph(scheduled_requests)
-            if maybe_graph is not None:
-                attn_metadata = maybe_graph.attn_metadata
-                spec_metadata = maybe_graph.spec_metadata
+                # Special handling for multimodal encoder only mode
+                if self.pytorch_backend_config.mm_encoder_only:
+                    return self._forward_step_mm_encoder_only(
+                        inputs, scheduled_requests)
+                else:
+                    return self._forward_step(inputs, gather_ids,
+                                              gather_context_logits)
+        with self.cuda_graph_runner.pad_batch(
+                scheduled_requests, resource_manager) as padded_requests:
+
+            maybe_graph, maybe_attn_metadata, maybe_spec_metadata = self.cuda_graph_runner.maybe_get_cuda_graph(
+                padded_requests)
+            if maybe_graph:
+                attn_metadata = maybe_attn_metadata
+                spec_metadata = maybe_spec_metadata
             else:
                 attn_metadata = self.attn_metadata
                 if self.enable_spec_decode:
@@ -2199,17 +2099,19 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = None
 
             inputs, gather_ids = self._prepare_inputs(
-                scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, cache_indirection_buffer)
+                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
+                new_tensors_device, cache_indirection_buffer)
 
             self.iter_counter += 1
 
-            if maybe_graph is None:
+            if not maybe_graph:
+                # Fallback to eager execution if graph was not used
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     outputs = self._forward_step(inputs, gather_ids,
                                                  gather_context_logits)
             else:
-                if maybe_graph.needs_capture():
+                batch_size = len(padded_requests.generation_requests)
+                if self.cuda_graph_runner.needs_capture(batch_size):
 
                     def capture_forward_fn(inputs: Dict[str, Any]):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -2218,18 +2120,16 @@ class PyTorchModelEngine(ModelEngine):
                                 gather_ids=gather_ids,
                                 gather_context_logits=gather_context_logits)
 
-                    pool = maybe_graph.capture(
-                        capture_forward_fn,
-                        self._cuda_graph_mem_pool,
-                    )
-                    self._cuda_graph_mem_pool = pool
+                    self.cuda_graph_runner.capture(batch_size,
+                                                   capture_forward_fn, inputs)
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
-                    outputs = maybe_graph.run(inputs)
+                    outputs = self.cuda_graph_runner.replay(batch_size, inputs)
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = maybe_graph.run(inputs)
+                        outputs = self.cuda_graph_runner.replay(
+                            batch_size, inputs)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
@@ -2277,6 +2177,44 @@ class PyTorchModelEngine(ModelEngine):
             return {'logits': logits[gather_ids]}
         else:
             return {'logits': logits}
+
+    @nvtx_range("_forward_step_mm_encoder_only")
+    def _forward_step_mm_encoder_only(
+            self, inputs: Dict[str, Any],
+            scheduled_requests: ScheduledRequests) -> Dict[str, Any]:
+        """Forward step for multimodal encoder only mode - returns mm_embeddings instead of logits."""
+        # Get multimodal parameters from inputs
+        multimodal_params = inputs.get("multimodal_params", [])
+        if not multimodal_params or len(multimodal_params) == 0:
+            # Return empty embeddings if no multimodal data
+            return {'mm_embeddings': []}
+        if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
+                   None) is None:
+            multimodal_chunks = None
+        else:
+            multimodal_chunks = [
+                sum(request.multimodal_lengths)
+                for request in scheduled_requests.context_requests
+                if request.multimodal_lengths is not None
+            ]
+        # For mm_encoder_only mode, we only run the vision encoder part
+        # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
+        mm_embeddings = self.model.forward(multimodal_params)
+        assert len(
+            mm_embeddings
+        ) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
+
+        if multimodal_chunks is None or len(multimodal_chunks) != len(
+                multimodal_params):
+            mm_embeddings = list(
+                torch.chunk(mm_embeddings[0],
+                            len(scheduled_requests.context_requests),
+                            dim=0))
+        else:
+            mm_embeddings = list(
+                torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
+
+        return {'mm_embeddings': mm_embeddings, 'logits': None}
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1:

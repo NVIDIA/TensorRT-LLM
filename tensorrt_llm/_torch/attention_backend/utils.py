@@ -1,7 +1,7 @@
 from typing import Optional, Type
 
 from ...models.modeling_utils import QuantConfig
-from . import IS_FLASHINFER_AVAILABLE
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention

@@ -7,11 +7,12 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from _graph_test_helpers import count_buffers, run_test
+from _graph_test_helpers import count_buffers, run_test_transformed_gm
 from _torch_test_utils import all_close, fp8_compatible, reset_parameters
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import FP8Linear
-from tensorrt_llm._torch.auto_deploy.transformations.library import fuse_gemms
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op
 
 torch.manual_seed(0)
@@ -254,10 +255,20 @@ def test_fusion(get_model: Callable[[], TestModel], dtype: str):
 
     buffer_size_before = count_buffers(model)
 
-    gm_transformed = run_test(
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_gemms": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
+
+    run_test_transformed_gm(
         model,
         x,
-        fuse_gemms,
+        gm_transformed,
         lambda gm: sum(is_linear_op(n, include_quantization=True) for n in gm.graph.nodes)
         == model.num_gemms_after_fusion,
         lambda num_p_og: num_p_og,  # unchanged since fusing doesn't change param count

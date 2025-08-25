@@ -1,12 +1,11 @@
-from functools import partial
-
 import pytest
 import torch
-from _graph_test_helpers import run_test
+from _graph_test_helpers import run_test_transformed_gm
 from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.rms_norm import *  # noqa
-from tensorrt_llm._torch.auto_deploy.transformations.library.rms_norm import fuse_rmsnorm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -52,15 +51,28 @@ def test_rmsnorm_fusion(eps, variant, op):
         return any(is_op(n, op) for n in gm.graph.nodes)
 
     model = TestModel(eps)
-    gm_transformed = run_test(
+    x = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
+    dynamic_shapes = {0: Dim("batch_size", max=8)}
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_rmsnorm": {
+                "stage": "post_load_fusion",
+                "backend": variant,
+            },
+        },
+    )(None, gm)
+
+    run_test_transformed_gm(
         model,
-        torch.randn(2, 1024, device="cuda", dtype=torch.float16),
-        partial(fuse_rmsnorm, backend=variant),
+        x,
+        gm_transformed,
         checker,
         lambda num_p_og: num_p_og,
-        dynamic_shapes={0: Dim("batch_size", max=8)},
+        dynamic_shapes=dynamic_shapes,
     )
-    print(gm_transformed.graph)
+
     new_input = torch.randn(4, 1024, device="cuda", dtype=torch.float16)
     y_transformed = gm_transformed(new_input)
     y_model = model(new_input)

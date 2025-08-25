@@ -212,6 +212,20 @@ These options provide finer control over performance and are set within a YAML f
 
 See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `extra_llm_api_options`.
 
+### Wide Expert Parallelism
+
+Add the following fields to the YAML configuration file `/tmp/config.yml` to enable wide EP:
+```yaml
+moe_config:
+    backend: WIDEEP
+    max_num_tokens: 9216
+    load_balancer:  # configure online EP balancer
+      num_slots: 288
+      layer_updates_per_iter: 1
+```
+
+Refer to the wide EP [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep) for more details.
+
 ## Testing API Endpoint
 
 ### Basic Test

@@ -890,18 +890,17 @@ int main(int argc, char** argv)
     {
         bool is_MLA = (d == 192 && dv == 128);
         if (((!is_MLA) && input_layout != Attention_input_layout::CONTIGUOUS_Q_KV)
-            || (is_MLA && input_layout != Attention_input_layout::Q_PAGED_KV
-                && input_layout != Attention_input_layout::SEPARATE_Q_K_V))
+            || (is_MLA && input_layout != Attention_input_layout::SEPARATE_Q_K_V))
         {
             fprintf(stderr,
                 "For normal attention, Only '--contiguous-q-kv' layout supports "
-                "'-save-softmax'. For MLA only '-paged-kv' and '-separate-q-k-v' layout supports "
+                "'-save-softmax'. For MLA only '-separate-q-k-v' layout supports "
                 "'-save-softmax'.\n");
             exit(1);
         }
         if (data_type == DATA_TYPE_E4M3)
         {
-            fprintf(stderr, "Currently fp8 kernel doesn't support fp8.\n");
+            fprintf(stderr, "Currently fp8 kernel doesn't support saving softmax.\n");
             exit(1);
         }
     }

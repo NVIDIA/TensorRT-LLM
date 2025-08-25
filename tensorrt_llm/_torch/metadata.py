@@ -28,7 +28,7 @@ class KVCacheParams:
     # The number of sink tokens for each layer.
     host_sink_token_length: Optional[torch.Tensor] = None
     # The number of extra kv for draft tokens
-    num_extra_kv_tokens: Optional[List[int]] = 0
+    num_extra_kv_tokens: Optional[int] = 0
 
 
 class CacheType(Enum):

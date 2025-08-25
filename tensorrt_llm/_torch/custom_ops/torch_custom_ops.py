@@ -4,6 +4,8 @@ from typing import List, Optional, Tuple
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -81,12 +83,9 @@ class MoERunner(TunableRunner):
                     use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
-        return range(self.fused_moe_runner.get_tactic_num())
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
 
     def forward(
         self,
@@ -318,11 +317,8 @@ class FP8RowwiseGemmRunner(TunableRunner):
         self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp8_rowwise_gemm_runner.get_num_configs()))
 
     def forward(
@@ -403,11 +399,8 @@ class FP4GemmRunner(TunableRunner):
                     output_dtype, int(fp4_gemm_type))
         self.fp4_gemm_runner = FP4GemmRunner.runner_dict[instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp4_gemm_runner.get_num_configs()))
 
     def forward(
@@ -518,11 +511,8 @@ class FP8BatchedGemmRunner(TunableRunner):
 
         return out_tensors
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         mat1, mat2, _, _, _ = inputs
 
@@ -735,11 +725,8 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.weight_only_quant_gemm_runner.get_num_configs()))
 
     def forward(
@@ -813,11 +800,8 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
         self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(
             range(self._finegrained_mixed_dtype_gemm_runner.get_num_configs()))
 
@@ -906,6 +890,94 @@ def _(
     # Assuming weight is packed and the output dimension can be inferred from weight.size(1)
     N = weight.size(1) if weight.dim() > 1 else weight.size(0)
     return input.new_empty((M, N), dtype=output_dtype)
+
+
+def fp8_swap_ab_gen_tuning_buckets(x: int):
+    buckets = tuple(range(8, 128, 8))
+    if x >= 128:
+        buckets += tuple(range(128, x, 128))
+    return buckets
+
+
+class fp8SwapABGemmRunner(TunableRunner):
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, fp8_swap_ab_gen_tuning_buckets), ),
+        tune_max_num_tokens=4096,
+    )
+
+    def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool):
+        self.output_dtype = output_dtype
+        self.disable_ue8m0_cast = disable_ue8m0_cast
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        # Encode swap_ab as False (0) and True (1). Currently only add one tactic here.
+        return [0]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        input, weight, weight_scale = inputs
+        a, a_sf = fp8_utils.per_token_quant_and_transform(input)
+        output = torch.empty(
+            (input.size(0), weight.size(0)),
+            device=input.device,
+            dtype=self.output_dtype,
+        )
+        # TODO: add swap_ab=tactic == 0 to detemrmine the swap_ab value
+        # Treat the default tactic=-1 as swap_ab=False
+        deep_gemm.fp8_gemm_nt(
+            (a, a_sf),
+            (weight, weight_scale),
+            output,
+            disable_ue8m0_cast=self.disable_ue8m0_cast,
+        )
+        return output
+
+
+@torch.library.custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
+def fp8_swap_ab_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    disable_ue8m0_cast: bool = False,
+    tune_max_num_tokens: int = 4096,
+) -> torch.Tensor:
+    tuner = AutoTuner.get()
+    fp8_swap_ab_gemm_runner = fp8SwapABGemmRunner(
+        output_dtype,
+        disable_ue8m0_cast,
+    )
+    fp8SwapABGemmRunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp8_swap_ab_gemm",
+        [fp8_swap_ab_gemm_runner],
+        fp8SwapABGemmRunner.tuning_config,
+        [input, weight, weight_scale],
+    )
+    return fp8_swap_ab_gemm_runner(
+        inputs=[input, weight, weight_scale],
+        tactic=best_tactic,
+    )
+
+
+@fp8_swap_ab_gemm.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+    disable_ue8m0_cast: bool = False,
+    tune_max_num_tokens: int = 4096,
+) -> torch.Tensor:
+    return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
 def get_event(event_idx: int):

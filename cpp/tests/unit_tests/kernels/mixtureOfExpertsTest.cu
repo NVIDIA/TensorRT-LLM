@@ -370,8 +370,8 @@ protected:
 
     float mSparseMixerEpsilon = 0.2f;
 
-    // Default this to true. This only matters for K>2, and so by doing this we will test the fused and unfused paths
-    bool mUseDeterministicHopperReduce = true;
+    // Default this to false. This only matters for K>2, and so by doing this we will test the fused and unfused paths
+    bool mUseFusedFinalize = false;
 
     // Disable this for long running tests to speed up runtime
     bool mIsLongTest = false;
@@ -456,7 +456,7 @@ protected:
     {
         managed_buffers.clear();
 
-        mMoERunner.use_fused_finalize_ = k < 3 || !mUseDeterministicHopperReduce;
+        mMoERunner.use_fused_finalize_ = k < 3 || mUseFusedFinalize;
 
         mHiddenSize = hidden_size;
         mInterSize = hidden_size * mInterSizeFraction;
@@ -1087,9 +1087,9 @@ protected:
         return std::tuple{(void*) weight_1, (void*) weight_2, bias_1, bias2_ptr, scale_1, scale_2, scale_3};
     }
 
-    auto getFilteredConfigs(int sm)
+    auto getFilteredConfigs(int sm, MoeGemmId gemm_id)
     {
-        auto tactics = mMoERunner.getTactics();
+        auto tactics = mMoERunner.getTactics(gemm_id);
         if (sm == 89 || sm >= 120)
         {
             // Filter some unsupported configs for L40S
@@ -1120,17 +1120,27 @@ protected:
     auto selectTacticsForArch(int sm)
     {
         bool is_tma_warp_specialized = sm >= 90 && !INT_QUANT;
-        auto tactics = getFilteredConfigs(sm);
-        auto it = std::find_if(tactics.begin(), tactics.end(),
+        auto epilogue_fusion_type = (is_tma_warp_specialized && mUseFusedFinalize)
+            ? tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
+            : tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
+        auto tactics1 = getFilteredConfigs(sm, MoeGemmId::GEMM_1);
+        auto tactics2 = getFilteredConfigs(sm, MoeGemmId::GEMM_2);
+        auto it1 = std::find_if(tactics1.begin(), tactics1.end(),
             [is_tma_warp_specialized](auto& c) { return c.is_tma_warp_specialized == is_tma_warp_specialized; });
-        if (it == tactics.end())
+        auto it2 = std::find_if(tactics2.begin(), tactics2.end(),
+            [is_tma_warp_specialized, epilogue_fusion_type](auto& c) {
+                return c.is_tma_warp_specialized == is_tma_warp_specialized
+                    && c.epilogue_fusion_type == epilogue_fusion_type;
+            });
+        if (it1 == tactics1.end() || it2 == tactics2.end())
         {
             // Fall back to any tactic
             std::cout << "WARNING: Could not find config for sm version " << sm << std::endl;
-            return std::pair{tactics[0], tactics[0]};
+            it1 = (it1 == tactics1.end()) ? tactics1.begin() : it1;
+            it2 = (it2 == tactics2.end()) ? tactics2.begin() : it2;
         }
 
-        return std::pair(*it, *it);
+        return std::pair(*it1, *it2);
     }
 
     using ConfigsToTestVec = std::vector<std::pair<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
@@ -1164,7 +1174,7 @@ protected:
         auto stream = mStream->get();
         auto tactic1 = mInternalSelectedConfig1;
         auto tactic2 = mInternalSelectedConfig2;
-        if (!tactic1)
+        if (!tactic1 || !tactic2)
         {
             int sm = getSMVersion();
             std::tie(tactic1, tactic2) = selectTacticsForArch(sm);
@@ -1629,8 +1639,9 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         auto [expected_experts, token_final_scales] = populateRouting(num_experts, num_tokens, k);
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
-        bool should_be_deterministic
-            = mUseDeterministicHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+        bool is_finalize_fusion = gemm2.epilogue_fusion_type
+            == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+        bool should_be_deterministic = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1749,7 +1760,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluBias)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteNonDeterministic)
 {
-    this->mUseDeterministicHopperReduce = false;
+    this->mUseFusedFinalize = true;
     // Just test case 3, cases 1&2 always use the fused paths
     this->BasicPermuteTest(3);
 }
@@ -1896,8 +1907,10 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
+                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
+                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                     bool should_be_deterministic
-                        = mUseDeterministicHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+                        = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1912,8 +1925,10 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 else
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
+                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
+                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                     bool should_be_deterministic
-                        = mUseDeterministicHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+                        = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -2077,6 +2092,7 @@ PARALLEL_TEST_SUITE(MixedParallel)
 TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
 {
     this->mIsLongTest = true;
+    this->mUseFusedFinalize = true; // True for all cases because we sweep both
     auto genConfigName = [](auto conf) -> std::string
     {
         using namespace tensorrt_llm::cutlass_extensions;
@@ -2103,12 +2119,13 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
     auto activation_pool = std::vector{ActivationType::Relu, ActivationType::Swiglu, ActivationType::SwigluBias};
     if (this->NVFP4)
         activation_pool = {ActivationType::Relu};
-    auto configs = this->getFilteredConfigs(getSMVersion());
+    auto configs1 = this->getFilteredConfigs(getSMVersion(), MoeGemmId::GEMM_1);
+    auto configs2 = this->getFilteredConfigs(getSMVersion(), MoeGemmId::GEMM_2);
     for (auto const activation_type : activation_pool)
     {
-        for (auto conf1 : configs)
+        for (auto conf1 : configs1)
         {
-            for (auto conf2 : configs)
+            for (auto conf2 : configs2)
             {
                 auto name1 = genConfigName(conf1);
                 auto name2 = genConfigName(conf2);
@@ -2120,7 +2137,6 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
                     this->mActType = activation_type;
                     for (auto k : {2, 3})
                     {
-
                         this->mOverrideSelectedConfig1 = conf1;
                         this->mOverrideSelectedConfig2 = conf2;
                         this->BasicPermuteTest(k, this->MINIMUM_ALIGNMENT);

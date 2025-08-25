@@ -558,16 +558,18 @@ void MLACacheFormatter::unformat(TransferSession& session)
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support MLA");
         return false;
     }
-
-    if (selfConfig.getAttentionConfig().mKvFactor != destConfig.getAttentionConfig().mKvFactor)
-    {
-        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support same kv factor");
-        return false;
-    }
     if (selfConfig.getParallelConfig().mEnableAttentionDP
         && (selfConfig.getParallelConfig().mTensorParallelism % selfConfig.getParallelConfig().mDPsize != 0))
     {
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be divisible by DP size");
+        return false;
+    }
+    if (selfConfig.getParallelConfig().mContextParallelism != 1
+        || destConfig.getParallelConfig().mContextParallelism != 1)
+    {
+        TLLM_LOG_WARNING(
+            "MLACacheFormatter::inquireSupport: context parallelism is not currently supported (selfCP=%d, destCP=%d).",
+            selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
         return false;
     }
     if (destConfig.getParallelConfig().mEnableAttentionDP

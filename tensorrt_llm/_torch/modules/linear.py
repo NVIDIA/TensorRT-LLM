@@ -12,7 +12,6 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -591,15 +590,12 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
             else:
-                from tensorrt_llm import deep_gemm
-                a, a_sf = fp8_utils.per_token_quant_and_transform(input)
-                output = torch.empty((input.shape[0], module.weight.shape[0]),
-                                     device=input.device,
-                                     dtype=torch.bfloat16)
-                deep_gemm.fp8_gemm_nt((a, a_sf),
-                                      (module.weight, module.weight_scale),
-                                      output,
-                                      disable_ue8m0_cast=True)
+                output = torch.ops.trtllm.fp8_swap_ab_gemm(
+                    input,
+                    module.weight,
+                    module.weight_scale,
+                    disable_ue8m0_cast=True,
+                )
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)

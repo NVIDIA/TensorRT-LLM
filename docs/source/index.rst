@@ -38,6 +38,7 @@ Welcome to TensorRT-LLM's Documentation!
    deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.md
    deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.md
    deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.md
+   deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.md
 
 
 .. toctree::

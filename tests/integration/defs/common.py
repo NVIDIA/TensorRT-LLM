@@ -956,3 +956,23 @@ def get_dummy_spec_decoding_heads(hf_model_dir,
     export_hf_checkpoint(model,
                          dtype=model.config.torch_dtype,
                          export_dir=os.path.join(save_dir, 'fp8'))
+
+
+def get_mmlu_accuracy(output):
+    mmlu_line = None
+    for line in output.split('\n'):
+        if "MMLU weighted average accuracy:" in line:
+            mmlu_line = line
+            break
+
+    if mmlu_line is None:
+        raise Exception(
+            f"Could not find 'MMLU weighted average accuracy:' in output. Full output:\n{output}"
+        )
+
+    mmlu_accuracy = float(
+        mmlu_line.split("MMLU weighted average accuracy: ")[1].split(" (")[0])
+
+    print(f"MMLU weighted average accuracy is: {mmlu_accuracy}")
+
+    return mmlu_accuracy

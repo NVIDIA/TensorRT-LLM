@@ -28,36 +28,11 @@ namespace tensorrt_llm::kernels
 namespace moe_prepare
 {
 
-#define STEP_DEPTH 2
-#define THREADS_PER_UNIT 1
 #define UNIT_PER_PIPELINE 128
 #define PIPELINE_PER_CTA 4
-#define EXPERT_BYTES_PER_UNIT 32
-#define SCALE_BYTES_PER_UNIT 32
-#define UNIT_COUNT_PER_PACKET 1024
-#define BYTES_COUNTER 8
 #define CUMSUM_THREADS_PER_BLOCK 128
 
-#define UNIT_PER_ITER 256
-#define STATIC_COPY_PER_ITER 128
-
-static constexpr int THREADS_PER_PIPELINE = THREADS_PER_UNIT * UNIT_PER_PIPELINE;
-static constexpr int THREADS_PER_CTA = THREADS_PER_PIPELINE * PIPELINE_PER_CTA;
-
-template <int UNIT_SIZE_INPUT, int PACKET_PER_STEP_INPUT>
-struct PipelineConfig
-{
-    static constexpr int UNIT_SIZE = UNIT_SIZE_INPUT;
-    static constexpr int PACKET_PER_STEP = PACKET_PER_STEP_INPUT;
-    static constexpr int UNIT_BYTES_SIZE = UNIT_SIZE * UNIT_PER_ITER * (sizeof(int) + sizeof(float));
-    static constexpr int SCALE_OFFSET = UNIT_SIZE * UNIT_PER_ITER * sizeof(int);
-    static constexpr int STATIC_COPY_OFFSET = UNIT_SIZE * UNIT_PER_ITER * (sizeof(int) + sizeof(float));
-    static constexpr int PACKET_SIZE = UNIT_BYTES_SIZE + STATIC_COPY_PER_ITER * 4 * sizeof(int);
-    static constexpr int PACKET_SIZE_IN_U64 = (PACKET_SIZE / 8);
-};
-
-// 1MB FIFO size
-static constexpr int FIFO_SIZE_IN_U64 = 1024 * 1024 / 8;
+static constexpr int THREADS_PER_PIPELINE = UNIT_PER_PIPELINE;
 
 #ifdef __CUDACC__
 #define ALIGN_256 __align__(256)
@@ -67,9 +42,9 @@ static constexpr int FIFO_SIZE_IN_U64 = 1024 * 1024 / 8;
 
 struct ALIGN_256 MoeCommFifoConnInfo
 {
-    volatile uint64_t head;  // write position
-    volatile uint64_t tail;  // read position
-    volatile uint64_t count; // for counter
+    volatile uint64_t head;   // write position
+    volatile uint64_t tail;   // read position
+    int volatile values[512]; // for values
 };
 
 struct MoeCommWorkspace
@@ -77,25 +52,11 @@ struct MoeCommWorkspace
     uint64_t* workspacePtr;
     size_t rankStrideInU64;
 #ifdef __CUDACC__
-    __inline__ __device__ uint64_t* getFifoBasePtr(
-        bool isSender, int epRank, int peerRank, int channel, int channelCount) const
-    {
-        // fifo itself is in receiver's side.
-        if (isSender)
-        {
-            return workspacePtr + peerRank * rankStrideInU64 + (epRank * channelCount + channel) * FIFO_SIZE_IN_U64;
-        }
-        else
-        {
-            return workspacePtr + epRank * rankStrideInU64 + (peerRank * channelCount + channel) * FIFO_SIZE_IN_U64;
-        }
-    }
-
     __inline__ __device__ MoeCommFifoConnInfo* getFifoConnInfo(
         bool isSender, int epRank, int peerRank, int channel, int epSize, int channelCount) const
     {
         // fifoInfo is in sender's side.
-        uint64_t* fifoInfoPtrU64 = workspacePtr + FIFO_SIZE_IN_U64 * channelCount * epSize;
+        uint64_t* fifoInfoPtrU64 = workspacePtr;
         int strideIndice = isSender ? epRank : peerRank;
         int fifoInfoIndice = isSender ? peerRank : epRank;
         fifoInfoPtrU64 += strideIndice * rankStrideInU64;
@@ -108,8 +69,9 @@ struct MoeCommWorkspace
 };
 
 void computeCountAndIndice(int* experts, int* sendCounts, int* recvCounts, int* sendIndiceWorkspace,
-    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, MoeCommWorkspace workspace, int tokenCount,
-    int maxTokenCountPerRank, int topK, int expert_count, int rankId, int rankCount, cudaStream_t stream);
+    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, int* expertStatics, int* gatheredExpertStatics,
+    MoeCommWorkspace workspace, int tokenCount, int maxTokenCountPerRank, int topK, int slotCount, int expertCount,
+    int rankId, int rankCount, cudaStream_t stream);
 
 void computeCumsum(int* sendCountsCumsum, int* recvCountsCumsum, int rankId, int rankCount, cudaStream_t stream);
 
@@ -117,10 +79,8 @@ void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, i
     int* backwardIndice, int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice, int rankId, int rankCount,
     int maxTokenCountPerRank, cudaStream_t stream);
 
-void allToAllMetadata(int* sendExperts, int* recvExperts, float* sendScales, float* recvScales, int* localExpertStatics,
-    int* gatheredExpertStatics, MoeCommWorkspace workspace, int* sendCountsCumsum, int* localSendIndice,
-    int* recvCountsCumsum, int* localRecvIndice, int tokenCount, int maxTokenCountPerRank, int topK, int expertCount,
-    int slotCount, int rankId, int rankCount, cudaStream_t stream);
+void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount,
+    int epSize, cudaStream_t stream);
 
 size_t getMoePrepareWorkspaceSize(int epSize);
 

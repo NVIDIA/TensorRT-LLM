@@ -1348,15 +1348,17 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
     int const batch_idx = blockIdx.z;
 
     // The decoder sequence length.
-    int const decoder_seq_len = params.seq_lens[batch_idx];
+    // Spec decoding not supported for cross-attention at the moment so we can set 1 and batch_idx here
+    int const decoder_seq_len = params.generation_phase ? 1 : params.seq_lens[batch_idx];
     // The decoder sequence offset.
-    int const decoder_seq_offset = params.cu_seq_lens[batch_idx];
+    int const decoder_seq_offset = params.generation_phase ? batch_idx : params.cu_seq_lens[batch_idx];
     // The decoder cache sequence length (includes the current input).
     int const decoder_cache_seq_len = params.cache_seq_lens[batch_idx];
     // The encoder sequence length.
     int const encoder_seq_len = params.encoder_seq_lens[batch_idx];
     // The encoder sequence offset.
-    int const encoder_seq_offset = params.cu_kv_seq_lens[batch_idx];
+    // Not needed in Gen phase
+    int const encoder_seq_offset = params.generation_phase ? -1 : params.cu_kv_seq_lens[batch_idx];
     // THe maximum sequence length of encoder and decoder.
     int const max_seq_len = max(decoder_seq_len, encoder_seq_len);
 
@@ -1411,45 +1413,49 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
             }
         }
 
-        // Encoder tokens (i.e. KV tokens).
-        if (head_idx == (kv_head_idx * params.qheads_per_kv_head) && token_idx < encoder_seq_len
-            && store_encoder_kv_cache && params.kv_cache_buffer.data != nullptr)
+        if (!params.generation_phase)
         {
-            // The global token idx in all sequences.
-            int global_token_idx = token_idx + encoder_seq_offset;
-
-            // The memory offset.
-            auto const src_k_idx = static_cast<size_t>(global_token_idx) * params.kv_hidden_size * 2 + hidden_idx_kv;
-            auto const src_v_idx
-                = static_cast<size_t>(global_token_idx) * params.kv_hidden_size * 2 + src_v_offset + hidden_idx_kv;
-
-            // Only load K,V tokens from encoder qkv input.
-            auto k = *reinterpret_cast<VecT const*>(&params.cross_kv_input[src_k_idx]);
-            auto v = *reinterpret_cast<VecT const*>(&params.cross_kv_input[src_v_idx]);
-
-            // The kv cache pointers.
-            auto k_cache_block_ptr
-                = reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx));
-            auto v_cache_block_ptr
-                = reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_idx));
-            // The vector idx in the cache block.
-            auto block_vec_idx
-                = params.kv_cache_buffer.getKVLocalIdx(token_idx, kv_head_idx, VECS_PER_HEAD, head_dim_vec_idx);
-
-            // Store K and V to the cache.
-            // INT8/FP8 kv cache.
-            if constexpr (sizeof(TCache) == 1)
+            // Encoder tokens (i.e. KV tokens).
+            if (head_idx == (kv_head_idx * params.qheads_per_kv_head) && token_idx < encoder_seq_len
+                && store_encoder_kv_cache && params.kv_cache_buffer.data != nullptr)
             {
-                // The element index inside the block.
-                auto block_elt_idx = block_vec_idx * ELTS_PER_VEC;
-                // Store 8bits kv cache.
-                mmha::store_8bits_vec(k_cache_block_ptr, k, block_elt_idx, scale_orig_quant);
-                mmha::store_8bits_vec(v_cache_block_ptr, v, block_elt_idx, scale_orig_quant);
-            }
-            else
-            {
-                reinterpret_cast<VecT*>(k_cache_block_ptr)[block_vec_idx] = k;
-                reinterpret_cast<VecT*>(v_cache_block_ptr)[block_vec_idx] = v;
+                // The global token idx in all sequences.
+                int global_token_idx = token_idx + encoder_seq_offset;
+
+                // The memory offset.
+                auto const src_k_idx
+                    = static_cast<size_t>(global_token_idx) * params.kv_hidden_size * 2 + hidden_idx_kv;
+                auto const src_v_idx
+                    = static_cast<size_t>(global_token_idx) * params.kv_hidden_size * 2 + src_v_offset + hidden_idx_kv;
+
+                // Only load K,V tokens from encoder qkv input.
+                auto k = *reinterpret_cast<VecT const*>(&params.cross_kv_input[src_k_idx]);
+                auto v = *reinterpret_cast<VecT const*>(&params.cross_kv_input[src_v_idx]);
+
+                // The kv cache pointers.
+                auto k_cache_block_ptr
+                    = reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx));
+                auto v_cache_block_ptr
+                    = reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_idx));
+                // The vector idx in the cache block.
+                auto block_vec_idx
+                    = params.kv_cache_buffer.getKVLocalIdx(token_idx, kv_head_idx, VECS_PER_HEAD, head_dim_vec_idx);
+
+                // Store K and V to the cache.
+                // INT8/FP8 kv cache.
+                if constexpr (sizeof(TCache) == 1)
+                {
+                    // The element index inside the block.
+                    auto block_elt_idx = block_vec_idx * ELTS_PER_VEC;
+                    // Store 8bits kv cache.
+                    mmha::store_8bits_vec(k_cache_block_ptr, k, block_elt_idx, scale_orig_quant);
+                    mmha::store_8bits_vec(v_cache_block_ptr, v, block_elt_idx, scale_orig_quant);
+                }
+                else
+                {
+                    reinterpret_cast<VecT*>(k_cache_block_ptr)[block_vec_idx] = k;
+                    reinterpret_cast<VecT*>(v_cache_block_ptr)[block_vec_idx] = v;
+                }
             }
         }
     }

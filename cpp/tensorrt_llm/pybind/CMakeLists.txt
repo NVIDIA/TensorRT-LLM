@@ -44,7 +44,7 @@ target_link_libraries(
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
          torch_python
-         CUDA::cuda_driver
+         ${CUDA_DRV_LIB}
          ${CUDA_NVML_LIB}
          th_common)
 target_compile_definitions(

@@ -185,6 +185,13 @@ class SpecMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
+    def is_layer_capture(self, layer_id: int):
+        """
+        Whether the layer should be captured (eg for Eagle3).
+        By default, does nothing.
+        """
+        return False
+
     def maybe_capture_hidden_states(self, layer_id: int,
                                     hidden_states: torch.Tensor,
                                     residual: torch.Tensor) -> None:

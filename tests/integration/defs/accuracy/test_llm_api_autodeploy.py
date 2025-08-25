@@ -30,6 +30,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         return {
             'skip_tokenizer_init': False,
             'trust_remote_code': True,
+            # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/7142):
+            # AutoDeploy does not support cache reuse yet.
             'kv_cache_config': {
                 'enable_block_reuse': False,
             },

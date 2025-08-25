@@ -600,6 +600,7 @@ def test_trtllm_bench(llm_root):  # noqa: F811
         run_benchmark(model_name, dataset_path, temp_dir)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5458798")
 @pytest.mark.no_xdist
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
     """Test that compares autodeploy backend performance against pytorch backend

@@ -243,6 +243,7 @@ class LoraModelConfig:
     trtllm_modules_to_hf_modules: dict[str, str]
     hidden_size: int
     dtype: str
+    swap_gate_up_proj_lora_b_weight: bool = True
 
 
 class HfLoraLoader:
@@ -422,7 +423,8 @@ def load_torch_hf_lora(lora_config: LoraConfig):
     pivot model config is the transformer's one.
     """
     # TODO smor- need to comibe with load_hf_lora
-    lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
+    if not lora_config.trtllm_modules_to_hf_modules:
+        lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
     lora_loader = HfLoraLoader(lora_config.lora_dir)
@@ -968,16 +970,17 @@ class LoraManager(object):
         )
         hf_modules = set(hf_modules_to_trtllm_modules.keys())
 
-        def preprocess_lora_weights(lora_model):
+        def preprocess_lora_weights(lora_model, model_config):
             # Swap weights of gate_up_proj
-            for key, value in lora_model.items():
-                if "gate_up_proj.lora_B.weight" in key:
-                    original_weights = value.contiguous().clone()
-                    half_split = original_weights.shape[0] // 2
-                    first_half = original_weights[:half_split, :]
-                    second_half = original_weights[half_split:, :]
-                    value = torch.cat((second_half, first_half), dim=0)
-                    lora_model[key] = value
+            if getattr(model_config, "swap_gate_up_proj_lora_b_weight", True):
+                for key, value in lora_model.items():
+                    if "gate_up_proj.lora_B.weight" in key:
+                        original_weights = value.contiguous().clone()
+                        half_split = original_weights.shape[0] // 2
+                        first_half = original_weights[:half_split, :]
+                        second_half = original_weights[half_split:, :]
+                        value = torch.cat((second_half, first_half), dim=0)
+                        lora_model[key] = value
             return lora_model
 
         def load_from_model_dir(uid, model_dir, hf_config):
@@ -989,7 +992,7 @@ class LoraManager(object):
             lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
-            lora_model = preprocess_lora_weights(lora_model)
+            lora_model = preprocess_lora_weights(lora_model, model_config)
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules, component)
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))

@@ -90,7 +90,7 @@ protected:
 
         size_t maxNumTokens = 1024;
         mTransBufferManager = std::make_unique<CacheTransBufferManager>(mCacheManager.get(), maxNumTokens);
-        mCacheState = std::make_unique<CacheState>(numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, dataType);
+        mCacheState = std::make_unique<CacheState>(numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, 1, dataType);
     }
 
     void TearDown() override

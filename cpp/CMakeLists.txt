@@ -69,7 +69,7 @@ add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
 set(BINDING_TYPE
-    "pybind"
+    "nanobind"
     CACHE STRING
           "Binding type of Python bindings for C++ runtime and batch manager")
 

@@ -19,7 +19,7 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ..custom_ops import IS_FLASHINFER_AVAILABLE
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 
 class RMSNorm(nn.Module):
