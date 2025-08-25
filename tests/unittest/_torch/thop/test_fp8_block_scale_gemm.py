@@ -19,9 +19,10 @@ import sys
 import pytest
 import torch
 from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
-                            per_block_cast_to_fp8_e8m0,
-                            per_token_cast_to_fp8_e8m0)
+                            per_block_cast_to_fp8_e8m0)
 from utils.util import getSMVersion
+
+from tensorrt_llm._torch.autotuner import autotune
 
 
 @pytest.mark.skipif(
@@ -46,16 +47,17 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
     a = torch.randn((m, k), device='cuda', dtype=dtype)
     b = torch.randn((n, k), device='cuda', dtype=dtype)
 
-    act_a_fp8, act_a_sf = per_token_cast_to_fp8_e8m0(a)
     act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
 
     output_expected = a @ b.t()
-    from tensorrt_llm import deep_gemm
-    output = torch.empty((act_a_fp8.shape[0], act_b_fp8.shape[0]),
-                         device=act_a_fp8.device,
-                         dtype=torch.bfloat16)
 
-    deep_gemm.fp8_gemm_nt((act_a_fp8, act_a_sf), (act_b_fp8, act_b_sf), output)
+    with autotune():
+        output = torch.ops.trtllm.fp8_swap_ab_gemm(
+            a,
+            act_b_fp8,
+            act_b_sf,
+        )
+
     diff = calc_diff(output, output_expected)
     assert diff < 1e-2
 
