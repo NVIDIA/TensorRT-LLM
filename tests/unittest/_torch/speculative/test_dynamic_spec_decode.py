@@ -130,7 +130,7 @@ def test_should_use_spec_decode():
                                           max_num_tokens=4096 * 8,
                                           max_draft_len=4) is False
 
-    # Edge case - None active requests OFF case: num_effective_requests = min(0, 8, very_large) = 0 <= 6 → False
+    # Edge case - None active requests OFF case
     active_requests = []
     assert drafter.should_use_spec_decode(active_requests,
                                           max_batch_size=8,
