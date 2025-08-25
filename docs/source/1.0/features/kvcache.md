@@ -4,7 +4,7 @@ The KV cache stores previously computed key-value pairs for reuse during generat
 
 ## The Basics
 
-The KV cache is a pool of blocks that can hold KV state for a fixed number of tokens. Multiple layers are packed within a single block, which requires all the layers to have the same number of heads and the same attention window size. A separate pool is created for each combination of attention window size and number of heads in order to support variable attention window size and optimization techniques like GQA. Number of tokens that can be stored in a single block can be set by user when the model engine is created. It must be a power of two greater than 1. Blocks are assigned to requests as needed.
+The KV cache is a pool of blocks that can hold KV state for a fixed number of tokens. Multiple layers are packed within a single block, which requires all the layers to have the same number of heads and the same attention window size. A separate pool is created for each combination of attention window size and number of heads in order to support variable attention window size and optimization techniques like GQA. Number of tokens that can be stored in a single block can be set by user when the model engine is created. It must be a power of two greater than 1. Blocks are assigned to requests as needed. Blocks are stored in a search structure as they are filled by requests, this allows later requests to reuse KV state if they have a matching prefix.
 
 If more than one pool is created, available memory is divided among the pools. The fraction to assign to each pool is determined during initialization and is static. This is not optimal and we are working on providing a better solution.
 
