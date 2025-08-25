@@ -20,7 +20,8 @@ import tempfile
 
 import pytest
 import yaml
-from defs.conftest import llm_models_root, skip_arm, skip_no_hopper
+from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
+                           skip_no_hopper)
 from defs.trt_test_alternative import check_call, check_output, popen
 
 from tensorrt_llm.logger import logger
@@ -1270,6 +1271,9 @@ def get_config_for_benchmark(model_root, backend):
 def test_disaggregated_benchmark_on_diff_backends(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         benchmark_model_root, benchmark_root, shared_gpt_path):
+    if "DeepSeek-V3-Lite" in benchmark_model_root and "fp8" in benchmark_model_root and get_sm_version(
+    ) != 90:
+        pytest.skip("The test should only run on Hopper")
     nixl_config = get_config_for_benchmark(benchmark_model_root, "NIXL")
     ucx_config = get_config_for_benchmark(benchmark_model_root, "UCX")
     temp_dir = tempfile.TemporaryDirectory()

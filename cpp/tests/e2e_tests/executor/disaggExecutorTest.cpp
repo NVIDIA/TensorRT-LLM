@@ -1405,7 +1405,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen1TP2PP2DisaaggOrchestrator, DisaggOrches
         ),
     generateTestNameDisaggParams);
 
-INSTANTIATE_TEST_SUITE_P(LlamaCon2TP2Gen2TP1DisaaggSpawnOrchestrator, DisaggOrchestratorParamsTest,
+INSTANTIATE_TEST_SUITE_P(LlamaCon2TP2Gen2TP1DisaggSpawnOrchestrator, DisaggOrchestratorParamsTest,
     testing::Combine(                                                                                      //
         testing::Values(1),                                                                                // processNum
         testing::Values(
@@ -1418,7 +1418,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP2Gen2TP1DisaaggSpawnOrchestrator, DisaggOrch
         ),
     generateTestNameDisaggParams);
 
-INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2PP2DisaaggSpawnOrchestrator, DisaggOrchestratorParamsTest,
+INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2PP2DisaggSpawnOrchestrator, DisaggOrchestratorParamsTest,
     testing::Combine(                                                                                      //
         testing::Values(1),                                                                                // processNum
         testing::Values(
