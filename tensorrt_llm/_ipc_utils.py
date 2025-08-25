@@ -17,17 +17,20 @@ import struct
 import sys
 from typing import List, Tuple
 
-from cuda import cuda, cudart
-from cuda.cudart import cudaError_t
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cuda, cudart
 
 from ._utils import mpi_comm
 from .logger import logger
 from .mapping import Mapping
 
 
-def _raise_if_error(error: cudaError_t | cuda.CUresult):
-    if isinstance(error, cudaError_t):
-        if error != cudaError_t.cudaSuccess:
+def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):
+    if isinstance(error, cudart.cudaError_t):
+        if error != cudart.cudaError_t.cudaSuccess:
             raise RuntimeError(f"CUDA Runtime API error: {repr(error)}")
     if isinstance(error, cuda.CUresult):
         if error != cuda.CUresult.CUDA_SUCCESS:

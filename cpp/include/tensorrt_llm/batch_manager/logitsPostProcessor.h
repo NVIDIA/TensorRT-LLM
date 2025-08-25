@@ -46,7 +46,7 @@ public:
     bool operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
         bool replicateLogitsPostProcessor, std::vector<batch_manager::LlmRequest::TensorPtr>& seqSlotLogits,
         runtime::WorldConfig const& worldConfig, runtime::TllmRuntime& runtime,
-        std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt) const;
+        std::optional<LogitsPostProcessorBatched> const& logitsPostProcessorBatched = std::nullopt) const;
 };
 
 } // namespace tensorrt_llm::batch_manager
