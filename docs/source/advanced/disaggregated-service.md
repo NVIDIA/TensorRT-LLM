@@ -36,6 +36,9 @@ There are some other useful environment variables that may help when encounterin
 
 * `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
 
+* `UCX_MAX_RNDV_RAILS`: The default value is `2`, means that UCX will try to use 2 ib NIC device for each GPU.
+If context and geneneration instances are both TEP, the KV cache transfer of a request for different TP happens at almost the same time, since each TP rank may use two NIC device, some NIC device may be occupied by multiple GPUs, resulting in lower efficiency. Setting it to `1` helps to improve efficiency in such case.
+
 ## Troubleshooting and FAQ
 
 ### General FAQs
@@ -74,7 +77,7 @@ A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
 
 A. The communication for kvCache transfer between executors are established dynamically. The connection establishment process incurs significant overhead, which explains the apparently lower kvCache transfer bandwidth observed during the initial requests after service startup. This lower bandwidth reflects the inclusion of connection establishment overhead. When conducting benchmarks, it is recommended to perform a warm-up phase to ensure accurate performance measurements.
 
-*Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?
+*Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?*
 
 A. NVLink domain can be found with `nvidia-smi -q` in the `Fabric.ClusterUUID` field. A few UCX environment variables can be adjusted when your servers have different NVLink domains:
 
