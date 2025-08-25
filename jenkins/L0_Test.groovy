@@ -1219,7 +1219,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         try {
             sh """
                 cd ${llmSrc}/tests/integration/defs && \
-                ${testCmdLine.join(" ")}
+                ${newTestCmdLine.join(" ")}
             """
         } catch(InterruptedException e) {
             throw e
