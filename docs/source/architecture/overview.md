@@ -1,18 +1,43 @@
-(architecture-overview)=
+# Architecture Overview
 
-# TensorRT-LLM Architecture
+The `LLM` class is a core entry point for the TensorRT-LLM, providing a simplified `generate()` API for efficient large language model inference. This abstraction aims to streamline the user experience, as demonstrated with TinyLlama:
 
-TensorRT-LLM is a toolkit to assemble optimized solutions to perform Large Language Model (LLM) inference. It offers a Model Definition API to define models and compile efficient [TensorRT](https://developer.nvidia.com/tensorrt) engines for NVIDIA GPUs. It also contains Python and C++ components to build runtimes to execute those engines as well as backends for the [Triton Inference
-Server](https://developer.nvidia.com/nvidia-triton-inference-server) to easily create web-based services for LLMs. TensorRT-LLM supports multi-GPU and multi-node configurations (through MPI).
+```python
+from tensorrt_llm import LLM
 
-As a user, the very first step to create an inference solution is to either define your own model or select a pre-defined network architecture (refer to {ref}`models` for the list of models supported by TensorRT-LLM). Once defined, that model must be trained using a training framework (training is outside of the scope of TensorRT-LLM). For pre-defined models, checkpoints can be downloaded from various providers. To illustrate that point, a lot of examples in TensorRT-LLM use model weights obtained from the [Hugging Face](https://huggingface.co) hub and trained using [NVIDIA Nemo](https://developer.nvidia.com/nemo) or [PyTorch](https://pytorch.org).
+# Initialize the LLM with a specified model
+llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-Equipped with the model definition and the weights, a user must use TensorRT-LLM's Model Definition API to recreate the model in a way that can be compiled by TensorRT into an efficient engine. For ease of use, TensorRT-LLM already supports a handful of standard models.
+# Generate text using the model
+output = llm.generate("Hello, my name is")
+```
 
-Together with the Model Definition API to describe models, TensorRT-LLM provides users with components to create a runtime that executes the efficient TensorRT engine. Runtime components offer beam-search, along with extensive sampling functionalities such as top-K and top-P sampling. The exhaustive list can be found in the documentation of the {ref}`gpt-runtime`. The C++ runtime is the recommended runtime.
+The `LLM` class automatically manages essential pre and post-processing steps, including tokenization (encoding input prompts into numerical representations) and detokenization (decoding model outputs back into human-readable text).
 
-TensorRT-LLM also includes Python and C++ backends for NVIDIA Triton Inference Server to assemble solutions for LLM online serving. The C++ backend implements in-flight batching as explained in the {ref}`executor` documentation and is the recommended backend.
+Internally, the `LLM` class orchestrates the creation of a dedicated `PyExecutor(Worker)` process on each rank.
 
-## Model Weights
+![TRT-LLM Architecture Overview](../media/TRTLLM_Architecture_Overview.png)
 
-TensorRT-LLM is a library for LLM inference, and so to use it, you need to supply a set of trained weights. You can either use your own model weights trained in a framework like [NVIDIA NeMo](https://www.nvidia.com/en-us/ai-data-science/generative-ai/nemo-framework/) or pull a set of pretrained weights from repositories like the Hugging Face Hub.
+This `PyExecutor` operates in a continuous background loop, designed for the efficient, asynchronous processing of inference requests.
+
+The `PyExecutor`'s functionality is built upon several key components:
+
+- `Scheduler`: Responsible for determining which active requests are ready for execution at each processing step.
+
+- `KVCacheManager`: Manages the allocation, deallocation, and maintenance of the Key-Value (KV) Cache. This is a critical optimization for Transformer models, significantly enhancing performance during autoregressive text generation by storing previously computed attention keys and values.
+
+- `ModelEngine`: Handles the loading and highly efficient execution of the language model on the GPU hardware.
+
+- `Sampler`: Takes the raw outputs (logits) from the ModelEngine and applies appropriate sampling strategies (e.g., greedy, top-k, top-p, beam search) to generate the final output tokens.
+
+During each iteration of its background loop, the `PyExecutor` performs the following sequence of operations:
+
+- Request Fetching: Retrieves new inference requests from an internal request queue, if available.
+
+- Scheduling: Interacts with the `Scheduler` to identify and prioritize requests that are ready to be processed in the current step.
+
+- Resource Preparation: Coordinates with the `KVCacheManager` to ensure that the necessary Key-Value (KV) Cache resources are allocated for the selected requests.
+
+- Model Execution: Invokes the `ModelEngine` to perform a forward pass on the scheduled requests, predicting the next output tokens.
+
+- Output Handling: Updates the partial outputs for ongoing requests and finalizes the results for any requests that have reached completion, returning them to the user.

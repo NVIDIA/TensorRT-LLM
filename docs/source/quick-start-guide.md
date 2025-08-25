@@ -22,20 +22,9 @@ The following examples can most easily be executed using the prebuilt [Docker re
 ## Launch Docker on a node with NVIDIA GPUs deployed.
 
 ```bash
-docker run --ipc host --gpus all -it nvcr.io/nvidia/tensorrt-llm/release
-```
-## Run Offline inference with LLM API
-The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.
-
-Here is a simple example to show how to use the LLM API with TinyLlama.
-
-```{literalinclude} ../../examples/llm-api/quickstart_example.py
-    :language: python
-    :linenos:
+docker run --ipc host --gpus all -p 8888:8888 -it nvcr.io/nvidia/tensorrt-llm/release
 ```
 
-You can also directly load TensorRT Model Optimizer's [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
-To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
 
 (deploy-with-trtllm-serve)=
 ## Deploy online serving with trtllm-serve
@@ -47,17 +36,13 @@ To start the server, you can run a command like the following example inside a D
 trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
-
-> [!NOTE]
-> If you are running `trtllm-server` inside a Docker container, you have two options for sending API requests:
-
-> 1. Expose port `8000` to access the server from outside the container.
-
-> 2. Open a new terminal and use the following command to directly attach to the running container:
-
-> ```bash
-> docker exec -it <container_id> bash
-> ```
+```{note}
+If you are running trtllm-server inside a Docker container, you have two options for sending API requests:
+1. Expose a port (e.g., 8000) to allow external access to the server from outside the container.
+2. Open a new terminal and use the following command to directly attach to the running container:
+```bash
+docker exec -it <container_id> bash
+```
 
 After the server has started, you can access well-known OpenAI endpoints such as `v1/chat/completions`.
 Inference can then be performed using examples similar to the one provided below, from a separate terminal.
@@ -104,15 +89,20 @@ _Example Output_
 }
 ```
 
-For detailed examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve.rst) section.
+For detailed examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve/trtllm-serve.rst) section.
 
-1. Expose port `8000` to access the server from outside the container.
+## Run Offline inference with LLM API
+The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.
 
-2. Open a new terminal and use the following command to directly attach to the running container:
+Here is a simple example to show how to use the LLM API with TinyLlama.
 
-```bash:docs/source/quick-start-guide.md
-docker exec -it <container_id> bash
+```{literalinclude} ../../examples/llm-api/quickstart_example.py
+    :language: python
+    :linenos:
 ```
+
+You can also directly load TensorRT Model Optimizer's [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
+To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
 
 ## Next Steps
 
@@ -128,4 +118,4 @@ For more examples, refer to:
 ## Related Information
 
 - [Best Practices Guide](https://nvidia.github.io/TensorRT-LLM/performance/performance-tuning-guide/index.html)
-- [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)
+- [Support Matrix](reference/support-matrix.md)
