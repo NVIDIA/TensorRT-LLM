@@ -930,6 +930,21 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
+
+    if (type.contains("dgx-h100")) {
+        expression = """
+                              - key: "kubernetes.io/hostname"
+                                operator: In
+                                values:
+                                - "viking-prod-519.ipp2u1.colossus"
+        """
+    } else {
+        expression = """
+                              - key: "tensorrt/taints"
+                                operator: DoesNotExist
+        """
+    }
+
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -944,8 +959,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         requiredDuringSchedulingIgnoredDuringExecution:
                             nodeSelectorTerms:
                             - matchExpressions:
-                              - key: "tensorrt/taints"
-                                operator: DoesNotExist
+                              ${expression}
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
