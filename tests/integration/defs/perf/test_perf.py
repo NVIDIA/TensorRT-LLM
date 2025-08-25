@@ -1267,7 +1267,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         ]
         if self._config.backend != "pytorch":
             benchmark_cmd += [
-                f"--backend=tensorrt", f"--engine_dir={engine_dir}"
+                f"--backend=tensorrt",
+                f"--engine_dir={engine_dir}",
+                "--disable_chunked_context"  # to preserve same behavior as previous release benchmark
             ]
         else:
             benchmark_cmd += ["--backend=pytorch"]
