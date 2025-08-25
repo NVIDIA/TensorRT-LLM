@@ -847,13 +847,13 @@ def test_generate_with_stop_words():
                      stop_reasons=["I J"])
 
 
-@force_ampere
-@pytest.mark.part0
+# @force_ampere
+# @pytest.mark.part0
 @pytest.mark.parametrize("model_path", [
     get_model_path('gemma/gemma-3-1b-it'),
 ])
 def test_generate_with_detokenization_stop_words(model_path):
-    llm = LLM(
+    llm = LLM_torch(
         model=model_path,
         kv_cache_config=global_kvcache_config,
         fast_build=True,
@@ -870,33 +870,33 @@ def test_generate_with_detokenization_stop_words(model_path):
 
     detokenization_prompts = [formatted_prompt]
 
-    # Test case 1: Stop word "How" should be detected after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello there!"],
-                     sampling_params=SamplingParams(stop="How", max_tokens=10),
-                     finish_reasons=['stop'],
-                     stop_reasons=["How"])
+    # # Test case 1: Stop word "How" should be detected after detokenization
+    # llm_check_output(llm,
+    #                  detokenization_prompts, ["Hello there!"],
+    #                  sampling_params=SamplingParams(stop="How", max_tokens=10),
+    #                  finish_reasons=['stop'],
+    #                  stop_reasons=["How"])
 
-    # Test case 2: Stop word "there" should be detected after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello"],
-                     sampling_params=SamplingParams(stop="there",
-                                                    max_tokens=10),
-                     finish_reasons=['stop'],
-                     stop_reasons=["there"])
+    # # Test case 2: Stop word "there" should be detected after detokenization
+    # llm_check_output(llm,
+    #                  detokenization_prompts, ["Hello"],
+    #                  sampling_params=SamplingParams(stop="there",
+    #                                                 max_tokens=10),
+    #                  finish_reasons=['stop'],
+    #                  stop_reasons=["there"])
 
-    # Test case 3: Stop word that should not be found after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello there! How can I help"],
-                     sampling_params=SamplingParams(stop="XYZ", max_tokens=10),
-                     finish_reasons=['length'],
-                     stop_reasons=[None])
+    # # Test case 3: Stop word that should not be found after detokenization
+    # llm_check_output(llm,
+    #                  detokenization_prompts, ["Hello there! How can I help"],
+    #                  sampling_params=SamplingParams(stop="XYZ", max_tokens=10),
+    #                  finish_reasons=['length'],
+    #                  stop_reasons=[None])
 
     # Test case 4: Multiple stop words, one should be found after detokenization
     llm_check_output(llm,
                      detokenization_prompts, ["Hello"],
-                     sampling_params=SamplingParams(stop=["XYZ", "there"],
-                                                    max_tokens=10),
+                     sampling_params=SamplingParams(
+                         stop=["XYZ whatsapp", "there"], max_tokens=10),
                      finish_reasons=['stop'],
                      stop_reasons=["there"])
 

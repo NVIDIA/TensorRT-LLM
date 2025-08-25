@@ -7,10 +7,11 @@ from torch import nn
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.llm_request import FinishReason, LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
-                                  add_token, int_tensor)
+from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
+                                  TorchSampler, TorchStore, add_token,
+                                  int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 
@@ -59,6 +60,22 @@ class MTPHiddenStatesManager(BaseResourceManager):
                 dtype=torch.float,
                 device='cuda',
             )
+        # hidden_states_ptrs is a pointer tensor
+        self.hidden_states_ptrs = torch.empty(
+            (self.max_num_requests),
+            dtype=torch.int64,
+            device='cuda',
+        )
+        self.past_tokens_ptrs = torch.empty(
+            (self.max_num_requests),
+            dtype=torch.int64,
+            device='cuda',
+        )
+        self.slot_ids = torch.empty(
+            [self.max_num_requests],
+            dtype=torch.long,
+            device='cuda',
+        )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
@@ -103,10 +120,6 @@ class MTPSpecMetadata(SpecMetadata):
     mtp_num_modules: int = 1,
     # The hidden states manager for MTP
     mtp_hidden_states_manager: Optional[MTPHiddenStatesManager] = None
-    # The slot ids for each request.
-    slot_ids: Optional[torch.Tensor] = None
-    # The index of the batche inputs
-    batch_indices_cuda: Optional[torch.Tensor] = None
     # The number of sequences for speculative model/layer of different rank
     _all_rank_num_seqs: Optional[List[int]] = None
     # This is used for attention dp in the MTP Eagle worker. The numbers of input
@@ -116,24 +129,6 @@ class MTPSpecMetadata(SpecMetadata):
     subseq_all_rank_num_tokens: Optional[List[int]] = None
 
     def __post_init__(self) -> None:
-        if self.mtp_hidden_states_manager is not None:
-            # mtp_hidden_states_ptrs is a pointer tensor
-            self.mtp_hidden_states_ptrs = torch.empty(
-                [self.max_num_requests],
-                dtype=torch.int64,
-                device='cuda',
-            )
-
-            self.mtp_past_tokens_ptrs = torch.empty(
-                [self.max_num_requests],
-                dtype=torch.int64,
-                device='cuda',
-            )
-            self.slot_ids = torch.empty(
-                [self.max_num_requests],
-                dtype=torch.long,
-                device='cuda',
-            )
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -171,11 +166,10 @@ class MTPSpecMetadata(SpecMetadata):
         if not self.spec_dec_mode.is_mtp_eagle():
             self.num_tokens -= self.num_generations
 
-        if self.mtp_hidden_states_manager is not None:  # MTP vanilla or use relaxed acceptance
+        if manager := self.mtp_hidden_states_manager:  # MTP vanilla or use relaxed acceptance
             mtp_slot_ids = []
             for rid in self.request_ids:
-                slot_id = self.mtp_hidden_states_manager.slot_manager.get_slot(
-                    rid)
+                slot_id = manager.slot_manager.get_slot(rid)
                 mtp_slot_ids.append(slot_id)
 
             # MTP Vanilla: Update mtp hidden states and past tokens
@@ -184,28 +178,40 @@ class MTPSpecMetadata(SpecMetadata):
                 mtp_past_tokens_ptrs = []
                 for slot_id in mtp_slot_ids:
                     mtp_hidden_states_ptrs.append(
-                        self.mtp_hidden_states_manager.
-                        mtp_past_hidden_states_pool[slot_id].data_ptr())
+                        manager.mtp_past_hidden_states_pool[slot_id].data_ptr())
                     mtp_past_tokens_ptrs.append(
-                        self.mtp_hidden_states_manager.
-                        mtp_past_tokens_pool[slot_id].data_ptr())
+                        manager.mtp_past_tokens_pool[slot_id].data_ptr())
                 mtp_hidden_states_ptrs = torch.tensor(mtp_hidden_states_ptrs,
                                                       dtype=torch.int64,
                                                       pin_memory=True)
                 mtp_past_tokens_ptrs = torch.tensor(mtp_past_tokens_ptrs,
                                                     dtype=torch.int64,
                                                     pin_memory=True)
-                self.mtp_hidden_states_ptrs[:num_seqs].copy_(
+                manager.hidden_states_ptrs[:num_seqs].copy_(
                     mtp_hidden_states_ptrs, non_blocking=True)
-                self.mtp_past_tokens_ptrs[:num_seqs].copy_(mtp_past_tokens_ptrs,
-                                                           non_blocking=True)
+                manager.past_tokens_ptrs[:num_seqs].copy_(mtp_past_tokens_ptrs,
+                                                          non_blocking=True)
             mtp_slot_ids = torch.tensor(mtp_slot_ids,
                                         dtype=torch.int,
                                         pin_memory=True)
-            self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
+            manager.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPSampler(TorchSampler):
+class MTPStore(TorchStore):
+
+    def __init__(self, *, max_draft_len: int, max_num_sequences: int,
+                 max_beam_width: int):
+        super().__init__(max_draft_len=max_draft_len,
+                         max_num_sequences=max_num_sequences,
+                         max_beam_width=max_beam_width)
+        self.next_new_tokens = int_tensor(
+            (self.max_tokens, self.max_num_sequences, self.MAX_BEAM_WIDTH))
+        self.next_draft_tokens = int_tensor(
+            (self.max_num_sequences, self.max_draft_len))
+        self.new_tokens_lens = int_tensor((self.max_num_sequences, ))
+
+
+class MTPSampler(Sampler):
     """
     MTP sampler.
     """
@@ -215,30 +221,36 @@ class MTPSampler(TorchSampler):
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
         self.draft_len = nextn
-        super().__init__(args)
+        self.store = MTPStore(max_draft_len=nextn,
+                              max_num_sequences=args.max_num_sequences,
+                              max_beam_width=args.max_beam_width)
+        self.BEAM = self.store.BEAM
 
-    @dataclass(frozen=True, kw_only=True)
-    class Store(TorchSampler.Store):
-        next_new_tokens: torch.Tensor
-        next_draft_tokens: torch.Tensor
-        new_tokens_lens: torch.Tensor
+    def _handle_stop_criteria(self, request: LlmRequest,
+                              new_token: int) -> bool:
+        """Handle stop criteria and set appropriate finish reasons and state.
+        Returns True if generation should stop."""
+        if new_token == request.py_end_id:
+            request.finish_by(FinishReason.END_ID, self.BEAM)
+            return True
 
-    def create_store(self) -> Store:
-        num_tokens, seq_slots, _ = self.NEW_TOKENS_SHAPE
-        draft_len = num_tokens - 1
-        assert draft_len == self.draft_len
-        return self.Store(
-            new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
-            next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
-            next_draft_tokens=int_tensor((seq_slots, draft_len)),
-            new_tokens_lens=int_tensor((seq_slots, )),
-        )
+        if self._meet_max_token_stop_criteria(request):
+            request.finish_by(FinishReason.LENGTH, self.BEAM)
+            return True
+
+        if self._meet_stop_token_criteria(request.py_stop_words_list,
+                                          request.get_tokens(self.BEAM)):
+            request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
+            return True
+
+        return False
 
     def _request_common_handling(self, request: LlmRequest,
                                  next_draft_tokens: list[list[int]]):
         assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
         assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
         assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
+        assert request.py_seq_slot is not None
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
         request.py_decoding_iter += 1
 
@@ -604,19 +616,19 @@ class MTPWorker(nn.Module):
         seq_lens = attn_metadata.seq_lens_cuda
         hidden_size = hidden_states.shape[-1]
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
-
+        assert spec_metadata.mtp_hidden_states_manager is not None
+        manager = spec_metadata.mtp_hidden_states_manager
         if self.is_thop:
             _, _ = torch.ops.trtllm.mtp_update_hidden_states_op(
-                input_ids, seq_lens, hidden_states,
-                spec_metadata.mtp_hidden_states_ptrs,
-                spec_metadata.mtp_past_tokens_ptrs, num_accepted_tokens,
-                mtp_num_modules, batch_size, num_contexts, hidden_size)
+                input_ids, seq_lens, hidden_states, manager.hidden_states_ptrs,
+                manager.past_tokens_ptrs, num_accepted_tokens, mtp_num_modules,
+                batch_size, num_contexts, hidden_size)
         else:
             assert len(spec_metadata.request_ids) == batch_size
-            mtp_past_hidden_states_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool
-            mtp_past_tokens_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_tokens_pool
+            mtp_past_hidden_states_pool = manager.mtp_past_hidden_states_pool
+            mtp_past_tokens_pool = manager.mtp_past_tokens_pool
 
-            slot_ids = spec_metadata.slot_ids[:batch_size]
+            slot_ids = manager.slot_ids[:batch_size]
             mtp_tokens = mtp_past_tokens_pool[slot_ids]
             mtp_hidden_states = mtp_past_hidden_states_pool[slot_ids]
 
@@ -787,7 +799,9 @@ class MTPWorker(nn.Module):
                                              dtype=torch.int,
                                              device=logits.device)
         if self.spec_config.use_relaxed_acceptance_for_thinking:
-            mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
+            assert spec_metadata.mtp_hidden_states_manager is not None
+            manager = spec_metadata.mtp_hidden_states_manager
+            mtp_relaxed_delta_pool = manager.mtp_relaxed_delta_pool
 
             # context
             con_logits = logits[:num_contexts]
@@ -810,7 +824,7 @@ class MTPWorker(nn.Module):
 
             ctx_delta = (ctx_think_tokens_num
                          >= 1).int() * self.spec_config.relaxed_delta
-            ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
+            ctx_slot_ids = manager.slot_ids[:num_contexts]
             mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
 
             # generation
@@ -819,7 +833,7 @@ class MTPWorker(nn.Module):
                 gen_logprobs, num_gens, mtp_num_modules, spec_metadata)
 
             accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
-                spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
+                manager.slot_ids, topk_value, topk_indices, draft_tokens,
                 mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
                 mtp_num_modules, batch_size, num_contexts,
                 self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
@@ -955,8 +969,10 @@ class MTPWorker(nn.Module):
         num_contexts = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_gens = batch_size - num_contexts
-        mtp_past_hidden_states_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool
-        mtp_past_tokens_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_tokens_pool
+        assert spec_metadata.mtp_hidden_states_manager is not None
+        manager = spec_metadata.mtp_hidden_states_manager
+        mtp_past_hidden_states_pool = manager.mtp_past_hidden_states_pool
+        mtp_past_tokens_pool = manager.mtp_past_tokens_pool
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
 
         if self.is_thop:
@@ -976,11 +992,10 @@ class MTPWorker(nn.Module):
             (return_input_ids, return_hidden_states
              ) = torch.ops.trtllm.mtp_prepare_drafter_inputs_op(
                  input_ids, attn_metadata.seq_lens_cuda,
-                 spec_metadata.mtp_hidden_states_ptrs,
-                 spec_metadata.mtp_past_tokens_ptrs, hidden_states,
-                 accepted_tokens, num_accepted_tokens, return_input_ids,
-                 return_hidden_states, mtp_num_modules, batch_size,
-                 num_contexts, hidden_size)
+                 manager.hidden_states_ptrs, manager.past_tokens_ptrs,
+                 hidden_states, accepted_tokens, num_accepted_tokens,
+                 return_input_ids, return_hidden_states, mtp_num_modules,
+                 batch_size, num_contexts, hidden_size)
 
         else:
             return_input_ids_list = []
@@ -1002,7 +1017,7 @@ class MTPWorker(nn.Module):
                 return_hidden_states_list.append(hidden_states_ctx)
             # generation
             if num_gens > 0:
-                slot_ids = spec_metadata.slot_ids[num_contexts:batch_size]
+                slot_ids = manager.slot_ids[num_contexts:batch_size]
                 gen_batch_idx = spec_metadata.batch_indices_cuda[:num_gens]
                 gen_token_idx = num_accepted_tokens[num_contexts:] - 1
                 accepted_tokens_gen = accepted_tokens[num_contexts:, :]
