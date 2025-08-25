@@ -492,12 +492,24 @@ class TorchSampler(Sampler):
         return num_accepted
 
     def _process_draft_tokens_rejection_sampling(
-            self, request: LlmRequest, new_tokens: torch.Tensor) -> int:
-        sampling_strategy = request_strategy(request)
-        generator = self.get_generator(request.py_draft_logits.device)
-        _, draft_probs = sample(sampling_strategy,
-                                request.py_draft_logits[0],
-                                generator=generator)
+            self,
+            request: LlmRequest,
+            new_tokens: torch.Tensor,
+            force_use_rejection_sampling: bool = False) -> int:
+        if force_use_rejection_sampling:
+            draft_probs = torch.zeros(len(request.py_draft_tokens),
+                                      request.py_target_probs.shape[-1],
+                                      device=request.py_target_probs.device)
+            draft_probs[torch.arange(len(request.py_draft_tokens)),
+                        request.py_draft_tokens] = 1
+            generator = self.get_generator(request.py_target_probs.device)
+        else:
+            sampling_strategy = request_strategy(request)
+            generator = self.get_generator(request.py_draft_logits.device)
+            _, draft_probs = sample(sampling_strategy,
+                                    request.py_draft_logits[0],
+                                    generator=generator)
+
         target_probs = request.py_target_probs
         rejected_indices = get_rejected_indices(draft_probs, target_probs,
                                                 generator,
@@ -533,15 +545,19 @@ class TorchSampler(Sampler):
 
         return num_accepted
 
-    def process_draft_tokens(self, request: LlmRequest,
-                             new_tokens: torch.Tensor) -> int:
-        if request.py_draft_logits is None:
+    def process_draft_tokens(self,
+                             request: LlmRequest,
+                             new_tokens: torch.Tensor,
+                             force_use_rejection_sampling: bool = False) -> int:
+        if request.py_draft_logits is None and not force_use_rejection_sampling:
             return self._process_draft_tokens_greedy(request, new_tokens)
         else:
             return self._process_draft_tokens_rejection_sampling(
-                request, new_tokens)
+                request, new_tokens, force_use_rejection_sampling)
 
-    def update_requests(self, state: SampleState) -> None:
+    def update_requests(self,
+                        state: SampleState,
+                        force_use_rejection_sampling: bool = False) -> None:
         assert isinstance(state, SampleState)
         if state.sampler_event:
             state.sampler_event.synchronize()
@@ -559,7 +575,8 @@ class TorchSampler(Sampler):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             processed = 1
-            num_accepted = self.process_draft_tokens(req, new_tokens)
+            num_accepted = self.process_draft_tokens(
+                req, new_tokens, force_use_rejection_sampling)
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
@@ -709,6 +726,11 @@ class TorchSampler(Sampler):
                 batched_strategy = strategies[0]
             else:
                 batched_strategy = None
+        else:
+            assert len(
+                set(strategies)
+            ) == 1, "mixed sampler is disabled, but multiple strategies are provided"
+            batched_strategy = strategies[0]
         generator = self.get_generator(raw_logits.device)
         if batched_strategy is not None:
             logits = raw_logits[:sum_steps]
@@ -739,8 +761,7 @@ class TorchSampler(Sampler):
                 softmax = batched_softmax[input_slice]
             current_slice = slice(0, steps), slot, beam
             new_tokens[current_slice] = next_tokens
-            if request.py_draft_logits is not None:
-                request.py_target_probs = softmax.clone()
+            request.py_target_probs = softmax.clone()
             if log_probs_host is not None:
                 assert beam == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
                 token_probs = torch.gather(
