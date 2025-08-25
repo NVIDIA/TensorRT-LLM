@@ -322,6 +322,7 @@ class BaseTransform(ABC):
 
         # check if run cleanup depending on the config and info
         if self.config.requires_shape_prop and not has_valid_shapes:
+            canonicalize_graph(gm)
             with lift_to_meta(gm):
                 canonicalize_graph(gm, shape_prop=True)
             is_clean = True
@@ -347,6 +348,7 @@ class BaseTransform(ABC):
 
         # check if run cleanup depending on the config and info
         if self.config.run_shape_prop and not (info.is_clean and info.has_valid_shapes):
+            canonicalize_graph(gm)
             with lift_to_meta(gm):
                 canonicalize_graph(gm, shape_prop=True)
         elif self.config.run_graph_cleanup and not info.is_clean:
