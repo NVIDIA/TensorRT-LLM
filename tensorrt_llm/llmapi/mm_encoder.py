@@ -56,7 +56,7 @@ class MultimodalEncoder(_TorchLLM):
         self._tokenizer = self.input_processor.tokenizer
 
         assert isinstance(self.args, TorchLlmArgs)
-        self.args.set_mm_encoder_only(True)
+        self.args.mm_encoder_only = True
 
         self._executor = self._executor_cls.create(
             self._engine_dir,

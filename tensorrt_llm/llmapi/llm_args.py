@@ -2458,9 +2458,6 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError("batch_wait_timeout_ms must be greater than 0")
         return self
 
-    def set_mm_encoder_only(self, mm_encoder_only):
-        self.mm_encoder_only = mm_encoder_only
-
     def get_executor_config(
         self,
         _hf_model_dir: Optional[Path] = None,
