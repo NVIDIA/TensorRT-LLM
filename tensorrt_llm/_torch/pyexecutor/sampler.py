@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from itertools import chain
 from typing import Literal, Optional
 
 import numpy as np
@@ -308,8 +307,6 @@ def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
 class TorchStore:
     BEAM = 0
     MAX_BEAM_WIDTH = BEAM + 1
-    new_tokens: torch.Tensor
-    """Shape: See cpp DecoderState.getAllNewTokens()"""
 
     def __init__(self, *, max_draft_len: int, max_num_sequences: int,
                  max_beam_width: int):
@@ -317,6 +314,21 @@ class TorchStore:
         assert max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.new_tokens = int_tensor(
             (self.max_tokens, max_num_sequences, max_beam_width))
+        """Shape: See cpp DecoderState.getAllNewTokens()"""
+        self.finish_reasons = int_tensor(self.new_tokens.shape)
+        dtype = self.finish_reasons.dtype
+        self.NOT_FINISHED = torch.tensor(FinishReason.NOT_FINISHED.value,
+                                         dtype=dtype,
+                                         device="cuda")
+        self.END_ID = torch.tensor(FinishReason.END_ID.value,
+                                   dtype=dtype,
+                                   device="cuda")
+        self.LENGTH = torch.tensor(FinishReason.LENGTH.value,
+                                   dtype=dtype,
+                                   device="cuda")
+        self.STOP_WORDS = torch.tensor(FinishReason.STOP_WORDS.value,
+                                       dtype=dtype,
+                                       device="cuda")
 
 
 class TorchSampler(Sampler):
@@ -371,13 +383,13 @@ class TorchSampler(Sampler):
                                                   >= self.max_seq_len)
 
     @staticmethod
-    def _meet_stop_token_criteria(request: LlmRequest):
-        if request.py_stop_words_list:
+    def _meet_stop_token_criteria(py_stop_words_list: list[list[int]] | None,
+                                  tokens: list[int]) -> bool:
+        if py_stop_words_list:
             assert isinstance(
-                request.py_stop_words_list,
+                py_stop_words_list,
                 list), "request.py_stop_words_list should be a list"
-            stop_words_list, prefix_sum = request.py_stop_words_list
-            tokens = request.get_tokens(0)
+            stop_words_list, prefix_sum = py_stop_words_list
             offset = 0
             for i, offset_end in enumerate(prefix_sum):
                 if i > 0:
@@ -401,7 +413,8 @@ class TorchSampler(Sampler):
             request.finish_by(FinishReason.LENGTH, self.BEAM)
             return True
 
-        if self._meet_stop_token_criteria(request):
+        if self._meet_stop_token_criteria(request,
+                                          request.get_tokens(self.BEAM)):
             request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
             return True
 
@@ -545,11 +558,20 @@ class TorchSampler(Sampler):
         vocab_size = model_outputs["logits"].shape[-1]
         log_probs_host = self.log_probs_host(requests)
         gen_logits_host = self.gen_logits_host(requests, vocab_size)
+        seq_slots_host = torch.tensor([r.py_seq_slot for r in requests],
+                                      pin_memory=True)
+        seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
         self._process_requests(requests,
                                model_outputs,
                                new_tokens,
+                               seq_slots=seq_slots,
+                               seq_slots_host=seq_slots_host,
                                gen_logits_host=gen_logits_host,
                                log_probs_host=log_probs_host)
+        self.write_finish_reasons(requests,
+                                  new_tokens=new_tokens,
+                                  seq_slots=seq_slots)
+
         new_tokens_host = new_tokens.to(device="cpu", non_blocking=True)
         sampler_event = torch.cuda.Event()
         sampler_event.record()
@@ -624,42 +646,43 @@ class TorchSampler(Sampler):
         return (request.py_stop_words_list or self.EMPTY_STOP_WORDS_LIST)[0]
 
     @staticmethod
-    def request_stopwords_cumsum(request: LlmRequest) -> list[int]:
-        if request.py_stop_words_list is None:
-            return []
-        lst = request.py_stop_words_list[1]
-        try:
-            cut = lst.index(-1)
-            return lst[:cut]
-        except ValueError:
-            return lst
+    def longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
+        max_stop_word_len = 0
+        for req in requests:
+            if req.py_stop_words_list is None:
+                continue
+            _, cumsum = req.py_stop_words_list
+            if -1 in cumsum:
+                cumsum = cumsum[:cumsum.index(-1)]
+            request_max_stop_word_len = np.max(np.diff(cumsum, prepend=0),
+                                               initial=0)
+            max_stop_word_len = max(max_stop_word_len,
+                                    request_max_stop_word_len)
+        return max_stop_word_len
 
-    def parse_trtllm_wordlist(
-            self, trtllm_wordlist: tuple[list[int], list[int]] | None
-    ) -> list[list[int]]:
-        if trtllm_wordlist is None:
-            return []
-        tokens, prefix = trtllm_wordlist
-        out = []
-        start = 0
-        for p in prefix:
-            if p == -1:
-                break
-            out.append(tokens[start:p])
-            start = p
-        return out
+    def write_reason(self, reason: torch.Tensor, *, where: torch.Tensor,
+                     seq_slots: torch.Tensor) -> None:
+        assert reason.numel() == 1
+        assert all([seq_slots.is_cuda, where.is_cuda, reason.is_cuda])
+        r, c = torch.nonzero(where, as_tuple=True)
+        self.store.finish_reasons[r, seq_slots[c], self.BEAM] = reason
 
-    def schmoob(self, requests: list[LlmRequest],
-                new_tokens_device: torch.Tensor,
-                seq_slots: torch.Tensor) -> None:
-        tt = new_tokens_device[:, seq_slots, self.BEAM]
+    def write_finish_reasons(self, requests: list[LlmRequest], *,
+                             new_tokens: torch.Tensor,
+                             seq_slots: torch.Tensor) -> None:
+        tokens = new_tokens[:, seq_slots, self.BEAM]
+        self.store.finish_reasons[:, seq_slots, self.BEAM].fill_(
+            self.store.NOT_FINISHED)  # TODO: Do we need this?
 
         end_ids_tensor = torch.tensor(
-            [([req.py_end_id] * self.max_tokens) for req in requests],
+            [([req.py_end_id if req.py_end_id is not None else -1] *
+              self.max_tokens) for req in requests],
             pin_memory=True,
-            dtype=new_tokens_device.dtype).to(device="cuda", non_blocking=True)
-        assert tt.shape == end_ids_tensor.shape
-        torch.eq(tt, end_ids_tensor)
+            dtype=new_tokens.dtype).T.to(device="cuda", non_blocking=True)
+        are_end_id = tokens == end_ids_tensor
+        self.write_reason(self.store.END_ID,
+                          where=are_end_id,
+                          seq_slots=seq_slots)
 
         lengths_tensor = torch.tensor([[
             ((req.get_num_tokens(self.BEAM) + num_tokens) -
@@ -670,48 +693,48 @@ class TorchSampler(Sampler):
             ([min(req.py_max_new_tokens, self.max_seq_len)] * self.max_tokens)
             for req in requests
         ])
-        assert lengths_tensor.shape == max_lengths_tensor.shape
-        are_length = lengths_tensor >= max_lengths_tensor
+        are_max_length = (lengths_tensor
+                          >= max_lengths_tensor).T.pin_memory().to(
+                              device="cuda", non_blocking=True)
 
-        stop_words_lengths = [
-            np.diff(self.request_stopwords_cumsum(req) or [0], prepend=0)
-            for req in requests
-        ]
-        longest_stop_word_len = max(chain.from_iterable(stop_words_lengths))
+        self.write_reason(self.store.LENGTH,
+                          where=are_max_length,
+                          seq_slots=seq_slots)
 
+        longest_stop_word_len = self.longest_stop_word_len(requests)
         if longest_stop_word_len == 0:
             return
 
-        stop_words_per_request = []
+        lookback = longest_stop_word_len - 1
 
-        for ri, request in enumerate(requests):
-            lookback = longest_stop_word_len - 1
+        def stop_words_per_request(request: LlmRequest,
+                                   new_tokens: torch.Tensor) -> list[bool]:
+            per_step = [False] * self.max_tokens
             old_tokens = request.get_tokens(self.BEAM)[-lookback:]
-            per_step = []
-            for i in range(1, self.max_tokens + 1):
-                stop_words_list = self.parse_trtllm_wordlist(
-                    request.py_stop_words_list)
-                for stop_seq in stop_words_list:
-                    if len(stop_seq) <= 0:
-                        break
-                    old = old_tokens + tt[:i, ri].tolist()
-                    if len(old) < len(stop_seq):
-                        continue
-                    older = old[-len(stop_seq):]
-                    if older == stop_seq:
-                        per_step.append(True)
-                        break
-                per_step.append(False)
-            stop_words_per_request.append(per_step)
+            new_tokens_list = new_tokens.tolist()
+            for step in range(self.max_tokens):
+                suspect_tokens = (old_tokens + new_tokens_list[:step + 1])
+                if self._meet_stop_token_criteria(request.py_stop_words_list,
+                                                  suspect_tokens):
+                    per_step[step] = True
+                    break  # We don't care about subsequent steps because we already found a stop word
+            return per_step
 
-        are_stop_words = torch.tensor(stop_words_per_request,
-                                      device=tt.device).T
+        are_stop_words = torch.tensor([
+            stop_words_per_request(request, tokens[:, i])
+            for i, request in enumerate(requests)
+        ]).T.pin_memory().to(device="cuda", non_blocking=True)
+        self.write_reason(self.store.STOP_WORDS,
+                          where=are_stop_words,
+                          seq_slots=seq_slots)
 
     def _process_requests(self,
                           requests: list[LlmRequest],
                           model_outputs: dict[str, torch.Tensor],
                           new_tokens: torch.Tensor,
                           *,
+                          seq_slots: torch.Tensor,
+                          seq_slots_host: torch.Tensor,
                           gen_logits_host: torch.Tensor | None = None,
                           log_probs_host: torch.Tensor | None = None):
         beam_width = self.MAX_BEAM_WIDTH
@@ -721,11 +744,6 @@ class TorchSampler(Sampler):
         sum_steps = sum(num_steps)
         no_draft_tokens = len(requests) == sum_steps
         fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
-
-        seq_slots_host = torch.as_tensor([r.py_seq_slot for r in requests])
-        seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
-
-        self.schmoob(requests, new_tokens, seq_slots)
 
         if fast_path:
             logits = raw_logits[:len(requests)]

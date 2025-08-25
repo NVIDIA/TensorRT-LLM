@@ -238,7 +238,8 @@ class MTPSampler(Sampler):
             request.finish_by(FinishReason.LENGTH, self.BEAM)
             return True
 
-        if self._meet_stop_token_criteria(request):
+        if self._meet_stop_token_criteria(request.py_stop_words_list,
+                                          request.get_tokens(self.BEAM)):
             request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
             return True
 
