@@ -274,6 +274,16 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         self._quant_config = value
 
     ### VALIDATION #################################################################################
+    @field_validator("max_seq_len", mode="before")
+    @classmethod
+    def ensure_max_seq_len(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None:
+            # Fallback to the AutoDeployConfig default when not provided
+            return AutoDeployConfig.model_fields["max_seq_len"].get_default(
+                call_default_factory=True
+            )
+        return value
+
     @field_validator("build_config", mode="before")
     @classmethod
     def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:
