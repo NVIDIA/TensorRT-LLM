@@ -653,10 +653,6 @@ class KVCacheManager(BaseResourceManager):
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
 
-    def reset_reuse_state(self):
-        """Reset the reuse state of the KV cache manager."""
-        self.impl.reset_reuse_state()
-
     def _get_window_size_to_layers(self) -> dict[int, list[int]]:
         """
         Get the window size to layers mapping.

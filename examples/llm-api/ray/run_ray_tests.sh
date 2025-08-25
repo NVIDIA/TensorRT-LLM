@@ -233,11 +233,6 @@ if [ -f "llm_inference_async_ray.py" ]; then
     run_python_file "llm_inference_async_ray.py"
 fi
 
-# 4. test_update_weight_from_ipc.py
-if [ -f "test_update_weight_from_ipc.py" ]; then
-    run_python_file "test_update_weight_from_ipc.py"
-fi
-
 # Run MPI guarding tests
 run_python_file "../llm_inference.py"
 

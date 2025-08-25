@@ -849,9 +849,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 for new_name in params_map[names[-1]]:
                     fw = filter_weights('.'.join(names[:-1] + [new_name]),
                                         weights)
-                    # tmp fixes to enable partial updates in old path
-                    if not fw:
-                        continue
                     if new_name in ['k_proj', 'v_proj']:
                         num_kv_heads_list = [num_kv_heads
                                              ] * len(fw) if isinstance(
@@ -868,27 +865,24 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                         }
 
                     module_weights.append(fw)
-                if module_weights:
-                    module.load_weights(weights=module_weights)
+                module.load_weights(weights=module_weights)
 
             else:
                 module_weights = filter_weights(name, weights)
-                if module_weights:
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                p.data.copy_(module_weights[n][:])
+                if hasattr(module, 'load_weights'):
+                    module.load_weights(weights=[module_weights])
+                else:
+                    for n, p in module._parameters.items():
+                        if p is not None:
+                            p.data.copy_(module_weights[n][:])
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       False) in ["True", "true", "1", "yes", "y"]:
-        for name, module in tqdm(list(
-                model.named_modules(remove_duplicate=False)),
+        for name, module in tqdm(list(model.named_modules()),
                                  desc="Loading weights"):
             load_single_module(name, module)
     else:
-        all_modules = dict(model.named_modules(remove_duplicate=False))
+        all_modules = dict(model.named_modules())
         serial_load_modules = []
         if preload_weight_modules is not None:
             for module in preload_weight_modules:
@@ -904,13 +898,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 del all_modules[module]
             pbar.close()
 
-        pbar = tqdm(list(model.named_modules(remove_duplicate=False)),
+        pbar = tqdm(list(model.named_modules()),
                     desc="Loading weights concurrently")
-        args_list = [
-            (name, module)
-            for name, module in model.named_modules(remove_duplicate=False)
-            if name not in serial_load_modules
-        ]
+        args_list = [(name, module) for name, module in model.named_modules()
+                     if name not in serial_load_modules]
         run_concurrently(load_single_module, args_list, pbar=pbar)
 
 

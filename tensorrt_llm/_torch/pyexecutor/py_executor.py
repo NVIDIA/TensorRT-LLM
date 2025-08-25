@@ -1086,48 +1086,6 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
-    def reset_prefix_cache(self):
-        self.kv_cache_manager.reset_reuse_state()
-
-    def update_weights(self, weights):
-        # Load weights into the model
-        self.model_engine.model.load_weights(weights)
-        torch.cuda.synchronize()
-
-        self.reset_prefix_cache()
-
-    def update_weight_from_ipc_handles(self, handles):
-        """
-        Update model weights from IPC handles.
-
-        Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
-                {device_uuid: all_handles}
-        """
-        from tensorrt_llm._torch.utils import get_device_uuid
-        device_uuid = get_device_uuid(self.device_id)
-
-        if device_uuid not in handles:
-            raise ValueError(
-                f"Device UUID {device_uuid} not found in ipc_handles")
-
-        try:
-            weights = {}
-            all_handles = handles[device_uuid]
-
-            for param_name, tensor_handle in all_handles:
-                func, args = tensor_handle
-                list_args = list(args)
-                list_args[6] = self.device_id  # Set target device
-                tensor = func(*list_args)
-                weights[param_name] = tensor
-
-            self.update_weights(weights)
-
-        except Exception as e:
-            logger.error(f"failed to update weights from ipc handles: {e}")
-            return False
-
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.

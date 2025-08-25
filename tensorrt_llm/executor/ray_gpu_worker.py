@@ -76,20 +76,6 @@ class RayWorkerWrapper:
     def abort_request(self, request_id: int) -> None:
         self.worker.abort_request(request_id)
 
-    def update_weights(self, weights: dict):
-        return self.worker.update_weights(weights)
-
-    def update_weights_from_ipc_handles(self, ipc_handles: dict):
-        return self.worker.update_weights_from_ipc_handles(ipc_handles)
-
-    def report_device_id(self) -> str:
-        from tensorrt_llm._torch.utils import get_device_uuid
-        local_id = self.physical_to_local_id(self.gpu)
-        return get_device_uuid(local_id)
-
-    def reset_prefix_cache(self):
-        self.worker.reset_prefix_cache()
-
     @staticmethod
     def physical_to_local_id(phys_id: int) -> int:
         visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -370,26 +356,6 @@ class RayGPUWorker(GenerationExecutor):
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e
-
-    def update_weights(self, weights: dict):
-        try:
-            self.engine.update_weights(weights)
-        except Exception as e:
-            raise RuntimeError(
-                f"Worker rank {self.rank} failed to update weights: {e}")
-
-    def update_weights_from_ipc_handles(self, ipc_handles: dict):
-        try:
-            self.engine.update_weight_from_ipc_handles(ipc_handles)
-        except Exception as e:
-            from tensorrt_llm.logger import logger
-            logger.error(
-                f"Worker rank {self.rank} failed to update weights from ipc handles: {e}"
-            )
-            return False
-
-    def reset_prefix_cache(self):
-        self.engine.reset_prefix_cache()
 
     @staticmethod
     def sleep(*tags: str):

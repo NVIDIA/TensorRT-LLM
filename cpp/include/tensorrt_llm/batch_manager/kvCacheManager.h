@@ -737,12 +737,6 @@ public:
         return 0;
     }
 
-    void resetReuseState()
-    {
-        mCachedBlocksRoot
-            = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
-    }
-
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -1126,14 +1120,6 @@ public:
     //! \brief Update cache offsets for block at index
     void updateCacheBlockOffsetsAtIdx(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
 
-    void resetReuseState()
-    {
-        for (auto& [windowSize, manager] : mWindowBlockManagers)
-        {
-            manager.resetReuseState();
-        }
-    }
-
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
@@ -1304,7 +1290,6 @@ public:
 
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
-    virtual void resetReuseState() = 0;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
@@ -1652,11 +1637,6 @@ public:
     void flushIterationEvents() override
     {
         mBlockManager.flushIterationEvents();
-    }
-
-    void resetReuseState() override
-    {
-        mBlockManager.resetReuseState();
     }
 
     /// @brief Finds the maximum attention window that can be used on a sequence, given some kv-cache block capacity.

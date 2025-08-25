@@ -1,6 +1,6 @@
 import os
 import socket
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import ray
 from ray.util.placement_group import (PlacementGroup,
@@ -136,66 +136,6 @@ class RayExecutor(GenerationExecutor):
                 for worker in workers
             ])
 
-    def update_weights(self, weights: dict):
-        try:
-            self.call_all_ray_workers("update_weights",
-                                      leader_only=False,
-                                      async_call=False,
-                                      weights=weights)
-        except Exception as e:
-            raise RuntimeError(f"Weight update failed: {e}")
-
-    def async_update_weights(self, weights: dict):
-        try:
-            self.call_all_ray_workers("update_weights",
-                                      leader_only=False,
-                                      async_call=True,
-                                      weights=weights)
-        except Exception as e:
-            raise RuntimeError(f"Async weight update failed: {e}")
-
-    def update_weights_from_ipc_handles(self, ipc_handles: dict):
-        try:
-            self.call_all_ray_workers("update_weights_from_ipc_handles",
-                                      leader_only=False,
-                                      async_call=False,
-                                      ipc_handles=ipc_handles)
-        except Exception as e:
-            raise RuntimeError(f"Weight update from IPC handles failed: {e}")
-
-    def async_update_weights_from_ipc_handles(self, ipc_handles: dict):
-        try:
-            self.call_all_ray_workers("update_weights_from_ipc_handles",
-                                      leader_only=False,
-                                      async_call=True,
-                                      ipc_handles=ipc_handles)
-        except Exception as e:
-            raise RuntimeError(
-                f"Async weight update from IPC handles failed: {e}")
-
-    def collective_rpc(self,
-                       method: str,
-                       args: tuple = (),
-                       kwargs: Optional[dict] = None,
-                       non_block: bool = False,
-                       unique_reply_rank: Optional[int] = None) -> list[Any]:
-        workers = (self.workers[unique_reply_rank],
-                   ) if unique_reply_rank is not None else self.workers
-        kwargs = kwargs or {}
-
-        refs = []
-        for w in workers:
-            try:
-                refs.append(getattr(w, method).remote(*args, **kwargs))
-            except AttributeError:
-                # Here worker is the RayWorkerWrapper.
-                # For extended worker methods, we need to use call_worker_method since
-                # Ray actor doesn't work with __getattr__ delegation.
-                refs.append(w.call_worker_method.remote(method, *args,
-                                                        **kwargs))
-
-        return refs if non_block else ray.get(refs)
-
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
             Low-level API to the executor. Return a "future" GenerationResult
@@ -221,12 +161,6 @@ class RayExecutor(GenerationExecutor):
                                       result_wait_queue=result.queue)
 
         return result
-
-    def report_device_ids(self) -> list[str]:
-        gpu_ids = self.call_all_ray_workers("report_device_id",
-                                            leader_only=False,
-                                            async_call=False)
-        return sorted(gpu_ids)
 
     def abort_request(self, request_id: int) -> None:
         self.call_all_ray_workers("abort_request",
