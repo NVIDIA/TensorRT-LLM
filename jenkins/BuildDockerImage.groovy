@@ -315,7 +315,7 @@ def buildImage(config, imageKeyToTag)
 
         args += prepareWheelFromBuildStage(dockerfileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
-        if (target == "trtllm") {
+        if (target == "trtllm" || target == "tritonrelease") {
             if (arch == "x86_64") {
                 build_jobs = BUILD_JOBS_RELEASE_X86_64
             } else {
@@ -399,6 +399,21 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             build_wheel: true,
             arch: "arm64",
             dockerfileStage: "release",
+        ],
+        "Build triton release (SBSA)": [
+            target: "tritonrelease",
+            action: release_action,
+            customTag: LLM_BRANCH_TAG + "-sbsa",
+            build_wheel: true,
+            arch: "arm64",
+            dockerfileStage: "tritonrelease",
+        ],
+        "Build triton release (x86_64)": [
+            target: "tritonrelease",
+            action: release_action,
+            customTag: LLM_BRANCH_TAG + "-x86_64",
+            build_wheel: true,
+            dockerfileStage: "tritonrelease",
         ],
         "Build CI image (x86_64 tritondevel)": [:],
         "Build CI image (SBSA tritondevel)": [
