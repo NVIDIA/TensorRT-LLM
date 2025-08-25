@@ -814,7 +814,18 @@ class KVCacheManager(BaseResourceManager):
         logger.debug(f"window_size_to_layers: {window_size_to_layers}")
 
         free_mem, total_mem = torch.cuda.mem_get_info()
-        primary_pool_memory_bytes = free_mem
+        free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
+                             if kv_cache_config.free_gpu_memory_fraction
+                             is not None else 0.9)
+        assert free_mem_fraction < 1.0, (
+            f"Invalid freeMemFraction: {free_mem_fraction} must be < 1.0")
+        logger.debug(f"free_mem_fraction: {free_mem_fraction}")
+
+        primary_pool_memory_bytes = int(free_mem * free_mem_fraction)
+        if self.mapping.world_size > 1:
+            # Make sure all ranks use the same (safe) budget
+            primary_pool_memory_bytes = mpi_comm().allreduce(
+                primary_pool_memory_bytes, op=MPI.MIN)
         secondary_pool_memory_bytes = 0
         logger.debug(
             f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \n"
