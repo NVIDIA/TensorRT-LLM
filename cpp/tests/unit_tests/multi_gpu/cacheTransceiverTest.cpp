@@ -99,7 +99,7 @@ TEST_F(RequestInfoTest, Basic)
     }
     auto state = std::make_unique<texec::DataTransceiverState>();
     state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
-    state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {4}, nvinfer1::DataType::kFLOAT});
+    state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {10}, nvinfer1::DataType::kFLOAT});
     RequestInfo info{1, *state};
     auto info2 = serializeDeserialize(info);
     EXPECT_EQ(info, info2);
@@ -167,7 +167,7 @@ public:
         ON_CALL(*this, recvRequestInfo)
             .WillByDefault(Return(RequestInfo{0,
                 texec::DataTransceiverState{
-                    texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 1, {4}, nvinfer1::DataType::kFLOAT},
+                    texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 1, {10}, nvinfer1::DataType::kFLOAT},
                     texec::kv_cache::CommState{std::vector<SizeType32>{0}, 0}}}));
         ON_CALL(*this, getCounterpartsCount).WillByDefault(Return(1));
     }
@@ -983,8 +983,6 @@ protected:
                 startLayerId += mAttentionLayerNumPerPP[ppRank];
             }
         }
-        // TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), " fillBlockData startLayerId:%d
-        // layerSizethisRank:%d", startLayerId, layerSizeThisRank);
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * (mTpRank / mDupHeadFactor);
         bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
@@ -1061,8 +1059,6 @@ protected:
             }
         }
 
-        // TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), " verifyBlockData startLayerId:%d
-        // layerSizethisRank:%d", startLayerId, layerSizethisRank);
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * (mTpRank / mDupHeadFactor);
         bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;

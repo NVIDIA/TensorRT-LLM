@@ -782,7 +782,8 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.skip_less_device(4)
+#tiny llama pp4 will have uneven layer per pp. pp4
+@pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
@@ -868,12 +869,14 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    #add one mtp layer, pp rank0 will have 15 layer, pp rank 1 will have 16 layers.
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",

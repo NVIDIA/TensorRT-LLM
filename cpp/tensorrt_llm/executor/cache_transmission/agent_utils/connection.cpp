@@ -35,8 +35,14 @@ std::string genUniqueAgentName()
     return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(counter++);
 }
 
+// NIXL connection is specific ,and different from the UCX and mpi connection, since NIXL only support one-sided
+// communication. gen send buffer metaData to context when it sending requestInfo, but don't send buffer offset, since
+// unformmatter has not called yet, it didn't know the cacheSize and offset. We assume the recv_size is the same as the
+// send_size. and compute the buffer offset according to  the layer num of the selfPPrank ,and previous PP rank's layer
+// num, since the buffer size is ratio is equal to the layer num ratio except the VSWA case.
+
 auto computeSendOffsetRatio(
-    CacheState const& peerCacheState, size_t peerIdx, CacheState const& selfCacheState, int valideConnectionIdx)
+    CacheState const& peerCacheState, int peerIdx, CacheState const& selfCacheState, int valideConnectionIdx)
 {
     auto peerTargetInfo = targetIRanks(selfCacheState, peerCacheState, peerIdx);
     // int ppRank = valideConnectionIdx % peerTargetInfo.mDomainPPSize;
@@ -176,8 +182,8 @@ bool AgentConnection::hasLoadRemoteAgent() const
 
 AgentConnectionManager::AgentConnectionManager(
     batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, CacheState cacheState)
-    : mRegMemDescs(MemoryType::kVRAM, {})
-    , mCacheState(std::move(cacheState))
+    : mCacheState(std::move(cacheState))
+    , mRegMemDescs(MemoryType::kVRAM, {})
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
@@ -352,7 +358,7 @@ batch_manager::kv_cache_manager::CacheTransBufferManager* AgentConnectionManager
     return mCacheTransBufferManager;
 }
 
-AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connecitonInfo,
+AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connectionInfo,
     std::optional<std::string> metadata, bool isSender)
 {
 
@@ -393,7 +399,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
             TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call connectRemoteAgent");
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with connectRemoteAgent",
                 mAgentName.c_str(), remoteAgentName.c_str());
-            m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
+            m_Agent->connectRemoteAgent(remoteAgentName, connectionInfo);
         }
     }
     else

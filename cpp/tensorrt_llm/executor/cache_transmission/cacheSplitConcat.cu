@@ -69,6 +69,9 @@ TargetRanksInfo TargetRanksInfoForDP(
     TLLM_CHECK(peerNumLayerPerPP.size() == peerPPNum);
     TLLM_CHECK(selfNumLayerPerPP.size() == selfPPNum);
     int selfStartLayerId = 0;
+    // global start layer id for selfPPrank, which is the sum of the layer num of the previous PP ranks.
+    // compute the target PP ranks and layer num need to be fetched from each target PP rank, according to [global start
+    // layer id, global end layer id)
 
     for (int pp_rank = 0; pp_rank < selfPPRank; pp_rank++)
     {
@@ -515,8 +518,6 @@ nvinfer1::Dims makeShapeFromCacheState(kv_cache::CacheState const& cacheState)
             cacheState.getAttentionConfig().mKvFactor, blockSize});
 }
 
-// MLA Head 1: One thread block per [(2), tokens, dimsPerHead]
-
 __device__ __forceinline__ void getLayerIdInDomainPPandRankInDomainPP(int layerId, int DomainPPSize,
     uint64_t* prefixLayerNumDevPtr, int& layerIdInDomainPP, int& rankInDomainPP, int& layerNumInSpecPP)
 {
@@ -541,6 +542,8 @@ __device__ __forceinline__ void getLayerIdInDomainPPandRankInDomainPP(int layerI
     rankInDomainPP = sharedRankInDomainPP;
     layerNumInSpecPP = sharedLayerNumInSpecPP;
 }
+
+// MLA Head 1: One thread block per [(2), tokens, dimsPerHead]
 
 template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T** __restrict__ outputCaches,
@@ -638,19 +641,12 @@ __global__ void splitKVCacheKernel(T const** __restrict__ inputBlocks, T** __res
         for (int layerId = blockIdx.x; layerId < numLayers; layerId += gridDim.x)
         {
 
-            //  if(peer PPrank ==threadIdx.x; peerPPRank <DomainPPSize)
-            // if( layerId>xx[peeRank] &&layerId<xx[peerPPRank+1])
-            // peerPPrank , layerIdInDomainPP = layerId - xx[peerPPrank]
             int layerIdInDomainPP{};
             int rankInDomainPP{};
             int layerNumInSpecPP{};
             getLayerIdInDomainPPandRankInDomainPP(
                 layerId, DomainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
 
-            // if (threadIdx.x == 0){
-            //     printf("splitKVCacheKernel: layerId:%d, layerIdInDomainPP:%d, rankInDomainPP:%d,
-            //     layerNumInSpecPP:%d\n", layerId, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
-            // }
 #pragma unroll 1
 
             for (int headId = subWarpGroupId; headId < headNum; headId += subWarpGroupNum)
@@ -892,11 +888,6 @@ __global__ void concatKVCacheKernel(T const** __restrict__ inputCaches, T** __re
             int layerNumInSpecPP{};
             getLayerIdInDomainPPandRankInDomainPP(
                 layerId, DomainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
-
-            // if (threadIdx.x == 0){
-            //     printf("concatKVCacheKernel: layerId:%d, layerIdInDomainPP:%d, rankInDomainPP:%d,
-            //     layerNumInSpecPP:%d\n", layerId, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
-            // }
 
 #pragma unroll 1
             for (int headId = subWarpGroupId; headId < headNum; headId += subWarpGroupNum)
