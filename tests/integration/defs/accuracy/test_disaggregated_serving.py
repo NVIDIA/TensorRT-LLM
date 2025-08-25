@@ -183,7 +183,7 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             )
             raise
 
-    with (MyThreadPoolExecutor(max_workers=16) as thread_pool, temp_dir):
+    with (MyThreadPoolExecutor(max_workers=4) as thread_pool, temp_dir):
         with multi_popen(ctx_servers + gen_servers):
             with popen([
                     trtllm_serve_path, "disaggregated", "-c",

@@ -101,8 +101,49 @@ public:
     {
         TLLM_CHECK(mSender);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
-        mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
+    }
+
+    void sendResponse(RequestIdType reqId) noexcept
+    {
+        std::unique_lock lk(mSendMutex);
+        // Send context cache is not called for this request yet.
+        std::unique_lock<std::mutex> lkResp(mResponderMutex);
+        auto readyResponseIt = mReadyResponses.find(reqId);
+        if (readyResponseIt == mReadyResponses.end())
+        {
+            return;
+        }
+        lkResp.unlock();
+        auto it = mRequestInfoMap.find(reqId);
+        if (it == mRequestInfoMap.end())
+        {
+            return;
+        }
+        auto blockHashes = it->second.getBlockHashes();
+        auto count = --mRemainSendCount[reqId];
+        TLLM_CHECK(count >= 0);
+        if (count == 0)
+        {
+            mRequestInfoMap.erase(it);
+            mRemainSendCount.erase(reqId);
+
+            // TODO(zhengd): pass the hashes directly instead of update llmRequest
+            auto llmRequest = readyResponseIt->second.mRequest;
+            llmRequest->setRequestedBlockHashes(std::move(blockHashes));
+
+            if (common::getEnvParallelCacheSend())
+            {
+                // TODO: Use a thread pool and check for thread safety.
+                mSendThreads.emplace_back(
+                    &DataResponder::Impl::sendAndRemoveResponse, this, reqId, std::move(readyResponseIt->second));
+            }
+            else
+            {
+                DataResponder::Impl::sendAndRemoveResponse(reqId, std::move(readyResponseIt->second));
+            }
+            removeResponse(readyResponseIt);
+        }
     }
 
     [[nodiscard]] std::future<void> respondAndSendAsync(LlmRequest& llmRequest)
@@ -115,6 +156,7 @@ public:
                 mReadyResponses.emplace(
                     llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
             }
+            sendResponse(llmRequest.mRequestId);
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
         }
@@ -134,6 +176,11 @@ public:
 
     ~Impl()
     {
+        for (auto& thread : mSendThreads)
+        {
+            thread.join();
+        }
+        mSendThreads.clear();
         terminate();
     }
 
@@ -177,57 +224,17 @@ private:
                 {
                     break;
                 }
-                std::vector<size_t> blockHashes;
-                if (!isSending() && !mReadyResponses.empty())
+                auto const& requestInfo = mSender->recvRequestInfo();
+                auto reqId = requestInfo.getRequestId();
                 {
-                    auto const& requestInfo = mSender->recvRequestInfo();
-                    auto reqId = requestInfo.getRequestId();
-                    blockHashes = requestInfo.getBlockHashes();
-
-                    mCurrentRequest = reqId;
+                    std::unique_lock lk(mSendMutex);
+                    mRequestInfoMap[reqId] = std::move(requestInfo);
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
                     {
                         mRemainSendCount[reqId] = mSender->getCounterpartsCount(reqId);
                     }
                 }
-                auto it = getCurrentResponse();
-                if (it != mReadyResponses.end())
-                {
-                    auto reqId = mCurrentRequest.value();
-                    auto count = --mRemainSendCount[reqId];
-                    TLLM_CHECK(count >= 0);
-                    if (count == 0)
-                    {
-                        mRemainSendCount.erase(reqId);
-
-                        // TODO(zhengd): pass the hashes directly instead of update llmRequest
-                        auto llmRequest = it->second.mRequest;
-                        llmRequest->setRequestedBlockHashes(std::move(blockHashes));
-
-                        if (common::getEnvParallelCacheSend())
-                        {
-                            // TODO: Use a thread pool and check for thread safety.
-                            std::thread(
-                                &DataResponder::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second))
-                                .detach();
-                        }
-                        else
-                        {
-                            DataResponder::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
-                        }
-                        removeResponse(it);
-                    }
-                    mCurrentRequest = std::nullopt;
-                }
-                else
-                {
-                    TLLM_CHECK_WITH_INFO(!mCurrentRequest.has_value(),
-                        "This executor does not have a prepared KV cache for request ID: %zu, and the "
-                        "mReadyResponses size is: %zu. mpi rank :%d     ",
-                        mCurrentRequest.value(), mReadyResponses.size(), mpi::MpiComm::world().getRank());
-                    std::unique_lock lk(mCondMutex);
-                    mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
-                }
+                sendResponse(reqId);
             }
         }
         catch (std::exception const& err)
@@ -264,31 +271,16 @@ private:
         }
     }
 
-    [[nodiscard]] bool isSending() const
-    {
-        return mCurrentRequest.has_value();
-    }
-
-    [[nodiscard]] RequestIdType getCurrentRequestId() const
-    {
-        return mCurrentRequest.value();
-    }
-
-    [[nodiscard]] std::map<RequestIdType, Response>::iterator getCurrentResponse()
-    {
-        std::unique_lock lk(mResponderMutex);
-        return mReadyResponses.find(getCurrentRequestId());
-    }
-
 private:
-    std::optional<RequestIdType> mCurrentRequest;
     std::map<RequestIdType, Response> mReadyResponses;
-    std::mutex mResponderMutex, mCondMutex;
+    std::mutex mCondMutex, mSendMutex, mResponderMutex;
     std::atomic<bool> mAnyReady{false}, mTerminate{false};
     std::condition_variable mResponderCv;
     std::future<void> mResponseFuture;
     std::unique_ptr<DataSender> mSender;
+    std::vector<std::thread> mSendThreads;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
+    std::unordered_map<LlmRequest::RequestIdType, RequestInfo> mRequestInfoMap;
     int mDeviceId{-1};
 };
 
