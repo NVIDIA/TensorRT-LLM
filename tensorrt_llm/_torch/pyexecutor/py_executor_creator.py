@@ -25,7 +25,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
-from .guided_decoder import GuidedDecoder
+from .guided_decoder import GuidedDecoder, GuidedWorker
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
@@ -356,19 +356,24 @@ def create_py_executor(
             _ExecutorCreationStage.GUIDED_DECODER):
         guided_decoder: Optional[GuidedDecoder] = None
         if executor_config.guided_decoding_config is not None:
-            if spec_config is not None and not has_spec_drafter:
-                raise ValueError(
-                    "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
-                )
+            # if spec_config is not None and not has_spec_drafter:
+            #     raise ValueError(
+            #         "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
+            #     )
             if mapping.is_last_pp_rank():
-                max_num_draft_tokens = 0
-                if spec_config is not None:
-                    max_num_draft_tokens = spec_config.max_draft_len
-                guided_decoder = GuidedDecoder(
+                kwargs = {
+                    "guided_decoding_config":
                     executor_config.guided_decoding_config,
-                    executor_config.max_batch_size,
-                    model_engine.model.vocab_size_padded,
-                    max_num_draft_tokens=max_num_draft_tokens)
+                    "max_num_sequences": executor_config.max_batch_size,
+                    "vocab_size_padded": model_engine.model.vocab_size_padded
+                }
+                if spec_config is not None:
+                    kwargs["max_num_draft_tokens"] = spec_config.max_draft_len
+                # TODO: fix it
+                if hasattr(model_engine.model, "spec_worker"):
+                    model_engine.set_guided_worker(GuidedWorker(**kwargs))
+                else:
+                    guided_decoder = GuidedDecoder(**kwargs)
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,
