@@ -2,6 +2,7 @@
 
 import copy
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any, Callable, Dict, Optional, Type
 
 import torch
@@ -10,6 +11,13 @@ from torch._prims_common import DeviceLikeType
 
 from ..custom_ops.attention_interface import CacheConfig
 from ..utils.logger import ad_logger
+
+
+class ShardingConfigSource(Enum):
+    """Enum for factory source."""
+
+    HUGGINGFACE = "huggingface"
+    UNKNOWN = "unknown"
 
 
 class ModelFactory(ABC):
@@ -38,6 +46,8 @@ class ModelFactory(ABC):
         self.max_seq_len = max_seq_len
         self._prefetched_model_path: Optional[str] = None
         self._prefetched_tokenizer_path: Optional[str] = None
+        self._sharding_config: Dict[str, Any] = {}
+        self._sharding_config["source"] = ShardingConfigSource.UNKNOWN
 
     @property
     def model(self) -> Optional[str]:
@@ -95,6 +105,10 @@ class ModelFactory(ABC):
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or None if not quantized."""
         return {}
+
+    def get_sharding_config(self) -> Dict:
+        """Returns the sharding config for this model."""
+        return self._sharding_config
 
     def get_cache_config(self) -> CacheConfig:
         """Return the cache configuration for the model.
