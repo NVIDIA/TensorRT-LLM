@@ -422,10 +422,6 @@ class Llama4DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx,
             )
 
-            self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
-            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -438,10 +434,12 @@ class Llama4DecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 layer_idx=layer_idx)
 
-            self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
-            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
+        self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
+        ) and not self.enable_attention_dp and self.enable_fusion and not model_config.mapping.has_pp(
+        )
+        self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
+        ) and not self.enable_attention_dp and self.enable_fusion and not model_config.mapping.has_pp(
+        )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
