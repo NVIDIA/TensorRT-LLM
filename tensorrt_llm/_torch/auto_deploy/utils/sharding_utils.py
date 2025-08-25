@@ -5,6 +5,7 @@ import operator
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from functools import partial
+from itertools import chain
 from typing import Callable, Dict, List, Literal, Optional
 
 import torch
@@ -12,6 +13,7 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
+from ..transformations._graph import canonicalize_graph
 from ..utils.logger import ad_logger
 from .node_utils import extract_param_names_from_lin_node, is_op, num_users_of_weight_node
 from .quantization_utils import QuantizationImpl
@@ -424,6 +426,13 @@ def _insert_sharded_moe(
     w2_list_sharded = get_partition(args[4], world_size, rank)
     w3_list_sharded = get_partition(args[5], world_size, rank)
 
+    # Register hooks to remove all parameters of experts that aren't used by this rank
+    w1_list_to_remove = [fx_node.target for fx_node in args[3] if fx_node not in w1_list_sharded]
+    w2_list_to_remove = [fx_node.target for fx_node in args[4] if fx_node not in w2_list_sharded]
+    w3_list_to_remove = [fx_node.target for fx_node in args[5] if fx_node not in w3_list_sharded]
+    for param in chain(w1_list_to_remove, w2_list_to_remove, w3_list_to_remove):
+        gm._register_load_state_dict_pre_hook(partial(_load_hook_remove, param_key=param))
+
     # -- Update args --
     args[1] = selected_experts_local
     args[2] = final_scales_local
@@ -447,6 +456,9 @@ def _insert_sharded_moe(
         )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)
+
+    # Clean up the graph (remove unused expert nodes)
+    canonicalize_graph(gm)
 
 
 class EPShardingInfo(ShardingTransformInfo):
