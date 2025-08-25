@@ -205,7 +205,7 @@ int nextPowerOfTwo(int num)
         break;
 
 template <typename InputT, typename OutputT, typename IdxT, bool DoSoftmaxBeforeTopK>
-void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
+void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream)
 {
 
@@ -249,20 +249,25 @@ void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
 }
 
 #define INSTANTIATE_RENORM_MOE_ROUTING(InputT, OutputT, IdxT, DoSoftmaxBeforeTopK)                                     \
-    template void invokeRenormMoeRouting<InputT, OutputT, IdxT, DoSoftmaxBeforeTopK>(InputT * routerLogits,            \
+    template void invokeCustomMoeRouting<InputT, OutputT, IdxT, DoSoftmaxBeforeTopK>(InputT * routerLogits,            \
         OutputT * topkValues, IdxT * topkIndices, int64_t const numTokens, int64_t const numExperts,                   \
         int64_t const topK, cudaStream_t const stream);
 
 INSTANTIATE_RENORM_MOE_ROUTING(float, float, int32_t, false);
 INSTANTIATE_RENORM_MOE_ROUTING(half, float, int32_t, false);
-#ifdef ENABLE_BF16
-INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t, false);
-#endif
-
 INSTANTIATE_RENORM_MOE_ROUTING(float, float, int32_t, true);
 INSTANTIATE_RENORM_MOE_ROUTING(half, float, int32_t, true);
+
 #ifdef ENABLE_BF16
+INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t, false);
+INSTANTIATE_RENORM_MOE_ROUTING(float, __nv_bfloat16, int32_t, false);
+INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t, false);
+INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, false);
+
 INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t, true);
+INSTANTIATE_RENORM_MOE_ROUTING(float, __nv_bfloat16, int32_t, true);
+INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t, true);
+INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, true);
 #endif
 
 } // namespace tensorrt_llm::kernels
