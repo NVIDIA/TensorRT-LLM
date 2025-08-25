@@ -123,6 +123,7 @@ void TmaWarpSpecializedGroupedGemmInput::setFinalizeFusionParams(
         FusedFinalizeEpilogue::StrideFinalOutput{}, cute::make_shape(hidden_size, num_output_tokens, 1));
 
     fused_finalize_epilogue.num_rows_in_final_output = num_output_tokens;
+    fused_finalize_epilogue.shape_override = hidden_size;
     fused_finalize_epilogue.use_reduction = use_reduction;
 }
 

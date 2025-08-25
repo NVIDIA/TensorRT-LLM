@@ -50,6 +50,7 @@ class MoERunner(TunableRunner):
         use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
         use_fused_finalize: bool,
+        unpadded_hidden_size: Optional[int] = None,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -69,6 +70,7 @@ class MoERunner(TunableRunner):
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
         self.use_fused_finalize = use_fused_finalize
+        self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
@@ -113,6 +115,7 @@ class MoERunner(TunableRunner):
             gemm_idx,
             tactic,
             do_preparation,
+            self.unpadded_hidden_size,
         )
 
 
@@ -148,6 +151,7 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
+    unpadded_hidden_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
@@ -182,6 +186,7 @@ def fused_moe(
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
         use_fused_finalize=use_fused_finalize,
+        unpadded_hidden_size=unpadded_hidden_size,
     )
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
@@ -232,6 +237,7 @@ def fused_moe(
         enable_alltoall,
         min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
+        unpadded_hidden_size,
     )
 
     return output if min_latency_mode else [output]
@@ -267,6 +273,9 @@ def _(
     min_latency_mode: bool = False,
     use_fused_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
+    tuner_num_tokens: Optional[int] = None,
+    tuner_top_k: Optional[int] = None,
+    unpadded_hidden_size: Optional[int] = None,
 ):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:

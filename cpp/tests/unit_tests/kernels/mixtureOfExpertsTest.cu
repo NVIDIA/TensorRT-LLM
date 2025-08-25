@@ -192,6 +192,7 @@ protected:
     DataType* mInputTensor{};
 
     int64_t mHiddenSize{};
+    int64_t mUnpaddedHiddenSize{}; // If 0, defaults to mHiddenSize
     int64_t mNumExperts{};
     int64_t mK{};
 
@@ -253,6 +254,7 @@ protected:
     void TearDown() override
     {
         managed_buffers.clear();
+        mUnpaddedHiddenSize = 0; // Reset for next test
         ASSERT_EQ(cudaStreamSynchronize(mStream->get()), cudaSuccess);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         ASSERT_EQ(cudaGetLastError(), cudaSuccess);
@@ -1238,9 +1240,10 @@ protected:
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
             ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
-            mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace,
-            mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall, mUseLora, lora_params,
-            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+            mTotalTokens, mHiddenSize, mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize,
+            mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
+            parallelism_config, enable_alltoall, mUseLora, lora_params, useFp8BlockScales, minLatencyMode,
+            min_latency_params, stream);
 #else
         mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
             ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
@@ -1472,11 +1475,14 @@ protected:
         if (final_results.empty())
             final_results = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
 
+        // Use unpadded size for validation if set
+        int64_t hidden_size_to_check = mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize;
+
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
             float block_max = 1.f;
             // NOTE: When mInterSize < mHiddenSize, those values get zeroed out by fc1 and lost
-            for (int64_t hidden_id = 0; hidden_id < std::min(mHiddenSize, mInterSize); hidden_id++)
+            for (int64_t hidden_id = 0; hidden_id < std::min(hidden_size_to_check, mInterSize); hidden_id++)
             {
                 if (MX_QUANT_ACT && hidden_id % FP4VecSize == 0)
                 {
@@ -1495,9 +1501,11 @@ protected:
                     sum += final_value * final_scale_value;
                 }
 
-                ASSERT_NEAR(OutputType{sum}, final_results[token_id * mHiddenSize + hidden_id], getTolerance(sum))
+                ASSERT_NEAR(
+                    OutputType{sum}, final_results[token_id * hidden_size_to_check + hidden_id], getTolerance(sum))
                     << "Incorrect final value at for token: " << token_id << " offset: " << hidden_id
-                    << " hidden_size: " << mHiddenSize << " inter_size: " << mInterSize;
+                    << " hidden_size: " << mHiddenSize << " unpadded_hidden_size: " << mUnpaddedHiddenSize
+                    << " inter_size: " << mInterSize;
             }
         }
     }
@@ -2053,14 +2061,37 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
         this->mActType = ActivationType::Swiglu;                                                                       \
         size_t hidden_size = 7168;                                                                                     \
         size_t inter_size = 2048;                                                                                      \
-        this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
+        float inter_size_fraction = float(inter_size) / hidden_size;                                                   \
                                                                                                                        \
         if (!this->checkSufficientTestMemory(75, hidden_size, 256, 8, true))                                           \
         {                                                                                                              \
             GTEST_SKIP() << "Insufficient free memory for test";                                                       \
         }                                                                                                              \
                                                                                                                        \
-        this->ParallelismType##Test(8, hidden_size, 256, 75, this->mInterSizeFraction);                                \
+        this->ParallelismType##Test(8, hidden_size, 256, 75, inter_size_fraction);                                     \
+    }                                                                                                                  \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##GptOss120b)                                                      \
+    {                                                                                                                  \
+        this->mIsLongTest = true;                                                                                      \
+        this->mUseBias = true;                                                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
+        size_t hidden_size = 2944;                                                                                     \
+        size_t inter_size = 2944;                                                                                      \
+        if (std::string(#ParallelismType) != "ExpertParallel")                                                         \
+        {                                                                                                              \
+            /* If with TP, the inter_size should also be padded, */                                                    \
+            /* so that after TP split the alignment requirement is still met */                                        \
+            inter_size = 3072;                                                                                         \
+        }                                                                                                              \
+        float inter_size_fraction = float(inter_size) / hidden_size;                                                   \
+        this->mUnpaddedHiddenSize = 2880;                                                                              \
+                                                                                                                       \
+        if (!this->checkSufficientTestMemory(75, hidden_size, 128, 4, true))                                           \
+        {                                                                                                              \
+            GTEST_SKIP() << "Insufficient free memory for test";                                                       \
+        }                                                                                                              \
+                                                                                                                       \
+        this->ParallelismType##Test(4, hidden_size, 128, 75, inter_size_fraction);                                     \
     }                                                                                                                  \
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
@@ -2266,8 +2297,8 @@ TYPED_TEST(MixtureOfExpertsTest, RunProfiler)
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
             typeToDtypeID<typename TypeParam::WeightType>(), typeToDtypeID<typename TypeParam::OutputType>(),
-            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
-            ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
+            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4,
+            this->mGroupSize, ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
             /*need_weights=*/true, MOEParallelismConfig{}, /*enable_alltoall=*/false);
 #else
         backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
@@ -2317,8 +2348,8 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
-                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
+                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 1024, 4096, mGroupSize, {},
+                false, mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
                 /*enable_alltoall=*/false);
 #else
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
