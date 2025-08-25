@@ -148,12 +148,22 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
             auto const& optionsA = configs[idx0].mOptions;
             auto const& optionsB = configs[idx1].mOptions;
 
-            // Choose the tileN that is closest to the problem N
-            // This is the batch size dimension for low latency (transposeMmaOutput) case;
+            // Choose the tileN that is closest to the problem N. Also if one tileN is larger and the other is smaller,
+            // prefer the larger one. This is the batch size dimension for low latency (transposeMmaOutput) case;
             if (optionsA.mTileN != optionsB.mTileN)
             {
-                return abs(gemmData.mProblemDimensions.mN - optionsA.mTileN)
-                    < abs(gemmData.mProblemDimensions.mN - optionsB.mTileN);
+                auto const N = gemmData.mProblemDimensions.mN;
+                auto const tileA = optionsA.mTileN;
+                auto const tileB = optionsB.mTileN;
+
+                // If one tile is larger than N and one is smaller, prefer the larger one
+                if ((tileA >= N) != (tileB >= N))
+                {
+                    return tileA > tileB;
+                }
+
+                // Otherwise, choose the closest to N
+                return abs(N - tileA) < abs(N - tileB);
             }
 
             // Sort by tileK sizes
