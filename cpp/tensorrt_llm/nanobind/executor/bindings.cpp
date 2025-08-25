@@ -240,7 +240,8 @@ void initBindings(nb::module_& m)
     nb::class_<tle::KVCacheEvent>(executor_kv_cache, "KVCacheEvent")
         .def_ro("event_id", &tle::KVCacheEvent::eventId)
         .def_ro("data", &tle::KVCacheEvent::data)
-        .def_ro("window_size", &tle::KVCacheEvent::windowSize);
+        .def_ro("window_size", &tle::KVCacheEvent::windowSize)
+        .def_ro("attention_dp_rank", &tle::KVCacheEvent::attentionDpRank);
 
     nb::class_<tle::KVCacheEventManager>(executor_kv_cache, "KVCacheEventManager")
         .def(
