@@ -758,18 +758,39 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             **kwargs,
         )
 
+        # Memory tracking before MoE/MLP
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            get_memory_stats, log_memory_stats)
+        stats_before_moe_mlp = get_memory_stats()
+        log_memory_stats(f"Memory stats BEFORE MoE/MLP layer {self.layer_idx}",
+                         stats_before_moe_mlp)
+
         if isinstance(self.mlp, Deepseekv3MoE):
-            return self.forward_MoE(
+            result = self.forward_MoE(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
             )
+
+            # Memory tracking after MoE
+            stats_after_moe = get_memory_stats()
+            log_memory_stats(f"Memory stats AFTER MoE layer {self.layer_idx}",
+                             stats_after_moe)
+
+            return result
         else:
             assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
+            result = self.forward_mlp(
                 hidden_states=hidden_states,
                 residual=residual,
             )
+
+            # Memory tracking after MLP
+            stats_after_mlp = get_memory_stats()
+            log_memory_stats(f"Memory stats AFTER MLP layer {self.layer_idx}",
+                             stats_after_mlp)
+
+            return result
 
     def forward_MoE(
         self,
