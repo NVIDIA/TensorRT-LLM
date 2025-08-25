@@ -2101,8 +2101,8 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
         if (conf.is_tma_warp_specialized)
         {
             tactic << conf.getTileConfigAsInt() << " and cluster shape " << (int) conf.cluster_shape
-                   << " mainloop sched " << (int) conf.mainloop_schedule << " epi sched "
-                   << (int) conf.epilogue_schedule;
+                   << " dynamic cluster shape " << (int) conf.dynamic_cluster_shape << " mainloop sched "
+                   << (int) conf.mainloop_schedule << " epi sched " << (int) conf.epilogue_schedule;
         }
         else if (conf.tile_config_sm80 != CutlassTileConfig::ChooseWithHeuristic)
         {
@@ -2125,8 +2125,15 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
     {
         for (auto conf1 : configs1)
         {
+            if (conf1.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::Undefined
+                && conf1.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_4x1x1)
+                continue; // To reduce the number of iterations we only test one dynamic cluster shape
             for (auto conf2 : configs2)
             {
+                if (conf2.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::Undefined
+                    && conf2.dynamic_cluster_shape
+                        != tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_4x1x1)
+                    continue; // To reduce the number of iterations we only test one dynamic cluster shape
                 auto name1 = genConfigName(conf1);
                 auto name2 = genConfigName(conf2);
                 if (name1.empty() || name2.empty())
