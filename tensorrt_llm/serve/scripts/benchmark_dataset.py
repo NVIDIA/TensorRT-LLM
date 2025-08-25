@@ -25,8 +25,8 @@ import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional, Union
 from functools import partial
+from typing import Any, Callable, Mapping, Optional, Union
 
 import numpy as np
 import pandas as pd
