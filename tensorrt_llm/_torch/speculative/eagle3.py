@@ -32,6 +32,7 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
         self.slot_manager = SlotManager(max_num_requests)
+        self.max_total_draft_tokens = config.max_total_draft_tokens
 
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
@@ -52,7 +53,7 @@ class Eagle3ResourceManager(BaseResourceManager):
                 max_num_requests=self.max_num_requests,
                 use_dynamic_tree=config.use_dynamic_tree,
                 max_draft_len=self.max_draft_len,
-                num_eagle_layers=config.num_eagle_layers,
+                max_total_draft_tokens=self.max_total_draft_tokens,
                 eagle_choices=config.eagle_choices,
                 dynamic_tree_max_topK=config.dynamic_tree_max_topK,
             )
@@ -101,7 +102,7 @@ class Eagle3SpecMetadata(SpecMetadata):
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
 
     eagle_choices: Optional[List[List[int]]] = None
-    num_eagle_layers: int = 0
+    max_total_draft_tokens: int = 0
 
     def __post_init__(self):
         if self.layers_to_capture is None:

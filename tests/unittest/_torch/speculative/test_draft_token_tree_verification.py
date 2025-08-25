@@ -17,10 +17,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 def run_test(eagle_model_dir, max_seq_len, beam_width, use_dynamic_tree,
              max_new_tokens, max_batch_size, input_request, input_new_tokens,
-             draft_layer_id, max_draft_len, num_eagle_layers, eagle_choices,
-             ref_num_accepted_draft_tokens, ref_mtokens):
+             draft_layer_id, max_total_draft_tokens, max_draft_len,
+             eagle_choices, ref_num_accepted_draft_tokens, ref_mtokens):
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         speculative_model_dir=eagle_model_dir,
         eagle3_one_model=False,
         eagle_choices=eagle_choices,
@@ -30,15 +31,16 @@ def run_test(eagle_model_dir, max_seq_len, beam_width, use_dynamic_tree,
         max_num_requests=max_batch_size,
         use_dynamic_tree=spec_config.use_dynamic_tree,
         max_draft_len=spec_config.max_draft_len,
-        num_eagle_layers=spec_config.num_eagle_layers,
+        max_total_draft_tokens=spec_config.max_total_draft_tokens,
         eagle_choices=spec_config.eagle_choices,
         dynamic_tree_max_topK=spec_config.dynamic_tree_max_topK,
     )
-    spec_tree_manager.cur_eagle_layer_idx = draft_layer_id
+    spec_tree_manager.cur_draft_layer_idx = draft_layer_id
     torch_sampler = TorchSampler(
         TorchSampler.Args(
             max_seq_len=max_seq_len,
             max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
             max_num_sequences=max_batch_size,
             max_beam_width=beam_width,
             enable_mixed_sampler=False,
@@ -76,8 +78,8 @@ def test_static_tree_verification_for_draft_model():
 
     ################## CASE 1 static tree, draft model's request, draft_layer_id = 1 ##########################
     draft_layer_id = 1
-    max_draft_len = 12
-    num_eagle_layers = 3
+    max_total_draft_tokens = 12
+    max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
 
@@ -89,8 +91,8 @@ def test_static_tree_verification_for_draft_model():
         sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
         is_streaming=False,
     )
-    # shape: [max_draft_len + 1, max_batch_size, beam_width]
-    input_new_tokens = torch.zeros(max_draft_len + 1,
+    # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
+    input_new_tokens = torch.zeros(max_total_draft_tokens + 1,
                                    max_batch_size,
                                    beam_width,
                                    dtype=torch.int,
@@ -111,15 +113,15 @@ def test_static_tree_verification_for_draft_model():
              input_new_tokens=input_new_tokens,
              draft_layer_id=draft_layer_id,
              max_draft_len=max_draft_len,
-             num_eagle_layers=num_eagle_layers,
+             max_total_draft_tokens=max_total_draft_tokens,
              eagle_choices=eagle_choices,
              ref_num_accepted_draft_tokens=0,
              ref_mtokens=ref_mtokens)
 
     ################## CASE 2 static tree, draft model's request, draft_layer_id = 2 ##########################
     draft_layer_id = 2
-    max_draft_len = 12
-    num_eagle_layers = 3
+    max_total_draft_tokens = 12
+    max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
 
@@ -131,8 +133,8 @@ def test_static_tree_verification_for_draft_model():
         sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
         is_streaming=False,
     )
-    # shape: [max_draft_len + 1, max_batch_size, beam_width]
-    input_new_tokens = torch.zeros(max_draft_len + 1,
+    # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
+    input_new_tokens = torch.zeros(max_total_draft_tokens + 1,
                                    max_batch_size,
                                    beam_width,
                                    dtype=torch.int,
@@ -153,15 +155,15 @@ def test_static_tree_verification_for_draft_model():
              input_new_tokens=input_new_tokens,
              draft_layer_id=draft_layer_id,
              max_draft_len=max_draft_len,
-             num_eagle_layers=num_eagle_layers,
+             max_total_draft_tokens=max_total_draft_tokens,
              eagle_choices=eagle_choices,
              ref_num_accepted_draft_tokens=0,
              ref_mtokens=ref_mtokens)
 
     ################## CASE 3 static tree, draft model's request, draft_layer_id = 3 ##########################
     draft_layer_id = 3
-    max_draft_len = 12
-    num_eagle_layers = 3
+    max_total_draft_tokens = 12
+    max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
 
@@ -173,8 +175,8 @@ def test_static_tree_verification_for_draft_model():
         sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
         is_streaming=False,
     )
-    # shape: [max_draft_len + 1, max_batch_size, beam_width]
-    input_new_tokens = torch.zeros(max_draft_len + 1,
+    # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
+    input_new_tokens = torch.zeros(max_total_draft_tokens + 1,
                                    max_batch_size,
                                    beam_width,
                                    dtype=torch.int,
@@ -195,7 +197,7 @@ def test_static_tree_verification_for_draft_model():
              input_new_tokens=input_new_tokens,
              draft_layer_id=draft_layer_id,
              max_draft_len=max_draft_len,
-             num_eagle_layers=num_eagle_layers,
+             max_total_draft_tokens=max_total_draft_tokens,
              eagle_choices=eagle_choices,
              ref_num_accepted_draft_tokens=0,
              ref_mtokens=ref_mtokens)
@@ -214,8 +216,8 @@ def test_static_tree_verification_for_target_model():
 
     ################## CASE 1 static tree, target model's request, no draft tokens are accepted ##########################
     draft_layer_id = 1  # Not be used.
-    max_draft_len = 12
-    num_eagle_layers = 3
+    max_total_draft_tokens = 12
+    max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
 
@@ -231,11 +233,12 @@ def test_static_tree_verification_for_target_model():
         [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
         dtype=torch.int,
         device='cpu')  # all draft tokens
-    # shape: [max_draft_len + 1, max_batch_size, beam_width]
+    # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
     input_new_tokens = torch.tensor(
         [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0],
         dtype=torch.int,
-        device='cpu').reshape((max_draft_len + 1, max_batch_size, beam_width))
+        device='cpu').reshape(
+            (max_total_draft_tokens + 1, max_batch_size, beam_width))
 
     ref_mtokens = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
                    31]  # Only accept the top-1 of the first draft layer.
@@ -251,15 +254,15 @@ def test_static_tree_verification_for_target_model():
              input_new_tokens=input_new_tokens,
              draft_layer_id=draft_layer_id,
              max_draft_len=max_draft_len,
-             num_eagle_layers=num_eagle_layers,
+             max_total_draft_tokens=max_total_draft_tokens,
              eagle_choices=eagle_choices,
              ref_num_accepted_draft_tokens=ref_num_accepted_draft_tokens,
              ref_mtokens=ref_mtokens)
 
     ################## CASE 2 static tree, target model's request, only one path is accepted, not the longest one ##########################
     draft_layer_id = 1  # Not be used.
-    max_draft_len = 12
-    num_eagle_layers = 3
+    max_total_draft_tokens = 12
+    max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
 
@@ -274,13 +277,14 @@ def test_static_tree_verification_for_target_model():
     input_request.py_draft_tokens = torch.tensor(
         [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
         dtype=torch.int,
-        device='cpu')  # all draft tokens, [max_draft_len]
-    # shape: [max_draft_len + 1, max_batch_size, beam_width]
+        device='cpu')  # all draft tokens, [max_total_draft_tokens]
+    # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
     input_new_tokens = torch.tensor(
         [11, 15, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112
-         ],  # [max_draft_len + 1]
+         ],  # [max_total_draft_tokens + 1]
         dtype=torch.int,
-        device='cpu').reshape((max_draft_len + 1, max_batch_size, beam_width))
+        device='cpu').reshape(
+            (max_total_draft_tokens + 1, max_batch_size, beam_width))
 
     ref_mtokens = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 15, 105]
     ref_num_accepted_draft_tokens = 2
@@ -295,15 +299,15 @@ def test_static_tree_verification_for_target_model():
              input_new_tokens=input_new_tokens,
              draft_layer_id=draft_layer_id,
              max_draft_len=max_draft_len,
-             num_eagle_layers=num_eagle_layers,
+             max_total_draft_tokens=max_total_draft_tokens,
              eagle_choices=eagle_choices,
              ref_num_accepted_draft_tokens=ref_num_accepted_draft_tokens,
              ref_mtokens=ref_mtokens)
 
     ################## CASE 3 static tree, target model's request, only one path is accepted, which is also the longest one ##########################
     draft_layer_id = 1  # Not be used.
-    max_draft_len = 12
-    num_eagle_layers = 3
+    max_total_draft_tokens = 12
+    max_draft_len = 3
     eagle_choices = [[0], [1], [2], [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
                      [2, 0], [0, 0, 0], [0, 1, 1], [1, 0, 0]]
 
@@ -318,13 +322,14 @@ def test_static_tree_verification_for_target_model():
     input_request.py_draft_tokens = torch.tensor(
         [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
         dtype=torch.int,
-        device='cpu')  # all draft tokens, [max_draft_len]
-    # shape: [max_draft_len + 1, max_batch_size, beam_width]
+        device='cpu')  # all draft tokens, [max_total_draft_tokens]
+    # shape: [max_total_draft_tokens + 1, max_batch_size, beam_width]
     input_new_tokens = torch.tensor(
         [11, 14, 102, 103, 20, 105, 106, 107, 108, 109, 110, 111, 112
-         ],  # [max_draft_len + 1]
+         ],  # [max_total_draft_tokens + 1]
         dtype=torch.int,
-        device='cpu').reshape((max_draft_len + 1, max_batch_size, beam_width))
+        device='cpu').reshape(
+            (max_total_draft_tokens + 1, max_batch_size, beam_width))
 
     ref_mtokens = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 14, 20, 110]
     ref_num_accepted_draft_tokens = 3
@@ -339,7 +344,7 @@ def test_static_tree_verification_for_target_model():
              input_new_tokens=input_new_tokens,
              draft_layer_id=draft_layer_id,
              max_draft_len=max_draft_len,
-             num_eagle_layers=num_eagle_layers,
+             max_total_draft_tokens=max_total_draft_tokens,
              eagle_choices=eagle_choices,
              ref_num_accepted_draft_tokens=ref_num_accepted_draft_tokens,
              ref_mtokens=ref_mtokens)
