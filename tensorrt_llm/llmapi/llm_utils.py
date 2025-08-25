@@ -607,7 +607,7 @@ class CachedModelLoader:
             self._workspace, tempfile.TemporaryDirectory) else Path(
                 self._workspace)
 
-    def submit_to_all_workers(
+    def _submit_to_all_workers(
         self,
         task: Callable[..., Any],
         *args,
@@ -638,7 +638,7 @@ class CachedModelLoader:
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
-                hf_model_dirs = self.submit_to_all_workers(
+                hf_model_dirs = self._submit_to_all_workers(
                     CachedModelLoader._node_download_hf_model,
                     model=self.model_loader.model_obj.model_name,
                     revision=self.llm_args.revision)
