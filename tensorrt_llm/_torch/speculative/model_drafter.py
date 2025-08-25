@@ -352,9 +352,9 @@ class ModelDrafter(Drafter):
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits, d2t=d2t)
 
-    def update_cur_eagle_layer_idx(
+    def update_cur_draft_layer_idx(
             self,
-            cur_eagle_layer_idx: int,
+            cur_draft_layer_idx: int,
             resource_manager: Optional[ResourceManager] = None):
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -363,7 +363,7 @@ class ModelDrafter(Drafter):
 
         spec_tree_manager = spec_resource_manager.spec_tree_manager
         if spec_tree_manager is not None:
-            spec_tree_manager.cur_eagle_layer_idx = cur_eagle_layer_idx
+            spec_tree_manager.cur_draft_layer_idx = cur_draft_layer_idx
 
     @nvtx_range("prepare_draft_tokens")
     def prepare_draft_tokens(
@@ -399,7 +399,7 @@ class ModelDrafter(Drafter):
             }
 
             # Initial forward pass
-            self.update_cur_eagle_layer_idx(
+            self.update_cur_draft_layer_idx(
                 0, resource_manager
             )  # Update the current eagle layer index in the resource manager.
             outputs = self._forward_draft_model(draft_batch, resource_manager)
@@ -417,11 +417,11 @@ class ModelDrafter(Drafter):
             draft_batch.context_requests = []
 
             # Generate remaining draft tokens iteratively
-            for i in range(self.spec_config.num_eagle_layers - 1):
+            for i in range(self.max_draft_tokens - 1):
                 if len(draft_batch.generation_requests) == 0:
                     break
 
-                self.update_cur_eagle_layer_idx(i + 1, resource_manager)
+                self.update_cur_draft_layer_idx(i + 1, resource_manager)
                 outputs = self._forward_draft_model(draft_batch,
                                                     resource_manager,
                                                     previous_batch)
@@ -443,8 +443,8 @@ class ModelDrafter(Drafter):
                 previous_batch = sample_state
 
             # Final cleanup
-            self.update_cur_eagle_layer_idx(
-                self.spec_config.num_eagle_layers, resource_manager
+            self.update_cur_draft_layer_idx(
+                self.spec_config.max_draft_len, resource_manager
             )  # Update for the `_update_requests()` to extract the number of draft tokens of the last layer.
             if previous_batch is not None:
                 self._update_requests(previous_batch, resource_manager)

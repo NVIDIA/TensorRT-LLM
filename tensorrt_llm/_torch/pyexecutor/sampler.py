@@ -63,7 +63,10 @@ class Sampler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def update_requests(self, state: SampleState) -> None:
+    def update_requests(
+            self,
+            state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
         raise NotImplementedError
 
     @staticmethod
@@ -88,7 +91,11 @@ class EarlyStopSampler(Sampler):
         host = SampleStateTensors(new_tokens=torch.empty(0))
         return SampleState(scheduled_requests=scheduled_requests, host=host)
 
-    def update_requests(self, state: SampleState) -> None:
+    def update_requests(
+            self,
+            state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> None:
+        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleState)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
@@ -130,7 +137,11 @@ class EarlyStopWithMMResult(Sampler):
         return SampleStateWithMMResult(scheduled_requests=scheduled_requests,
                                        data=data)
 
-    def update_requests(self, state: SampleStateWithMMResult) -> None:
+    def update_requests(
+            self,
+            state: SampleStateWithMMResult,
+            resource_manager: Optional[ResourceManager] = None) -> None:
+        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateWithMMResult)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
@@ -379,11 +390,12 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         enable_mixed_sampler: bool
+        max_total_draft_tokens: Optional[int]
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
         self.enable_mixed_sampler = args.enable_mixed_sampler
-        self.max_tokens = args.max_draft_len + 1
+        self.max_tokens = args.max_total_draft_tokens + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.max_num_sequences = args.max_num_sequences
 
@@ -419,7 +431,8 @@ class TorchSampler(Sampler):
             return None
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        if spec_resource_manager is None:
+        if spec_resource_manager is None or not hasattr(spec_resource_manager,
+                                                        "spec_tree_manager"):
             return None
         return spec_resource_manager.spec_tree_manager
 
@@ -502,7 +515,7 @@ class TorchSampler(Sampler):
         # For the drafter model, we will not do the tree verification logic,
         # but only add the draft tokens of the previous layer.
         if len(request.py_draft_tokens) == 0:
-            cur_draft_layer_idx = spec_tree_manager.cur_eagle_layer_idx
+            cur_draft_layer_idx = spec_tree_manager.cur_draft_layer_idx
 
             if spec_tree_manager.dynamic_tree:
                 # TODO: For the last layer, we need to resampling all the draft tokens.
@@ -527,28 +540,27 @@ class TorchSampler(Sampler):
             assert seq_slot is not None
             if spec_tree_manager.dynamic_tree:
                 eagle_paths = spec_tree_manager.eagle_paths[
-                    seq_slot]  # [max_draft_len + 1, num_eagle_layers + 1]
+                    seq_slot]  # [max_total_draft_tokens + 1, max_draft_len + 1]
             else:
                 eagle_paths = spec_tree_manager.eagle_paths[
-                    0]  # [max_draft_len + 1, num_eagle_layers + 1]
+                    0]  # [max_total_draft_tokens + 1, max_draft_len + 1]
 
-            all_draft_tokens = request.py_draft_tokens  # [max_draft_len]
+            all_draft_tokens = request.py_draft_tokens  # [max_total_draft_tokens]
             all_target_tokens = new_tokens[:, seq_slot, :].squeeze(
-                -1)  # [max_draft_len]
+                -1)  # [max_total_draft_tokens]
             assert all_target_tokens.shape[
-                0] == spec_tree_manager.max_draft_len + 1
+                0] == spec_tree_manager.max_total_draft_tokens + 1
 
             longest_accepted_len = 0
             longest_match_path_idx = -1
 
             for path_idx, path in enumerate(eagle_paths):
                 path_exclude_root = path[
-                    1:] - 1  # [num_eagle_layers], '[1:]' since the new_tokens does not contain the root node.
+                    1:] - 1  # [max_draft_len], '[1:]' since the new_tokens does not contain the root node.
                 # '-1' is the index shift after exclude the root node.
-                draft_tokens_indices = path_exclude_root[
-                    path_exclude_root >= 0]  # [num_eagle_layers]
-                target_tokens_indices = path[path
-                                             >= 0]  # [num_eagle_layers + 1]
+                draft_tokens_indices = path_exclude_root[path_exclude_root >=
+                                                         0]  # [max_draft_len]
+                target_tokens_indices = path[path >= 0]  # [max_draft_len + 1]
 
                 assert len(
                     draft_tokens_indices) == len(target_tokens_indices) - 1
@@ -699,7 +711,7 @@ class TorchSampler(Sampler):
             num_logits_per_request = raw_logits.shape[0] // len(requests)
             request_index = torch.arange(len(requests))
 
-            draft_layer_id = spec_tree_manager.cur_eagle_layer_idx
+            draft_layer_id = spec_tree_manager.cur_draft_layer_idx
 
             # 1) Calculate how many nodes in the current layer that need to be expanded.
             cur_layer_num_nodes = spec_tree_manager.num_nodes_per_layer[0][
@@ -719,9 +731,8 @@ class TorchSampler(Sampler):
             assert has_child_nodes_list.shape[0] == num_logits_per_request
 
             # TODO: this tensor can be optimized
-            # new_draft_tokens_cuda = torch.empty((spec_tree_manager.max_draft_len + 1, len(requests)), dtype=torch.int64, device='cuda')
             new_draft_tokens_cuda = torch.zeros(
-                (len(requests), spec_tree_manager.max_draft_len + 1),
+                (len(requests), spec_tree_manager.max_total_draft_tokens + 1),
                 dtype=torch.int64,
                 device='cuda')
             topK_list_cumsum = torch.cumsum(topK_list, dim=0)
@@ -745,8 +756,8 @@ class TorchSampler(Sampler):
             int_new_draft_tokens = new_draft_tokens_cuda.transpose(0, 1).to(
                 torch.int, non_blocking=True)
             int_new_draft_tokens = int_new_draft_tokens.unsqueeze(
-                dim=-1)  # [max_draft_len + 1, max_num_sequences, 1]
-            # new_tokens: device buffer, shape:[max_draft_len + 1, max_num_sequences, MAX_BEAM_WIDTH]
+                dim=-1)  # [max_total_draft_tokens + 1, max_num_sequences, 1]
+            # new_tokens: device buffer, shape:[max_total_draft_tokens + 1, max_num_sequences, MAX_BEAM_WIDTH]
             # new_tokens just store the new draft tokens for each layer.
             new_tokens.index_copy_(1, seq_slots, int_new_draft_tokens)
 
@@ -1250,7 +1261,10 @@ class TRTLLMSampler(Sampler):
                                  finalize_events=finalize_events)
 
     @torch.inference_mode()
-    def update_requests(self, state: SampleStateTRTLLM):
+    def update_requests(self,
+                        state: SampleStateTRTLLM,
+                        resource_manager: Optional[ResourceManager] = None):
+        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateTRTLLM)
         if state.scheduled_requests.batch_size == 0:
             return

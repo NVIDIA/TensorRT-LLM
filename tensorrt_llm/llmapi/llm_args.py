@@ -421,10 +421,15 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle_choices: Optional[List[List[int]]] = None
     greedy_sampling: Optional[bool] = True
     posterior_threshold: Optional[float] = None
-    use_dynamic_tree: Optional[bool] = False
-    dynamic_tree_max_topK: Optional[int] = None
-    num_eagle_layers: Optional[int] = None
-    max_non_leaves_per_layer: Optional[int] = None
+    use_dynamic_tree: Optional[bool] = False  # Whether to use dynamic tree.
+    dynamic_tree_max_topK: Optional[
+        int] = None  # The topK value for each layer when enable dynamic tree.
+    max_total_draft_tokens: Optional[
+        int] = None  # The number of draft tokens in the draft tokens tree.
+    num_eagle_layers: Optional[
+        int] = None  # The number of eagle layer. will not be used in pytorch flow, just for compatibility with TRT flow
+    max_non_leaves_per_layer: Optional[
+        int] = None  # The number of non-leaves in each layer.
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
 
@@ -433,19 +438,23 @@ class EagleDecodingConfig(DecodingBaseConfig):
         for attr_name, attr_value in kwargs.items():
             if attr_name == 'max_draft_len':
                 self.num_eagle_layers = attr_value
+                self.max_total_draft_tokens = attr_value  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
             # Convert the data type of Eagle choice from str to List[List[int]]
-            if attr_name == 'eagle_choices' and not isinstance(
-                    attr_value, list):
+            if attr_name == 'eagle_choices' and attr_value is not None:
                 logger.warning(
                     "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
                 )
-                if isinstance(attr_value, str):
-                    attr_value = ast.literal_eval(attr_value.replace(" ", ""))
-                else:
-                    raise ValueError(
-                        "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
-                    )
+                if not isinstance(attr_value, list):
+                    if isinstance(attr_value, str):
+                        attr_value = ast.literal_eval(
+                            attr_value.replace(" ", ""))
+                    else:
+                        raise ValueError(
+                            "Wrong eagle choices type. Eagle choices should be a List[List[int]] or a string like [[0], [1], [2], [0, 0], [0, 1]]."
+                        )
             setattr(self, attr_name, attr_value)
+
+        assert self.max_draft_len is not None, "max_draft_len is required for Eagle"
 
         # Checks whether the input eagle choices is valid
         # and reset the max_draft_len and num_eagle_layers if necessary
@@ -461,18 +470,23 @@ class EagleDecodingConfig(DecodingBaseConfig):
             num_eagle_layers_from_choices = self.check_eagle_choices()
             if num_eagle_layers_from_choices != self.num_eagle_layers:
                 logger.warning(
-                    f"Base on the input choices, reset the num_eagle_layers from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
+                    f"Base on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
                 )
                 self.num_eagle_layers = num_eagle_layers_from_choices
+                self.max_draft_len = num_eagle_layers_from_choices
 
-            # Each draft node has a path(choice) from the root to it.
-            # So the number of choices also represents the number of draft nodes.
-            max_draft_len_from_choices = len(self.eagle_choices)
+            # The max_draft_len is the length of the longest choice minus 1.
+            max_draft_len_from_choices = max(
+                len(choice) for choice in self.eagle_choices)
             if max_draft_len_from_choices != self.max_draft_len:
                 logger.warning(
                     f"Base on the input choices, reset the max_draft_len from {self.max_draft_len} to {max_draft_len_from_choices}"
                 )
                 self.max_draft_len = max_draft_len_from_choices
+
+            # Each draft node has a path(choice) from the root to it.
+            # So the number of choices also represents the number of max draft nodes.
+            len(self.eagle_choices)
 
     @classmethod
     def from_dict(cls, data: dict):
