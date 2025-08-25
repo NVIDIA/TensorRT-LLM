@@ -5,13 +5,14 @@ import operator
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from functools import partial
-from typing import Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch.fx import GraphModule, Node
 
+from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
 from .node_utils import extract_param_names_from_lin_node, is_op, num_users_of_weight_node
 from .quantization_utils import QuantizationImpl
@@ -182,8 +183,12 @@ def _insert_sharded_matmul(
 class SplitDimension(IntEnum):
     """Enum for tensor split dimensions in sharding."""
 
-    ROW = 0  # Split along rows (first dimension)
-    COLUMN = 1  # Split along columns (second dimension)
+    # NOTE: The names COLUMN/ROW reflect the hugging face
+    # base_tp_plan sharding notation, but since we assume Y = W @ X^T,
+    # when splitting weight matrix W^T across columns, the actual split
+    # is over dimension 0
+    COLUMN = 0
+    ROW = 1
 
 
 class ShardingTransformInfo(BaseModel, ABC):
@@ -232,16 +237,16 @@ class TPShardingInfo(ShardingTransformInfo):
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
         if self.dist_op is not None:
-            if self.split_dim == SplitDimension.ROW:
+            if self.split_dim == SplitDimension.COLUMN:
                 if self.dist_op == "all_reduce":
                     ad_logger.warning(
-                        f"Row split is only supported for all_gather. Skipping {self}."
+                        f"Column split is only supported for all_gather. Skipping {self}."
                     )
                     return False
-            if self.split_dim == SplitDimension.COLUMN:
+            if self.split_dim == SplitDimension.ROW:
                 if self.dist_op == "all_gather":
                     ad_logger.warning(
-                        f"Column split is only supported for all_reduce. Skipping {self}."
+                        f"Row split is only supported for all_reduce. Skipping {self}."
                     )
                     return False
         return True
@@ -477,6 +482,98 @@ class EPShardingInfo(ShardingTransformInfo):
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
+    factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
+    rank: int = Field(default=0)
+    world_size: int = Field(default=1)
+    predefined_config: Optional[Dict[str, Any]] = None
+    simple_shard_only: bool = Field(default=False)
+    use_sharding_from_factory: bool = False
+    sharding_dims: List[str] = Field(default_factory=list)
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_and_normalize(self):
+        # Normalize empty dict to None for "no config"
+        if isinstance(self.predefined_config, dict) and not self.predefined_config:
+            self.predefined_config = None
+        # Validate only if provided
+        if self.predefined_config is not None:
+            self.validate_config()
+        return self
+
+    def validate_config(self) -> bool:
+        if self.factory_source != ShardingConfigSource.HUGGINGFACE:
+            ad_logger.warning(
+                "Sharding config is currently only supported for HuggingFace. Skipping."
+            )
+            # invalidate the config
+            self.predefined_config = {}
+            return False
+
+        if not isinstance(self.predefined_config, dict):
+            ad_logger.warning("Sharding config is not a dictionary. Skipping.")
+            # invalidate the config
+            self.predefined_config = {}
+            return False
+
+        if "head_dim" not in self.predefined_config:
+            ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
+            # invalidate the config
+            self.predefined_config = {}
+            return False
+
+        if "tp_plan" not in self.predefined_config or self.predefined_config["tp_plan"] is None:
+            ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
+            # invalidate the config
+            self.predefined_config = {}
+            return False
+        tp_plan = self.predefined_config["tp_plan"]
+
+        values = set(tp_plan.values())
+        allowed_values = {
+            "colwise",  # row split and no collective
+            "rowwise",  # column split and all-reduce
+            "gather",  # simple shard (row + all_gather)
+            # TODO: remaining values are not supported yet.
+            # They require hybrid EP+TP and/or SP support.
+            # "sequence_parallel", # sequence parallelism
+            # "local_colwise",
+            # "local_rowwise",
+            # "local_packed_rowwise",
+            # "local",
+        }
+        if not values.issubset(allowed_values):
+            ad_logger.warning("Sharding config contains invalid values. Skipping.")
+            # invalidate the config
+            self.predefined_config = {}
+            return False
+        return True
+
+    def get_predefined_config(self) -> Dict[str, Any]:
+        return self.predefined_config
+
+
+def _append_simple_shard(
+    nodes_linear: Dict[Node, List[Node]],
+    rank: int,
+    world_size: int,
+    sharding_config: ShardingConfig,
+) -> None:
+    # for every linear node:
+    # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
+    tp_shards: List[TPShardingInfo] = []
+    for node_group in nodes_linear.values():
+        for n in node_group:
+            tp_shards.append(
+                TPShardingInfo(
+                    target_node=n.name,
+                    split_dim=SplitDimension.COLUMN,
+                    rank=rank,
+                    world_size=world_size,
+                    dist_op="all_gather",
+                    min_local_shape=1,
+                )
+            )
+    sharding_config.tp_transforms.extend(tp_shards)
