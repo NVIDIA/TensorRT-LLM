@@ -10,8 +10,13 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
+from tensorrt_llm.bindings.executor import (ContextChunkingPolicy,
+                                            ExecutorConfig,
+                                            LogitsPostProcessorConfig,
+                                            ParallelConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -203,10 +208,20 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
 
 
 def create_py_executor(
-        executor_config: ExecutorConfig,
-        checkpoint_dir: str = None,
-        lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: str = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    lora_config: Optional[LoraConfig] = None,
+    logits_post_processor_config: Optional[LogitsPostProcessorConfig] = None,
+    parallel_config: Optional[ParallelConfig] = None,
+) -> PyExecutor:
+
+    executor_config = llm_args.get_executor_config(checkpoint_dir, tokenizer)
+    executor_config.logits_post_processor_config = logits_post_processor_config
+    executor_config.parallel_config = parallel_config
+
+    garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
+
     _mangle_executor_config(executor_config)
     pytorch_backend_config = executor_config.pytorch_backend_config
 
