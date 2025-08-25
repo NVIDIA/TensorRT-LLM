@@ -1169,7 +1169,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
     // fail the stage immediately without attempting any reruns
-    rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
+    def rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
     if (fileExists(rerunTestList)) {
         sh "cat ${rerunTestList}"
         error "There are some failed tests that cannot be rerun, skip the rerun step."
@@ -1178,10 +1178,10 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     // If the stage has more than 5 failed tests, skip the rerun step
     def validLineCount = 0
     for (times in [1, 2]) {
-        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
-        if (fileExists(rerunTestList)) {
+        def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (fileExists(currentRerunTestList)) {
             count = sh(
-                script: "grep -v '^[[:space:]]*\$' ${rerunTestList} | wc -l",
+                script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
                 returnStdout: true
             ).trim().toInteger()
             echo "Found ${count} tests to rerun ${times} time(s)"
@@ -1197,12 +1197,12 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     // Rerun tests
     isRerunFailed = false
     for (times in [1, 2]) {
-        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
-        if (!fileExists(rerunTestList)) {
+        def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (!fileExists(currentRerunTestList)) {
             echo "No failed tests need to be rerun ${times} time(s)"
             continue
         }
-        sh "cat ${rerunTestList}"
+        sh "cat ${currentRerunTestList}"
         xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
         noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
@@ -1211,7 +1211,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
             !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
         }
         testCmdLine += [
-            "--test-list=${rerunTestList}",
+            "--test-list=${currentRerunTestList}",
             "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
             "--junit-xml ${xmlFile}",
             "--reruns ${times - 1}"
