@@ -589,6 +589,10 @@ def main(args: argparse.Namespace):
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer_mode = args.tokenizer_mode
 
+    if backend == "openai-chat" and args.use_chat_template:
+        raise ValueError(
+            "'--use-chat-template' should not be set when using 'openai-chat'.")
+
     if backend == "openai-chat":
         args.endpoint = "/v1/chat/completions"
 
@@ -704,14 +708,14 @@ def main(args: argparse.Namespace):
                                       dataset_path=args.dataset_path,
                                       download_path=args.download_path,
                                       download_timeout=args.download_timeout,
-                                      random_seed=args.seed).sample(
-                                          tokenizer=tokenizer,
-                                          num_requests=args.num_prompts,
-                                          prefix_len=args.random_prefix_len,
-                                          input_len=args.random_input_len,
-                                          output_len=args.random_output_len,
-                                          range_ratio=args.random_range_ratio,
-                                          use_chat_template=args.use_chat_template),
+                                      random_seed=args.seed).
+                sample(tokenizer=tokenizer,
+                       num_requests=args.num_prompts,
+                       prefix_len=args.random_prefix_len,
+                       input_len=args.random_input_len,
+                       output_len=args.random_output_len,
+                       range_ratio=args.random_range_ratio,
+                       use_chat_template=args.use_chat_template),
                 "random_image":
                 lambda: RandomImageDataset(
                     random_seed=args.seed,
