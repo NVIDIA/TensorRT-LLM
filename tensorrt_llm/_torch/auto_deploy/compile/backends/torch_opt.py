@@ -17,11 +17,10 @@ class TorchOptCompiler(TorchCudagraphCompiler):
         torch._dynamo.config.recompile_limit = max(
             len(self.cuda_graph_batch_sizes), torch._dynamo.config.recompile_limit
         )
-        ad_logger.info(f"Setting recompile limit to {torch._dynamo.config.recompile_limit}")
-
-        # Global torch config, set the torch compile cache to fix up to llama 405B
-        torch._dynamo.config.cache_size_limit = 20
-        ad_logger.info(f"Setting cache size limit to {torch._dynamo.config.cache_size_limit}")
+        ad_logger.info(
+            f"Setting Torch Dynamo recompile limit {torch._dynamo.config.recompile_limit=}; "
+            f"{torch._dynamo.config.cache_size_limit=}"
+        )
 
     def _init_captured_graph(self, gm, in_spec, out_spec) -> CapturedGraph:
         gm = torch.compile(gm, dynamic=True)

@@ -23,6 +23,8 @@ from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.sampling_params import SamplingParams
 
+torch._dynamo.config.cache_size_limit = 20
+
 
 class PromptConfig(BaseModel):
     """Prompt configuration.

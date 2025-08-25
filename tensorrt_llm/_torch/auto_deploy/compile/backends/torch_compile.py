@@ -12,9 +12,7 @@ from ..compiler import BackendCompiler, BackendRegistry
 class TorchCompileCompiler(BackendCompiler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Global torch config, set the torch compile cache to fix up to llama 405B
-        torch._dynamo.config.cache_size_limit = 20
-        ad_logger.info(f"Setting cache size limit to {torch._dynamo.config.cache_size_limit}")
+        ad_logger.info(f"Torch Dynamo cache size limit {torch._dynamo.config.cache_size_limit=}")
 
     def compile(self) -> nn.Module:
         """Compile the model using torch.compile."""
