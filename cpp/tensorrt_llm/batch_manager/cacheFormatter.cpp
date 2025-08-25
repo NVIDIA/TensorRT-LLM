@@ -57,12 +57,19 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
     bool needReuse = !common::getEnvDisableSelectiveCacheTransfer();
     auto const& requestedBlockHashesPerWindow = llmRequest.getRequestedBlockHashesPerWindow();
+
+    // if only one window, the context and gen may have different window size, which may be specified by the seq_len;
+    // so the requested window may be different from the window in metaData.
+
+    bool const onlyOneWindow = requestedBlockHashesPerWindow.size() == 1;
+
     for (auto const& [windowSize, metadata] : windowsMetadata)
     {
+        SizeType32 requestedWindow = onlyOneWindow ? requestedBlockHashesPerWindow.begin()->first : windowSize;
         SizeType32 reuseStartBlockIdx
-            = (needReuse && requestedBlockHashesPerWindow.at(windowSize).size() > 0
-                  && requestedBlockHashesPerWindow.at(windowSize).size() < blockIdsPerWindow.at(windowSize).size())
-            ? (blockIdsPerWindow.at(windowSize).size() - requestedBlockHashesPerWindow.at(windowSize).size())
+            = (needReuse && requestedBlockHashesPerWindow.at(requestedWindow).size() > 0
+                  && requestedBlockHashesPerWindow.at(requestedWindow).size() < blockIdsPerWindow.at(windowSize).size())
+            ? (blockIdsPerWindow.at(windowSize).size() - requestedBlockHashesPerWindow.at(requestedWindow).size())
             : 0;
         auto windowStartBlockIdx = needSendAllForWindow
             ? 0
