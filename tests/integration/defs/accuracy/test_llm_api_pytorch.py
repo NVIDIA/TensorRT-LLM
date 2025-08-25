@@ -665,8 +665,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4), (8, 1, 8), (4, 1, 1),
-                                    (4, 1, 2), (4, 1, 4)],
-        ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4"])
+                                    (4, 1, 2), (4, 1, 4), (4, 2, 1)],
+        ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4", "tp4pp2"])
     def test_fp8(self, cuda_graph, tp_size, pp_size, ep_size):
         if get_device_memory() < 140000 and get_device_count() < 8:
             pytest.skip("Not enough memory for this test")
