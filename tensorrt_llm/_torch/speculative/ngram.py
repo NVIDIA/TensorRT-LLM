@@ -177,6 +177,7 @@ class NGramDrafter(Drafter):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
+        request_mapping: dict[int, LlmRequest],
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         # Sort by request_id when py_batch_idx is None as a fallback.
@@ -188,7 +189,7 @@ class NGramDrafter(Drafter):
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
             # Add new token to a copy of the generated tokens to find new draft tokens
-            prefix = list(request.get_tokens(0))  # Get a copy
+            prefix = list(request_mapping[request.py_request_id].get_tokens(0))
 
             # Generate draft tokens
             draft_tokens = self.spec_resource_manager.get_draft_tokens(
@@ -203,3 +204,5 @@ class NGramDrafter(Drafter):
                 pad_length = self.max_draft_len - len(draft_tokens)
                 draft_tokens.extend([0] * pad_length)
             request.py_draft_tokens = draft_tokens
+            request_mapping[
+                request.py_request_id].py_draft_tokens = draft_tokens
