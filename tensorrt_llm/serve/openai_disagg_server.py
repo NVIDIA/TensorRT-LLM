@@ -8,14 +8,14 @@ import traceback
 from collections import deque
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Optional, Type, Union
+from typing import Callable, Optional, Type, Union
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.status import HTTP_429_TOO_MANY_REQUESTS
+from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -42,7 +42,8 @@ class OpenAIDisaggServer:
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
-                 metadata_server_cfg: Optional[MetadataServerConfig] = None):
+                 metadata_server_cfg: Optional[MetadataServerConfig] = None,
+                 metrics_interval_secs: int = 0):
 
         self.ctx_servers, self.gen_servers = get_ctx_gen_server_urls(config.server_configs)
         self.metadata_server = create_metadata_server(metadata_server_cfg)
@@ -68,6 +69,17 @@ class OpenAIDisaggServer:
         if config.max_retries < 0:
             raise ValueError(f"Max retries {config.max_retries} must be greater than or equal to 0")
         self.max_retries = config.max_retries
+        # Metrics counters and synchronization
+        self._metrics = {
+            "ctx_total_requests": 0,
+            "ctx_completed_requests": 0,
+            "gen_total_requests": 0,
+            "gen_completed_requests": 0,
+        }
+        self._metrics_lock = asyncio.Lock()
+        self._metrics_task = None
+        self.metrics_interval_secs = metrics_interval_secs
+
         logger.info(f"Server max retries: {self.max_retries}")
 
         if (len(self.gen_servers) == 0):
@@ -98,12 +110,23 @@ class OpenAIDisaggServer:
                 await self.ctx_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
                 await self.gen_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
 
+            # Start periodic metrics logging
+            self._metrics_task = asyncio.create_task(self._log_metrics_periodically(self.metrics_interval_secs))
+
             yield
 
             if self.metadata_server:
                 logger.info("Stopping server monitoring via metadata service")
                 await self.ctx_router.stop_server_monitoring()
                 await self.gen_router.stop_server_monitoring()
+
+            # Stop periodic metrics logging
+            if self._metrics_task is not None:
+                self._metrics_task.cancel()
+                try:
+                    await self._metrics_task
+                except asyncio.CancelledError:
+                    pass
 
             await self.session.close()  # Ensure session cleanup
 
@@ -114,6 +137,28 @@ class OpenAIDisaggServer:
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
+
+    async def _increment_metric(self, key: str, amount: int = 1):
+        async with self._metrics_lock:
+            self._metrics[key] += amount
+
+    async def _get_metrics_snapshot(self):
+        async with self._metrics_lock:
+            return dict(self._metrics)
+
+    async def _log_metrics_periodically(self, interval_seconds: int):
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                snapshot = await self._get_metrics_snapshot()
+                logger.info(
+                    (
+                        f"[Statistics] total_context_requests={snapshot['ctx_total_requests']}, completed_context_requests={snapshot['ctx_completed_requests']}, "
+                        f"total_generation_requests={snapshot['gen_total_requests']}, completed_generation_requests={snapshot['gen_completed_requests']}"
+                    )
+                )
+        except asyncio.CancelledError:
+            pass
 
     @staticmethod
     def create_error_response(
@@ -198,15 +243,15 @@ class OpenAIDisaggServer:
                                         gen_server: str,
                                         gen_req: Union[CompletionRequest, ChatCompletionRequest]):
         try:
-
             if ctx_response is not None and len(ctx_response.choices) != 1:
                 raise ValueError("Context server did not return a single choice. This is not expected")
 
             #If request finished after first token not due to length, return right away and skip gen
             if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
-                yield f"data: [DONE]\n\n".encode('utf-8')
+                yield "data: [DONE]\n\n".encode('utf-8')
             else:
                 # Then yield the generation responses
+                await self._increment_metric("gen_total_requests")
                 if isinstance(gen_req, CompletionRequest):
                     gen_response = await self.send_completion_request(gen_server, gen_req)
                 elif isinstance(gen_req, ChatCompletionRequest):
@@ -216,6 +261,7 @@ class OpenAIDisaggServer:
 
                 async for chunk in gen_response.body_iterator:
                     yield chunk
+                await self._increment_metric("gen_completed_requests")
 
         finally:
             await self.gen_router.finish_request(gen_req)
@@ -258,6 +304,7 @@ class OpenAIDisaggServer:
         ctx_req.stream_options = None
 
         logger.debug("Sending request to ctx server: %s", ctx_server)
+        await self._increment_metric("ctx_total_requests")
         try:
             if isinstance(ctx_req, ChatCompletionRequest):
                 ctx_response = await self.send_chat_request(ctx_server, ctx_req)
@@ -266,6 +313,7 @@ class OpenAIDisaggServer:
                 ctx_response = await self.send_completion_request(ctx_server, ctx_req)
         finally:
             await self.ctx_router.finish_request(ctx_req)
+            await self._increment_metric("ctx_completed_requests")
 
         choices = ctx_response.choices
         if len(choices) > 1:
@@ -342,11 +390,13 @@ class OpenAIDisaggServer:
                         del ctx_response.choices[0].disaggregated_params
                         return ctx_response
                     else:
+                        await self._increment_metric("gen_total_requests")
                         if isinstance(req, CompletionRequest):
                             gen_response = await self.send_completion_request(gen_server, req)
                         else:
                             assert isinstance(req, ChatCompletionRequest)
                             gen_response = await self.send_chat_request(gen_server, req)
+                        await self._increment_metric("gen_completed_requests")
                         return gen_response
                 finally:
                     if gen_server is not None:
@@ -400,7 +450,7 @@ class OpenAIDisaggServer:
                            request: Union[CompletionRequest, ChatCompletionRequest],
                            endpoint: str,
                            response_type: Type[Union[CompletionResponse, ChatCompletionResponse]],
-                           create_generator: callable) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
+                           create_generator: Callable) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
         for attempt in range(self.max_retries + 1):
             try:
                 if request.stream:
@@ -419,7 +469,7 @@ class OpenAIDisaggServer:
                         return response_type(**response_dict)
             except (aiohttp.ClientError, OSError) as e:
                 if attempt == self.max_retries:
-                    raise HTTPException(status_code=HTTP_429_TOO_MANY_REQUESTS, detail=f"Too many requests") from e
+                    raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error") from e
                 logger.error(f"Client error: {e} - retry {attempt} of {self.max_retries}")
                 # TODO : add a configurable retry interval
                 await asyncio.sleep(1)

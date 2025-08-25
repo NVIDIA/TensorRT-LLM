@@ -457,10 +457,14 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
+@click.option("--metrics-log-interval",
+              type=int,
+              default=30,
+              help="The interval of logging metrics in seconds")
 def disaggregated(config_file: Optional[str],
                   metadata_server_config_file: Optional[str],
                   server_start_timeout: int, request_timeout: int,
-                  log_level: str):
+                  log_level: str, metrics_log_interval: int):
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)
@@ -473,7 +477,8 @@ def disaggregated(config_file: Optional[str],
     server = OpenAIDisaggServer(config=disagg_cfg,
                                 req_timeout_secs=request_timeout,
                                 server_start_timeout_secs=server_start_timeout,
-                                metadata_server_cfg=metadata_server_cfg)
+                                metadata_server_cfg=metadata_server_cfg,
+                                metrics_interval_secs=metrics_log_interval)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 

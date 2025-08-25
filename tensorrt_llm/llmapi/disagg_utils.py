@@ -51,7 +51,7 @@ class DisaggServerConfig():
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
-    max_retries: int = 3
+    max_retries: int = 1
     perf_metrics_max_requests: int = 0
 
 
@@ -91,7 +91,7 @@ def parse_disagg_config_file(yaml_config_file: str):
 
 def extract_disagg_cfg(hostname: str = 'localhost',
                        port: int = 8000,
-                       max_retries: int = 3,
+                       max_retries: int = 1,
                        perf_metrics_max_requests: int = 0,
                        context_servers: Optional[dict] = None,
                        generation_servers: Optional[dict] = None,
