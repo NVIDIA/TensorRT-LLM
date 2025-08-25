@@ -1914,8 +1914,9 @@ def enable_mutex(kspec):
 
 
 def enable_tma_store(kspec):
+    output_dtype = kspec.output_dtype if kspec.output_dtype is not None else kspec.dtype
     # TMA copies data in the 16B granularity.
-    return 'true' if (kspec.dtype in ['e4m3', 'e4m3_fp32']
+    return 'true' if (output_dtype in ['e4m3', 'e4m3_fp32']
                       and kspec.head_size % 16 == 0) else 'false'
 
 
@@ -3812,7 +3813,9 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
     # use specialized kernels for cases without alibi scales.
     # there is a numeric issues when applying the exp2f scale optimization and alibi scale at the same time.
     combinations = product([False, True], \
-        [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.Q_PAGED_KV], [False, True])
+        [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
+         InputLayout.Q_PAGED_KV, InputLayout.SEPARATE_Q_K_V],
+        [False, True])
     for (alibi, input_layout, enable_attn_logit_softcapping) in combinations:
         # alibi and bmm1_tanh_scale shouldn't be used together.
         if alibi and enable_attn_logit_softcapping:
@@ -3911,7 +3914,7 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
                 has_noloop=0,
                 noloop_step=64,
                 kv_loop_step=
-                128,  # use 64 kv step size to avoid register spilling
+                128,  # use 128 kv step size to avoid register spilling
                 kv_tile_buffers=2,  # only used by warp specialized kernels
                 unroll_threshold=1,
                 has_scale_max=False,
@@ -3925,6 +3928,46 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
                 input_layout=input_layout,
                 sage_block_sizes=sage_block_sizes,
                 output_dtype=output_dtype))
+
+        # context MLA (192x128)
+        # we could use param 'output_dtype' of enumerate_qgmma_flash_warpspec_kernels(),
+        # but it will generate many unnecessary kernels and they are not easy to filter out.
+        for output_type in [None, 'bf16']:
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=192,
+                    head_size_v=128,
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=128,
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=
+                    False,  # return softmax stats is not supported for fp8 now
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    sage_block_sizes=sage_block_sizes,
+                    output_dtype=output_type))
 
 
 def enumerate_igmma_kernels(specs, sm=90):
@@ -6377,7 +6420,7 @@ def enumerate_kernels():
                   and kspec.tiled == True)
                   # Deepseek MLA (context 192/128 separate-q-k-v)
                   or (kspec.sm            in [90, 100, 120]
-                  and kspec.dtype         in ['bf16', 'e4m3_fp32']
+                  and kspec.dtype         in ['bf16', 'e4m3', 'e4m3_fp32']
                   and kspec.head_size     == 192
                   and kspec.head_size_v   == 128
                   and kspec.input_layout == InputLayout.SEPARATE_Q_K_V

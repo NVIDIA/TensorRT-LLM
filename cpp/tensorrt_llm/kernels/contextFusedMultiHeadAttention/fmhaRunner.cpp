@@ -453,14 +453,13 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.force_unroll = true;
         mLaunchParams.kernel_s = 0;
 
-        // Now we have SM90 FP8 generation and BF16 context MLA kernels
+        // Now we have SM90 context and FP8 generation MLA kernels
+        bool isHopperContextMLA = isSm90 && mFixedParams.headSizeV == 128;
         bool isHopperFP8GenerationMLA
             = isSm90 && mFixedParams.dataType == DATA_TYPE_E4M3 && mFixedParams.headSizeV == 512;
-        bool isHopperBF16ContextMLA
-            = isSm90 && mFixedParams.dataType == DATA_TYPE_BF16 && mFixedParams.headSizeV == 128;
 
         // These treatments are only for other MLA cases
-        if (!isHopperFP8GenerationMLA && !isHopperBF16ContextMLA)
+        if (!isHopperContextMLA && !isHopperFP8GenerationMLA)
         {
             mLaunchParams.granular_tiling = true;
             // Even on SM90, we use ampere-style kernel, will be optimized later
