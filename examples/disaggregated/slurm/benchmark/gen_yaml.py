@@ -123,6 +123,7 @@ def gen_config_file(config_path: str,
                     model_path: str,
                     num_ctx_servers: int,
                     ctx_tp_size: int,
+                    ctx_pp_size: int,
                     ctx_batch_size: int,
                     ctx_max_num_tokens: int,
                     ctx_max_seq_len: int,
@@ -130,6 +131,7 @@ def gen_config_file(config_path: str,
                     ctx_enable_attention_dp: bool,
                     num_gen_servers: int,
                     gen_tp_size: int,
+                    gen_pp_size: int,
                     gen_batch_size: int,
                     gen_max_num_tokens: int,
                     gen_max_seq_len: int,
@@ -148,6 +150,7 @@ def gen_config_file(config_path: str,
         model_path: Path to the model
         num_ctx_servers: Number of context servers
         ctx_tp_size: Tensor parallel size for context servers
+        ctx_pp_size: Pipeline parallel size for context servers
         ctx_batch_size: Batch size for context servers
         ctx_max_num_tokens: Max number of tokens for context servers
         ctx_max_seq_len: Max sequence length for context servers
@@ -155,6 +158,7 @@ def gen_config_file(config_path: str,
         ctx_enable_attention_dp: Enable attention DP for context servers
         num_gen_servers: Number of generation servers
         gen_tp_size: Tensor parallel size for generation servers
+        gen_pp_size: Pipeline parallel size for generation servers
         gen_batch_size: Batch size for generation servers
         gen_max_num_tokens: Max number of tokens for generation servers
         gen_enable_attention_dp: Enable attention DP for generation servers
@@ -187,7 +191,7 @@ def gen_config_file(config_path: str,
             'tensor_parallel_size': ctx_tp_size,
             'moe_expert_parallel_size': ctx_tp_size,
             'enable_attention_dp': ctx_enable_attention_dp,
-            'pipeline_parallel_size': 1,
+            'pipeline_parallel_size': ctx_pp_size,
             'print_iter_log': True,
             'disable_overlap_scheduler': True,
             'kv_cache_config': {
@@ -205,7 +209,7 @@ def gen_config_file(config_path: str,
             'tensor_parallel_size': gen_tp_size,
             'moe_expert_parallel_size': gen_tp_size,
             'enable_attention_dp': gen_enable_attention_dp,
-            'pipeline_parallel_size': 1,
+            'pipeline_parallel_size': gen_pp_size,
             'max_batch_size': gen_batch_size,
             'max_num_tokens': gen_max_num_tokens,
             'max_seq_len': gen_max_seq_len,
@@ -237,15 +241,15 @@ def gen_config_file(config_path: str,
 
     # Generate URLs for context and generation servers
     ctx_urls, task_nodes_offset = generate_urls("ctx", num_ctx_servers,
-                                                ctx_tp_size, 1,
+                                                ctx_tp_size, ctx_pp_size,
                                                 max_tasks_per_node, nodes,
                                                 task_nodes, node_ports)
     if num_ctx_servers > 0:
         config['context_servers']['urls'] = ctx_urls
 
-    gen_urls, _ = generate_urls("gen", num_gen_servers, gen_tp_size, 1,
-                                max_tasks_per_node, nodes, task_nodes,
-                                node_ports, task_nodes_offset)
+    gen_urls, _ = generate_urls("gen", num_gen_servers, gen_tp_size,
+                                gen_pp_size, max_tasks_per_node, nodes,
+                                task_nodes, node_ports, task_nodes_offset)
     config['generation_servers']['urls'] = gen_urls
 
     # set the hostname to the first node
@@ -300,6 +304,10 @@ if __name__ == "__main__":
                         type=int,
                         required=True,
                         help="Tensor parallel size for context servers")
+    parser.add_argument("--ctx_pp_size",
+                        type=int,
+                        default=1,
+                        help="Pipeline parallel size for context servers")
     parser.add_argument("--ctx_batch_size",
                         type=int,
                         required=True,
@@ -328,6 +336,10 @@ if __name__ == "__main__":
                         type=int,
                         required=True,
                         help="Tensor parallel size for generation servers")
+    parser.add_argument("--gen_pp_size",
+                        type=int,
+                        default=1,
+                        help="Pipeline parallel size for generation servers")
     parser.add_argument("--gen_batch_size",
                         type=int,
                         required=True,
@@ -372,11 +384,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     gen_config_file(args.config, args.model, args.num_ctx_servers,
-                    args.ctx_tp_size, args.ctx_batch_size,
+                    args.ctx_tp_size, args.ctx_pp_size, args.ctx_batch_size,
                     args.ctx_max_num_tokens, args.ctx_max_seq_len,
                     args.ctx_free_gpu_memory_fraction,
                     args.ctx_enable_attention_dp, args.num_gen_servers,
-                    args.gen_tp_size, args.gen_batch_size,
+                    args.gen_tp_size, args.gen_pp_size, args.gen_batch_size,
                     args.gen_max_num_tokens, args.gen_max_seq_len,
                     args.gen_enable_attention_dp, args.gen_gpu_memory_fraction,
                     args.eplb_num_slots, args.mtp_size, args.worker_start_port,
