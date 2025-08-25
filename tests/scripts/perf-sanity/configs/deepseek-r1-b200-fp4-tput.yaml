@@ -1,0 +1,13 @@
+# tput scenarios uses CUTLASS backend and enable_attention_dp
+extra_configs:
+  cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 1024
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+      dtype: fp8
+      free_gpu_memory_fraction: 0.9
+  stream_interval: 10
+  moe_config:
+      backend: CUTLASS

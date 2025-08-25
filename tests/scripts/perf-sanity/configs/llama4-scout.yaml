@@ -1,0 +1,18 @@
+
+# options specifiec in trtllm-serve command line
+cmd_configs:
+  max_num_tokens: 16384
+  max_batch_size: 1024
+  max_seq_len: 2048
+
+## --extra_llm_api_options
+extra_configs:
+  cuda_graph_config:
+     enable_padding: true
+     max_batch_size: ${MAX_BATCH_SIZE}
+  kv_cache_config:
+     dtype: fp8
+     free_gpu_memory_fraction: 0.9
+     enable_block_reuse: false 
+  print_iter_log: true
+  stream_interval: 10
