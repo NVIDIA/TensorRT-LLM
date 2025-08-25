@@ -311,7 +311,9 @@ class LmEvalEvaluator(Evaluator):
             ) from e
         import lm_eval.tasks
         self.MULTIMODAL = is_multimodal
-        print(f"LmEvalEvaluator::__init__: apply_chat_template: {apply_chat_template}")
+        print(
+            f"LmEvalEvaluator::__init__: apply_chat_template: {apply_chat_template}"
+        )
         if self.MULTIMODAL:
             apply_chat_template = True
             logger.info(
