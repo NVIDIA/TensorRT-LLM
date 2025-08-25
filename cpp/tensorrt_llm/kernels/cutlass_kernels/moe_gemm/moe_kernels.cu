@@ -4493,11 +4493,6 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
             gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
             gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 
-            bool const use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
-            bool const use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
-                && mWType == nvinfer1::DataType::kUINT8);
-            bool const use_w4_groupwise = use_w4afp8 || use_wfp4a16;
-
             gemm1_tma_ws_input.swap_ab = swap_ab;
             gemm2_tma_ws_input.swap_ab = swap_ab;
 
