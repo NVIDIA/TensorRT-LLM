@@ -42,7 +42,7 @@ from .guided_decoder import GuidedDecoder
 from .handle_logits import HandleLogits
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse)
+                          LlmResponse, SamplingConfig)
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
@@ -924,6 +924,10 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
+        if (self.drafter is not None and hasattr(self.drafter, 'spec_config')
+                and self.drafter.spec_config.spec_dec_mode.is_ngram()):
+            context_request_mapping = {}
+            generation_request_mapping = {}
         with self._profiler() as profile_step:
             sample_state = None
             iter_start_time = time.time()
@@ -963,8 +967,37 @@ class PyExecutor:
                             if self.guided_decoder is not None:
                                 self.guided_decoder.rollback_rejected_tokens(
                                     scheduled_batch)
+                            greedy_sample_requests = ScheduledRequests()
+                            if hasattr(
+                                    self.drafter, 'spec_config'
+                            ) and self.drafter.spec_config.spec_dec_mode.is_ngram(
+                            ):
+                                for req in scheduled_batch.generation_requests:
+                                    if req.py_request_id not in generation_request_mapping:
+                                        generation_request_mapping[
+                                            req.py_request_id] = req.clone()
+                                        generation_request_mapping[
+                                            req.
+                                            py_request_id].sampling_config = SamplingConfig(
+                                            )
+                                    greedy_sample_requests.generation_requests.append(
+                                        generation_request_mapping[
+                                            req.py_request_id])
+                                for req in scheduled_batch.context_requests:
+                                    if req.py_request_id not in context_request_mapping:
+                                        context_request_mapping[
+                                            req.py_request_id] = req.clone()
+                                        context_request_mapping[
+                                            req.
+                                            py_request_id].sampling_config = SamplingConfig(
+                                            )
+                                    greedy_sample_requests.context_requests.append(
+                                        context_request_mapping[
+                                            req.py_request_id])
+
                             self.drafter.prepare_draft_tokens(
-                                scheduled_batch, self.resource_manager)
+                                scheduled_batch, generation_request_mapping,
+                                self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
@@ -973,8 +1006,17 @@ class PyExecutor:
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
 
+                    if (self.drafter is not None
+                            and hasattr(self.drafter, 'spec_config') and
+                            self.drafter.spec_config.spec_dec_mode.is_ngram()):
+                        if len(greedy_sample_requests.generation_requests) > 0:
+                            greedy_sample_state = self._sample_async(
+                                greedy_sample_requests, batch_outputs)
+                            self._update_requests(greedy_sample_state)
+
                     self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state)
+                    self._update_requests(sample_state,
+                                          force_use_rejection_sampling=True)
 
                     if self.kv_cache_transceiver:
                         ctx_transmission_reqs = self._send_disagg_ctx_cache(
@@ -1536,9 +1578,12 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self, sample_state: SampleState):
+    def _update_requests(self,
+                         sample_state: SampleState,
+                         force_use_rejection_sampling: bool = False):
         try:
-            self.sampler.update_requests(sample_state)
+            self.sampler.update_requests(sample_state,
+                                         force_use_rejection_sampling)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)

@@ -397,6 +397,53 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.state = LlmRequestState.GENERATION_COMPLETE
         self.set_finished_reason(reason, beam)
 
+    def clone(self):
+        return LlmRequest(
+            request_id=self.py_request_id,
+            max_num_tokens=self.max_num_tokens,
+            input_tokens=self.input_tokens,
+            sampling_config=self.sampling_config,
+            is_streaming=self.is_streaming,
+            end_id=self.end_id,
+            pad_id=self.pad_id,
+            embedding_bias=self.embedding_bias,
+            bad_words_list=self.bad_words_list,
+            stop_words_list=self.stop_words_list,
+            prompt_embedding_table=self.prompt_embedding_table,
+            prompt_vocab_size=self.prompt_vocab_size,
+            multimodal_hashes=self.multimodal_hashes,
+            multimodal_positions=self.multimodal_positions,
+            multimodal_lengths=self.multimodal_lengths,
+            multimodal_embedding=self.multimodal_embedding,
+            lora_task_id=self.lora_task_id,
+            lora_weights=self.lora_weights,
+            lora_config=self.lora_config,
+            py_lora_path=self.py_lora_path,
+            mrope_rotary_cos_sin=self.mrope_rotary_cos_sin,
+            mrope_position_deltas=self.mrope_position_deltas,
+            lookahead_config=self.lookahead_config,
+            return_log_probs=self.return_log_probs,
+            return_context_logits=self.return_context_logits,
+            return_generation_logits=self.return_generation_logits,
+            return_perf_metrics=self.return_perf_metrics,
+            exclude_last_generation_logits=self.exclude_last_generation_logits,
+            draft_tokens=self.draft_tokens,
+            draft_logits=self.draft_logits,
+            exclude_input_from_output=self.exclude_input_from_output,
+            logits_post_processor=self.logits_post_processor,
+            apply_logits_post_processor_batched=self.
+            apply_logits_post_processor_batched,
+            guided_decoding_params=self.guided_decoding_params,
+            py_logits_post_processors=self.py_logits_post_processors,
+            encoder_input_tokens=self.encoder_input_tokens,
+            return_encoder_output=self.return_encoder_output,
+            client_id=self.client_id,
+            priority=self.priority,
+            llm_request_type=self.llm_request_type,
+            context_phase_params=self.context_phase_params,
+            py_multimodal_data=self.py_multimodal_data,
+            seq_slot=self.py_seq_slot)
+
     def create_child_request(self, child_id):
         child = super().create_child_request(child_id)
         py_request = LlmRequest(llm_request=child)
