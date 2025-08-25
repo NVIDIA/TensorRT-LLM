@@ -74,6 +74,11 @@ public:
     {
         return -3.40282347E+38F;
     }
+
+    static constexpr float infinity() noexcept
+    {
+        return __int_as_float(0x7f800000);
+    }
 };
 
 template <typename T>
