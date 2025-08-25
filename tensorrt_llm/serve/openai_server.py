@@ -251,8 +251,12 @@ class OpenAIServer:
 
     async def get_iteration_stats(self) -> JSONResponse:
         stats = []
-        async for stat in self.llm.get_stats_async(2):
-            stats.append(stat)
+        try:
+            async for stat in self.llm.get_stats_async(2):
+                stats.append(stat)
+        except IndexError:
+            # queue is empty, no more stats
+            pass
         return JSONResponse(content=stats)
 
     async def get_kv_cache_events(self) -> JSONResponse:
