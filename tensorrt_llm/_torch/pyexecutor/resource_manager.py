@@ -615,16 +615,27 @@ class KVCacheManager(BaseResourceManager):
         return (self.get_num_free_blocks() * self.tokens_per_block -
                 self.num_extra_kv_tokens - max_num_draft_tokens)
 
-    def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
+    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
         result = self.impl.get_primary_pool_data(layer_offset)
-        return result.reshape(
-            result.shape[0],
-            self.kv_factor,
-            self.tokens_per_block,
-            self.num_kv_heads_per_layer[layer_offset],
-            self.head_dim,
-        )
+
+        assert kv_layout in ["NHD", "HND"], f"Unsupported kv_layout: {kv_layout}"
+        if kv_layout == "NHD":
+            return result.reshape(
+                result.shape[0],
+                self.kv_factor,
+                self.tokens_per_block,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.head_dim,
+            )
+        else:
+            return result.reshape(
+                result.shape[0],
+                self.kv_factor,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.tokens_per_block,
+                self.head_dim,
+            )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
