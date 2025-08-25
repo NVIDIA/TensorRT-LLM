@@ -41,7 +41,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -52,6 +52,7 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
+from ..distributed.ops import MNNVLAllReduce
 from ..model_config import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
@@ -738,10 +739,24 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 intermediate_size // block_size,
                 self.mapping.tp_size,
             )
-            mlp_tp_size = math.gcd(
-                tp,
-                self.mapping.gpus_per_node,
-            ) if tp > self.mapping.gpus_per_node else tp  # Avoid costly inter-node TP
+            # mlp_tp_size = math.gcd(
+            #     tp,
+            #     self.mapping.gpus_per_node,
+            # ) if tp > self.mapping.gpus_per_node else tp  # Avoid costly inter-node TP
+            if tp > self.mapping.gpus_per_node and (
+                    self.model_config.allreduce_strategy not in (
+                        AllReduceStrategy.AUTO,
+                        AllReduceStrategy.MNNVL,
+                    ) or not MNNVLAllReduce.is_mnnvl(
+                        self.mapping,
+                        self.model_config.pretrained_config.torch_dtype)):
+                mlp_tp_size = math.gcd(
+                    tp,
+                    self.mapping.gpus_per_node,
+                )  # Avoid costly inter-node TP when MNNVL is not supported and tp > gpus_per_node
+            else:
+                mlp_tp_size = tp
+
         return mlp_tp_size
 
     def forward(
