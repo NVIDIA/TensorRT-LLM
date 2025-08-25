@@ -7,6 +7,7 @@ from ..speculative.interface import SpecMetadata
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
+from .external_api import APIDrafter
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -52,7 +53,8 @@ def get_spec_metadata(spec_config,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
-        spec_config.spec_dec_mode.is_user_provided():
+        spec_config.spec_dec_mode.is_user_provided() or \
+        spec_config.spec_dec_mode.is_external_api():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
@@ -101,6 +103,8 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return NGramPoolManager(spec_config, max_num_requests)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
+    if spec_dec_mode.is_external_api():
+        return None
     return None
 
 
@@ -129,7 +133,6 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_user_provided():
         return spec_config.drafter
-
     max_num_requests = model_engine.batch_size
     if spec_config.spec_dec_mode.is_draft_target(
     ) or spec_config.spec_dec_mode.is_eagle3():
@@ -143,7 +146,8 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
-
+    if spec_config.spec_dec_mode.is_external_api():
+        return APIDrafter(spec_config)
     return None
 
 
