@@ -1699,10 +1699,21 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          16,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         True,
+                         True,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
         ],
         ids=[
             "latency", "latency_trtllmgen", "throughput", "throughput_tp8",
-            "throughput_tp4"
+            "throughput_tp4", "throughput_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
@@ -1746,8 +1757,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
         [(8, 1, 4, 3, False, False, True, True, 1),
-         (8, 1, 8, 0, True, True, True, True, 24)],
-        ids=["latency", "throughput"])
+         (8, 1, 8, 0, True, True, True, True, 24),
+         (8, 1, 8, 1, True, True, True, True, 24)],
+        ids=["latency", "throughput", "throughput_mtp"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size):

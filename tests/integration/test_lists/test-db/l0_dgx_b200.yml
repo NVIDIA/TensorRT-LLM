@@ -49,6 +49,28 @@ l0_dgx_b200:
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-CUTLASS]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp]
 - condition:
     ranges:
       system_gpu_count:
