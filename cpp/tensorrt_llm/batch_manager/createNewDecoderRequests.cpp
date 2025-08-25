@@ -54,7 +54,8 @@ using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 namespace
 {
 
-void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffers& inputBuffers,
+//! @brief Fills the seqSlots and sequence lengths in the inputBuffers.
+TensorPtr copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffers& inputBuffers,
     ITensor& sequenceLengths, SizeType32 beamWidth, runtime::CudaStream const& stream)
 {
     auto const bufferManager = BufferManager{std::make_shared<CudaStream>(stream.get())};
@@ -82,6 +83,7 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
     }
 
     // copy sequence lengths
+    if (!contextRequests.empty())
     {
         auto batchSlotsDeviceView = tr::ITensor::slice(inputBuffers.setupBatchSlotsDevice, 0, batchSize);
         auto fillValuesViewDevice = tr::ITensor::slice(inputBuffers.fillValuesDevice, 0, batchSize);
@@ -90,6 +92,8 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
         bufferManager.copy(*fillValuesView, *fillValuesViewDevice);
         tr::kernels::invokeFillBatch(sequenceLengths, *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream);
     }
+
+    return batchSlotsView;
 }
 
 /// @brief Retrieve the embedding bias from the request. This potentially makes a copy of the tensor
@@ -131,7 +135,46 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
 
 } // namespace
 
-std::tuple<TensorPtr, std::vector<runtime::SamplingConfig>, std::vector<runtime::ITensor::SharedConstPtr>,
+// Similar to copySequenceLengths, but only fills the seqSlots.
+TensorPtr CreateNewDecoderRequests::fillBatchSlots(RequestVector const& requests, DecoderInputBuffers& inputBuffers)
+{
+    auto const batchSize = requests.size();
+    auto batchSlotsView = tr::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
+
+    auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlotsView);
+
+    // fill buffers on host
+    SizeType32 batchIdx{0};
+    for (auto const& llmReq : requests)
+    {
+        auto const seqSlot = llmReq->mSeqSlot.value();
+        batchSlotsRange[batchIdx] = seqSlot;
+        ++batchIdx;
+    }
+
+    // TODO: copy to device and use in GptDecoder
+    // manager.copy(*batchSlotsView, *batchSlotsDeviceView);
+
+    return batchSlotsView;
+}
+
+std::optional<SamplingConfig> CreateNewDecoderRequests::fuseSamplingConfigs(RequestVector const& requests)
+{
+    if (requests.empty())
+    {
+        return std::nullopt;
+    }
+
+    std::vector<SamplingConfig> samplingConfigs;
+    samplingConfigs.reserve(requests.size());
+    for (auto const& llmReq : requests)
+    {
+        samplingConfigs.push_back(llmReq->mSamplingConfig);
+    }
+    return SamplingConfig(samplingConfigs);
+}
+
+std::tuple<TensorPtr, runtime::SamplingConfig, std::vector<runtime::ITensor::SharedConstPtr>,
     std::vector<executor::LookaheadDecodingConfig>>
 CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, nvinfer1::DataType logitsType,
@@ -142,33 +185,21 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(CreateNewDecoderRequests);
 
-    RequestVector finishedContextRequests;
-    std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
-        [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
+    TLLM_CHECK_WITH_INFO(
+        !contextRequests.empty(), "CreateNewDecoderRequests should be called with at least one request");
 
-    if (!finishedContextRequests.empty())
-    {
-        copySequenceLengths(
-            finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth, runtimeStream);
-    }
+    auto batchSlotsView = copySequenceLengths(
+        contextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth, runtimeStream);
 
     auto [lookaheadPrompt, lookaheadAlgoConfigs]
-        = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig, decoderState,
-            logitsType, modelConfig, worldConfig, runtimeStream, decoderStream, maxSequenceLength, medusaBuffers);
+        = createDecoderRequests(contextRequests, inputBuffers.inputsIds, decodingConfig, decoderState, logitsType,
+            modelConfig, worldConfig, runtimeStream, decoderStream, maxSequenceLength, medusaBuffers);
 
-    auto const batchSize = finishedContextRequests.size();
-
-    std::vector<SamplingConfig> samplingConfigs;
-    samplingConfigs.reserve(batchSize);
-    for (auto const& llmReq : finishedContextRequests)
-    {
-        samplingConfigs.push_back(llmReq->mSamplingConfig);
-    }
-
-    TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
+    auto samplingConfig = fuseSamplingConfigs(contextRequests);
+    TLLM_CHECK(samplingConfig.has_value());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(batchSlotsView), std::move(samplingConfigs), std::move(lookaheadPrompt),
+    return {std::move(batchSlotsView), std::move(samplingConfig.value()), std::move(lookaheadPrompt),
         std::move(lookaheadAlgoConfigs)};
 }
 

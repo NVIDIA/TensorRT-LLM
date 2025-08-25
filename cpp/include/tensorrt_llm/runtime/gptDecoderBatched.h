@@ -26,12 +26,6 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <memory>
-#include <vector>
-
-namespace tensorrt_llm::batch_manager
-{
-class LlmRequest;
-} // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::runtime
 {
@@ -41,16 +35,12 @@ class GptDecoderBatched : public IGptDecoderBatched
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
-    using LlmRequestPtr = std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>;
-    using RequestVector = std::vector<LlmRequestPtr>;
     using TensorPtr = ITensor::SharedPtr;
 
     explicit GptDecoderBatched(CudaStreamPtr stream);
 
     void setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig) override;
-
-    void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) override;
 
     CudaEvent forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) override;
     void forward(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) override;
@@ -60,12 +50,12 @@ public:
     [[nodiscard]] CudaEvent finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
         SamplingConfig const& samplingConfig, bool streaming) const override;
 
-    CudaStreamPtr getDecoderStream() const
+    [[nodiscard]] CudaStreamPtr getDecoderStream() const
     {
         return mDecoderStream;
     }
 
-    IGptDecoder& getUnderlyingDecoder() const
+    [[nodiscard]] IGptDecoder& getUnderlyingDecoder() const
     {
         return *mDecoder.get();
     }
