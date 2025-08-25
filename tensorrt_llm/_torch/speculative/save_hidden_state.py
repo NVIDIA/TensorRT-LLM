@@ -54,8 +54,7 @@ class SaveHiddenStatesDrafter(Drafter):
         super().__init__(spec_config.max_concurrency)
         self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
-        self._iter = 0
-        self._start_iter = 0
+        self._iter = 1
         self._output_directory = spec_config.output_directory
         self._file_prefix = spec_config.file_prefix
         self._write_interval = spec_config.write_interval
@@ -67,7 +66,7 @@ class SaveHiddenStatesDrafter(Drafter):
             self, request: LlmRequest,
             resource_manager: SaveHiddenStatesResourceManager) -> None:
         out_dict = {}
-        if local_mpi_rank() != 0:
+        if local_mpi_rank() == 0:
             input_ids = torch.tensor(list(request.get_tokens(0)),
                                      dtype=torch.long,
                                      device='cpu')
@@ -96,7 +95,7 @@ class SaveHiddenStatesDrafter(Drafter):
             self._saved_state.append(out_dict)
 
     def _write_to_file(self) -> None:
-        if local_mpi_rank() == 0 and self._iter != self._start_iter:
+        if local_mpi_rank() == 0:
             output_path = os.path.join(self._output_directory,
                                        f"{self._file_prefix}_{self._iter}.pt")
             torch.save(self._saved_state, output_path)
@@ -113,12 +112,32 @@ class SaveHiddenStatesDrafter(Drafter):
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
             request.py_max_new_tokens = 1
+            # Pad length to `self.max_draft_len`
+            draft_tokens = [0] * self.max_draft_len
+            request.py_draft_tokens = draft_tokens
+
+    def prepare_draft_tokens_post(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
+        is_warmup: bool = False,
+    ) -> None:
+        for request in sorted(
+                scheduled_requests.context_requests,
+                key=lambda r:
+            (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
+        ):
+            if is_warmup:
+                continue
             self._process_request(request, self.spec_resource_manager)
             if self._iter % self._write_interval == 0:
                 self._write_to_file()
             self._iter += 1
-            # Pad length to `self.max_draft_len`
-            if len(draft_tokens) > 0:
-                pad_length = self.max_draft_len - len(draft_tokens)
-                draft_tokens.extend([0] * pad_length)
-            request.py_draft_tokens = draft_tokens
+
+    def needs_draft_forward_post(self) -> bool:
+        """
+        If draft forward needs to be run directly after the target model forward,
+        this method can be overridden to do that.
+        Used in SaveHiddenStatesDrafter (to ensure correct input_ids)
+        """
+        return False
