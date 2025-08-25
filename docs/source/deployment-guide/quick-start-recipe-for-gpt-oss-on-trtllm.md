@@ -69,9 +69,11 @@ cat << EOF > ${EXTRA_LLM_API_FILE}
 enable_attention_dp: false
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 128
+  max_batch_size: 720
 moe_config:
     backend: TRTLLM
+stream_interval: 10
+num_postprocess_workers: 4
 EOF
 ```
 
@@ -84,9 +86,11 @@ cat << EOF > ${EXTRA_LLM_API_FILE}
 enable_attention_dp: true
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 128
+  max_batch_size: 720
 moe_config:
     backend: CUTLASS
+stream_interval: 10
+num_postprocess_workers: 4
 EOF
 ```
 
@@ -99,9 +103,8 @@ trtllm-serve openai/gpt-oss-120b \
     --host 0.0.0.0 \
     --port 8000 \
     --backend pytorch \
-    --max_batch_size 128 \
+    --max_batch_size 720 \
     --max_num_tokens 16384 \
-    --max_seq_len 2048 \
     --kv_cache_free_gpu_memory_fraction 0.9 \
     --tp_size 8 \
     --ep_size 8 \
@@ -134,7 +137,7 @@ These options are used directly on the command line when you start the `trtllm-s
 
 #### `--max_batch_size`
 
-* **Description:** The maximum number of user requests that can be grouped into a single batch for processing.
+* **Description:** The maximum number of user requests that can be grouped into a single batch for processing. The actual max batch size that can be achieved depends on total sequence length (input + output).
 
 #### `--max_num_tokens`
 
@@ -142,7 +145,7 @@ These options are used directly on the command line when you start the `trtllm-s
 
 #### `--max_seq_len`
 
-* **Description:** The maximum possible sequence length for a single request, including both input and generated output tokens.
+* **Description:** The maximum possible sequence length for a single request, including both input and generated output tokens. We won't specifically set it. It will be inferred from model config.
 
 #### `--trust_remote_code`
 
@@ -229,8 +232,7 @@ TODO: Use Chat Compeletions API / Responses API as the example after the PR is m
 ### Running Evaluations to Verify Accuracy (Optional)
 
 We use OpenAI's official evaluation tool to test the model's accuracy. For more information see [https://github.com/openai/gpt-oss/tree/main/gpt_oss/evals](gpt-oss-eval).
-
-TODO(@Binghan Chen): Add instructions for running gpt-oss-eval.
+With the added support of Chat Completions and Responses API in `trtllm-serve,` `gpt_oss.evals` works directly without any modifications.
 
 ## Benchmarking Performance
 
@@ -266,6 +268,8 @@ done
 EOF
 chmod +x bench.sh
 ```
+
+To achieve max through-put, with attention DP on, one needs to sweep up to `concurrency = max_batch_size * num_gpus`.
 
 If you want to save the results to a file add the following options.
 
