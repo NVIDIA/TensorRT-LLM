@@ -516,15 +516,15 @@ class Deepseekv3MoE(nn.Module):
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
             if isinstance(self.experts, TRTLLMGenFusedMoE):
-                print(f"[DEBUG] Deepseekv3MoE.compute_routed_output - all_rank_num_tokens: {all_rank_num_tokens}")
+                # print(f"[DEBUG] Deepseekv3MoE.compute_routed_output - all_rank_num_tokens: {all_rank_num_tokens}")
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
                                           sizes=all_rank_num_tokens)
-        print(f"[DEBUG] Deepseekv3MoE.compute_routed_output.gather - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # print(f"[DEBUG] Deepseekv3MoE.compute_routed_output.gather - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         router_logits = self.gate(hidden_states)
 
-        print(f"[DEBUG] Deepseekv3MoE.compute_routed_output.gate - router_logits shape: {router_logits.shape}, dtype: {router_logits.dtype}")
+        # print(f"[DEBUG] Deepseekv3MoE.compute_routed_output.gate - router_logits shape: {router_logits.shape}, dtype: {router_logits.dtype}")
         routed_output = self.experts(
             hidden_states_fp4 or hidden_states,
             router_logits,
@@ -550,7 +550,7 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            print(f"[DEBUG] Deepseekv3MoE.forward - _compute_shared_output - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}, all_rank_num_tokens: {all_rank_num_tokens}")
+            # print(f"[DEBUG] Deepseekv3MoE.forward - _compute_shared_output - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}, all_rank_num_tokens: {all_rank_num_tokens}")
             shared_output = self.shared_experts(hidden_states_fp4
                                                 or hidden_states)
             if self.shared_output_scale is not None:
@@ -558,7 +558,7 @@ class Deepseekv3MoE(nn.Module):
             return shared_output
 
         def _compute_routed_output():
-            print(f"[DEBUG] Deepseekv3MoE.forward - _compute_routed_output - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}, all_rank_num_tokens: {all_rank_num_tokens}")
+            # print(f"[DEBUG] Deepseekv3MoE.forward - _compute_routed_output - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}, all_rank_num_tokens: {all_rank_num_tokens}")
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
@@ -615,6 +615,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_fusion = os.environ.get(
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
+
+        self.enable_split_batch_overlap = os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP") == "1"
+        self.enable_split_batch_overlap_local_bs = int(os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_LOCAL_BS",0))
+        self.enable_split_batch_overlap_split_bs = int(os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_SPLIT_BS",0))
+        if self.enable_split_batch_overlap:
+            assert self.enable_split_batch_overlap_local_bs > 0 and self.enable_split_batch_overlap_split_bs > 0, "ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_LOCAL_BS and ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP_SPLIT_BS must be set"
 
         # FIXME: incompatible with mixed quantization mode
         quant_config = self._get_decoder_layer_quant_config(
@@ -680,6 +686,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
+        self.aux_stream_dict = aux_stream_dict
+
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         """
@@ -742,76 +750,81 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             hidden_states = self.input_layernorm(hidden_states)
         
         # Self Attention
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states shape: {hidden_states.shape if hidden_states is not None else None}")
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata: {attn_metadata}")
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.kv_cache_pool_pointers: {attn_metadata.kv_cache_manager.kv_cache_pool_pointers.shape}")
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.tokens_per_block: {attn_metadata.kv_cache_manager.tokens_per_block}")
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.max_seq_len: {attn_metadata.kv_cache_manager.max_seq_len}")
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.head_dim: {attn_metadata.kv_cache_manager.head_dim}")
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.kv_cache_block_offsets: {attn_metadata.kv_cache_block_offsets.shape}")
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.host_kv_cache_block_offsets: {attn_metadata.host_kv_cache_block_offsets.shape}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states shape: {hidden_states.shape if hidden_states is not None else None}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata: {attn_metadata}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.kv_cache_pool_pointers: {attn_metadata.kv_cache_manager.kv_cache_pool_pointers.shape}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.tokens_per_block: {attn_metadata.kv_cache_manager.tokens_per_block}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.max_seq_len: {attn_metadata.kv_cache_manager.max_seq_len}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.head_dim: {attn_metadata.kv_cache_manager.head_dim}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.kv_cache_block_offsets: {attn_metadata.kv_cache_block_offsets.shape}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.host_kv_cache_block_offsets: {attn_metadata.host_kv_cache_block_offsets.shape}")
         num_requests = position_ids.shape[1]
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests: {num_requests}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests: {num_requests}")
         
-        if num_requests == 64 and os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP") == "1" and attn_metadata.num_contexts == 0:
+        if self.enable_split_batch_overlap and \
+            num_requests == self.enable_split_batch_overlap_local_bs and attn_metadata.num_contexts == 0:
             
-            stream_half1 = torch.cuda.Stream()
-            stream_half2 = torch.cuda.Stream()
+            stream_half1 = self.aux_stream_dict[AuxStreamType.Attention]
+            stream_half2 = self.aux_stream_dict[AuxStreamType.MoeChunkingOverlap]
 
             # Create CUDA event to synchronize between streams
             event_half1_complete = torch.cuda.Event()
 
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests == 64")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests == 64")
             hidden_states_half1, hidden_states_half2 = hidden_states.chunk(2, dim=0)
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1.shape} {hidden_states_half2.shape}")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1.shape} {hidden_states_half2.shape}")
             position_ids_half1, position_ids_half2 = position_ids.chunk(2, dim=1)
             residual_half1, residual_half2 = residual.chunk(2, dim=0)
             
             attn_metadata_half1 = copy.copy(attn_metadata)
-            attn_metadata_half1.max_num_requests = 32
-            attn_metadata_half1.max_num_sequences = 32
-            attn_metadata_half1.all_rank_num_tokens = [32, 32]
-            attn_metadata_half1.all_rank_max_num_tokens = 32
+            attn_metadata_half1.max_num_requests = self.enable_split_batch_overlap_split_bs
+            attn_metadata_half1.max_num_sequences = self.enable_split_batch_overlap_split_bs
+            attn_metadata_half1.all_rank_num_tokens = [self.enable_split_batch_overlap_split_bs, self.enable_split_batch_overlap_split_bs]
+            attn_metadata_half1.all_rank_max_num_tokens = self.enable_split_batch_overlap_split_bs
             attn_metadata_half1.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
             #attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
-            attn_metadata_half1.kv_cache_manager.tokens_per_block = 32  
-            attn_metadata_half1.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,:32,:,:]
-            attn_metadata_half1.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,:32,:,:]
-            attn_metadata_half1.seq_lens = attn_metadata.seq_lens[:32]
-            attn_metadata_half1.seq_lens_kv = attn_metadata.seq_lens_kv[:32]
-            attn_metadata_half1.prompt_lens = attn_metadata.prompt_lens[:32]
-            attn_metadata_half1.request_ids = attn_metadata.request_ids[:32]
-            attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:32]
+            attn_metadata_half1.kv_cache_manager.tokens_per_block = self.enable_split_batch_overlap_split_bs  
+            attn_metadata_half1.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,:self.enable_split_batch_overlap_split_bs,:,:]
+            attn_metadata_half1.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,:self.enable_split_batch_overlap_split_bs,:,:]
+            attn_metadata_half1.seq_lens = attn_metadata.seq_lens[:self.enable_split_batch_overlap_split_bs]
+            attn_metadata_half1.seq_lens_kv = attn_metadata.seq_lens_kv[:self.enable_split_batch_overlap_split_bs]
+            attn_metadata_half1.prompt_lens = attn_metadata.prompt_lens[:self.enable_split_batch_overlap_split_bs]
+            attn_metadata_half1.request_ids = attn_metadata.request_ids[:self.enable_split_batch_overlap_split_bs]
+            attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:self.enable_split_batch_overlap_split_bs]
             attn_metadata_half1.on_update()
 
             attn_metadata_half2 = copy.copy(attn_metadata)
-            attn_metadata_half2.max_num_requests = 32
-            attn_metadata_half2.max_num_sequences = 32
-            attn_metadata_half2.all_rank_num_tokens = [32, 32]
-            attn_metadata_half2.all_rank_max_num_tokens = 32
+            attn_metadata_half2.max_num_requests = self.enable_split_batch_overlap_split_bs
+            attn_metadata_half2.max_num_sequences = self.enable_split_batch_overlap_split_bs
+            attn_metadata_half2.all_rank_num_tokens = [self.enable_split_batch_overlap_split_bs, self.enable_split_batch_overlap_split_bs]
+            attn_metadata_half2.all_rank_max_num_tokens = self.enable_split_batch_overlap_split_bs
             attn_metadata_half2.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
             #attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
-            attn_metadata_half2.kv_cache_manager.tokens_per_block = 32  
-            attn_metadata_half2.kv_cache_manager.max_seq_len = 32
-            attn_metadata_half2.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,32:,:,:]
-            attn_metadata_half2.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,32:,:,:]
-            attn_metadata_half2.seq_lens = attn_metadata.seq_lens[32:]
-            attn_metadata_half2.seq_lens_kv = attn_metadata.seq_lens_kv[32:]
-            attn_metadata_half2.prompt_lens = attn_metadata.prompt_lens[32:]
-            attn_metadata_half2.request_ids = attn_metadata.request_ids[32:]
-            attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[32:]
+            attn_metadata_half2.kv_cache_manager.tokens_per_block = self.enable_split_batch_overlap_split_bs  
+            attn_metadata_half2.kv_cache_manager.max_seq_len = self.enable_split_batch_overlap_split_bs
+            attn_metadata_half2.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,self.enable_split_batch_overlap_split_bs:,:,:]
+            attn_metadata_half2.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,self.enable_split_batch_overlap_split_bs:,:,:]
+            attn_metadata_half2.seq_lens = attn_metadata.seq_lens[self.enable_split_batch_overlap_split_bs:]
+            attn_metadata_half2.seq_lens_kv = attn_metadata.seq_lens_kv[self.enable_split_batch_overlap_split_bs:]
+            attn_metadata_half2.prompt_lens = attn_metadata.prompt_lens[self.enable_split_batch_overlap_split_bs:]
+            attn_metadata_half2.request_ids = attn_metadata.request_ids[self.enable_split_batch_overlap_split_bs:]
+            attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:self.enable_split_batch_overlap_split_bs]
             attn_metadata_half2.on_update()
 
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata_half1: {attn_metadata_half1}")
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata_half2: {attn_metadata_half2}")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata_half1: {attn_metadata_half1}")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata_half2: {attn_metadata_half2}")
 
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - kwargs: {kwargs}")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - kwargs: {kwargs}")
 
             kwargs_half1 = kwargs.copy()
             if 'attn_metadata' in kwargs_half1:
-                print(f"[DEBUG] DeepseekV3DecoderLayer.forward - kwargs_half1: {kwargs_half1}")
+                # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - kwargs_half1: {kwargs_half1}")
                 del kwargs_half1['attn_metadata']
+
+            kwargs_half2 = kwargs.copy()
+            if 'attn_metadata' in kwargs_half2:
+                del kwargs_half2['attn_metadata']
            
             with torch.cuda.stream(stream_half1):
                 hidden_states_half1 = self.self_attn(
@@ -822,14 +835,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         enable_allreduce=not (self.disable_attn_allreduce)),
                     **kwargs_half1,
                 )
-                print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1.shape}")
-            # Record event when half1 is complete
-            event_half1_complete.record()
+                # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1.shape}")
+                # Record event when half1 is complete
+                event_half1_complete.record()
 
-            with torch.cuda.stream(stream_half1):
-                event_half1_complete.wait()
                 if isinstance(self.mlp, Deepseekv3MoE):
-                    print(f"[DEBUG] DeepseekV3DecoderLayer.forward - self.mlp is Deepseekv3MoE")
+                    # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - self.mlp is Deepseekv3MoE")
                     hidden_states_half1, residual_half1 = self.forward_MoE(
                         hidden_states=hidden_states_half1,
                         attn_metadata=attn_metadata_half1,
@@ -837,16 +848,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     )
                 else:
                     assert isinstance(self.mlp, GatedMLP)
-                    print(f"[DEBUG] DeepseekV3DecoderLayer.forward - self.mlp is GatedMLP")
+                    # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - self.mlp is GatedMLP")
                     hidden_states_half1, residual_half1 = self.forward_mlp(
                         hidden_states=hidden_states_half1,
                         residual=residual_half1,
                     )
-                print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1 after MOE/GatedMLP: {hidden_states_half1.shape}")
-            kwargs_half2 = kwargs.copy()
-            if 'attn_metadata' in kwargs_half2:
-                del kwargs_half2['attn_metadata']
-
+               
+                # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1 after MOE/GatedMLP: {hidden_states_half1.shape}")
             with torch.cuda.stream(stream_half2):
                 # Wait for half1 to complete before starting half2
                 event_half1_complete.wait()
@@ -874,11 +882,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             torch.cuda.current_stream().wait_stream(stream_half1)
             torch.cuda.current_stream().wait_stream(stream_half2)
             
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1[0].shape} {hidden_states_half1[1].shape}")
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half2: {hidden_states_half2[0].shape} {hidden_states_half2[1].shape}")
-                 
-            hidden_states = torch.cat([hidden_states_half1, hidden_states_half2], dim=0)
-            residual = torch.cat([residual_half1, residual_half2], dim=0)
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1[0].shape} {hidden_states_half1[1].shape}")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half2: {hidden_states_half2[0].shape} {hidden_states_half2[1].shape}")
+            # Concatenate hidden_states and residual in stream_half1
+            with torch.cuda.stream(stream_half1):
+                hidden_states = torch.cat([hidden_states_half1, hidden_states_half2], dim=0)
+                residual = torch.cat([residual_half1, residual_half2], dim=0)
+            
             return hidden_states, residual
         else:
             hidden_states = self.self_attn(
@@ -911,7 +921,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> torch.Tensor:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
@@ -926,7 +936,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
             # TODO: unify the two min-latency MoE backends by enabling quant fusion
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - self.fusion_config.PRE_MOE_FUSION: {self.fusion_config.PRE_MOE_FUSION}")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - self.fusion_config.PRE_MOE_FUSION: {self.fusion_config.PRE_MOE_FUSION}")
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -938,7 +948,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 ))
         else:
             # No fusion
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - No fusion")
+            # print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - No fusion")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
@@ -948,11 +958,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.fusion_config.POST_MOE_FUSION
                  and self.model_config.moe_backend == "TRTLLM"
                  and self.mlp.experts.has_nvfp4))
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - do_finalize: {do_finalize}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - do_finalize: {do_finalize}")
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
                                  do_finalize=do_finalize)
-        print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - hidden_states after MoE: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - hidden_states after MoE: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
                 hidden_states, residual = self.allreduce(
@@ -1179,9 +1189,9 @@ class DeepseekV3Model(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
-        print(f"[DEBUG] DeepSeekV3Model.forward - input_ids shape: {input_ids.shape if input_ids is not None else None}")
-        print(f"[DEBUG] DeepSeekV3Model.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
-        print(f"[DEBUG] DeepSeekV3Model.forward - inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}")
+        # print(f"[DEBUG] DeepSeekV3Model.forward - input_ids shape: {input_ids.shape if input_ids is not None else None}")
+        # print(f"[DEBUG] DeepSeekV3Model.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        # print(f"[DEBUG] DeepSeekV3Model.forward - inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}")
         
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -1190,23 +1200,23 @@ class DeepseekV3Model(DecoderModel):
         
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-            print(f"[DEBUG] DeepSeekV3Model.forward - Computed inputs_embeds shape: {inputs_embeds.shape}, dtype: {inputs_embeds.dtype}")
+            # print(f"[DEBUG] DeepSeekV3Model.forward - Computed inputs_embeds shape: {inputs_embeds.shape}, dtype: {inputs_embeds.dtype}")
 
         hidden_states = inputs_embeds
         residual = None
-        print(f"[DEBUG] DeepSeekV3Model.forward - Initial hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # print(f"[DEBUG] DeepSeekV3Model.forward - Initial hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
 
         for layer_idx, decoder_layer in enumerate(self.layers[:self.num_hidden_layers]):
-            print(f"[DEBUG] DeepSeekV3Model.forward - Layer {layer_idx} input hidden_states shape: {hidden_states.shape}")
+            # print(f"[DEBUG] DeepSeekV3Model.forward - Layer {layer_idx} input hidden_states shape: {hidden_states.shape}")
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
             )
-            print(f"[DEBUG] DeepSeekV3Model.forward - Layer {layer_idx} output hidden_states shape: {hidden_states.shape}")
+            # print(f"[DEBUG] DeepSeekV3Model.forward - Layer {layer_idx} output hidden_states shape: {hidden_states.shape}")
 
-        print(f"[DEBUG] DeepSeekV3Model.forward - Final hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # print(f"[DEBUG] DeepSeekV3Model.forward - Final hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         return hidden_states
 
 
@@ -1272,11 +1282,11 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Input keys: {list(kwargs.keys())}")
-        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - input_ids shape: {input_ids.shape if input_ids is not None else None}")
-        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
-        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}")
-        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - return_context_logits: {return_context_logits}")
+        # print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Input keys: {list(kwargs.keys())}")
+        # print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - input_ids shape: {input_ids.shape if input_ids is not None else None}")
+        # print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        # print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}")
+        # print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - return_context_logits: {return_context_logits}")
         
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
         hidden_states = self.model(
@@ -1285,7 +1295,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
         )
-        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Model output hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Model output hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
 
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
             # get logits
@@ -1295,7 +1305,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 attn_metadata,
                 True,
             )
-            print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - MTP logits shape: {logits.shape}, dtype: {logits.dtype}")
+            # print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - MTP logits shape: {logits.shape}, dtype: {logits.dtype}")
             # get accepted tokens and next draft tokens
             return self.mtp_worker(
                 input_ids=input_ids,
@@ -1314,7 +1324,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 attn_metadata,
                 return_context_logits,
             )
-            print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Final logits shape: {logits.shape}, dtype: {logits.dtype}")
+            # print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Final logits shape: {logits.shape}, dtype: {logits.dtype}")
             return logits
 
     def load_weights(self, weights: Dict):
