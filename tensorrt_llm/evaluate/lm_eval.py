@@ -390,7 +390,9 @@ class LmEvalEvaluator(Evaluator):
                  scores_filter: str = None) -> float:
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
-        print(f"self.apply_chat_template: {self.apply_chat_template}")
+        print(
+            f"LmEvalEvaluator::evaluate: apply_chat_template: {self.apply_chat_template}"
+        )
         results = lm_eval.evaluate(
             lm=lm_cls(llm, sampling_params, streaming),
             task_dict=self.task_dict,
