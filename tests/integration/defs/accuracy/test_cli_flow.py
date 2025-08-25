@@ -109,7 +109,6 @@ class TestGpt2(CliFlowAccuracyTestHarness):
                  extra_summarize_args=["--gpu_weights_percent=0"])
 
     def test_cuda_graph(self):
-        pytest.fail("test")
         self.run(extra_summarize_args=["--cuda_graph_mode"])
 
 
