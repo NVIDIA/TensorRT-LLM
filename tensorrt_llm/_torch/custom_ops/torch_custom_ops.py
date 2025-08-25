@@ -1,7 +1,8 @@
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import List, Mapping, Optional, Tuple
 
 import torch
+import triton  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
@@ -11,6 +12,7 @@ from tensorrt_llm._utils import get_sm_version
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
 from ..modules.multi_stream_utils import do_multi_stream
+from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
@@ -978,6 +980,50 @@ def _(
     tune_max_num_tokens: int = 4096,
 ) -> torch.Tensor:
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
+
+
+@torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())
+def silu_and_mul(x: torch.Tensor,
+                 scale: Optional[torch.Tensor] = None,
+                 dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    b, n = x.shape
+
+    assert n % 2 == 0
+    d = n // 2
+
+    o_dtype = dtype or x.dtype
+    o = torch.empty((b, d), dtype=o_dtype, device=x.device)
+
+    def grid(meta: Mapping[str, int]) -> tuple[int, int]:
+        return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
+
+    silu_and_mul_kernel[grid](
+        o_ptr=o,
+        o_stride=o.stride(0),
+        o_scale_ptr=scale,
+        x_ptr=x,
+        x_stride=x.stride(0),
+        d=d,
+        BLOCK_SIZE=1024,
+        HAS_O_SCALE=scale is not None,
+    )
+
+    return o
+
+
+@silu_and_mul.register_fake
+def _(
+    x: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    b, n = x.shape
+
+    assert n % 2 == 0
+    d = n // 2
+
+    o_dtype = dtype or x.dtype
+    return x.new_empty((b, d), dtype=o_dtype)
 
 
 def get_event(event_idx: int):
