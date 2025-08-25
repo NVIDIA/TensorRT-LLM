@@ -15,6 +15,7 @@ from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig, QuantConfig)
 from .config import Phi3Config
 from .convert import load_weights_from_hf_model
+from ..model_weights_loader import ModelWeightsLoader
 
 
 class Phi3DecoderLayer(Module):
@@ -298,20 +299,24 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
                                               quant_config=quant_config,
                                               **kwargs)
 
-        if not use_preloading:
-            trust_remote_code = kwargs.pop('trust_remote_code', True)
-
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                hf_model_dir,
-                torch_dtype="auto",
-                trust_remote_code=trust_remote_code)
-
-        assert isinstance(hf_model, transformers.PreTrainedModel)
-
-        weights = load_weights_from_hf_model(hf_model, config)
-
-        model = cls(config)
-        model.load(weights)
+        if quant_config is None:
+            if not use_preloading:
+                trust_remote_code = kwargs.pop('trust_remote_code', True)
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    hf_model_dir,
+                    torch_dtype="auto",
+                    trust_remote_code=trust_remote_code)
+            assert isinstance(hf_model, transformers.PreTrainedModel)
+            weights = load_weights_from_hf_model(hf_model, config)
+            model = cls(config)
+            model.load(weights)
+        else:
+            # TODO: make weights loading correctly.
+            custom_dict = {}
+            arg_dict = {}
+            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+            model = cls(config)
+            loader.generate_tllm_weights(model, arg_dict)
         return model
 
     def use_lora(self, lora_config: LoraConfig):
