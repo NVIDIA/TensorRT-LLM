@@ -1,4 +1,3 @@
-import bisect
 import contextlib
 import copy
 import functools
@@ -57,7 +56,7 @@ from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
-from .cuda_graph_runner import DecodingCUDAGraphRunner
+from .cuda_graph_runner import CUDAGraphRunner
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -422,7 +421,6 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states = {}
         self._cuda_graphs = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
-        self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
 
@@ -451,7 +449,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self.cuda_graph_dummy_request = None
+        self.cuda_graph_runner = CUDAGraphRunner(self)
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -541,12 +539,12 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextlib.contextmanager
     def no_cuda_graph(self):
-        _run_cuda_graphs = self._run_cuda_graphs
-        self._run_cuda_graphs = False
+        _run_cuda_graphs = self.cuda_graph_runner.enabled
+        self.cuda_graph_runner.enabled = False
         try:
             yield
         finally:
-            self._run_cuda_graphs = _run_cuda_graphs
+            self.cuda_graph_runner.enabled = _run_cuda_graphs
 
     @with_warmup_flag
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -561,7 +559,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy request to None in warmup.
-        self.cuda_graph_dummy_request = None
+        self.cuda_graph_runner.padding_dummy_request = None
 
         def get_cuda_graph_warmup_request(batch_size, draft_len):
             # Divide by max_beam_width to get an approximation of the number of requests that can be run in parallel.
@@ -756,7 +754,7 @@ class PyTorchModelEngine(ModelEngine):
 
             AutoTuner.get().print_profiling_cache()
 
-        if not (self._run_cuda_graphs
+        if not (self.cuda_graph_runner.enabled
                 or self._torch_compile_piecewise_cuda_graph):
             return
 
@@ -888,152 +886,6 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager=spec_resource_manager,
             is_draft_model=self.is_draft_model)
         return self.spec_metadata
-
-    def _get_padded_batch(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager,
-            spec_resource_manager: Optional[BaseResourceManager] = None) -> int:
-        can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
-        batch_size = scheduled_requests.batch_size
-        new_batch_size = batch_size
-
-        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            graph_batch_size = self.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            all_can_graph = all(graph_batch[0]
-                                for graph_batch in graph_batch_size)
-            if all_can_graph:
-                new_batch_size = max(gen_only_batch[1]
-                                     for gen_only_batch in graph_batch_size)
-
-        if (not self._run_cuda_graphs or not self._cuda_graph_padding_enabled
-                or not can_run_cuda_graph
-                or new_batch_size > self._max_cuda_graph_batch_size):
-            return 0
-
-        padded_batch_size = self._round_up_batch_size(new_batch_size)
-        if batch_size == padded_batch_size:
-            return 0
-
-        padding_size = padded_batch_size - batch_size
-        if padding_size + scheduled_requests.batch_size > self.batch_size:
-            return 0
-
-        # No padding if it would create too many concurrent requests.
-        # This is not strictly required, but we should probably
-        # respect the requirement just in case that changes in the future.
-        if self.cuda_graph_dummy_request is None:
-            available_blocks = kv_cache_manager.get_num_free_blocks()
-            # No padding if not enough KV cache space
-            if available_blocks < 1:
-                return 0
-
-            cuda_graph_dummy_request_ids = [MAX_UINT64 - 1]
-            self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
-                cuda_graph_dummy_request_ids,
-                is_gen=True,
-                max_num_draft_tokens=self.runtime_draft_len,
-                use_mrope=self.use_mrope,
-                max_beam_width=self.max_beam_width)[0]
-            self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(
-                    request_ids=cuda_graph_dummy_request_ids)
-
-        scheduled_requests.generation_requests.extend(
-            [self.cuda_graph_dummy_request] * padding_size)
-
-        return padding_size
-
-    @contextlib.contextmanager
-    def _maybe_pad_batch(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
-        """
-        CUDA graphs can only be used for specific batch sizes.
-
-        If using CUDA graphs, this method will add dummy requests to the given
-        batch so we can always use a CUDA graph. It is a context manager
-        because the padded requests will be removed from scheduled requests.
-        """
-        padding_size = self._get_padded_batch(scheduled_requests,
-                                              kv_cache_manager,
-                                              spec_resource_manager)
-        try:
-            yield scheduled_requests
-        finally:
-            if padding_size > 0:
-                scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
-                                                                                                -padding_size]
-
-    def _round_up_batch_size(self, batch_size: int) -> int:
-        """
-        Round up the given batch size to the nearest batch size that is
-        associated with a CUDA graph.
-        """
-        idx = bisect.bisect_left(self._cuda_graph_batch_sizes, batch_size)
-        return self._cuda_graph_batch_sizes[idx]
-
-    def _maybe_get_cuda_graph(
-        self,
-        batch: ScheduledRequests,
-    ) -> Optional[DecodingCUDAGraphRunner]:
-        """
-        Get a CUDA graph runner or return None (e.g. if CUDA graphs are disabled
-        or if the batch size is too big).
-        """
-        # disable when doing statistic
-        if ExpertStatistic.set_iter(self.iter_counter):
-            return None
-
-        draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
-        can_run_cuda_graph = batch.can_run_cuda_graph
-        batch_size = len(batch.generation_requests)
-        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            all_can_graph_batch = self.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            is_all_gen_only = all(all_can_graph[0]
-                                  for all_can_graph in all_can_graph_batch)
-            all_batch_size_equal = all(
-                all_gen_only[1] == all_can_graph_batch[0][1]
-                for all_gen_only in all_can_graph_batch)
-
-            if not is_all_gen_only or not all_batch_size_equal:
-                return None
-
-        if not self._run_cuda_graphs or not can_run_cuda_graph:
-            return None
-
-        if batch_size in self._cuda_graphs and draft_len in self._cuda_graphs[
-                batch_size]:
-            return self._cuda_graphs[batch_size][draft_len]
-
-        if batch_size not in self._cuda_graph_batch_sizes:
-            return None
-
-        num_sequences_in_batch = batch_size * self.max_beam_width
-        attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, draft_len)
-        assert attn_metadata.is_cuda_graph
-
-        if self.enable_spec_decode:
-            spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
-                num_sequences_in_batch)
-            spec_metadata.draft_tokens = self.draft_tokens_cuda
-        else:
-            spec_metadata = None
-
-        # Initialize nested dictionary if needed
-        if batch_size not in self._cuda_graphs:
-            self._cuda_graphs[batch_size] = {}
-
-        self._cuda_graphs[batch_size][draft_len] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope,
-            self.max_beam_width)
-        return self._cuda_graphs[batch_size][draft_len]
 
     def __del__(self) -> None:
         if getattr(self, 'ub_buffers', None):
@@ -1244,13 +1096,7 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_num_tokens()
 
     def _release_cuda_graphs(self):
-        for batch_size, draft_graphs in self._cuda_graphs.items():
-            for draft_len, graph in draft_graphs.items():
-                del graph
-        self._cuda_graphs.clear()
-        torch.cuda.empty_cache()
-        del self._cuda_graph_mem_pool
-        self._cuda_graph_mem_pool = None
+        self.cuda_graph_runner.clear()
 
     def get_max_num_sequences(self) -> int:
         """
@@ -2237,12 +2083,14 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     return self._forward_step(inputs, gather_ids,
                                               gather_context_logits)
-        with self._maybe_pad_batch(scheduled_requests, kv_cache_manager,
-                                   spec_resource_manager) as scheduled_requests:
-            maybe_graph = self._maybe_get_cuda_graph(scheduled_requests)
-            if maybe_graph is not None:
-                attn_metadata = maybe_graph.attn_metadata
-                spec_metadata = maybe_graph.spec_metadata
+        with self.cuda_graph_runner.pad_batch(
+                scheduled_requests, resource_manager) as padded_requests:
+
+            maybe_graph, maybe_attn_metadata, maybe_spec_metadata = self.cuda_graph_runner.maybe_get_cuda_graph(
+                padded_requests)
+            if maybe_graph:
+                attn_metadata = maybe_attn_metadata
+                spec_metadata = maybe_spec_metadata
             else:
                 attn_metadata = self.attn_metadata
                 if self.enable_spec_decode:
@@ -2251,17 +2099,19 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = None
 
             inputs, gather_ids = self._prepare_inputs(
-                scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, cache_indirection_buffer)
+                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
+                new_tensors_device, cache_indirection_buffer)
 
             self.iter_counter += 1
 
-            if maybe_graph is None:
+            if not maybe_graph:
+                # Fallback to eager execution if graph was not used
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     outputs = self._forward_step(inputs, gather_ids,
                                                  gather_context_logits)
             else:
-                if maybe_graph.needs_capture():
+                batch_size = len(padded_requests.generation_requests)
+                if self.cuda_graph_runner.needs_capture(batch_size):
 
                     def capture_forward_fn(inputs: Dict[str, Any]):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -2270,18 +2120,16 @@ class PyTorchModelEngine(ModelEngine):
                                 gather_ids=gather_ids,
                                 gather_context_logits=gather_context_logits)
 
-                    pool = maybe_graph.capture(
-                        capture_forward_fn,
-                        self._cuda_graph_mem_pool,
-                    )
-                    self._cuda_graph_mem_pool = pool
+                    self.cuda_graph_runner.capture(batch_size,
+                                                   capture_forward_fn, inputs)
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
-                    outputs = maybe_graph.run(inputs)
+                    outputs = self.cuda_graph_runner.replay(batch_size, inputs)
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = maybe_graph.run(inputs)
+                        outputs = self.cuda_graph_runner.replay(
+                            batch_size, inputs)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
