@@ -975,7 +975,13 @@ class PyExecutor:
                                 for req in scheduled_batch.generation_requests:
                                     if req.py_request_id not in generation_request_mapping:
                                         generation_request_mapping[
-                                            req.py_request_id] = req.clone()
+                                            req.py_request_id] = LlmRequest(
+                                                llm_request=req,
+                                                stop_words_list=req.
+                                                py_stop_words_list,
+                                                seq_slot=req.py_seq_slot,
+                                                target_seq_slot=req.
+                                                py_target_seq_slot)
                                         generation_request_mapping[
                                             req.
                                             py_request_id].sampling_config = SamplingConfig(
@@ -986,7 +992,13 @@ class PyExecutor:
                                 for req in scheduled_batch.context_requests:
                                     if req.py_request_id not in context_request_mapping:
                                         context_request_mapping[
-                                            req.py_request_id] = req.clone()
+                                            req.py_request_id] = LlmRequest(
+                                                llm_request=req,
+                                                stop_words_list=req.
+                                                py_stop_words_list,
+                                                seq_slot=req.py_seq_slot,
+                                                target_seq_slot=req.
+                                                py_target_seq_slot)
                                         context_request_mapping[
                                             req.
                                             py_request_id].sampling_config = SamplingConfig(
