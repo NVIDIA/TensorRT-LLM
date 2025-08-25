@@ -937,16 +937,26 @@ def test_llm_torch_multi_lora_support(
 
     input_prompts = get_test_prompts(use_code_prompts)
 
+    from tensorrt_llm.llmapi import KvCacheConfig
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.3,
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+    )
+
     with LLM_torch(
             model=hf_model_dir,
             lora_config=lora_config,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             dtype="bfloat16",
-            max_batch_size=8,  # From original test
-            max_input_len=512,  # From original test
-            max_seq_len=562,  # From original test
-            max_beam_width=1  # From original test
+            max_batch_size=4,  # Reduce from 8 to 4
+            max_input_len=256,  # Reduce from 512 to 256
+            max_seq_len=320,  # Reduce from 562 to 320
+            max_num_tokens=1024,  # Add explicit max_num_tokens
+            max_beam_width=1,  # From original test
+            kv_cache_config=kv_cache_config,
     ) as llm:
 
         init_end = time.time()
