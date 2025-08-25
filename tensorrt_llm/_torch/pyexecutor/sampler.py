@@ -569,8 +569,8 @@ class TorchSampler(Sampler):
                                gen_logits_host=gen_logits_host,
                                log_probs_host=log_probs_host)
         self.write_finish_reasons(requests,
-                                  new_tokens=new_tokens,
-                                  seq_slots=seq_slots)
+                                  seq_slots=seq_slots,
+                                  new_tokens=new_tokens)
 
         new_tokens_host = new_tokens.to(device="cpu", non_blocking=True)
         sampler_event = torch.cuda.Event()
@@ -663,8 +663,8 @@ class TorchSampler(Sampler):
         self.store.finish_reasons[r, seq_slots[c], self.BEAM] = reason
 
     def write_finish_reasons(self, requests: list[LlmRequest], *,
-                             new_tokens: torch.Tensor,
-                             seq_slots: torch.Tensor) -> None:
+                             seq_slots: torch.Tensor,
+                             new_tokens: torch.Tensor) -> None:
         tokens = new_tokens[:, seq_slots, self.BEAM]
         self.store.finish_reasons[:, seq_slots, self.BEAM].fill_(
             self.store.NOT_FINISHED)  # TODO: Do we need this?
