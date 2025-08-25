@@ -179,71 +179,27 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
-    @torch.library.register_fake("trtllm::moe_comm_prepare_indices")
-    def _(
-        gathered_target_rank_ids: torch.Tensor,
-        real_rank_token_count_cum_sum: Optional[torch.Tensor],
-        max_token_count_per_rank: int,
-        expert_count: int,
-        top_k: int,
-        ep_rank: int,
-        ep_size: int,
-    ):
-        max_send_ranks_per_token = max(ep_size, top_k)
-        local_gather_indices_shape = (max_token_count_per_rank * ep_size, )
-        rank_count_cum_sum_shape = (ep_size, )
-        send_rank_local_indices_shape = (max_token_count_per_rank *
-                                         max_send_ranks_per_token, )
-        recv_rank_local_indices_shape = (max_token_count_per_rank * ep_size, )
-        backward_recv_rank_local_indices_shape = (max_token_count_per_rank *
-                                                  max_send_ranks_per_token, )
-
-        local_gather_indices = gathered_target_rank_ids.new_empty(
-            local_gather_indices_shape, dtype=torch.int32)
-        send_rank_count_cum_sum = gathered_target_rank_ids.new_empty(
-            rank_count_cum_sum_shape, dtype=torch.int32)
-        send_rank_local_indices = gathered_target_rank_ids.new_empty(
-            send_rank_local_indices_shape, dtype=torch.int32)
-        recv_rank_count_cum_sum = gathered_target_rank_ids.new_empty(
-            rank_count_cum_sum_shape, dtype=torch.int32)
-        recv_rank_local_indices = gathered_target_rank_ids.new_empty(
-            recv_rank_local_indices_shape, dtype=torch.int32)
-        backward_recv_rank_local_indices = gathered_target_rank_ids.new_empty(
-            backward_recv_rank_local_indices_shape, dtype=torch.int32)
-
-        return (local_gather_indices, send_rank_count_cum_sum,
-                send_rank_local_indices, recv_rank_count_cum_sum,
-                recv_rank_local_indices, backward_recv_rank_local_indices)
-
-    @torch.library.register_fake("trtllm::moe_local_gather")
-    def _(
-        recv_rank_cum_sum: torch.Tensor,
-        local_gather_indices: torch.Tensor,
-        gathered_expert_ids: torch.Tensor,
-        gathered_scales: Optional[torch.Tensor],
-        local_expert_ids: torch.Tensor,
-        local_scales: Optional[torch.Tensor],
-        max_token_count_per_rank: int,
-        expert_count: int,
-        top_k: int,
-        ep_rank: int,
-        ep_size: int,
-    ):
-        pass
-
     @torch.library.register_fake("trtllm::moe_comm")
     def _(
-        input: torch.Tensor,
+        inputs: List[torch.Tensor],
         send_rank_cum_sum: torch.Tensor,
         send_indices: torch.Tensor,
-        output: torch.Tensor,
         recv_rank_cum_sum: torch.Tensor,
         recv_indices: torch.Tensor,
         all_workspaces: torch.Tensor,
+        output_allocation_count: int,
         ep_rank: int,
         ep_size: int,
+        need_zero_output: Optional[List[bool]],
     ):
-        pass
+        outputs = []
+        for input_tensor in inputs:
+            output_tensor = torch.empty(
+                (output_allocation_count, input_tensor.shape[1]),
+                dtype=input_tensor.dtype,
+                device=input_tensor.device)
+            outputs.append(output_tensor)
+        return outputs
 
     @torch.library.register_fake("trtllm::get_moe_commworkspace_size_per_rank")
     def _(ep_size: int):
@@ -286,6 +242,12 @@ def _register_fake():
     def _(single_layer_load_balancer_ptr: int,
           token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
+
+    @torch.library.register_fake("trtllm::memset_expert_ids")
+    def _(experts_ids: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
+          max_token_count_per_rank: int, top_k: int, slot_count: int,
+          ep_size: int):
+        pass
 
     @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))

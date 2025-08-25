@@ -26,11 +26,15 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
 @pytest.mark.parametrize(
-    "dim, dconv, req_type, dtype, batch_size, max_seq_len, remove_padding, apply_silu, paged_cache",
+    "dim, dconv, req_type, dtype, batch_size, max_seq_len, remove_padding, apply_silu, paged_cache, use_initial_state",
     list(
         product([2048], [4], ['context', 'generation'],
                 ['float16', 'float32', 'bfloat16'], [5], [16], [False, True],
-                [False, True], [False, True])) +
+                [False, True], [False, True], [False])) +
+    # test with initial state
+    list(
+        product([2048], [4], ['context'], ['bfloat16'], [5], [16],
+                [False, True], [False], [False, True], [True])) +
     # long sequence tests to cover the int overflow issue
     list(
         map(
@@ -42,10 +46,11 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
                        "The long sequence test needs at least 33GB memory, skipping"
                        )),
             product([5376], [4], ['context'], ['float16', 'bfloat16'], [2],
-                    [131072], [False, True], [False, True], [False]))))
+                    [131072], [False, True], [False, True], [False], [False]))))
 @pytest.mark.high_cuda_memory
 def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
-                       remove_padding, apply_silu, paged_cache):
+                       remove_padding, apply_silu, paged_cache,
+                       use_initial_state):
     device = "cuda"
     seq_len = max_seq_len if req_type == "context" else 1
     mean = 0.0
@@ -68,7 +73,7 @@ def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
         host_context_lengths = torch.ones(
             (batch_size, ), dtype=torch.int32) * seq_len
 
-    if req_type == "context":
+    if req_type == "context" and not use_initial_state:
         conv_state = torch.zeros([batch_size, dim, dconv - 1],
                                  dtype=torch_dtype,
                                  device=device)
@@ -111,7 +116,8 @@ def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
     conv_weight_input = conv_weight.squeeze(1).contiguous()
 
     if req_type == "context":
-        has_initial_state = None
+        has_initial_state = None if not use_initial_state else torch.ones(
+            batch_size, device=device, dtype=torch.bool)
 
         torch.ops.trtllm.causal_conv1d_fwd(
             x_in_out,
