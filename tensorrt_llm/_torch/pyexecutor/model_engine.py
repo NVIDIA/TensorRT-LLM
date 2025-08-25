@@ -356,6 +356,8 @@ class PyTorchModelEngine(ModelEngine):
         )
 
         attn_backend = pytorch_backend_config.attn_backend
+        log_memory_stats("Before model loading start - Memory usage",
+                         get_memory_stats())
         self.model = self._load_model(
             model_path,
             mapping=self.mapping,

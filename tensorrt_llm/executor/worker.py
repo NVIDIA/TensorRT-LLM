@@ -60,6 +60,13 @@ class GenerationExecutorWorker(GenerationExecutor):
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
+        # Memory tracking before worker initialization
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            get_memory_stats, log_memory_stats)
+        stats_before_worker_init = get_memory_stats()
+        log_memory_stats("Memory stats BEFORE worker initialization",
+                         stats_before_worker_init)
+
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
             num_postprocess_workers=postproc_config.num_postprocess_workers,

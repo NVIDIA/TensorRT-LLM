@@ -386,6 +386,13 @@ class GenerationExecutor(ABC):
         if lora_config:
             worker_kwargs["lora_config"] = lora_config
 
+        from tensorrt_llm._torch.pyexecutor.model_engine import (
+            get_memory_stats, log_memory_stats)
+        stats_before_worker_init = get_memory_stats()
+        log_memory_stats(
+            "Memory stats BEFORE GenerationExecution initialization",
+            stats_before_worker_init)
+
         # The case where the Python main process is launched by mpirun
         mpirun_launch = external_mpi_comm_available(model_world_size)
         # The case where the Python main process utilizes mpi4py to spawn MPI workers
