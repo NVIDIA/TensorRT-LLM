@@ -245,6 +245,8 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3,)
 
+                sh(label: "Print slurm_jenkins_agent_setup.sh script", script: "cat ${jenkinsSetupPath}")
+
                 Utils.exec(
                     pipeline,
                     timeout: false,
@@ -319,10 +321,13 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
 
-    sh """
-        env | sort
-        pwd && ls -alh
-    """
+    sh(
+        label: "Print env for debugging",
+        script: """
+            env | sort
+            pwd && ls -alh
+        """
+    )
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -366,6 +371,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}", numRetries: 3,)
+                sh(label: "Print slurm_run.sh script", script: "cat ${scriptRunLocalPath}")
                 // Upload waives.txt to Frontend node
                 def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}", numRetries: 3,)
@@ -422,6 +428,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 pipeline.writeFile(file: scriptLaunchDestPath, text: scriptContent)
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}", numRetries: 3,)
+                sh(label: "Print slurm_launch.sh script", script: "cat ${scriptLaunchDestPath}")
             }
             stage('Run Test') {
                 def scriptLaunch = "${jobWorkspace}/slurm_launch.sh"
