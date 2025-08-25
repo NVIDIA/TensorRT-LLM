@@ -108,7 +108,7 @@ protected:
 
 TEST_F(AgentCommTest, AgentConnectionManagerBasic)
 {
-    auto connectionManager = std::make_unique<AgentConnectionManager>(mTransBufferManager.get());
+    auto connectionManager = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
     ASSERT_TRUE(connectionManager != nullptr);
     ASSERT_TRUE(connectionManager->getCacheTransBufferManager() != nullptr);
     ASSERT_EQ(connectionManager->getDeviceId(), 0);
@@ -121,8 +121,8 @@ TEST_F(AgentCommTest, AgentConnectionManagerBasic)
 
 TEST_F(AgentCommTest, AgentConnectionManagerConnect)
 {
-    auto connectionManager0 = std::make_unique<AgentConnectionManager>(mTransBufferManager.get());
-    auto connectionManager1 = std::make_unique<AgentConnectionManager>(mTransBufferManager.get());
+    auto connectionManager0 = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
+    auto connectionManager1 = std::make_unique<AgentConnectionManager>(mTransBufferManager.get(), *mCacheState);
     auto agentName0 = connectionManager0->getAgentName();
     auto agentName1 = connectionManager1->getAgentName();
     ASSERT_TRUE(!agentName0.empty());

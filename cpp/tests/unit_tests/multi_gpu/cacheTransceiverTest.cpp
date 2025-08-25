@@ -776,8 +776,8 @@ protected:
 
                 setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
 
-                mConnectionManager
-                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(mCacheTransBufferManager.get());
+                mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
+                    mCacheTransBufferManager.get(), *mCacheState);
             }
             else
             {
@@ -1486,6 +1486,12 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0, Asymmetrical
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4),
         testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false)));
+
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0EvenLayer, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(1),
+        testing::Values(1), testing::Values(5), testing::Values(2), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate1, AsymmetricalCacheTestWithDP,
