@@ -86,10 +86,6 @@ class Evaluator(ABC):
         outputs, references, auxiliaries = [], [], []
         for prompt, sampling_args, reference, *aux in tqdm(
                 self.generate_samples(), desc="Submitting requests"):
-            print(
-                f"interface.py::evaluate: self.apply_chat_template: {self.apply_chat_template}"
-            )
-            print(f"interface.py::evaluate: prompt: {prompt}")
             if self.apply_chat_template:
                 prompt = self.do_apply_chat_template(llm, prompt)
             sampling_params = self._get_sampline_params(sampling_params,
