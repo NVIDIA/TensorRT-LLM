@@ -338,7 +338,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // Upload slurm_run_sh to Frontend node
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}",numRetries: 3,)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}", numRetries: 3,)
                 // Upload waives.txt to Frontend node
                 def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}", numRetries: 3,)
