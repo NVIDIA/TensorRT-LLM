@@ -75,7 +75,6 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
 bool CacheFormatter::needSendCache(
     CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx)
 {
-    // int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     if (targetInfo.mDupHeadFactor <= 1)
     {
@@ -91,12 +90,17 @@ bool CacheFormatter::needSendCache(
         selfTpRankInDpGroup = selfTpRank % selfTPNumInDPGroup;
     }
 
+    // only TP rank % dupHeadFactor == 0 need to send cache.
     return selfTpRankInDpGroup % targetInfo.mDupHeadFactor == 0;
 }
 
 void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::CacheState const& selfConfig,
     BaseCacheFormatter::CacheState const& destConfig)
 {
+    // TODO: VSWA do not support uneven layer per PP.
+    // if gen PP and context PP are different, cache formatter only support alternative window like gpt-oss.
+    // which is one layer is WSA, and another layer is Full attention.
+
     auto numPools = cacheManager->getBlockManager().getNumPools();
     auto layerNum = cacheManager->getBlockManager().getNumLayers();
 
@@ -163,6 +167,7 @@ void CacheFormatter::format(TransferSession& session)
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
+    // Some TP rank don't need to send cache since duplicate header is not needed.
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
@@ -214,7 +219,7 @@ void CacheFormatter::format(TransferSession& session)
         int blockNum = 0;
 
         size_t allCacheBlockSize = 0;
-
+        // gather cache blocks of the request.
         std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocks;
         for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
@@ -224,6 +229,7 @@ void CacheFormatter::format(TransferSession& session)
                 "window size already exists, which is not supported");
             inputKvCacheBlocks.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
             auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
+            // only block in window will be sent.
             SizeType32 blockNumThisWindow = 0;
             for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
             {
@@ -278,13 +284,21 @@ void CacheFormatter::format(TransferSession& session)
             return;
         }
 
+        // formatter flow
+        // 1. gather cache blocks of the request.
+        // 2. compute the buffer size for each target.
+        // 3. prepare the pre-allocated buffer for each target according to the buffer size.
+        // 4. call splitKVCacheDispatch to split the cache blocks according to the different parallelis and gather the
+        // cache blocks to the corresponding buffer.
+        // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
+
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto targetNum = connections.size();
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
             / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
-        int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP[ppRank];
+        int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
 
         auto getBufferSizeForTarget = [&]()
         {
@@ -418,7 +432,7 @@ void CacheFormatter::format(TransferSession& session)
             }
             else
             {
-                // concurrency num
+                // concurrency num should <=bufferCoverTargetNum to avoid data-race.
                 auto concurrencyNum
                     = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), connections.size());
 
@@ -504,6 +518,7 @@ void CacheFormatter::unformat(TransferSession& session)
     TLLM_CHECK(!outputBuffersPerWindow.empty());
     if (outputBuffersPerWindow.size() > 1)
     {
+        // We only support limited case for VSWA.
         if (selfConfig.getParallelConfig().mPipelineParallelism != destConfig.getParallelConfig().mPipelineParallelism)
         {
             checkAlternateWindow(mCacheManager, selfConfig, destConfig);
@@ -602,6 +617,13 @@ void CacheFormatter::unformat(TransferSession& session)
                     ctxReqId);
                 return;
             }
+            // unformatted flow
+            // 1. gather cache blocks of the request.
+            // 2. compute the buffer size for each target.
+            // 3. prepare the pre-allocated buffer for each target according to the buffer size.
+            // 4. receive the buffer from the corresponding target. Ideally, we receive only once (one buffer) for each
+            // target.
+            // 5. call concatKvCacheV2Dispatch to  concatenate the cache blocks according to the different parallelis
 
             runtime::ITensor::SharedPtr recvBufferTemp;
             std::vector<runtime::ITensor::SharedPtr> recvSplitCaches;
@@ -613,8 +635,8 @@ void CacheFormatter::unformat(TransferSession& session)
             auto ppRank = selfIdx
                 / (selfConfig.getParallelConfig().mTensorParallelism
                     * selfConfig.getParallelConfig().mContextParallelism);
-            int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP[ppRank];
-            auto getTargetBufferEleSzie = [&]()
+            int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+            auto getTargetBufferEleSize = [&]()
             {
                 if (outputBuffersPerWindow.size() > 1)
                 {
@@ -626,14 +648,17 @@ void CacheFormatter::unformat(TransferSession& session)
                     // TODO: LayerNumbufferTargetNum for VWSA
                     return std::make_pair(bufferSizeForTarget, std::vector<SizeType32>(targetNum, 0));
                 }
-                size_t valideTpSize = pickUpConnections.size() / targetInfo.mDomainPPSize;
-                TLLM_CHECK_WITH_INFO(cacheBlockSizeSum % valideTpSize == 0,
-                    "cacheBlockSizeSum must be divisible by valideTpSize %ld", valideTpSize);
-                TLLM_CHECK_WITH_INFO((cacheBlockSizeSum % (selfAttentionLayerNum * valideTpSize)) == 0,
-                    "cacheBlockSizeSum must be divisible by valideTpSize %ld * selfAttentionLayerNum %d", valideTpSize,
+                // for duplicate header, gen will not recv from TP which has duplicate header, and will not prepare
+                // buffer for it.
+                size_t validTpSize = pickUpConnections.size() / targetInfo.mDomainPPSize;
+                TLLM_CHECK_WITH_INFO(cacheBlockSizeSum % validTpSize == 0,
+                    "cacheBlockSizeSum must be divisible by validTpSize %ld", validTpSize);
+                TLLM_CHECK_WITH_INFO((cacheBlockSizeSum % (selfAttentionLayerNum * validTpSize)) == 0,
+                    "cacheBlockSizeSum must be divisible by validTpSize %ld * selfAttentionLayerNum %d", validTpSize,
                     selfAttentionLayerNum);
                 TLLM_CHECK(targetNum == pickUpConnections.size());
-                size_t baseEleSize = cacheBlockSizeSum / (valideTpSize * selfAttentionLayerNum);
+                // the sum of buffer size is cacheBlockSizeSum.
+                size_t baseEleSize = cacheBlockSizeSum / (validTpSize * selfAttentionLayerNum);
 
                 std::vector<size_t> bufferEleSizes(targetNum, 0);
                 std::vector<SizeType32> LayerNumbufferTargetNum(targetNum, 0);
@@ -646,7 +671,7 @@ void CacheFormatter::unformat(TransferSession& session)
                 }
                 return std::make_pair(bufferEleSizes, LayerNumbufferTargetNum);
             };
-            auto [bufferEleSizes, LayerNumbufferTargetNum] = getTargetBufferEleSzie();
+            auto [bufferEleSizes, LayerNumbufferTargetNum] = getTargetBufferEleSize();
 
             size_t remainNoCoverTargetNum = 0;
             size_t bufferCoverTargetNum = 0;

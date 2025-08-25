@@ -155,7 +155,7 @@ void MLACacheFormatter::format(TransferSession& session)
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     auto ppRank = selfIdx
         / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
-    int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP[ppRank];
+    int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
     size_t pPDomainSize = targetInfo.mDomainPPSize;
     auto getBufferSizeForTarget = [&]()
     {
@@ -368,7 +368,9 @@ void MLACacheFormatter::unformat(TransferSession& session)
         auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
         auto ppRank = selfIdx
             / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
-        auto selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP[ppRank];
+        auto selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+        TLLM_CHECK_WITH_INFO(selfAttentionLayerNum != 0, "selfAttentionLayerNum should not be 0");
+
         auto getBufferSizeForTarget = [&]()
         {
             std::vector<size_t> bufferEleSizes(targetNum, 0);
