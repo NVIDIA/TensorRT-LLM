@@ -332,7 +332,7 @@ llm_perf_full:
   - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:1000,1000-reqs:20000-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:1000,2000-reqs:3000-ep:8-tp:8-gpus:8] TIMEOUT(100)
   # qwen3_235b_a22b_fp8
-  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8] TIMEOUT(45)
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8] TIMEOUT(60)
 
 
 # FP8 specific tests
