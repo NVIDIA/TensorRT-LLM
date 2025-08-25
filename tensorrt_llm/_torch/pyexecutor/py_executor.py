@@ -42,7 +42,7 @@ from .guided_decoder import GuidedDecoder
 from .handle_logits import HandleLogits
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse)
+                          LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
@@ -995,6 +995,15 @@ class PyExecutor:
                                     scheduled_batch)
                             self.drafter.prepare_draft_tokens(
                                 scheduled_batch, self.resource_manager)
+
+                            # Pad draft tokens to the max draft length. This is for CUDA
+                            # graph compatibility.
+                            for req in scheduled_batch.generation_requests:
+                                max_draft_tokens = self.max_draft_len
+                                num_draft_tokens = get_draft_token_length(req)
+                                req.py_draft_tokens.extend(
+                                    0 for _ in range(max_draft_tokens -
+                                                     num_draft_tokens))
 
                     batch_outputs = self._forward_step(scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,

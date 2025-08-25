@@ -10,8 +10,7 @@ from tensorrt_llm.logger import logger
 
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
-from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
-                                      get_draft_token_length)
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState, TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -326,15 +325,6 @@ class ModelDrafter(Drafter):
 
         return new_requests
 
-    def _pad_to_max_draft_tokens(self,
-                                 scheduled_requests: ScheduledRequests) -> None:
-        """Pad draft tokens to maximum length for all generation requests."""
-        for req in scheduled_requests.generation_requests:
-            max_draft_tokens = self.max_draft_tokens
-            num_draft_tokens = get_draft_token_length(req)
-            req.py_draft_tokens.extend(
-                0 for _ in range(max_draft_tokens - num_draft_tokens))
-
     def _execute_guided_decoder(self,
                                 scheduled_batch: ScheduledRequests,
                                 logits: torch.Tensor,
@@ -418,7 +408,6 @@ class ModelDrafter(Drafter):
                 self._update_requests(previous_batch)
                 self._process_decoded_tokens(previous_batch.scheduled_requests,
                                              req_id_to_old_request)
-            self._pad_to_max_draft_tokens(scheduled_requests)
 
             if self.guided_decoder is not None:
                 self.guided_decoder.rollback_draft_tokens(scheduled_requests)
