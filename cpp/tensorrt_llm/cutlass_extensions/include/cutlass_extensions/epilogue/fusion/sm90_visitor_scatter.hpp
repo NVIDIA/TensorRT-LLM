@@ -727,6 +727,7 @@ struct FusionCallbacks<
     StrideOutput dOut = {};
     int const* const* ptr_index{};   // per-group pointer to the scatter index
     int index_modulo{}; // modulo used to transform the index before store
+    int shape_override = -1; // override value for contiguous output tensor mode
     bool use_reduction = true;
 
     operator typename Impl::Arguments() const {
@@ -743,7 +744,7 @@ struct FusionCallbacks<
             {}                                                              // binary args: multiply
           },                                                            // end binary op
           //scatter                                                       // unary args: reduce
-          { ptr_out, dOut, ptr_index, index_modulo, use_reduction }
+          { ptr_out, dOut, ptr_index, index_modulo, shape_override, use_reduction }
         };                                                          // end unary op
     }
   };
