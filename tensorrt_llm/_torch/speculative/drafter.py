@@ -36,3 +36,11 @@ class Drafter(ABC):
         if self.max_concurrency is not None:
             return len(requests) <= self.max_concurrency
         return True
+
+    def needs_draft_forward_post(self) -> bool:
+        """
+        If draft forward needs to be run directly after the target model forward,
+        this method can be overridden to do that.
+        Used in SaveHiddenStatesDrafter (to ensure correct input_ids)
+        """
+        return False
