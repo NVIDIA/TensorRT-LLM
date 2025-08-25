@@ -53,7 +53,7 @@ def test_dynamic_spec_decode():
 
     # Mock should_use_spec_decode to return True for first two calls, then False
     def mock_should_use_spec_decode(self, requests, max_batch_size,
-                                    max_num_tokens, draft_len):
+                                    max_num_tokens, max_draft_len):
         if not hasattr(mock_should_use_spec_decode, 'call_count'):
             mock_should_use_spec_decode.call_count = 0
         mock_should_use_spec_decode.call_count += 1

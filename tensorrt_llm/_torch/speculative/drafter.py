@@ -36,12 +36,19 @@ class Drafter(ABC):
         is not specified by the user's spec config.
         """
 
-        # Inputs validated upstream: max_batch_size>0, max_num_tokens>0, max_draft_len>0
+        # Inputs typically validated upstream: max_batch_size>0, max_num_tokens>0, max_draft_len>=0
 
         if self.max_concurrency is None:
             return True
 
-        token_cap = max_num_tokens // (1 + max_draft_len)
-        num_effective_requests = min(len(requests), max_batch_size, token_cap)
+        # Defensive guards; keep behavior explicit for zero/empty cases
+        if not requests or max_batch_size <= 0 or max_num_tokens <= 0:
+            return False
 
-        return 0 < num_effective_requests <= self.max_concurrency
+        tokens_per_request = 1 + max(0, max_draft_len)
+        token_cap = max_num_tokens // tokens_per_request
+        if token_cap <= 0:
+            return False
+
+        num_effective_requests = min(len(requests), max_batch_size, token_cap)
+        return num_effective_requests <= self.max_concurrency
