@@ -36,8 +36,7 @@ There are some other useful environment variables that may help when encounterin
 
 * `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
 
-* `UCX_MAX_RNDV_RAILS`: The default value is `2`, means that UCX will try to use 2 ib NIC device for each GPU.
-If context and geneneration instances are both TEP, the KV cache transfer of a request for different TP happens at almost the same time, since each TP rank may use two NIC device, some NIC device may be occupied by multiple GPUs, resulting in lower efficiency. Setting it to `1` helps to improve efficiency in such case.
+* `UCX_MAX_RNDV_RAILS`: With the default value `2`, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting `UCX_MAX_RNDV_RAILS=1` can reduce contention in this case.
 
 ## Troubleshooting and FAQ
 
