@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import logger
+from tensorrt_llm._utils import get_sm_version, logger
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -15,8 +15,10 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
+from .moe_backend import MoEBackendSelection
 from .moe_load_balancer import get_moe_load_balancer
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CutlassFusedMoEMethod,
                            UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
@@ -232,6 +234,9 @@ class WideEPMoE(MoE):
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
 
+        # Select MoE backend based on configuration
+        self.moe_backend = None  # Will be initialized after weights are created
+
     def _check_configs(self):
         assert self._weights_created
 
@@ -318,7 +323,10 @@ class WideEPMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
+                if get_sm_version() == 100:
+                    return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+                else:
+                    return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
@@ -340,6 +348,9 @@ class WideEPMoE(MoE):
 
         self._weights_created = True
         self._check_configs()
+
+        # Initialize MoE backend after weights are created
+        self.moe_backend = MoEBackendSelection.select_backend(self)
 
     def dummy_allreduce(self):
         """
@@ -638,6 +649,7 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
+        # Original fused_moe call (preserved as reference)
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_slots,
@@ -664,6 +676,35 @@ class WideEPMoE(MoE):
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
         )
+
+        # Use the selected backend to compute MoE with the same parameters as fused_moe
+        # final_hidden_states = self.moe_backend.run_moe(
+        #     x,
+        #     token_selected_slots,
+        #     token_final_scales,
+        #     w3_w1_weight.view(weight_dtype),
+        #     None,  # w3_w1_bias
+        #     w2_weight.view(weight_dtype),
+        #     None,  # w2_bias
+        #     output_dtype,
+        #     quant_scales=quant_scales,
+        #     input_sf=x_sf,
+        #     swizzled_input_sf=False,
+        #     tp_size=self.tp_size,
+        #     tp_rank=self.tp_rank,
+        #     ep_size=ep_size,
+        #     ep_rank=ep_rank,
+        #     cluster_size=cluster_size,
+        #     cluster_rank=cluster_rank,
+        #     enable_alltoall=use_all_to_all,
+        #     use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+        #     use_w4_group_scaling=use_w4_group_scaling,
+        #     min_latency_mode=False,
+        #     tune_max_num_tokens=self.tune_max_num_tokens,
+        #     tuner_num_tokens=tuner_num_tokens,
+        #     tuner_top_k=tuner_top_k,
+        #     module=self,  # Additional parameter for backend to access module properties
+        # )
 
         if self.layer_load_balancer and is_last_call:
             self.layer_load_balancer.start_set_cpu_stage()
