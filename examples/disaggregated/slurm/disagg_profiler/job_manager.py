@@ -9,7 +9,7 @@ import requests
 import yaml
 
 
-def get_slurm_allocation(account, partition, time_limit, job_name, num_nodes):
+def get_slurm_allocation(account, partition, time_limit, job_name, num_nodes, gres=None):
     """
     Request a SLURM allocation and wait for it to be granted.
     Args:
@@ -30,6 +30,8 @@ def get_slurm_allocation(account, partition, time_limit, job_name, num_nodes):
         "salloc", "-A", account, "-p", partition, "-N",
         str(num_nodes), "-t", time_limit, "-J", job_name, "--no-shell"
     ]
+    if gres:
+        cmd.append(f"--gres={gres}")
 
     try:
         # Run the command and stream the output in real-time

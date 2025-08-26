@@ -50,6 +50,10 @@ def setup_argparse():
                         type=int,
                         required=True,
                         help="Number of tasks per node")
+    parser.add_argument("--gres",
+                        type=str,
+                        default=None,
+                        help="GPUs per node")
 
     parser.add_argument("--trtllm-repo",
                         type=str,
@@ -79,7 +83,8 @@ def main():
                                         args.partition,
                                         args.time,
                                         f"{args.job_name}",
-                                        num_nodes=args.num_nodes)
+                                        num_nodes=args.num_nodes,
+                                        gres=args.gres)
     os.environ["SLURM_JOB_ID"] = slurm_job_id
     with JobManager(args) as job_manager:
         job_manager.launch_jobs()
