@@ -4484,7 +4484,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
         workspaces.at("gemm_workspace").first, mScalingType);
     tma_ws_input_workspace += tma_ws_size;
 
-    int workspace_index = static_cast<int>(fusion) * (NUM_SWAP_AB_TYPES * NUM_ROUTING_SAMPLES)
+    int workspace_index = static_cast<int>(use_finalize_fusion) * (NUM_SWAP_AB_TYPES * NUM_ROUTING_SAMPLES)
         + static_cast<int>(swap_ab) * NUM_ROUTING_SAMPLES;
     tma_ws_input_workspace += workspace_index * tma_ws_size;
 
