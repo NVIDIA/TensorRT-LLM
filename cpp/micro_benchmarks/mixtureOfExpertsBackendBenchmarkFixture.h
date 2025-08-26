@@ -1074,11 +1074,10 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
         state.SkipWithMessage("Out of range tactic");
         return;
     }
-    auto tactics = mMoERunner.getTactics();
+    auto tactics1 = mMoERunner.getTactics(MoeGemmId::GEMM_1);
+    auto tactics2 = mMoERunner.getTactics(MoeGemmId::GEMM_2);
     if (LOG_LEVEL >= INFO)
     {
-        auto tactics1 = mMoERunner.getTactics(MoeGemmId::GEMM_1);
-        auto tactics2 = mMoERunner.getTactics(MoeGemmId::GEMM_2);
         std::cout << "Selected tactic #1: " << tactic_idx1 << "/" << tactics1.size() << "\n"
                   << tactics1[tactic_idx1].toString() << std::endl;
         std::cout << "Selected tactic #2: " << tactic_idx2 << "/" << tactics2.size() << "\n"
@@ -1087,19 +1086,19 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     state.counters["tactic_idx1"] = tactic_idx1;
     state.counters["tactic_idx2"] = tactic_idx2;
 
-    state.counters["t1_sm_version"] = tactics[tactic_idx1].sm_version;
-    state.counters["t1_tile_shape"] = tactics[tactic_idx1].getTileConfigAsInt();
-    state.counters["t1_cluster_shape"] = (int) tactics[tactic_idx1].cluster_shape;
-    state.counters["t1_dynamic_cluster_shape"] = (int) tactics[tactic_idx1].dynamic_cluster_shape;
-    state.counters["t1_fallback_cluster_shape"] = (int) tactics[tactic_idx1].fallback_cluster_shape;
-    state.counters["t1_epilogue_schedule"] = (int) tactics[tactic_idx1].epilogue_schedule;
+    state.counters["t1_sm_version"] = tactics1[tactic_idx1].sm_version;
+    state.counters["t1_tile_shape"] = tactics1[tactic_idx1].getTileConfigAsInt();
+    state.counters["t1_cluster_shape"] = (int) tactics1[tactic_idx1].cluster_shape;
+    state.counters["t1_dynamic_cluster_shape"] = (int) tactics1[tactic_idx1].dynamic_cluster_shape;
+    state.counters["t1_fallback_cluster_shape"] = (int) tactics1[tactic_idx1].fallback_cluster_shape;
+    state.counters["t1_epilogue_schedule"] = (int) tactics1[tactic_idx1].epilogue_schedule;
 
-    state.counters["t2_sm_version"] = tactics[tactic_idx2].sm_version;
-    state.counters["t2_tile_shape"] = tactics[tactic_idx2].getTileConfigAsInt();
-    state.counters["t2_cluster_shape"] = (int) tactics[tactic_idx2].cluster_shape;
-    state.counters["t2_dynamic_cluster_shape"] = (int) tactics[tactic_idx2].dynamic_cluster_shape;
-    state.counters["t2_fallback_cluster_shape"] = (int) tactics[tactic_idx2].fallback_cluster_shape;
-    state.counters["t2_epilogue_schedule"] = (int) tactics[tactic_idx2].epilogue_schedule;
+    state.counters["t2_sm_version"] = tactics2[tactic_idx2].sm_version;
+    state.counters["t2_tile_shape"] = tactics2[tactic_idx2].getTileConfigAsInt();
+    state.counters["t2_cluster_shape"] = (int) tactics2[tactic_idx2].cluster_shape;
+    state.counters["t2_dynamic_cluster_shape"] = (int) tactics2[tactic_idx2].dynamic_cluster_shape;
+    state.counters["t2_fallback_cluster_shape"] = (int) tactics2[tactic_idx2].fallback_cluster_shape;
+    state.counters["t2_epilogue_schedule"] = (int) tactics2[tactic_idx2].epilogue_schedule;
 
     createGraph(parallelism_config, gemm_to_profile);
 
