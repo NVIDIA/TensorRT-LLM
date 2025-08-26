@@ -9,7 +9,12 @@ import requests
 import yaml
 
 
-def get_slurm_allocation(account, partition, time_limit, job_name, num_nodes, gres=None):
+def get_slurm_allocation(account,
+                         partition,
+                         time_limit,
+                         job_name,
+                         num_nodes,
+                         gres=None):
     """
     Request a SLURM allocation and wait for it to be granted.
     Args:
@@ -94,52 +99,6 @@ def wait_for_server(host, port, max_retries=1000, delay=5):
 
     print(f"Server did not start after {max_retries} attempts")
     return False
-
-
-def calculate_nodes_needed(config, num_gpus):
-    """
-    Calculate the number of nodes needed based on the configuration.
-
-    The calculation is based on:
-    1. The number of context servers and their TP size
-    2. The number of generation servers and their TP size
-    3. The number of IFB servers and their TP size
-    4. The number of GPUs per node (num_gpus)
-
-    Args:
-        config (dict): The configuration dictionary
-
-    Returns:
-        int: The number of nodes needed
-    """
-    total_gpus_needed = 0
-
-    # Calculate GPUs needed for context servers
-    if 'context' in config['exec']['config']:
-        context_config = config['exec']['config']['context']
-        context_tp = context_config['tp']
-        context_dp = context_config['dp']
-        total_gpus_needed += context_tp * context_dp
-
-    # Calculate GPUs needed for generation servers
-    if 'generation' in config['exec']['config']:
-        generation_config = config['exec']['config']['generation']
-        generation_tp = generation_config['tp']
-        generation_dp = generation_config['dp']
-        total_gpus_needed += generation_tp * generation_dp
-
-    # Calculate GPUs needed for IFB servers
-    if 'ifb' in config['exec']['config']:
-        ifb_config = config['exec']['config']['ifb']
-        ifb_tp = ifb_config['tp']
-        ifb_dp = ifb_config['dp']
-        total_gpus_needed += ifb_tp * ifb_dp
-
-    # Calculate nodes needed (round up to ensure enough nodes)
-    nodes_needed = (total_gpus_needed + num_gpus - 1) // num_gpus
-
-    # Ensure we request at least one node
-    return max(1, nodes_needed)
 
 
 class JobManager:
@@ -602,7 +561,8 @@ class JobManager:
             cmd = [
                 "srun", f"--container-name={self.container_name}",
                 f"--container-mounts={self.mounts}", "--mpi=pmix", "--overlap",
-                "-N", str(self.num_nodes), "--ntasks-per-node=1", "bash", "-c",
+                "-N",
+                str(self.num_nodes), "--ntasks-per-node=1", "bash", "-c",
                 f"echo 'Running install operation...' && pip install -e {self.trtllm_repo} 2>&1 | tee install.log"
             ]
             return execute_cmd(cmd)
@@ -1008,23 +968,6 @@ class JobManager:
         print("DEBUG JobManager: run_loadgen_tests completed")
         return pid
 
-    def record_kv_cache_stats(self, generation_server_urls, output_folder):
-        """Record the kv cache stats for a specific concurrency level."""
-        print(
-            f"DEBUG JobManager: Recording kv cache stats for generation servers"
-        )
-        # Get the kv cache stats
-        # Send a request to "/metrics" and store the output in a file
-        for url in generation_server_urls:
-            response = requests.get(f"http://{url}/metrics")
-            with open(
-                    os.path.join(output_folder,
-                                 f"{url.split(':')[0]}_kv_cache_stats.txt"),
-                    "w") as f:
-                f.write(response.text)
-        print(
-            f"DEBUG JobManager: Recorded kv cache stats for generation servers")
-
     def prepare_dataset(self, output_folder):
         """Prepare the dataset for the loadgen tests."""
         input_tokens = str(self.config['profile']['isl'])
@@ -1086,7 +1029,11 @@ class JobManager:
                                               output_folder):
         """Run the benchmark serving test for a specific concurrency level."""
         dataset_path = self.config['profile']['dataset_path']
-        cmd=["wget", "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json", "-O", dataset_path]
+        cmd = [
+            "wget",
+            "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json",
+            "-O", dataset_path
+        ]
         execute_cmd(cmd).wait()
 
         model_name = self.config['exec']['model_path']
@@ -1096,9 +1043,10 @@ class JobManager:
         cmd = [
             "/usr/bin/python3", "-m",
             "tensorrt_llm.serve.scripts.benchmark_serving", "--model",
-            model_name, "--tokenizer", model_name, "--dataset-name",
-            "random", "--dataset-path", dataset_path, "--random-input-len", isl,
-            "--random-output-len", osl, "--random-prefix-len", 0, "--num-prompts",
+            model_name, "--tokenizer", model_name, "--dataset-name", "random",
+            "--dataset-path", dataset_path, "--random-input-len", isl,
+            "--random-output-len", osl, "--random-prefix-len", 0,
+            "--num-prompts",
             str(num_prompts), "--host", hostname, "--port",
             str(port), "--max-concurrency",
             str(concurrency), "--no-test-input"

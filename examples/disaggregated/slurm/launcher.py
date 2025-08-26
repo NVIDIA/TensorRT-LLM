@@ -50,10 +50,7 @@ def setup_argparse():
                         type=int,
                         required=True,
                         help="Number of tasks per node")
-    parser.add_argument("--gres",
-                        type=str,
-                        default=None,
-                        help="GPUs per node")
+    parser.add_argument("--gres", type=str, default=None, help="GPUs per node")
 
     parser.add_argument("--trtllm-repo",
                         type=str,
