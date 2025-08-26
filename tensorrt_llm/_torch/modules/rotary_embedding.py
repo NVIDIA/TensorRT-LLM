@@ -125,3 +125,69 @@ class RotaryEmbedding(nn.Module):
         else:
             embed = torch.stack((o1, o2), dim=-1).flatten(-2)
             return torch.cat((embed, q_or_k_pass), dim=-1)
+
+
+class MRotaryEmbedding(RotaryEmbedding):
+
+    def __init__(
+        self,
+        rope_params: RopeParams,
+        *,
+        head_dim: int,
+        is_neox: bool = True,
+        # NOTE: default mrope_section is [16, 24, 24] for Qwen2/2.5-VL
+        mrope_section: List[int] = [16, 24, 24],
+    ):
+        super().__init__(rope_params, head_dim=head_dim, is_neox=is_neox)
+        self.mrope_section = mrope_section
+
+    def forward(
+        self,
+        position_ids: torch.Tensor,
+        targets: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        # it is assumed all targets are of the same rank
+        q_or_k = targets[0]
+        remove_input_padding = (len(q_or_k.size()) == 2)
+
+        if position_ids.ndim == 3:
+            cos_sin = self.rotary_cos_sin[position_ids.view(3, -1)]
+            cos, sin = cos_sin[:, :, 0, :], cos_sin[:, :, 1, :]
+            cos = torch.cat([
+                m[i]
+                for i, m in enumerate(cos.split(self.mrope_section, dim=-1))
+            ],
+                            dim=-1)
+            sin = torch.cat([
+                m[i]
+                for i, m in enumerate(sin.split(self.mrope_section, dim=-1))
+            ],
+                            dim=-1)
+        else:
+            # Fallback to the original RoPE where position_ids is 2D for dummy requests
+            cos_sin = self.rotary_cos_sin[position_ids.view(-1)]
+            cos, sin = cos_sin[:, 0, :], cos_sin[:, 1, :]
+
+        cos = cos.to(dtype=q_or_k.dtype).unsqueeze(0)
+        sin = sin.to(dtype=q_or_k.dtype).unsqueeze(0)
+        if remove_input_padding:
+            bsz = 1
+            seq_len, _ = q_or_k.size()
+        else:
+            bsz, seq_len, _ = q_or_k.size()
+
+        def rope_target(target):
+            target = target.view(bsz, seq_len, -1,
+                                 self.head_dim).transpose(1, 2)
+            target = RotaryEmbedding.apply_rotary_pos_emb(target,
+                                                          cos,
+                                                          sin,
+                                                          is_neox=self.is_neox)
+            target = target.transpose(1, 2).contiguous()
+            if remove_input_padding:
+                target = target.view(seq_len, -1)
+            else:
+                target = target.view(bsz, seq_len, -1)
+            return target
+
+        return [rope_target(target) for target in targets]

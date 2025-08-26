@@ -160,7 +160,6 @@ class Llama4Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         skip_attn_scaling: bool = False,
     ):
@@ -180,7 +179,7 @@ class Llama4Attention(Attention):
                                         attention_mask,
                                         None,
                                         None,
-                                        mrope_config,
+                                        None,
                                         attention_sinks=None)
 
         attn_output = self.o_proj(attn_output,
@@ -195,7 +194,6 @@ class Llama4Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
@@ -207,7 +205,6 @@ class Llama4Attention(Attention):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 attention_mask=attention_mask,
-                mrope_config=mrope_config,
                 all_reduce_params=all_reduce_params,
                 lora_params=lora_params,
                 **kwargs,
@@ -217,7 +214,6 @@ class Llama4Attention(Attention):
                                       hidden_states=hidden_states,
                                       attn_metadata=attn_metadata,
                                       attention_mask=attention_mask,
-                                      mrope_config=mrope_config,
                                       all_reduce_params=all_reduce_params)
 
 

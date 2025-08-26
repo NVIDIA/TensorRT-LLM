@@ -2,6 +2,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from ...inputs.multimodal import MultimodalParams
 from ..attention_backend.interface import AttentionMetadata
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.interface import SpecMetadata
@@ -44,19 +45,32 @@ class DecodingCUDAGraphRunner:
             (batch_size * max_beam_width * token_per_request, ),
             device=device,
             dtype=torch.int32)
-        self.position_ids = torch.zeros(
-            (1, batch_size * max_beam_width * token_per_request),
-            device=device,
-            dtype=torch.int32)
-        self.mrope_position_deltas = torch.zeros(
-            (batch_size,
-             1), device=device, dtype=torch.int32) if use_mrope else None
+        self.use_mrope = use_mrope
 
+        if self.use_mrope:
+            self.position_ids = torch.zeros(
+                (3, 1, batch_size * max_beam_width * token_per_request),
+                device=device,
+                dtype=torch.int32)
+        else:
+            self.position_ids = torch.zeros(
+                (1, batch_size * max_beam_width * token_per_request),
+                device=device,
+                dtype=torch.int32)
+
+        self.multimodal_params = [
+            MultimodalParams(
+                multimodal_data={
+                    "mrope_config": {
+                        "mrope_position_deltas":
+                        torch.zeros((1, 1), device=device, dtype=torch.int32)
+                    }
+                }) for _ in range(batch_size)
+        ] if self.use_mrope else []
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
         self._output = None
         self._graph = None
-        self.optional_extra_model_inputs = ["mrope_position_deltas"]
 
     def __del__(self):
         self._graph.reset()
@@ -73,7 +87,7 @@ class DecodingCUDAGraphRunner:
             "position_ids": self.position_ids,
             "inputs_embeds": None,
             "spec_metadata": self.spec_metadata,
-            "mrope_position_deltas": self.mrope_position_deltas,
+            "multimodal_params": self.multimodal_params,
         }
 
         # We have to do warm up runs to initialize PyTorch's
@@ -112,10 +126,17 @@ class DecodingCUDAGraphRunner:
         position_ids = inputs["position_ids"]
         seqlen = input_ids.shape[0]
         self.input_ids[:seqlen].copy_(input_ids)
-        self.position_ids[:, :seqlen].copy_(position_ids)
-        if "mrope_position_deltas" in inputs:
-            self.mrope_position_deltas[:self.batch_size].copy_(
-                inputs["mrope_position_deltas"])
+        if self.use_mrope:
+            self.position_ids[:, :, :seqlen].copy_(position_ids)
+            for i, multimodal_param in enumerate(inputs['multimodal_params']):
+                # NOTE: Currently, we only need 'mrope_position_deltas' on generation phase for multimodal models.
+                self.multimodal_params[i].multimodal_data['mrope_config'][
+                    'mrope_position_deltas'].copy_(
+                        multimodal_param.multimodal_data['mrope_config']
+                        ['mrope_position_deltas'],
+                        non_blocking=True)
+        else:
+            self.position_ids[:, :seqlen].copy_(position_ids)
 
         assert self._output is not None and self._graph is not None
         self._graph.replay()
