@@ -147,12 +147,7 @@ class SpecMetadata:
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
-    _all_rank_num_tokens: Optional[List[int]] = field(init=False,
-                                                      default=None,
-                                                      repr=False)
-    all_rank_num_tokens: Optional[List[int]]
-    # The max number of tokens among all ranks.
-    all_rank_max_num_tokens: Optional[int] = None
+    all_rank_num_tokens: Optional[List[int]] = None
 
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
@@ -205,13 +200,3 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
-
-    @property
-    def all_rank_num_tokens(self) -> Optional[List[int]]:
-        return self._all_rank_num_tokens
-
-    @all_rank_num_tokens.setter
-    def all_rank_num_tokens(self, value: Optional[List[int]]):
-        value = value if value is not SpecMetadata.all_rank_num_tokens else None
-        self._all_rank_num_tokens = value
-        self.all_rank_max_num_tokens = max(value) if value is not None else None
