@@ -1,21 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-HarmonyAdapter for vLLM OpenAI entrypoint.
-Stateless, supports OpenAI <-> Harmony format conversion for chat completions.
-
-UPDATE NOTES from Partner (v9):
-- Fixed parser to handle parsing tool names as authors
-- New encode() and decode() convenience methods available (could replace _safe_decode_utf8)
-- Fixed rendering <|call|> tokens for tool calling
-- Fixed tool calling examples to specify <|channel|>commentary
-- to= recipient can be at either part of header
-
-TODO: Partner noted harmony repo is under constant construction - monitor for future updates
-- Consider migrating to encoding.decode() convenience method when mature
-- Watch for potential browser/python tool changes (Exa integration, citation helpers)
-- Monitor for responses API implementation completion
-"""
 
 import json
 import re
