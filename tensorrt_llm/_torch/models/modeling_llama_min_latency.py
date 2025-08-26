@@ -417,7 +417,6 @@ class Llama4MinLatencyAttention(Llama4Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         # If we are going to use min-latency gemm+attn_scaling kernel, pass position_ids to QKV gemm and set
@@ -431,8 +430,8 @@ class Llama4MinLatencyAttention(Llama4Attention):
             skip_attn_scaling = True
 
         return super()._forward_nope(position_ids, hidden_states, attn_metadata,
-                                     attention_mask, mrope_config,
-                                     all_reduce_params, skip_attn_scaling)
+                                     attention_mask, all_reduce_params,
+                                     skip_attn_scaling)
 
 
 class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
