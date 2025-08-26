@@ -157,7 +157,6 @@ endif
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
     		$(EXTRA_VOLUMES) \
-    		$(if $(and $(filter 1,$(LOCAL_USER)),$(shell [ -w "$(USER_CACHE_DIR)" ] && echo 1)),--volume $(USER_CACHE_DIR):/home/$(USER_NAME)/.cache:rw) \
     		--env "CCACHE_DIR=$(CCACHE_DIR)" \
     		--env "CCACHE_BASEDIR=$(CODE_DIR)" \
     		--env "CONAN_HOME=$(CONAN_DIR)" \

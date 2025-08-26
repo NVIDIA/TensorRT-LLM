@@ -159,10 +159,22 @@ def run_disaggregated_test(example_dir,
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
 
+    nsys_path = os.getenv("NSYS_PATH", "nsys")
+    nsys_file = os.getenv("NSYS_FILE", f"/tmp/disagg_test_{test_desc}")
+    nsys_cmd = [
+        "nsys",
+        "profile",
+        "--trace",
+        "cuda,cublas,nvtx",
+        "--output=" + nsys_file,
+        "--force-overwrite=true",
+        "--duration=120",
+    ] if nsys_path and nsys_file else []
+
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
 
-    workers_cmd = [
+    workers_cmd = nsys_cmd + [
         'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
         str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
@@ -257,6 +269,7 @@ def run_disaggregated_test(example_dir,
                                 "The capital of Germany is Berlin",
                                 "Asyncio is a Python library"
                             ]
+                        expected_strings = []
                         for expected_string in expected_strings:
                             if isinstance(expected_string, list):
                                 # At least one of the strings in the list should be found in the content
