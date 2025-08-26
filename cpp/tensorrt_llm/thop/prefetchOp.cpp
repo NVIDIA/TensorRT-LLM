@@ -68,6 +68,10 @@ void cute_host_prefetch_pytorch(
     {
         DISPATCH_PREFETCH(cutlass::bfloat16_t, at::BFloat16);
     }
+    else if (tensor.dtype() == torch::kUInt8)
+    {
+        DISPATCH_PREFETCH(uint8_t, uint8_t);
+    }
     else if (tensor.dtype() == torch::kFloat8_e4m3fn)
     {
         DISPATCH_PREFETCH(cutlass::float_e4m3_t, at::Float8_e4m3fn);
@@ -83,8 +87,8 @@ void cute_host_prefetch_pytorch(
     else
     {
         TORCH_CHECK(false,
-            "Unsupported tensor data type. Supported types: float32, float16, bfloat16, float8_e4m3fn, float8_e5m2, "
-            "int64");
+            "Unsupported tensor data type. Supported types: float32, float16, bfloat16, uint8, float8_e4m3fn, "
+            "float8_e5m2, int64");
     }
 }
 
