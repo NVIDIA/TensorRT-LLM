@@ -1937,12 +1937,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 7, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 7, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 7, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 7, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 7, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-6": ["gb200-multi-node", "l0_gb200_multi_nodes", 6, 7, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 5, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
