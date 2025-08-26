@@ -226,7 +226,6 @@ def _preprocess_after_permute_kernel(
 ):
     pid_x = tl.program_id(0)
     pid_y = tl.program_id(1)
-
     if pid_y == 0:
         token_offsets = pid_x * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         token_mask = token_offsets < TOTAL_TOKENS
@@ -238,8 +237,9 @@ def _preprocess_after_permute_kernel(
             cond = (token_offsets < boundary) & ~found_mask
             expert_ids = tl.where(cond, i, expert_ids)
             found_mask = found_mask | cond
-        tl.store(token_map_ptr + token_offsets, expert_ids, mask=token_mask)
-
+        tl.store(token_map_ptr + token_offsets,
+                 expert_ids.to(tl.int64),
+                 mask=token_mask)
     elif pid_y == 1:
         # get num_tokens for each expert
         expert_mask = pid_x < NUM_EXPERTS
@@ -268,7 +268,7 @@ def preprocess_after_permute(expert_first_token_offset_tensor,
     # create output tensors
     masked_m = torch.empty(num_experts, dtype=torch.int32, device='cuda')
     token_to_expert_map = torch.empty(total_tokens,
-                                      dtype=torch.int32,
+                                      dtype=torch.int64,
                                       device='cuda')
 
     # calculate the grid size
@@ -278,7 +278,8 @@ def preprocess_after_permute(expert_first_token_offset_tensor,
         BLOCK_SIZE_M = DEFAULT_BLOCK_SIZE_M
         grid = (grid_m_size, 2)
     else:
-        BLOCK_SIZE_M = triton.cdiv(total_tokens, num_experts)
+        block_size_m = triton.cdiv(total_tokens, num_experts)
+        BLOCK_SIZE_M = triton.next_power_of_2(block_size_m)
         grid = (num_experts, 2)
 
     # launch the kernel
