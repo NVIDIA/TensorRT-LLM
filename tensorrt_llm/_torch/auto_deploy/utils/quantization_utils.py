@@ -27,10 +27,6 @@ try:
 except ImportError:
     float4_sf_dtype = None
 
-# TODO: put the ENUMs in the same place and import it
-FORMAT_FP8 = 0
-FORMAT_NVFP4 = 1
-
 
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:
     """Converts the modelopt FP4 per-block weight scale to the cutlass format (padded and swizzled)."""
@@ -185,14 +181,11 @@ class FP8QuantizationImpl(QuantizationImpl):
     def build_custom_kwargs_for_linear(
         scale_getattrs: Dict[str, Node],
     ) -> Dict[str, object]:
-        # FP8 custom op contract:
-        #   input_scale=[tensor], weight_scale=[tensor], input_zp=[], weight_zp=[], format_type=FORMAT_FP8
         return dict(
             input_scale=[scale_getattrs["input_scale"]],
             weight_scale=[scale_getattrs["weight_scale"]],
             input_zp=[],
             weight_zp=[],
-            # format_type=FORMAT_FP8,
         )
 
     @staticmethod
@@ -280,7 +273,6 @@ class FP4QuantizationImpl(QuantizationImpl):
               weight_scale=[weight_scale_cutlass_uint8, alpha_fused],
               input_zp=[],
               weight_zp=[],
-              format_type=FORMAT_NVFP4
           )
         """
         return dict(
@@ -288,7 +280,6 @@ class FP4QuantizationImpl(QuantizationImpl):
             weight_scale=[scale_getattrs["weight_scale"], scale_getattrs["alpha"]],
             input_zp=[],
             weight_zp=[],
-            # format_type=FORMAT_NVFP4,
         )
 
     @staticmethod
