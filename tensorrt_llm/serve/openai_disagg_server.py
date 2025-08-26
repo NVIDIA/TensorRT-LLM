@@ -377,7 +377,7 @@ class OpenAIDisaggServer:
             if need_ctx:
                 ctx_req = copy.deepcopy(req)
                 ctx_server, _ = await self.ctx_router.get_next_server(ctx_req)
-                #todo: rename event to something more descriptive
+
                 tracing.add_event(tracing.SpanEvents.CTX_SERVER_SELECTED, attributes={"server": str(ctx_server),})
 
                 # TODO: add ctx_server info into generation request for pre-registration
