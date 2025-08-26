@@ -28,9 +28,11 @@ exec:
       dp: 1
   model_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 profile:
+  dataset_path: /tmp/ShareGPT_V3_unfiltered_cleaned_split.json
   isl: 1024
   osl: 1024
   use_benchmark_serving: true
   concurrency:
   - 128
   - 256
+  ignore_eos: true

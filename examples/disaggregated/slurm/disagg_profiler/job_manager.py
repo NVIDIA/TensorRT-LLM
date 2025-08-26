@@ -1085,17 +1085,23 @@ class JobManager:
     def run_benchmark_serving_for_concurrency(self, hostname, port, concurrency,
                                               output_folder):
         """Run the benchmark serving test for a specific concurrency level."""
-        model_name = self.config['exec']['model_path']
         dataset_path = self.config['profile']['dataset_path']
+        cmd=["wget", "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json", "-O", dataset_path]
+        execute_cmd(cmd).wait()
+
+        model_name = self.config['exec']['model_path']
+        isl = self.config['profile']['isl']
+        osl = self.config['profile']['osl']
         num_prompts = self.config['profile']['num_prompts']
         cmd = [
             "/usr/bin/python3", "-m",
             "tensorrt_llm.serve.scripts.benchmark_serving", "--model",
             model_name, "--tokenizer", model_name, "--dataset-name",
-            "trtllm_custom", "--dataset-path", dataset_path, "--num-prompts",
+            "random", "--dataset-path", dataset_path, "--random-input-len", isl,
+            "--random-output-len", osl, "--random-prefix-len", 0, "--num-prompts",
             str(num_prompts), "--host", hostname, "--port",
             str(port), "--max-concurrency",
-            str(concurrency)
+            str(concurrency), "--no-test-input"
         ]
         if 'ignore_eos' in self.config['profile'] and self.config['profile'][
                 'ignore_eos']:
