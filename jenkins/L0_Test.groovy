@@ -1897,8 +1897,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
         "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -1918,8 +1917,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
-        "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 2],
-        "GH200-TensorRT-Post-Merge-2": ["gh200", "l0_gh200", 2, 2],
+        "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
     ]
     fullSet += SBSATestConfigs.keySet()
 
