@@ -556,7 +556,7 @@ trtllm-bench --model ${MODEL_NAME} \
     --backend pytorch \
     --dataset ./dataset.json \
     --warmup 0 \
-    --eos_id -1
+    --ignore_eos=True
 ```
 
 After inference, review the dumped statistic files in `$EXPERT_STATISTIC_PATH`. Run the `examples/ep_load_balancer/report_load_statistics.py` script to show the standard deviation and imbalance ratio metrics:
@@ -638,7 +638,7 @@ trtllm-bench --model ${MODEL_NAME} \
     --backend pytorch \
     --dataset ./dataset.json \
     --warmup 0 \
-    --eos_id -1
+    --ignore_eos=True
 ```
 
 Run the `examples/ep_load_balancer/report_load_statistics.py` script again:
