@@ -20,11 +20,10 @@ from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig,
-                                              ObservabilityConfig,
                                               get_ctx_gen_server_urls)
-from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
