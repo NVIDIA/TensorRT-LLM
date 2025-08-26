@@ -350,6 +350,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 @pytest.mark.parametrize("spec_dec_model_path", ["EAGLE3-LLaMA3.1-Instruct-8B"])
 @pytest.mark.parametrize("generation_overlap", [False])
 @pytest.mark.parametrize("eagle3_one_model", [True, False])
+@pytest.mark.usefixtures("torch_empty_cache")
 def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
                                                  generation_overlap,
                                                  eagle3_one_model):

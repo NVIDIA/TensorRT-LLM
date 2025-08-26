@@ -95,6 +95,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mm_encoder_only:
+        annotation: bool
+        default: False
+        status: prototype
       disable_overlap_scheduler:
         annotation: bool
         default: False
@@ -131,6 +135,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      perf_metrics_max_requests:
+        annotation: int
+        default: 0
+        status: prototype
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
         default: null

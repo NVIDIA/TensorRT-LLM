@@ -22,9 +22,11 @@ from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import KvCacheConnectorConfig
+from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
+from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
@@ -355,8 +357,10 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
         kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[TorchLlmArgs] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -383,6 +387,9 @@ class GenerationExecutor(ABC):
             "engine": engine,
             "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
+            "hf_model_dir": hf_model_dir,
+            "tokenizer": tokenizer,
+            "llm_args": llm_args,
         }
 
         if lora_config:
@@ -401,8 +408,6 @@ class GenerationExecutor(ABC):
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold,
                 kv_connector_config=kv_connector_config)
 
         # WAR: For the performance of gathering logits, we use single process worker
@@ -416,8 +421,6 @@ class GenerationExecutor(ABC):
             return GenerationExecutorWorker(
                 **worker_kwargs,
                 is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold,
                 kv_connector_config=kv_connector_config)
 
         # For single-gpu case:
@@ -431,8 +434,6 @@ class GenerationExecutor(ABC):
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold,
                 kv_connector_config=kv_connector_config)
         else:
             ctx = multiprocessing.get_context("spawn")
@@ -445,8 +446,6 @@ class GenerationExecutor(ABC):
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold,
                 kv_connector_config=kv_connector_config)
 
     def wait_first_completed(

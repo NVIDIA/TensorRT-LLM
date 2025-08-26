@@ -254,7 +254,7 @@ class KVCacheManager(BaseResourceManager):
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        self.is_vswa = len(self.max_attention_window_vec) > 1
+        self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
         # Calculate blocks per window using appropriate method
         if self.is_vswa:
@@ -708,13 +708,14 @@ class KVCacheManager(BaseResourceManager):
     @staticmethod
     def adjust_window_sizes_for_vswa(
         window_size_to_layers: Dict[int, List[int]],
+        max_attention_window_vec: List[int],
         kv_cache_config: KvCacheConfigCpp,
         model_config: ModelConfig,
         pool_memory_bytes: int,
         kv_factor: int,
         dtype: DataType,
         is_cross_attention: bool = False,
-    ) -> Dict[int, List[int]]:
+    ) -> Tuple[Dict[int, List[int]], List[int]]:
 
         assert is_cross_attention is False, 'Cross attention is not supported'
 
@@ -739,7 +740,8 @@ class KVCacheManager(BaseResourceManager):
 
         if required_mem_bytes_per_seq < pool_memory_bytes:
             # No need to adjust the window sizes.
-            return copy.deepcopy(window_size_to_layers)
+            return (copy.deepcopy(window_size_to_layers),
+                    max_attention_window_vec)
 
         logger.debug(
             f'Adjusting the window sizes {list(window_size_to_layers)} to fit '
@@ -752,6 +754,8 @@ class KVCacheManager(BaseResourceManager):
 
         accum_max_tokens = 0
         prev_window_size = 0
+        adjusted_dict = {}
+        adjusted_max_attention_window_vec = max_attention_window_vec.copy()
 
         for window_size in sorted(window_size_to_layers):
             layers = window_size_to_layers[window_size]
@@ -795,11 +799,18 @@ class KVCacheManager(BaseResourceManager):
                 adjusted_window_size_to_layers[accum_max_tokens] = layers.copy()
             else:
                 adjusted_window_size_to_layers[accum_max_tokens].extend(layers)
+            adjusted_dict[window_size] = accum_max_tokens
+            # also update adjusted_max_attention_window_vec
+            adjusted_max_attention_window_vec = [
+                adjusted_dict.get(v, v)
+                for v in adjusted_max_attention_window_vec
+            ]
 
             remaining_layers -= set(layers)
             prev_window_size = window_size
 
-        return adjusted_window_size_to_layers
+        return (adjusted_window_size_to_layers,
+                adjusted_max_attention_window_vec)
 
     def calculate_max_num_blocks_from_cpp(
             self,
@@ -836,24 +847,29 @@ class KVCacheManager(BaseResourceManager):
         logger.debug(f"window_size_to_layers: {window_size_to_layers}")
 
         free_mem, total_mem = torch.cuda.mem_get_info()
-        primary_pool_memory_bytes = free_mem
-        secondary_pool_memory_bytes = 0
+        # Respect max_gpu_total_bytes if provided
+        free_gpu_memory_fraction = kv_cache_config.free_gpu_memory_fraction if kv_cache_config.free_gpu_memory_fraction else 0.9
+        self._primary_pool_memory_bytes = kv_cache_config.max_gpu_total_bytes if kv_cache_config.max_gpu_total_bytes > 0 else int(
+            free_mem * free_gpu_memory_fraction)
+        self._secondary_pool_memory_bytes = kv_cache_config.host_cache_size if kv_cache_config.host_cache_size else 0
         logger.debug(
-            f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \n"
-            f"secondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
+            f"primary_pool_memory_bytes is set to {self._primary_pool_memory_bytes/1024**3}GB, \n"
+            f"secondary_pool_memory_bytes is set to {self._secondary_pool_memory_bytes/1024**3}GB"
         )
 
         # Adjust the window sizes to fit the memory if even a single sequence
         # cannot fit in the memory.
-        window_size_to_layers = self.adjust_window_sizes_for_vswa(
+        window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
             window_size_to_layers=window_size_to_layers,
+            max_attention_window_vec=self.max_attention_window_vec,
             model_config=model_config,
             kv_cache_config=kv_cache_config,
-            pool_memory_bytes=primary_pool_memory_bytes,
+            pool_memory_bytes=self._primary_pool_memory_bytes,
             kv_factor=self.kv_factor,
             dtype=self.dtype,
             is_cross_attention=is_cross_attention,
         )
+        self.max_attention_window_vec = max_attention_window_vec
 
         blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
             config=kv_cache_config,
@@ -863,8 +879,8 @@ class KVCacheManager(BaseResourceManager):
             model_config=model_config,
             world_config=world_config_cpp,
             window_size_to_layers=window_size_to_layers,
-            allotted_primary_mem_bytes=primary_pool_memory_bytes,
-            allotted_secondary_mem_bytes=secondary_pool_memory_bytes,
+            allotted_primary_mem_bytes=self._primary_pool_memory_bytes,
+            allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
             extra_cost_memory=extra_cost_memory,
             kv_factor=self.kv_factor,
         )

@@ -1707,27 +1707,29 @@ void KVCacheManager::allocatePools(bool useUvm)
     mBlockManager.allocatePools(useUvm);
     auto const numPools = mBlockManager.getNumPools();
 
+    uint64_t cacheSizeBytes = 0;
+    for (SizeType32 poolIdx = 0; poolIdx < numPools; poolIdx++)
+    {
+        auto const cacheShape = mBlockManager.getPrimaryPool(poolIdx)->getShape();
+        auto const cacheVolume = ITensor::volume(cacheShape);
+#ifdef ENABLE_FP4
+        auto const isFp4 = mDataType == nvinfer1::DataType::kFP4;
+#else
+        auto const isFp4 = false;
+#endif
+        if (!isFp4)
+        {
+            cacheSizeBytes += cacheVolume * BufferDataType(mDataType).getSize();
+        }
+        else
+        {
+            cacheSizeBytes += (cacheVolume * 4) / 8;
+        }
+    }
+    // Save the total number of bytes allocated for the KV-cache for KvCacheStats
+    mAllocatedBytes = cacheSizeBytes;
     if (tc::Logger::getLogger()->getLevel() <= tc::Logger::INFO)
     {
-        uint64_t cacheSizeBytes = 0;
-        for (SizeType32 poolIdx = 0; poolIdx < numPools; poolIdx++)
-        {
-            auto const cacheShape = mBlockManager.getPrimaryPool(poolIdx)->getShape();
-            auto const cacheVolume = ITensor::volume(cacheShape);
-#ifdef ENABLE_FP4
-            auto const isFp4 = mDataType == nvinfer1::DataType::kFP4;
-#else
-            auto const isFp4 = false;
-#endif
-            if (!isFp4)
-            {
-                cacheSizeBytes += cacheVolume * BufferDataType(mDataType).getSize();
-            }
-            else
-            {
-                cacheSizeBytes += (cacheVolume * 4) / 8;
-            }
-        }
 
         TLLM_LOG_INFO("Number of tokens per block: %d.", mBlockManager.getTokensPerBlock());
         auto const maxNumTokens = mBlockManager.getNumPrimaryBlocks() * mBlockManager.getTokensPerBlock();

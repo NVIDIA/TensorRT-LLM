@@ -193,6 +193,8 @@ struct KvCacheStats
     float cacheHitRate;
     // Number of free blocks for every configured attention-window size.
     std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
+    // GPU bytes allocated for KV-cache
+    std::size_t allocatedBytes{};
 };
 
 // Basic building block of a paged KV cache - a single
@@ -1483,6 +1485,7 @@ public:
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
         kvCacheStats.numFreeBlocksPerWindowSize = getNumFreeBlocksPerWindowSize();
+        kvCacheStats.allocatedBytes = mAllocatedBytes;
         return kvCacheStats;
     }
 
@@ -1687,6 +1690,8 @@ private:
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;
     runtime::ITensor::SharedPtr mBlockScalePoolPointers;
+    // GPU bytes allocated for KV-cache
+    std::size_t mAllocatedBytes{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

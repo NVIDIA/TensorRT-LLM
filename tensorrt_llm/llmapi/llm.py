@@ -37,8 +37,7 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
-from .tokenizer import (TokenizerBase, _llguidance_tokenizer_info,
-                        _xgrammar_tokenizer_info)
+from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     print_colored_debug, set_api_status)
@@ -967,90 +966,11 @@ class _TorchLLM(BaseLLM):
                                                       self.tokenizer)
         self._tokenizer = self.input_processor.tokenizer
 
-        max_batch_size = self.args.max_batch_size
-        max_num_tokens = self.args.max_num_tokens
-        max_seq_len = self.args.max_seq_len
-
-        kwargs = {}
-        if self._on_trt_backend:
-            kwargs[
-                "batching_type"] = self.args.batching_type or tllm.BatchingType.INFLIGHT
-
-        self._executor_config = tllm.ExecutorConfig(
-            max_beam_width=self.args.max_beam_width,
-            scheduler_config=PybindMirror.maybe_to_pybind(
-                self.args.scheduler_config),
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            gather_generation_logits=self.args.gather_generation_logits,
-            fail_fast_on_attention_window_too_large=getattr(
-                self.args, 'fail_fast_on_attention_window_too_large', False),
-            **kwargs)
-
-        if self.args.kv_cache_config is not None:
-            self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
-                self.args.kv_cache_config)
-        if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
-            # Disable KV cache reuse for deterministic mode
-            self._executor_config.kv_cache_config.enable_block_reuse = False
-            self._executor_config.kv_cache_config.enable_partial_reuse = False
-        if self.args.peft_cache_config is not None:
-            self._executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
-                self.args.peft_cache_config)
-        if self.args.decoding_config is not None:
-            self._executor_config.decoding_config = self.args.decoding_config
-        if self.args.guided_decoding_backend == 'xgrammar':
-            self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
-                backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
-                XGRAMMAR,
-                **_xgrammar_tokenizer_info(self.tokenizer))
-        elif self.args.guided_decoding_backend == 'llguidance':
-            self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
-                backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
-                LLGUIDANCE,
-                **_llguidance_tokenizer_info(self.tokenizer))
-        elif self.args.guided_decoding_backend is not None:
-            raise ValueError(
-                f"Unsupported guided decoding backend {self.args.guided_decoding_backend}"
-            )
-
-        if self._on_trt_backend:
-            self._executor_config.normalize_log_probs = self.args.normalize_log_probs
-        self._executor_config.enable_chunked_context = self.args.enable_chunked_prefill
-        self._executor_config.max_beam_width = self.args.max_beam_width
-        if self.args.cache_transceiver_config is not None:
-            self._executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
-                self.args.cache_transceiver_config)
-        from tensorrt_llm._torch.pyexecutor.config import update_executor_config
-
-        spec_config = self.args.speculative_config
-        max_batch_size = self._executor_config.max_batch_size
-
-        if spec_config is not None and spec_config.decoding_type == "AUTO":
-            from tensorrt_llm._torch.speculative import suggest_spec_config
-            spec_config = suggest_spec_config(max_batch_size)
-
-        update_executor_config(
-            self._executor_config,
-            backend=self.args.backend,
-            pytorch_backend_config=self.args.get_pytorch_backend_config()
-            if self.args.backend in ["pytorch", "_autodeploy"] else None,
-            mapping=self.args.parallel_config.to_mapping(),
-            speculative_config=spec_config,
-            hf_model_dir=self._hf_model_dir,
-            max_input_len=self.args.max_input_len,
-            max_seq_len=max_seq_len,
-            checkpoint_format=None if self.args.backend == "_autodeploy" else
-            self.args.checkpoint_format,
-            checkpoint_loader=None if self.args.backend == "_autodeploy" else
-            self.args.checkpoint_loader)
-
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
-
         self._executor = self._executor_cls.create(
             self._engine_dir,
-            executor_config=self._executor_config,
+            executor_config=None,
             batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
@@ -1063,11 +983,11 @@ class _TorchLLM(BaseLLM):
             ),
             is_llm_executor=True,
             lora_config=self.args.lora_config,
-            garbage_collection_gen0_threshold=self.args.
-            garbage_collection_gen0_threshold,
             # Autodeploy does not support kv_connector_config
             kv_connector_config=getattr(self.args, "kv_connector_config", None),
-        )
+            hf_model_dir=self._hf_model_dir,
+            tokenizer=self.tokenizer,
+            llm_args=self.args)
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.
