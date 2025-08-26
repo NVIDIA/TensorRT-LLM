@@ -15,12 +15,12 @@ from utils.llm_data import llm_models_root
 
 # TODO: add disable_overlap_scheduler=False
 @pytest.mark.parametrize(
-    "disable_overlap_scheduler,use_cuda_graph,attn_backend",
-    [[True, False, "TRTLLM"], [True, True, "TRTLLM"],
-     [True, False, "FLASHINFER"]])
+    "disable_overlap_scheduler,use_cuda_graph,attn_backend,use_top_p",
+    [[True, False, "TRTLLM", False], [True, True, "TRTLLM", False],
+     [True, False, "FLASHINFER", False], [True, False, "TRTLLM", True]])
 @pytest.mark.high_cuda_memory
 def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
-                     attn_backend: str):
+                     attn_backend: str, use_top_p: bool):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 20:
         pytest.skip("Not enough memory to load target model")
@@ -54,7 +54,14 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         "The capital of France is",
         "The president of the United States is",
     ]
-    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+
+    if use_top_p == False:
+        sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+    else:
+        sampling_params = SamplingParams(max_tokens=32,
+                                         ignore_eos=True,
+                                         top_p=0.9,
+                                         temperature=0.0)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     results_spec = llm_spec.generate(prompts, sampling_params)

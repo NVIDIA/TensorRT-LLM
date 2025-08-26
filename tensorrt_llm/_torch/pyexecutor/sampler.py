@@ -493,7 +493,7 @@ class TorchSampler(Sampler):
 
     def _process_draft_tokens_rejection_sampling(
             self, request: LlmRequest, new_tokens: torch.Tensor) -> int:
-        if request.py_draft_logits:
+        if request.py_draft_logits is None:
             draft_probs = torch.zeros(len(request.py_draft_tokens),
                                       request.py_target_probs.shape[-1],
                                       device=request.py_target_probs.device)
@@ -545,8 +545,8 @@ class TorchSampler(Sampler):
     def process_draft_tokens(self, request: LlmRequest,
                              new_tokens: torch.Tensor) -> int:
         # If the request has ngram spec tokens and the strategy is not greedy, use rejection sampling to get higher draft acceptance rate.
-        if request.py_has_ngram_spec_tokens and request_strategy(
-                request) != Strategy.GREEDY:
+        if request.py_has_ngram_spec_tokens and request_strategy(request) != (
+                "greedy", None):
             return self._process_draft_tokens_rejection_sampling(
                 request, new_tokens)
         if request.py_draft_logits is None:

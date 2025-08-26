@@ -924,9 +924,7 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        if self.need_extra_greedy_sample():
-            context_request_mapping = {}
-            generation_request_mapping = {}
+
         with self._profiler() as profile_step:
             sample_state = None
             iter_start_time = time.time()
@@ -967,45 +965,8 @@ class PyExecutor:
                                 self.guided_decoder.rollback_rejected_tokens(
                                     scheduled_batch)
                             if self.need_extra_greedy_sample():
-                                greedy_sample_requests = ScheduledRequests()
-                                for req in scheduled_batch.generation_requests:
-                                    req.py_has_ngram_spec_tokens = True
-                                    if req.py_request_id not in generation_request_mapping:
-                                        generation_request_mapping[
-                                            req.py_request_id] = LlmRequest(
-                                                llm_request=req,
-                                                stop_words_list=req.
-                                                py_stop_words_list,
-                                                seq_slot=req.py_seq_slot,
-                                                target_seq_slot=req.
-                                                py_target_seq_slot)
-                                        generation_request_mapping[
-                                            req.
-                                            py_request_id].sampling_config = SamplingConfig(
-                                            )
-                                        generation_request_mapping[
-                                            req.
-                                            py_request_id].py_has_ngram_spec_tokens = True
-                                    greedy_sample_requests.generation_requests.append(
-                                        generation_request_mapping[
-                                            req.py_request_id])
-                                for req in scheduled_batch.context_requests:
-                                    if req.py_request_id not in context_request_mapping:
-                                        context_request_mapping[
-                                            req.py_request_id] = LlmRequest(
-                                                llm_request=req,
-                                                stop_words_list=req.
-                                                py_stop_words_list,
-                                                seq_slot=req.py_seq_slot,
-                                                target_seq_slot=req.
-                                                py_target_seq_slot)
-                                        context_request_mapping[
-                                            req.
-                                            py_request_id].sampling_config = SamplingConfig(
-                                            )
-                                    greedy_sample_requests.context_requests.append(
-                                        context_request_mapping[
-                                            req.py_request_id])
+                                greedy_sample_requests, generation_request_mapping, context_request_mapping = self.get_extra_greedy_sample_requests(
+                                    scheduled_batch)
 
                             self.drafter.prepare_draft_tokens(
                                 scheduled_batch, generation_request_mapping,
@@ -1024,6 +985,7 @@ class PyExecutor:
                     if self.need_extra_greedy_sample():
                         greedy_sample_state = self._sample_async(
                             greedy_sample_requests, batch_outputs)
+                        self._update_request_states(greedy_sample_requests)
                         self._update_requests(greedy_sample_state)
 
                     if self.kv_cache_transceiver:
@@ -1838,3 +1800,37 @@ class PyExecutor:
         return self.drafter is not None and hasattr(
             self.drafter, 'spec_config'
         ) and self.drafter.spec_config.spec_dec_mode.is_ngram()
+
+    def get_extra_greedy_sample_requests(self,
+                                         scheduled_batch: ScheduledRequests):
+        greedy_sample_requests = ScheduledRequests()
+        generation_request_mapping = {}
+        context_request_mapping = {}
+
+        def get_extra_greedy_sample_requests_helper(
+                requests: list[LlmRequest],
+                request_mapping: dict[int, LlmRequest], is_generation: bool):
+            for req in requests:
+                req.py_has_ngram_spec_tokens = True
+                if req.py_request_id not in request_mapping:
+                    request_mapping[req.py_request_id] = LlmRequest(
+                        llm_request=req,
+                        stop_words_list=req.py_stop_words_list,
+                        seq_slot=req.py_seq_slot,
+                        target_seq_slot=req.py_target_seq_slot)
+                    request_mapping[
+                        req.py_request_id].sampling_config = SamplingConfig()
+                    if is_generation:
+                        greedy_sample_requests.generation_requests.append(
+                            request_mapping[req.py_request_id])
+                    else:
+                        greedy_sample_requests.context_requests.append(
+                            request_mapping[req.py_request_id])
+
+        get_extra_greedy_sample_requests_helper(
+            scheduled_batch.generation_requests, generation_request_mapping,
+            True)
+        get_extra_greedy_sample_requests_helper(
+            scheduled_batch.context_requests, context_request_mapping, False)
+
+        return greedy_sample_requests, generation_request_mapping, context_request_mapping
