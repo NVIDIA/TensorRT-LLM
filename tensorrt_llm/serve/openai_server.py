@@ -672,7 +672,6 @@ class OpenAIServer:
         Supports both streaming and non-streaming modes.
         """
         try:
-            # 1. RAW INPUT REQUEST (before harmony adapter)
             # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
             tools_dict = None
             if request.tools:

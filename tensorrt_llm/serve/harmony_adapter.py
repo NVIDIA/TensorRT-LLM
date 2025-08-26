@@ -651,7 +651,7 @@ class HarmonyAdapter:
                     if content:
                         system_instructions.append(content.strip())
                 # Collect developer instructions
-                if role == "developer":
+                elif role == "developer":
                     content = self.collect_content(msg)
                     if content:
                         dev_instructions.append(content.strip())
