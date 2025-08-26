@@ -22,7 +22,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
-from tensorrt_llm.bindings.exceptions import RequestSpecificException
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -1514,40 +1513,35 @@ class PyExecutor:
 
         return ctx_transmission_reqs
 
-    def _check_cache_transfer_status_helper(self,
-                                            method_name: str,
-                                            method_call,
-                                            atLeastNum: int = 0):
-        """Helper method to handle cache transfer status checking with error handling."""
-        try:
-            method_call(atLeastNum)
-        except RequestSpecificException as e:
-            error_msg = str(e)
-            logger.error(
-                f"Encountered a request-specific error in {method_name}: {error_msg}"
-            )
-            request = [
-                req for req in self.active_requests
-                if req.py_request_id == e.request_id
-            ]
-            self._handle_errors(error_msg, request)
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(
-                f"Encountered a system error in {method_name}: {error_msg}")
-            self._handle_errors(error_msg)
+    def _check_request_error_state(self):
+        error_requests = []
+        for req in self.active_requests:
+            if req.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                error_requests.append(req)
+
+        return error_requests
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
-        self._check_cache_transfer_status_helper(
-            "checking context transfer status",
-            self.kv_cache_transceiver.check_context_transfer_status, atLeastNum)
+        self.kv_cache_transceiver.check_context_transfer_status(atLeastNum)
+
+        # Check if any request is in error state
+        error_requests = self._check_request_error_state()
+        if len(error_requests) > 0:
+            self._handle_errors(
+                f"Error in kv cache transfer for context requests",
+                requests=error_requests)
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
-        self._check_cache_transfer_status_helper(
-            "checking generation transfer status",
-            self.kv_cache_transceiver.check_gen_transfer_status, atLeastNum)
+        self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+
+        # Check if any request is in error state
+        error_requests = self._check_request_error_state()
+        if len(error_requests) > 0:
+            self._handle_errors(
+                f"Error in kv cache transfer for generation requests",
+                requests=error_requests)
 
     def _forward_step(self,
                       scheduled_requests,
