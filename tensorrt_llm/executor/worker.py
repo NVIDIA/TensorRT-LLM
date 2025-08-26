@@ -159,29 +159,9 @@ class GenerationExecutorWorker(GenerationExecutor):
                                      executor_config=executor_config,
                                      managed_weights=engine.managed_weights)
 
-            if not hasattr(executor_config, "backend"):
-                return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                     executor_config)
-            args = {
-                "executor_config": executor_config,
-                "checkpoint_dir": executor_config.hf_model_dir,
-            }
-            if executor_config.backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-                    create_py_executor
-                create_executor = create_py_executor
-                args["lora_config"] = lora_config
-                args[
-                    "garbage_collection_gen0_threshold"] = llm_args.garbage_collection_gen0_threshold
-                args["kv_connector_config"] = kv_connector_config
-            elif executor_config.backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-            else:
-                raise ValueError(
-                    f"Unsupported backend config: {executor_config.backend}")
-            return create_executor(**args)
+            assert not hasattr(executor_config, "backend")
+            return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
+                                 executor_config)
 
         self.engine = _create_py_executor(
             executor_config) if llm_args is not None else _create_engine(
