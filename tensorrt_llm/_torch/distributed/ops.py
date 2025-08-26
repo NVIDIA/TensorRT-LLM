@@ -323,14 +323,6 @@ class MNNVLAllReduce(nn.Module):
                 and not mapping.has_cp() and mapping.is_multi_node()
                 and MnnvlMemory.supports_mnnvl() and is_on_aarch64)
 
-    # Check if MNNVL strategy is used
-    @staticmethod
-    def should_use_mnnvl(strategy: AllReduceStrategy, mapping: Mapping,
-                         dtype: torch.dtype) -> bool:
-        if strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
-            return MNNVLAllReduce.is_mnnvl(mapping, dtype)
-        return False
-
     def forward(
         self,
         input: torch.Tensor,
@@ -488,6 +480,9 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+
+    def is_mnnvl(self) -> bool:
+        return self.mnnvl_allreduce is not None
 
     def forward(
         self,

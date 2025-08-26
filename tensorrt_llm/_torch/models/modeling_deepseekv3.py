@@ -52,7 +52,6 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
-from ..distributed.ops import MNNVLAllReduce
 from ..model_config import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
@@ -746,9 +745,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.mapping.tp_size,
             )
 
-            if tp > self.mapping.gpus_per_node and not MNNVLAllReduce.should_use_mnnvl(
-                    self.model_config.allreduce_strategy, self.mapping,
-                    self.config.torch_dtype):
+            if tp > self.mapping.gpus_per_node and not self.allreduce.is_mnnvl(
+            ):
                 mlp_tp_size = math.gcd(
                     tp,
                     self.mapping.gpus_per_node,
