@@ -577,7 +577,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
             return config;
         });
 
-    if (!use_w4_groupwise)
+    if (use_w4_groupwise)
     {
         // w4 groupwise implementation requires swap_ab to be true
         tma_ws_configs.erase(
