@@ -490,18 +490,17 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def(nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
                  std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
                  std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
-                 nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, bool, tbk::CacheType,
+                 nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, tbk::CacheType,
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
                  bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
             nb::arg("sink_token_length"), nb::arg("stream"), nb::arg("max_sequence_length").none(),
-            nb::arg("enable_block_reuse") = false, nb::arg("onboard_blocks") = true,
-            nb::arg("cache_type") = tbk::CacheType::kSELF, nb::arg("secondary_offload_min_priority") = std::nullopt,
-            nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
-            nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("enable_block_reuse") = false, nb::arg("cache_type") = tbk::CacheType::kSELF,
+            nb::arg("secondary_offload_min_priority") = std::nullopt, nb::arg("event_manager") = nullptr,
+            nb::arg("enable_partial_reuse") = true, nb::arg("copy_on_partial_reuse") = true,
+            nb::arg("kv_connector_manager") = nullptr, nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

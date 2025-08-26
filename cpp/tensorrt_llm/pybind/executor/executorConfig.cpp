@@ -102,8 +102,8 @@ void initConfigBindings(pybind11::module_& m)
     {
         return py::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
-            self.getOnboardBlocks(), self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(),
-            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm(),
+            self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(), self.getEventBufferMaxSize(),
+            self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm(),
             self.getAttentionDpEventsGatherPeriodMs(), self.getMaxGpuTotalBytes());
     };
     auto kvCacheConfigSetstate = [](py::tuple const& state)
@@ -144,7 +144,6 @@ void initConfigBindings(pybind11::module_& m)
         .def_property(
             "max_gpu_total_bytes", &tle::KvCacheConfig::getMaxGpuTotalBytes, &tle::KvCacheConfig::setMaxGpuTotalBytes)
         .def_property("host_cache_size", &tle::KvCacheConfig::getHostCacheSize, &tle::KvCacheConfig::setHostCacheSize)
-        .def_property("onboard_blocks", &tle::KvCacheConfig::getOnboardBlocks, &tle::KvCacheConfig::setOnboardBlocks)
         .def_property("cross_kv_cache_fraction", &tle::KvCacheConfig::getCrossKvCacheFraction,
             &tle::KvCacheConfig::setCrossKvCacheFraction)
         .def_property("secondary_offload_min_priority", &tle::KvCacheConfig::getSecondaryOffloadMinPriority,
