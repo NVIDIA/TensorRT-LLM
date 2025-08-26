@@ -3,6 +3,8 @@ from typing import Dict, List, Optional, Union
 import torch
 from torch import nn
 
+from ...custom_ops.trtllm_gen_custom_ops import \
+    fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor, next_positive_power_of_2
 from .interface import MoE, MoEWeightLoadingMode
@@ -76,6 +78,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            layer_idx=layer_idx,
         )
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
@@ -179,10 +182,11 @@ class TRTLLMGenFusedMoE(MoE):
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -398,3 +402,31 @@ class TRTLLMGenFusedMoE(MoE):
             final_hidden_states = final_hidden_states[:
                                                       all_rank_num_tokens[rank]]
         return final_hidden_states
+
+    def forward_fake(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        if do_finalize:
+            # TRTLLMGenFusedMoE only supports bfloat16 output
+            return super().forward_fake(x,
+                                        router_logits,
+                                        do_finalize=do_finalize,
+                                        output_dtype=torch.bfloat16,
+                                        all_rank_num_tokens=all_rank_num_tokens,
+                                        use_dp_padding=use_dp_padding,
+                                        **kwargs)
+        else:
+            return fp4_block_scale_fake_output_without_finalize(
+                x,
+                self.num_experts,
+                self.routing_method.top_k,
+                self.routing_method.e_score_correction_bias,
+            )
