@@ -393,6 +393,11 @@ class DecodingBaseConfig(StrictBaseModel):
         Do any additional error checking here.
         """
 
+    def update_for_draft_init(self):
+        """
+        Update the config for draft model initialization.
+        """
+
     @functools.cached_property
     def spec_dec_mode(self):
         # spec_dec_mode has more functionality than the raw decoding_mode string.
@@ -462,7 +467,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
 
-    @functools.cached_property
+    @property
     def num_capture_layers(self):
         """
         Returns the number of layers to capture of the target model.
@@ -472,6 +477,16 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_layers_to_capture is not None:
             return len(self.eagle3_layers_to_capture)
         return 3
+
+    def update_for_draft_init(self):
+        """
+        Update the config for draft model initialization.
+        """
+        if not self.eagle3_one_model:
+            num_layers = self.num_eagle_layers
+            if num_layers is None:
+                num_layers = 1
+            self.eagle3_layers_to_capture = set(num_layers - 1)
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
