@@ -16,6 +16,9 @@ l0_a10:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
+  # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
+  # test list either).
+  - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
@@ -25,6 +28,7 @@ l0_a10:
   - test_e2e.py::test_openai_chat_structural_tag_example
   - test_e2e.py::test_openai_chat_json_example
   - test_e2e.py::test_openai_chat_multimodal_example
+  - test_e2e.py::test_openai_perf_metrics
   - test_e2e.py::test_openai_prometheus
   - test_e2e.py::test_openai_lora
   - test_e2e.py::test_trtllm_serve_multimodal_example
@@ -199,7 +203,7 @@ l0_a10:
   tests:
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
-l0_a10_nanobind:
+l0_a10_pybind:
 - condition:
     ranges:
       system_gpu_count:
@@ -211,6 +215,7 @@ l0_a10_nanobind:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
-      backend: tensorrt
   tests:
   - unittest/bindings
+  - test_e2e.py::test_openai_chat_example[trt]
+  - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
