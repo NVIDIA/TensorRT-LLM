@@ -33,7 +33,7 @@ docker run --rm --ipc=host -it \
   -p 8000:8000 \
   -e TRTLLM_ENABLE_PDL=1 \
   -v ~/.cache:/root/.cache:rw \
-  nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc0 \
+  nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc1 \
   /bin/bash
 ```
 
@@ -206,12 +206,10 @@ Currently, the best throughput **19.5k tps/gpu** is achieved with DP4EP4 using 4
 
 ## Launch the TensorRT-LLM Server
 
-We can use `trtllm-serve` to serve the model by translating the benchmark commands above. For low-latency configuration, run:
+We can use `trtllm-serve` to serve the model by translating the benchmark commands above. For low-latency configuration, run:  
+**Note:** You can also point to a local path containing the model weights instead of the HF repo (e.g., `${local_model_path}`).
 
 ```bash
-trtllm-serve \
-Note: You can also point to a local path containing the model weights instead of the HF repo (e.g., `${local_model_path}`).
-
 trtllm-serve \
   openai/gpt-oss-120b \
   --host 0.0.0.0 \
@@ -230,7 +228,6 @@ The initialization may take several minutes as it loads and optimizes the models
 For max-throughput configuration, run:
 
 ```bash
-trtllm-serve \
 trtllm-serve \
   openai/gpt-oss-120b \
   --host 0.0.0.0 \
