@@ -312,6 +312,7 @@ class MNNVLAllReduce(nn.Module):
     def get_supported_dtypes():
         return (torch.float16, torch.bfloat16, torch.float32)
 
+    # Check if MNNVL is supported
     @staticmethod
     def is_mnnvl(mapping: Mapping, dtype: torch.dtype) -> bool:
         from tensorrt_llm._mnnvl_utils import MnnvlMemory
@@ -321,6 +322,14 @@ class MNNVLAllReduce(nn.Module):
         return (dtype in MNNVLAllReduce.get_supported_dtypes()
                 and not mapping.has_cp() and mapping.is_multi_node()
                 and MnnvlMemory.supports_mnnvl() and is_on_aarch64)
+
+    # Check if MNNVL strategy is used
+    @staticmethod
+    def should_use_mnnvl(strategy: AllReduceStrategy, mapping: Mapping,
+                         dtype: torch.dtype) -> bool:
+        if strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
+            return MNNVLAllReduce.is_mnnvl(mapping, dtype)
+        return False
 
     def forward(
         self,

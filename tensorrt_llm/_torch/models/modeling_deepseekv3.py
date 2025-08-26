@@ -41,7 +41,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -612,7 +612,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                        torch.cuda.Stream]):
         super().__init__()
         self.model_config = model_config
-        config = model_config.pretrained_config
+        self.config = model_config.pretrained_config
+        config = self.config
 
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -745,13 +746,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.mapping.tp_size,
             )
 
-            if tp > self.mapping.gpus_per_node and (
-                    self.model_config.allreduce_strategy not in (
-                        AllReduceStrategy.AUTO,
-                        AllReduceStrategy.MNNVL,
-                    ) or not MNNVLAllReduce.is_mnnvl(
-                        self.mapping,
-                        self.model_config.pretrained_config.torch_dtype)):
+            if tp > self.mapping.gpus_per_node and not MNNVLAllReduce.should_use_mnnvl(
+                    self.model_config.allreduce_strategy, self.mapping,
+                    self.config.torch_dtype):
                 mlp_tp_size = math.gcd(
                     tp,
                     self.mapping.gpus_per_node,
