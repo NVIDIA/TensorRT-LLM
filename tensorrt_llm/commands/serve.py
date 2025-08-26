@@ -110,42 +110,24 @@ def get_llm_args(model: str,
     )
     backend = backend if backend in ["pytorch", "_autodeploy"] else None
     llm_args = {
-        "model":
-        model,
-        "scheduler_config":
-        scheduler_config,
-        "tokenizer":
-        tokenizer,
-        "tensor_parallel_size":
-        tensor_parallel_size,
-        "pipeline_parallel_size":
-        pipeline_parallel_size,
-        "moe_expert_parallel_size":
-        moe_expert_parallel_size,
-        "gpus_per_node":
-        gpus_per_node,
-        "trust_remote_code":
-        trust_remote_code,
-        "build_config":
-        build_config,
-        "max_batch_size":
-        max_batch_size,
-        "max_num_tokens":
-        max_num_tokens,
-        "max_beam_width":
-        max_beam_width,
-        "max_seq_len":
-        max_seq_len,
-        "kv_cache_config":
-        kv_cache_config,
-        "backend":
-        backend,
-        "num_postprocess_workers":
-        num_postprocess_workers,
-        "postprocess_tokenizer_dir":
-        tokenizer or model,
-        "reasoning_parser":
-        reasoning_parser,
+        "model": model,
+        "scheduler_config": scheduler_config,
+        "tokenizer": tokenizer,
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
+        "moe_expert_parallel_size": moe_expert_parallel_size,
+        "gpus_per_node": gpus_per_node,
+        "trust_remote_code": trust_remote_code,
+        "build_config": build_config,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
+        "kv_cache_config": kv_cache_config,
+        "backend": backend,
+        "num_postprocess_workers": num_postprocess_workers,
+        "postprocess_tokenizer_dir": tokenizer or model,
+        "reasoning_parser": reasoning_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
         "otlp_traces_endpoint": otlp_traces_endpoint,
@@ -305,12 +287,10 @@ def launch_mm_encoder_server(
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
-@click.option(
-    "--otlp_traces_endpoint",
-    type=str,
-    default=None,
-    help="Target URL to which OpenTelemetry traces will be sent."
-)
+@click.option("--otlp_traces_endpoint",
+              type=str,
+              default=None,
+              help="Target URL to which OpenTelemetry traces will be sent.")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
