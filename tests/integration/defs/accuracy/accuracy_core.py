@@ -189,6 +189,8 @@ class AccuracyTask:
                 sampling_params.truncate_prompt_tokens = self.MAX_INPUT_LEN
 
         evaluator_kwargs = {}
+        print(f"self.EVALUATOR_KWARGS: {self.EVALUATOR_KWARGS}")
+        print(f"extra_evaluator_kwargs: {extra_evaluator_kwargs}")
         if self.EVALUATOR_KWARGS is not None:
             evaluator_kwargs.update(self.EVALUATOR_KWARGS)
         if extra_evaluator_kwargs is not None:
