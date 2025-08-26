@@ -417,7 +417,7 @@ void runSlidingWindowAttentionTest()
     auto constexpr batchSize = 1;
     auto constexpr maxBlocksPerSeq = 10;
     auto constexpr bytesPerToken = 4;
-    auto constexpr maxAttentionWindow = windowSize;
+    auto constexpr maxAttentionWindow = 4096;
     auto constexpr sinkTokenLen = 0;
     auto constexpr canUseOneMoreBlock = true;
 
@@ -431,12 +431,13 @@ void runSlidingWindowAttentionTest()
 
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
         blocksPerWindow, maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, type, 0, onboardBlocks);
+        std::vector<BlockManager::SizeType32>{windowSize}, std::nullopt, type, 0, onboardBlocks);
     blockManager.allocatePools(false);
 
     // Add first sequence that contributes reusable tokens
     VecTokens firstSequenceTokens(seqLen0);
     std::iota(firstSequenceTokens.begin(), firstSequenceTokens.end(), 1);
+    printf("1st :: ");   for (auto ll : firstSequenceTokens) printf("%d, ",ll);   printf("\b\b \n");
     auto inputTokens = std::make_shared<VecTokens>(firstSequenceTokens);
     auto const inputLength = static_cast<SizeType32>(inputTokens->size());
     LlmRequest::RequestIdType requestId0{0};
@@ -466,6 +467,7 @@ void runSlidingWindowAttentionTest()
     VecTokens secondSequenceTokens(seqLen0);
     std::iota(secondSequenceTokens.begin(), secondSequenceTokens.end(), 1);
     for (int i = numMatching; i < seqLen0; ++i) secondSequenceTokens[i] += 1;
+    printf("2nd :: ");   for (auto ll : secondSequenceTokens) printf("%d, ",ll);   printf("\b\b \n");
     auto inputTokens1 = std::make_shared<VecTokens>(secondSequenceTokens);
     auto inputLength1 = static_cast<SizeType32>(inputTokens1->size());
     LlmRequest::RequestIdType requestId1{1};
@@ -475,11 +477,11 @@ void runSlidingWindowAttentionTest()
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
     blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
     auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
-    auto constexpr reusedBlocks = (numMatching + tokensPerBlock - 1) / tokensPerBlock;
-    auto constexpr firstOnboardedBlock = std::max(0, ((numMatching - windowSize) + tokensPerBlock - 1) / tokensPerBlock);
+    auto constexpr fullyReusedBlocks = numMatching / tokensPerBlock;
+    auto constexpr firstOnboardedBlock = std::max(0, (numMatching - windowSize) / tokensPerBlock);
     std::vector<int> expectedBlocks1(numBlocks); // both sequences are same length
-    for (int i = 0; i < reusedBlocks; ++i) expectedBlocks1[i] = i;
-    for (int i = reusedBlocks; i < numBlocks; ++i) expectedBlocks1[i] = numBlocks + i - reusedBlocks;
+    for (int i = 0; i < fullyReusedBlocks; ++i) expectedBlocks1[i] = i;
+    for (int i = fullyReusedBlocks; i < numBlocks; ++i) expectedBlocks1[i] = numBlocks + i - fullyReusedBlocks;
     EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray(expectedBlocks1));
     // Verify that the right blocks were onboarded
     int blockIdx = 0;
