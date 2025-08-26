@@ -158,6 +158,7 @@ struct TmaWarpSpecializedGroupedGemmInput
 
         int const** ptr_source_token_index = nullptr;
         int num_rows_in_final_output = 0;
+        int shape_override = -1;
 
         bool use_reduction = true;
     };
