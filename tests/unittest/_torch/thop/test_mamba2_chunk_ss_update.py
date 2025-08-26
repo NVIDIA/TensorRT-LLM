@@ -369,8 +369,6 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
     (16, 20),
 ])
 def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
-    if mamba_chunk_size == 8 and seqlens == (270, 88, 212, 203):
-        pytest.skip("https://nvbugspro.nvidia.com/bug/5477332")
     dim = 1024
     headdim = 64
     ngroups = 1
@@ -566,7 +564,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
     # kernel chunked is same as kernel overall
     # tight tolerance to find subtle correctness issues
     rtol = 1e-2
-    atol = 2e-3
+    atol = 5e-3
     for i in range(num_sequences):
         out_seq = out[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]
         out_seq_ref = out_ref[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]

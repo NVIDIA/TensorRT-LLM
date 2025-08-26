@@ -82,7 +82,7 @@ Firstly let’s have an overview of the overall imbalance issues across layers:
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture1.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture1.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: The routed token count from rank 0 to all the ranks(including rank 0), for decode iteration 1950, and all the MoE layers</em></sub></p>
@@ -93,7 +93,7 @@ If we zoom on the MoE in the layer 36 and record its activated expert rank distr
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture2.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture2.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: The tokens received for each expert rank for layer 36</em></sub></p>
@@ -102,7 +102,7 @@ If we flatten the data to see the routed tokens for each expert, we can see that
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture3.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture3.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: The tokens received for each expert for layer 36</em></sub></p>
@@ -111,7 +111,7 @@ It is also interesting to see that this kind of imbalance issue is very stable a
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture4.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture4.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: The accumulated token counts received for each expert for layer 36, within 50 decode steps, and the local batch size=256.</em></sub></p>
@@ -121,7 +121,7 @@ We have also done the duration-based analysis for local batch size=1 which corre
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture5.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture5.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: The accumulated token counts received for each expert  for layer 36, within 400 decode iterations, and the local batch size \= 1\.</em></sub></p>
@@ -139,7 +139,7 @@ And another natural question is whether the above observation can change signifi
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture6.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture6.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: The routed token count from rank 0 to all the ranks, for iteration 1950, and all the MoE layers</em></sub></p>
@@ -148,7 +148,7 @@ In Figure 6, compared with Figure 1, it can be seen that for GSM8K, the hot laye
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture7.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture7.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7: routed token counts from EP rank 0 to other EP ranks, still taking the iteration 1950, MoE layer 36 as the example</em></sub></p>
@@ -158,7 +158,7 @@ Based on Figure 8, it can be observed that the workload imbalance is relatively 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture8.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture8.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 8: The accumulated token counts sent from EP Rank 0 to all the ranks, for MoE layer 57 within 50 decode steps, local batch size=256</em></sub></p>
@@ -167,7 +167,7 @@ If we flatten the EP rank level data to expert-level data, we can have the follo
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture9.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture9.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 9: The accumulated token counts received for each expert for layer 57, within 50 decode steps, and the local batch size=256.</em></sub></p>
@@ -176,7 +176,7 @@ The similar imbalance pattern also exists for a single request.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture10.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture10.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 10: The accumulated token counts received for each expert for layer 57, within 400 decode steps, for a single request</em></sub></p>
@@ -185,7 +185,7 @@ If we use another request, then we can still observe the expert imbalance issue,
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture11.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture11.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 11: The accumulated token counts received for each expert for layer 57, within 400 decode steps, for a single request</em></sub></p>
@@ -218,7 +218,7 @@ To make sure large-scale EP can run well, careful considerations are needed to m
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture12.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture12.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 12: the high-level design of TensorRT-LLM large-scale EP</em></sub></p>
@@ -247,7 +247,7 @@ For the **Update Weights \& Placemen**t component, we identified two design choi
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture13.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture13.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 13: One example of the layer-wise MoE weight re-distribution</em></sub></p>
@@ -258,7 +258,7 @@ Let’s use GB200 as an example. In Figure 14, we illustrate the communication b
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture14.png" width="500" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture14.png" width="500" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 14: high-level topology of GB200 system</em></sub></p>
@@ -270,7 +270,7 @@ Let's assume that we target **50ms** inter-token-latency (ITL) as our main laten
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture15.png" width="300" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture15.png" width="300" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 15: The theoretical expert count to be updated for each iteration with following 50ms ITL constraints, by using different HW as pools to store the full MoE weight</em></sub></p>
@@ -407,14 +407,14 @@ As shown by Figure 1, on the machine translation dataset, MoE layer 36 suffers f
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture16.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture16.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 16: The routed token count by receiving ranks (x-axis) and iterations (y-axis) at layer 36 (No EPLB)</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture17.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture17.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 17: The routed token count by experts (x-axis) and iterations (y-axis) at layer 36 (No EPLB)</em></sub></p>
@@ -425,14 +425,14 @@ With the above statistics, we can perform offline EPLB. One potential strategy i
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture18.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture18.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 18: The routed token count by receiving ranks (x-axis) and iterations (y-axis) at layer 36 (EPLB with 9 per-rank slots and EP 32)</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture19.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture19.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 19: The routed token count by experts (x-axis) and iterations (y-axis) at layer 36 (EPLB with 9 per-rank slots and EP 32)</em></sub></p>
@@ -441,14 +441,14 @@ Another EPLB strategy is to maintain 8 expert slots per rank while increasing ex
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture20.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture20.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 20: The routed token count by receiving ranks (x-axis) and iterations (y-axis) at layer 36 (EPLB with 8 per-rank slots and EP 36)</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture21.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture21.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 21: The routed token count by experts (x-axis) and iterations (y-axis) at layer 36 (EPLB with 8 per-rank slots and EP 36)</em></sub></p>
@@ -473,7 +473,7 @@ Let’s still use the machine translation dataset, DeepSeek R1 model,  layer 36 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture22.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture22.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 22: The token count sent from rank 0 to all the ranks, run on GB200, with EP32, local batch size=256, with 256 slots(no replication), so each rank hosts 8 experts</em></sub></p>
@@ -484,7 +484,7 @@ In Figure 22, only placement adjustment has been done by the Online EPLB. If we 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture23.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture23.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 23: The token count sent from rank 0 to all the ranks, run on GB200, with EP32, local batch size=256, with 288 slots(with replication), so each rank hosts 9 experts</em></sub></p>
@@ -498,7 +498,7 @@ Note: all the representative workloads illustrated in this section are from the 
 Let's use some representative workloads to illustrate the performance impact with large-scale EP.
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture24.png" width="500" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture24.png" width="500" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 24: EP impact over MoE Group GEMM and EP communication</em></sub></p>
@@ -508,7 +508,7 @@ When the EP size increases from 18 to 72, the speed-up diminishes. We are workin
 Next, let's use some representative workloads to understand the performance impact with EPLB.
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture25.png" width="500" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture25.png" width="500" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 25: EPLB performance impact</em></sub></p>
