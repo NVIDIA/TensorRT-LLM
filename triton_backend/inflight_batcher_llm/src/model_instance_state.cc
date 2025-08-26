@@ -127,17 +127,6 @@ executor::KvCacheConfig ModelInstanceState::getKvCacheConfigFromParams()
         TLLM_LOG_WARNING("kv_cache_host_memory_bytes not set, defaulting to 0");
     }
 
-    bool kvCacheOnboardBlocks = true;
-    try
-    {
-        kvCacheOnboardBlocks = model_state_->GetParameter<bool>("kv_cache_onboard_blocks");
-    }
-    catch (std::exception const& e)
-    {
-        // If parameter is not specified, just ignore
-        TLLM_LOG_WARNING("kv_cache_onboard_blocks not set, defaulting to true");
-    }
-
     std::optional<std::vector<int32_t>> maxAttentionWindow = std::nullopt;
     try
     {
@@ -183,7 +172,7 @@ executor::KvCacheConfig ModelInstanceState::getKvCacheConfigFromParams()
     }
 
     return executor::KvCacheConfig(enableKVCacheReuse, maxTokensInPagedKvCache, maxAttentionWindowVec, sinkTokenLength,
-        kvCacheFreeGpuMemFraction, kvCacheHostCacheSize, kvCacheOnboardBlocks, crossKvCacheFraction);
+        kvCacheFreeGpuMemFraction, kvCacheHostCacheSize, crossKvCacheFraction);
 }
 
 executor::ExtendedRuntimePerfKnobConfig ModelInstanceState::getExtendedRuntimePerfKnobConfigFromParams()

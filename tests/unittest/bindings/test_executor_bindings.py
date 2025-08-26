@@ -1308,7 +1308,6 @@ def test_kv_cache_config():
     assert config.free_gpu_memory_fraction is None
     assert config.cross_kv_cache_fraction is None
     assert config.host_cache_size is None
-    assert config.onboard_blocks == True
     assert config.secondary_offload_min_priority is None
     assert config.event_buffer_max_size == 0
     assert config.enable_partial_reuse == True
@@ -1323,7 +1322,6 @@ def test_kv_cache_config():
     config.free_gpu_memory_fraction = 0.5
     config.cross_kv_cache_fraction = 0.5
     config.host_cache_size = 4
-    config.onboard_blocks = False
     config.secondary_offload_min_priority = 50
     config.event_buffer_max_size = 1024
     config.enable_partial_reuse = False
@@ -1337,7 +1335,6 @@ def test_kv_cache_config():
     assert config.free_gpu_memory_fraction == 0.5
     assert config.cross_kv_cache_fraction == 0.5
     assert config.host_cache_size == 4
-    assert config.onboard_blocks == False
     assert config.secondary_offload_min_priority == 50
     assert config.event_buffer_max_size == 1024
     assert config.enable_partial_reuse == False
@@ -1353,7 +1350,6 @@ def test_kv_cache_config():
         "free_gpu_memory_fraction": 0.5,
         "cross_kv_cache_fraction": 0.5,
         "host_cache_size": 1024,
-        "onboard_blocks": False,
         "event_buffer_max_size": 2048,
         "enable_partial_reuse": True,
         "copy_on_partial_reuse": False,
@@ -2400,7 +2396,6 @@ def test_kv_cache_config_pickle():
     config.free_gpu_memory_fraction = 0.3
     config.cross_kv_cache_fraction = 0.5
     config.host_cache_size = 4
-    config.onboard_blocks = False
     config.secondary_offload_min_priority = 50
     config.event_buffer_max_size = 1024
     config.enable_partial_reuse = False
@@ -2414,7 +2409,6 @@ def test_kv_cache_config_pickle():
     assert config.free_gpu_memory_fraction == config_copy.free_gpu_memory_fraction
     assert config.cross_kv_cache_fraction == config_copy.cross_kv_cache_fraction
     assert config.host_cache_size == config_copy.host_cache_size
-    assert config.onboard_blocks == config_copy.onboard_blocks
     assert config.secondary_offload_min_priority == config_copy.secondary_offload_min_priority
     assert config.event_buffer_max_size == config_copy.event_buffer_max_size
     assert config.enable_partial_reuse == config_copy.enable_partial_reuse

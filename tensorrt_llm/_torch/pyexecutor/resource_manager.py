@@ -332,7 +332,6 @@ class KVCacheManager(BaseResourceManager):
             'stream': self._stream.cuda_stream,
             'max_sequence_length': max_seq_len,
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
-            'onboard_blocks': kv_cache_config.onboard_blocks,
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,

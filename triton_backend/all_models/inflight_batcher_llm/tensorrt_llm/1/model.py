@@ -914,8 +914,6 @@ class TritonPythonModel:
             get_parameter(model_config, "cross_kv_cache_fraction", float),
             "host_cache_size":
             get_parameter(model_config, "kv_cache_host_memory_bytes", int),
-            "onboard_blocks":
-            get_parameter(model_config, "kv_cache_onboard_blocks", bool),
         }
         max_attention_window_size = get_parameter(model_config,
                                                   "max_attention_window_size")
