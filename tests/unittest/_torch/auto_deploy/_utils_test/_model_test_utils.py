@@ -253,6 +253,28 @@ class BMMDynamicModel(nn.Module):
         return torch.bmm(x, dynamic_weights)
 
 
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+class FakeFP8Linear(nn.Linear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        device = self.weight.device
+        weight_scale = torch.max(torch.abs(self.weight)).to(torch.float).to(device) / FP8_MAX
+        self.weight = nn.Parameter((self.weight / weight_scale).to(torch.float8_e4m3fn))
+        self.register_buffer(
+            "input_scale", torch.tensor(1.0, device=self.weight.device, dtype=torch.float)
+        )
+        self.register_buffer("weight_scale", weight_scale)
+        if self.bias is not None:
+            self.bias = nn.Parameter(self.bias.to(torch.half))
+
+    def forward(self, x):
+        return torch.ops.auto_deploy.torch_fake_quant_fp8_linear(
+            x, self.weight, self.bias, [self.input_scale], [self.weight_scale], [], []
+        )
+
+
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {

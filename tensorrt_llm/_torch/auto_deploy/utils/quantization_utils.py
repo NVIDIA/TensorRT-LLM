@@ -98,9 +98,13 @@ class QuantizationImpl:
         for q in [
             FP4QuantizationImpl,
             FP8QuantizationImpl,
-            FP8BMMQuantizationImpl,
         ]:
             if is_op(quant_type_or_node, q.custom_op()):
+                return q
+        for q in [
+            FP8BMMQuantizationImpl,
+        ]:
+            if is_op(quant_type_or_node, q.target_op()):
                 return q
         return None
 
