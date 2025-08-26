@@ -165,6 +165,7 @@ class JobManager:
 
         self.args = args
         self.num_gpus = args.num_gpus
+        self.num_nodes = args.num_nodes
         self.account = args.account
         self.partition = args.partition
         self.time = args.time
@@ -589,7 +590,7 @@ class JobManager:
         cmd = [
             "srun", "-l", f"--container-image={self.container_image}",
             f"--container-name={self.container_name}",
-            f"--container-mounts={self.mounts}", "--mpi=pmix",
+            f"--container-mounts={self.mounts}", "--mpi=pmix", "bash", "-c",
             "echo 'Container up.'"
         ]
         return execute_cmd(cmd)
@@ -601,9 +602,7 @@ class JobManager:
             cmd = [
                 "srun", f"--container-name={self.container_name}",
                 f"--container-mounts={self.mounts}", "--mpi=pmix", "--overlap",
-                "-N",
-                os.environ.get('SLURM_NNODES',
-                            '1'), "--ntasks-per-node=1", "bash", "-c",
+                "-N", str(self.num_nodes), "--ntasks-per-node=1", "bash", "-c",
                 f"echo 'Running install operation...' && pip install -e {self.trtllm_repo} 2>&1 | tee install.log"
             ]
             return execute_cmd(cmd)
