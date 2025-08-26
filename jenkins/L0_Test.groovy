@@ -1923,7 +1923,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     SBSASlurmTestConfigs = [
         // Not used in the pipeline now
-        // "GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 3],
+        "GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 3],
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
     ]
