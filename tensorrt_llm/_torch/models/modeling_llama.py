@@ -25,7 +25,6 @@ from ...inputs import (ExtraProcessedInputs, InputProcessor,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
-from ...llmapi.utils import download_hf_model
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
@@ -979,12 +978,6 @@ class Llama4VisionEncoder(nn.Module):
         self.pretrained_config = model_config.pretrained_config
         self.device = f"cuda:{model_config.mapping.rank}"
 
-        model_path = self.pretrained_config._name_or_path
-        if os.path.isdir(model_path):
-            local_model_path = model_path
-        else:
-            local_model_path = download_hf_model(model_path)
-
         self.dtype = self.pretrained_config.text_config.torch_dtype
         module_dict = nn.ModuleDict({
             "vision_model":
@@ -992,7 +985,9 @@ class Llama4VisionEncoder(nn.Module):
             "multi_modal_projector":
             Llama4MultiModalProjector(self.pretrained_config),
         })
-        load_sharded_checkpoint(module_dict, local_model_path, strict=False)
+        load_sharded_checkpoint(module_dict,
+                                self.pretrained_config._name_or_path,
+                                strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)
