@@ -94,21 +94,24 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
     uint8_t* const globalScaleOutBytes = compact_ptr + numGroups * outputBlockSizeInBytes;
 
     // 4) Per-16 group quantization
-    for (int groupStart = laneId * 16, groupId = 0; groupStart < numElems; groupStart += WARP_SIZE * 16, groupId++)
+    for (int groupId = 0; groupId < numGroups; groupId++)
     {
+        int groupStart = laneId * 16 + groupId * (WARP_SIZE * 16);
         float vecMax;
+
         if constexpr (std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>)
         {
             using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
-
             int const numPairs = numElems / 2;
             DType2 const* in2Ptr = reinterpret_cast<DType2 const*>(in);
 
-            int const pairIdxBase = groupStart >> 1;
-            DType2 localMax2 = tensorrt_llm::common::cuda_abs(in2Ptr[pairIdxBase]);
+            DType2 localMax2;
+            localMax2.x = DType(0.);
+            localMax2.y = DType(0.);
 
+            int const pairIdxBase = groupStart >> 1;
 #pragma unroll
-            for (int i = 1; i < 8; ++i)
+            for (int i = 0; i < 8; ++i)
             {
                 if (pairIdxBase + i < numPairs)
                 {
@@ -120,7 +123,7 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
         }
         else
         {
-            float localMax = fabsf(tensorrt_llm::common::cuda_cast<float>(in[groupStart]));
+            float localMax = 0.f;
 #pragma unroll
             for (int t = 0; t < 16; ++t)
             {
@@ -239,6 +242,7 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
     int const inputBlockSizeInBytes = 8 * WARP_SIZE + WARP_SIZE;
     uint8_t* const globalScaleOutBytes = compact_ptr + numGroups * inputBlockSizeInBytes;
     float const SFScaleVal = reciprocal_approximate_ftz(*reinterpret_cast<float const*>(globalScaleOutBytes));
+    __syncwarp();
 
     DType* out = reinterpret_cast<DType*>(compact_ptr);
 
@@ -255,6 +259,7 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
         sf8.__x = inScalePtr[0];
         float const SFValueNarrow = static_cast<float>(sf8);
         float const dequantScale = SFScaleVal * SFValueNarrow;
+        __syncwarp();
 
         float2 tmp[8];
         e2m1_to_fp32_vec(packed, tmp);
@@ -267,8 +272,16 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
             {
                 out[idx0] = tensorrt_llm::common::cuda_cast<DType>(tmp[t].x * dequantScale);
                 out[idx0 + 1] = tensorrt_llm::common::cuda_cast<DType>(tmp[t].y * dequantScale);
+
+                // This is a workaround to avoid the issue of nan or inf.
+                // TODO: remove this after the issue is fixed.
+                if (dequantScale > 1e10)
+                {
+                    printf("This is a workaround to avoid the issue of nan or inf. \n");
+                }
             }
         }
+        __syncwarp();
     }
 #endif
 }
