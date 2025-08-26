@@ -53,7 +53,10 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
         DType2 const* in2 = reinterpret_cast<DType2 const*>(in);
         int const numPairs = numElems / 2;
 
-        auto localMax2 = tensorrt_llm::common::cuda_abs(in2[0]);
+        // Initialize to zero to avoid a concentrated shared-memory read from index 0 across all lanes
+        DType2 localMax2;
+        localMax2.x = DType(0.);
+        localMax2.y = DType(0.);
         // stride over pairs
         for (int i = laneId; i < numPairs; i += WARP_SIZE)
         {
@@ -101,25 +104,52 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
 
         if constexpr (std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>)
         {
+            // Conflict-free local 16-element max using 8-lane subgroup reduction.
             using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
             int const numPairs = numElems / 2;
             DType2 const* in2Ptr = reinterpret_cast<DType2 const*>(in);
 
-            DType2 localMax2;
-            localMax2.x = DType(0.);
-            localMax2.y = DType(0.);
+            // Base pair-index for this WARP_SIZE*16 group.
+            int const groupBasePairs = (groupId * (WARP_SIZE * 16)) >> 1;
+            int const subgroupId = laneId >> 3; // 0..3
+            int const laneInGroup = laneId & 7; // 0..7
+            unsigned const subgroupMask = 0xFFu << (subgroupId * 8);
 
-            int const pairIdxBase = groupStart >> 1;
+            float laneVecMax = 0.f;
 #pragma unroll
-            for (int i = 0; i < 8; ++i)
+            for (int phase = 0; phase < 8; ++phase)
             {
-                if (pairIdxBase + i < numPairs)
+                // Each lane loads one pair for destination lane (subgroupId*8 + phase) at index r = laneInGroup.
+                // Each subgroup (32 lanes -> 4 subgroups of 8) handles its own 64-pair region.
+                // For destination lane L = subgroupId*8 + phase, the r-th pair (r = laneInGroup) is at:
+                // pairIdx = groupBasePairs + L*8 + r = groupBasePairs + (subgroupId*8 + phase)*8 + laneInGroup.
+                int const pairIdx = groupBasePairs + ((subgroupId << 3) + phase) * 8 + laneInGroup;
+
+                float pairMax = 0.f;
+                if (pairIdx < numPairs)
                 {
-                    DType2 v2 = in2Ptr[pairIdxBase + i];
-                    localMax2 = tensorrt_llm::common::cuda_max(localMax2, tensorrt_llm::common::cuda_abs(v2));
+                    DType2 v2 = in2Ptr[pairIdx];
+                    // Max of the two values in the pair (in magnitude), then cast to float
+                    DType2 const v2abs = tensorrt_llm::common::cuda_abs(v2);
+                    DType const pairMaxD = tensorrt_llm::common::cuda_max<DType, DType2>(v2abs);
+                    pairMax = tensorrt_llm::common::cuda_cast<float>(pairMaxD);
+                }
+
+                // Reduce within the 8-lane subgroup to get max across all 8 pairs for the destination lane.
+#pragma unroll
+                for (int off = 4; off > 0; off >>= 1)
+                {
+                    float const other = __shfl_xor_sync(subgroupMask, pairMax, off);
+                    pairMax = fmaxf(pairMax, other);
+                }
+
+                // Only the destination lane of this phase records the result.
+                if (laneInGroup == phase)
+                {
+                    laneVecMax = fmaxf(laneVecMax, pairMax);
                 }
             }
-            vecMax = tensorrt_llm::common::cuda_cast<float>(tensorrt_llm::common::cuda_max<DType, DType2>(localMax2));
+            vecMax = laneVecMax;
         }
         else
         {
@@ -250,13 +280,39 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
     for (int groupId = numGroups - 1; groupId >= 0; --groupId)
     {
         int const groupStart = laneId * 16 + groupId * (WARP_SIZE * 16);
-        uint8_t const* const inValPtr = compact_ptr + groupId * inputBlockSizeInBytes + laneId * sizeof(uint64_t);
-        uint64_t const packed = reinterpret_cast<uint64_t const*>(inValPtr)[0];
+        // Conflict-free read of packed 64-bit e2m1 values from shared memory:
+        // serialize half-warps to avoid lane i and i+16 hitting the same bank in the same cycle.
+        uint8_t const* const valBase = compact_ptr + groupId * inputBlockSizeInBytes;
+        uint64_t packed = 0ull;
+        if (laneId < 16)
+        {
+            packed = reinterpret_cast<uint64_t const*>(valBase)[laneId];
+        }
+        __syncwarp();
+        if (laneId >= 16)
+        {
+            packed = reinterpret_cast<uint64_t const*>(valBase)[laneId];
+        }
 
-        uint8_t const* const inScalePtr
-            = compact_ptr + groupId * inputBlockSizeInBytes + WARP_SIZE * sizeof(uint64_t) + laneId * sizeof(uint8_t);
+        // Conflict-free read of per-lane 1-byte scales via subgroup leader loading 2x32-bit and broadcasting.
+        uint8_t const* const scalesBase = compact_ptr + groupId * inputBlockSizeInBytes + WARP_SIZE * sizeof(uint64_t);
+        int const subgroupId = laneId >> 3; // 0..3
+        int const laneInGroup = laneId & 7; // 0..7
+        unsigned const subgroupMask = 0xFFu << (subgroupId * 8);
+        uint32_t w0 = 0, w1 = 0;
+        if (laneInGroup == 0)
+        {
+            uint32_t const* scaleIn32 = reinterpret_cast<uint32_t const*>(scalesBase + subgroupId * 8);
+            w0 = scaleIn32[0];
+            w1 = scaleIn32[1];
+        }
+        w0 = __shfl_sync(subgroupMask, w0, (subgroupId << 3) | 0);
+        w1 = __shfl_sync(subgroupMask, w1, (subgroupId << 3) | 0);
+        uint32_t word = (laneInGroup < 4) ? w0 : w1;
+        int shift = (laneInGroup & 3) * 8;
+        uint8_t sfByte = static_cast<uint8_t>((word >> shift) & 0xFFu);
         __nv_fp8_e4m3 sf8;
-        sf8.__x = inScalePtr[0];
+        sf8.__x = sfByte;
         float const SFValueNarrow = static_cast<float>(sf8);
         float const dequantScale = SFScaleVal * SFValueNarrow;
         __syncwarp();
@@ -264,21 +320,25 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
         float2 tmp[8];
         e2m1_to_fp32_vec(packed, tmp);
 
+        // Vectorized 32-bit stores (two DType per transaction) for higher bandwidth and fewer bank splits.
 #pragma unroll
         for (int t = 0; t < 8; ++t)
         {
             int idx0 = groupStart + (t << 1);
             if (idx0 < numElems)
             {
-                out[idx0] = tensorrt_llm::common::cuda_cast<DType>(tmp[t].x * dequantScale);
-                out[idx0 + 1] = tensorrt_llm::common::cuda_cast<DType>(tmp[t].y * dequantScale);
+                using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
+                DType2 v2;
+                v2.x = tensorrt_llm::common::cuda_cast<DType>(tmp[t].x * dequantScale);
+                v2.y = tensorrt_llm::common::cuda_cast<DType>(tmp[t].y * dequantScale);
+                reinterpret_cast<DType2*>(out + idx0)[0] = v2;
 
                 // This is a workaround to avoid the issue of nan or inf.
                 // TODO: remove this after the issue is fixed.
-                if (dequantScale > 1e10)
-                {
-                    printf("This is a workaround to avoid the issue of nan or inf. \n");
-                }
+                // if (dequantScale > 1e10)
+                // {
+                //     printf("This is a workaround to avoid the issue of nan or inf. \n");
+                // }
             }
         }
         __syncwarp();
