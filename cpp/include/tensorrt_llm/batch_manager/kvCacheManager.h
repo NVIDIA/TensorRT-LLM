@@ -143,11 +143,7 @@ struct BlockKey
     {
     }
 
-    bool operator==(BlockKey const& other) const noexcept
-    {
-        return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
-            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys);
-    }
+    bool operator==(BlockKey const& other) const noexcept;
 
     int partialMatch(BlockKey const& other) const noexcept
     {
