@@ -234,6 +234,27 @@ TODO: Use Chat Compeletions API / Responses API as the example after the PR is m
 We use OpenAI's official evaluation tool to test the model's accuracy. For more information see [https://github.com/openai/gpt-oss/tree/main/gpt_oss/evals](gpt-oss-eval).
 With the added support of Chat Completions and Responses API in `trtllm-serve,` `gpt_oss.evals` works directly without any modifications.
 
+You need to set `enable_attention_dp`, `tp_size`, `ep_size`, `max_batch_size` and `max_num_tokens` when launching the trtllm server and set `reasoning-effort` when launching evaluation in gpt-oss. Below are some reference configurations for accuracy evaluation on B200. 
+
+| **reasoning-effort** | **parallel configuration** | **max_batch_size** | **max_num_tokens** |
+|:--------------------:|:--------------------------:|:------------------:|:------------------:|
+| low/medium           | DP+TP8+EP8 / DP+TP4+EP4    | 128                | 32768              |
+| high                 | DP+TP8+EP8 / DP+TP4+EP4    | 2                  | 133120             |
+| low/medium           | TP8 / TP4                  | 1024               | 32768              |
+| high                 | TP8 / TP4                  | 16                 | 133120             |
+
+Below is an example command for evaluating the accuracy of gpt-oss-120b with low and medium reasoning-effort on GPQA and AIME2025.
+
+```shell
+# execute this command in gpt-oss
+python -m gpt_oss.evals \
+  --sampler chat_completions \
+  --eval gpqa,aime25 \
+  --model gpt-oss-120b \
+  --reasoning-effort low,medium
+```
+
+
 ## Benchmarking Performance
 
 To benchmark the performance of your TensorRT-LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
