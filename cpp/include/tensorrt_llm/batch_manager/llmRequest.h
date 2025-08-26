@@ -2022,9 +2022,6 @@ protected:
     // Tensors containing the additional generation output.
     TensorMap mAdditionalGenerationOutputTensors;
 
-    // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
-    std::vector<size_t> mRequestedBlockHashes;
-
     bool mIsDummyRequest{false};
 
     bool mUseDraftModel{false};

@@ -160,6 +160,22 @@ std::vector<BlockKey> buildBlockKeys(
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+bool BlockKey::operator==(BlockKey const& other) const noexcept
+{
+    if (hash != 0)
+    {
+        return hash == BlockKeyHasher::hash(other);
+    }
+    if (other.hash != 0)
+    {
+        return other.hash == BlockKeyHasher::hash(*this);
+    }
+
+    return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens
+        && extraKeys == other.extraKeys);
+}
+
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
 {
     // Hashing algorithm adapted from StackOverflow:
@@ -395,7 +411,7 @@ void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
 std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
     BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const
 {
-    if (blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0)
+    if ((blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0) && !blockKey.hash)
     {
         return {false, 0, nullptr};
     }

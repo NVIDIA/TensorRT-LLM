@@ -528,6 +528,75 @@ TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare)
     }
 }
 
+TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByHashesTest)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 8;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 4;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+
+    auto constexpr batchSize = 1;
+    auto constexpr maxBlocksPerSeq = 10;
+    auto constexpr bytesPerToken = 4;
+    auto constexpr maxAttentionWindow = 4096;
+    auto constexpr maxAttentionWindowAllLayer = 4096;
+    auto constexpr sinkTokenLen = 0;
+    auto constexpr canUseOneMoreBlock = true;
+
+    SizeType32 constexpr maxNewTokens{0};
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
+        blocksPerWindow, maxNumSequences, stream, maxAttentionWindow, beamWidth,
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0,
+        onboardBlocks);
+    blockManager.allocatePools(false);
+
+    auto oneLayerBlockSize = blockManager.getBlockSize(0);
+    EXPECT_EQ(oneLayerBlockSize, numKvHeads * sizePerHead * tokensPerBlock);
+
+    // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16] (17 tokens, three blocks)
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+    LlmRequest::RequestIdType requestId{0};
+    auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
+    auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
+    auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
+    blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
+    EXPECT_EQ(llmRequest0->getContextCurrentPosition(), 0);
+    auto cacheBlockIds = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
+
+    blockManager.storeContextBlocks(seq0, *llmRequest0);
+
+    std::vector<size_t> emptyHashes{};
+    auto result = blockManager.findBlocksInReuseTreeByHashes(emptyHashes, maxAttentionWindow);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ((*result)->getBlockId(), KVCacheBlock::kCachedBlocksRootId);
+
+    auto block0 = blockManager.getBlockById(cacheBlockIds[0], maxAttentionWindow);
+    // Corrupt the valid hash to guarantee a miss
+    std::vector<size_t> badHashes{block0->getHash() ^ static_cast<size_t>(0x9e3779b97f4a7c15ULL)};
+    result = blockManager.findBlocksInReuseTreeByHashes(badHashes, maxAttentionWindow);
+    EXPECT_FALSE(result.has_value());
+
+    std::vector<size_t> hashes{block0->getHash()};
+    result = blockManager.findBlocksInReuseTreeByHashes(hashes, maxAttentionWindow);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ((*result)->getBlockId(), block0->getBlockId());
+}
+
 #ifdef ENABLE_FP4
 TEST_F(KVCacheManagerTest, FP4BlockScaleManagementTest)
 {
