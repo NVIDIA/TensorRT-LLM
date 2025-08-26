@@ -4072,7 +4072,7 @@ def test_llama_3_x_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
     )
 
 
-# @pytest.mark.skip(reason="TODO: test on 8 GPUs locally")
+@pytest.mark.skip(reason="TODO: Remains to be tested on 8 GPUs")
 @skip_pre_ada
 @pytest.mark.skip_less_device(8)
 @pytest.mark.skip_less_device_memory(80000)

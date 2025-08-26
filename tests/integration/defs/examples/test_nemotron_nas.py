@@ -232,7 +232,7 @@ def test_nemotron_super_49b_real_lora_torch(nemotron_nas_example_root, llm_venv,
     )
 
 
-# @pytest.mark.skip(reason="TODO: test on 8 GPUs locally")
+@pytest.mark.skip(reason="TODO: Test OOMs on 8 GPUs - to fix")
 @pytest.mark.skip_less_device(8)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("nemotron_nas_model_root", [
