@@ -12,6 +12,9 @@ from _model_test_utils import _hf_model_dir_or_hub_id
 from utils.cpp_paths import llm_root  # noqa: F401
 from utils.llm_data import llm_models_root
 
+# Tolerance for additional memory reduction after fwd pass (in MB)
+POST_FWD_FREE_MEM_LOWER_SLACK_MB = 2000
+
 
 def remove_outliers_iqr(values: List[float]) -> List[float]:
     """
@@ -347,8 +350,10 @@ def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
 
             # Free memory values should be in reasonable range
             expected_free_mem_pre_range = expected_free_mem_range
+            # Allow extra headroom after forward pass to account for fragmentation/transient buffers.
+            lower_slack_mb = POST_FWD_FREE_MEM_LOWER_SLACK_MB
             expected_free_mem_post_range = (
-                expected_free_mem_range[0] - 2000,
+                max(0, expected_free_mem_range[0] - lower_slack_mb),
                 expected_free_mem_range[1],
             )
 
