@@ -52,7 +52,7 @@ export OTEL_EXPORTER_OTLP_TRACES_INSECURE=true
 export OTEL_SERVICE_NAME="trt-server"
 ```
 
-Then run TensorRT-LLM with OpenTelemetry:
+Then run TensorRT-LLM with OpenTelemetry, and make sure to set `return_perf_metrics` to true in the model configuration:
 
 ```bash
 trtllm-serve models/Qwen3-8B/ --otlp_traces_endpoint="$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
