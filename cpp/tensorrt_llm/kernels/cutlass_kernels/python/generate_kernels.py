@@ -207,7 +207,9 @@ def instantiate_operation_tma_warp_specialized(operation):
     cute_cga_shape = tuple_to_cute_shape(operation.cga_shape)
 
     kernel_sched = KernelScheduleTag[operation.mainloop_schedule]
-    epi_sched = EpilogueScheduleTag[operation.epi_schedule]
+    epi_sched = "void"
+    if operation.epi_schedule is not None:
+        epi_sched = EpilogueScheduleTag[operation.epi_schedule]
 
     if operation.gemm_kind == GemmKind.Gemm:
         weight_tag = DataTypeTag[operation.weight_type]
@@ -414,7 +416,7 @@ def is_grouped_gemm_op_valid(op):
     if op.epi_tag != TrtLlm_EpilogueTag.epilogue_op_default:
         return False
 
-    if op.epi_schedule != EpilogueScheduleType.NoSmemWarpSpecialized:
+    if op.epi_schedule is not None and op.epi_schedule != EpilogueScheduleType.NoSmemWarpSpecialized:
         return False
 
     if op.mainloop_schedule not in [
@@ -529,7 +531,7 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
         cta_shape_mnk = cta_shape_mn + (cta_shape_k, )
 
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative if dtype != DataType.e4m3 else KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum
-        epi_schedule = EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized
+        epi_schedule = None
 
         otypes = [dtype]
         if dtype == DataType.e4m3:
@@ -669,7 +671,7 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
 
         # Ignored
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
-        epi_schedule = EpilogueScheduleType.TmaWarpSpecialized
+        epi_schedule = None
 
         otypes = [dtype]
         if dtype in [DataType.e4m3, e2m1]:

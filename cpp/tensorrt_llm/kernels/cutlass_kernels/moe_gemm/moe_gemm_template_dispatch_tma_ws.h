@@ -181,8 +181,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
         }
         else if constexpr (Arch::kMinComputeCapability >= 120 || Arch::kMinComputeCapability == 90)
         {
-            using EpilogueSchedule = std::conditional_t<Arch::kMinComputeCapability >= 120,
-                cutlass::epilogue::TmaWarpSpecialized, cutlass::epilogue::PtrArrayTmaWarpSpecialized>;
+            using EpilogueSchedule = void; // These are hardcoded in the launcher
             constexpr bool dynamic_cga = false;
             auto selected_func = hopper_input.swap_ab
                 ? kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T, WeightType,
