@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tests/layers/medusaDecodeLayerTest.h"
+#include "medusaDecodeLayerTest.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
