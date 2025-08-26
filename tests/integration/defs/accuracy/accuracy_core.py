@@ -189,8 +189,6 @@ class AccuracyTask:
                 sampling_params.truncate_prompt_tokens = self.MAX_INPUT_LEN
 
         evaluator_kwargs = {}
-        print(f"self.EVALUATOR_KWARGS: {self.EVALUATOR_KWARGS}")
-        print(f"extra_evaluator_kwargs: {extra_evaluator_kwargs}")
         if self.EVALUATOR_KWARGS is not None:
             evaluator_kwargs.update(self.EVALUATOR_KWARGS)
         if extra_evaluator_kwargs is not None:
@@ -299,15 +297,13 @@ class GSM8K(AccuracyTask):
     ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
-    NUM_SAMPLES = 2  # Full sample
+    NUM_SAMPLES = 1319  # Full sample
 
     MAX_INPUT_LEN = 4096
     MAX_OUTPUT_LEN = 256
 
     EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8K
-    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
-                            random_seed=0,
-                            apply_chat_template=False)
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
     EVALUATE_KWARGS = dict(scores_filter=None)
 
