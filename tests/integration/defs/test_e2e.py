@@ -1697,7 +1697,7 @@ def parse_output(text):
     for item in text_lists:
         item = item.replace(os.linesep, "")
         while True:
-            match = re.search(r"(Generated text: \'(.*?)\')", item,
+            match = re.search(r'Generated text: ([\'"])(.*?)\1', item,
                               re.MULTILINE)
             if match is None:
                 break
@@ -2338,9 +2338,9 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "gemma-3-27b-it": {
             "image": [
-                ["dramatic", "turbulent", "waves", "ocean", "overcast"],
-                ["half", "dome", "yosemite", "landmark", "rounded"],
-                ["flowing", "traffic", "vehicles", "road", "Changi"],
+                ["natural", "turbulent", "dramatic", "scene", "wave"],
+                ["image", "famous", "rock", "granite", "landmark"],
+                ["traffic", "moderate", "heavy", "flowing", "cars"],
             ],
         },
     }
@@ -2577,8 +2577,8 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
         },
         "Phi-4-multimodal-instruct": {
             "image": [
-                ["image", "depicts", "mountain", "half", "rock"],
-                ["road", "car", "lane", "traffic", "bus"],
+                ["object", "mountain", "weather", "clear", "clouds"],
+                ["traffic", "road", "vehicles", "cars", "bus"],
             ],
         },
     }
