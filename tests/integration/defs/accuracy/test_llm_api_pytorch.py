@@ -2868,4 +2868,4 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
+            task.evaluate(llm)
