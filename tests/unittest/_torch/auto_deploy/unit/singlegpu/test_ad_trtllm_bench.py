@@ -656,7 +656,7 @@ def trtllm_bench_unified_comparison(
     """
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     )
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -788,7 +788,7 @@ def trtllm_bench_unified_comparison(
 def test_trtllm_bench(llm_root):  # noqa: F811
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     )
 
     with tempfile.TemporaryDirectory() as temp_dir:
