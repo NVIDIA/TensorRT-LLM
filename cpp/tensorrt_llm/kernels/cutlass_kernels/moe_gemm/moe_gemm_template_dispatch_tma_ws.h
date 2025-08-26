@@ -73,9 +73,9 @@ template <typename Arch, typename T, typename WeightType, typename OutputType, t
 auto getDispatchFunctionForSM100(
     cutlass_extensions::EpilogueScheduleType epilogue_schedule, bool dynamic_cga, bool swap_ab)
 {
-    auto select_swap_ab = [dynamic_cga, epilogue_schedule](auto swap_ab)
+    auto select_swap_ab = [dynamic_cga, epilogue_schedule](auto swap_ab_t)
     {
-        auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga)
+        auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga_t)
         {
             if constexpr (!std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>
                 && FUSION != EpilogueFusion::FINALIZE)
@@ -83,10 +83,10 @@ auto getDispatchFunctionForSM100(
                 auto func_map = std::array{
                     &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T, WeightType,
                         OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized, EpilogueTag, FUSION, TileShape,
-                        ClusterShape, is_wfp4afp8, decltype(dynamic_cga)::value, false, decltype(swap_ab)::value>,
+                        ClusterShape, is_wfp4afp8, decltype(dynamic_cga_t)::value, false, decltype(swap_ab_t)::value>,
                     &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T, WeightType,
                         OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION, TileShape,
-                        ClusterShape, is_wfp4afp8, decltype(dynamic_cga)::value, false, decltype(swap_ab)::value>
+                        ClusterShape, is_wfp4afp8, decltype(dynamic_cga_t)::value, false, decltype(swap_ab_t)::value>
 
                 };
                 bool const tma_epilogue = epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA;
@@ -94,20 +94,12 @@ auto getDispatchFunctionForSM100(
             }
             else
             {
-
-                // NOTE: We disregard the epilogue schedule for finalize fusion since only TMA is supported
-                //   However, to prevent these implementation details from leaking to the caller we still allow the
-                //   caller to pass configs for both schedules
-                if constexpr (FUSION != EpilogueFusion::FINALIZE)
-                {
-                    TLLM_CHECK_WITH_INFO(epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
-                        "No Smem epilogue schedule is not supported for block scaled types");
-                }
-
+                TLLM_CHECK_WITH_INFO(epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
+                    "No Smem epilogue schedule is not supported for block scaled types or finalize fusion");
                 return &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
                     WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION,
-                    TileShape, ClusterShape, is_wfp4afp8, decltype(dynamic_cga)::value, false,
-                    decltype(swap_ab)::value>;
+                    TileShape, ClusterShape, is_wfp4afp8, decltype(dynamic_cga_t)::value, false,
+                    decltype(swap_ab_t)::value>;
             }
         };
         return dynamic_cga ? select_dynamic_cga(tensorrt_llm::common::ConstBool<true>{})
@@ -187,9 +179,9 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
             selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
                 cluster_shape_cute, cluster_shape_cute_fallback);
         }
-        else if constexpr (Arch::kMinComputeCapability == 120)
+        else if constexpr (Arch::kMinComputeCapability >= 120 || Arch::kMinComputeCapability == 90)
         {
-            using EpilogueSchedule = std::conditional_t<Arch::kMinComputeCapability == 120,
+            using EpilogueSchedule = std::conditional_t<Arch::kMinComputeCapability >= 120,
                 cutlass::epilogue::TmaWarpSpecialized, cutlass::epilogue::PtrArrayTmaWarpSpecialized>;
             constexpr bool dynamic_cga = false;
             auto selected_func = hopper_input.swap_ab
