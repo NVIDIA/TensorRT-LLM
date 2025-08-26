@@ -252,6 +252,7 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
+            draft_spec_config.update_for_draft_init()
             draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
             if spec_config.load_format == "dummy":
                 draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
