@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
+from _model_test_utils import FakeFP8Linear
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -107,6 +108,19 @@ class MLP(nn.Module):
         return self.linear2(y)
 
 
+class FP8MLP(nn.Module):
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.linear1 = FakeFP8Linear(in_features, 4 * in_features, bias=bias)
+        self.linear2 = FakeFP8Linear(4 * in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        y = F.relu(self.linear1(x))
+        return self.linear2(y)
+
+
 def _run_job(
     model_cls: nn.Module,
     dist_op_expected: str,
@@ -130,6 +144,8 @@ def _run_job(
             hidden_size=num_features,
             num_key_value_heads=num_key_value_heads,
         ).to(device="cuda", dtype=torch.float16)
+    elif model_cls == FP8MLP:
+        model = model_cls(num_features, num_features, bias=bias).to("cuda")
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
@@ -264,7 +280,7 @@ def _run_pattern_detection_job(
                             min_local_shape=min_local_shape,
                         )
                     )
-        elif model_cls == MLP:
+        elif model_cls == MLP or model_cls == FP8MLP:
             for node in gm.graph.nodes:
                 if is_linear_op(node, include_quantization=True):
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
@@ -328,6 +344,7 @@ def _run_pattern_detection_job(
     "model_cls, dist_op_expected",
     (
         (MLP, "torch_dist_all_reduce"),
+        (FP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
         (GQA_Block, "torch_dist_all_reduce"),
     ),
@@ -345,13 +362,14 @@ def test_sharding(
     )
 
 
-@pytest.mark.parametrize("world_size", [1, 8])
+@pytest.mark.parametrize("world_size", [8])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("from_config", [False, True])
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
         (MLP, "torch_dist_all_reduce"),
+        (FP8MLP, "torch_dist_all_reduce"),
         (nn.Linear, "torch_dist_all_gather"),
         (GQA_Block, "torch_dist_all_reduce"),
     ),

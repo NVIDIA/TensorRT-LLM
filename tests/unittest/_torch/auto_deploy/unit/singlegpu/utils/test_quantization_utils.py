@@ -4,10 +4,10 @@ import torch
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import FP8_MAX
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     FP8QuantizationImpl,
-    _shard_fp4_weight_scale,
     fp4_global_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
+from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import _shard_fp4_weight_scale
 
 
 @pytest.mark.parametrize("dim", [0, 1])

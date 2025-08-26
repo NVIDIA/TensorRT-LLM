@@ -6,6 +6,8 @@ from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
 )
 
+from .quant import QUANT_LINEAR_OPS, QUANT_OPS
+
 # ===== Enums =====
 FORMAT_FP8 = 0
 FORMAT_NVFP4 = 1
@@ -285,3 +287,11 @@ def torch_fake_quant_fp4_linear(
     weight_zp: List[torch.Tensor],
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
+
+
+CUSTOM_QUANT_LINEAR_OPS = [
+    torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
+    torch.ops.auto_deploy.torch_fake_quant_fp4_linear,
+]
+QUANT_LINEAR_OPS.extend(CUSTOM_QUANT_LINEAR_OPS)
+QUANT_OPS.extend(CUSTOM_QUANT_LINEAR_OPS)
