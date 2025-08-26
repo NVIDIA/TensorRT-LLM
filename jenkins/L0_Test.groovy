@@ -1517,14 +1517,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         cd ${llmSrc}/tests/integration/defs && \
                         ${testCmdLine.join(" ")}
                     """
-                    throw new Exception("Infrastructure error")
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    echo "error: ${e.message}"
+                    error "Infrastructure error"
+                } catch (hudson.AbortException e) {
+                    def failedSigs = trtllm_utils.getRetryStagesSignaturesList()
+                    def isMachineOrInfraError = failedSigs.any { sig -> e.message?.contains(sig) }
+                    if (isMachineOrInfraError) {
+                        echo "There is a machine or infrastructure error, skip the rerun step."
+                        throw e
+                    }
                     isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
                     if (isRerunFailed) {
-                        error "The tests still failed after rerun attempt. ${e.message}"
+                        error "The tests still failed after rerun attempt."
                     }
                 }
             }
@@ -2338,7 +2341,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 } else {
                     values()
                 }
-            }, sleepTimeInSecs: 120)
+            }, [sleepTimeInSecs: 120])
         }
     }]}
 
