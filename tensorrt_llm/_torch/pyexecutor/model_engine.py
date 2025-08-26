@@ -1,3 +1,4 @@
+import bisect
 import contextlib
 import copy
 import functools
