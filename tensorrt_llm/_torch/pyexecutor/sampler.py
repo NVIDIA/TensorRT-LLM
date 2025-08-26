@@ -492,11 +492,8 @@ class TorchSampler(Sampler):
         return num_accepted
 
     def _process_draft_tokens_rejection_sampling(
-            self,
-            request: LlmRequest,
-            new_tokens: torch.Tensor,
-            force_use_rejection_sampling: bool = False) -> int:
-        if force_use_rejection_sampling:
+            self, request: LlmRequest, new_tokens: torch.Tensor) -> int:
+        if request.py_draft_logits:
             draft_probs = torch.zeros(len(request.py_draft_tokens),
                                       request.py_target_probs.shape[-1],
                                       device=request.py_target_probs.device)
@@ -545,19 +542,20 @@ class TorchSampler(Sampler):
 
         return num_accepted
 
-    def process_draft_tokens(self,
-                             request: LlmRequest,
-                             new_tokens: torch.Tensor,
-                             force_use_rejection_sampling: bool = False) -> int:
-        if request.py_draft_logits is None and not force_use_rejection_sampling:
+    def process_draft_tokens(self, request: LlmRequest,
+                             new_tokens: torch.Tensor) -> int:
+        # If the request has ngram spec tokens and the strategy is not greedy, use rejection sampling to get higher draft acceptance rate.
+        if request.py_has_ngram_spec_tokens and request_strategy(
+                request) != Strategy.GREEDY:
+            return self._process_draft_tokens_rejection_sampling(
+                request, new_tokens)
+        if request.py_draft_logits is None:
             return self._process_draft_tokens_greedy(request, new_tokens)
         else:
             return self._process_draft_tokens_rejection_sampling(
-                request, new_tokens, force_use_rejection_sampling)
+                request, new_tokens)
 
-    def update_requests(self,
-                        state: SampleState,
-                        force_use_rejection_sampling: bool = False) -> None:
+    def update_requests(self, state: SampleState) -> None:
         assert isinstance(state, SampleState)
         if state.sampler_event:
             state.sampler_event.synchronize()
@@ -575,8 +573,7 @@ class TorchSampler(Sampler):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             processed = 1
-            num_accepted = self.process_draft_tokens(
-                req, new_tokens, force_use_rejection_sampling)
+            num_accepted = self.process_draft_tokens(req, new_tokens)
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted

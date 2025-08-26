@@ -924,8 +924,7 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        if (self.drafter is not None and hasattr(self.drafter, 'spec_config')
-                and self.drafter.spec_config.spec_dec_mode.is_ngram()):
+        if self.need_extra_greedy_sample():
             context_request_mapping = {}
             generation_request_mapping = {}
         with self._profiler() as profile_step:
@@ -967,12 +966,10 @@ class PyExecutor:
                             if self.guided_decoder is not None:
                                 self.guided_decoder.rollback_rejected_tokens(
                                     scheduled_batch)
-                            greedy_sample_requests = ScheduledRequests()
-                            if hasattr(
-                                    self.drafter, 'spec_config'
-                            ) and self.drafter.spec_config.spec_dec_mode.is_ngram(
-                            ):
+                            if self.need_extra_greedy_sample():
+                                greedy_sample_requests = ScheduledRequests()
                                 for req in scheduled_batch.generation_requests:
+                                    req.py_has_ngram_spec_tokens = True
                                     if req.py_request_id not in generation_request_mapping:
                                         generation_request_mapping[
                                             req.py_request_id] = LlmRequest(
@@ -986,6 +983,9 @@ class PyExecutor:
                                             req.
                                             py_request_id].sampling_config = SamplingConfig(
                                             )
+                                        generation_request_mapping[
+                                            req.
+                                            py_request_id].py_has_ngram_spec_tokens = True
                                     greedy_sample_requests.generation_requests.append(
                                         generation_request_mapping[
                                             req.py_request_id])
@@ -1018,17 +1018,13 @@ class PyExecutor:
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
 
-                    if (self.drafter is not None
-                            and hasattr(self.drafter, 'spec_config') and
-                            self.drafter.spec_config.spec_dec_mode.is_ngram()):
-                        if len(greedy_sample_requests.generation_requests) > 0:
-                            greedy_sample_state = self._sample_async(
-                                greedy_sample_requests, batch_outputs)
-                            self._update_requests(greedy_sample_state)
-
                     self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state,
-                                          force_use_rejection_sampling=True)
+                    self._update_requests(sample_state)
+
+                    if self.need_extra_greedy_sample():
+                        greedy_sample_state = self._sample_async(
+                            greedy_sample_requests, batch_outputs)
+                        self._update_requests(greedy_sample_state)
 
                     if self.kv_cache_transceiver:
                         ctx_transmission_reqs = self._send_disagg_ctx_cache(
@@ -1590,12 +1586,9 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self,
-                         sample_state: SampleState,
-                         force_use_rejection_sampling: bool = False):
+    def _update_requests(self, sample_state: SampleState):
         try:
-            self.sampler.update_requests(sample_state,
-                                         force_use_rejection_sampling)
+            self.sampler.update_requests(sample_state)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -1837,3 +1830,11 @@ class PyExecutor:
         """Remove reqids of current requests from self.inflight_req_ids."""
         for req in scheduled_requests.all_requests():
             self.inflight_req_ids.erase(req.request_id)
+
+    def need_extra_greedy_sample(self):
+        """
+        If the drafter is not None and the spec_dec_mode is ngram, we need to do extra greedy sample for rejection sampling to get higher draft acceptance rate.
+        """
+        return self.drafter is not None and hasattr(
+            self.drafter, 'spec_config'
+        ) and self.drafter.spec_config.spec_dec_mode.is_ngram()

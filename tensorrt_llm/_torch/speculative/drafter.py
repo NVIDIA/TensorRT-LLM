@@ -16,6 +16,7 @@ class Drafter(ABC):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
+        request_mapping: Optional[dict[int, LlmRequest]] = None,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         """
