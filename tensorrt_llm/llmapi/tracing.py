@@ -34,7 +34,6 @@ try:
                                      get_current_span, set_tracer_provider)
     from opentelemetry.trace.propagation.tracecontext import \
         TraceContextTextMapPropagator
-    from opentelemetry.util import types
 
     _is_otel_imported = True
 except ImportError:
@@ -162,7 +161,7 @@ def contains_trace_headers(headers: Mapping[str, str]) -> bool:
 
 
 def add_event(name: str,
-              attributes: types.Attributes = None,
+              attributes: Optional[Mapping[str, object]] = None,
               timestamp: typing.Optional[int] = None) -> None:
     """Add an event to the current span if tracing is available."""
     if not is_tracing_enabled():
