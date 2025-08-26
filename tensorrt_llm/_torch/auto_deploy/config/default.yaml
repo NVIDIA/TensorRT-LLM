@@ -80,6 +80,8 @@ transforms:
     stage: post_load_fusion
   fuse_fp8_gemms:
     stage: post_load_fusion
+  fuse_quant:
+    stage: post_load_fusion
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   fuse_collectives:
@@ -89,8 +91,6 @@ transforms:
   fuse_rmsnorm:
     stage: post_load_fusion
     backend: flashinfer
-  fuse_quant:
-    stage: post_load_fusion
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
