@@ -427,8 +427,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds)
         .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds)
-        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents)
-        .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState);
+        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents);
 
     nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
         .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })

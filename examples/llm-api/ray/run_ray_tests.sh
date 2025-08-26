@@ -212,23 +212,7 @@ if [ -f "simple_ray_single_node.py" ]; then
     fi
 fi
 
-# 2. rlhf_colocate.py - Check GPU count first
-if [ -f "rlhf/rlhf_colocate.py" ]; then
-    echo "Available GPUs: $gpu_count"
-
-    if [ "$gpu_count" -ge 4 ]; then
-        run_python_file "rlhf/rlhf_colocate.py"
-    else
-        echo "⚠️  Skipping rlhf_colocate.py - requires at least 4 GPUs, but only $gpu_count GPU(s) available"
-        echo "   rlhf_colocate.py was not run due to insufficient GPU count (< 4)"
-        echo ""
-        # Record this as a skipped test
-        TEST_RESULTS["rlhf_colocate"]="SKIP"
-        TEST_LOG_FILES["rlhf_colocate"]="N/A"
-    fi
-fi
-
-# 3. llm_inference_async_ray.py
+# 2. llm_inference_async_ray.py
 if [ -f "llm_inference_async_ray.py" ]; then
     run_python_file "llm_inference_async_ray.py"
 fi

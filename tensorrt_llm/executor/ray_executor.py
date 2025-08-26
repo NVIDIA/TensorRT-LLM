@@ -1,6 +1,6 @@
 import os
 import socket
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import ray
 from ray.util.placement_group import (PlacementGroup,
