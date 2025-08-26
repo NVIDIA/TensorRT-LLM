@@ -584,6 +584,16 @@ class JobManager:
         with open(f"job_{self.job_id}/node_distribution.yaml", "w") as f:
             yaml.dump(distribution, f)
 
+    def start_container(self):
+        """Start the container."""
+        cmd = [
+            "srun", "-l", f"--container-image={self.container_image}",
+            f"--container-name={self.container_name}",
+            f"--container-mounts={self.mounts}", "--mpi=pmix",
+            "echo 'Container up.'"
+        ]
+        return execute_cmd(cmd)
+
     def install_trtllm(self):
         """Install TensorRT-LLM into the container."""
 
@@ -601,6 +611,9 @@ class JobManager:
     def launch_jobs(self):
         """Launch SLURM jobs for all nodes."""
         print("DEBUG JobManager: launch_jobs started")
+
+        # Start the container
+        self.start_container().wait()
 
         # Install TensorRT-LLM into the container
         self.install_trtllm().wait()
