@@ -427,7 +427,7 @@ void runSlidingWindowAttentionTest()
     tr::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
 
-    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    auto const blocksPerWindow = BlocksPerWindow{{windowSize, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
         blocksPerWindow, maxNumSequences, stream, maxAttentionWindow, beamWidth,
@@ -445,8 +445,8 @@ void runSlidingWindowAttentionTest()
     GenerationRequest seq0{requestId0, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
-    auto cacheBlockIds0 = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, windowSize);
+    auto cacheBlockIds0 = seq0.getCacheBlockIds(windowSize).at(beamIdx);
     auto constexpr numBlocks = (seqLen0 + tokensPerBlock - 1) / tokensPerBlock;
     std::vector<int> expectedBlocks(numBlocks);
     std::iota(expectedBlocks.begin(), expectedBlocks.end(), 0);
@@ -454,10 +454,10 @@ void runSlidingWindowAttentionTest()
     // Offload blocks before storage
     for (auto cacheBlockId : cacheBlockIds0)
     {
-        auto block = blockManager.getBlockById(cacheBlockId, maxAttentionWindow);
+        auto block = blockManager.getBlockById(cacheBlockId, windowSize);
         EXPECT_TRUE(block->isPrimary());
         // offload so we can write to block in CPU code
-        blockManager.offloadBlock(block, maxAttentionWindow);
+        blockManager.offloadBlock(block, windowSize);
         EXPECT_FALSE(block->isPrimary());
     }
     // Store blocks for reuse (last token cannot be reused)
@@ -475,8 +475,8 @@ void runSlidingWindowAttentionTest()
     GenerationRequest seq1{requestId1, inputLength1, beamWidth, blockManager.getWindowSizesMetadata()};
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
-    blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
-    auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, windowSize);
+    auto cacheBlockIds1 = seq1.getCacheBlockIds(windowSize).at(beamIdx);
     auto constexpr fullyReusedBlocks = numMatching / tokensPerBlock;
     auto constexpr firstOnboardedBlock = std::max(0, (numMatching - windowSize) / tokensPerBlock);
     std::vector<int> expectedBlocks1(numBlocks); // both sequences are same length
@@ -487,7 +487,7 @@ void runSlidingWindowAttentionTest()
     int blockIdx = 0;
     for (auto cacheBlockId : cacheBlockIds1)
     {
-        auto block = blockManager.getBlockById(cacheBlockId, maxAttentionWindow);
+        auto block = blockManager.getBlockById(cacheBlockId, windowSize);
         auto shouldBeOnboarded = blockIdx >= firstOnboardedBlock;
         EXPECT_EQ(block->isPrimary(), shouldBeOnboarded);
         ++blockIdx;
