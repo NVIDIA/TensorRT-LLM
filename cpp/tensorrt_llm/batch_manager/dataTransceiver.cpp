@@ -230,6 +230,10 @@ private:
                     {
                         std::unique_lock lk(mCondMutex);
                         mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                        if (mTerminate)
+                        {
+                            break;
+                        }
                         it = getCurrentResponse();
                     }
                     sendResponse(blockHashes, it);
