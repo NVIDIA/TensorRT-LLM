@@ -581,7 +581,8 @@ def trtllm_bench_unified_comparison(
             )
 
 
-def test_trtllm_bench(llm_root):  # noqa: F811
+@pytest.mark.parametrize("compile_backend", ["torch-compile", "torch-opt", "torch-cudagraph"])
+def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     )
@@ -591,7 +592,9 @@ def test_trtllm_bench(llm_root):  # noqa: F811
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": 2},
-                    "cuda_graph_batch_sizes": [1, 2],
+                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                    "max_batch_size": 128,
+                    "compile_backend": compile_backend,
                 },
                 f,
             )
