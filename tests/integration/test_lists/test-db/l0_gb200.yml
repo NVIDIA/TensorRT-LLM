@@ -1,5 +1,3 @@
-# Don't add any tests here.
-# Copied from l0_b200.yml but not used in the pipeline now
 version: 0.0.1
 l0_gb200:
 - condition:
