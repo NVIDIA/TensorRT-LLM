@@ -594,7 +594,7 @@ class JobManager:
                 "-N",
                 os.environ.get('SLURM_NNODES',
                             '1'), "--ntasks-per-node=1", "bash", "-c",
-                f"echo 'Running install operation...' && pip install -e {self.trtllm_repo}"
+                f"echo 'Running install operation...' && pip install -e {self.trtllm_repo} 2>&1 | tee install.log"
             ]
             return execute_cmd(cmd)
 
@@ -603,7 +603,7 @@ class JobManager:
         print("DEBUG JobManager: launch_jobs started")
 
         # Install TensorRT-LLM into the container
-        self.install_trtllm()
+        self.install_trtllm().wait()
 
         # Calculate server distribution
         distribution = self.calculate_server_distribution()
