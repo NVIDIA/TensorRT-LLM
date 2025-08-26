@@ -172,6 +172,7 @@ class JobManager:
         self.container_image = args.container_image
         self.mounts = args.mounts
         self.container_name = "trtllm-disagg-server"
+        self.trtllm_repo = args.trtllm_repo
         self.workdir = os.path.abspath(os.path.join(os.getcwd()))
         self.context_jobs = []
         self.generation_jobs = []
@@ -586,15 +587,16 @@ class JobManager:
     def install_trtllm(self):
         """Install TensorRT-LLM into the container."""
 
-        cmd = [
-            "srun", f"--container-name={self.container_name}",
-            f"--container-mounts={self.mounts}", "--mpi=pmix", "--overlap",
-            "-N",
-            os.environ.get('SLURM_NNODES',
-                           '1'), "--ntasks-per-node=1", "bash", "-c",
-            f"echo 'Running install operation...' && pip install -e {self.trtllm_repo}"
-        ]
-        return execute_cmd(cmd)
+        if self.trtllm_repo:
+            cmd = [
+                "srun", f"--container-name={self.container_name}",
+                f"--container-mounts={self.mounts}", "--mpi=pmix", "--overlap",
+                "-N",
+                os.environ.get('SLURM_NNODES',
+                            '1'), "--ntasks-per-node=1", "bash", "-c",
+                f"echo 'Running install operation...' && pip install -e {self.trtllm_repo}"
+            ]
+            return execute_cmd(cmd)
 
     def launch_jobs(self):
         """Launch SLURM jobs for all nodes."""
