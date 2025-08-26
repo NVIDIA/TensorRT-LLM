@@ -346,6 +346,18 @@ protected:
         std::cout << std::endl;
     }
 
+    template <typename T>
+    void showHostTensor(tensorrt_llm::runtime::BufferManager::ITensorPtr& tensor, std::string const& tensor_name)
+    {
+        std::cout << "Tensor: " << tensor_name << ": \n";
+        auto* const ptr = reinterpret_cast<T*>(tensor->data());
+        for (int _ = 0; _ < tensor->getSize(); _++)
+        {
+            std::cout << static_cast<float>(ptr[_]) << " ";
+        }
+        std::cout << std::endl;
+    }
+
     int generateRandomSizeSmallerThan(int a)
     {
         if (a <= 0)
@@ -492,13 +504,13 @@ protected:
             cudaMemcpy(this->d_cu_q_seq_lens->data(), this->h_cu_q_seq_lens->data(),
                 this->h_cu_q_seq_lens->getSizeInBytes(), cudaMemcpyHostToDevice);
 #ifdef TRTLLM_MLA_CHUNKED_PREFILL_TEST_DBG
-            this->showHostTensor<int64_t>(this->h_cu_q_seq_lens);
-            this->showHostTensor<int64_t>(this->h_cu_kv_seq_lens);
+            this->showHostTensor<int64_t>(this->h_cu_q_seq_lens, "cu_q_seq_lens");
+            this->showHostTensor<int64_t>(this->h_cu_kv_seq_lens, "cu_kv_seq_lens");
 #endif
         }
         int const total_chunk_size = this->mChunkSize * this->mBatchSize;
         int const total_cached_kv_len = this->mTotalKVLen - this->mTotalQLen;
-        int const chunked_loop_num = (total_cached_kv_len + total_chunk_size - 1) % total_chunk_size;
+        int const chunked_loop_num = (total_cached_kv_len + total_chunk_size - 1) / total_chunk_size;
         this->h_cu_chunk_lens = tensorrt_llm::runtime::BufferManager::pinned(
             ITensor::makeShape({chunked_loop_num + 1, this->mBatchSize + 1}), nvinfer1::DataType::kINT64);
         this->h_chunked_ld_global_offset = tensorrt_llm::runtime::BufferManager::pinned(
@@ -650,6 +662,7 @@ protected:
 
     int prepareChunkedPrefillMetaData()
     {
+        using tensorrt_llm::runtime::bufferCast;
         int const total_chunk_size = this->mChunkSize * this->mBatchSize;
         int chunked_loop_num = (this->mTotalKVLen - this->mTotalQLen + total_chunk_size - 1) / total_chunk_size;
 
@@ -716,7 +729,7 @@ protected:
             }
         }
         // merge op
-        for (int loop_idx = 0; loop_idx < chunked_loop_num + 1; loop_idx++)
+        for (int loop_idx = 0; loop_idx < chunked_loop_num; loop_idx++)
         {
             for (int b = 0; b < this->mBatchSize; b++)
             {
@@ -734,6 +747,21 @@ protected:
                 }
             }
         }
+        // for the last uncached part
+        for (int b = 0; b < this->mBatchSize; b++)
+        {
+            int temp_cached_kv_len = (h_cu_kv_seq_lens_ptr[b + 1] - h_cu_kv_seq_lens_ptr[b])
+                - (h_cu_q_seq_lens_ptr[b + 1] - h_cu_q_seq_lens_ptr[b]);
+            if (temp_cached_kv_len == 0)
+            {
+                h_merge_op[chunked_loop_num * (this->mBatchSize) + b] = 2; // copy
+            }
+            else
+            {
+                h_merge_op[chunked_loop_num * (this->mBatchSize) + b] = 1; // merge
+            }
+            chunked_ld_global_offset(chunked_loop_num, b) = temp_cached_kv_len;
+        }
 
 #undef chunked_seq_len
 #undef cu_chunked_seq_len
@@ -745,6 +773,12 @@ protected:
             this->h_chunked_ld_global_offset->getSizeInBytes(), cudaMemcpyHostToDevice);
         cudaMemcpy(this->m_d_merge_op->data(), this->m_h_merge_op->data(), this->m_h_merge_op->getSizeInBytes(),
             cudaMemcpyHostToDevice);
+#ifdef TRTLLM_MLA_CHUNKED_PREFILL_TEST_DBG
+        std::cout << "chunked_loop_num: " << chunked_loop_num << '\n';
+        this->showHostTensor<int64_t>(this->m_h_merge_op, "merge_op");
+        this->showHostTensor<int64_t>(this->h_chunked_ld_global_offset, "chunked_ld_global_offset");
+        this->showHostTensor<int64_t>(this->h_cu_chunk_lens, "cu_chunk_lens");
+#endif
         return chunked_loop_num;
     }
 
@@ -788,7 +822,7 @@ protected:
         int const total_chunk_size = this->mChunkSize * this->mBatchSize;
         int chunked_loop_num = (this->mTotalKVLen - this->mTotalQLen + total_chunk_size - 1) / total_chunk_size;
         // do not apply mask
-        for (int _ = 0; _ < chunked_loop_num - 1; _++)
+        for (int _ = 0; _ < chunked_loop_num; _++)
         {
             // copy related kv chunk data
             copyRelatedChunkedKV(h_chunked_kv_ptr, h_kv_ptr, h_chunked_ld_global_offset_ptr, this->mBatchSize,
@@ -822,12 +856,6 @@ protected:
         // copy the last chunked kv data
         copyRelatedChunkedKV(h_chunked_kv_ptr, h_kv_ptr, h_chunked_ld_global_offset_ptr, this->mBatchSize,
             this->mNumHeads, h_cu_kv_seq_lens_ptr, h_cu_chunk_lens_ptr, this->mNopeSize);
-#ifdef TRTLLM_MLA_CHUNKED_PREFILL_TEST_DBG
-        std::cout << "merge op: ";
-        this->showHostTensor<int64_t>(this->m_h_merge_op);
-        std::cout << "cu chunk lens: ";
-        this->showHostTensor<int64_t>(this->h_cu_chunk_lens);
-#endif
         // attention
         selfAttentionRef<DataType>(h_output_ptr, h_q_ptr, h_chunked_kv_ptr, this->mBatchSize, this->mNumHeads,
             h_cu_q_seq_lens_ptr, h_cu_chunk_lens_ptr, this->mNopeSize, true, h_softmax_sum_ptr, this->mIsCausalMask);
@@ -870,7 +898,7 @@ protected:
 
         loadChunkedKVKernelRef<DataType, TCache>(compressed_kv_output_ptr, k_pe_output_ptr, kv_cache, this->mBatchSize,
             h_cu_chunk_lens_ptr, h_chunked_ld_global_offset_ptr, this->mLoraSize, this->mRopeSize,
-            this->max_chunk_len_per_loop[chunk_idx], kv_scale_quant_orig_ptr);
+            kv_scale_quant_orig_ptr);
     }
 
     void PreformLoadChunkedKV(int chunk_idx)
