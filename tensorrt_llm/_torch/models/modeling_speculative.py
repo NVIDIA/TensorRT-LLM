@@ -219,8 +219,11 @@ class Eagle3DraftModel(DecoderModel):
         # we expect that to happen outside the model definition. This helps us
         # avoid data-dependent control flow and gives us better CUDA graph
         # coverage.
+        residual = None
         if self.num_layers > 1:
             for layer in self.midlayer:
+                if residual is not None:
+                    hidden_states = hidden_states + residual
                 hidden_states, residual = layer(position_ids=position_ids,
                                                 embeds=inputs_embeds,
                                                 hidden_states=hidden_states,
