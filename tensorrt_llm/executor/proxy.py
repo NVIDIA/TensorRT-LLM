@@ -95,6 +95,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
+                             is_llm_executor=False,
                              kv_connector_config=kv_connector_config)
 
         if "log_level" not in worker_kwargs:
