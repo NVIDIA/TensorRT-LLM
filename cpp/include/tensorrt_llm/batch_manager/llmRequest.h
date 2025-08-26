@@ -1110,7 +1110,7 @@ public:
 
     [[nodiscard]] SizeType32 getNumDraftTokens() const
     {
-        return mDraftTokens->size();
+        return hasDraftTokens() ? mDraftTokens->size() : 0;
     }
 
     void discardDraftTokens(SizeType32 numTokensToDiscard)
