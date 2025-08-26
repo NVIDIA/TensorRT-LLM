@@ -2845,3 +2845,27 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
                  kv_cache_config=self.kv_cache_config) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_host_memory(100000)
+class TestQwQ_32B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/QwQ-32B"
+    MODEL_PATH = f"{llm_models_root()}/QwQ-32B"
+
+    # NOTE: according to Sampling Parameters section
+    sampling_params = SamplingParams(
+        temperature=0.6,
+        top_p=0.95,
+        top_k=30,
+        presence_penalty=1.0,
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=16384,
+                 kv_cache_config=self.kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
