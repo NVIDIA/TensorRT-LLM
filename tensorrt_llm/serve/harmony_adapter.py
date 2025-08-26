@@ -6,7 +6,7 @@ import re
 import time
 import traceback
 import uuid
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Literal
 
 from openai_harmony import (Author, Conversation, DeveloperContent,
                             HarmonyEncodingName, HarmonyError, Message,
@@ -189,7 +189,6 @@ class HarmonyStreamState:
                 # Send opening token if this is the first content in this channel
                 if not self.channel_started:
                     self.channel_started = True
-                    # print(f"Request {self.request_id}: starting preamble channel")
                     return {
                         "content":
                         f"<|channel|>commentary<|message|>{self.parser.last_content_delta}",
@@ -284,7 +283,7 @@ class HarmonyAdapter:
     - Commentary preamble: tool_calls: [] (empty array)
     - Commentary tool call: tool_calls: [...] (populated array)
     - Final content: no tool_calls field
-    - Analysis: reasoning_content field
+    - Analysis: reasoning field
 
     Parameters:
     - harmony_input: If True, expect harmony format input (no conversion)
@@ -978,8 +977,6 @@ class HarmonyAdapter:
                 msg_recipient = getattr(msg, 'recipient', None)
                 msg_content = getattr(msg, 'content', [])
 
-                # print(f"DEBUG: Processing message - channel={msg_channel}, recipient={msg_recipient}, content={msg_content}")
-
                 if msg_channel == "analysis":
                     for content in msg_content:
                         if isinstance(content, TextContent):
@@ -1585,3 +1582,17 @@ def _create_usage_info(final_res: RequestOutput) -> UsageInfo:
                       completion_tokens=num_generated_tokens,
                       total_tokens=num_prompt_tokens + num_generated_tokens)
     return usage
+
+
+def maybe_transform_reasoning_effort(
+        reasoning_effort: ReasoningEffort | Literal["low", "medium", "high"] | None
+    ) -> ReasoningEffort | None:
+    str_to_effort = {
+        "low": ReasoningEffort.LOW,
+        "medium": ReasoningEffort.MEDIUM,
+        "high": ReasoningEffort.HIGH
+    }
+    if reasoning_effort and not isinstance(reasoning_effort, ReasoningEffort):
+        return str_to_effort[reasoning_effort]
+    else:
+        return reasoning_effort

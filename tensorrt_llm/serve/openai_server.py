@@ -50,7 +50,8 @@ from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, handle_non_streaming_response,
-                              handle_streaming_response)
+                              handle_streaming_response,
+                              maybe_transform_reasoning_effort)
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -678,8 +679,7 @@ class OpenAIServer:
                 tools_dict = [tool.model_dump() for tool in request.tools]
 
             # Reasoning effort precedence: request.reasoning_effort > system message parsing > serving default
-            reasoning_effort = request.reasoning_effort
-
+            reasoning_effort = maybe_transform_reasoning_effort(request.reasoning_effort)
             # Get tool_choice from request
             tool_choice = getattr(request, 'tool_choice', None)
 

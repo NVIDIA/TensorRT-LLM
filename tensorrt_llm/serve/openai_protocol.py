@@ -507,12 +507,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
-    reasoning_effort: Optional[ReasoningEffort] = Field(
-        default=ReasoningEffort.LOW,
-        description=("The level of reasoning effort to use. Controls how much "
-                     "reasoning is shown in the model's response. Options: "
-                     "'low', 'medium', 'high'."),
-    )
+    reasoning_effort: Optional[ReasoningEffort | Literal[
+        "low", "medium", "high"]] = Field(
+            default=ReasoningEffort.LOW,
+            description=(
+                "The level of reasoning effort to use. Controls how much "
+                "reasoning is shown in the model's response. Options: "
+                "'low', 'medium', 'high'."),
+        )
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
