@@ -18,7 +18,7 @@ jobs:
           repository: poweiw/goggles_action
           path: ./.github/actions/goggles_action
           token: ${{ secrets.GOGGLES_ACTION_REPO_TOKEN}}
-          ref: test/pr-checklist-20250819
+          ref: 0dc6365
 
       - name: Validate PR Checklist
         uses: ./.github/actions/goggles_action/actions/pr_checklist
