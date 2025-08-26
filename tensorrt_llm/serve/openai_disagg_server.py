@@ -111,7 +111,8 @@ class OpenAIDisaggServer:
                 await self.gen_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
 
             # Start periodic metrics logging
-            self._metrics_task = asyncio.create_task(self._log_metrics_periodically(self.metrics_interval_secs))
+            if self.metrics_interval_secs > 0:
+                self._metrics_task = asyncio.create_task(self._log_metrics_periodically(self.metrics_interval_secs))
 
             yield
 
@@ -139,8 +140,9 @@ class OpenAIDisaggServer:
         self.register_routes()
 
     async def _increment_metric(self, key: str, amount: int = 1):
-        async with self._metrics_lock:
-            self._metrics[key] += amount
+        if self.metrics_interval_secs > 0:
+            async with self._metrics_lock:
+                self._metrics[key] += amount
 
     async def _get_metrics_snapshot(self):
         async with self._metrics_lock:

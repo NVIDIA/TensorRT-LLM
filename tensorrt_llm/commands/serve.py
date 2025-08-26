@@ -457,10 +457,13 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
-@click.option("--metrics-log-interval",
-              type=int,
-              default=30,
-              help="The interval of logging metrics in seconds")
+@click.option(
+    "--metrics-log-interval",
+    type=int,
+    default=0,
+    help=
+    "The interval of logging metrics in seconds. Set to 0 to disable metrics logging."
+)
 def disaggregated(config_file: Optional[str],
                   metadata_server_config_file: Optional[str],
                   server_start_timeout: int, request_timeout: int,
