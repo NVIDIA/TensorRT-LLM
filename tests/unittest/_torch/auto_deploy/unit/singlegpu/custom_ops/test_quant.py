@@ -8,10 +8,6 @@ from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_
 
 torch.manual_seed(0)
 
-scaling_vector_size = 16
-FORMAT_FP8 = 0
-FORMAT_NVFP4 = 1
-
 SCALING_VECTOR_SIZE = 16  # NVFP4 block size along K
 
 
@@ -51,7 +47,7 @@ def test_fp4_linear():
     weight_scale_2 = fp4_global_scale(weight)
 
     weight_fp4, weight_scale = torch.ops.trtllm.fp4_quantize(
-        weight, weight_scale_2, scaling_vector_size, False
+        weight, weight_scale_2, SCALING_VECTOR_SIZE, False
     )
 
     output_fp4_gemm = torch.ops.auto_deploy.torch_quant_fp4_linear(

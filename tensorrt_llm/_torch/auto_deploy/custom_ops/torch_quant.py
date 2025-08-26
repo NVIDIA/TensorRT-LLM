@@ -8,14 +8,6 @@ from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
 
 from .quant import QUANT_LINEAR_OPS, QUANT_OPS
 
-# ===== Enums =====
-FORMAT_FP8 = 0
-FORMAT_NVFP4 = 1
-
-# scale layouts
-PER_TENSOR = 0
-PER_CHANNEL_OUT = 1
-
 # FP4 tables (E2M1)
 e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
 e2m1_values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
@@ -179,7 +171,6 @@ def torch_fake_quant_fp8_linear(
     For FP8:
       - input_scale[0] and weight_scale[0] are required (amax/448 style)
       - input_zp / weight_zp ignored
-      - supports PER_TENSOR and PER_CHANNEL_OUT for weights
     """
     if weight_quantized.dtype != torch.float8_e4m3fn:
         raise TypeError("FP8 path requires weight_quantized.dtype == float8_e4m3fn")
