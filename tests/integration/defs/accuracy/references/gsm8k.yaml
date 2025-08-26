@@ -13,12 +13,12 @@ meta-llama/Llama-3.3-70B-Instruct:
   - accuracy: 83.78
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 88.70
+    accuracy: 87.33
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 84.08
+    accuracy: 90.30
   - quant_algo: FP8
-    accuracy: 84.08
+    accuracy: 90.30
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 92.20
   - quant_algo: FP8
@@ -150,8 +150,14 @@ speakleash/Bielik-11B-v2.2-Instruct:
     accuracy: 40.41
 google/gemma-3-1b-it:
   - accuracy: 25.52 # score getting from lm-eval with HF implementation
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 23.96
 google/gemma-3-27b-it:
   - accuracy: 91.66
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 90.66
 mistralai/Ministral-8B-Instruct-2410:
   - accuracy: 79.25
   - quant_algo: FP8

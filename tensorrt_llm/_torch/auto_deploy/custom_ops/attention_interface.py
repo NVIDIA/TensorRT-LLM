@@ -476,9 +476,6 @@ class SequenceInfo:
         idx = self.previous_batch_indices_cuda[: len(previous_batch_indices)]
         idx.copy_(host_idx, non_blocking=True)
 
-        # sort them so that masked_scatter_ lines up correctly
-        idx, _ = idx.sort()
-
         # gather the exact values you want to write
         src = new_tokens[0, idx, 0]
 

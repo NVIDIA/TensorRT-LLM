@@ -165,8 +165,8 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
     if dtype == "-bf16" and s == 4096:
         epsilon += ' -epsilon 0.03'
 
-    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 120:
-        pytest.skip("FP8 MLAs are only supported on sm120 currently.")
+    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version not in [90, 120]:
+        pytest.skip("FP8 MLAs are only supported on sm90 and sm120 currently.")
 
     # Context phase kernels, always use separate-q-k-v layout.
     subprocess.run(
