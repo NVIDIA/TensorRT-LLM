@@ -26,15 +26,13 @@ TEST(UserBuffer, basic)
 {
     if (!tr::ub::ub_supported())
     {
-        return;
+        GTEST_SKIP() << "UserBuffer is not supported";
     }
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-    {
-        return;
-    }
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+
     tr::ub::ub_initialize(world_size);
     EXPECT_EQ(tr::ub::ub_is_initialized(), true);
     EXPECT_NE(tr::ub::ub_comm(), nullptr);
