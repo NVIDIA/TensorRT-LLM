@@ -1519,6 +1519,24 @@ class PyTorchModelEngine(ModelEngine):
                     ['mrope_position_deltas']
                     for multimodal_params in multimodal_params_list
                 ]
+                if len(mrope_position_deltas_list) != len(
+                        scheduled_requests.generation_requests):
+                    dummy_tensor = torch.empty_like(
+                        mrope_position_deltas_list[0])
+                    logger.debug(f"[DEBUG] CUDA Graph MROPE Padding:")
+                    padding_count = 0
+                    for request in reversed(
+                            scheduled_requests.generation_requests):
+                        if request.is_cuda_graph_dummy:
+                            mrope_position_deltas_list.append(dummy_tensor)
+                            padding_count += 1
+                        else:
+                            break
+                    logger.debug(
+                        f"  - Total padded: {padding_count} dummy tensors for mrope_position_deltas"
+                    )
+                assert len(mrope_position_deltas_list) == len(scheduled_requests.generation_requests), \
+                    f"MROPE deltas mismatch: {len(mrope_position_deltas_list)} != {len(scheduled_requests.generation_requests)}"
                 inputs['mrope_position_deltas'] = torch.cat(
                     mrope_position_deltas_list, dim=0)
 
