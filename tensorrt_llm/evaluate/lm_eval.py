@@ -314,8 +314,8 @@ class LmEvalEvaluator(Evaluator):
         print(
             f"LmEvalEvaluator::__init__: apply_chat_template: {apply_chat_template}"
         )
-        if apply_chat_template:
-            assert False
+        import traceback
+        traceback.print_stack()
         if self.MULTIMODAL:
             apply_chat_template = True
             logger.info(
