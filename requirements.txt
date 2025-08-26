@@ -3,7 +3,7 @@
 accelerate>=0.25.0
 build
 colored
-cuda-python>=12,<13
+cuda-python # Do not override the custom version of cuda-python installed in the NGC PyTorch image.
 diffusers>=0.27.0
 lark
 mpi4py
@@ -58,4 +58,3 @@ ninja
 etcd3
 blake3
 llguidance==0.7.29
-triton==3.3.1; platform_machine == "x86_64"
