@@ -160,9 +160,8 @@ private:
         }
     }
 
-    void sendResponse(std::vector<size_t> const& blockHashes)
+    void sendResponse(std::vector<size_t> const& blockHashes, std::map<RequestIdType, Response>::iterator it)
     {
-        auto it = getCurrentResponse();
         auto reqId = mCurrentRequest.value();
         auto count = --mRemainSendCount[reqId];
         TLLM_CHECK(count >= 0);
@@ -222,7 +221,7 @@ private:
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
                 {
-                    sendResponse(blockHashes);
+                    sendResponse(blockHashes, it);
                 }
                 else
                 {
@@ -233,7 +232,7 @@ private:
                         mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
                         it = getCurrentResponse();
                     }
-                    sendResponse(blockHashes);
+                    sendResponse(blockHashes, it);
                 }
             }
         }
