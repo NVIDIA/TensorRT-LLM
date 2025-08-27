@@ -84,7 +84,7 @@ class Runner
 {
 public:
     explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-        bool useDeepSeekFp8, int tileTokensDim, ActType actType, bool useTmaOobOpt);
+        bool useDeepSeekFp8, int tileTokensDim, ActType actType);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
@@ -96,10 +96,6 @@ public:
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const;
 
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
-
-    // See comments in MoE::Runner::getNumPrependTokens*InputBuffer()
-    [[nodiscard]] int32_t getNumPrependTokensInputBuffer() const;
-    [[nodiscard]] int32_t getNumPrependTokensOutputBuffer() const;
 
     void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale, void* expertWeights,
         float* outputScalesScalar, float* outputScalesGateScalar, float* ptrBias, float* ptrSwiGluAlpha,
@@ -123,7 +119,7 @@ class Runner
 {
 public:
     explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-        batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim, bool useTmaOobOpt);
+        batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
@@ -135,10 +131,6 @@ public:
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const;
 
     [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
-
-    // See comments in MoE::Runner::getNumPrependTokens*InputBuffer()
-    [[nodiscard]] int32_t getNumPrependTokensInputBuffer() const;
-    [[nodiscard]] int32_t getNumPrependTokensOutputBuffer() const;
 
     void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight, void* weightScale,
         float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
@@ -275,10 +267,9 @@ class Runner
 {
 public:
     // FIXME: tileTokensDim is hardcoded for now
-    explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-        bool useDeepSeekFp8, int tileTokensDim = 8, ActType actType = ActType::SwiGlu, bool useTmaOobOpt = true);
-    explicit Runner(
-        batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8, bool useTmaOobOpt = true);
+    Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
+        int tileTokensDim = 8, ActType actType = ActType::SwiGlu);
+    Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
 
     void run(
         MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex);
@@ -291,31 +282,6 @@ public:
 
     [[nodiscard]] int64_t getDefaultValidConfigIndex(
         int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts, int32_t numTokens) const;
-
-    // If the kernels have TMA OOB optimization (useTmaOobOpt==true) enabled in load/store, then the input/output of the
-    // kernel requires prepended dummy tokens. These functions return the number of prepended tokens required for each
-    // of the IO buffers. The user is responsible for allocating extra memory with respective hidden/intermediate size
-    // and dtype size, and slicing the valid part of the buffer for the final output data.
-    //
-    // FC1 input does not require extra padding as the data is loaded using indirection, which does not use TMA load
-    // cp.async.bulk. Required tensor size is always [num_tokens, hidden_size]. Effective range is [0:num_tokens,
-    // 0:hidden_size]
-    //
-    // FC1 output requires prepended padding when useTmaOobOpt==true. In this case, the required tensor size is [maxCtas
-    // * padding + padding, intermediate_size]. Effective range is [padding:, 0:intermediate_size]
-    //
-    // FC2 input requires prepended padding when useTmaOobOpt==true. In this case, the required tensor size is [maxCtas
-    // * padding + padding, intermediate_size]. Effective range is [padding:, 0:intermediate_size]
-    //
-    // FC2 output requires prepended padding when useTmaOobOpt==true. In this case, the required tensor size is [maxCtas
-    // * padding + padding, hidden_size]. Effective range is [padding:, 0:hidden_size]
-    //
-    // The last part about the effective range of the FC2 output implies that the downstream kernel needs to skip over
-    // padding * hidden_size * dtype_size amount of bytes to start reading the valid data.
-    [[nodiscard]] int32_t getNumPrependTokensFc1InputBuffer() const;
-    [[nodiscard]] int32_t getNumPrependTokensFc2InputBuffer() const;
-    [[nodiscard]] int32_t getNumPrependTokensFc1OutputBuffer() const;
-    [[nodiscard]] int32_t getNumPrependTokensFc2OutputBuffer() const;
 
 private:
     void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, moe::dev::convertsf::Data& convertSfData,

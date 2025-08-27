@@ -52,9 +52,7 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "")
 int32_t getMaxPermutedPaddedCount(int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding)
 {
     int32_t maxCtas = getMaxNumCtasInBatchDim(numTokens, expertsPerToken, numExperts, padding);
-    // TMA OOB optimization (mTmaOobOpt==true) requires prepending the buffer with `padding` number of tokens.
-    // For simplicity, we always extend the buffer by the same amount of tokens.
-    return maxCtas * padding + padding;
+    return maxCtas * padding;
 }
 
 std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType)
@@ -252,8 +250,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 namespace PermuteGemm1
 {
 
-tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeAct, btg::Dtype dtypeWeights,
-    int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType, bool useTmaOobOpt)
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
+    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType)
 {
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options
         = {// Swap A and B dtypes because transposeMmaOutput is hardcoded to true
@@ -266,19 +264,17 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
             .routeAct = true,
             .staticBatch = false,
             .transposeMmaOutput = true,
-            .useTmaOobOpt = useTmaOobOpt,
             .tileSize = tileTokensDim,
             .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
     return options;
 }
 
-Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType,
-    bool useTmaOobOpt)
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType)
     : mDtypeAct(dtypeAct)
     , mDtypeWeights(dtypeWeights)
     , mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useTmaOobOpt)))
+          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType)))
 {
 }
 
@@ -329,24 +325,12 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const
     return mRunner.getPassingConfigIndices();
 }
 
-int32_t Runner::getNumPrependTokensInputBuffer() const
-{
-    // FC1 loads packed token layout.
-    return 0;
-}
-
-int32_t Runner::getNumPrependTokensOutputBuffer() const
-{
-    // FC1 stores padded token layout. Prepend tokens when TMA OOB optimization is enabled.
-    return (mRunner.getOptions().useTmaOobOpt) ? mRunner.getOptions().tileSize : 0;
-}
-
 } // namespace PermuteGemm1
 
 namespace Gemm2
 {
-tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeAct, btg::Dtype dtypeWeights,
-    btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8, bool useTmaOobOpt)
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
+    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8)
 {
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options
         = {// Swap A and B dtypes because transposeMmaOutput is hardcoded to true
@@ -358,20 +342,19 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
             .routeAct = false,
             .staticBatch = false,
             .transposeMmaOutput = true,
-            .useTmaOobOpt = useTmaOobOpt,
             .tileSize = tileTokensDim,
             .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
     return options;
 }
 
-Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8,
-    int tileTokensDim, bool useTmaOobOpt)
+Runner::Runner(
+    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8, int tileTokensDim)
     : mDtypeAct(dtypeAct)
     , mDtypeWeights(dtypeWeights)
     , mDtypeOut(dtypeOut)
     , mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8, useTmaOobOpt)))
+          getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8)))
 {
 }
 
@@ -423,31 +406,15 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const
     return mRunner.getPassingConfigIndices();
 }
 
-int32_t Runner::getNumPrependTokensInputBuffer() const
-{
-    // FC2 loads padded token layout. Prepend tokens when TMA OOB optimization is enabled.
-    return (mRunner.getOptions().useTmaOobOpt) ? mRunner.getOptions().tileSize : 0;
-}
-
-int32_t Runner::getNumPrependTokensOutputBuffer() const
-{
-    // FC1 stores padded token layout. Prepend tokens when TMA OOB optimization is enabled.
-    return (mRunner.getOptions().useTmaOobOpt) ? mRunner.getOptions().tileSize : 0;
-}
-
 } // namespace Gemm2
 
 namespace MoE
 {
-Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int32_t tileTokensDim,
-    ActType actType, bool useTmaOobOpt)
-    : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType, useTmaOobOpt))
-    , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim, useTmaOobOpt))
+Runner::Runner(
+    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int32_t tileTokensDim, ActType actType)
+    : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType))
+    , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim))
 {
-    // Sanity check.
-    TLLM_CHECK_WITH_INFO(getNumPrependTokensFc1OutputBuffer() == getNumPrependTokensFc2InputBuffer(),
-        "FC1 output and FC2 input must have the same number of prepended tokens");
-
     auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
     auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
@@ -465,8 +432,8 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
     TLLM_CHECK_WITH_INFO(!mPassingConfigs.empty(), "No compatible configs found for the fp8 block scale MoE runner.");
 }
 
-Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim, bool useTmaOobOpt)
-    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActType::SwiGlu, useTmaOobOpt)
+Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim)
+    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim)
 {
 }
 
@@ -487,13 +454,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     activationData.mDtypeElt = args.mDtypeElt;
     activationData.mUsePdl = true;
     activationData.mUseDeepSeekFp8 = true;
-    // The Gemm1 output may contain extra padding space before the actual data begins. In that case, we need to skip
-    // over the padding space.
-    activationData.inPtr = (uint8_t*) workspace.gemm1_output
-        + mPermuteGemm1.getNumPrependTokensOutputBuffer() * args.intermediate_size * 2
-            * btg::dtypeGetNumBits(args.mDtypeElt) / 8;
-    activationData.outPtr = (uint8_t*) workspace.activation_output
-        + mGemm2.getNumPrependTokensInputBuffer() * args.intermediate_size * btg::dtypeGetNumBits(args.mDtypeElt) / 8;
+    activationData.inPtr = workspace.gemm1_output;
+    activationData.outPtr = workspace.activation_output;
     activationData.inDqSfsPtr = workspace.gemm1_output_scale;
     activationData.outDqSfsPtr = workspace.activation_output_scale;
     activationData.innerDim = args.intermediate_size * 2;
@@ -510,10 +472,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         finalizeData.mDtypeExpW = args.mDtypeExpW;
         finalizeData.mUsePdl = true;
         finalizeData.mUseDeepSeekFp8 = false;
-        // The Gemm2 output may contain extra padding space before the actual data begins. In that case, we need to skip
-        // over the padding space.
-        finalizeData.inPtr = (uint8_t*) workspace.gemm2_output
-            + mGemm2.getNumPrependTokensOutputBuffer() * args.hidden_size * btg::dtypeGetNumBits(args.mDtypeOut) / 8;
+        finalizeData.inPtr = workspace.gemm2_output;
         finalizeData.outPtr = args.output;
         finalizeData.inDqSfsPtr = workspace.gemm2_output_scale;
         finalizeData.outDqSfsPtr = args.output_scale;
@@ -633,27 +592,6 @@ void Runner::run(
         sync_check_cuda_error(stream);
     }
 }
-
-int32_t Runner::getNumPrependTokensFc1InputBuffer() const
-{
-    return mPermuteGemm1.getNumPrependTokensInputBuffer();
-}
-
-int32_t Runner::getNumPrependTokensFc2InputBuffer() const
-{
-    return mGemm2.getNumPrependTokensInputBuffer();
-}
-
-int32_t Runner::getNumPrependTokensFc1OutputBuffer() const
-{
-    return mPermuteGemm1.getNumPrependTokensOutputBuffer();
-}
-
-int32_t Runner::getNumPrependTokensFc2OutputBuffer() const
-{
-    return mGemm2.getNumPrependTokensOutputBuffer();
-}
-
 } // namespace MoE
 
 } // namespace trtllmGenFp8BlockScaleMoe

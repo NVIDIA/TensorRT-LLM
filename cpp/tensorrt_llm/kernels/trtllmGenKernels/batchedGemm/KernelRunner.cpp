@@ -107,7 +107,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
             && (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
-            && tileSize == mOptions.tileSize && mOptions.useTmaOobOpt == options.mUseTmaOobOpt)
+            && tileSize == mOptions.tileSize)
         {
             // FIXME: Disable split-k for now.
             if (options.mClusterDimZ != 1)
@@ -132,10 +132,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
     TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(),
         "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, mUseDeepSeekFp8: %d, "
-        "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d, mUseTmaOobOpt: %d",
+        "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d",
         tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
         tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
-        mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize, mOptions.useTmaOobOpt);
+        mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize);
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
@@ -223,8 +223,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     gemmData.mInputBuffers.mPtrPerTokenSfA = mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
     gemmData.mInputBuffers.mPtrPerTokenSfB = mOptions.transposeMmaOutput ? perTokensSfA : perTokensSfB;
     gemmData.mInputBuffers.mPtrBias = ptrBias;
-    gemmData.mInputBuffers.mPtrSwiGluAlpha = ptrAlpha;
-    gemmData.mInputBuffers.mPtrSwiGluBeta = ptrBeta;
+    gemmData.mInputBuffers.mPtrGatedActAlpha = ptrAlpha;
+    gemmData.mInputBuffers.mPtrGatedActBeta = ptrBeta;
     gemmData.mInputBuffers.mPtrClampLimit = ptrClampLimit;
 
     gemmData.mInputBuffers.mPtrRouteMap = routeMap;

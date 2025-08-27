@@ -75,7 +75,6 @@ def create_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
-    tllmgen_use_tma_oob_opt: bool = False,
 ) -> MoE:
     moe_cls = get_moe_cls(model_config, routing_method, dtype,
                           override_quant_config)
@@ -97,9 +96,6 @@ def create_moe(
     if swiglu_limit is not None:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE], \
             f"swiglu_limit is only supported in CutlassFusedMoE, TritonFusedMoE and TRTLLMGenFusedMoE, not in {moe_cls.__name__}."
-
-    if moe_cls not in [TRTLLMGenFusedMoE]:
-        assert not tllmgen_use_tma_oob_opt, "tllmgen_use_tma_oob_opt must be False when using other moe backends."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."

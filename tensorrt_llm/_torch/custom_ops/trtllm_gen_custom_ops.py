@@ -248,18 +248,9 @@ def fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
     tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
     kernel_runner = FP4BlockScaleMoERunner(
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        tile_tokens_dim,
-        routing_method_type,
-        do_finalize,
-    )
+        num_experts, top_k, n_group, topk_group, intermediate_size,
+        local_expert_offset, local_num_experts, routed_scaling_factor,
+        tile_tokens_dim, routing_method_type, do_finalize)
 
     inputs = [
         routing_logits,
@@ -520,18 +511,12 @@ def fp8_block_scale_moe_runner(
     num_tokens = hidden_states.shape[0]
     tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
-    kernel_runner = FP8BlockScaleMoERunner(
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        tile_tokens_dim,
-        routing_method_type,
-    )
+    kernel_runner = FP8BlockScaleMoERunner(num_experts, top_k, n_group,
+                                           topk_group, intermediate_size,
+                                           local_expert_offset,
+                                           local_num_experts,
+                                           routed_scaling_factor,
+                                           tile_tokens_dim, routing_method_type)
 
     inputs = [
         routing_logits,
@@ -773,31 +758,18 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 @torch.library.custom_op("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
                          mutates_args=())
 def mxe4m3_mxe2m1_block_scale_moe_runner(
-    routing_logits: torch.Tensor,
-    routing_bias: Optional[torch.Tensor],
-    hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor,
-    gemm1_weights: torch.Tensor,
-    gemm1_weights_scale: torch.Tensor,
-    gemm1_bias: Optional[torch.Tensor],
-    gemm1_alpha: Optional[torch.Tensor],
-    gemm1_beta: Optional[torch.Tensor],
-    gemm1_clamp_limit: Optional[torch.Tensor],
-    gemm2_weights: torch.Tensor,
-    gemm2_weights_scale: torch.Tensor,
-    gemm2_bias: Optional[torch.Tensor],
-    num_experts: int,
-    top_k: int,
-    n_group: Optional[int],
-    topk_group: Optional[int],
-    intermediate_size: int,
-    hidden_size_output: int,
-    local_expert_offset: int,
-    local_num_experts: int,
-    routed_scaling_factor: Optional[float],
-    routing_method_type: int,
-    act_type: int,
-) -> torch.Tensor:
+        routing_logits: torch.Tensor, routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor, hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor, gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: Optional[torch.Tensor], gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor], gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor, gemm2_bias: Optional[torch.Tensor],
+        num_experts: int, top_k: int, n_group: Optional[int],
+        topk_group: Optional[int], intermediate_size: int,
+        hidden_size_output: int, local_expert_offset: int,
+        local_num_experts: int, routed_scaling_factor: Optional[float],
+        routing_method_type: int, act_type: int) -> torch.Tensor:
 
     tuner = AutoTuner.get()
 
@@ -805,19 +777,9 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
     tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
     kernel_runner = MxE4m3MxE2m1BlockScaleMoERunner(
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        hidden_size_output,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        tile_tokens_dim,
-        routing_method_type,
-        act_type,
-    )
+        num_experts, top_k, n_group, topk_group, intermediate_size,
+        hidden_size_output, local_expert_offset, local_num_experts,
+        routed_scaling_factor, tile_tokens_dim, routing_method_type, act_type)
 
     input_tensors = [
         routing_logits,
@@ -1035,18 +997,9 @@ def e4m3_mxe2m1_block_scale_moe_runner(
     tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
     kernel_runner = E4m3MxE2m1BlockScaleMoERunner(
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        tile_tokens_dim,
-        routing_method_type,
-        act_type,
-    )
+        num_experts, top_k, n_group, topk_group, intermediate_size,
+        local_expert_offset, local_num_experts, routed_scaling_factor,
+        tile_tokens_dim, routing_method_type, act_type)
 
     input_tensors = [
         routing_logits,
@@ -1127,11 +1080,9 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         )
 
         if instance_key not in Bf16MxE2m1BlockScaleMoERunner.runner_dict:
-            Bf16MxE2m1BlockScaleMoERunner.runner_dict[instance_key] = (
-                torch.classes.trtllm.Bf16MxE2m1BlockScaleMoERunner(
-                    self.tile_tokens_dim,
-                    self.act_type,
-                ))
+            Bf16MxE2m1BlockScaleMoERunner.runner_dict[
+                instance_key] = torch.classes.trtllm.Bf16MxE2m1BlockScaleMoERunner(
+                    self.tile_tokens_dim, self.act_type)
 
         self.kernel_runner = Bf16MxE2m1BlockScaleMoERunner.runner_dict[
             instance_key]
@@ -1259,18 +1210,9 @@ def bf16_mxe2m1_block_scale_moe_runner(
     tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
     kernel_runner = Bf16MxE2m1BlockScaleMoERunner(
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        tile_tokens_dim,
-        routing_method_type,
-        act_type,
-    )
+        num_experts, top_k, n_group, topk_group, intermediate_size,
+        local_expert_offset, local_num_experts, routed_scaling_factor,
+        tile_tokens_dim, routing_method_type, act_type)
 
     input_tensors = [
         routing_logits,
