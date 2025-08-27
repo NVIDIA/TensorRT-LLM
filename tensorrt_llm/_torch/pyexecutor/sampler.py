@@ -364,6 +364,9 @@ class TorchStore:
 
     def __init__(self, *, max_draft_len: int, max_num_sequences: int,
                  max_beam_width: int):
+        self.max_draft_len = max_draft_len
+        self.max_num_sequences = max_num_sequences
+        self.max_beam_width = max_beam_width
         self.max_tokens = max_draft_len + 1
         assert max_beam_width == SINGLE_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.new_tokens = int_tensor(
