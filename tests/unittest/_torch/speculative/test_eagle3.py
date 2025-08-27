@@ -226,10 +226,7 @@ def test_deepseek_eagle3():
             pass
 
 
-@pytest.mark.parametrize("use_one_model", [
-    [True],
-    [False],
-])
+@pytest.mark.parametrize("use_one_model", [True, False])
 def test_multi_eagle3(use_one_model: bool):
     use_cuda_graph = True
     attn_backend = "TRTLLM"
