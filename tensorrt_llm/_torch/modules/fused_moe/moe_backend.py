@@ -4,11 +4,14 @@ This module provides a unified interface for different MoE backends (Cutlass, De
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
 from tensorrt_llm._utils import get_sm_version
+
+if TYPE_CHECKING:
+    from .interface import MoE
 
 
 class MoEBackend(ABC):
@@ -38,7 +41,7 @@ class MoEBackend(ABC):
         For DeepGemm backend, this can be a no-op.
 
         Args:
-            module: The MoE module containing weights and configurations
+            module: The MoE module containing MoE configurations
             tuner_input: Real input used for tuning (same shape/layout as non-alltoall)
             output_dtype: Output dtype for tuner run
             min_latency_mode: Whether to profile for min-latency path
@@ -48,6 +51,7 @@ class MoEBackend(ABC):
     @abstractmethod
     def compute_moe(
             self,
+            module: 'MoE',
             # Input tensors
             x: torch.Tensor,
             token_selected_slots: torch.Tensor,
@@ -63,36 +67,40 @@ class MoEBackend(ABC):
             quant_scales: List[torch.Tensor],
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
-            # SwiGLU parameters (optional)
-            swiglu_alpha: Optional[torch.Tensor] = None,
-            swiglu_beta: Optional[torch.Tensor] = None,
-            swiglu_limit: Optional[torch.Tensor] = None,
-            # Parallel configuration
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            ep_size: int = 1,
-            ep_rank: int = 0,
-            cluster_size: int = 1,
-            cluster_rank: int = 0,
-            enable_alltoall: bool = False,
-            # Quantization flags
-            use_deepseek_fp8_block_scale: bool = False,
-            use_w4_group_scaling: bool = False,
-            use_int8_woq_per_channel: bool = False,
-            use_mxfp8_act_scaling: bool = False,
-            # Performance tuning
+            # Performance tuning (only runtime-variable parameters)
             min_latency_mode: bool = False,
             use_fused_finalize: bool = True,
-            tune_max_num_tokens: int = 8192,
             tuner_num_tokens: Optional[int] = None,
             tuner_top_k: Optional[int] = None,
-            module: Optional[Any] = None,
             **kwargs) -> torch.Tensor:
         """
-        Perform the actual MoE computation with full parameter support.
+        Perform the actual MoE computation.
 
-        This method should be compatible with the original torch.ops.trtllm.fused_moe
-        interface to ensure backward compatibility and full feature support.
+        Configuration parameters (tp_size, ep_size, swiglu params, etc.) are
+        automatically extracted from the module parameter.
+
+        Args:
+            module: MoE module containing configuration and parameters.
+                   The following will be extracted:
+                   - tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank
+                   - enable_alltoall, tune_max_num_tokens
+                   - swiglu_alpha, swiglu_beta, swiglu_limit
+                   - Quantization flags based on module properties
+            x: Input tensor
+            token_selected_slots: Selected expert slots
+            token_final_scales: Scaling factors
+            w3_w1_weight: Fused gate and up projection weights
+            w3_w1_bias: Optional bias
+            w2_weight: Down projection weights
+            w2_bias: Optional bias
+            output_dtype: Output data type
+            quant_scales: Quantization scales
+            input_sf: Input scaling factor
+            swizzled_input_sf: Whether input_sf is swizzled
+            min_latency_mode: Use minimum latency optimizations
+            use_fused_finalize: Use fused finalization
+            tuner_num_tokens: Number of tokens for tuning
+            tuner_top_k: Top-k value for tuning
 
         Returns:
             Computed MoE output tensor
@@ -100,7 +108,8 @@ class MoEBackend(ABC):
 
     def run_moe(
             self,
-            # Positional arguments (same order as torch.ops.trtllm.fused_moe)
+            module: 'MoE',
+            # Input tensors
             input: torch.Tensor,
             token_selected_slots: torch.Tensor,
             token_final_scales: torch.Tensor,
@@ -109,39 +118,23 @@ class MoEBackend(ABC):
             w2_weight: torch.Tensor,
             w2_bias: Optional[torch.Tensor],
             output_dtype: torch.dtype,
-            # Keyword arguments
+            # Quantization parameters
             quant_scales: List[torch.Tensor],
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
-            swiglu_alpha: Optional[torch.Tensor] = None,
-            swiglu_beta: Optional[torch.Tensor] = None,
-            swiglu_limit: Optional[torch.Tensor] = None,
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            ep_size: int = 1,
-            ep_rank: int = 0,
-            cluster_size: int = 1,
-            cluster_rank: int = 0,
-            enable_alltoall: bool = False,
-            use_deepseek_fp8_block_scale: bool = False,
-            use_w4_group_scaling: bool = False,
-            use_int8_woq_per_channel: bool = False,
-            use_mxfp8_act_scaling: bool = False,
+            # Performance tuning (only runtime-variable parameters)
             min_latency_mode: bool = False,
             use_fused_finalize: bool = True,
-            tune_max_num_tokens: int = 8192,
             tuner_num_tokens: Optional[int] = None,
             tuner_top_k: Optional[int] = None,
-            module: Optional[
-                Any] = None,  # Module reference for accessing properties
             **kwargs) -> torch.Tensor:
         """
         Run the complete MoE computation pipeline.
 
-        This method provides a unified interface compatible with torch.ops.trtllm.fused_moe,
-        handling both tactic finalization and the actual MoE computation.
+        Configuration parameters are automatically extracted from the module.
 
         Args:
+            module: MoE module containing configuration
             input: Input tensor to the MoE layer
             token_selected_slots: Selected expert slots for each token
             token_final_scales: Final scaling factors for each token
@@ -153,66 +146,38 @@ class MoEBackend(ABC):
             quant_scales: Quantization scales for weights
             input_sf: Optional input scale factors for quantization
             swizzled_input_sf: Whether input scale factors are swizzled
-            swiglu_alpha/beta/limit: Optional SwiGLU activation parameters
-            tp_size/tp_rank: Tensor parallel configuration
-            ep_size/ep_rank: Expert parallel configuration
-            cluster_size/cluster_rank: Cluster configuration
-            enable_alltoall: Whether to use alltoall communication
-            use_deepseek_fp8_block_scale: Enable DeepSeek FP8 block scaling
-            use_w4_group_scaling: Enable W4 group scaling
-            use_int8_woq_per_channel: Enable INT8 weight-only quantization
-            use_mxfp8_act_scaling: Enable MXFP8 activation scaling
             min_latency_mode: Use minimum latency optimizations
             use_fused_finalize: Use fused finalization
-            tune_max_num_tokens: Maximum tokens for tuning
-            tuner_num_tokens: Number of tokens for tuner input (alltoall mode)
-            tuner_top_k: Top-k value for tuning (alltoall mode)
-            module: Optional MoE module reference for accessing properties
+            tuner_num_tokens: Number of tokens for tuner input
+            tuner_top_k: Top-k value for tuning
 
         Returns:
             Computed MoE output tensor
         """
-
         self.finalize_tactic(module, input, output_dtype, min_latency_mode,
                              tuner_top_k)
 
-        # Call compute_moe with all parameters
-        return self.compute_moe(
-            x=input,
-            token_selected_slots=token_selected_slots,
-            token_final_scales=token_final_scales,
-            w3_w1_weight=w3_w1_weight,
-            w3_w1_bias=w3_w1_bias,
-            w2_weight=w2_weight,
-            w2_bias=w2_bias,
-            output_dtype=output_dtype,
-            quant_scales=quant_scales,
-            input_sf=input_sf,
-            swizzled_input_sf=swizzled_input_sf,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            enable_alltoall=enable_alltoall,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
-            use_int8_woq_per_channel=use_int8_woq_per_channel,
-            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-            min_latency_mode=min_latency_mode,
-            use_fused_finalize=use_fused_finalize,
-            tune_max_num_tokens=tune_max_num_tokens,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
-            module=module,
-            **kwargs)
+        # Call compute_moe with module
+        return self.compute_moe(module=module,
+                                x=input,
+                                token_selected_slots=token_selected_slots,
+                                token_final_scales=token_final_scales,
+                                w3_w1_weight=w3_w1_weight,
+                                w3_w1_bias=w3_w1_bias,
+                                w2_weight=w2_weight,
+                                w2_bias=w2_bias,
+                                output_dtype=output_dtype,
+                                quant_scales=quant_scales,
+                                input_sf=input_sf,
+                                swizzled_input_sf=swizzled_input_sf,
+                                min_latency_mode=min_latency_mode,
+                                use_fused_finalize=use_fused_finalize,
+                                tuner_num_tokens=tuner_num_tokens,
+                                tuner_top_k=tuner_top_k,
+                                **kwargs)
 
 
-class MoeCutlassBackend(MoEBackend):
+class MoECutlassBackend(MoEBackend):
     """Cutlass-based MoE backend using torch.ops.trtllm.fused_moe."""
 
     def __init__(self):
@@ -227,6 +192,7 @@ class MoeCutlassBackend(MoEBackend):
         tuner_input: torch.Tensor,
         output_dtype: torch.dtype,
         min_latency_mode: bool = False,
+        use_fused_finalize: bool = True,
         tuner_top_k: Optional[int] = None,
     ) -> None:
         """
@@ -270,7 +236,7 @@ class MoeCutlassBackend(MoEBackend):
                 use_mxfp8_act_scaling=getattr(module, 'has_mxfp8_act_scaling',
                                               False),
                 min_latency_mode=min_latency_mode,
-                use_fused_finalize=getattr(module, 'use_fused_finalize', False),
+                use_fused_finalize=use_fused_finalize,
             )
 
         # Set tuning configuration
@@ -315,8 +281,9 @@ class MoeCutlassBackend(MoEBackend):
 
     def compute_moe(
             self,
+            module: 'MoE',  # Now required as first parameter
             # Input tensors
-            x: torch.Tensor,
+        x: torch.Tensor,
             token_selected_slots: torch.Tensor,
             token_final_scales: Optional[torch.Tensor],
             # Weight tensors
@@ -330,35 +297,34 @@ class MoeCutlassBackend(MoEBackend):
             quant_scales: List[torch.Tensor],
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
-            # SwiGLU parameters (optional)
-            swiglu_alpha: Optional[torch.Tensor] = None,
-            swiglu_beta: Optional[torch.Tensor] = None,
-            swiglu_limit: Optional[torch.Tensor] = None,
-            # Parallel configuration
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            ep_size: int = 1,
-            ep_rank: int = 0,
-            cluster_size: int = 1,
-            cluster_rank: int = 0,
-            enable_alltoall: bool = False,
-            # Quantization flags
-            use_deepseek_fp8_block_scale: bool = False,
-            use_w4_group_scaling: bool = False,
-            use_int8_woq_per_channel: bool = False,
-            use_mxfp8_act_scaling: bool = False,
-            # Performance tuning
+            # Performance tuning (only runtime-variable parameters)
             min_latency_mode: bool = False,
             use_fused_finalize: bool = True,
-            tune_max_num_tokens: int = 8192,
             tuner_num_tokens: Optional[int] = None,
             tuner_top_k: Optional[int] = None,
-            module: Optional[Any] = None,
             **kwargs) -> torch.Tensor:
         """
         Compute MoE using Cutlass backend with MoERunner.
         """
-        # Import necessary modules
+        # Extract parameters from module
+        tp_size = module.tp_size
+        tp_rank = module.tp_rank
+        ep_size = module.ep_size
+        ep_rank = module.ep_rank
+        cluster_size = module.cluster_size
+        cluster_rank = module.cluster_rank
+        enable_alltoall = module.enable_alltoall
+        getattr(module, 'tune_max_num_tokens', 8192)
+        swiglu_alpha = module.swiglu_alpha
+        swiglu_beta = module.swiglu_beta
+        swiglu_limit = module.swiglu_limit
+        # Extract quantization flags from module properties
+        use_deepseek_fp8_block_scale = getattr(module,
+                                               'has_deepseek_fp8_block_scales',
+                                               False)
+        use_w4_group_scaling = getattr(module, 'has_w4afp8', False)
+        use_int8_woq_per_channel = getattr(module, 'has_int8_woq_per_channel',
+                                           False)
 
         # Determine weight dtype for view operation if needed
         weight_dtype = w3_w1_weight.dtype
@@ -412,6 +378,8 @@ class MoeCutlassBackend(MoEBackend):
 
     def run_moe(
             self,
+            module: 'MoE',
+            # Input tensors
             input: torch.Tensor,
             token_selected_slots: torch.Tensor,
             token_final_scales: torch.Tensor,
@@ -420,39 +388,23 @@ class MoeCutlassBackend(MoEBackend):
             w2_weight: torch.Tensor,
             w2_bias: Optional[torch.Tensor],
             output_dtype: torch.dtype,
-            # Keyword arguments
+            # Quantization parameters
             quant_scales: List[torch.Tensor],
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
-            swiglu_alpha: Optional[torch.Tensor] = None,
-            swiglu_beta: Optional[torch.Tensor] = None,
-            swiglu_limit: Optional[torch.Tensor] = None,
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            ep_size: int = 1,
-            ep_rank: int = 0,
-            cluster_size: int = 1,
-            cluster_rank: int = 0,
-            enable_alltoall: bool = False,
-            use_deepseek_fp8_block_scale: bool = False,
-            use_w4_group_scaling: bool = False,
-            use_int8_woq_per_channel: bool = False,
-            use_mxfp8_act_scaling: bool = False,
+            # Performance tuning (only runtime-variable parameters)
             min_latency_mode: bool = False,
             use_fused_finalize: bool = True,
-            tune_max_num_tokens: int = 8192,
             tuner_num_tokens: Optional[int] = None,
             tuner_top_k: Optional[int] = None,
-            module: Optional[
-                Any] = None,  # Module reference for accessing properties
             **kwargs) -> torch.Tensor:
         """
-        Run the complete MoE computation pipeline.
+        Run the complete MoE computation pipeline for Cutlass backend.
 
-        This method provides a unified interface compatible with torch.ops.trtllm.fused_moe,
-        handling both tactic finalization and the actual MoE computation.
+        This override handles the specific tuner_input logic needed for Cutlass.
 
         Args:
+            module: MoE module containing configuration
             input: Input tensor to the MoE layer
             token_selected_slots: Selected expert slots for each token
             token_final_scales: Final scaling factors for each token
@@ -464,25 +416,17 @@ class MoeCutlassBackend(MoEBackend):
             quant_scales: Quantization scales for weights
             input_sf: Optional input scale factors for quantization
             swizzled_input_sf: Whether input scale factors are swizzled
-            swiglu_alpha/beta/limit: Optional SwiGLU activation parameters
-            tp_size/tp_rank: Tensor parallel configuration
-            ep_size/ep_rank: Expert parallel configuration
-            cluster_size/cluster_rank: Cluster configuration
-            enable_alltoall: Whether to use alltoall communication
-            use_deepseek_fp8_block_scale: Enable DeepSeek FP8 block scaling
-            use_w4_group_scaling: Enable W4 group scaling
-            use_int8_woq_per_channel: Enable INT8 weight-only quantization
-            use_mxfp8_act_scaling: Enable MXFP8 activation scaling
             min_latency_mode: Use minimum latency optimizations
             use_fused_finalize: Use fused finalization
-            tune_max_num_tokens: Maximum tokens for tuning
-            tuner_num_tokens: Number of tokens for tuner input (alltoall mode)
-            tuner_top_k: Top-k value for tuning (alltoall mode)
-            module: Optional MoE module reference for accessing properties
+            tuner_num_tokens: Number of tokens for tuner input
+            tuner_top_k: Top-k value for tuning
 
         Returns:
             Computed MoE output tensor
         """
+        # Extract enable_alltoall from module to determine tuner_input logic
+        enable_alltoall = module.enable_alltoall
+
         # Compute tuner_input per fused_moe logic
         if enable_alltoall:
             assert tuner_num_tokens is not None
@@ -497,49 +441,32 @@ class MoeCutlassBackend(MoEBackend):
         self.finalize_tactic(module, tuner_input, output_dtype,
                              min_latency_mode, tuner_top_k)
 
-        # Call compute_moe with all parameters
-        return self.compute_moe(
-            x=input,
-            token_selected_slots=token_selected_slots,
-            token_final_scales=token_final_scales,
-            w3_w1_weight=w3_w1_weight,
-            w3_w1_bias=w3_w1_bias,
-            w2_weight=w2_weight,
-            w2_bias=w2_bias,
-            output_dtype=output_dtype,
-            quant_scales=quant_scales,
-            input_sf=input_sf,
-            swizzled_input_sf=swizzled_input_sf,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            enable_alltoall=enable_alltoall,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
-            use_int8_woq_per_channel=use_int8_woq_per_channel,
-            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-            min_latency_mode=min_latency_mode,
-            use_fused_finalize=use_fused_finalize,
-            tune_max_num_tokens=tune_max_num_tokens,
-            tuner_num_tokens=tuner_num_tokens,
-            tuner_top_k=tuner_top_k,
-            module=module,
-            **kwargs)
+        # Call compute_moe with module
+        return self.compute_moe(module=module,
+                                x=input,
+                                token_selected_slots=token_selected_slots,
+                                token_final_scales=token_final_scales,
+                                w3_w1_weight=w3_w1_weight,
+                                w3_w1_bias=w3_w1_bias,
+                                w2_weight=w2_weight,
+                                w2_bias=w2_bias,
+                                output_dtype=output_dtype,
+                                quant_scales=quant_scales,
+                                input_sf=input_sf,
+                                swizzled_input_sf=swizzled_input_sf,
+                                min_latency_mode=min_latency_mode,
+                                use_fused_finalize=use_fused_finalize,
+                                tuner_num_tokens=tuner_num_tokens,
+                                tuner_top_k=tuner_top_k,
+                                **kwargs)
 
 
-class MoeDeepGemmBackend(MoEBackend):
+class MoEDeepGemmBackend(MoEBackend):
     """DeepGemm-based MoE backend for GB200 block FP8."""
 
     def __init__(self):
         """Initialize DeepGemm backend."""
         super().__init__()
-        # Import DeepGemm specific functions
         import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
         self.fp8_utils = fp8_utils
 
@@ -556,7 +483,6 @@ class MoeDeepGemmBackend(MoEBackend):
     ) -> None:
         """
         No-op for DeepGemm backend as it doesn't require tactic profiling.
-        DeepGemm uses static tactics and doesn't need runtime profiling.
 
         Args:
             module: The MoE module (unused for DeepGemm)
@@ -618,6 +544,7 @@ class MoeDeepGemmBackend(MoEBackend):
 
     def compute_moe(
             self,
+            module: 'MoE',
             # Input tensors
             x: torch.Tensor,
             token_selected_slots: torch.Tensor,
@@ -633,30 +560,11 @@ class MoeDeepGemmBackend(MoEBackend):
             quant_scales: List[torch.Tensor],
             input_sf: Optional[torch.Tensor] = None,
             swizzled_input_sf: bool = True,
-            # SwiGLU parameters (optional)
-            swiglu_alpha: Optional[torch.Tensor] = None,
-            swiglu_beta: Optional[torch.Tensor] = None,
-            swiglu_limit: Optional[torch.Tensor] = None,
-            # Parallel configuration
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            ep_size: int = 1,
-            ep_rank: int = 0,
-            cluster_size: int = 1,
-            cluster_rank: int = 0,
-            enable_alltoall: bool = False,
-            # Quantization flags
-            use_deepseek_fp8_block_scale: bool = False,
-            use_w4_group_scaling: bool = False,
-            use_int8_woq_per_channel: bool = False,
-            use_mxfp8_act_scaling: bool = False,
-            # Performance tuning
+            # Performance tuning (only runtime-variable parameters)
             min_latency_mode: bool = False,
             use_fused_finalize: bool = True,
-            tune_max_num_tokens: int = 8192,
             tuner_num_tokens: Optional[int] = None,
             tuner_top_k: Optional[int] = None,
-            module: Optional[Any] = None,
             **kwargs) -> torch.Tensor:
         """
         Compute MoE using DeepGemm backend with block FP8 quantization.
@@ -670,10 +578,18 @@ class MoeDeepGemmBackend(MoEBackend):
                                          preprocess_after_permute, set_strides,
                                          triton_masked_index_gather)
 
-        # Module is required for DeepGemm backend
-        if module is None:
-            raise ValueError(
-                "Module reference is required for DeepGemm backend")
+        # Extract parameters from module
+        tp_size = module.tp_size
+        tp_rank = module.tp_rank
+        ep_size = module.ep_size
+        ep_rank = module.ep_rank
+        cluster_size = module.cluster_size
+        cluster_rank = module.cluster_rank
+        enable_alltoall = module.enable_alltoall
+        getattr(module, 'tune_max_num_tokens', 8192)
+        module.swiglu_alpha
+        module.swiglu_beta
+        module.swiglu_limit
 
         # Not supported: min_latency_mode. Raise error if enabled.
         if min_latency_mode:
@@ -875,7 +791,7 @@ class MoEBackendSelection:
                    - has_deepseek_fp8_block_scales: Whether block FP8 is enabled
 
         Returns:
-            MoEBackend: Selected backend instance (MoeCutlassBackend or MoeDeepGemmBackend)
+            MoEBackend: Selected backend instance (MoECutlassBackend or MoEDeepGemmBackend)
 
         Example:
             >>> backend = MoEBackendSelection.select_backend(moe_module)
@@ -891,8 +807,8 @@ class MoEBackendSelection:
         if is_blackwell and has_block_fp8:
             # Use DeepGemm backend for Blackwell with block FP8
             print("xxi select backend: use deepgemm backend")
-            return MoeDeepGemmBackend()
+            return MoEDeepGemmBackend()
         else:
             # Use Cutlass backend for all other cases
             print("xxi select backend: use cutlass backend")
-            return MoeCutlassBackend()
+            return MoECutlassBackend()

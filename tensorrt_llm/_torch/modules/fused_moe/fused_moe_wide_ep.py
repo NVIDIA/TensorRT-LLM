@@ -15,7 +15,7 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
-from .moe_backend import MoEBackendSelection
+from .moe_backend import MoEBackend, MoEBackendSelection
 from .moe_load_balancer import get_moe_load_balancer
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
@@ -234,8 +234,8 @@ class WideEPMoE(MoE):
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
 
-        # Select MoE backend based on configuration
-        self.moe_backend = None  # Will be initialized after weights are created
+        # MoE backend will be lazily initialized when first accessed (see moe_backend property)
+        self._moe_backend_impl = None
 
     def _check_configs(self):
         assert self._weights_created
@@ -365,8 +365,18 @@ class WideEPMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
-        # Initialize MoE backend after weights are created
-        self.moe_backend = MoEBackendSelection.select_backend(self)
+    @property
+    def moe_backend_impl(self) -> MoEBackend:
+        """
+        Lazily initialize and return the MoE backend.
+
+        The backend is selected based on hardware capabilities and quantization
+        configuration, which are only available after weights are created.
+        """
+        if self._moe_backend_impl is None:
+            assert self._weights_created, "Weights must be created before accessing moe_backend"
+            self._moe_backend_impl = MoEBackendSelection.select_backend(self)
+        return self._moe_backend_impl
 
     def dummy_allreduce(self):
         """
@@ -422,8 +432,6 @@ class WideEPMoE(MoE):
         if self.layer_load_balancer and is_first_call:
             self.layer_load_balancer.start_wait_gpu_stage()
 
-        use_deepseek_fp8_block_scale = False
-        use_w4_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
@@ -578,9 +586,8 @@ class WideEPMoE(MoE):
                     x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
-                use_deepseek_fp8_block_scale = True
+                pass
             elif self.has_w4afp8:
-                use_w4_group_scaling = True
                 weight_dtype = torch.quint4x2
             else:
                 raise ValueError(
@@ -603,12 +610,12 @@ class WideEPMoE(MoE):
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
 
-        ep_size = self.ep_size
-        ep_rank = self.ep_rank
+        # ep_size = self.ep_size
+        # ep_rank = self.ep_rank
         w3_w1_weight = self.w3_w1_weight
         w2_weight = self.w2_weight
-        cluster_size = self.cluster_size
-        cluster_rank = self.cluster_rank
+        # cluster_size = self.cluster_size
+        # cluster_rank = self.cluster_rank
         quant_scales = self.quant_scales
 
         if use_postquant_alltoall:
@@ -697,8 +704,9 @@ class WideEPMoE(MoE):
         #     tuner_top_k=tuner_top_k,
         # )
 
-        # Use the selected backend to compute MoE with the same parameters as fused_moe
-        final_hidden_states = self.moe_backend.run_moe(
+        # Use backend interface with module as first parameter for automatic configuration extraction
+        final_hidden_states = self.moe_backend_impl.run_moe(
+            self,  # Module as first parameter
             x,
             token_selected_slots,
             token_final_scales,
@@ -710,21 +718,11 @@ class WideEPMoE(MoE):
             quant_scales=quant_scales,
             input_sf=x_sf,
             swizzled_input_sf=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            enable_alltoall=use_all_to_all,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
+            # Only need to pass runtime-variable parameters
             min_latency_mode=False,
-            tune_max_num_tokens=self.tune_max_num_tokens,
+            use_fused_finalize=True,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
-            module=
-            self,  # Additional parameter for backend to access module properties
         )
 
         # print(
