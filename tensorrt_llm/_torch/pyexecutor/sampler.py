@@ -583,9 +583,9 @@ class TorchSampler(Sampler):
         self._process_requests(scheduled_requests,
                                model_outputs,
                                new_tokens,
+                               num_context_logits_prefix_sum,
                                seq_slots=seq_slots,
                                seq_slots_host=seq_slots_host,
-                               num_context_logits_prefix_sum,
                                log_probs_host=log_probs_host)
         self._write_finish_reasons(requests,
                                    finish_reasons=finish_reasons,
