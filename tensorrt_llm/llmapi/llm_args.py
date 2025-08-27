@@ -353,6 +353,15 @@ class DecodingBaseConfig(StrictBaseModel):
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
     load_format: Optional[str] = None
+    # PyTorch only.
+    # Rolling average window size (N) for acceptance length across completed requests.
+    # If not set or set to 0, the feature is disabled.
+    acceptance_window: Optional[int] = None
+    # PyTorch only.
+    # Threshold for average acceptance length; speculation will be disabled
+    # permanently once the rolling average over the last N completed requests
+    # (N = acceptance_window) drops below this value.
+    acceptance_threshold: Optional[float] = None
 
     @classmethod
     def from_dict(cls, data: dict):
