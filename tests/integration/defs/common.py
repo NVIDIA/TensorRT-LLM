@@ -745,7 +745,7 @@ def generate_dummy_loras(
 
     print("Creating pseudo LoRAs...")
 
-    # Try to load with CPU offloading disabled first
+    # Avoid meta tensors by loading model to CPU first (ensures all parameters are materialized)
     try:
         model = AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
