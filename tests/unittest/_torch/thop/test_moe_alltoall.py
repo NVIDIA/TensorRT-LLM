@@ -17,6 +17,7 @@ import unittest
 import pytest
 import torch
 from parameterized import parameterized
+from utils.util import getSMVersion
 
 import tensorrt_llm as tllm
 
@@ -174,6 +175,10 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                                                 vector_dims,
                                                 dtype,
                                                 use_low_precision=False):
+
+        if use_low_precision and getSMVersion() < 100:
+            pytest.skip("low precision is not supported on pre-blackwell")
+
         torch.cuda.set_device(0)
         max_world_size = 8
         assert world_size <= max_world_size, f"should run with world_size at most {max_world_size}"

@@ -332,13 +332,6 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
                 v2.x = tensorrt_llm::common::cuda_cast<DType>(tmp[t].x * dequantScale);
                 v2.y = tensorrt_llm::common::cuda_cast<DType>(tmp[t].y * dequantScale);
                 reinterpret_cast<DType2*>(out + idx0)[0] = v2;
-
-                // This is a workaround to avoid the issue of nan or inf.
-                // TODO: remove this after the issue is fixed.
-                // if (dequantScale > 1e10)
-                // {
-                //     printf("This is a workaround to avoid the issue of nan or inf. \n");
-                // }
             }
         }
         __syncwarp();
