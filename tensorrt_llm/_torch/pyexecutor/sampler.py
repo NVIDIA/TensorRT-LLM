@@ -391,12 +391,24 @@ class TorchSampler(Sampler):
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs([token_log_probs])
 
-    def _process_draft_tokens_greedy(self, request: LlmRequest,
-                                     new_tokens: torch.Tensor) -> int:
+    _REASONS = {
+        FinishReason.END_ID, FinishReason.LENGTH, FinishReason.STOP_WORDS
+    }
+
+    @classmethod
+    def finish_if_reason(cls, request: LlmRequest, finish_reasons: torch.Tensor,
+                         *, step: int) -> bool:
+        reason = FinishReason(finish_reasons[step, request.py_seq_slot, BEAM_0])
+        if reason in cls._REASONS:
+            request.finish_by(reason, BEAM_0)
+            return True
+        return False
+
+    def _process_draft_tokens_greedy(self, request: LlmRequest, *,
+                                     new_tokens: torch.Tensor,
+                                     finish_reasons: torch.Tensor) -> int:
         new_token = add_token(request, new_tokens, beam=BEAM_0)
-        stop = handle_stop_1_beam(request,
-                                  new_token,
-                                  max_seq_len=self.max_seq_len)
+        stop = self.finish_if_reason(request, finish_reasons, step=0)
         if stop or get_draft_token_length(request) == 0:
             return 0
         num_accepted = 0
@@ -411,14 +423,15 @@ class TorchSampler(Sampler):
                                   new_tokens,
                                   beam=BEAM_0,
                                   step=num_accepted)
-            if handle_stop_1_beam(request,
-                                  new_token,
-                                  max_seq_len=self.max_seq_len):
+            if self.finish_if_reason(finish_reasons, request,
+                                     step=num_accepted):
                 break
         return num_accepted
 
     def _process_draft_tokens_rejection_sampling(
             self, request: LlmRequest, new_tokens: torch.Tensor) -> int:
+        """We cannot use finish_if_reason in _process_draft_tokens_rejection_sampling because it *writes to new_tokens*,
+        rendering the finish reason calculation in sample_async stale (incorrect) for this batch"""
         sampling_strategy = request_strategy(request)
         generator = self.get_generator(request.py_draft_logits.device)
         _, draft_probs = sample(sampling_strategy,
@@ -459,25 +472,18 @@ class TorchSampler(Sampler):
 
         return num_accepted
 
-    def process_draft_tokens(self, request: LlmRequest,
-                             new_tokens: torch.Tensor) -> int:
-        if request.py_draft_logits is None:
-            return self._process_draft_tokens_greedy(request, new_tokens)
-        else:
-            return self._process_draft_tokens_rejection_sampling(
-                request, new_tokens)
-
     def update_requests(self, state: SampleState) -> None:
         assert isinstance(state, SampleState)
         if state.sampler_event:
             state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
+        finish_reasons = state.host.finish_reasons
 
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
-            new_token = add_token(req, new_tokens, beam=BEAM_0)
-            handle_stop_1_beam(req, new_token, max_seq_len=self.max_seq_len)
+            add_token(req, new_tokens, beam=BEAM_0)
+            self.finish_if_reason(req, finish_reasons, step=0)
             self.handle_logits(req, state, beam=BEAM_0, count=1)
             req.py_decoding_iter += 1
 
@@ -485,7 +491,12 @@ class TorchSampler(Sampler):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             processed = 1
-            num_accepted = self.process_draft_tokens(req, new_tokens)
+            if req.py_draft_logits is None:
+                num_accepted = self._process_draft_tokens_greedy(
+                    req, new_tokens=new_tokens, finish_reasons=finish_reasons)
+            else:
+                num_accepted = self._process_draft_tokens_rejection_sampling(
+                    req, new_tokens)
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
