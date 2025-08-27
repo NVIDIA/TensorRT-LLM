@@ -1508,6 +1508,9 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
             static_assert(!is_nvfp4 && !is_mxfp8, "NVFP4 and MXFP8 are not supported for AWQ");
             static_assert(!std::is_same_v<InputActivationsType, ExpandedActivationsType>,
                 "Input and output types must be different for AWQ");
+            int64_t expert = findTotalEltsLessThanTarget(
+                                 expert_first_token_offset, num_experts_per_node, (int64_t) permuted_row + 1)
+                - 1;
             for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
             {
                 auto frag_elems = source_row_ptr[elem_index];
@@ -1515,7 +1518,8 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                 CUTLASS_PRAGMA_UNROLL
                 for (int e = 0; e < ELEM_PER_THREAD; e++)
                 {
-                    frag_elems[e] = frag_elems[e] * prequant_scales[elem_index * ELEM_PER_THREAD + e];
+                    frag_elems[e]
+                        = frag_elems[e] * prequant_scales[expert * hidden_size + elem_index * ELEM_PER_THREAD + e];
                 }
 
                 dest_row_ptr[elem_index] = arrayConvert<DataElem, OutputElem>(frag_elems);
