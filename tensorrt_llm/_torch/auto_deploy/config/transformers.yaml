@@ -2,7 +2,7 @@
 #In transformers mode are playing with gm.factory_module, which is a dead module.
 #Need to always ensure not cleaning graph.
 transforms:
-  build_model:
+  build_and_load_factory_model:
     stage: factory
     device: meta
     run_graph_cleanup: false
@@ -13,7 +13,7 @@ transforms:
     run_graph_cleanup: false
     requires_clean_graph: false
 
-  load_factory_model_weights:
+  move_cm_to_device:
     stage: weight_load
     run_graph_cleanup: false
     requires_clean_graph: false

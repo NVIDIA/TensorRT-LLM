@@ -106,8 +106,42 @@ def forward_cached(module: torch.nn.Module, *cm_args):
     )
 
 
+def fake_profiler_mha(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    **kwargs,
+):
+    """Fake attn to count number of attn calls and record per-rank kv shape of each layer."""
+
+    # Get pointer to the factory model.
+    factory_model_ptr = kwargs["factory_model_ptr"]
+
+    # Set layer idx to current attention module, so it can fetch its kv cache from cm input args later.
+    module._layer_idx = len(factory_model_ptr.kv_cache_shapes)
+
+    # Record kv cache shape for this layer, for initializing kv cache.
+    factory_model_ptr.kv_cache_shapes.append(
+        {
+            "n_q_heads": query.shape[1],
+            "n_kv_heads": key.shape[1],
+            "head_dim": key.shape[-1],
+        }
+    )
+
+    # Return fake outputs.
+    attn_output = torch.empty_like(torch.einsum("bhld->blhd", query).contiguous())
+    attn_weights = None
+
+    return attn_output, attn_weights
+
+
 def _get_fake_attn_node(num_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype):
-    """Return a fake attn node for the cache initializers."""
+    """Return a fake attn node with correct shape info for the cache initializers."""
     q_fake = fx.Node(
         graph=fx.Graph(),
         name="q_fake",
@@ -149,21 +183,34 @@ class HFReplaceCachedAttn(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        cache_config = factory.get_cache_config()
-        hf_config = gm.factory_model.config
         # TODO:(hg) Hard-coded attn_backend=flashinfer now.
         attn_descriptor = AttentionRegistry.get("flashinfer")
+        model = gm.factory_model
+        cache_config = factory.get_cache_config()
 
-        # Register cached attn in HF.
+        # First, we run a profile to get the number of attns and per-rank kv cache shapes.
+        # We do this to avoid any assumptions about params naming or tp plan of the hf model.
+
+        # Register fake profiler attn.
+        ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", fake_profiler_mha)
+        model.config._attn_implementation = "ad_cached_mha"
+
+        # Add an empty list as attribute for profiler to write to.
+        model.kv_cache_shapes = []
+
+        # Run forward with fake attn and dummy inputs.
+        dummy_input_ids = model.dummy_inputs["input_ids"].to(model.device)
+        model.original_forward(input_ids=dummy_input_ids, factory_model_ptr=model)
+        num_layers = len(model.kv_cache_shapes)
+
+        # Ends profiling, switch back to real attn operator.
         ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", cached_mha_for_hf)
-        gm.factory_model.config._attn_implementation = "ad_cached_mha"
 
-        # Each attn module save their layer idx to find their cache from cm input args later.
-        for layer_idx in range(hf_config.num_hidden_layers):
-            gm.factory_model.model.layers[layer_idx].self_attn._layer_idx = layer_idx
-
+        # Next, we gradually add cm args and build an index_map along the way, to
+        # let each attention layer find their inputs from all cm args.
         cm_args_index_map = {}
-        # cm have 2 inputs by default, input_ids and position_ids.
+
+        # Cm has 2 inputs to start with, input_ids and position_ids.
         num_cm_args = len(cm.args)
         cm_args_index_map["ids_and_position_ids"] = slice(0, num_cm_args)
 
@@ -174,16 +221,19 @@ class HFReplaceCachedAttn(BaseTransform):
         )
         num_cm_args += num_cached_attn_args
 
-        # Add cache and update map
-        dummy_attn_node = _get_fake_attn_node(
-            hf_config.num_attention_heads,
-            hf_config.num_key_value_heads,
-            hf_config.head_dim,
-            gm.factory_model.dtype,
-        )
-        cache_initializers = attn_descriptor.get_cache_initializers(dummy_attn_node, cache_config)
+        # We record kv cache index as a list of slices, one per layer.
         per_layer_kvcache_slice = []
-        for layer_idx in range(hf_config.num_hidden_layers):
+        for layer_idx in range(num_layers):
+            # Allowing each layer to have potentially different kv cache shapes.
+            dummy_attn_node = _get_fake_attn_node(
+                model.kv_cache_shapes[layer_idx]["n_q_heads"],
+                model.kv_cache_shapes[layer_idx]["n_kv_heads"],
+                model.kv_cache_shapes[layer_idx]["head_dim"],
+                model.dtype,
+            )
+            cache_initializers = attn_descriptor.get_cache_initializers(
+                dummy_attn_node, cache_config
+            )
             for k_or_v, get_cache in cache_initializers.items():
                 cm.add_cache(f"{k_or_v}_{layer_idx}", get_cache)
             per_layer_kvcache_slice.append(
@@ -194,7 +244,7 @@ class HFReplaceCachedAttn(BaseTransform):
 
         # Add buffer and update map
         existing_buffers = set()
-        for layer_idx in range(hf_config.num_hidden_layers):
+        for layer_idx in range(num_layers):
             for k, get_buffer in attn_descriptor.get_global_buffer_initializers(
                 dummy_attn_node
             ).items():
@@ -207,14 +257,14 @@ class HFReplaceCachedAttn(BaseTransform):
 
         # prepare get_metadata function
         get_metadata, _ = attn_descriptor.get_prepare_metadata_op()
-        gm.factory_model.get_attn_metadata = partial(get_metadata, page_size=cm.info.page_size)
+        model.get_attn_metadata = partial(get_metadata, page_size=cm.info.page_size)
 
         # Save index map for the module to fetch args from cm input
-        gm.factory_model.cm_args_index_map = cm_args_index_map
+        model.cm_args_index_map = cm_args_index_map
 
         # Finally, we patch the forward method of facotry_model and the whole gm.
-        gm.factory_model.forward = types.MethodType(forward_cached, gm.factory_model)
-        gm.forward = gm.factory_model.forward
+        model.forward = types.MethodType(forward_cached, model)
+        gm.forward = model.forward
 
         # by convention, we say this fake graph module is always clean
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
