@@ -100,71 +100,52 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
     for (int groupId = 0; groupId < numGroups; groupId++)
     {
         int groupStart = laneId * 16 + groupId * (WARP_SIZE * 16);
-        float vecMax;
+        float vecMax = 0.f;
+        float2 raw[8];
 
         if constexpr (std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>)
         {
-            // Conflict-free local 16-element max using 8-lane subgroup reduction.
             using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
             int const numPairs = numElems / 2;
             DType2 const* in2Ptr = reinterpret_cast<DType2 const*>(in);
+            int const pairBase = groupStart >> 1;
 
-            // Base pair-index for this WARP_SIZE*16 group.
-            int const groupBasePairs = (groupId * (WARP_SIZE * 16)) >> 1;
-            int const subgroupId = laneId >> 3; // 0..3
-            int const laneInGroup = laneId & 7; // 0..7
-            unsigned const subgroupMask = 0xFFu << (subgroupId * 8);
-
-            float laneVecMax = 0.f;
 #pragma unroll
-            for (int phase = 0; phase < 8; ++phase)
+            for (int i = 0; i < 8; ++i)
             {
-                // Each lane loads one pair for destination lane (subgroupId*8 + phase) at index r = laneInGroup.
-                // Each subgroup (32 lanes -> 4 subgroups of 8) handles its own 64-pair region.
-                // For destination lane L = subgroupId*8 + phase, the r-th pair (r = laneInGroup) is at:
-                // pairIdx = groupBasePairs + L*8 + r = groupBasePairs + (subgroupId*8 + phase)*8 + laneInGroup.
-                int const pairIdx = groupBasePairs + ((subgroupId << 3) + phase) * 8 + laneInGroup;
-
-                float pairMax = 0.f;
-                if (pairIdx < numPairs)
+                int const pi = pairBase + i;
+                if (pi < numPairs)
                 {
-                    DType2 v2 = in2Ptr[pairIdx];
-                    // Max of the two values in the pair (in magnitude), then cast to float
-                    DType2 const v2abs = tensorrt_llm::common::cuda_abs(v2);
-                    DType const pairMaxD = tensorrt_llm::common::cuda_max<DType, DType2>(v2abs);
-                    pairMax = tensorrt_llm::common::cuda_cast<float>(pairMaxD);
+                    DType2 v2 = in2Ptr[pi];
+                    float x = tensorrt_llm::common::cuda_cast<float>(v2.x);
+                    float y = tensorrt_llm::common::cuda_cast<float>(v2.y);
+                    raw[i] = make_float2(x, y);
+                    vecMax = fmaxf(vecMax, fmaxf(fabsf(x), fabsf(y)));
                 }
-
-                // Reduce within the 8-lane subgroup to get max across all 8 pairs for the destination lane.
-#pragma unroll
-                for (int off = 4; off > 0; off >>= 1)
+                else
                 {
-                    float const other = __shfl_xor_sync(subgroupMask, pairMax, off);
-                    pairMax = fmaxf(pairMax, other);
-                }
-
-                // Only the destination lane of this phase records the result.
-                if (laneInGroup == phase)
-                {
-                    laneVecMax = fmaxf(laneVecMax, pairMax);
+                    raw[i] = make_float2(0.0f, 0.0f);
                 }
             }
-            vecMax = laneVecMax;
         }
         else
         {
-            float localMax = 0.f;
 #pragma unroll
-            for (int t = 0; t < 16; ++t)
+            for (int i = 0; i < 8; ++i)
             {
-                int idx = groupStart + t;
+                int idx = groupStart + (i << 1);
                 if (idx < numElems)
                 {
-                    float v = tensorrt_llm::common::cuda_cast<float>(in[idx]);
-                    localMax = fmaxf(localMax, fabsf(v));
+                    float x = tensorrt_llm::common::cuda_cast<float>(in[idx]);
+                    float y = (idx + 1 < numElems) ? tensorrt_llm::common::cuda_cast<float>(in[idx + 1]) : 0.0f;
+                    raw[i] = make_float2(x, y);
+                    vecMax = fmaxf(vecMax, fmaxf(fabsf(x), fabsf(y)));
+                }
+                else
+                {
+                    raw[i] = make_float2(0.0f, 0.0f);
                 }
             }
-            vecMax = localMax;
         }
 
         // SF from vecMax and global scale; write as E4M3
@@ -175,22 +156,12 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
             ? reciprocal_approximate_ftz(SFValueNarrow * reciprocal_approximate_ftz(SFScaleVal))
             : 0.0f;
 
-        // Pack 16 values -> 8 bytes e2m1
+        // Pack 16 values -> 8 bytes e2m1 (use raw[] read above to avoid a second shared-memory read)
         float2 fp2Vals[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i)
         {
-            int idx = groupStart + (i << 1);
-            if (idx < numElems)
-            {
-                float x = tensorrt_llm::common::cuda_cast<float>(in[idx]) * outputScale;
-                float y = tensorrt_llm::common::cuda_cast<float>(in[idx + 1]) * outputScale;
-                fp2Vals[i] = make_float2(x, y);
-            }
-            else
-            {
-                fp2Vals[i] = make_float2(0.0f, 0.0f);
-            }
+            fp2Vals[i] = make_float2(raw[i].x * outputScale, raw[i].y * outputScale);
         }
         uint64_t const e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
 
