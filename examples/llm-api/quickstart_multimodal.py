@@ -4,8 +4,9 @@ import os
 
 from quickstart_advanced import add_llm_args, setup_llm
 
-from tensorrt_llm.inputs import (ALL_SUPPORTED_MULTIMODAL_MODELS,
-                                 default_multimodal_input_loader)
+from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 example_medias_and_prompts = {
     "image": {
@@ -55,20 +56,43 @@ example_medias_and_prompts = {
             "Describe the scene in the image briefly.",
             "",
         ]
-    }
+    },
+    "multiple_image": {
+        "media": [
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+            "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+        ],
+        "prompt": ["Describe the difference between the two images."],
+    },
+    "mixture_text_image": {
+        "media": [
+            [],
+            [
+                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png"
+            ],
+        ],
+        "prompt": [
+            "Who invented the internet?",
+            "Describe the scene in the image briefly.",
+        ],
+    },
 }
 
 
 def add_multimodal_args(parser):
-    parser.add_argument("--model_type",
-                        type=str,
-                        choices=ALL_SUPPORTED_MULTIMODAL_MODELS,
-                        help="Model type.")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types(),
+        help="Model type as specified in the HuggingFace model config.")
     parser.add_argument("--modality",
                         type=str,
-                        choices=["image", "video", "audio", "image_audio"],
+                        choices=[
+                            "image", "video", "audio", "image_audio",
+                            "multiple_image", "mixture_text_image"
+                        ],
                         default="image",
-                        help="Media type.")
+                        help="Media type being used for inference.")
     parser.add_argument("--media",
                         type=str,
                         nargs="+",
@@ -82,6 +106,22 @@ def add_multimodal_args(parser):
                         choices=["pt", "pil"],
                         default="pt",
                         help="The format of the image.")
+    parser.add_argument("--device",
+                        type=str,
+                        default="cpu",
+                        help="The device to have the input on.")
+    parser.add_argument(
+        "--custom_module_dirs",
+        type=str,
+        nargs="+",
+        default=None,
+        help=
+        ("Paths to an out-of-tree model directory which should be imported."
+         " This is useful to load a custom model. The directory should have a structure like:"
+         " <model_name>"
+         " ├── __init__.py"
+         " ├── <model_name>.py"
+         " └── <sub_dirs>"))
     return parser
 
 
@@ -114,11 +154,15 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    # set prompts and media to example prompts and images if they are not provided
-    if args.prompt is None:
-        args.prompt = example_medias_and_prompts[args.modality]["prompt"]
-    if args.media is None:
-        args.media = example_medias_and_prompts[args.modality]["media"]
+    if args.custom_module_dirs is not None:
+        for custom_module_dir in args.custom_module_dirs:
+            try:
+                import_custom_module_from_dir(custom_module_dir)
+            except Exception as e:
+                print(
+                    f"Failed to import custom module from {custom_module_dir}: {e}"
+                )
+                raise e
 
     lora_config = None
     if args.load_lora:
@@ -127,6 +171,9 @@ def main():
         models_module = importlib.import_module('tensorrt_llm._torch.models')
         model_class = getattr(models_module, args.auto_model_name)
         lora_config = model_class.lora_config(args.model_dir)
+        # For stability - explicitly set the LoRA GPU cache & CPU cache to have space for 2 adapters
+        lora_config.max_loras = 2
+        lora_config.max_cpu_loras = 2
 
     llm, sampling_params = setup_llm(args, lora_config=lora_config)
 
@@ -135,19 +182,26 @@ def main():
         model_type = args.model_type
     else:
         model_type = json.load(
-            open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
-    assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
+            open(os.path.join(str(llm._hf_model_dir),
+                              'config.json')))['model_type']
+    assert model_type in MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types(), \
+        f"Unsupported model_type: {model_type} found!\n" \
+        f"Supported types: {MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()}"
 
-    device = "cpu"
+    # set prompts and media to example prompts and images if they are not provided
+    if args.prompt is None:
+        args.prompt = example_medias_and_prompts[args.modality]["prompt"]
+    if args.media is None:
+        args.media = example_medias_and_prompts[args.modality]["media"]
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
-                                             model_dir=llm._hf_model_dir,
+                                             model_dir=str(llm._hf_model_dir),
                                              model_type=model_type,
                                              modality=args.modality,
                                              prompts=args.prompt,
                                              media=args.media,
                                              image_data_format=image_format,
                                              num_frames=args.num_frames,
-                                             device=device)
+                                             device=args.device)
 
     lora_request = None
     if args.load_lora:

@@ -29,7 +29,8 @@ class Phi3Attention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-
+        # Pass max_seq_len to config for LongRoPE.
+        config.max_seq_len = model_config.max_seq_len
         rope_params = RopeParams.from_config(config)
         super().__init__(
             hidden_size=config.hidden_size,
@@ -66,6 +67,7 @@ class Phi3DecoderLayer(DecoderLayer):
             bias=False,
             dtype=config.torch_dtype,
             config=model_config,
+            layer_idx=layer_idx,
         )
 
         self.input_layernorm = RMSNorm(
@@ -107,7 +109,11 @@ class Phi3DecoderLayer(DecoderLayer):
         # Fully connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, **kwargs)
+        hidden_states = self.mlp(
+            hidden_states,
+            lora_params=lora_params,
+            **kwargs,
+        )
         return hidden_states, residual
 
 
@@ -216,31 +222,42 @@ class Phi3ForCausalLM(DecoderModelForCausalLM[Phi3Model, Phi3Config]):
                                               num_kv_heads * head_dim, :]
                         v_weight = qkv_weight[hidden_size +
                                               num_kv_heads * head_dim:, :]
-                        module.load_weights(weights=[
-                            {
-                                'weight': q_weight
-                            },
-                            {
-                                'weight': k_weight
-                            },
-                            {
-                                'weight': v_weight
-                            },
-                        ])
+
+                        # Get the scale factor for the fused QKV projection
+                        qkv_scale = module_weights.get('weight_scale', None)
+
+                        q_dict = {'weight': q_weight}
+                        if qkv_scale is not None:
+                            q_dict['weight_scale'] = qkv_scale
+
+                        k_dict = {'weight': k_weight}
+                        if qkv_scale is not None:
+                            k_dict['weight_scale'] = qkv_scale  # Use same scale
+
+                        v_dict = {'weight': v_weight}
+                        if qkv_scale is not None:
+                            v_dict['weight_scale'] = qkv_scale  # Use same scale
+
+                        module.load_weights(weights=[q_dict, k_dict, v_dict])
                     elif "mlp.gate_up_proj" in name:
                         # The weights need to be split correctly before sharding to support tp_size >1.
                         intermediate_size = self.config.intermediate_size
                         gate_up_weight = module_weights['weight'][:]
                         gate_weight = gate_up_weight[:intermediate_size, :]
                         up_weight = gate_up_weight[intermediate_size:, :]
-                        module.load_weights(weights=[
-                            {
-                                'weight': gate_weight
-                            },
-                            {
-                                'weight': up_weight
-                            },
-                        ])
+
+                        # Get the scale factors if they exist
+                        gate_up_scale = module_weights.get('weight_scale', None)
+
+                        gate_dict = {'weight': gate_weight}
+                        if gate_up_scale is not None:
+                            gate_dict['weight_scale'] = gate_up_scale
+
+                        up_dict = {'weight': up_weight}
+                        if gate_up_scale is not None:
+                            up_dict['weight_scale'] = gate_up_scale
+
+                        module.load_weights(weights=[gate_dict, up_dict])
                     else:
                         module.load_weights(weights=[module_weights])
                 else:

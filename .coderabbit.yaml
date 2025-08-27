@@ -20,7 +20,7 @@ language: "en-US"
 reviews:
   profile: chill
   auto_title_placeholder: '@coderabbitai title'
-  auto_title_instructions: 'Should follow the format: "[fix/feat/doc/infra/...] \<summary of this PR\>". Keep it concise.'
+  auto_title_instructions: 'Format: "[<category>] <title>". Category must be one of: fix, feat, doc, infra, style, refactor, perf, test, chore, revert. Enclose the category in square brackets. Title should be concise (<= 60 chars). Example: "[feat] Add logit_bias support".'
   commit_status: false
   collapse_walkthrough: true
   assess_linked_issues: true
@@ -28,7 +28,6 @@ reviews:
   related_prs: true
   suggested_labels: true
   suggested_reviewers: true
-  auto_assign_reviewers: true
   poem: false
   auto_review:
     drafts: true

@@ -18,8 +18,48 @@ import sys
 
 import pytest
 import torch
-from _torch.helpers import calc_diff, per_block_cast_to_fp8
+from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
+                            per_block_cast_to_fp8_e8m0)
 from utils.util import getSMVersion
+
+from tensorrt_llm._torch.autotuner import autotune
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 100,
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+     (2048, 7168), (1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128, 4096],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype)
+    b = torch.randn((n, k), device='cuda', dtype=dtype)
+
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
+
+    output_expected = a @ b.t()
+
+    with autotune():
+        output = torch.ops.trtllm.fp8_swap_ab_gemm(
+            a,
+            act_b_fp8,
+            act_b_sf,
+        )
+
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-2
 
 
 @pytest.mark.skipif(

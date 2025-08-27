@@ -92,8 +92,11 @@ MODEL_PATH_DICT = {
     "mistral_7b_v0.1": "mistral-7b-v0.1",
     "ministral_8b": "Ministral-8B-Instruct-2410",
     "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
+    "gemma_3_1b_it": "gemma/gemma-3-1b-it",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
+    "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
+    "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
     "qwen2_7b_instruct": "Qwen2-7B-Instruct",
@@ -124,6 +127,7 @@ MODEL_PATH_DICT = {
     "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
     "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
+    "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -153,6 +157,7 @@ HF_MODEL_PATH = {
     "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
     "flan_t5_base_hf": "google/flan-t5-small",
     "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
+    "gemma_3_1b_it_hf": "google/gemma-3-1b-it",
 }
 LORA_MODEL_PATH = {
     "llama_v2_13b":
@@ -163,6 +168,8 @@ LORA_MODEL_PATH = {
     "lora/llama-3-chinese-8b-instruct-v2-lora/",
     "ministral_8b":
     "lora/ministral/Ministral-8B-Instruct-2410-Loras-Dummy",  # Dummy LoRA for Ministral
+    "gemma_3_1b_it":
+    "lora/gemma/gemma-3-1b-it-dummy-lora",  # Dummy LoRA for Gemma-3-1B-Instruct
     "phi_4_multimodal_instruct_image":
     "multimodals/Phi-4-multimodal-instruct/vision-lora",
     "phi_4_multimodal_instruct_audio":
@@ -259,6 +266,8 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Average time-to-first-token \[TTFT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
     re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
+    PerfMetricType.KV_CACHE_SIZE:
+    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
 }
 # (Relative threshold, Absolute threshold) for all metric types
 PERF_METRIC_THRESHOLD = {
@@ -318,6 +327,7 @@ BENCH_INFERENCE_METRICS = [
     PerfMetricType.INFERENCE_TIME,
     PerfMetricType.TOKEN_THROUGHPUT,
     PerfMetricType.SEQ_THROUGHPUT,
+    PerfMetricType.KV_CACHE_SIZE,
 ]
 
 
@@ -370,6 +380,7 @@ class PerfTestConfig:
         num_reqs: int = 512,
         concurrency: int = -1,
         quantization: str = "",
+        kv_cache_free_gpu_mem_fraction: float = 0.9,
         kv_cache_dtype: str = "auto",
         ep_size: int = None,
         tp_size: int = 1,
@@ -414,6 +425,8 @@ class PerfTestConfig:
         self.concurrency = concurrency
         # Quantization type.
         self.quantization = quantization
+        # KV cache free gpu mem fraction
+        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
         # KV Cache dtype
         self.kv_cache_dtype = kv_cache_dtype
         # Multiple Profiles
@@ -470,6 +483,10 @@ class PerfTestConfig:
 
         # Add Max number of tokens.
         entries.append(f"maxnt:{self.max_num_tokens}")
+
+        # Add kv cache free gpu mem fraction.
+        if self.kv_cache_free_gpu_mem_fraction != 0.9:
+            entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
 
         if self.build_only:
             entries.append(f"build_only")
@@ -579,6 +596,10 @@ class PerfTestConfig:
 
         if labels[0].startswith("maxnt"):
             self.max_num_tokens = int(labels.pop(0).replace("maxnt:", ""))
+
+        if labels[0].startswith("kv_frac"):
+            self.kv_cache_free_gpu_mem_fraction = float(
+                labels.pop(0).replace("kv_frac:", ""))
 
         if labels[0] == "build_only":
             self.build_only = True
@@ -986,7 +1007,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def get_trtllm_bench_build_command(self, engine_dir) -> list:
         model_dir = self.get_trtllm_bench_model()
-        dataset_path = os.path.join(engine_dir, "synthetic_data.json")
         if model_dir == "":
             pytest.skip("Model Name is not supported by trtllm-bench")
         model_name = self._config.model_name
@@ -996,13 +1016,19 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         build_cmd = [
             self._build_script, f"--log_level=info",
             f"--workspace={engine_dir}", f"--model={hf_model_name}",
-            f"--model_path={model_dir}", "build", f"--dataset={dataset_path}",
+            f"--model_path={model_dir}", "build",
             f"--tp_size={self._config.tp_size}",
             f"--pp_size={self._config.pp_size}"
         ]
         max_seq_len = max(self._config.input_lens) + max(
             self._config.output_lens)
         build_cmd.append(f"--max_seq_len={max_seq_len}")
+        # Add max_batch_size and max_num_tokens to ensure build matches runtime configuration
+        # Note: trtllm-bench requires both to be specified together (option group constraint)
+        assert self._config.max_batch_size > 0, f"max_batch_size must be > 0, got {self._config.max_batch_size}"
+        assert self._config.max_num_tokens > 0, f"max_num_tokens must be > 0, got {self._config.max_num_tokens}"
+        build_cmd.append(f"--max_batch_size={self._config.max_batch_size}")
+        build_cmd.append(f"--max_num_tokens={self._config.max_num_tokens}")
         if self._config.quantization:
             build_cmd.append(
                 f"--quantization={self._config.quantization.upper()}")
@@ -1240,6 +1266,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--max_batch_size={self._config.max_batch_size}",
             f"--max_num_tokens={self._config.max_num_tokens}",
             f"--report_json={report_path}",
+            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
         ]
         if self._config.backend != "pytorch":
             benchmark_cmd += [

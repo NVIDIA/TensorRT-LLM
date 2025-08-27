@@ -12,7 +12,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationExecutorProxy
 from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
@@ -274,9 +274,6 @@ def test_llama_7b_multi_lora_tp2():
         enable_lora=True,
         build_config=BuildConfig(lora_config=lora_config),
         fast_build=True,
-        max_lora_rank=lora_config.max_lora_rank,
-        max_loras=lora_config.max_loras,
-        max_cpu_loras=lora_config.max_cpu_loras,
         kv_cache_config=global_kv_cache_config)
 
 
@@ -466,7 +463,7 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=2)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=2)
 
 
 def test_llm_with_postprocess_parallel_tp2():

@@ -41,10 +41,6 @@ class PromptConfig(BaseModel):
             "In simple words and in a single sentence, explain the concept of gravity: ",
             "How to fix slicing in golf? ",
             "Where is the capital of Iceland? ",
-            "How big is the universe? ",
-            "In simple words and in a single sentence, explain the concept of gravity: ",
-            "How to fix slicing in golf? ",
-            "Where is the capital of Iceland? ",
         ]
     )
     sp_kwargs: Dict[str, Any] = Field(

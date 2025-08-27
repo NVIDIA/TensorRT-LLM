@@ -15,6 +15,7 @@ from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..transformations._graph import canonicalize_graph, lift_to_meta
 from ..utils.logger import ad_logger
+from ..utils.sharding_utils import ShardingConfig
 
 
 class TransformError(Exception):
@@ -45,6 +46,15 @@ class Stages(Enum):
         if self.__class__ is other.__class__:
             return list(self.__class__).index(self) < list(other.__class__).index(other)
         return NotImplemented
+
+
+class SharedConfig(BaseModel):
+    """Global config shared between multiple transforms in the inference optimizer."""
+
+    sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
+    local_rank: int = Field(default=0)
+    world_size: int = Field(default=1)
+    attn_backend: str = Field(default="flashinfer", description="The attention backend to use.")
 
 
 class TransformConfig(BaseModel):
@@ -190,7 +200,11 @@ class BaseTransform(ABC):
 
     @final
     def __call__(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> GraphModule:
         """Apply the transform to the graph.
 
@@ -198,6 +212,7 @@ class BaseTransform(ABC):
             gm: The graph module to apply the transform to.
             cm: The cached sequence interface defining the sequence interface.
             factory: The model factory used to build the model.
+            shared_config: Global info shared between multiple transforms.
 
         Returns:
             GraphModule: The transformed graph module.
@@ -227,18 +242,26 @@ class BaseTransform(ABC):
         # run or skip the transform
         if self.config.enabled:
             # run graph pre-cleanup
-            self._run_pre_cleanup(gm, info_last)
+            is_clean_pre, has_valid_shapes_pre = self._run_pre_cleanup(gm, info_last)
 
-            # run the transform in a error-handling wrapper
-            try:
-                gm, info = self._apply(gm, cm, factory)
-            except Exception as e:
-                error_msg = f"Transform {t_name} failed"
-                if self.config.skip_on_error:
+            # run the transform in a error-handling wrapper if desired
+            if self.config.skip_on_error:
+                try:
+                    gm, info = self._apply(gm, cm, factory, shared_config)
+                except Exception as e:
+                    error_msg = f"Transform {t_name} failed"
                     ad_logger.warning(f"{error_msg}: {e}")
                     info = TransformInfo(skipped=True, num_matches=0)
-                else:
-                    raise TransformError(error_msg) from e
+            else:
+                # handle this here normally to improve debugging and error message
+                gm, info = self._apply(gm, cm, factory, shared_config)
+
+            # we cannot say it's clean if the previous wasn't clean even if this one is
+            # create new info object with updated cleanup status
+            info_dict = info.model_dump()
+            info_dict["is_clean"] &= is_clean_pre
+            info_dict["has_valid_shapes"] &= has_valid_shapes_pre
+            info = TransformInfo(**info_dict)
 
             # run graph post-cleanup
             info = self._run_post_cleanup(gm, info)
@@ -263,7 +286,10 @@ class BaseTransform(ABC):
         # update + store new meta data
         history[t_name] = info
         autodeploy_meta[self._history_key] = history
-        self._set_autodeploy_meta(gm, autodeploy_meta)
+
+        if isinstance(gm, GraphModule):
+            # After compilation, gm becomes type CapturedGraph with no meta data.
+            self._set_autodeploy_meta(gm, autodeploy_meta)
 
         # return the graph module
         return gm
@@ -279,20 +305,37 @@ class BaseTransform(ABC):
         gm.meta[self._autodeploy_meta_key] = autodeploy_meta
 
     @final
-    def _run_pre_cleanup(self, gm: GraphModule, info: TransformInfo) -> None:
+    def _run_pre_cleanup(self, gm: GraphModule, info: TransformInfo) -> Tuple[bool, bool]:
         """Run graph cleanup before the transform.
+
+        Args:
+            gm: The graph module to run cleanup on.
+            info: The last transform info.
+
+        Returns:
+            A tuple of (is_clean, has_valid_shapes) indicating the cleanup status after the
+            pre-cleanup.
 
         This is used to ensure the transform is applied to a clean graph as needed by the transform.
         """
         if not self.config.requires_clean_graph:
-            return
+            return info.is_clean, info.has_valid_shapes
+
+        is_clean = info.is_clean
+        has_valid_shapes = is_clean and info.has_valid_shapes
 
         # check if run cleanup depending on the config and info
-        if self.config.requires_shape_prop and not (info.is_clean and info.has_valid_shapes):
+        if self.config.requires_shape_prop and not has_valid_shapes:
+            canonicalize_graph(gm)
             with lift_to_meta(gm):
                 canonicalize_graph(gm, shape_prop=True)
-        elif self.config.requires_clean_graph and not info.is_clean:
+            is_clean = True
+            has_valid_shapes = True
+        elif self.config.requires_clean_graph and not is_clean:
             canonicalize_graph(gm)
+            is_clean = True
+
+        return is_clean, has_valid_shapes
 
     @final
     def _run_post_cleanup(self, gm: GraphModule, info: TransformInfo) -> TransformInfo:
@@ -309,6 +352,7 @@ class BaseTransform(ABC):
 
         # check if run cleanup depending on the config and info
         if self.config.run_shape_prop and not (info.is_clean and info.has_valid_shapes):
+            canonicalize_graph(gm)
             with lift_to_meta(gm):
                 canonicalize_graph(gm, shape_prop=True)
         elif self.config.run_graph_cleanup and not info.is_clean:
@@ -322,7 +366,11 @@ class BaseTransform(ABC):
 
     @abstractmethod
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Apply the transform to the graph.
 

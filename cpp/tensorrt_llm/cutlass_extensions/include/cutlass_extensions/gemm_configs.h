@@ -133,11 +133,6 @@ enum class CutlassTileConfigSM100
     CtaShape128x256x128B,
     CtaShape128x128x256B,
     CtaShape128x256x256B,
-
-    // M=256
-    CtaShape256x64x128B,
-    CtaShape256x128x128B,
-    CtaShape256x256x128B,
 };
 
 enum class CutlassTileConfigSM120
@@ -438,6 +433,14 @@ struct CutlassGemmConfig
     int sm_version = 80; // Use 80 as a catch all for <90
     bool is_tma_warp_specialized = false;
 
+    enum class EpilogueFusionType : int
+    {
+        NONE,
+        FINALIZE
+    };
+
+    EpilogueFusionType epilogue_fusion_type = EpilogueFusionType::NONE;
+
     CutlassGemmConfig() = default;
 
     CutlassGemmConfig(CutlassTileConfig tile_config, SplitKStyle split_k_style, int split_k_factor, int stages)
@@ -507,7 +510,8 @@ struct CutlassGemmConfig
                    << "\n\tsm: " << sm_version << "\n\ttile shape ID: " << getTileConfigAsInt()
                    << "\n\tcluster shape ID: " << (int) cluster_shape
                    << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule
-                   << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
+                   << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false")
+                   << "\n\tepilogue fusion type: " << (int) epilogue_fusion_type;
         }
         else if (tile_config_sm80 != tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic)
         {
@@ -539,7 +543,8 @@ inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& conf
             << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
             << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
             << ", cluster_shape_enum: " << int(config.cluster_shape)
-            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
+            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false")
+            << ", epilogue_fusion_type: " << int(config.epilogue_fusion_type);
     }
     else
     {

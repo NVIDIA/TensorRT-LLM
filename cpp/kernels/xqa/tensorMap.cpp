@@ -58,12 +58,23 @@ CUtensorMap makeTensorMapForPagedKVCache(void const* addr, CUtensorMapDataType_e
 {
     CUtensorMap tensorMap{};
     uint32_t elemBytes = getElemBytes(dataType);
+// VLLM Layout
+#if PAGED_KV_CACHE_LAYOUT == 1
+    uint64_t const globalDims[] = {headElems, nbKHeads, tokensPerPage, 1U << 31};
+    uint32_t const headBytes = elemBytes * headElems;
+    uint64_t const globalStrides[] = {headBytes, headBytes * nbKHeads, headBytes * nbKHeads * tokensPerPage};
+    uint32_t const partBytes = partElems * elemBytes;
+    uint32_t const boxDims[] = {partElems, 1, mha::min(tokensPerPage, nbTokensPerTile), 1};
+    uint32_t const elemStrides[] = {1, 1, 1, 1};
+    // XQA Original Layout
+#else
     uint64_t const globalDims[] = {headElems, tokensPerPage, nbKHeads, 1U << 31};
     uint32_t const headBytes = elemBytes * headElems;
     uint64_t const globalStrides[] = {headBytes, headBytes * tokensPerPage, headBytes * tokensPerPage * nbKHeads};
     uint32_t const partBytes = partElems * elemBytes;
     uint32_t const boxDims[] = {partElems, mha::min(tokensPerPage, nbTokensPerTile), 1, 1};
     uint32_t const elemStrides[] = {1, 1, 1, 1};
+#endif
 
     auto const swizzle = [&]
     {

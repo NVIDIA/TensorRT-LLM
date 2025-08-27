@@ -48,10 +48,10 @@ CONFIG_LINUX_AARCH64 = "linux_aarch64"
 def CONFIG_LINUX_AARCH64_LLVM = "linux_aarch64_LLVM"
 
 @Field
-def CONFIG_LINUX_X86_64_NANOBIND = "linux_x86_64_Nanobind"
+def CONFIG_LINUX_X86_64_PYBIND = "linux_x86_64_Pybind"
 
 @Field
-def CONFIG_LINUX_AARCH64_NANOBIND = "linux_aarch64_Nanobind"
+def CONFIG_LINUX_AARCH64_PYBIND = "linux_aarch64_Pybind"
 
 @Field
 def BUILD_CONFIGS = [
@@ -62,9 +62,9 @@ def BUILD_CONFIGS = [
     (TARNAME) : "TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
-  (CONFIG_LINUX_X86_64_NANOBIND) : [
-    (WHEEL_EXTRA_ARGS) : "--binding_type nanobind --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
-    (TARNAME) : "nanobind-TensorRT-LLM.tar.gz",
+  (CONFIG_LINUX_X86_64_PYBIND) : [
+    (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
+    (TARNAME) : "pybind-TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
@@ -82,9 +82,9 @@ def BUILD_CONFIGS = [
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
-  (CONFIG_LINUX_AARCH64_NANOBIND): [
-    (WHEEL_EXTRA_ARGS) : "--binding_type nanobind --extra-cmake-vars WARNING_IS_ERROR=ON",
-    (TARNAME) : "nanobind-TensorRT-LLM-GH200.tar.gz",
+  (CONFIG_LINUX_AARCH64_PYBIND): [
+    (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars WARNING_IS_ERROR=ON",
+    (TARNAME) : "pybind-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
@@ -446,7 +446,9 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     // Build tritonserver artifacts
     def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
     // TODO: Remove after the cmake version is upgraded to 3.31.8
-    sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=r25.05 -DTRITON_CORE_REPO_TAG=r25.05 -DTRITON_THIRD_PARTY_REPO_TAG=r25.05 -DTRITON_BACKEND_REPO_TAG=r25.05 -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
+    // Get triton tag from docker/dockerfile.multi
+    def tritonShortTag = sh(script: "${LLM_ROOT}/jenkins/scripts/get_triton_tag.sh ${LLM_ROOT}", returnStdout: true).trim()
+    sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=${tritonShortTag} -DTRITON_CORE_REPO_TAG=${tritonShortTag} -DTRITON_THIRD_PARTY_REPO_TAG=${tritonShortTag} -DTRITON_BACKEND_REPO_TAG=${tritonShortTag} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
 
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
@@ -460,6 +462,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "mkdir -p TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/bertBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/gptManagerBenchmark TensorRT-LLM/benchmarks/cpp"
+    sh "cp ${LLM_ROOT}/cpp/build/benchmarks/disaggServerBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
 
@@ -539,8 +542,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
-        "Build TRT-LLM Nanobind": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_NANOBIND : CONFIG_LINUX_X86_64_NANOBIND),
+        "Build TRT-LLM Pybind": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
+            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_PYBIND : CONFIG_LINUX_X86_64_PYBIND),
     ]
 
     if (cpu_arch == X86_64_TRIPLE) {

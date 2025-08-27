@@ -2,11 +2,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modules.fused_moe import (DefaultMoeRoutingMethod,
-                                                   LoadBalancedMoeRoutingMethod,
-                                                   RenormalizeMoeRoutingMethod,
-                                                   SparseMixerMoeRoutingMethod,
-                                                   StaticMoeRoutingMethod)
+from tensorrt_llm._torch.modules.fused_moe import (
+    DefaultMoeRoutingMethod, LoadBalancedMoeRoutingMethod,
+    RenormalizeMoeRoutingMethod, SparseMixerMoeRoutingMethod,
+    StaticMoeRoutingMethod, create_renormalize_expert_load_balanced_logits)
 
 
 # Test DefaultMoeRoutingMethod with different top_k values
@@ -169,34 +168,96 @@ def test_load_balanced_moe_routing():
 def test_static_moe_routing():
     routing = StaticMoeRoutingMethod(
         torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32).cuda())
-    assert routing.experts_per_token == 4
+    with torch.device('cpu'):
+        assert routing.experts_per_token == 4
 
-    logits = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
-                          dtype=torch.float32).cuda()
+        logits = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
+                              dtype=torch.float32).cuda()
+        indices, scales = routing.apply(logits)
+        indices = indices.cpu()
+
+        assert scales is None
+        assert indices.shape == (2, 4)
+        assert indices.dtype == torch.int32
+
+        assert torch.equal(
+            indices,
+            torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32))
+
+        routing = StaticMoeRoutingMethod(
+            torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]],
+                         dtype=torch.int32).cuda(),
+            torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
+                         dtype=torch.float32).cuda())
+        indices, scales = routing.apply(logits)
+        scales = scales.cpu()
+
+        assert scales is not None
+        assert scales.shape == (2, 4)
+        assert scales.dtype == torch.float32
+        assert torch.equal(
+            scales,
+            torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
+                         dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "num_tokens,expected_assignments,description",
+    [(3, [2, 2, 1, 1],
+      "3 tokens - slight imbalance due to total work not divisible by EP size"),
+     (4, [2, 2, 2, 2], "4 tokens - perfect balance"),
+     (32, [16, 16, 16, 16], "32 tokens - large batch with perfect balance")])
+def test_renormalize_expert_load_balanced_logits(num_tokens,
+                                                 expected_assignments,
+                                                 description):
+    """Test GPU load balancing with RenormalizeMoeRoutingMethod across different token counts."""
+    # Test parameters (consistent across all test cases)
+    num_experts = 8
+    experts_per_token = 2
+    moe_ep_size = 4
+    device = torch.device('cuda')
+
+    # Generate expert load balanced logits using the utility function directly
+    logits = create_renormalize_expert_load_balanced_logits(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        experts_per_token=experts_per_token,
+        moe_ep_size=moe_ep_size,
+        device=device,
+        dtype=torch.float32)
+
+    # Use RenormalizeMoeRoutingMethod to get expert assignments
+    routing = RenormalizeMoeRoutingMethod(top_k=experts_per_token)
     indices, scales = routing.apply(logits)
-    indices = indices.cpu()
 
-    assert scales is None
-    assert indices.shape == (2, 4)
-    assert indices.dtype == torch.int32
+    # Verify shapes
+    assert indices.shape == (num_tokens, experts_per_token)
+    assert scales.shape == (num_tokens, experts_per_token)
 
-    assert torch.equal(
-        indices, torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32))
+    # Count expert assignments per GPU
+    # GPU 0: experts [0, 1], GPU 1: experts [2, 3], GPU 2: experts [4, 5], GPU 3: experts [6, 7]
+    gpu_assignments = [0, 0, 0, 0]  # Count for each GPU
+    experts_per_gpu = num_experts // moe_ep_size  # = 2
 
-    routing = StaticMoeRoutingMethod(
-        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32).cuda(),
-        torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
-                     dtype=torch.float32).cuda())
-    indices, scales = routing.apply(logits)
-    scales = scales.cpu()
+    indices_flat = indices.view(-1).cpu()
+    for expert_idx in indices_flat:
+        gpu_id = expert_idx.item() // experts_per_gpu
+        gpu_assignments[gpu_id] += 1
 
-    assert scales is not None
-    assert scales.shape == (2, 4)
-    assert scales.dtype == torch.float32
-    assert torch.equal(
-        scales,
-        torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
-                     dtype=torch.float32))
+    # Verify total assignments and expected distribution
+    total_expected = num_tokens * experts_per_token
+    assert sum(
+        gpu_assignments
+    ) == total_expected, f"Total assignments mismatch for {description}"
+
+    # For cases where perfect balance isn't possible, check sorted equality
+    # For perfect balance cases, check exact equality
+    if len(set(expected_assignments)
+           ) == 1:  # All values are the same (perfect balance)
+        assert gpu_assignments == expected_assignments, f"Perfect balance expected for {description}"
+    else:  # Slight imbalance expected
+        assert sorted(gpu_assignments) == sorted(
+            expected_assignments), f"Load balance failed for {description}"
 
 
 if __name__ == '__main__':

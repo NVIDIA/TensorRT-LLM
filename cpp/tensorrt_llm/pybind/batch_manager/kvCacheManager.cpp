@@ -299,7 +299,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_readwrite("reused_blocks", &tbk::KvCacheStats::reusedBlocks)
         .def_readwrite("missed_blocks", &tbk::KvCacheStats::missedBlocks)
         .def_readwrite("cache_hit_rate", &tbk::KvCacheStats::cacheHitRate)
-        .def_readwrite("num_free_blocks_per_window_size", &tbk::KvCacheStats::numFreeBlocksPerWindowSize);
+        .def_readwrite("num_free_blocks_per_window_size", &tbk::KvCacheStats::numFreeBlocksPerWindowSize)
+        .def_readonly("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
 
     py::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
         .def(py::init<>())
@@ -321,7 +322,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_static("hash", &tbk::BlockKeyHasher::hash, py::arg("block_key"), py::arg("parent_hash") = 0);
 
     py::class_<tbk::KVCacheEventManager, std::shared_ptr<tbk::KVCacheEventManager>>(m, "KVCacheEventManager")
-        .def(py::init<size_t>(), py::arg("max_kv_event_entries"));
+        .def(py::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),
+            py::arg("max_kv_event_entries"), py::arg("attention_dp_rank") = std::nullopt,
+            py::arg("attention_dp_size") = std::nullopt, py::arg("attention_dp_events_gather_period_ms") = 5);
 
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),

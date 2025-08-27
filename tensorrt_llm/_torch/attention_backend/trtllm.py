@@ -2,17 +2,18 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..utils import (Fp4QuantizedTensor, compute_swizzled_sf_shape,
-                     get_global_attrs, get_model_extra_attrs)
+from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
+                     get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
@@ -23,6 +24,7 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
 class TrtllmAttentionWrapper:
     sequence_length: torch.Tensor
     host_past_key_value_lengths: torch.Tensor
+    host_total_kv_lens: torch.Tensor
     context_lengths: torch.Tensor
     host_context_lengths: torch.Tensor
     host_request_types: torch.Tensor
@@ -66,7 +68,9 @@ class TrtllmAttentionWrapper:
     qk_nope_head_dim: Optional[int]
     v_head_dim: Optional[int]
     attention_chunk_size: Optional[int]
+    softmax_stats_tensor: Optional[torch.Tensor]
     use_spec_decoding: bool
+    is_spec_dec_tree: bool
     spec_decoding_position_offsets: Optional[torch.Tensor]
     spec_decoding_packed_mask: Optional[torch.Tensor]
     spec_decoding_generation_lengths: Optional[torch.Tensor]
@@ -152,6 +156,7 @@ class TrtllmAttentionWrapper:
         beam_width: int = 1,
         sequence_length: torch.Tensor = ...,
         host_past_key_value_lengths: torch.Tensor = ...,
+        host_total_kv_lens: torch.Tensor = ...,
         context_lengths: torch.Tensor = ...,
         host_context_lengths: torch.Tensor = ...,
         host_request_types: torch.Tensor = ...,
@@ -172,14 +177,14 @@ class TrtllmAttentionWrapper:
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
-        mla_context_paged_kv: Optional[torch.Tensor] = None,
-        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
         is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
+        is_spec_dec_tree: bool = False,
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -197,6 +202,7 @@ class TrtllmAttentionWrapper:
             beam_width (int): Beam width in beam search.
             sequence_length (torch.Tensor): The length of each sequence with shape (batch_size) on GPU.
             host_past_key_value_lengths (torch.Tensor): Same as sequence_length, but on CPU.
+            host_total_kv_lens (torch.Tensor): The tensor to store the total KV lens for context requests and generation requests, with shape (2) on CPU.
             context_lengths (torch.Tensor): The context-phase sequence length of each request with shape (batch_size) on GPU.
             host_context_lengths (torch.Tensor): Same as context_lengths, but on CPU.
             host_request_types (torch.Tensor): The tensor that indicates whether a request is in context or generation phase, with shape (batch_size) on CPU.
@@ -212,9 +218,8 @@ class TrtllmAttentionWrapper:
             out_scale_sf (torch.Tensor): The tensor to store the global scale for NVFP4 scaling factors, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
-            mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
-            mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
+            attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -225,6 +230,7 @@ class TrtllmAttentionWrapper:
         self.beam_width = beam_width
         self.sequence_length = sequence_length
         self.host_past_key_value_lengths = host_past_key_value_lengths
+        self.host_total_kv_lens = host_total_kv_lens
         self.context_lengths = context_lengths
         self.host_context_lengths = host_context_lengths
         self.host_request_types = host_request_types
@@ -248,9 +254,8 @@ class TrtllmAttentionWrapper:
         self.mrope_position_deltas = mrope_config.get(
             'mrope_position_deltas') if mrope_config is not None else None
         self.block_ids_per_seq = block_ids_per_seq
-        self.mla_context_paged_kv = mla_context_paged_kv
-        self.mla_context_kv_cache_block_offsets = mla_context_kv_cache_block_offsets
         self.softmax_stats_tensor = softmax_stats_tensor
+        self.attention_sinks = attention_sinks
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -258,10 +263,40 @@ class TrtllmAttentionWrapper:
             )
         self.is_spec_decoding_enabled = is_spec_decoding_enabled
         self.use_spec_decoding = use_spec_decoding
+        self.is_spec_dec_tree = is_spec_dec_tree
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
         self.kwargs.update(kwargs)
+
+    def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
+        num_tokens = q.size(0)
+        attention_input_type = (AttentionInputType(self.attention_input_type)
+                                if self.attention_input_type is not None else
+                                AttentionInputType.mixed)
+        if out_dtype is None:
+            out_dtype = q.dtype
+        is_gen_only = attention_input_type == AttentionInputType.generation_only
+        v_head_size = self.head_size
+        if self.is_mla_enable:
+            v_head_size = self.kv_lora_rank if is_gen_only else self.v_head_dim
+        if out_dtype == torch.uint8:
+            num_nvfp4_elements_per_container = 2
+            scaling_vector_size = 16
+            size_per_token = self.num_heads * v_head_size
+            output = q.new_empty(
+                (num_tokens,
+                 size_per_token // num_nvfp4_elements_per_container),
+                dtype=torch.uint8)
+            # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
+            output_sf = q.new_empty(compute_swizzled_sf_shape(
+                num_tokens, size_per_token // scaling_vector_size),
+                                    dtype=torch.uint8)
+        else:
+            output = q.new_empty((num_tokens, self.num_heads * v_head_size),
+                                 dtype=out_dtype)
+            output_sf = None
+        return output, output_sf
 
     def run(
         self,
@@ -325,18 +360,12 @@ class TrtllmAttentionWrapper:
             else:
                 raise ValueError("Unexpected attention mask type")
         else:
-            assert is_fused_qkv
             if self.attention_input_type == AttentionInputType.context_only:
-                if self.use_paged_context_fmha:
-                    assert self.mla_context_paged_kv is not None
-                    assert self.mla_context_kv_cache_block_offsets is not None
-                    qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
-                                                        self.qk_rope_head_dim)
-                else:
-                    qkv_hidden_size = self.num_heads * (
-                        2 * (self.qk_nope_head_dim + self.qk_rope_head_dim)
-                    ) + self.num_kv_heads * self.v_head_dim
+                assert not is_fused_qkv
+                qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
+                                                    self.qk_rope_head_dim)
             elif self.attention_input_type == AttentionInputType.generation_only:
+                assert is_fused_qkv
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
                                                     self.qk_rope_head_dim)
             else:
@@ -361,30 +390,7 @@ class TrtllmAttentionWrapper:
 
         if output is None:
             assert output_sf is None
-            num_tokens = q.size(0)
-            attention_input_type = (AttentionInputType(
-                self.attention_input_type) if self.attention_input_type
-                                    is not None else AttentionInputType.mixed)
-            if out_dtype is None:
-                out_dtype = q.dtype
-            is_gen_only = attention_input_type == AttentionInputType.generation_only
-            v_head_size = self.head_size if not self.is_mla_enable else self.kv_lora_rank if is_gen_only else self.v_head_dim
-            if out_dtype == torch.uint8:
-                num_nvfp4_elements_per_container = 2
-                scaling_vector_size = 16
-                size_per_token = self.num_heads * v_head_size
-                output = q.new_empty(
-                    (num_tokens,
-                     size_per_token // num_nvfp4_elements_per_container),
-                    dtype=torch.uint8)
-                # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
-                output_sf = q.new_empty(compute_swizzled_sf_shape(
-                    num_tokens, size_per_token // scaling_vector_size),
-                                        dtype=torch.uint8)
-            else:
-                output = q.new_empty((num_tokens, self.num_heads * v_head_size),
-                                     dtype=out_dtype)
-                output_sf = None
+            output, output_sf = self.create_output(q, out_dtype)
         else:
             # output is provided, expect output_sf be provided as well if has NVFP4 output.
             assert out_dtype is None or out_dtype != torch.uint8 or output_sf is not None
@@ -399,14 +405,15 @@ class TrtllmAttentionWrapper:
             self.rotary_embedding_original_max_positions
         ]
         spec_decoding_bool_params = [
-            self.is_spec_decoding_enabled, self.use_spec_decoding
+            self.is_spec_decoding_enabled, self.use_spec_decoding,
+            self.is_spec_dec_tree
         ]
         spec_decoding_tensor_params = [
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
 
-        torch.ops.trtllm.attention_inplace(
+        thop.attention(
             q,
             k,
             v,
@@ -416,6 +423,7 @@ class TrtllmAttentionWrapper:
             self.workspace,
             self.sequence_length,
             self.host_past_key_value_lengths,
+            self.host_total_kv_lens,
             self.context_lengths,
             self.host_context_lengths,
             self.host_request_types,
@@ -432,6 +440,7 @@ class TrtllmAttentionWrapper:
             self.latent_cache,
             self.q_pe,
             self.block_ids_per_seq,
+            self.attention_sinks,
             is_fused_qkv,
             update_kv_cache,
             self.predicted_tokens_per_seq,
@@ -464,8 +473,6 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
-            self.mla_context_paged_kv,
-            self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
@@ -608,6 +615,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
+        self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
 
         # For debugging, can use it to call the wrapper's plan function
@@ -634,7 +642,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
-                self.block_ids_per_seq = torch.empty(
+                self.block_ids_per_seq = torch.zeros(
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
@@ -650,7 +658,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     device='cuda',
                 )
-            if self.enable_paged_context_mla:
+            if self.enable_context_mla_with_cached_kv:
                 # for kv cache reuse/chunked context in MLA
                 self.ctx_cached_token_indptr = torch.zeros(
                     (self.max_num_requests + 1, ),
@@ -731,12 +739,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
         self.kv_lens_cuda[:self.num_seqs].copy_(
             kv_lens[:self.num_seqs].pin_memory(), non_blocking=True)
+        # total kv lens for context requests and generation requests, without extra tokens
+        self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
+        self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
+                                             num_seqs].sum().item()
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
 
         # prepare for kv cache reuse/chunked context in MLA
-        if self.enable_paged_context_mla:
-            self.prepare_paged_context_mla(cached_token_lens, kv_lens)
+        if self.enable_context_mla_with_cached_kv:
+            self.prepare_context_mla_with_cached_kv(cached_token_lens, kv_lens)
 
         # kv block offsets
         assert self.request_ids is not None
@@ -823,8 +835,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             else:
                 merge_op_tensor[chunked_loop_num, s] = 1  # merge
 
-    def prepare_paged_context_mla(self, cached_token_lens: torch.Tensor,
-                                  kv_lens: torch.Tensor) -> None:
+    def prepare_context_mla_with_cached_kv(self,
+                                           cached_token_lens: torch.Tensor,
+                                           kv_lens: torch.Tensor) -> None:
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[:self.
                                                            num_contexts].sum(
@@ -1086,13 +1099,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
-        mla_context_paged_kv: Optional[torch.Tensor] = None,
-        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -1106,12 +1119,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         ) if metadata.runtime_features else False
 
         if self.is_mla_enable:
-            # for MLA, we only use paged_context_fmha when there is cached kv
-            use_paged_context_fmha = use_paged_context_fmha and self.has_cached_kv_for_mla_context(
-                metadata)
+            # Context MLA uses separate qkv instead of paged_context_fmha
+            use_paged_context_fmha = False
 
         use_nvfp4_output = False
-        if self.has_nvfp4 and self.support_nvfp4_output():
+        if enable_attn_nvfp4_output and self.has_nvfp4 and self.support_nvfp4_output(
+        ):
             # Runtime check whether the NVFP4 output kernel is available.
             use_nvfp4_output = self.wrapper.is_nvfp4_output_kernel_available(
                 tokens_per_block=metadata.tokens_per_block,
@@ -1131,6 +1144,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             beam_width=metadata.beam_width,
             sequence_length=metadata.kv_lens_cuda_runtime,
             host_past_key_value_lengths=metadata.kv_lens_runtime,
+            host_total_kv_lens=metadata.host_total_kv_lens,
             context_lengths=metadata.prompt_lens_cuda_runtime,
             host_context_lengths=metadata.prompt_lens_cpu_runtime,
             host_request_types=metadata.host_request_types_runtime,
@@ -1151,17 +1165,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             latent_cache=latent_cache,
             q_pe=q_pe,
             mrope_config=mrope_config,
-            mla_context_paged_kv=mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets=
-            mla_context_kv_cache_block_offsets,
             softmax_stats_tensor=softmax_stats_tensor,
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
+            is_spec_dec_tree=metadata.is_spec_dec_tree,
             spec_decoding_position_offsets=metadata.
             spec_decoding_position_offsets,
             spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
             spec_decoding_generation_lengths=metadata.
             spec_decoding_generation_lengths,
+            attention_sinks=attention_sinks,
         )
         out_dtype = None
         if out_scale is not None:
@@ -1184,9 +1197,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             update_kv_cache=not metadata.is_cross or k is not None,
             attention_mask=attention_mask)
 
-        if out_dtype == torch.uint8:
-            assert output_sf is not None
-            return Fp4QuantizedTensor(output, output_sf)
+        if use_nvfp4_output:
+            return output, output_sf
+
         return output
 
     @classmethod
@@ -1212,7 +1225,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
         return (self.is_mla_enable and metadata.kv_cache_manager is not None
-                and metadata.enable_paged_context_mla
+                and metadata.enable_context_mla_with_cached_kv
                 and metadata.num_ctx_cached_tokens > 0)
 
     def is_chunked_prefill_for_mla_context(
@@ -1220,7 +1233,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
         return (self.is_mla_enable and metadata.kv_cache_manager is not None
-                and metadata.enable_paged_context_mla
+                and metadata.enable_context_mla_with_cached_kv
                 and metadata.num_ctx_cached_tokens > 0
                 and metadata.runtime_features.chunked_prefill)
 
@@ -1228,7 +1241,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self,
         metadata: TrtllmAttentionMetadata,
         out_dtype: torch.dtype,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
@@ -1270,15 +1283,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         num_ctx_cached_tokens: int,
         cu_chunked_seq_len: torch.Tensor,
         out_dtype: torch.dtype,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
         if metadata.max_ctx_cached_token_len == 0:
-            return torch.empty((0, metadata.kv_cache_manager.head_dim),
-                               dtype=out_dtype,
-                               device=cu_chunked_seq_len.device)
+            empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
+                                   dtype=out_dtype,
+                                   device=cu_chunked_seq_len.device)
+            empty_k_pe = torch.empty((0, self.mla_params.qk_rope_head_dim),
+                                     dtype=out_dtype,
+                                     device=cu_chunked_seq_len.device)
+            return empty_kv, empty_k_pe
 
         sink_token_length = 0
         beam_width = 1
@@ -1305,86 +1322,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.wrapper.quant_mode,
         )
         return output_kv, output_k_pe
-
-    def set_paged_kv_cache_for_mla(
-        self,
-        paged_kv: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        k_pe: torch.Tensor,
-        metadata: TrtllmAttentionMetadata,
-    ) -> torch.Tensor:
-        assert self.is_mla_enable and self.mla_params is not None
-        assert self.mla_params.qk_nope_head_dim == self.mla_params.v_head_dim
-        assert metadata.kv_cache_manager is not None
-        assert paged_kv.shape[0] == metadata.num_contexts
-        assert paged_kv.is_contiguous()
-
-        num_contexts = metadata.num_contexts
-        max_seq_len = metadata.max_ctx_kv_len
-        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
-
-        paged_kv_offsets = torch.ops.trtllm.set_paged_kv_cache_for_mla(
-            paged_kv,
-            k,
-            v,
-            k_pe,
-            num_contexts,
-            metadata.ctx_kv_indptr,
-            max_seq_len,
-            self.num_heads,
-            self.mla_params.qk_nope_head_dim,
-            self.mla_params.qk_rope_head_dim,
-            tokens_per_block,
-        )
-
-        max_block_num = (max_seq_len + tokens_per_block - 1) // tokens_per_block
-        assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
-        return paged_kv_offsets
-
-    def set_chunked_kv_cache_for_mla(
-        self,
-        paged_kv: torch.Tensor,
-        kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        cu_chunked_seq_len: torch.Tensor,
-        cached: bool,
-        metadata: TrtllmAttentionMetadata,
-    ) -> torch.Tensor:
-        assert self.is_mla_enable and self.mla_params is not None
-        assert self.mla_params.qk_nope_head_dim == self.mla_params.v_head_dim
-        assert metadata.kv_cache_manager is not None
-        assert paged_kv.shape[0] == metadata.num_contexts
-        assert paged_kv.is_contiguous()
-
-        kv = kv.contiguous()
-        k_pe = k_pe.contiguous()
-
-        num_contexts = metadata.num_contexts
-        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
-        if cached:
-            # this indptr is the fake.
-            cu_seq_len = cu_chunked_seq_len
-            max_seq_len = metadata.runtime_features.chunk_size
-        else:
-            cu_seq_len = metadata.ctx_uncached_token_indptr
-            max_seq_len = metadata.max_ctx_seq_len
-        paged_kv_offsets = torch.ops.trtllm.set_chunked_kv_cache_for_mla(
-            paged_kv,
-            kv,
-            k_pe,
-            num_contexts,
-            cu_seq_len,
-            self.num_heads,
-            self.mla_params.qk_nope_head_dim,
-            self.mla_params.qk_rope_head_dim,
-            metadata.kv_cache_manager.tokens_per_block,
-            max_seq_len,
-        )
-
-        max_block_num = (max_seq_len + tokens_per_block - 1) // tokens_per_block
-        assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
-        return paged_kv_offsets
 
     def mla_rope_append_paged_kv_assign_q(
         self,

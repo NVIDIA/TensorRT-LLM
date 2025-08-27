@@ -4,21 +4,20 @@ set -ex
 
 TRT_VER="10.11.0.33"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-05.html#rel-25-05
-CUDA_VER="12.9" # 12.9.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-06.html#rel-25-06
+CUDA_VER="12.9" # 12.9.1
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.10.1.4-1"
-# NCCL version 2.26.x used in the NGC PyTorch 25.05 image but has a performance regression issue.
-# Use NCCL version 2.27.5 which has the fixes.
+CUDNN_VER="9.10.2.21-1"
+# NGC PyTorch 25.06 image uses NCCL 2.27.3, while NCCL 2.27.5 resolves a perf regression issue.
+# Use NCCL version 2.27.5 instead.
 NCCL_VER="2.27.5-1+cuda12.9"
-# Use cuBLAS version 12.9.0.13 instead.
-CUBLAS_VER="12.9.0.13-1"
+CUBLAS_VER="12.9.1.4-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="12.9.41-1"
-CUDA_RUNTIME="12.9.37-1"
-CUDA_DRIVER_VERSION="575.51.03-1.el8"
+NVRTC_VER="12.9.86-1"
+CUDA_RUNTIME="12.9.79-1"
+CUDA_DRIVER_VERSION="575.57.08-1.el8"
 
 for i in "$@"; do
     case $i in

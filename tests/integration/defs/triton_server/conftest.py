@@ -13,6 +13,14 @@ from .trt_test_alternative import (SessionDataWriter, check_call, check_output,
                                    print_info)
 
 
+def find_repo_root():
+    """Find the repository root by going up 4 directories from the current file location."""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        current_dir = os.path.dirname(current_dir)
+    return current_dir
+
+
 def llm_models_root() -> str:
     '''return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path
     '''
@@ -68,7 +76,11 @@ def output_dir(request):
 
 @pytest.fixture(scope="session")
 def llm_backend_root():
-    return os.path.join(os.environ["LLM_ROOT"], "triton_backend")
+    llm_root = os.environ.get("LLM_ROOT", find_repo_root())
+    backend_root = os.path.join(llm_root, "triton_backend")
+    assert os.path.isabs(backend_root), "LLM backend path must be absolute"
+    assert os.path.exists(backend_root), f"{backend_root} does not exist"
+    return backend_root
 
 
 @pytest.fixture(scope="session")
@@ -550,6 +562,19 @@ def tiny_llama_model_root():
         tiny_llama_model_root
     ), f"{tiny_llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return tiny_llama_model_root
+
+
+@pytest.fixture(scope="session")
+def mistral_small_3_1_24b_model_root():
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    model_root = os.path.join(models_root,
+                              "Mistral-Small-3.1-24B-Instruct-2503")
+
+    assert os.path.exists(
+        model_root
+    ), f"{model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    return model_root
 
 
 # Returns an array of total memory for each available device

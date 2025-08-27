@@ -18,13 +18,16 @@ from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import PybindMirror
+from ..llmapi.llm_args import PybindMirror, TorchLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
+from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
                             print_traceback_on_error)
-from ..lora_manager import LoraConfig, LoraManager
+from ..lora_helper import LoraConfig
+from ..lora_manager import LoraManager
+from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -58,7 +61,9 @@ class GenerationExecutorWorker(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[TorchLlmArgs] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -79,8 +84,8 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(
             self)  # TODO: make it weakref
         self._executor_config = executor_config
-        self._is_pytorch_backend = getattr(self._executor_config, "backend",
-                                           None) == "pytorch"
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
+        self.llm_args = llm_args
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -88,20 +93,55 @@ class GenerationExecutorWorker(GenerationExecutor):
         if isinstance(engine, list):
             engine = engine[self.rank]
 
-        if executor_config is None:
-            executor_config = tllm.ExecutorConfig(1)
-
-        executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-            processor_batched=batched_logits_processor, replicate=False)
-
-        def _create_engine():
+        def _get_comm_ranks_device_id():
             device_id = self.global_rank % torch.cuda.device_count()
             torch.cuda.set_device(device_id)
-
             # Make sure C++ executor would use same devices/ranks as py_executor
             global_rank = global_mpi_rank()
             comm_ranks = mpi_comm().allgather(global_rank)
             device_ids = mpi_comm().allgather(device_id)
+            return comm_ranks, device_ids
+
+        def _create_py_executor(executor_config):
+            assert executor_config is None, "expect an empty executor_config is _create_py_executor"
+            executor_config = llm_args.get_executor_config(
+                hf_model_dir, tokenizer)
+            # Persist so downstream code (e.g., default max_tokens deduction) has access
+            self._executor_config = executor_config
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_batched=batched_logits_processor, replicate=False)
+            comm_ranks, device_ids = _get_comm_ranks_device_id()
+            executor_config.parallel_config = tllm.ParallelConfig(
+                participant_ids=comm_ranks, device_ids=device_ids)
+            args = {
+                "executor_config": executor_config,
+                "checkpoint_dir": executor_config.hf_model_dir,
+            }
+            assert hasattr(
+                executor_config, "backend"
+            ), "executor_config should be with backend in _create_py_executor"
+            if executor_config.backend == "pytorch":
+                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+                    create_py_executor
+                create_executor = create_py_executor
+                args["lora_config"] = lora_config
+                args[
+                    "garbage_collection_gen0_threshold"] = llm_args.garbage_collection_gen0_threshold
+            elif executor_config.backend == "_autodeploy":
+                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
+                    create_autodeploy_executor
+                create_executor = create_autodeploy_executor
+            else:
+                raise ValueError(
+                    f"Unsupported backend config: {executor_config.backend}")
+            return create_executor(**args)
+
+        def _create_engine(executor_config):
+            if executor_config is None:
+                executor_config = tllm.ExecutorConfig(1)
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_batched=batched_logits_processor, replicate=False)
+            comm_ranks, device_ids = _get_comm_ranks_device_id()
             executor_config.parallel_config = tllm.ParallelConfig(
                 participant_ids=comm_ranks, device_ids=device_ids)
 
@@ -113,30 +153,13 @@ class GenerationExecutorWorker(GenerationExecutor):
                                      executor_config=executor_config,
                                      managed_weights=engine.managed_weights)
 
-            if not hasattr(executor_config, "backend"):
-                return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                     executor_config)
-            args = {
-                "executor_config": executor_config,
-                "checkpoint_dir": executor_config.hf_model_dir,
-            }
-            if executor_config.backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-                    create_py_executor
-                create_executor = create_py_executor
-                args["lora_config"] = lora_config
-                args[
-                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
-            elif executor_config.backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-            else:
-                raise ValueError(
-                    f"Unsupported backend config: {executor_config.backend}")
-            return create_executor(**args)
+            assert not hasattr(executor_config, "backend")
+            return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
+                                 executor_config)
 
-        self.engine = _create_engine()
+        self.engine = _create_py_executor(
+            executor_config) if llm_args is not None else _create_engine(
+                executor_config)
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
@@ -159,7 +182,7 @@ class GenerationExecutorWorker(GenerationExecutor):
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
-        if getattr(executor_config, "backend",
+        if getattr(self._executor_config, "backend",
                    "") == "pytorch" and lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
                 ResourceManagerType
@@ -260,7 +283,7 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _iteration_result_task(self, it_result_queue: IterationResultQueue,
                                engine_get_result_api: Callable,
                                result_singleton: IterationResult,
-                               result_serializer: Callable):
+                               result_serializer: Callable) -> bool:
         time.sleep(0.2)
         async_queues = []
         queue = result_singleton.queue if self._is_llm_executor and result_singleton else it_result_queue.queue
@@ -372,6 +395,7 @@ class GenerationExecutorWorker(GenerationExecutor):
 
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
+        py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
             adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
                 request.lora_request.adapter_id)
@@ -381,8 +405,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 task_id=request.lora_request.adapter_id,
                 weights=self._lora_manager.cpp_lora_weights[uid]
                 if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid]
-                if not adapter_in_cache else None)
+                config=self._lora_manager.cpp_lora_config[uid])
+            py_lora_path = request.lora_request.lora_path
         else:
             lora_config = None
 
@@ -427,14 +451,16 @@ class GenerationExecutorWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        is_overlap_enabled = self._is_pytorch_backend and not self._executor_config.pytorch_backend_config.disable_overlap_scheduler
-        if is_overlap_enabled:
-            is_disaggregated = self.engine.kv_cache_transceiver is not None
-            if is_disaggregated and (
-                    request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
-                raise ValueError(
-                    "Context only requests are not supported in pytorch backend when overlap is enabled."
-                )
+        if self._is_pytorch_backend:
+            assert isinstance(self.llm_args, TorchLlmArgs)
+            if not self.llm_args.disable_overlap_scheduler:
+                is_disaggregated = self.engine.kv_cache_transceiver is not None
+                if is_disaggregated and (
+                        request_type
+                        == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
+                    raise ValueError(
+                        "Context only requests are not supported in pytorch backend when overlap is enabled."
+                    )
 
         assert request.id is not None
 
@@ -485,7 +511,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                #NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
+                # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
                 multimodal_embedding=None,
                 mrope_config=None,
                 logits_post_processor_name=(
@@ -497,9 +523,12 @@ class GenerationExecutorWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+            executor_request.py_lora_path = py_lora_path
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
+                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
@@ -508,6 +537,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lp = request.sampling_params.logits_processor
                 executor_request.py_logits_post_processors = lp if isinstance(
                     lp, list) else [lp]
+
+            executor_request.py_scheduling_params = None
+            if self._is_pytorch_backend and request.scheduling_params is not None:
+                executor_request.py_scheduling_params = request.scheduling_params
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
@@ -631,7 +664,9 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
-    garbage_collection_gen0_threshold: Optional[int] = None,
+    hf_model_dir: Optional[Path] = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    llm_args: Optional[TorchLlmArgs] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -758,13 +793,15 @@ def worker_main(
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+            hf_model_dir=hf_model_dir,
+            tokenizer=tokenizer,
+            llm_args=llm_args)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
         print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
-            worker_init_status_queue.put(e)
+            worker_init_status_queue.put((e, traceback.format_exc()))
         return
 
     with worker:
@@ -782,7 +819,7 @@ def worker_main(
                                                    mp_stats_queue)
                 worker._set_iteration_result_queue(worker.kv_events_queues,
                                                    kv_cache_events_queue)
-                worker_init_status_queue.put(ready_signal)
+                worker_init_status_queue.put((ready_signal, None))
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
@@ -882,10 +919,8 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
-            logprobs_result = _get_logprobs(self.worker, response,
+            response = _maybe_wrap_response(self.worker, response,
                                             self.worker._is_pytorch_backend)
-            if logprobs_result:
-                response = ResponseWrapper(response, logprobs_result)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
@@ -915,7 +950,9 @@ class AwaitResponseHelper:
 
         for response in responses:
 
-            if self.worker._has_background_error():
+            if isinstance(response, ErrorResponse):
+                pass  # send ErrorResponse directly
+            elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
                 # Convert to ErrorResponse, because tllm.Response cannot be
@@ -923,10 +960,8 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
             else:
-                logprobs_result = _get_logprobs(self.worker, response,
+                response = _maybe_wrap_response(self.worker, response,
                                                 self.worker._is_pytorch_backend)
-                if logprobs_result:
-                    response = ResponseWrapper(response, logprobs_result)
 
             _send_rsp(self.worker,
                       response,
@@ -1034,3 +1069,41 @@ def _send_rsp(
         worker._pop_result(response.client_id)
     else:
         raise ValueError(f"Unknown response type: {response}")
+
+
+def _get_metrics_dict(
+        response: tllm.Response) -> dict[RequestEventTiming, float]:
+    req_perf_metrics, metrics_dict = None, {}
+    res = response.result
+    if res:
+        if hasattr(res, '_result'):
+            if result := res.get_result():
+                req_perf_metrics = result.request_perf_metrics
+        else:
+            req_perf_metrics = res.request_perf_metrics
+        if req_perf_metrics and req_perf_metrics.timing_metrics:
+            metrics_dict = {
+                RequestEventTiming.ARRIVAL_TIME:
+                req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
+                RequestEventTiming.FIRST_TOKEN_TIME:
+                req_perf_metrics.timing_metrics.first_token_time.total_seconds(
+                ),
+                RequestEventTiming.FIRST_SCHEDULED_TIME:
+                req_perf_metrics.timing_metrics.first_scheduled_time.
+                total_seconds(),
+                RequestEventTiming.LAST_TOKEN_TIME:
+                req_perf_metrics.timing_metrics.last_token_time.total_seconds()
+            }
+    return metrics_dict
+
+
+def _maybe_wrap_response(
+        worker,
+        response: tllm.Response,
+        is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
+
+    logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
+    req_perf_metrics = _get_metrics_dict(response)
+    if logprobs_result or req_perf_metrics:
+        response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
+    return response

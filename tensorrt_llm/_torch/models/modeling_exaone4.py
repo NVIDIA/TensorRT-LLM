@@ -3,7 +3,6 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -55,7 +54,6 @@ class Exaone4Attention(Attention):
 
     def __init__(self,
                  model_config: ModelConfig[Exaone4Config],
-                 is_sliding: bool,
                  layer_idx: Optional[int] = None,
                  aux_stream: Optional[torch.cuda.Stream] = None,
                  fuse_qk_norm_rope: bool = False):
@@ -64,9 +62,10 @@ class Exaone4Attention(Attention):
         self.attention_window_size = None
 
         # NOTE: In EXAONE4, only sliding layers apply rope.
-        self.is_sliding = is_sliding
+        self.sliding_window = config.sliding_window
+        self.is_sliding = check_is_sliding(config, layer_idx)
         pos_embd_params = None
-        if self.is_sliding:
+        if self.sliding_window is None or self.is_sliding:
             self.attention_window_size = config.sliding_window
 
             pos_embd_params = PositionalEmbeddingParams(
@@ -140,7 +139,7 @@ class Exaone4Attention(Attention):
 
         q, k, v = self.split_qkv(q, k, v)
         q, k = self.apply_qk_norm(q, k)
-        if self.is_sliding:
+        if self.sliding_window is None or self.is_sliding:
             return super().apply_rope(q, k, v, position_ids)
         else:
             return q, k, v
@@ -152,7 +151,6 @@ class Exaone4Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -165,7 +163,6 @@ class Exaone4Attention(Attention):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=attention_mask,
-            all_reduce_params=all_reduce_params,
             lora_params=lora_params,
             attention_window_size=self.attention_window_size,
             **kwargs,
@@ -185,11 +182,9 @@ class Exaone4DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
-        is_sliding = check_is_sliding(config, layer_idx)
 
         self.self_attn = Exaone4Attention(
             model_config,
-            is_sliding=is_sliding,
             layer_idx=layer_idx,
             aux_stream=aux_stream,
         )
@@ -228,8 +223,6 @@ class Exaone4DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.mapping.tp_size == 1)),
             **kwargs,
         )
 
@@ -237,11 +230,7 @@ class Exaone4DecoderLayer(DecoderLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
 
-        hidden_states = self.mlp(
-            hidden_states,
-            final_all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.mapping.tp_size == 1)),
-        )
+        hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
 
         hidden_states = hidden_states + residual

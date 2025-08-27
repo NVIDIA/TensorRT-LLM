@@ -676,7 +676,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_fp8 \
 The peak GPU memory consumption when doing FP8 quantizaton is more than 210GB (there is also some activation memory occupation when doing calibration).
 So you need a node with at least 4 H100(A100) to run the quantization command. After quantization, 2 GPUs are okay to for building and run.
 
-Experimental: use FP8 GEMV to optimize performance in FP8 small-batch-size cases.
+Note: use FP8 GEMV to optimize performance in FP8 small-batch-size cases.
 
 ```bash
 # Quantize HF LLaMA 7B into FP8 and export trtllm checkpoint
@@ -694,7 +694,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
              --gemm_plugin fp8
 ```
 
-**Note**: FP8 gemm plugin is an experimental feature aimed to improve performance in small-batch-size cases(e.g. BS<=4). Although inputs with batch size larger than 4 can be correctly inferenced, the performance may decrease as batch size grows.
+**Note**: FP8 gemv plugin uses CUDA cores to compute, by contrast to Tensor Core gemm kernel within cuBLAS. Over last year, as cuBLAS have improved their performance by a lot under small M case for Hopper(sm90), FP8 gemv kernel may or may not surpass cuBLAS, depending on specific gemm problem shape. Nonetheless, we still strongly recommend FP8 gemv kernel for Ada (sm89) as cuBLAS still falls behind gemv on it.
 
 ### Groupwise quantization (AWQ/GPTQ)
 One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `trtllm-build`:
@@ -1571,7 +1571,6 @@ Explanation:
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
-    --backend pytorch \
     --tp_size 8 \
     --max_batch_size 1024 \
     --trust_remote_code \

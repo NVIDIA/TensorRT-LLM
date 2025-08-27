@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # # Force resource release after test
+import os
+import sys
+import traceback
+from typing import Any
 
 import pytest
 import torch
@@ -53,6 +57,19 @@ def pytest_runtest_protocol(item, nextitem):
             break
 
 
+# Logging exceptions to stdout to prevent them from being masked by
+# pytest-threadleak complaints.
+@pytest.hookimpl(wrapper=True)
+def pytest_pyfunc_call(pyfuncitem) -> Any:
+    try:
+        return (yield)
+    # NB: _pytest.outcomes.OutcomeException subclasses BaseException
+    except BaseException as e:
+        print(f"TEST RAISED ERROR: {e}")
+        traceback.print_exception(e)
+        raise
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--test-prefix",
@@ -82,6 +99,33 @@ def pytest_sessionstart(session):
     # To counter TransformerEngine v2.3's lazy_compile deferral,
     # which will cause Pytest thinks there's a thread leakage.
     import torch._inductor.async_compile  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def cuda_error_early_quit(capfd):
+    """
+    Fixture to handle CUDA error.
+
+    CUDA error are usually persistent that requires restart process to recover.
+    Immediately stop the current worker when CUDA error occurred.
+    It will then be restarted by the master process.
+    """
+    if torch.cuda.is_available() and os.environ.get("PYTEST_XDIST_WORKER",
+                                                    None):
+        try:
+            yield
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            msg = str(e)
+            if 'CUDA error:' in msg:
+                with capfd.disabled():
+                    traceback.print_exception(e, file=sys.stderr)
+                    print("CUDA Error occurred, worker must quit now",
+                          file=sys.stderr)
+                os._exit(1)
+            raise
+    else:
+        yield
 
 
 @pytest.fixture(autouse=True)

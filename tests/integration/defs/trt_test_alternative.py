@@ -93,15 +93,31 @@ if is_linux():
             time.sleep(5)
 
             lines = []
+            torch_inductors = []
+
             for pid in sorted(target_pids):
                 try:
                     sp = psutil.Process(pid)
                     if verbose_message:
                         cmdline = sp.cmdline()
+
+                        # Detect repetitive torch inductor worker processes
+                        if len(cmdline) > 3 and \
+                            'python' in cmdline[0] and \
+                            'torch/_inductor/compile_worker/__main__.py' in cmdline[1] and \
+                            '--pickler=torch._inductor.compile_worker.subproc_pool.SubprocPickler' == cmdline[2]:
+                            torch_inductors.append(pid)
+                            continue
+
                         lines.append(f"{pid}: {cmdline}")
                     persist_pids.append(pid)
                 except psutil.Error:
                     pass
+
+            if torch_inductors:
+                lines.append(
+                    f"{len(torch_inductors)}*torch inductor workers: {torch_inductors}"
+                )
 
             if persist_pids:
                 msg = f"Found leftover subprocesses: {persist_pids} launched by {p.args}"
@@ -216,9 +232,10 @@ def call(*popenargs,
         while True:
             try:
                 return p.wait(timeout=spin_time)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as e:
                 elapsed_time += spin_time
                 if timeout is not None and elapsed_time >= timeout:
+                    e.timeout = timeout
                     raise
             for p_poll in poll_procs:
                 if p_poll.poll() is None:

@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
@@ -14,12 +14,15 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -70,6 +73,14 @@ class Llama4Attention(Attention):
             # This is safe to do because we limit seqlen to 8k for
             # non TRTLLM backends.
             attention_chunk_size = None
+        elif get_sm_version() <= 90 and model_config.spec_config is not None:
+            # pre-Blackwell spec-dec kernel does not support
+            attention_chunk_size = None
+        else:
+            # Disable chunked attention when max_seq_len is smaller than attention_chunk_size
+            # TODO: Remove this after all attention kernels in TRTLLM backend support chunked attention
+            if attention_chunk_size and model_config.max_seq_len and model_config.max_seq_len < attention_chunk_size:
+                attention_chunk_size = None
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -161,22 +172,16 @@ class Llama4Attention(Attention):
             q, k, v = self.split_qkv(q, k, v)
             q = self._attention_scaling(q, position_ids)
 
-        out_scale = None
-        out_scale_sf = None
-        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
-            out_scale = self.o_proj.inv_input_scale
-        if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
-            out_scale_sf = self.o_proj.input_scale
-
         q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.attn.forward(q,
+        attn_output = self.forward_impl(q,
                                         k,
                                         v,
                                         attn_metadata,
-                                        out_scale=out_scale,
-                                        out_scale_sf=out_scale_sf,
-                                        attention_mask=attention_mask,
-                                        mrope_config=mrope_config)
+                                        attention_mask,
+                                        None,
+                                        None,
+                                        mrope_config,
+                                        attention_sinks=None)
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
@@ -978,7 +983,10 @@ class Llama4InputProcessor(InputProcessor):
         self.tokenizer = tokenizer
         self.vocab_size = model_config.text_config.vocab_size
         self.image_token_index = model_config.image_token_index
-
+        self.fake_image_token = self.processor.fake_image_token
+        self.image_token = self.processor.img_patch_token
+        self.image_token_start_index = self.model_config.boi_token_index
+        self.image_token_end_index = self.model_config.eoi_token_index
         self.encoder = nn.ModuleDict({
             "vision_model":
             Llama4VisionModel(model_config.vision_config),
@@ -986,6 +994,134 @@ class Llama4InputProcessor(InputProcessor):
             Llama4MultiModalProjector(model_config)
         }).cuda()
         load_sharded_checkpoint(self.encoder, model_path, strict=False)
+
+    def attach_multimodal_embeddings(
+        self, inputs: TextPrompt, multimodal_embedding: Dict[str,
+                                                             List[Dict[str,
+                                                                       Any]]],
+        sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """
+        Attach pre-processed multimodal embeddings into text token stream for Llama4 model.
+
+        This method skips vision processing and works with externally provided embeddings.
+        It replaces/expands image placeholders in the text with appropriate tokens and prepares
+        the embeddings for model forward pass.
+
+        Args:
+            inputs: Text prompt containing image placeholders
+            multimodal_embedding: Dictionary containing pre-processed image embedding data with special token information.
+                                  Consider adding metadata fields (e.g., model_type, model_name, version) for validation.
+        Returns:
+            Tuple of (token_ids, extra_processed_inputs) where:
+            - token_ids: List of processed token IDs with image placeholders
+            - extra_processed_inputs: Optional dictionary containing multimodal embeddings
+        """
+        text_prompt = inputs.get("prompt")
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
+
+        if not isinstance(multimodal_embedding, dict):
+            raise ValueError("multimodal_embedding must be a dictionary")
+
+        if 'image' not in multimodal_embedding:
+            raise ValueError(
+                "Only image modality is supported for external multimodal embedding"
+            )
+
+        mm_embedding_info = multimodal_embedding['image']
+        if not mm_embedding_info or not isinstance(mm_embedding_info[0], dict):
+            raise ValueError(
+                "Llama4 image embedding must contain special token information")
+
+        # Extract embedding components
+        try:
+            mm_embeddings = [
+                mm_embedding['mm_embeddings']
+                for mm_embedding in mm_embedding_info
+            ]
+            mm_embedding_special_tokens = [
+                mm_embedding['image_special_tokens']
+                for mm_embedding in mm_embedding_info
+            ]
+            mm_embedding_special_offsets = [
+                mm_embedding['image_special_token_offsets']
+                for mm_embedding in mm_embedding_info
+            ]
+        except KeyError as e:
+            raise ValueError(
+                f"Missing required key in multimodal embedding: {e}")
+
+        # Validate embedding dimensions
+        model_hidden_size = self.model_config.text_config.hidden_size
+        for i, embedding in enumerate(mm_embeddings):
+            if embedding.shape[-1] != model_hidden_size:
+                raise ValueError(
+                    f"Multimodal embedding {i} hidden size {embedding.shape[-1]} "
+                    f"must match model hidden size {model_hidden_size}")
+
+        # Count image placeholders (number of images) in the prompt
+        total_placeholders = text_prompt.count(self.fake_image_token)
+        if total_placeholders == 0:
+            raise ValueError(
+                "No image placeholders found in the prompt, but multimodal embedding was provided"
+            )
+
+        if total_placeholders != len(mm_embeddings):
+            raise ValueError(
+                f"Number of image placeholders ({total_placeholders}) "
+                f"does not match number of embeddings ({len(mm_embeddings)})")
+
+        # Process prompt with image embeddings
+        prompt_splits = text_prompt.split(self.fake_image_token)
+        new_prompt_parts = []
+
+        for local_image_index, split_part in enumerate(prompt_splits):
+            new_prompt_parts.append(split_part)
+
+            if local_image_index < total_placeholders:
+                # Calculate total tokens for this image
+                num_tokens = len(mm_embeddings[local_image_index]) + len(
+                    mm_embedding_special_tokens[local_image_index])
+
+                # Create image token sequence
+                image_tokens = [self.image_token] * num_tokens
+
+                # Replace special tokens with actual decoded tokens
+                for offset, token_id in zip(
+                        mm_embedding_special_offsets[local_image_index],
+                        mm_embedding_special_tokens[local_image_index]):
+                    if offset < 0 or offset >= len(image_tokens):
+                        raise ValueError(
+                            f"Image special token offset {offset} is out of range with the total image tokens length {len(image_tokens)}"
+                        )
+                    if offset < len(image_tokens):
+                        image_tokens[offset] = self.tokenizer.decode([token_id])
+
+                # Join tokens without spaces
+                image_str = "".join(image_tokens)
+                new_prompt_parts.append(image_str)
+
+        # Combine all parts and tokenize
+        processed_text = "".join(new_prompt_parts)
+        kwargs = {}
+        if sampling_params.truncate_prompt_tokens is not None:
+            kwargs = dict(truncation=True,
+                          max_length=sampling_params.truncate_prompt_tokens)
+        text_inputs = self.tokenizer(
+            processed_text,
+            return_tensors="pt",
+            add_special_tokens=sampling_params.add_special_tokens,
+            **kwargs)
+        token_ids = text_inputs.input_ids.squeeze()
+
+        # Replace image token indices with out-of-vocabulary tokens
+        token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+        # Concatenate all multimodal embeddings
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = torch.cat(mm_embeddings,
+                                                            dim=0)
+        return token_ids.tolist(), {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()
     def __call__(
@@ -1033,7 +1169,13 @@ class Llama4InputProcessor(InputProcessor):
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
-@register_input_processor(Llama4InputProcessor, model_type="llama4")
+@register_input_processor(
+    Llama4InputProcessor,
+    model_type="llama4",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "<|image|>"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
 
@@ -1060,13 +1202,14 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_params = kwargs.get("multimodal_params", [])
-        if multimodal_params:
-            mm_embed = [
+        mm_embeds = []
+        if len(multimodal_params) > 0:
+            mm_embeds = [
                 multimodal_param.multimodal_data["multimodal_embedding"]
                 for multimodal_param in multimodal_params
             ]
-            input_ids, inputs_embeds = fuse_input_embeds(
-                self.model.embed_tokens, input_ids, mm_embed)
+        input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
+                                                     input_ids, mm_embeds)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

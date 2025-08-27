@@ -8,14 +8,14 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, SamplerType
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import (LoraConfig,
-                                       get_default_trtllm_modules_to_hf_modules,
-                                       load_torch_lora)
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_manager import load_torch_lora
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
@@ -24,12 +24,13 @@ from .config_utils import is_mla, is_nemotron_hybrid
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
+from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
-from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler
+from .resource_manager import (KVCacheManager, PeftCacheManager,
+                               ResourceManager, ResourceManagerType)
+from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
+                      TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
@@ -97,8 +98,7 @@ class KvCacheCreator:
             fraction = 0.9
         return fraction
 
-    def _cal_max_tokens(self, peak_memory, total_gpu_memory, fraction,
-                        alloc_kv_tokens: int) -> int:
+    def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
         kv_size_per_token = self._get_cache_size_per_token(
@@ -107,18 +107,25 @@ class KvCacheCreator:
             draft_model_config = self._draft_model_engine.model.model_config
             kv_size_per_token += self._get_cache_size_per_token(
                 draft_model_config, mapping)
+        return kv_size_per_token
+
+    def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
+                        allocated_bytes: int) -> int:
+        """
+        Calculate the max KV cache capacity.
+
+        NOTE: `allocated_bytes` is the total KV-cache memory that must be pre-allocated during the estimation phase (for both the main and draft models) so the estimation run can complete successfully. When computing `available_kv_mem`, add this amount back in.
+        """
+        kv_size_per_token = self._get_kv_size_per_token()
 
         available_kv_mem = (total_gpu_memory - peak_memory +
-                            alloc_kv_tokens * kv_size_per_token) * fraction
+                            allocated_bytes) * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
-            f", tmp kv_mem { (alloc_kv_tokens * kv_size_per_token) / (GB):.2f} GiB"
-        )
-        max_tokens = int((available_kv_mem) // kv_size_per_token)
-        max_tokens = max(max_tokens, 0)
-        return max_tokens
+            f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
+        return int(available_kv_mem)
 
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
@@ -143,6 +150,8 @@ class KvCacheCreator:
                                      end_id=-1)
             requests.append(request)
             remaining_tokens -= input_seq_len
+        if self._mapping.enable_attention_dp:
+            requests = requests * self._mapping.tp_size
         return requests
 
     def _get_token_num_for_estimation(self) -> int:
@@ -188,8 +197,9 @@ class KvCacheCreator:
             )
         return estimating_kv_cache
 
-    def estimate_max_tokens(self, py_executor: PyExecutor) -> None:
+    def configure_kv_cache_capacity(self, py_executor: PyExecutor) -> None:
         """Perform KV cache capacity estimation.
+        NOTE: for VSWA case, we calculate and set kv cache memory instead of using max_tokens in kv_cache_config.
 
         This updates `kv_cache_config`.
         """
@@ -240,8 +250,8 @@ class KvCacheCreator:
             torch_used_bytes = torch.cuda.memory_stats(
             )["allocated_bytes.all.current"]
         finally:
-            py_executor.shutdown()
             py_executor.is_warmup = False
+            py_executor.shutdown()
             py_executor.enable_iter_perf_stats = origin_iter_stats
             py_executor.set_gather_responses(False)
 
@@ -255,19 +265,74 @@ class KvCacheCreator:
         logger.info(
             f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
         )
+
+        # get kv cache stats for both model and draft model
         kv_stats = py_executor.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
+        kv_stats_draft = py_executor.resource_manager.resource_managers.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER).get_kv_cache_stats(
+            ) if self._draft_model_engine is not None else None
 
-        kv_cache_max_tokens = self._cal_max_tokens(
-            peak_memory, total_gpu_memory, fraction,
-            kv_stats.max_num_blocks * kv_stats.tokens_per_block)
+        # get total allocated bytes
+        allocated_bytes = kv_stats.allocated_bytes + (
+            kv_stats_draft.allocated_bytes if kv_stats_draft is not None else 0)
 
+        # calculate max memory from peak memory and free gpu memory fraction
+        kv_cache_max_memory = self._cal_max_memory(peak_memory,
+                                                   total_gpu_memory, fraction,
+                                                   allocated_bytes)
+
+        max_attention_window = executor_config.kv_cache_config.max_attention_window
+        is_vswa = max_attention_window and len(set(max_attention_window)) > 1
+
+        # NOTE:
+        # KvCacheCreator currently controls KV-cache capacity using two parameters in KVCacheConfig:
+        #   • max_tokens
+        #   • max_gpu_total_bytes
+        # Ideally, the internal logic would rely solely on max_gpu_total_bytes,
+        # leaving max_tokens as a user-defined constraint.
+
+        # ---------------------------handle max_tokens---------------------------------
+        # if user provided max_tokens, calculate max memory from max_tokens
         if self._max_kv_tokens_in is not None:
-            kv_cache_max_tokens = min(kv_cache_max_tokens,
-                                      self._max_kv_tokens_in)
+            # raise error if it is VSWA case
+            if is_vswa:
+                logger.warning(
+                    "max_tokens should not be set for VSWA case as it is ambiguous concept for VSWA."
+                )
+            # calculate max memory from max_tokens
+            kv_cache_max_memory_from_max_tokens = self._max_kv_tokens_in * self._get_kv_size_per_token(
+            )
+            kv_cache_max_memory = min(kv_cache_max_memory,
+                                      kv_cache_max_memory_from_max_tokens)
+            logger.info(
+                f"max_tokens={self._max_kv_tokens_in} is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
+            )
+        if is_vswa:
+            # For VSWA KvCacheManager now it can only use max_gpu_total_bytes
+            executor_config.kv_cache_config.max_tokens = None
+        else:
+            # For non-VSWA KvCacheManager, its logic still relies on max_tokens, need to improve in the future.
+            executor_config.kv_cache_config.max_tokens = int(
+                kv_cache_max_memory // self._get_kv_size_per_token())
+        # ---------------------------handle max_tokens---------------------------------
 
-        logger.info(f"Estimated max tokens in KV cache : {kv_cache_max_tokens}")
-        executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
+        # ---------------------------handle max_gpu_total_bytes---------------------------------
+        # if user provided max_gpu_total_bytes, set max memory from max_gpu_total_bytes
+        if executor_config.kv_cache_config.max_gpu_total_bytes > 0:
+            kv_cache_max_memory = min(
+                kv_cache_max_memory,
+                executor_config.kv_cache_config.max_gpu_total_bytes)
+            logger.info(
+                f"max_gpu_total_bytes={executor_config.kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
+            )
+
+        logger.info(
+            f"Estimated max memory in KV cache : {kv_cache_max_memory / (GB):.2f} GiB"
+        )
+        # set max_gpu_total_bytes
+        executor_config.kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(
             self, model_engine: PyTorchModelEngine) -> KVCacheManager:
@@ -311,6 +376,7 @@ class KvCacheCreator:
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
             )
         elif is_nemotron_hybrid(config):
             if executor_config.max_beam_width > 1:
@@ -326,17 +392,19 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
-                config.hidden_size,
                 config.ssm_state_size,
                 config.conv_kernel,
-                config.expand,
+                config.mamba_num_heads,
                 config.n_groups,
                 config.mamba_head_dim,
                 mamba_num_layers,
                 mamba_layer_mask,
                 config.torch_dtype,
+                model_engine.model.model_config.quant_config.
+                mamba_ssm_cache_dtype,
                 # kv cache parameters
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -374,6 +442,7 @@ class KvCacheCreator:
                 max_num_tokens=executor_config.max_num_tokens,
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
@@ -411,7 +480,6 @@ def create_py_executor_instance(
         executor_config,
         ctx_chunk_config,
         model_engine,
-        draft_model_engine,
         start_worker,
         sampler,
         drafter,
@@ -451,18 +519,16 @@ def create_py_executor_instance(
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
-        num_attn_layers = model_binding_config.num_attention_layers()
-        per_layer_kv_heads = [
-            model_binding_config.num_kv_heads(i) for i in range(num_attn_layers)
-        ]
-        num_kv_attention_heads = max(per_layer_kv_heads)
-        if len(set(per_layer_kv_heads)) > 1:
-            # NOTE: This code-path is currently untested and not validated. Can fail!
-            # This support is tracked in TRTLLM-6561
+        num_kv_attention_heads_per_layer = model_binding_config.num_kv_heads_per_layer
+        if max(num_kv_attention_heads_per_layer) != min(
+                num_kv_attention_heads_per_layer):
             logger.warning(
-                f"Non-uniform KV heads per layer detected, using max ({num_kv_attention_heads}) for LoRA. "
-                "This code-path is currently untested and not validated. May fail!"
+                "Defining LORA with per-layer KV heads is not supported for LORA, using the max number of KV heads per layer"
             )
+            num_kv_attention_heads = max(num_kv_attention_heads_per_layer)
+        else:
+            # all layers have the same number of KV heads
+            num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
 
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,
@@ -481,12 +547,17 @@ def create_py_executor_instance(
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
-        executor_config.peft_cache_config = trtllm.PeftCacheConfig(
-            num_device_module_layer=max_lora_rank * num_lora_modules *
-            lora_config.max_loras,
-            num_host_module_layer=max_lora_rank * num_lora_modules *
-            lora_config.max_cpu_loras,
+        peft_cache_config_model = PeftCacheConfig.from_pybind(
+            executor_config.peft_cache_config
+        ) if executor_config.peft_cache_config is not None else PeftCacheConfig(
         )
+        if lora_config.max_loras is not None:
+            peft_cache_config_model.num_device_module_layer = \
+                max_lora_rank * num_lora_modules * lora_config.max_loras
+        if lora_config.max_cpu_loras is not None:
+            peft_cache_config_model.num_host_module_layer = \
+                max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
+        executor_config.peft_cache_config = peft_cache_config_model._to_pybind()
 
         from tensorrt_llm.bindings import WorldConfig
         world_config = WorldConfig(
@@ -498,13 +569,15 @@ def create_py_executor_instance(
         )
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=executor_config.peft_cache_config,
+            lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules)
+            lora_config.trtllm_modules_to_hf_modules,
+            lora_config.swap_gate_up_proj_lora_b_weight)
 
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
 
@@ -519,8 +592,14 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
+    # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
+    # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
+    scheduler_capacity = max_num_sequences
+    if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
+        scheduler_capacity += 1
+
     capacity_scheduler = BindCapacityScheduler(
-        max_num_sequences,
+        scheduler_capacity,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         peft_cache_manager.impl if peft_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
@@ -551,7 +630,6 @@ def create_py_executor_instance(
         max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
-        draft_model_engine=draft_model_engine,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
@@ -580,14 +658,21 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         mapping,
         max_seq_len=engine.max_seq_len,
         enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
-    if mapping.cp_config.get('cp_type') == 'star_attention':
+    decoding_mode = get_decoding_mode(executor_config)
+    if mapping.cp_config.get('cp_type') == CpType.STAR:
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
-    if pytorch_backend_config.enable_trtllm_sampler:
-        decoding_mode = get_decoding_mode(executor_config)
+
+    if executor_config.mm_encoder_only:
+        # NOTE: handle model outputs specially for mm encoder executor/engine
+        return EarlyStopWithMMResult()
+    if pytorch_backend_config.sampler_type == SamplerType.TRTLLMSampler or (
+            pytorch_backend_config.sampler_type == SamplerType.auto
+            and decoding_mode.isBeamSearch()):
+        logger.debug(f"DecodingMode: {decoding_mode.name}")
         return TRTLLMSampler(executor_config, engine.model, engine.dtype,
                              mapping, decoding_mode,
                              pytorch_backend_config.disable_overlap_scheduler)
@@ -615,92 +700,6 @@ def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
         )
         decoding_mode = DecodingMode.TopKTopP()
 
-    # Override decoding mode when Medusa is used
-    if executor_config.speculative_config and executor_config.speculative_config.is_medusa and not decoding_mode.isMedusa(
-    ):
-        logger.warning(
-            "Model is Medusa, but decoding mode is not Medusa. Overwriting decoding mode to Medusa."
-        )
-        decoding_mode = DecodingMode.Medusa()
-
-    # Override decoding mode when Medusa is not used
-    if (not executor_config.speculative_config
-            or not executor_config.speculative_config.is_medusa
-        ) and decoding_mode.isMedusa():
-        logger.warning(
-            "Model is not Medusa, but decoding mode is Medusa. Overwriting decoding mode."
-        )
-        if executor_config.max_beam_width == 1:
-            decoding_mode = DecodingMode.TopKTopP()
-        else:
-            decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when lookahead decoding is used
-    if executor_config.speculative_config and executor_config.speculative_config.is_lookahead and not decoding_mode.isLookahead(
-    ):
-        logger.warning(
-            "Model is Lookahead, but decoding mode is not Lookahead. Overwriting decoding mode to Lookahead."
-        )
-        decoding_mode = DecodingMode.Lookahead()
-
-    # Override decoding mode when lookahead decoding is not used
-    if (not executor_config.speculative_config
-            or not executor_config.speculative_config.is_lookahead
-        ) and decoding_mode.isLookahead():
-        logger.warning(
-            "Model is not built with Lookahead decoding, but decoding mode is Lookahead. Overwriting decoding mode."
-        )
-        if executor_config.max_beam_width == 1:
-            decoding_mode = DecodingMode.TopKTopP()
-        else:
-            decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when 'explicit draft tokens' is used
-    if executor_config.speculative_config and executor_config.speculative_config.is_explicit_draft_tokens and not decoding_mode.isExplicitDraftTokens(
-    ):
-        logger.warning(
-            "Model is built with 'explicit draft tokens' decoding, but decoding mode is something else. Overwriting decoding mode."
-        )
-        decoding_mode = DecodingMode.ExplicitDraftTokens()
-
-    # Override decoding mode when 'explicit draft tokens' is not used
-    if (not executor_config.speculative_config
-            or not executor_config.speculative_config.is_explicit_draft_tokens
-        ) and decoding_mode.isExplicitDraftTokens():
-        logger.warning(
-            "Model is not built with 'explicit draft tokens' decoding, but decoding mode is set to it. Overwriting decoding mode to default."
-        )
-        if executor_config.max_beam_width == 1:
-            decoding_mode = DecodingMode.TopKTopP()
-        else:
-            decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when EAGLE is used
-    if executor_config.speculative_config and executor_config.speculative_config.is_eagle and not decoding_mode.isEagle(
-    ):
-        logger.warning(
-            "Model is Eagle, but decoding mode is not Eagle. Overwriting decoding mode to Eagle."
-        )
-        decoding_mode = DecodingMode.Eagle()
-
-    # Override decoding mode when Eagle is not used
-    if (not executor_config.speculative_config
-            or not executor_config.speculative_config.is_eagle
-        ) and decoding_mode.isEagle():
-        logger.warning(
-            "Model is not Eagle, but decoding mode is Eagle. Overwriting decoding mode."
-        )
-        if executor_config.max_beam_width == 1:
-            decoding_mode = DecodingMode.TopKTopP()
-        else:
-            decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when draft tokens are external
-    if executor_config.speculative_config and executor_config.speculative_config.is_draft_tokens_external:
-        logger.warning("Overwriting decoding mode to external draft token")
-        decoding_mode = DecodingMode.ExternalDraftTokens()
-
-    logger.debug(f"DecodingMode: {decoding_mode.name}")
     return decoding_mode
 
 

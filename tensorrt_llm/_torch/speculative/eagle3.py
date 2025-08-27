@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set
 
 import torch
 from torch import nn
@@ -35,9 +35,10 @@ class Eagle3ResourceManager(BaseResourceManager):
         # empty hidden states tensor
         max_num_tokens = min(max_num_tokens,
                              max_num_requests * self.max_seq_len)
-        self.hidden_states = torch.empty((max_num_tokens, self.hidden_size * 3),
-                                         dtype=self.dtype,
-                                         device='cuda')
+        self.hidden_states = torch.empty(
+            (max_num_tokens, self.hidden_size * config.num_capture_layers),
+            dtype=self.dtype,
+            device='cuda')
         # sequence length, only used for metadata preparation
         self.seq_lens = {i: 0 for i in range(max_num_requests)}
         # start indices of each slot
@@ -79,8 +80,7 @@ class Eagle3ResourceManager(BaseResourceManager):
 @dataclass
 class Eagle3SpecMetadata(SpecMetadata):
     hidden_states: List[torch.Tensor] = field(default_factory=list)
-    num_capture_layers: int = 3
-    layers_to_capture: Tuple[int, ...] = field(init=False)
+    layers_to_capture: Optional[Set[int]] = None
     target_model_embed_tokens: Optional[torch.nn.Module] = None
     hidden_size: int = 0
     max_num_tokens: int = 0
@@ -90,14 +90,19 @@ class Eagle3SpecMetadata(SpecMetadata):
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
 
     def __post_init__(self):
-        if self.num_layers == 1:
-            self.layers_to_capture = (0, )
-        else:
-            if self.num_layers <= 5:
-                raise ValueError("Not enough hidden layers for EAGLE")
+        if self.layers_to_capture is None:
+            if self.num_layers == 1:
+                self.layers_to_capture = (self.num_layers - 1, )
+            else:
+                if self.num_layers <= 5:
+                    raise ValueError(
+                        "Not enough hidden layers for default EAGLE3 capture")
 
-            self.layers_to_capture = (1, self.num_layers // 2 - 1,
-                                      self.num_layers - 4)
+                self.layers_to_capture = (1, self.num_layers // 2 - 1,
+                                          self.num_layers - 4)
+        else:
+            self.layers_to_capture = sorted(list(self.layers_to_capture))
+        self.num_capture_layers = len(self.layers_to_capture)
 
         # Initialize to 0 to avoid reading uninitialized memory during warmup
         self.hidden_states_read_indices = torch.zeros([self.max_num_tokens],
@@ -186,7 +191,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # The hidden states
     hidden_states: Optional[torch.Tensor] = None
     # The layers to be captured
-    layers_to_capture: Tuple[int, ...] = field(init=False)
+    layers_to_capture: Optional[Set[int]] = None
     # The hidden size of the hidden states
     hidden_size: int = 0
     # The max number of tokens
@@ -197,14 +202,19 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     batch_indices_cuda: Optional[torch.Tensor] = None
 
     def __post_init__(self):
-        if self.num_layers == 1:
-            self.layers_to_capture = (1, )
-        else:
-            if self.num_layers <= 5:
-                raise ValueError("Not enough hidden layers for EAGLE")
+        if self.layers_to_capture is None:
+            if self.num_layers == 1:
+                self.layers_to_capture = (self.num_layers - 1, )
+            else:
+                if self.num_layers <= 5:
+                    raise ValueError(
+                        "Not enough hidden layers for default EAGLE3 capture")
 
-            self.layers_to_capture = (1, self.num_layers // 2 - 1,
-                                      self.num_layers - 4)
+                self.layers_to_capture = (1, self.num_layers // 2 - 1,
+                                          self.num_layers - 4)
+        else:
+            self.layers_to_capture = sorted(list(self.layers_to_capture))
+        self.num_capture_layers = len(self.layers_to_capture)
         self.hidden_states = torch.empty(
             (self.max_num_tokens,
              self.hidden_size * len(self.layers_to_capture)),
@@ -266,7 +276,8 @@ class Eagle3OneModelWorker(nn.Module):
         self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
 
-    @torch.compile(options={"max-autotune": True})
+    # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
+    # @torch.compile(options={"max-autotune": True})
     def forward(self, input_ids, position_ids, hidden_states, logits,
                 attn_metadata, spec_metadata, draft_model):
         batch_size = attn_metadata.num_seqs

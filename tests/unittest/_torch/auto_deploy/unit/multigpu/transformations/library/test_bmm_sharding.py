@@ -6,16 +6,12 @@ import pytest
 import torch
 import torch.nn as nn
 from _dist_test_utils import get_device_counts
-from _graph_test_helpers import run_sharding_pattern_detection_test, run_test
+from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import (
-    BMMShardingInfo,
-    ShardingConfig,
-    detect_dp_bmm_shard,
-    sharding_transform_executor,
-)
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import BMMShardingInfo
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -64,22 +60,30 @@ def _run_job(
     num_experts = num_experts_multiplier * world_size
     model = BMM(num_experts, num_features).to(device="cuda", dtype=torch.float16)
     x = torch.randn(batch_size * num_experts, num_features, device="cuda", dtype=torch.float16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "use_sharding_from_factory": False,
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )(None, gm)
 
     def _get_expected_num_params(num_p_og: int) -> int:
         num_params = num_p_og // world_size
         return num_params
 
-    def transform_func(gm) -> None:
-        sharding_config = ShardingConfig()
-        detect_dp_bmm_shard(gm, rank, world_size, sharding_config)
-        sharding_transform_executor(gm, sharding_config)
-
     # now run the test
     op_expected = getattr(torch.ops.auto_deploy, "torch_dist_all_gather")
-    run_test(
+    run_test_transformed_gm(
         model,
         x,
-        transform=transform_func,
+        gm_transformed,
         check_transformed_graph=lambda gm: any(is_op(n, op_expected) for n in gm.graph.nodes)
         == (world_size > 1),
         _get_expected_num_params=_get_expected_num_params,
@@ -118,9 +122,19 @@ def _run_pattern_detection_job(
                 )
 
     # get detected transformations
-    sharding_config = ShardingConfig()
-    detect_dp_bmm_shard(gm, rank, world_size, sharding_config)
-    detected_transformations = sharding_config.bmm_transforms
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "use_sharding_from_factory": False,
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = rank
+    optimizer.shared_config.world_size = world_size
+    _ = optimizer(None, gm)
+    detected_transformations = optimizer.shared_config.sharding_config.bmm_transforms
 
     # Run pattern detection test
     run_sharding_pattern_detection_test(detected_transformations, expected_transformations)

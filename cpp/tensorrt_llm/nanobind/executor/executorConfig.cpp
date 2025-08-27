@@ -21,6 +21,7 @@
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <cstdint>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/map.h>
@@ -110,11 +111,12 @@ void initConfigBindings(nb::module_& m)
         return nb::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
             self.getOnboardBlocks(), self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(),
-            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm());
+            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm(),
+            self.getAttentionDpEventsGatherPeriodMs(), self.getMaxGpuTotalBytes());
     };
     auto kvCacheConfigSetstate = [](tle::KvCacheConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 13)
+        if (state.size() != 15)
         {
             throw std::runtime_error("Invalid state!");
         }
@@ -123,20 +125,22 @@ void initConfigBindings(nb::module_& m)
             nb::cast<std::optional<float>>(state[4]), nb::cast<std::optional<size_t>>(state[5]),
             nb::cast<bool>(state[6]), nb::cast<std::optional<float>>(state[7]),
             nb::cast<std::optional<tle::RetentionPriority>>(state[8]), nb::cast<size_t>(state[9]),
-            nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), nb::cast<bool>(state[12]));
+            nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), nb::cast<bool>(state[12]),
+            nb::cast<SizeType32>(state[13]), std::nullopt, nb::cast<uint64_t>(state[14]));
     };
     nb::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(nb::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&, bool,
                  std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&, bool, bool, bool,
-                 std::optional<RuntimeDefaults> const&>(),
+                 SizeType32, std::optional<RuntimeDefaults> const&, uint64_t const&>(),
             nb::arg("enable_block_reuse") = true, nb::arg("max_tokens") = nb::none(),
             nb::arg("max_attention_window") = nb::none(), nb::arg("sink_token_length") = nb::none(),
             nb::arg("free_gpu_memory_fraction") = nb::none(), nb::arg("host_cache_size") = nb::none(),
             nb::arg("onboard_blocks") = true, nb::arg("cross_kv_cache_fraction") = nb::none(),
             nb::arg("secondary_offload_min_priority") = nb::none(), nb::arg("event_buffer_max_size") = 0, nb::kw_only(),
             nb::arg("enable_partial_reuse") = true, nb::arg("copy_on_partial_reuse") = true, nb::arg("use_uvm") = false,
-            nb::arg("runtime_defaults") = nb::none())
+            nb::arg("attention_dp_events_gather_period_ms") = 5, nb::arg("runtime_defaults") = nb::none(),
+            nb::arg("max_gpu_total_bytes") = 0)
         .def_prop_rw(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_prop_rw("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
@@ -159,6 +163,10 @@ void initConfigBindings(nb::module_& m)
         .def_prop_rw("copy_on_partial_reuse", &tle::KvCacheConfig::getCopyOnPartialReuse,
             &tle::KvCacheConfig::setCopyOnPartialReuse)
         .def_prop_rw("use_uvm", &tle::KvCacheConfig::getUseUvm, &tle::KvCacheConfig::setUseUvm)
+        .def_prop_rw("attention_dp_events_gather_period_ms", &tle::KvCacheConfig::getAttentionDpEventsGatherPeriodMs,
+            &tle::KvCacheConfig::setAttentionDpEventsGatherPeriodMs)
+        .def_prop_rw(
+            "max_gpu_total_bytes", &tle::KvCacheConfig::getMaxGpuTotalBytes, &tle::KvCacheConfig::setMaxGpuTotalBytes)
         .def("fill_empty_fields_from_runtime_defaults", &tle::KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults)
         .def("__getstate__", kvCacheConfigGetstate)
         .def("__setstate__", kvCacheConfigSetstate);
@@ -477,7 +485,7 @@ void initConfigBindings(nb::module_& m)
             c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
             c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
-            c.getPromptTableOffloading(), c.getEnableTrtOverlap());
+            c.getPromptTableOffloading(), c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge());
         auto pickle_tuple = nb::make_tuple(cpp_states, nb::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -490,7 +498,7 @@ void initConfigBindings(nb::module_& m)
         }
 
         auto cpp_states = nb::cast<nb::tuple>(state[0]);
-        if (cpp_states.size() != 28)
+        if (cpp_states.size() != 29)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -525,7 +533,8 @@ void initConfigBindings(nb::module_& m)
             nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[24]),             // CacheTransceiverConfig
             nb::cast<bool>(cpp_states[25]),                                                   // GatherGenerationLogits
             nb::cast<bool>(cpp_states[26]),                                                   // PromptTableOffloading
-            nb::cast<bool>(cpp_states[27])                                                    // EnableTrtOverlap
+            nb::cast<bool>(cpp_states[27]),                                                   // EnableTrtOverlap
+            nb::cast<bool>(cpp_states[28]) // FailFastOnAttentionWindowTooLarge
         );
 
         // Restore Python data
@@ -564,7 +573,8 @@ void initConfigBindings(nb::module_& m)
                  std::optional<tle::CacheTransceiverConfig>,             // CacheTransceiverConfig
                  bool,                                                   // GatherGenerationLogits
                  bool,                                                   // PromptTableOffloading
-                 bool                                                    // EnableTrtOverlap
+                 bool,                                                   // EnableTrtOverlap
+                 bool                                                    // FailFastOnAttentionWindowTooLarge
                  >(),
             nb::arg("max_beam_width") = 1, nb::arg("scheduler_config") = tle::SchedulerConfig(),
             nb::arg("kv_cache_config") = tle::KvCacheConfig(), nb::arg("enable_chunked_context") = false,
@@ -582,7 +592,7 @@ void initConfigBindings(nb::module_& m)
             nb::arg("spec_dec_config") = nb::none(), nb::arg("guided_decoding_config") = nb::none(),
             nb::arg("additional_model_outputs") = nb::none(), nb::arg("cache_transceiver_config") = nb::none(),
             nb::arg("gather_generation_logits") = false, nb::arg("mm_embedding_offloading") = false,
-            nb::arg("enable_trt_overlap") = false)
+            nb::arg("enable_trt_overlap") = false, nb::arg("fail_fast_on_attention_window_too_large") = false)
         .def_prop_rw("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_prop_rw("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_prop_rw("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -632,6 +642,9 @@ void initConfigBindings(nb::module_& m)
             &tle::ExecutorConfig::setPromptTableOffloading)
         .def_prop_rw(
             "enable_trt_overlap", &tle::ExecutorConfig::getEnableTrtOverlap, &tle::ExecutorConfig::setEnableTrtOverlap)
+        .def_prop_rw("fail_fast_on_attention_window_too_large",
+            &tle::ExecutorConfig::getFailFastOnAttentionWindowTooLarge,
+            &tle::ExecutorConfig::setFailFastOnAttentionWindowTooLarge)
         .def("__getstate__", executorConfigGetState)
         .def("__setstate__", executorConfigSetState);
 }

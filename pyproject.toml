@@ -2,7 +2,7 @@
 ###############################  BUILD CONFIGURATION  ##############################################
 ####################################################################################################
 [build-system]
-requires = ["setuptools >= 64"]
+requires = ["setuptools >= 64", "pip >= 24"]
 build-backend = "setuptools.build_meta"
 
 ####################################################################################################
@@ -33,6 +33,7 @@ extend_skip_glob = [
     "tensorrt_llm/top_model_mixin.py",
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
+    "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
 ]
 
 [tool.yapf]
@@ -63,12 +64,13 @@ ignore_patterns = [
     "tensorrt_llm/top_model_mixin.py",
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
+    "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
 ]
 
 [tool.codespell]
 skip = ".git,3rdparty,tests/integration/test_input_files**,**.jsonl,**.json"
 exclude-file = "examples/models/core/whisper/tokenizer.py"
-ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw"
+ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw,dOut"
 
 [tool.autoflake]
 in-place = true
@@ -97,6 +99,7 @@ exclude = [
     "tensorrt_llm/top_model_mixin.py",
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
+    "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
 ]
 
 
@@ -140,6 +143,7 @@ include = [
     "tensorrt_llm/top_model_mixin.py",
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
+    "tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py",
 ]
 exclude = [
     "**3rdparty/**",

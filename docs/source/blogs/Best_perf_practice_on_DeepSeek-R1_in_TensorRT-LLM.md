@@ -149,7 +149,6 @@ export TRTLLM_ENABLE_PDL=1
 trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     throughput \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --num_requests 10 \
     --concurrency 1 \
     --max_batch_size 1 \
@@ -161,7 +160,6 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 Explanation:
 - `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published. See [TensorRT-LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
 - `--dataset`: Prompt dataset used to benchmark. Our official benchmark dataset has ISL = 1K, OSL = 2K
-- `--backend`: Inference backend. Here we use PyTorch backend.
 - `--num_requests`: Num requests used for the benchmark.
 - `--concurrency`: Total concurrency for the system.
 - `--max_batch_size`: Max batch size in each rank.
@@ -216,7 +214,6 @@ EOF
 trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
      throughput
      --dataset ${YOUR_DATA_PATH}
-     --backend pytorch
      --tp 8  --ep 8
      --extra_llm_api_options ./extra-llm-api-config.yml
      --max_batch_size 896
@@ -285,7 +282,6 @@ trtllm-bench -m nvidia/DeepSeek-R1-FP4 \
     --ep 8 \
     --warmup 0 \
     --dataset ${YOUR_DATA_PATH} \
-    --backend pytorch \
     --max_batch_size 384 \
     --max_num_tokens 1536 \
     --num_requests 49152 \
@@ -325,7 +321,6 @@ EOF
 trtllm-bench --model deepseek-ai/DeepSeek-R1 \
     throughput \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --num_requests 10 \
     --max_batch_size 1 \
     --tp 8 \
@@ -380,7 +375,6 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --ep 8 \
     --warmup 0 \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --max_batch_size 128 \
     --max_num_tokens 1151 \
     --num_requests 5120 \
@@ -418,9 +412,10 @@ Generally, you should make sure that `max_batch_size` is not too low to bottlene
 
 For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
-### Not supported: MLA chunked context support on Hopper
+### MLA chunked context
 
-MLA chunked context support has been added on Blackwell GPUs, while it's not supported on Hopper yet. On Hopper, note that `max_num_tokens` has to be at least larger than the max input sequence length of the samples in dataset.
+MLA currently supports the chunked context feature on both Hopper and Blackwell GPUs. You can use `--enable_chunked_context` to enable it. This feature is primarily designed to reduce TPOT (Time Per Output Token). The default chunk size is set to `max_num_tokens`. If you want to achieve a lower TPOT, you can appropriately reduce the chunk size. However, please note that this will also decrease overall throughput. Therefore, a trade-off needs to be considered. 
+
 For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Out of memory issues

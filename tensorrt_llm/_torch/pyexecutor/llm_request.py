@@ -1,9 +1,11 @@
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 
@@ -171,6 +173,7 @@ class PyResult:
             max_new_tokens, use_device_memory, exclude_last_generation_logits
         ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
+        self._mm_embeddings = None
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -185,6 +188,10 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+
+    def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
+        self._mm_embeddings = SharedTensorContainer.from_tensor(
+            mm_embeddings).dump_to_dict()
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -223,11 +230,16 @@ class PyResult:
     def cum_log_probs(self) -> list[float] | None:
         return self._log_probs and self._log_probs.cum_log_probs
 
+    @property
+    def mm_embedding_handle(self) -> Dict[str, Any] | None:
+        return self._mm_embeddings
+
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
+        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
+         'mm_embedding_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
@@ -248,6 +260,12 @@ class LlmResult:
     def deserialize(self):
         self._result = tensorrt_llm.bindings.executor.deserialize_result(
             self._result)
+
+    def get_result(self):
+        if tmp_res := tensorrt_llm.bindings.executor.deserialize_result(
+                self._result):
+            return tmp_res
+        return None
 
 
 @dataclass
@@ -277,22 +295,31 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             exclude_last_generation_logits: bool = False,
             return_perf_metrics: bool = False,
             stop_words_list: list[list[int]] | None = None,
+            llm_request: Optional[
+                tensorrt_llm.bindings.internal.batch_manager.LlmRequest] = None,
             is_draft: bool = False,
+            seq_slot: Optional[int] = None,
+            target_seq_slot: Optional[int] = None,
             **kwargs):
+
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
-        super().__init__(
-            *args,
-            client_id=client_id,
-            return_log_probs=return_log_probs,
-            return_context_logits=False,
-            return_generation_logits=False,
-            return_perf_metrics=return_perf_metrics,
-            stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
-            if stop_words_list else None,
-            **kwargs)
+        if llm_request is not None:
+            super().__init__(llm_request)
+        else:
+            super().__init__(
+                *args,
+                client_id=client_id,
+                return_log_probs=return_log_probs,
+                return_context_logits=False,
+                return_generation_logits=False,
+                return_perf_metrics=return_perf_metrics,
+                stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
+                if stop_words_list else None,
+                **kwargs)
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
@@ -301,22 +328,31 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_orig_prompt_len = self.orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens
         self.py_batch_idx = None
+        self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_context_chunk = (None, None)
+        self.py_draft_logits = None
+        self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
-        self.py_lora_task_layer_module_configs = None
+        self.py_lora_task_layer_module_configs: list[
+            tensorrt_llm.bindings.internal.runtime.
+            TaskLayerModuleConfig] | None = None
 
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_is_draft = is_draft
-        self.py_seq_slot = None
+        # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
+        self.py_seq_slot = seq_slot
+        # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
+        self.py_target_seq_slot = target_seq_slot
+        self.use_draft_model = is_draft
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -327,6 +363,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_log_probs, return_context_logits,
                                   return_generation_logits,
                                   exclude_last_generation_logits)
+        self.child_requests = []
+
+        self._py_embedding_bias_1d = None
+        if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
+            # Pre-squeeze to 1D if needed (remove batch dimension)
+            if self.embedding_bias.dim() > 1:
+                self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
+            else:
+                self._py_embedding_bias_1d = self.embedding_bias
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
@@ -338,7 +383,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
         return LlmResponse(
-            request_id=self.py_request_id,
+            request_id=self.py_request_id
+            if self.is_child else self.parent_request_id,
             result=LlmResult(result, self.py_result, is_final),
             client_id=self.py_client_id) if len(result) > 0 else None
 
@@ -350,6 +396,32 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """CPP finish by reason does not support beam_width > 1"""
         self.state = LlmRequestState.GENERATION_COMPLETE
         self.set_finished_reason(reason, beam)
+
+    def create_child_request(self, child_id):
+        child = super().create_child_request(child_id)
+        py_request = LlmRequest(llm_request=child)
+
+        # Copy all py_* attributes from parent to child
+        for attr_name, attr_value in self.__dict__.items():
+            if attr_name.startswith('py_'):
+                attr_value = getattr(self, attr_name)
+                setattr(py_request, attr_name, deepcopy(attr_value))
+            elif attr_name in ['is_attention_dp_dummy', 'is_cuda_graph_dummy']:
+                setattr(py_request, attr_name, attr_value)
+
+        # Rewrite specific attributes that should use child_request values.
+        py_request.py_request_id = child.request_id
+        py_request.py_batch_idx = None
+        py_request.py_seq_slot = None
+
+        py_request.child_requests = []
+
+        assert py_request.is_child
+        assert py_request.request_id == child.request_id
+        assert py_request.parent_request_id == self.request_id
+        assert py_request.sampling_config.random_seed != self.sampling_config.random_seed
+
+        self.child_requests.append(py_request)
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
@@ -392,6 +464,7 @@ def convert_wordlist(word_list) -> List[List[int]]:
 def executor_request_to_llm_request(
         req_id: int,
         executor_request: ExecutorRequest,
+        child_req_ids: List[int],
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
@@ -427,9 +500,7 @@ def executor_request_to_llm_request(
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
         pad_id=executor_request.pad_id,
-        embedding_bias=torch.tensor(executor_request.embedding_bias,
-                                    dtype=torch.int32)
-        if executor_request.embedding_bias else None,
+        embedding_bias=executor_request.embedding_bias,
         bad_words_list=torch.tensor(
             convert_wordlist(executor_request.bad_words), dtype=torch.int32)
         if executor_request.bad_words else None,
@@ -448,6 +519,7 @@ def executor_request_to_llm_request(
         if executor_request.lora_config is not None else None,
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
+        py_lora_path=getattr(executor_request, "py_lora_path", None),
         mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         mrope_position_deltas=mrope_position_deltas,
         lookahead_config=None,
@@ -476,4 +548,22 @@ def executor_request_to_llm_request(
         context_phase_params=executor_request.context_phase_params,
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
+    if child_req_ids:
+        for child_id in child_req_ids:
+            llm_request.create_child_request(child_id)
+
     return llm_request
+
+
+def get_draft_token_length(request: LlmRequest) -> int:
+    """Get the length of draft tokens for a given request.
+
+    Args:
+        request: The LlmRequest to get draft token length for
+
+    Returns:
+        The number of draft tokens, or 0 if no draft tokens exist
+    """
+    if request.py_draft_tokens is not None:
+        return len(request.py_draft_tokens)
+    return 0

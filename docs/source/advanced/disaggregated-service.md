@@ -1,10 +1,10 @@
 (disaggregated-service)=
 
-# Disaggregated-Service (Experimental)
+# Disaggregated-Service (Prototype)
 
 ```{note}
 Note:
-This feature is currently experimental, and the related API is subjected to change in future versions.
+This feature is currently in prototype, and the related API is subjected to change in future versions.
 ```
 Currently TRT-LLM supports `disaggregated-service`, where the context and generation phases of a request can run on different executors. TRT-LLM's disaggregated service relies on the executor API, please make sure to read the [executor page](executor.md) before reading the document.
 
@@ -36,6 +36,8 @@ There are some other useful environment variables that may help when encounterin
 
 * `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
 
+* `UCX_MAX_RNDV_RAILS`: With the default value `2`, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting `UCX_MAX_RNDV_RAILS=1` can reduce contention in this case.
+
 ## Troubleshooting and FAQ
 
 ### General FAQs
@@ -66,17 +68,6 @@ A. Yes, it's recommended that different executor use different GPUs . We support
 
 ### Debugging FAQs
 
-*Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
-
-A. please set `backendType` of `CacheTransceiverConfig`.
-```cpp
-ExecutorConfig executorConfig{...};
-
-executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::DEFAULT));
-```
-
-When the environment variable `TRTLLM_USE_MPI_KVCACHE=1` is set, TRT-LLM will transfer the KV cache using `CUDA-aware MPI`. All executor processes involved must share the same MPI world communicator. Consequently, with `TRTLLM_USE_MPI_KVCACHE=1`, TRT-LLM only supports launching multiple executors via `MPI`. Additionally, the `CommunicationMode` for the executors must be set to `kLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for the `disaggregated-service`. These restrictions do not apply when `TRTLLM_USE_UCX_KVCACHE=1` is set.
-
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
@@ -85,7 +76,7 @@ A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
 
 A. The communication for kvCache transfer between executors are established dynamically. The connection establishment process incurs significant overhead, which explains the apparently lower kvCache transfer bandwidth observed during the initial requests after service startup. This lower bandwidth reflects the inclusion of connection establishment overhead. When conducting benchmarks, it is recommended to perform a warm-up phase to ensure accurate performance measurements.
 
-*Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?
+*Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?*
 
 A. NVLink domain can be found with `nvidia-smi -q` in the `Fabric.ClusterUUID` field. A few UCX environment variables can be adjusted when your servers have different NVLink domains:
 

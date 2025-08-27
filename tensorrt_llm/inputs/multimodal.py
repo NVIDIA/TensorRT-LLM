@@ -159,6 +159,10 @@ class MultimodalParams:
         multimodal_input: Multimodal input data with hashing information.
         multimodal_data: Processed multimodal data containing embeddings, configurations,
                         and modality-specific data organized by type.
+        multimodal_runtime: Runtime data for tracking multimodal token caching and reuse
+                           during KV cache scenarios. Contains information about cached
+                           tokens, multimodal token positions, and lengths for efficient
+                           processing during inference.
 
     Structure of multimodal_data:
         {
@@ -190,6 +194,168 @@ class MultimodalParams:
         if self.multimodal_data is None:
             self.multimodal_data = {}
 
+    def _is_shared_tensor_dict(self, obj: Any) -> bool:
+        """Check if an object is a shared tensor dictionary.
+
+        Args:
+            obj: Object to check
+
+        Returns:
+            True if the object is a shared tensor dictionary, False otherwise
+        """
+        if not isinstance(obj, dict):
+            return False
+
+        # Check for required keys that uniquely identify a shared tensor dict
+        required_keys = {'method_key'}
+        if not required_keys.issubset(obj.keys()):
+            return False
+
+        # Additional validation based on method_key
+        method_key = obj.get('method_key')
+
+        # Import here to avoid circular imports
+        from tensorrt_llm._torch.shared_tensor import \
+            _SharedTensorRebuildMethodRegistry
+
+        if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
+            cuda_keys = {'tensor_size', 'storage_handle', 'storage_device'}
+            return cuda_keys.issubset(obj.keys())
+        elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
+            cpu_keys = {'tensor_size', 'storage_handle', 'manager_handle'}
+            return cpu_keys.issubset(obj.keys())
+
+        return False
+
+    def _apply_tensor_operation(
+            self, input_data: Union[torch.Tensor, List, dict, None],
+            operation: str, **kwargs) -> Union[torch.Tensor, List, dict, None]:
+        """Apply tensor operations recursively to nested data structures.
+
+        This method handles three types of operations:
+        - "to_handle": Convert tensors to shared tensor dictionaries
+        - "to_tensor": Convert shared tensor dictionaries back to tensors
+        - "to_device": Move tensors to specified device
+
+        Args:
+            input_data: Input data structure (tensor, list, dict, or None)
+            operation: Operation to apply
+            **kwargs: Additional arguments for the operation
+
+        Returns:
+            Transformed data structure
+        """
+        # Handle None case
+        if input_data is None:
+            return None
+
+        # Handle list case - recursively process each element
+        if isinstance(input_data, list):
+            return [
+                self._apply_tensor_operation(item, operation, **kwargs)
+                for item in input_data
+            ]
+
+        # Handle dictionary case
+        if isinstance(input_data, dict):
+            if operation == "to_tensor" and self._is_shared_tensor_dict(
+                    input_data):
+                # Convert shared tensor dict back to tensor
+                try:
+                    # Import here to avoid circular imports
+                    from tensorrt_llm._torch.shared_tensor import \
+                        SharedTensorContainer
+
+                    return SharedTensorContainer.from_dict(
+                        input_data).get_local_view()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to restore tensor from shared tensor dict: {e}"
+                    )
+            else:
+                # Regular dictionary - recursively process values
+                return {
+                    key: self._apply_tensor_operation(value, operation,
+                                                      **kwargs)
+                    for key, value in input_data.items()
+                }
+
+        # Handle tensor case
+        if isinstance(input_data, torch.Tensor):
+            if operation == "to_handle":
+                try:
+                    # Import here to avoid circular imports
+                    from tensorrt_llm._torch.shared_tensor import \
+                        SharedTensorContainer
+                    return SharedTensorContainer.from_tensor(
+                        input_data).dump_to_dict()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to convert tensor to shared tensor: {e}")
+            elif operation == "to_device":
+                device = kwargs.get('device')
+                if device is None:
+                    raise ValueError(
+                        "Device must be specified for 'to_device' operation")
+
+                pin_memory = kwargs.get('pin_memory', False)
+                try:
+                    if pin_memory and input_data.device.type == 'cpu':
+                        return input_data.pin_memory().to(device,
+                                                          non_blocking=True)
+                    else:
+                        return input_data.to(device, non_blocking=True)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to move tensor to device {device}: {e}")
+
+        # For any other type, return as-is
+        return input_data
+
+    def to_handle(self, element: str) -> None:
+        """Move specified multimodal data element to shared tensor.
+
+        Args:
+            element: Element to move (only "multimodal_data" is supported)
+
+        Raises:
+            ValueError: If element is not "multimodal_data"
+            RuntimeError: If tensor conversion fails
+        """
+        if element != "multimodal_data":
+            raise ValueError(
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
+
+        data = getattr(self, element)
+        if data is None:
+            return  # Nothing to convert
+
+        transformed_data = self._apply_tensor_operation(data, "to_handle")
+        setattr(self, element, transformed_data)
+
+    def to_tensor(self, element: str) -> None:
+        """Move specified multimodal data element from shared tensor.
+
+        Args:
+            element: Element to restore (only "multimodal_data" is supported)
+
+        Raises:
+            ValueError: If element is not "multimodal_data"
+            RuntimeError: If tensor restoration fails
+        """
+        if element != "multimodal_data":
+            raise ValueError(
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
+
+        data = getattr(self, element)
+        if data is None:
+            return  # Nothing to restore
+
+        restored_data = self._apply_tensor_operation(data, "to_tensor")
+        setattr(self, element, restored_data)
+
     def to_device(self,
                   element: str,
                   device: str,
@@ -197,84 +363,47 @@ class MultimodalParams:
         """Move specified multimodal data element to target device.
 
         Args:
-            element: Element to move ("multimodal_data" or "multimodal_input")
+            element: Element to move (only "multimodal_data" is supported)
             device: Target device (e.g., "cuda", "cpu")
             pin_memory: Whether to pin memory for faster transfers
+
+        Raises:
+            ValueError: If element is not "multimodal_data" or device is invalid
+            RuntimeError: If device transfer fails
         """
+        if element != "multimodal_data":
+            raise ValueError(
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
 
-        def _to_device(
-            input_tensor: Union[torch.Tensor, List, dict, None],
-            pin_memory: bool = False,
-        ) -> Union[torch.Tensor, List, dict, None]:
-            if input_tensor is None:
-                return None
-            elif isinstance(input_tensor, list):
-                return [_to_device(item, pin_memory) for item in input_tensor]
-            elif isinstance(input_tensor, dict):
-                return {
-                    key: _to_device(value, pin_memory)
-                    for key, value in input_tensor.items()
-                }
-            elif isinstance(input_tensor, torch.Tensor):
-                if pin_memory and input_tensor.device.type == 'cpu':
-                    return input_tensor.pin_memory().to(device,
-                                                        non_blocking=True)
-                else:
-                    return input_tensor.to(device, non_blocking=True)
-            else:
-                return input_tensor
+        data = getattr(self, element)
+        if data is None:
+            return  # Nothing to move
 
-        if element == "multimodal_data":
-            self.multimodal_data = _to_device(self.multimodal_data, pin_memory)
-        elif element == "multimodal_input":
-            self.multimodal_input = _to_device(self.multimodal_input,
-                                               pin_memory)
-        else:
-            print(
-                f"MultimodalParams: Unsupported element '{element}' to move to device. "
-                f"Supported elements: 'multimodal_data', 'multimodal_input'")
-
-    def strip_for_context(self) -> None:
-        """Strip multimodal data for context processing.
-
-        Removes only mrope_position_deltas while keeping all other multimodal data
-        (embeddings, images, etc.) needed for context phase processing.
-        """
-        if not (self.multimodal_data
-                and 'mrope_config' in self.multimodal_data):
-            return
-
-        mrope_config = self.multimodal_data['mrope_config']
-        if 'mrope_position_deltas' in mrope_config:
-            del mrope_config['mrope_position_deltas']
-
-            # Clean up empty mrope_config
-            if not mrope_config:
-                del self.multimodal_data['mrope_config']
+        transformed_data = self._apply_tensor_operation(data,
+                                                        "to_device",
+                                                        device=device,
+                                                        pin_memory=pin_memory)
+        setattr(self, element, transformed_data)
 
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_position_deltas and removes all other multimodal data
+        Keeps only mrope_config and removes all other multimodal data
         (embeddings, images, etc.) as they're not needed during generation.
         """
         if not self.multimodal_data:
             return
 
-        # Extract mrope_position_deltas before clearing
-        mrope_position_deltas = None
+        # Extract mrope_config before clearing
+        mrope_config = None
         if 'mrope_config' in self.multimodal_data:
             mrope_config = self.multimodal_data['mrope_config']
-            if isinstance(mrope_config,
-                          dict) and 'mrope_position_deltas' in mrope_config:
-                mrope_position_deltas = mrope_config['mrope_position_deltas']
 
-        # Clear all data and restore only position deltas if they exist
+        # Clear all data and restore only mrope_config if it exists
         self.multimodal_data = {}
-        if mrope_position_deltas is not None:
-            self.multimodal_data['mrope_config'] = {
-                'mrope_position_deltas': mrope_position_deltas
-            }
+        if mrope_config is not None:
+            self.multimodal_data['mrope_config'] = mrope_config
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""

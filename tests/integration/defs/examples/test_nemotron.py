@@ -15,8 +15,14 @@
 
 import pytest
 from defs.common import venv_check_call, venv_mpi_check_call
-from defs.conftest import skip_fp8_pre_ada
+from defs.conftest import get_sm_version, skip_fp8_pre_ada
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.mark.skip_less_device_memory(50000)

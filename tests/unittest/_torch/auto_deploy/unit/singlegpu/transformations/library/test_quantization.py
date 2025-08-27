@@ -4,19 +4,36 @@ Tests for basic graph sharding.
 
 import pytest
 import torch
-from _graph_test_helpers import run_test
+from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MLP, BMMDynamicModel, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import QUANT_OPS
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library import quantize
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale
 
 
 def check_quantized(gm):
     return any(is_op(n, QUANT_OPS) for n in gm.graph.nodes)
+
+
+class DummyFactory(ModelFactory):
+    """Dummy factory to pass quant_config for testing."""
+
+    def __init__(self, quant_config):
+        self.quant_config = quant_config
+
+    def _build_model(self, device: str):
+        return
+
+    def _load_checkpoint(self, model, device):
+        return
+
+    def get_quant_config(self):
+        return self.quant_config
 
 
 @pytest.mark.parametrize(
@@ -51,11 +68,22 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
         model.linear2.register_buffer(
             "input_scale", torch.tensor([1.0], device=model.linear2.weight.device)
         )
+    # set up sequence+cache objects
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {
+            "quantize_from_config": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
+    gm_transformed.to("cuda")
 
-    gm_transformed = run_test(
+    run_test_transformed_gm(
         model,
         x,
-        quantize,
+        gm_transformed,
         check_quantized,
         num_p_og,
         atol,
@@ -122,10 +150,22 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
             model.register_buffer("bmm_dynamic_input_scale", fp8_scale(x))
             model.register_buffer("bmm_dynamic_weight_scale", fp8_scale(dummy_weight))
 
-    gm_transformed = run_test(
+    # set up sequence+cache objects
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {
+            "quantize_from_config": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
+    gm_transformed.to("cuda")
+
+    run_test_transformed_gm(
         model,
         x,
-        quantize,
+        gm_transformed,
         check_quantized,
         num_p_og,
         atol,

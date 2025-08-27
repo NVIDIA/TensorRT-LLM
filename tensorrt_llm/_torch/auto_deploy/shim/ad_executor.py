@@ -94,19 +94,20 @@ class ADEngine(ModelEngine):
             f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}"
         )
 
+        # update device to contain the current default device if it's in cuda
+        device = torch.device(ad_config.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        device = str(device)
+
         # initialize seq info object
         seq_info = SequenceInfo(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
+            device=device,
         )
-
-        # update device to contain the current default device if it's in cuda
-        device = torch.device(ad_config.device)
-        if device.type == "cuda" and device.index is None:
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        device = str(device)
 
         # construct inference optimizer
         build_and_optimize = InferenceOptimizer(
@@ -132,6 +133,10 @@ class ADEngine(ModelEngine):
         self.pytorch_backend_config.enable_iter_perf_stats = False
         self.pytorch_backend_config.enable_iter_req_stats = False
         self.pytorch_backend_config.stream_interval = 1
+        self.pytorch_backend_config.attention_dp_enable_balance = False
+        self.pytorch_backend_config.attention_dp_time_out_iters = 50
+        self.pytorch_backend_config.attention_dp_batching_wait_iters = 10
+        self.pytorch_backend_config.batch_wait_timeout_ms = 0
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
@@ -167,16 +172,12 @@ class ADEngine(ModelEngine):
         context_requests = scheduled_requests.context_requests
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
 
-        # new_tokens is a tensor on the device, we need to convert it to a list of lists.
-        # can we avoid this additional gpu->cpu transfer?
-        new_tokens_list = new_tokens.flatten().cpu().tolist() if new_tokens is not None else None
-
         # info to be extracted
         input_ids: List[List[int]] = []
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
-
+        previous_batch_indices: List[int] = []
         # look at context requests first
         for request in context_requests:
             # store input ids and pos of first token in sequence
@@ -190,11 +191,13 @@ class ADEngine(ModelEngine):
         # TODO: we should also handle extend requests (for speculative decoding) here
         for request in gen_requests:
             # new_tokens are provided when the overlap scheduler is enabled.
-            if new_tokens_list is None or request.is_dummy or request.py_batch_idx is None:
+            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
                 input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
                 input_pos.append(request.max_beam_num_tokens - 1)
             else:
-                input_ids.append([new_tokens_list[request.py_batch_idx]])
+                # insert a dummy token to indicate the new tokens
+                input_ids.append([-1])
+                previous_batch_indices.append(request.py_batch_idx)
                 input_pos.append(request.max_beam_num_tokens)
 
             request.py_batch_idx = request.seq_slot
@@ -210,11 +213,15 @@ class ADEngine(ModelEngine):
 
         # update the sequence info object now
         si = self.cache_seq_interface.info
-        si.nest_sequences(input_ids)
         si.update_pos(input_pos, reset=True)
         si.assign_cache_loc(page_assignments)
+        si.nest_sequences(input_ids)
+
+        if new_tokens is not None:
+            si.update_input_ids_with_new_tokens(new_tokens, previous_batch_indices)
         return last_logit_only
 
+    @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(*self.cache_seq_interface.args)[0]
@@ -231,13 +238,13 @@ class ADEngine(ModelEngine):
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
-        new_tokens_device: Optional[torch.Tensor] = None,
+        new_tensors_device: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
-        new_tokens = getattr(new_tokens_device, "new_tokens", None)
+        new_tokens = getattr(new_tensors_device, "new_tokens", None)
         last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
 
         # compute all logits

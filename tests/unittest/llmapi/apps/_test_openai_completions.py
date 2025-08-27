@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_completion.py
+
 from typing import List
 
 import openai
@@ -7,6 +8,8 @@ import pytest
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
+from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
+                    make_server_with_custom_sampler_fixture)
 
 
 @pytest.fixture(scope="module")
@@ -75,6 +78,18 @@ def test_single_completion(client: openai.OpenAI, model_name):
         temperature=0.0,
     )
     assert len(completion.choices[0].text) >= 1
+
+
+def test_single_completion_with_too_long_prompt(client: openai.OpenAI,
+                                                model_name):
+    completion = client.completions.create(
+        model=model_name,
+        prompt="Hello, my name is" * 100,
+        max_tokens=5,
+        temperature=0.0,
+    )
+
+    print(completion)
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -370,34 +385,34 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
     assert tokens == single_output
 
 
-@pytest.mark.asyncio
-async def test_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
-                                          model_name: str):
-    """Test logit_bias with valid token IDs"""
-    logit_bias = {
-        "1000": 80,
-        "2000": -80,
-    }
-
-    completion = await async_client.completions.create(
-        model=model_name,
-        prompt="The capital of France is",
-        max_tokens=10,
-        logit_bias=logit_bias,
-        temperature=0.0,
-    )
-
-    assert completion.choices[0].text
+# Use the shared fixture from utils.py
+server_with_custom_sampler = make_server_with_custom_sampler_fixture(
+    'completions')
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='function')
+@pytest.mark.parametrize(
+    'server_with_custom_sampler',
+    [
+        {
+            'sampler_type': "TorchSampler"
+        },  # torch_sampler
+        {
+            'sampler_type': "TRTLLMSampler"
+        },  # trtllm_sampler
+    ],
+    indirect=True,
+    ids=['torch_sampler', 'trtllm_sampler'])
+async def test_completion_with_logit_bias_effect(
+        server_with_custom_sampler: RemoteOpenAIServer,
+        model_name: str) -> None:
+    '''Test that logit bias affects output as expected for both samplers (completions endpoint).'''
+    client = server_with_custom_sampler.get_async_client()
+    await logit_bias_effect_helper(client, model_name, 'completions')
+
+
+@pytest.mark.asyncio(loop_scope="module")
 async def test_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys)"""
-    with pytest.raises(openai.BadRequestError):
-        await async_client.completions.create(
-            model=model_name,
-            prompt="Hello world",
-            logit_bias={"invalid_token": 1.0},  # Non-integer key
-            max_tokens=5,
-        )
+    await invalid_logit_bias_helper(async_client, model_name, 'completions')

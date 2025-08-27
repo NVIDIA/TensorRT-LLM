@@ -15,20 +15,23 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
+from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
+from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
 from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
                                SamplingParams)
+from ..scheduling_params import SchedulingParams
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
@@ -120,6 +123,7 @@ class GenerationExecutor(ABC):
         disaggregated_params: Optional[DisaggregatedParams] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -142,7 +146,8 @@ class GenerationExecutor(ABC):
             streaming=streaming,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
-            multimodal_params=multimodal_params)
+            multimodal_params=multimodal_params,
+            scheduling_params=scheduling_params)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
@@ -351,7 +356,9 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[TorchLlmArgs] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -378,6 +385,9 @@ class GenerationExecutor(ABC):
             "engine": engine,
             "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
+            "hf_model_dir": hf_model_dir,
+            "tokenizer": tokenizer,
+            "llm_args": llm_args,
         }
 
         if lora_config:
@@ -395,9 +405,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                is_llm_executor=is_llm_executor)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -408,9 +416,7 @@ class GenerationExecutor(ABC):
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
             return GenerationExecutorWorker(**worker_kwargs,
-                                            is_llm_executor=is_llm_executor,
-                                            garbage_collection_gen0_threshold=
-                                            garbage_collection_gen0_threshold)
+                                            is_llm_executor=is_llm_executor)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
@@ -422,9 +428,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                is_llm_executor=is_llm_executor)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -435,9 +439,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                is_llm_executor=is_llm_executor)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

@@ -27,6 +27,8 @@ std::optional<int32_t> getIntEnv(char const* name);
 
 std::optional<size_t> getUInt64Env(char const* name);
 
+std::optional<float> getFloatEnv(char const* name);
+
 bool getBoolEnv(char const* name);
 
 // XQA kernels (optimized kernels for generation phase).
@@ -74,7 +76,7 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string getEnvKVCacheTransferOutputPath();
+std::string const& getEnvKVCacheTransferOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
@@ -83,6 +85,9 @@ bool getEnvForceDeterministic();
 
 // Force deterministic behavior for MoE plugin.
 bool getEnvForceDeterministicMOE();
+
+// Disable finalize fusion in MoE plugin
+bool getEnvMOEDisableFinalizeFusion();
 
 // Force deterministic behavior for attention plugin.
 bool getEnvForceDeterministicAttention();

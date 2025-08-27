@@ -5,6 +5,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
+import torch
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import \
@@ -16,7 +17,34 @@ from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
-from ..sampling_params import LogitBiasLogitsProcessor
+
+def _logit_bias_to_embedding_bias(logit_bias: Optional[Dict[str, float]],
+                                  vocab_size: int) -> Optional[torch.Tensor]:
+    """Convert OpenAI logit_bias dict to embedding_bias tensor for sampling."""
+    if logit_bias is None:
+        return None
+
+    # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
+    embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
+
+    # Apply biases for specified token IDs
+    for token_str, bias in logit_bias.items():
+        try:
+            token_id = int(token_str)
+            if 0 <= token_id < vocab_size:
+                embedding_bias[token_id] = bias
+            else:
+                raise ValueError(
+                    f"Token ID {token_id} out of vocabulary range [0, {vocab_size})"
+                )
+        except ValueError as e:
+            if "invalid literal" in str(e):
+                raise ValueError(
+                    f"Invalid logit_bias key '{token_str}': must be a valid integer token ID"
+                )
+            raise
+
+    return embedding_bias
 
 
 class OpenAIBaseModel(BaseModel):
@@ -100,6 +128,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
             "including encountering the EOS token"),
     )
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -127,6 +156,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
             "to stop, None if the completion finished for some other reason "
             "including encountering the EOS token"),
     )
+    avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -225,7 +255,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     # doc: end-completion-extra-params
 
-    def to_sampling_params(self) -> SamplingParams:
+    def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
@@ -258,8 +288,8 @@ class CompletionRequest(OpenAIBaseModel):
             detokenize=self.detokenize,
 
             # logits_bias
-            logits_processor=None if not self.logit_bias else
-            LogitBiasLogitsProcessor(self.logit_bias),
+            embedding_bias=_logit_bias_to_embedding_bias(
+                self.logit_bias, vocab_size),
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
@@ -362,8 +392,12 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
+    # TODO: progressivly add more info like input_ids, specific_token_ids, mrope, mm_hashes, etc
+    # TODO: and use a JSON-safe handle to refer to the server-side output
+    mm_embedding_handle: Optional[Dict[str, Any]] = None
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -391,6 +425,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
+    avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -521,7 +556,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # doc: end-chat-completion-extra-params
 
-    def to_sampling_params(self) -> SamplingParams:
+    def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -553,8 +588,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 self.response_format),
 
             # logits_bias
-            logits_processor=None if not self.logit_bias else
-            LogitBiasLogitsProcessor(self.logit_bias),
+            embedding_bias=_logit_bias_to_embedding_bias(
+                self.logit_bias, vocab_size),
 
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
