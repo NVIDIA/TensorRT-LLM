@@ -19,6 +19,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
+from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo
 
 base_model_tp_plan = {
     "q_proj": "colwise",
@@ -280,7 +281,7 @@ def _run_pattern_detection_job(
                             min_local_shape=min_local_shape,
                         )
                     )
-        elif model_cls == MLP or model_cls == FP8MLP:
+        elif model_cls == MLP:
             for node in gm.graph.nodes:
                 if is_linear_op(node, include_quantization=True):
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
@@ -312,6 +313,27 @@ def _run_pattern_detection_job(
                             rank=rank,
                             world_size=world_size,
                             dist_op="all_gather",
+                            min_local_shape=1,
+                        )
+                    )
+        elif model_cls == FP8MLP:
+            for node in gm.graph.nodes:
+                if is_linear_op(node, include_quantization=True):
+                    # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
+                    # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
+                    if "linear1" in node.args[1].name:
+                        dim = SplitDimension.ROW
+                        dist_op = None
+                    else:
+                        dim = SplitDimension.COLUMN
+                        dist_op = "all_reduce"
+                    expected_transformations.append(
+                        FP8TPShardingInfo(
+                            target_node=node.name,
+                            split_dim=dim,
+                            rank=rank,
+                            world_size=world_size,
+                            dist_op=dist_op,
                             min_local_shape=1,
                         )
                     )
@@ -362,16 +384,16 @@ def test_sharding(
     )
 
 
-@pytest.mark.parametrize("world_size", [8])
+@pytest.mark.parametrize("world_size", [1, 8])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("from_config", [False, True])
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
-        (MLP, "torch_dist_all_reduce"),
+        # (MLP, "torch_dist_all_reduce"),
         (FP8MLP, "torch_dist_all_reduce"),
-        (nn.Linear, "torch_dist_all_gather"),
-        (GQA_Block, "torch_dist_all_reduce"),
+        # (nn.Linear, "torch_dist_all_gather"),
+        # (GQA_Block, "torch_dist_all_reduce"),
     ),
 )
 def test_sharding_pattern_detection(

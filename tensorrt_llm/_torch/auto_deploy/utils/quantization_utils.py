@@ -94,10 +94,6 @@ class QuantizationImpl:
         for q in [
             FP4QuantizationImpl,
             FP8QuantizationImpl,
-        ]:
-            if is_op(quant_type_or_node, q.custom_op()):
-                return q
-        for q in [
             FP8BMMQuantizationImpl,
         ]:
             if is_op(quant_type_or_node, q.target_op()):
@@ -140,13 +136,6 @@ class QuantizationImpl:
         pass
 
     @staticmethod
-    def build_custom_kwargs_for_linear(
-        scale_getattrs: Dict[str, Node],
-    ) -> Dict[str, object]:
-        """Default: no extra kwargs. Each impl overrides to pass the right inputs/scales/zps/format."""
-        return {}
-
-    @staticmethod
     def build_custom_args_for_linear(  # renamed to reflect args
         scale_getattrs: Dict[str, Node],
     ) -> Tuple[object, ...]:
@@ -156,11 +145,6 @@ class QuantizationImpl:
 class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
     def target_op():
-        return torch.ops.auto_deploy.torch_quant_fp8_linear
-
-    @staticmethod
-    def custom_op():
-        """Unified custom kernel entry-point for quantized linear."""
         return torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default
 
     @staticmethod
@@ -178,26 +162,12 @@ class FP8QuantizationImpl(QuantizationImpl):
         return {"input_scale": torch.tensor(1.0), "weight_scale": torch.tensor(1.0)}
 
     @staticmethod
-    def build_custom_kwargs_for_linear(
-        scale_getattrs: Dict[str, Node],
-    ) -> Dict[str, object]:
-        return dict(
-            input_scale=[scale_getattrs["input_scale"]],
-            weight_scale=[scale_getattrs["weight_scale"]],
-            input_zp=[],
-            weight_zp=[],
-        )
-
-    @staticmethod
-    def build_custom_args_for_linear(  # renamed to reflect args
+    def build_custom_args_for_linear(
         scale_getattrs: Dict[str, Node],
     ) -> Tuple[object, ...]:
         """
         Build the *positional* tail for torch_fake_quant_fp8_linear:
-            (..., bias, input_scale(list), weight_scale(list), input_zp(list), weight_zp(list))
-
-        We pass bias=None to match the exported pattern:
-        torch_fake_quant_fp8_linear(args_0, args_1, args_2, [args_2_0], [args_3_0], [], [])
+            (input, weight, bias, input_scale(list), weight_scale(list), input_zp(list), weight_zp(list))
         """
         return (
             [scale_getattrs["input_scale"]],  # input_scale list
@@ -227,11 +197,6 @@ class FP8QuantizationImpl(QuantizationImpl):
 class FP4QuantizationImpl(QuantizationImpl):
     @staticmethod
     def target_op():
-        return torch.ops.auto_deploy.torch_quant_fp4_linear
-
-    @staticmethod
-    def custom_op():
-        """Unified custom kernel entry-point for quantized linear."""
         return torch.ops.auto_deploy.torch_fake_quant_fp4_linear.default
 
     @staticmethod
@@ -262,37 +227,9 @@ class FP4QuantizationImpl(QuantizationImpl):
         }
 
     @staticmethod
-    def build_custom_kwargs_for_linear(
-        scale_getattrs: Dict[str, Node],
-    ) -> Dict[str, object]:
-        """
-        Contract:
-          custom_quant_linear(
-              x, Wq, bias,
-              input_scale=[s_in2],
-              weight_scale=[weight_scale_cutlass_uint8, alpha_fused],
-              input_zp=[],
-              weight_zp=[],
-          )
-        """
-        return dict(
-            input_scale=[scale_getattrs["input_scale"]],
-            weight_scale=[scale_getattrs["weight_scale"], scale_getattrs["alpha"]],
-            input_zp=[],
-            weight_zp=[],
-        )
-
-    @staticmethod
-    def build_custom_args_for_linear(  # renamed to reflect args
+    def build_custom_args_for_linear(
         scale_getattrs: Dict[str, Node],
     ) -> Tuple[object, ...]:
-        """
-        Build the *positional* tail for torch_fake_quant_fp8_linear:
-            (..., bias, input_scale(list), weight_scale(list), input_zp(list), weight_zp(list))
-
-        We pass bias=None to match the exported pattern:
-        torch_fake_quant_fp8_linear(args_0, args_1, args_2, [args_2_0], [args_3_0], [], [])
-        """
         return (
             [scale_getattrs["input_scale"]],  # input_scale list
             [scale_getattrs["weight_scale"], scale_getattrs["alpha"]],  # weight_scale list

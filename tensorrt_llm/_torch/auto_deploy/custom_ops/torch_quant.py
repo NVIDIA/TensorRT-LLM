@@ -20,7 +20,7 @@ def _expect_single_scale(scales: List[Optional[torch.Tensor]], name: str) -> tor
     return scales[0]
 
 
-def _to_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def _to_fp8_fake(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (x / scale).to(torch.float8_e4m3fn)
 
 
@@ -84,7 +84,7 @@ def _cast_fp4(weight: torch.Tensor):
 
     sign_bit = (weight < 0).to(torch.uint8)
 
-    weight_abs = weight.abs_()
+    weight_abs = weight.abs()  # avoid in-place modification to input
     # Calculate the ordinal value based on the bounds
     ord = torch.searchsorted(e2m1_bounds.to(device), weight_abs, out_int32=True).to(torch.uint8)
     # All values equal to e2m1_bounds at odd indices are rounded up and even indices are rounded down
@@ -105,7 +105,7 @@ def _quantize_nvfp4(
         block_size (int): The size of each block for quantization.
         weights_scaling_factor_2 (torch.Tensor): The per-tensor scaling factor for the weights.
     Returns:
-    tuple: Contains quantized data, quantized per block scaling factor, and per block scaling factor.
+    tuple: Contains quantized data and quantized per block scaling factor
     """
 
     weights_scaling_factor, weights_scaling_factor_2 = _nvfp4_get_weights_scaling_factor(
@@ -160,11 +160,11 @@ def _dequantize_nvfp4(
 def torch_fake_quant_fp8_linear(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
-    bias: torch.Tensor,  # Optional, no default
-    input_scale: List[torch.Tensor],  # Tensor?[]  (REQUIRED: no default)
-    weight_scale: List[torch.Tensor],  # Tensor?[]
-    input_zp: List[torch.Tensor],  # Tensor?[]
-    weight_zp: List[torch.Tensor],  # Tensor?[]
+    bias: torch.Tensor,
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
 ) -> torch.Tensor:
     """
     Reference (eager) implementation for multiple quant formats via `format_type`.
@@ -180,7 +180,7 @@ def torch_fake_quant_fp8_linear(
     in_dtype = input.dtype
     out_features, in_features = weight_quantized.shape
 
-    input_fp8 = _to_fp8(input, s_in)
+    input_fp8 = _to_fp8_fake(input, s_in)
     input_deq = _from_fp8(input_fp8, s_in, in_dtype)
 
     weight_deq = _dequant_weight_fp8(weight_quantized, s_w, out_features, in_dtype)
@@ -209,11 +209,11 @@ def torch_fake_quant_fp8_linear(
 def torch_fake_quant_fp4_linear(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
-    bias: torch.Tensor,  # Optional, no default
-    input_scale: List[torch.Tensor],  # Tensor?[]  (REQUIRED: no default)
-    weight_scale: List[torch.Tensor],  # Tensor?[]
-    input_zp: List[torch.Tensor],  # Tensor?[]
-    weight_zp: List[torch.Tensor],  # Tensor?[]
+    bias: torch.Tensor,
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
 ) -> torch.Tensor:
     """
     Reference (eager) implementation for multiple quant formats via `format_type`.

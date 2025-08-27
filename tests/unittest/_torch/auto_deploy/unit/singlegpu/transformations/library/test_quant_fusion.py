@@ -7,21 +7,9 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale, fp8_scale
-
-
-class DummyFactory(ModelFactory):
-    def __init__(self, quant_config=None):
-        self._quant_config = quant_config or {}
-
-    def _build_model(self, device: str):
-        return
-
-    def _load_checkpoint(self, model, device):
-        return
 
 
 def _has_fused_linear_fp8(gm):
@@ -46,10 +34,8 @@ def _has_fused_linear_fp4(gm):
 
 class TinyFP8Ref(nn.Module):
     """
-    A tiny module whose forward uses the *reference* FP8 op:
+    A tiny module whose forward uses the reference FP8 op:
       torch_fake_quant_fp8_linear(input, weight_fp8, bias, [in_s], [w_s], [], [])
-    The transform should rewrite it to:
-      torch_quant_fp8_linear(input, weight_fp8, bias, input_scale=in_s, weight_scale=w_s)
     """
 
     def __init__(self, in_features=16, out_features=32, use_bias=True):
@@ -87,10 +73,8 @@ class TinyFP8Ref(nn.Module):
 
 class TinyFP4Ref(nn.Module):
     """
-    A tiny module whose forward uses the *reference* NVFP4 op:
+    A tiny module whose forward uses the reference NVFP4 op:
       torch_fake_quant_fp4_linear(x, w_fp4, bias, [s_in2], [cutlass_vec, alpha], [], [])
-    The transform should rewrite it to fused:
-      torch_quant_fp4_linear(x, w_fp4, bias, input_scale=s_in2, weight_scale=cutlass_vec, alpha=alpha)
     """
 
     def __init__(self, in_features=64, out_features=32, use_bias=True):
@@ -138,7 +122,7 @@ def test_fuse_quant_rewrites_fp8_linear(use_bias):
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     gm_transformed = InferenceOptimizer(
-        DummyFactory({}),
+        None,
         {
             "fuse_quant": {
                 "stage": "pattern_matcher",
@@ -158,9 +142,7 @@ def test_fuse_quant_rewrites_fp8_linear(use_bias):
         False,  # test_load_hook
         False,  # strict_loading
         None,  # dynamic_shapes
-        1,  # check_num_matches
         False,  # skip_output_assert
-        {},  # quant_config
     )
 
 
@@ -176,7 +158,7 @@ def test_fuse_quant_rewrites_fp4_linear(use_bias):
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     gm_transformed = InferenceOptimizer(
-        DummyFactory({}),
+        None,
         {
             "fuse_quant": {
                 "stage": "pattern_matcher",
@@ -189,14 +171,12 @@ def test_fuse_quant_rewrites_fp4_linear(use_bias):
         model,
         x,
         gm_transformed,
-        _has_fused_linear_fp4,
-        lambda n: n,  # num_p_og
-        0.2,  # atol
+        _has_fused_linear_fp8,
+        lambda n: n,
+        0.1,  # atol
         0.05,  # rtol
         False,  # test_load_hook
         False,  # strict_loading
         None,  # dynamic_shapes
-        1,  # check_num_matches
         False,  # skip_output_assert
-        {},  # quant_config
     )

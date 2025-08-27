@@ -260,14 +260,14 @@ class FakeFP8Linear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         device = self.weight.device
-        weight_scale = torch.max(torch.abs(self.weight)).to(torch.float).to(device) / FP8_MAX
+        amax = self.weight.detach().abs().max().to(torch.float)
+        eps = torch.finfo(torch.float32).tiny
+        weight_scale = torch.clamp(amax / FP8_MAX, min=eps).to(device)
         self.weight = nn.Parameter((self.weight / weight_scale).to(torch.float8_e4m3fn))
         self.register_buffer(
             "input_scale", torch.tensor(1.0, device=self.weight.device, dtype=torch.float)
         )
         self.register_buffer("weight_scale", weight_scale)
-        if self.bias is not None:
-            self.bias = nn.Parameter(self.bias.to(torch.half))
 
     def forward(self, x):
         return torch.ops.auto_deploy.torch_fake_quant_fp8_linear(

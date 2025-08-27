@@ -79,7 +79,7 @@ def _insert_quantized_linear(
 
     custom_args = quantization_impl.build_custom_args_for_linear(scales)
 
-    node.target = quantization_impl.custom_op()
+    node.target = quantization_impl.target_op()
     node.args = (*node.args, *custom_args)
 
 
@@ -195,7 +195,6 @@ class LinearQuantizationFromConfig(BaseTransform):
         impl = QuantizationImpl.create(quant_algo, is_bmm=False)
 
         for n in gm.graph.nodes:
-            # Only consider linear ops; skip if excluded
             if not is_linear_op(n, include_quantization=False):
                 continue
             if should_skip_quantization(n, excluded):
@@ -236,7 +235,6 @@ class BMMQuantizationFromConfig(BaseTransform):
         for n in gm.graph.nodes:
             if not is_bmm_op(n):
                 continue
-            # Reuse common exclusion rule (supports Node or param-name string)
             if should_skip_quantization(n, excluded):
                 continue
 

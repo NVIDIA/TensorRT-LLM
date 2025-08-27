@@ -449,8 +449,8 @@ class FP4TPShardingInfo(QuantizationShardingMixin, TPShardingInfo):
 
 
 TP_SHARDING_RULES = [
-    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_linear_fp8), FP8TPShardingInfo),
-    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_linear_fp4), FP4TPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_fp8_linear), FP8TPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_fp4_linear), FP4TPShardingInfo),
 ]
 
 

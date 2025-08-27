@@ -34,17 +34,10 @@ from torch.fx import GraphModule
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
+# Copied from torch._dynamo.utils.detect_fake_mode but skip the same FakeMode assertion
+# In our use case, FakeMode of the inserted replacement pattern is different from the original
+# FakeMode from graph, which breaks this assertion
 def ad_detect_fake_mode(inputs: Any = None):
-    """
-    Attempts to "detect" what the current fake mode is.  If there is one ambiently
-    available from TracingContext, we preferentially use that.  Otherwise, we
-    heuristically detect the fake mode via the following sources, in order of
-    priority:
-
-        - Currently active fake mode on stack
-        - Fake mode associated with passed in tensors (inputs does not
-          have to be flattened)
-    """
     from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
     fake_modes = []
@@ -72,7 +65,6 @@ def ad_detect_fake_mode(inputs: Any = None):
         return None
 
 
-# Replace the function used as a context manager
 torch._dynamo.utils.detect_fake_mode = ad_detect_fake_mode
 
 
