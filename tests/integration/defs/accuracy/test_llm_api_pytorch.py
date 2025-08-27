@@ -2037,7 +2037,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                       True,
                       True,
                       False,
-                      marks=pytest.mark.skip_less_device(8))],
+                      marks=pytest.mark.skip_less_mpi_world_size(8))],
         ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                   overlap_scheduler, is_cached):
