@@ -52,6 +52,19 @@ public:
         std::vector<size_t> const& requestedBlockHashes)
     {
         auto const windowSize = firstWindowSize(cacheManager);
+        std::cout << "allBlockHashes: " << allBlockHashes.size() << std::endl;
+        for (auto hash : allBlockHashes)
+        {
+            std::cout << hash << " ";
+        }
+        std::cout << std::endl;
+        std::cout << "requestedBlockHashes: " << requestedBlockHashes.size() << std::endl;
+        for (auto hash : requestedBlockHashes)
+        {
+            std::cout << hash << " ";
+        }
+        std::cout << std::endl;
+
         auto lastBlock = *cacheManager.findBlocksInReuseTreeByHashes(allBlockHashes, windowSize);
         // TODO: handle the case where the last block is not found
         TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");

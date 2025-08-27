@@ -492,8 +492,28 @@ public:
             auto beam = 0;
             auto allBlockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
             auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest);
-            requestInfo = RequestInfo(
-                requestId, allBlockRange.getBlockHashes(), mSelfState, requestedBlockRange.getBlockHashes());
+
+            auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
+            auto blockedUniqueTokens = tensorrt_llm::batch_manager::kv_cache_manager::chopVectorIntoBlocks<UniqueToken>(
+                uniqueTokens, uniqueTokens.size() - 1, mFormatter->getCacheManager()->getTokensPerBlock(), false);
+            auto blockKeys
+                = tensorrt_llm::batch_manager::kv_cache_manager::buildBlockKeys(blockedUniqueTokens, llmRequest);
+            std::vector<size_t> allBlockHashes;
+            for (auto const& blockKey : blockKeys)
+            {
+                allBlockHashes.push_back(tensorrt_llm::batch_manager::kv_cache_manager::BlockKeyHasher::hash(blockKey));
+            }
+            // Figure out the size difference for computing the requested block hashes
+            std::vector<size_t> requestedBlockHashes;
+            for (auto i = 0; i < allBlockHashes.size(); i++)
+            {
+                if (i >= requestedBlockRange.getBlockHashes().size())
+                {
+                    requestedBlockHashes.push_back(allBlockHashes[i]);
+                }
+            }
+
+            requestInfo = RequestInfo(requestId, allBlockHashes, mSelfState, requestedBlockHashes);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);

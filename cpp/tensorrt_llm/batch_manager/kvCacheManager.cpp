@@ -50,32 +50,6 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
-//! \brief Split vector into list of blocks of given size.
-//! \param vec vector to split
-//! \param usableSize part of the vector that is processed
-//! \param elementsPerBlock desired size of blocks
-//! \param allowPartial whether to append a block smaller than `elementsPerBlock` at the end
-//! \return list of blocks
-template <typename T>
-std::list<std::vector<T>> chopVectorIntoBlocks(
-    std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
-{
-    TLLM_CHECK_WITH_INFO(
-        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
-    std::list<std::vector<T>> blockedVectors;
-    auto const vecEnd = vec.begin() + usableSize;
-    for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
-    {
-        auto blockSize = std::min(elementsPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
-        auto end = begin + blockSize;
-        if (blockSize == elementsPerBlock || allowPartial)
-        {
-            blockedVectors.emplace_back(begin, end);
-        }
-    }
-    return blockedVectors;
-}
-
 inline uint8_t getNthByte(SizeType32 hashPart, uint8_t byteIdx) noexcept
 {
     return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
@@ -1039,6 +1013,12 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReuseTreeByHashes(
     std::vector<size_t> const& hashes) const
 {
+    std::cout << "findBlocksInReuseTreeByHashes: " << hashes.size() << std::endl;
+    for (auto hash : hashes)
+    {
+        std::cout << hash << " ";
+    }
+    std::cout << std::endl;
     std::vector<BlockKey> blockKeys;
     for (auto const& hash : hashes)
     {
@@ -1048,13 +1028,16 @@ std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReu
     auto searchRoot = mCachedBlocksRoot;
     for (auto const& blockKey : blockKeys)
     {
+        std::cout << "findBlocksInReuseTreeByHashes: searching for block key: " << blockKey.hash << std::endl;
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
             ? searchRoot->findMatchingBlock(blockKey, false, false)
             : std::make_tuple(false, 0, nullptr);
         if (matchingBlock == nullptr)
         {
+            std::cout << "findBlocksInReuseTreeByHashes: no matching block found" << std::endl;
             return std::nullopt;
         }
+        std::cout << "findBlocksInReuseTreeByHashes: matching block found" << matchingBlock->getHash() << std::endl;
         searchRoot = std::move(matchingBlock);
     }
     return searchRoot;
@@ -1358,6 +1341,8 @@ void WindowBlockManager::storeBlocks(
     for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
     {
         auto const bid = blockIds[blockCnt];
+        std::cout << "Storing block " << bid << " block hash: " << BlockKeyHasher::hash(blockKeys[blockCnt])
+                  << std::endl;
         TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
         auto& block = mAllBlocksById[bid];
         auto const& blockKey = blockKeys[blockCnt];

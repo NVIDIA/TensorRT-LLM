@@ -595,6 +595,9 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByHashesTest)
     result = blockManager.findBlocksInReuseTreeByHashes(hashes, maxAttentionWindow);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ((*result)->getBlockId(), block0->getBlockId());
+
+    // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16] (17 tokens, three blocks)
+    BlockKey
 }
 
 #ifdef ENABLE_FP4
