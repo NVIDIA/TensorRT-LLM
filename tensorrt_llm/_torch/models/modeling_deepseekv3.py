@@ -279,10 +279,16 @@ class Deepseekv3RoutingImpl():
         self.routed_scaling_factor = routed_scaling_factor
         self.is_fused = is_fused
 
-    def noaux_tc(self, logits, e_score_correction_bias):
-        n_group = self.n_group
+    @torch.compile(options={"max-autotune": True})
+    def get_scores(self, logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias
+        return scores, scores_with_bias
+
+    def noaux_tc(self, logits, e_score_correction_bias):
+        n_group = self.n_group
+        scores, scores_with_bias = self.get_scores(logits,
+                                                   e_score_correction_bias)
         scores_shape = list(scores_with_bias.shape)
 
         if enable_llm_debug():
