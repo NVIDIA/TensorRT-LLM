@@ -61,6 +61,7 @@ class CUDAGraphRunner:
         token_per_request = self.max_possible_draft_len + 1
         max_total_tokens = (self.max_supported_batch_size *
                             self.max_beam_width * token_per_request)
+        max_total_tokens = min(max_total_tokens, engine.max_num_tokens)
 
         self.shared_static_tensors = {
             "input_ids":
