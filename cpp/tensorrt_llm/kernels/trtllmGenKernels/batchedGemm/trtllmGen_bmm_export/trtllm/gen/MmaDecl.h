@@ -16,6 +16,11 @@
  */
 #pragma once
 
+#include "trtllm/gen/CommonUtils.h"
+#include <cassert>
+#include <cstdint>
+#include <string>
+
 namespace batchedGemm
 {
 
@@ -80,6 +85,16 @@ inline std::string mmaKindToString(MmaKind mmaKind)
     case MmaKind::Tf32: return "Tf32";
     default: assert(false); return "Unsupported type";
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// function to get the TMEM column stride per group (i.e., 64 K elements)
+inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK)
+{
+    // Calculate the stride of TMEM column for every 64 elements in the K dimension
+    int32_t div = 2 * ceilDiv(tileMn, 64);
+    return mmaK == 96 ? std::max(4, div) : div;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
