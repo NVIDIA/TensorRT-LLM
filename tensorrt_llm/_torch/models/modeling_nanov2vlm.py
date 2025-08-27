@@ -7,6 +7,7 @@ import torch.nn as nn
 import transformers
 from PIL import Image
 
+from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -34,10 +35,27 @@ class SquaredReLU(nn.Module):
         return torch.pow(torch.nn.functional.relu(x), 2)
 
 
+class RMSNorm(nn.Module):
+
+    def __init__(self, hidden_size, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return (self.weight.to(torch.float32) * hidden_states).to(input_dtype)
+
+
 class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
                             transformers.generation.GenerationMixin):
 
-    def __init__(self, config: transformers.PretrainedConfig):
+    def __init__(self,
+                 model_config: ModelConfig[transformers.PretrainedConfig]):
+        config = model_config.pretrained_config
         super().__init__(config)
         self.image_size = config.force_image_size
         self.patch_size = config.patch_size
@@ -59,12 +77,15 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         self.llm_hidden_size = config.llm_config.hidden_size
 
         self.mlp1 = nn.Sequential(
-            nn.LayerNorm(self.vit_hidden_size *
-                         int(1 / self.downsample_ratio)**2,
-                         bias=False),
+            # nn.LayerNorm(self.vit_hidden_size *
+            #              int(1 / self.downsample_ratio)**2,
+            #              bias=False),
+            RMSNorm(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
+                    eps=1e-5),
             nn.Linear(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
                       self.vision_projection_hidden_size,
-                      bias=False), SquaredReLU(),
+                      bias=False),
+            SquaredReLU(),
             nn.Linear(self.vision_projection_hidden_size,
                       self.llm_hidden_size,
                       bias=False))
@@ -80,13 +101,27 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
             with open("hf_vision_encoder_arch.txt", "w") as f:
                 f.write(str(self.vision_model))
         else:
-            # Update the vision model with customized one.
-            from .modeling_radio import RADIOModel
-            self.vision_model = RADIOModel(config.vision_config)
-            self.vision_model.to(config.torch_dtype)
+            WITH_TRTLLM_CODES = True
+            if WITH_TRTLLM_CODES:
+                from .modeling_radio import RADIOVisionModel
 
-            with open("user_vision_encoder_arch.txt", "w") as f:
-                f.write(str(self.vision_model))
+                vision_model_config = copy.deepcopy(model_config)
+                vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
+
+                self.vision_model = RADIOVisionModel(vision_model_config)
+                self.vision_model.to(config.torch_dtype)
+
+                with open("trtllm_vision_encoder_arch.txt", "w") as f:
+                    f.write(str(self.vision_model))
+
+            else:
+                # Update the vision model with customized one.
+                from .modeling_radio import RADIOModel
+                self.vision_model = RADIOModel(config.vision_config)
+                self.vision_model.to(config.torch_dtype)
+
+                with open("user_vision_encoder_arch.txt", "w") as f:
+                    f.write(str(self.vision_model))
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -258,7 +293,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             return
 
         if not _is_disagg():
-            self.vision_encoder = NanoV2VLVisionEncoder(config).eval()
+            self.vision_encoder = NanoV2VLVisionEncoder(model_config).eval()
             self.vision_encoder.to(config.torch_dtype)
 
         llm_model_config = copy.deepcopy(model_config)
@@ -272,7 +307,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.is_loaded = True
 
     def load_weights(self, weights):
-        # Load vision encoder weights.
+        # Load vision encoder weights for pytorch modules.
         filter_weights = {
             k: v
             for k, v in weights.items()
@@ -280,11 +315,45 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         }
         missing_keys, unexpected_keys = self.vision_encoder.load_state_dict(
             filter_weights, strict=False)
-        if len(unexpected_keys) > 0:
-            raise ValueError(f"Unexpected keys: {unexpected_keys}")
-        if len(missing_keys) > 1 and missing_keys[
-                0] != 'vision_model.radio_model.summary_idxs':
-            raise ValueError(f"Missing keys: {missing_keys}")
+        for m in missing_keys:
+            if not m.startswith(
+                    'vision_model.radio_model.model.blocks.'
+            ) and m != "vision_model.radio_model.summary_idxs":
+                raise ValueError(f"Missing key: {m}")
+        for u in unexpected_keys:
+            if not u.startswith('vision_model.radio_model.model.blocks.'):
+                raise ValueError(f"Unexpected key: {u}")
+
+        # Load weights for vision transformer module.
+        model_weights = {
+            k.replace('vision_model.radio_model.model.', ''): v
+            for k, v in weights.items()
+            if k.startswith('vision_model.radio_model.model.')
+        }
+        converted_weights = dict()
+        for name in model_weights:
+            # Handle with weights and bias for vision transformer's qkv projection.
+            if "attn.qkv." in name:
+                q_name = name.replace("attn.qkv.", "attn.q_proj.")
+                k_name = name.replace("attn.qkv.", "attn.k_proj.")
+                v_name = name.replace("attn.qkv.", "attn.v_proj.")
+                dim_shape = model_weights[name].shape[0] // 3
+                converted_weights[q_name] = model_weights[name][:dim_shape]
+                converted_weights[k_name] = model_weights[name][dim_shape:2 *
+                                                                dim_shape]
+                converted_weights[v_name] = model_weights[name][2 * dim_shape:]
+            else:
+                converted_weights[name] = model_weights[name]
+        pattern_mapping = {
+            r'(.*?)attn.proj.(.*)': r'\1attn.o_proj.\2',
+            r'(.*?)mlp.fc1.(.*)': r'\1mlp.up_proj.\2',
+            r'(.*?)mlp.fc2.(.*)': r'\1mlp.down_proj.\2',
+        }
+        modeling_utils._load_weights_impl(
+            self.vision_encoder.vision_model.radio_model.model,
+            converted_weights,
+            params_map=pattern_mapping)
+
         # Load language model weights.
         filtered_weights = {
             k.replace('language_model.', ''): v
