@@ -2845,14 +2845,14 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
                  kv_cache_config=self.kv_cache_config) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
 @pytest.mark.skip_less_device_memory(80000)
 class TestQwQ_32B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/QwQ-32B"
     MODEL_PATH = f"{llm_models_root()}/QwQ-32B"
 
-    @pytest.mark.parametrize(
-        "tp_size", [8, 4, 2],
-        ids=["tp8", "tp4", "tp2"])
+    @pytest.mark.parametrize("tp_size", [8, 4, 2], ids=["tp8", "tp4", "tp2"])
     def test_auto_dtype(self, tp_size):
         if get_device_count() != tp_size:
             pytest.skip("Device count mismatch with world size")
