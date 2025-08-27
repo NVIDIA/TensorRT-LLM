@@ -1,22 +1,28 @@
 # KV Cache System
 
-The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT-LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It has support for variable attention window sizes and MHA optimization techniques like MQA and GQA.
+The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT-LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
 
 ## The Basics
 
-The KV cache is a pool of blocks that can hold KV state for a fixed number of tokens. Multiple layers are packed within a single block, which requires all the layers to have the same number of heads and the same attention window size. A separate pool is created for each combination of attention window size and number of heads in order to support variable attention window size and optimization techniques like GQA. Number of tokens that can be stored in a single block can be set by user when the model engine is created. It must be a power of two greater than 1. Blocks are assigned to requests as needed. Blocks are stored in a search structure as they are filled by requests, this allows later requests to reuse KV state if they have a matching prefix.
+The KV cache is a pool of blocks that can hold KV state for a fixed number of tokens. Multiple layers are packed within a single block, which requires all the layers to have the same number of heads and the same attention window size. A separate pool is created for each combination of attention window size and number of heads to support variable attention window size and optimization techniques like GQA.
+
+The number of tokens that can be stored in a single block can be set by user when the model engine is created. It must be a power of two greater than 1. Blocks are assigned to requests as needed. Blocks are stored in a search structure as they are filled by requests, this allows later requests to reuse KV state if they have a matching prefix.
 
 If more than one pool is created, available memory is divided among the pools. The fraction to assign to each pool is determined during initialization and is static. This is not optimal and we are working on providing a better solution.
 
 ## Reuse Across Requests
 
-Blocks containing KV state computed for previous requests are stored in a radix search tree as soon as they are filled. A search is performed when a new request is added, matched blocks are reused instead of calculated. Blocks that are reused can be shared among multiple requests, thus reuse saves memory as well as computations. Blocks remain reusable until they are evicted from the search tree. Eviction happens when a new (blank) block is needed. The core eviction scheme is prioritized LRU. All blocks are assigned a priority between 0 and 100 (100 being most important), all blocks of the lowest priority must be evicted before any blocks of the next priority can be evicted. If all blocks have the same priority, the least recently used block is evicted. When a block is evicted from primary memory, it's KV state is copied to a block in secondary memory. The secondary memory block remains in the search tree, hence the block remains reusable until it is evicted from secondary memory. Eviction from secondary memory happens when a new block in secondary memory is needed to offload a primary block. The eviction scheme is the same for primary and secondary blocks.
+Blocks containing KV state computed for previous requests are stored in a radix search tree as soon as they are filled. A search is performed when a new request is added, and matched blocks are reused instead of calculated. Blocks that are reused can be shared among multiple requests, so reuse saves memory as well as computations.
 
-One caveat in the current code is that only leaf blocks can be evicted (leafs are blocks with no descendants in the radix tree). This design works well for full attention layers, but not for limited attention layers. This will be fixed in a future version.
+Blocks remain reusable until they are evicted from the search tree. Eviction happens when a new (blank) block is needed. The core eviction scheme is prioritized LRU. All blocks are assigned a priority between 0 and 100 (100 being most important). All blocks of the lowest priority must be evicted before any blocks of the next priority can be evicted. If all blocks have the same priority, the least recently used block is evicted.
+
+When a block is evicted from primary memory, its KV state is copied to a block in secondary memory. The secondary memory block remains in the search tree, so the block remains reusable until it is evicted from secondary memory. Eviction from secondary memory happens when a new block in secondary memory is needed to offload a primary block. The eviction scheme is the same for primary and secondary blocks.
+
+One caveat in the current code is that only leaf blocks can be evicted (leaves are blocks with no descendants in the radix tree). This design works well for full attention layers, but not for limited attention layers. This will be fixed in a future version.
 
 ### Retention Policy
 
-Blocks are assigned priority in line with the [retention policy](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [TokenRangeRetentionConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.KvCacheRetentionConfig) objects, each specifying priority for a given range of tokens, i.e. "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect, priority will revert to the default after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect, after which priority will revert to the default. Default priority is 35. Any property that expects a duration can be set to None, which indicates retention policy never expires.
+Blocks are assigned priority in line with the [retention policy](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [TokenRangeRetentionConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.KvCacheRetentionConfig) objects, each specifying priority for a given range of tokens, such as "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect, priority will revert to the default after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect, after which priority will revert to the default. Default priority is 35. Any property that expects a duration can be set to None, which indicates retention policy never expires.
 
 Not in use: ```transfer_mode``` is a debug option and should not be used.
 
@@ -32,13 +38,13 @@ TensorRT-LLM takes advantage of layers with limited attention window size in ord
 
 TensorRT-LLM takes advantage of grouped query attention in order to save memory. KV cache will create blocks with only enough space to store state for the discrete query head groups. For MHA, there is one group per head, for MQA there is a single group for all the heads. GQA strikes a balance between these two.
 
-## Controling KV Cache Behavior
+## Controlling KV Cache Behavior
 
 Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of KV cache system.
 
 ### Datatype
 
-Perhaps the most important property is ```dtype``` which specifices what data type is held in KV cache. The default 'auto' specifies that data type should be infered from model config. 
+Perhaps the most important property is ```dtype``` which specifies what data type is held in KV cache. The default 'auto' specifies that data type should be inferred from model config. 
 
 ### How Much Memory is Allocated to KV Cache
 
@@ -46,13 +52,13 @@ Property ```free_gpu_memory_fraction``` is a ratio > 0 and < 1 that specifies ho
 
 ### Enable/Disable Cross Request Reuse
 
-Block reuse across requests is enabled by default, but can be disabled by setting ```enable_block_reuse``` to False. Note that block reuse requires the model engine to support paged context attention, which is enabled by default, but can be enabled or disabled explicitly when the model engine is built: ```trtllm-build --use_paded_context_fmha enable```.
+Block reuse across requests is enabled by default, but can be disabled by setting ```enable_block_reuse``` to False. Note that block reuse requires the model engine to support paged context attention, which is enabled by default, but can be enabled or disabled explicitly when the model engine is built: ```trtllm-build --use_paged_context_fmha enable```.
 
 ### Enable Offloading to Host Memory
 
 Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.
 
-When offloading is enabled, client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded, they are evicted directly from GPU memory in order to reduced traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
+When offloading is enabled, the client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded; they are evicted directly from GPU memory to reduce traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
 
 ### Partial Reuse
 
