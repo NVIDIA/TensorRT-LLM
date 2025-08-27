@@ -19,6 +19,7 @@ from typing import Optional, Union
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
 from ..llama.config import LLaMAConfig
+from ..qwen.config import QWenConfig
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -31,10 +32,10 @@ class MedusaConfig(PretrainedConfig):
                  num_medusa_layers: int = 1,
                  max_draft_len: int = 63,
                  **kwargs):
-        GenericMedusaConfig = QWenConfig if 'medel_type' in kwargs and \
-            "qwen" in kwargs['model_type'] else LLaMAConfig
 
-        self.config = GenericMedusaConfig(**kwargs)
+        model_type = str(kwargs.get('model_type', '')).lower()
+        generic_medusa_config = QWenConfig if 'qwen' in model_type else LLaMAConfig
+        self.config = generic_medusa_config(**kwargs)
 
         # Add objects
         self.config.num_medusa_heads = num_medusa_heads
