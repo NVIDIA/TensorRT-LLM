@@ -69,9 +69,9 @@ public:
         PYBIND11_OVERLOAD_PURE(bool, tb::BaseCacheTransceiver, checkGenTransferComplete);
     }
 
-    void cancelRequest(tb::LlmRequest* llmRequest) override
+    bool cancelRequest(tb::LlmRequest* llmRequest) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, cancelRequest, llmRequest);
+        PYBIND11_OVERLOAD_PURE(bool, tb::BaseCacheTransceiver, cancelRequest, llmRequest);
     }
 };
 } // namespace
