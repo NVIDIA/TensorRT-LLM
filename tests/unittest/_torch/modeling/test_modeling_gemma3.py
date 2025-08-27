@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -19,6 +20,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
     Gemma3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -199,7 +201,9 @@ class TestGemma3(unittest.TestCase):
 
         position_ids = torch.cat(position_ids).unsqueeze(0)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(gemma3.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
                                     position_ids=position_ids,
@@ -207,7 +211,7 @@ class TestGemma3(unittest.TestCase):
 
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
-        with torch.inference_mode():
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
                                     position_ids=position_ids,
@@ -342,7 +346,9 @@ class TestGemma3(unittest.TestCase):
         else:
             image_token_mask = None
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(gemma3.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=input_ids,
                                     position_ids=position_ids,
@@ -381,7 +387,9 @@ class TestGemma3(unittest.TestCase):
                          input_ids.size(-1) + gen_input_ids.size(-1))
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
-        with torch.inference_mode():
+        extra_attrs = deepcopy(gemma3.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = gemma3.forward(input_ids=gen_input_ids,
                                     position_ids=gen_position_ids,
