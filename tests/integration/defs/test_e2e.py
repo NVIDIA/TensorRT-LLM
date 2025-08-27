@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union
 
@@ -31,10 +32,9 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
                      prune_checkpoint, quantize_data, refit_model,
                      venv_check_call)
-from .conftest import (get_device_count, llm_models_root, skip_no_sm120,
-                       skip_nvlink_inactive, skip_post_blackwell,
-                       skip_pre_blackwell, skip_pre_hopper, tests_path,
-                       unittest_path)
+from .conftest import (llm_models_root, skip_no_sm120, skip_nvlink_inactive,
+                       skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper,
+                       tests_path, unittest_path, get_device_count)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -2981,18 +2981,14 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
 
 @pytest.mark.parametrize("workflow", ["trt", "torch"])
 @pytest.mark.parametrize("tp_size", [1, 8], ids=["tp1", "tp8"])
-@pytest.mark.parametrize(
-    ["model_path", "lora_path"],
-    [("llama-3.1-model/Llama-3.1-8B-Instruct",
-      "lora/evian2-8b-instruct_vhf-lora-v1_jetart"),
-     ("llama-3.3-models/Llama-3.3-70B-Instruct",
-      "lora/llama3-70b-instruct-lora_vhf-squad-v1"),
-     ("nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
-      "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64")(
-          "Mixtral-8x7B-v0.1", "lora/mixtral-8x7b-instruct-v0-1_vhf-lora-v1"),
-     ("Mistral-7B-Instruct-v0.3",
-      "lora/mistral-7b-instruct-v0-3_vhf_lora_squad"),
-     ("starcoder2-7b", "lora/starcoder2-7b_vhf-lora-squad-030325211133")])
+@pytest.mark.parametrize(["model_path", "lora_path"], [
+    ("llama-3.1-model/Llama-3.1-8B-Instruct", "lora/evian2-8b-instruct_vhf-lora-v1_jetart"),
+    ("llama-3.3-models/Llama-3.3-70B-Instruct", "lora/llama3-70b-instruct-lora_vhf-squad-v1"),
+    ("nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1", "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64")
+    ("Mixtral-8x7B-v0.1", "lora/mixtral-8x7b-instruct-v0-1_vhf-lora-v1"),
+    ("Mistral-7B-Instruct-v0.3", "lora/mistral-7b-instruct-v0-3_vhf_lora_squad"),
+    ("starcoder2-7b", "lora/starcoder2-7b_vhf-lora-squad-030325211133")
+])
 def test_llmapi_lora(workflow, model_path, lora_path, tp_size):
     device_count = get_device_count()
     if device_count < tp_size:
@@ -3007,10 +3003,12 @@ def test_llmapi_lora(workflow, model_path, lora_path, tp_size):
     from tensorrt_llm.sampling_params import SamplingParams
 
     # Configure LoRA
-    lora_config = LoraConfig(lora_dir=[f"/code/tensorrt_llm/{lora_path}"],
-                             max_lora_rank=8,
-                             max_loras=1,
-                             max_cpu_loras=1)
+    lora_config = LoraConfig(
+        lora_dir=[f"/code/tensorrt_llm/{lora_path}"],
+        max_lora_rank=8,
+        max_loras=1,
+        max_cpu_loras=1
+    )
 
     # Initialize LLM with LoRA support
     llm = LLM(f"{llm_models_root()}/{model_path}",
@@ -3018,8 +3016,7 @@ def test_llmapi_lora(workflow, model_path, lora_path, tp_size):
               tensor_parallel_size=tp_size)
 
     # Create LoRA request
-    lora_request = LoRARequest("my-lora-task", 0,
-                               f"/code/tensorrt_llm/{lora_path}")
+    lora_request = LoRARequest("my-lora-task", 0, f"/code/tensorrt_llm/{lora_path}")
 
     # Test multiple prompts
     prompts = [
@@ -3027,7 +3024,7 @@ def test_llmapi_lora(workflow, model_path, lora_path, tp_size):
         "What is the capital of France?",
         "Explain the concept of machine learning.",
     ]
-
+    
     sampling_params = SamplingParams(max_tokens=50)
 
     # Generate with LoRA
@@ -3038,42 +3035,39 @@ def test_llmapi_lora(workflow, model_path, lora_path, tp_size):
 
     # Generate without LoRA (baseline)
     print("=== Generating without LoRA adapter (baseline) ===")
-    baseline_outputs = llm.generate(prompts,
-                                    sampling_params,
-                                    lora_request=[None] * len(prompts))
+    baseline_outputs = llm.generate(
+        prompts,
+        sampling_params,
+        lora_request=[None] * len(prompts)
+    )
 
     # Compare outputs using token_ids for more accurate overlap calculation
     print("\n=== Token-based Overlap Analysis ===")
     total_overlap_ratio = 0
-
-    for i, (prompt, lora_out, baseline_out) in enumerate(
-            zip(prompts, lora_outputs, baseline_outputs)):
+    
+    for i, (prompt, lora_out, baseline_out) in enumerate(zip(prompts, lora_outputs, baseline_outputs)):
         lora_tokens = lora_out.outputs[0].token_ids
         baseline_tokens = baseline_out.outputs[0].token_ids
-
+        
         # Calculate overlap between token sequences
         min_len = min(len(lora_tokens), len(baseline_tokens))
         if min_len == 0:
             overlap_ratio = 0.0
         else:
             # Count matching tokens at each position
-            matching_tokens = sum(1 for j in range(min_len)
-                                  if lora_tokens[j] in baseline_tokens)
+            matching_tokens = sum(1 for j in range(min_len) if lora_tokens[j] in baseline_tokens)
             overlap_ratio = matching_tokens / min_len
-
+        
         total_overlap_ratio += overlap_ratio
-
+        
         print(f"\nPrompt {i+1}: {prompt}")
-        print(f"LoRA tokens:    {lora_tokens[:10]}...")  # Show first 10 tokens
-        print(f"Baseline tokens: {baseline_tokens[:10]}...")
-        print(f"Token overlap:   {overlap_ratio:.2%}")
         print(f"LoRA text:       {lora_out.outputs[0].text.strip()}")
         print(f"Baseline text:   {baseline_out.outputs[0].text.strip()}")
         print("-" * 80)
-
+    
     # Calculate average overlap across all prompts
     avg_overlap = total_overlap_ratio / len(prompts)
     print(f"\n=== Final Results ===")
     print(f"Average token overlap: {avg_overlap:.2%}")
-
+    
     assert avg_overlap >= 0.6, f"Average token overlap {avg_overlap:.2%} is below 60%"
