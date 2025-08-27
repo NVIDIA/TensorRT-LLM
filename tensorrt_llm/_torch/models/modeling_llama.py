@@ -979,6 +979,8 @@ class Llama4VisionEncoder(nn.Module):
         self.device = f"cuda:{model_config.mapping.rank}"
 
         self.dtype = self.pretrained_config.text_config.torch_dtype
+
+    def load_weights(self):
         module_dict = nn.ModuleDict({
             "vision_model":
             Llama4VisionModel(self.pretrained_config.vision_config),
@@ -1268,6 +1270,9 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         return super().infer_max_seq_len()
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        if not DISAGG:
+            self.mm_encoder.load_weights()
+
         # Temporarily detach mm_encoder so the TRT-LLM loader doesn't try to load it
         had_mm_encoder = hasattr(self, "mm_encoder")
         saved_mm_encoder = getattr(self, "mm_encoder", None)
