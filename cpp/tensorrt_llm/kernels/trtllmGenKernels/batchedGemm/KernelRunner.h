@@ -54,12 +54,6 @@ struct TrtllmGenBatchedGemmRunnerOptions
     bool routeAct{false};
     bool staticBatch{false};
     bool transposeMmaOutput{false};
-    // Whether runner selects kernels with TMA OOB optimization. It requires the TMA descriptor and the
-    // underlying buffer be constructed differently:
-    // - Requires valid buffer at (p - mTileTokensDim * hiddenSize) - needs prepending `mTileTokensDim` tokens.
-    // - TMA outermost dimension must be extended by `mTileTokensDim` or loads will OOB in the rightmost side.
-    bool useTmaOobOpt{true};
-    // The assumed tile size in the token dimension.
     int32_t tileSize{8};
     int32_t epilogueTileM{128};
 };
