@@ -718,6 +718,12 @@ class PyExecutor:
                 batch_state.sample_state.scheduled_requests), req_stats)
 
     def _executor_loop_cleanup(self):
+        # Unblock receiving processes. When second-last rank quits before last rank,
+        # last rank will never return from recv_object.
+        for req in self.send_handles:
+            if req is not None:
+                req.wait()
+
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
@@ -872,7 +878,6 @@ class PyExecutor:
                                 sample_state.host,
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
-                    torch.cuda.nvtx.range_pop()
 
                 # Stage 3: Finalize previous batch that finished tokens communication
                 # In last pp rank, stage 2 and 3 process different previous batches
