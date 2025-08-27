@@ -98,6 +98,7 @@ EOF
 Notes:
 - Ensure your base model directory is `/config/models/gpt-oss-120b`.
 - Ensure your Eagle3 assets are present under `/config/models/eagle/`.
+- If you are running on Top of Tree, replace `use_torch_sampler: true` with `sampler_type: TorchSampler`.
 
 ### Launch the server (Eagle3 speculative decoding)
 
