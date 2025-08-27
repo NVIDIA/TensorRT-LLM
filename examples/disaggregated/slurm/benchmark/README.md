@@ -34,17 +34,29 @@ It takes the following arguments in order:
 
 1.  `num_ctx_servers`: Number of context servers.
 2.  `ctx_tp_size`: Tensor parallel size for context servers.
-3.  `ctx_batch_size`: Max batch size for context servers.
-4.  `ctx_max_num_tokens`: Max number of tokens for context servers.
-5.  `ctx_enable_attention_dp`: `true` or `false` to enable attention DP for context servers.
-6.  `num_gen_servers`: Number of generation servers.
-7.  `gen_tp_size`: Tensor parallel size for generation servers.
-8.  `gen_batch_size`: Max batch size for generation servers.
-9.  `gen_max_num_tokens`: Max number of tokens for generation servers.
-10. `gen_enable_attention_dp`: `true` or `false` to enable attention DP for generation servers.
-11. `gen_gpu_memory_fraction`: GPU memory fraction for generation servers.
-12. `concurrency_list`: A space-separated list of concurrencies to test (e.g., "1 2 4 8").
-13. `sub_file`: A subdirectory name for logs.
+3.  `ctx_pp_size`: Pipeline parallel size for context servers.
+4.  `ctx_batch_size`: Max batch size for context servers.
+5.  `ctx_max_num_tokens`: Max number of tokens for context servers.
+6.  `ctx_enable_attention_dp`: `true` or `false` to enable attention DP for context servers.
+7.  `num_gen_servers`: Number of generation servers.
+8.  `gen_tp_size`: Tensor parallel size for generation servers.
+9.  `gen_pp_size`: Pipeline parallel size for generation servers.
+10. `gen_batch_size`: Max batch size for generation servers.
+11. `gen_max_num_tokens`: Max number of tokens for generation servers.
+12. `gen_enable_attention_dp`: `true` or `false` to enable attention DP for generation servers.
+13. `gen_gpu_memory_fraction`: GPU memory fraction for generation servers.
+14. `eplb_num_slots`: Number of slots for eplb.
+15. `mtp_size`: Number of nextn layers for MTP.
+16. `concurrency`: Concurrency level for benchmarking.
+17. `isl`: Input sequence length.
+18. `osl`: Output sequence length.
+19. `multi_round`: Number of rounds for the benchmark.
+20. `streaming`: `true` or `false` for streaming mode.
+21. `container_image`: Container image to use.
+22. `mounts`: Container mounts.
+23. `workdir`: Working directory.
+24. `model_dir`: Model directory path.
+25. `trtllm_repo`: TensorRT-LLM repository path.
 
 ### `gen_yaml.py`
 
@@ -90,5 +102,5 @@ This script orchestrates the execution of the benchmark client. It waits for the
 7.  `disaggr_torch.slurm` starts the main `trtllm-serve` process.
 8.  `disaggr_torch.slurm` runs `run_benchmark.sh` which waits for the server to be ready.
 9.  `run_benchmark.sh` executes the benchmark for each concurrency level specified.
-10.  After the benchmark, `run_benchmark.sh` and `disaggr_torch.slurm` attempt to kill the server and worker processes.
+10. After the benchmark, `run_benchmark.sh` and `disaggr_torch.slurm` attempt to kill the server and worker processes.
 11. Logs for each run are stored in a subdirectory specified by the `sub_file` parameter.

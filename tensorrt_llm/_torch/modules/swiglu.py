@@ -1,6 +1,3 @@
-from collections.abc import Mapping
-from typing import Optional
-
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
@@ -51,37 +48,13 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
     tl.store(o_row_ptr + offsets, result, mask=mask)
 
 
-def silu_and_mul(x: torch.Tensor,
-                 scale: Optional[torch.Tensor] = None,
-                 dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-    b, n = x.shape
-
-    assert n % 2 == 0
-    d = n // 2
-
-    o_dtype = dtype or x.dtype
-    o = torch.empty((b, d), dtype=o_dtype, device=x.device)
-
-    def grid(meta: Mapping[str, int]) -> tuple[int, int]:
-        return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
-
-    silu_and_mul_kernel[grid](
-        o_ptr=o,
-        o_stride=o.stride(0),
-        o_scale_ptr=scale,
-        x_ptr=x,
-        x_stride=x.stride(0),
-        d=d,
-        BLOCK_SIZE=1024,
-        HAS_O_SCALE=scale is not None,
-    )
-
-    return o
-
-
 def swiglu(x, quant_scale: torch.Tensor = None, quant_type=None):
     if quant_scale is not None:
         assert quant_type is not None
-        return silu_and_mul(x, scale=quant_scale, dtype=quant_type)
+        return torch.ops.trtllm.silu_and_mul(
+            x,
+            scale=quant_scale,
+            dtype=quant_type,
+        )
 
-    return silu_and_mul(x)
+    return torch.ops.trtllm.silu_and_mul(x)
