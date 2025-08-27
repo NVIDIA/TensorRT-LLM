@@ -331,7 +331,8 @@ class Qwen2VisionModelBase(nn.Module):
         model = model_class.from_pretrained(
             model_path,
             torch_dtype=pretrained_config.torch_dtype,
-            attn_implementation='flash_attention_2').eval()
+            attn_implementation='flash_attention_2',
+            ignore_mismatched_sizes=True).eval()
         # TODO: Make vision model compatible with meta init mode and load_weights at the same place
         self.visual = model.visual.to(self.device)
         self.post_config()
