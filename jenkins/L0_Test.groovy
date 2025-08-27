@@ -317,7 +317,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 // Upload slurm_run_sh to Frontend node
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
 
-                Utils.copyScriptToRemoteHost(
+                Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
                     scriptRunLocalPath,
@@ -332,7 +332,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 def testListPathLocal = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
-                Utils.copyScriptToRemoteHost(
+                Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
                     testListPathLocal,
@@ -428,7 +428,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 }
                 scriptContent = scriptContent.replaceAll('\t','').stripIndent()
                 pipeline.writeFile(file: scriptLaunchPathLocal, text: scriptContent)
-                Utils.copyScriptToRemoteHost(
+                Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
                     scriptLaunchPathLocal,
