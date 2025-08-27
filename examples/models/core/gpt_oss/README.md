@@ -35,7 +35,7 @@ OpenAI MoE models support function calling. Here is an example based on [XGramma
 First, launch a server with XGrammar enabled:
 
 ```bash
-trtllm-serve <model> --backend pytorch
+trtllm-serve <model>
 ```
 
 Run the [openai_chat_client_function_calling.py](./openai_chat_client_function_calling.py) script, which queries the LLM server in two steps:

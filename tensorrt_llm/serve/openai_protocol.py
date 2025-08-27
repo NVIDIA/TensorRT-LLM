@@ -329,7 +329,7 @@ class FunctionCall(OpenAIBaseModel):
     arguments: str
 
 
-class DeltaFunctionCall(BaseModel):
+class DeltaFunctionCall(OpenAIBaseModel):
     name: Optional[str] = None
     arguments: Optional[str] = None
 

@@ -26,7 +26,7 @@ from .openai_protocol import (ChatCompletionMessageParam, ChatCompletionRequest,
                               DeltaFunctionCall, DeltaMessage, DeltaToolCall,
                               UsageInfo)
 
-# yapf: enale
+# yapf: enable
 
 
 class HarmonyStreamState:
@@ -1585,8 +1585,8 @@ def _create_usage_info(final_res: RequestOutput) -> UsageInfo:
 
 
 def maybe_transform_reasoning_effort(
-        reasoning_effort: ReasoningEffort | Literal["low", "medium", "high"] | None
-    ) -> ReasoningEffort | None:
+    reasoning_effort: ReasoningEffort | Literal["low", "medium", "high"] | None
+) -> ReasoningEffort | None:
     str_to_effort = {
         "low": ReasoningEffort.LOW,
         "medium": ReasoningEffort.MEDIUM,

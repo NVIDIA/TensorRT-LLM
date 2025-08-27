@@ -102,7 +102,7 @@ class OpenAIServer:
                 self.perf_metrics_lock = asyncio.Lock()
 
         # gpt-oss
-        self.harmony_adapter = HarmonyAdapter()
+        self.harmony_adapter: HarmonyAdapter | None = None
         self.use_harmony = self.model_config.model_type == "gpt_oss"
 
         @asynccontextmanager
@@ -673,6 +673,10 @@ class OpenAIServer:
         Supports both streaming and non-streaming modes.
         """
         try:
+            # Initialize HarmonyAdapter
+            # NOTE: WAR for Disagg failure, may affect perf if no warmup
+            if not self.harmony_adapter:
+                self.harmony_adapter = HarmonyAdapter()
             # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
             tools_dict = None
             if request.tools:

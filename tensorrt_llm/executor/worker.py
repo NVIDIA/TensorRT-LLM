@@ -467,26 +467,40 @@ class GenerationExecutorWorker(GenerationExecutor):
         def _deduce_max_tokens(request: GenerationRequest,
                                executor_config: tllm.ExecutorConfig) -> int:
             # deduce max_tokens when it's not set by user
+            max_tokens = request.sampling_params.max_tokens
             query_token_len = len(
                 request.query_token_ids) if request.query_token_ids else 0
             cp_size = 1 if (not hasattr(executor_config, "mapping")
                             or executor_config.mapping.cp_size
                             is None) else executor_config.mapping.cp_size
             if not hasattr(executor_config, "max_seq_len"):
-                raise RuntimeError(
-                    "max_tokens for sampling is not set and cannot be deduced")
+                logger.warning("`default_max_tokens` cannot be deduced")
+                if max_tokens is None:
+                    raise ValueError(
+                        "`max_tokens` must be set when `default_max_tokens` cannot be deduced"
+                    )
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = executor_config.max_seq_len - splited_prompt_len - query_token_len
-            if default_max_tokens < 0:
-                raise ValueError(
-                    f"Deduced max_tokens {default_max_tokens} is less than 0, because"
-                    f"prompt length {splited_prompt_len} plus query length {query_token_len} "
-                    f"is larger than max_seq_len {executor_config.max_seq_len}")
+            if default_max_tokens <= 0:
+                logger.warning(
+                    f"`default_max_tokens` ({default_max_tokens}) should be greater than 0, "
+                    f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({executor_config.max_seq_len})"
+                    f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
+                )
+                if max_tokens is None:
+                    raise ValueError(
+                        "`max_tokens` must be set when `default_max_tokens` is illegal"
+                    )
             # default_max_tokens is the biggest available value
-            if (max_tokens := request.sampling_params.max_tokens
-                ) and max_tokens < default_max_tokens:
-                return max_tokens
-            return default_max_tokens
+            if max_tokens is None:
+                return default_max_tokens
+            elif max_tokens > default_max_tokens:
+                logger.warning(
+                    f"User-specified `max_tokens` ({max_tokens}) is greater than deduced "
+                    f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
+                )
+                return default_max_tokens
+            return max_tokens
 
         try:
             executor_request = tllm.Request(
