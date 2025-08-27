@@ -131,6 +131,14 @@ methods:
         annotation: float
         default: 0
         status: prototype
+      batch_wait_timeout_iters:
+        annotation: int
+        default: 0
+        status: prototype
+      batch_wait_max_tokens_ratio:
+        annotation: float
+        default: 0
+        status: prototype
       print_iter_log:
         annotation: bool
         default: False
