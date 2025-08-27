@@ -31,9 +31,8 @@ class MedusaConfig(PretrainedConfig):
                  num_medusa_layers: int = 1,
                  max_draft_len: int = 63,
                  **kwargs):
-        GenericMedusaConfig = QWenConfig if hasattr(
-            kwargs,
-            'model_type') and "qwen" in kwargs['model_type'] else LLaMAConfig
+        GenericMedusaConfig = QWenConfig if 'medel_type' in kwargs and \
+            "qwen" in kwargs['model_type'] else LLaMAConfig
 
         self.config = GenericMedusaConfig(**kwargs)
 
