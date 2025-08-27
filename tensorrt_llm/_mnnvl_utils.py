@@ -369,6 +369,7 @@ class MnnvlMoe:
         torch.ops.trtllm.moe_initialize_workspace(
             MnnvlMoe.moe_workspace_tensor, mapping.tp_rank, mapping.tp_size
         )
+        torch.cuda.synchronize()
         MnnvlMoe.moe_workspace.comm.barrier()
         return MnnvlMoe.moe_workspace_tensor
 

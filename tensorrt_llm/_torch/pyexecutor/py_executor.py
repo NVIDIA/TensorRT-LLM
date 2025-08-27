@@ -1185,7 +1185,7 @@ class PyExecutor:
                 return True
 
         new_requests_cur_rank = self.executor_request_queue.fetch_new_requests(
-            len(self.active_requests))
+            self.active_requests)
         self.is_shutdown = self.executor_request_queue.is_shutdown
         self.expected_num_active_requests = self.executor_request_queue.get_expected_num_active_requests(
         )
