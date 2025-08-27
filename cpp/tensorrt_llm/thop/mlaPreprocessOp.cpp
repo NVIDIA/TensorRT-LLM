@@ -565,7 +565,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "merge_chunked_attention_for_mla("
-        "Tensor merged_attn"
+        "Tensor(a!) merged_attn"
         ", Tensor temp_attn"
         ", Tensor merged_softmax_stats"
         ", Tensor temp_softmax_stats"

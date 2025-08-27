@@ -9,6 +9,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.guided_decoder import GuidedDecoder
+from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
                                       get_draft_token_length)
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
@@ -266,7 +267,21 @@ class ModelDrafter(Drafter):
         """Sample tokens from draft model outputs."""
         try:
             if self.sampler is not None:
-                return self.sampler.sample_async(draft_batch, outputs)
+                num_context_logits_prefix_sum = [0]
+                prefix_sum = 0
+                for request in draft_batch.context_requests:
+                    prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
+                    num_context_logits_prefix_sum.append(prefix_sum)
+
+                HandleLogits()(
+                    draft_batch.context_requests,
+                    draft_batch.generation_requests, outputs["logits"],
+                    self.sampler.beam_width(draft_batch.all_requests()),
+                    num_context_logits_prefix_sum,
+                    self.sampler.is_generation_model())
+
+                return self.sampler.sample_async(draft_batch, outputs,
+                                                 num_context_logits_prefix_sum)
             return None
         except Exception as e:
             logger.error(f"Error in sampling: {str(e)}")

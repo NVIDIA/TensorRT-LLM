@@ -221,7 +221,9 @@ class NemotronHModel(DecoderModel):
             )
 
         if self.mamba_metadata is None or self.mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            self.mamba_metadata = Mamba2Metadata(attn_metadata.max_num_requests)
+            self.mamba_metadata = Mamba2Metadata(
+                attn_metadata.max_num_requests,
+                chunk_size=self.model_config.pretrained_config.chunk_size)
         self.mamba_metadata.prepare(attn_metadata)
 
         if inputs_embeds is None:
