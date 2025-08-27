@@ -347,7 +347,7 @@ class ModelDrafter(Drafter):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
-        request_mapping: dict[int, LlmRequest],
+        request_mapping: Optional[dict[int, LlmRequest]] = None,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         """

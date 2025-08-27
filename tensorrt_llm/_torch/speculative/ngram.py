@@ -86,6 +86,7 @@ class NGramPoolManager(BaseResourceManager):
     def get_draft_tokens(
         self,
         prefix: list[int],
+        request: list[int],
         request_id: int,
         padding_id: int,
         max_sequence_length: int,
@@ -129,7 +130,7 @@ class NGramPoolManager(BaseResourceManager):
         draft_tokens = [padding_id]  # fallback value
         for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
                           -1):
-            pattern = tuple(prefix[-size:])
+            pattern = tuple(request[-size:])
             if pattern not in pool:
                 continue
             draft_tokens = pool[pattern][0 if self.is_use_oldest else -1]
@@ -177,7 +178,7 @@ class NGramDrafter(Drafter):
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
-        request_mapping: dict[int, LlmRequest],
+        request_mapping: Optional[dict[int, LlmRequest]] = None,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         # Sort by request_id when py_batch_idx is None as a fallback.
@@ -194,6 +195,7 @@ class NGramDrafter(Drafter):
             # Generate draft tokens
             draft_tokens = self.spec_resource_manager.get_draft_tokens(
                 prefix,
+                request.get_tokens(0),
                 request.request_id,
                 padding_id=0,
                 max_sequence_length=request.py_orig_prompt_len +
@@ -203,6 +205,7 @@ class NGramDrafter(Drafter):
             if len(draft_tokens) > 0:
                 pad_length = self.max_draft_len - len(draft_tokens)
                 draft_tokens.extend([0] * pad_length)
+
             request.py_draft_tokens = draft_tokens
             request_mapping[
                 request.py_request_id].py_draft_tokens = draft_tokens
