@@ -860,6 +860,10 @@ struct Result
     /// one token can be generated per iteration. Used for speculative decoding statistics.
     SizeType32 decodingIter{0};
 
+    /// @brief The average number of decoded tokens per iteration. For standard model it is 1.
+    /// For speculative decoding model >= 1 -- number of draft tokens accepted per step + 1.
+    float avgDecodedTokensPerIter{0.0f};
+
     /// @brief The index of the output sequence of this result where 0 <= sequenceIndex < numReturnSequences.
     /// In beam search (beamWidth > 1), this index will be always zero because all beams to be returned are included
     /// in this result.
@@ -1002,7 +1006,8 @@ public:
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
         SizeType32 attentionDpEventsGatherPeriodMs = 5,
-        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
+        uint64_t const& maxGpuTotalBytes = 0);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] bool getEnablePartialReuse() const;
@@ -1018,11 +1023,12 @@ public:
     [[nodiscard]] size_t getEventBufferMaxSize() const;
     [[nodiscard]] bool getUseUvm() const;
     [[nodiscard]] SizeType32 getAttentionDpEventsGatherPeriodMs() const;
+    [[nodiscard]] uint64_t getMaxGpuTotalBytes() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
     void setCopyOnPartialReuse(bool copyOnPartialReuse);
-    void setMaxTokens(SizeType32 maxTokens);
+    void setMaxTokens(std::optional<SizeType32> maxTokens);
     void setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentionWindowVec);
     void setSinkTokenLength(SizeType32 sinkTokenLength);
     void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
@@ -1033,6 +1039,7 @@ public:
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
     void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
+    void setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1091,6 +1098,10 @@ private:
 
     /// @brief The period in milliseconds to gather attention DP events across ranks
     SizeType32 mAttentionDpEventsGatherPeriodMs;
+    /// @brief The maximum size in bytes of GPU memory that can be allocated for the KV cache.
+    /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
+    /// be allocated.
+    uint64_t mMaxGpuTotalBytes;
 };
 
 /// @brief Configuration class for the runtime perf knobs

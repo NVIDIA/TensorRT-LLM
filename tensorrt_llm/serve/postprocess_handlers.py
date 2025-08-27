@@ -160,7 +160,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
 
         choice = ChatCompletionResponseStreamChoice(index=i,
                                                     delta=delta_message,
-                                                    finish_reason=None)
+                                                    finish_reason=None,
+                                                    avg_decoded_tokens_per_iter=getattr(rsp, 'avg_decoded_tokens_per_iter', None))
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
@@ -224,6 +225,7 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
             finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
             disaggregated_params=disaggregated_params,
+            avg_decoded_tokens_per_iter=getattr(rsp, 'avg_decoded_tokens_per_iter', None),
         )
 
         if args.return_logprobs:
@@ -293,6 +295,7 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
             token_ids=None if args.detokenize else output.token_ids_diff,
             finish_reason = output.finish_reason,
             stop_reason = output.stop_reason,
+            avg_decoded_tokens_per_iter=getattr(rsp, 'avg_decoded_tokens_per_iter', None),
         )
         chunk = CompletionStreamResponse(model=args.model, choices=[choice])
         if include_continuous_usage:
@@ -337,6 +340,7 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
             context_logits=None if rsp.context_logits is None else rsp.context_logits.tolist(),
             stop_reason=output.stop_reason,
             finish_reason=output.finish_reason,
+            avg_decoded_tokens_per_iter=getattr(rsp, 'avg_decoded_tokens_per_iter', None),
         )
 
         completion_tokens += output.length

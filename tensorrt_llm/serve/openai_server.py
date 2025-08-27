@@ -4,11 +4,12 @@ import os
 import re
 import signal
 import traceback
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, List, Optional
+from typing import Any, AsyncGenerator, AsyncIterator, List, Optional, Union
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -24,6 +25,7 @@ from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
+from tensorrt_llm.llmapi import MultimodalEncoder
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
@@ -33,7 +35,8 @@ from tensorrt_llm.serve.chat_utils import (check_multiple_response,
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
-                                                CompletionRequest,
+                                                ChatCompletionResponseChoice,
+                                                ChatMessage, CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
@@ -54,7 +57,7 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds.
 class OpenAIServer:
 
     def __init__(self,
-                 llm: LLM,
+                 llm: Union[LLM, MultimodalEncoder],
                  model: str,
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig):
@@ -82,12 +85,18 @@ class OpenAIServer:
         else:
             self.model = model
         self.metrics_collector = None
+        self.perf_metrics = None
+        self.perf_metrics_lock = None
         if self.llm.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
                 "model_name": "undefined",
                 "engine_type": "undefined"
             })
+            max_perf_metrics = self.llm.args.perf_metrics_max_requests
+            if max_perf_metrics > 0:
+                self.perf_metrics = deque(maxlen=max_perf_metrics)
+                self.perf_metrics_lock = asyncio.Lock()
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -118,7 +127,11 @@ class OpenAIServer:
         async def validation_exception_handler(_, exc):
             return self.create_error_response(message=str(exc))
 
-        self.register_routes()
+        if self.server_role is not ServerRole.MM_ENCODER:
+            self.register_routes()
+        else:
+            assert isinstance(self.llm, MultimodalEncoder), "llm must be a MultimodalEncoder for multimodal encoder"
+            self.register_mm_encoder_routes()
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
@@ -153,6 +166,7 @@ class OpenAIServer:
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
+        self.app.add_api_route("/perf_metrics", self.get_perf_metrics, methods=["GET"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
         self.app.add_api_route("/v1/completions",
@@ -187,6 +201,16 @@ class OpenAIServer:
         metrics_route = Mount("/prometheus/metrics", metrics_app)
         metrics_route.path_regex = re.compile("^/prometheus/metrics(?P<path>.*)$")
         self.app.routes.append(metrics_route)
+
+    def register_mm_encoder_routes(self):
+        self.app.add_api_route("/health", self.health, methods=["GET"])
+        self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
+        self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
+        self.app.add_api_route("/v1/chat/completions",
+                               self.openai_mm_encoder,
+                               methods=["POST"])
 
     async def health(self) -> Response:
         return Response(status_code=200)
@@ -239,6 +263,50 @@ class OpenAIServer:
             stats.append(stat)
         return JSONResponse(content=stats)
 
+    async def get_perf_metrics(self) -> JSONResponse:
+        if self.perf_metrics is None:
+            return JSONResponse(content=[])
+        async with self.perf_metrics_lock:
+            perf_metrics = self.perf_metrics
+            self.perf_metrics = deque(maxlen=self.llm.args.perf_metrics_max_requests)
+        for metrics_dict in perf_metrics:
+            metrics = metrics_dict["perf_metrics"]
+            timing_metrics = metrics.timing_metrics
+            kv_cache_metrics = metrics.kv_cache_metrics
+            speculative_decoding = metrics.speculative_decoding
+            metrics_json = {
+                "first_iter": metrics.first_iter,
+                "last_iter": metrics.last_iter,
+                # exclude metrics.iter since it is only meaningful when the request is not finished
+            }
+            metrics_json["timing_metrics"] = {
+                "arrival_time": timing_metrics.arrival_time.total_seconds(),
+                "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds(),
+                "first_token_time": timing_metrics.first_token_time.total_seconds(),
+                "last_token_time": timing_metrics.last_token_time.total_seconds(),
+            }
+            metrics_json["kv_cache_metrics"] = {
+                "num_total_allocated_blocks": kv_cache_metrics.num_total_allocated_blocks,
+                "num_new_allocated_blocks": kv_cache_metrics.num_new_allocated_blocks,
+                "num_reused_blocks": kv_cache_metrics.num_reused_blocks,
+                "num_missed_blocks": kv_cache_metrics.num_missed_blocks,
+            }
+            if timing_metrics.kv_cache_size > 0:
+                metrics_json["timing_metrics"].update({
+                    # TODO: move to kv_cache_metrics
+                    "kv_cache_size": timing_metrics.kv_cache_size,
+                    "kv_cache_transfer_start": timing_metrics.kv_cache_transfer_start.total_seconds(),
+                    "kv_cache_transfer_end": timing_metrics.kv_cache_transfer_end.total_seconds(),
+                })
+            if speculative_decoding.total_draft_tokens > 0:
+                metrics_json["speculative_decoding"] = {
+                    "acceptance_rate": speculative_decoding.acceptance_rate,
+                    "total_accepted_draft_tokens": speculative_decoding.total_accepted_draft_tokens,
+                    "total_draft_tokens": speculative_decoding.total_draft_tokens,
+                }
+            metrics_dict["perf_metrics"] = metrics_json
+        return JSONResponse(content=list(perf_metrics))
+
     async def get_kv_cache_events(self) -> JSONResponse:
         events = []
         try:
@@ -248,6 +316,23 @@ class OpenAIServer:
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
+
+    async def _extract_metrics(self, res: RequestOutput):
+        if not res.finished:
+            return
+        if self.metrics_collector:
+            self.metrics_collector.log_metrics_dict(res.metrics_dict)
+        if self.llm.args.return_perf_metrics:
+            output = res.outputs[0]
+            item = {
+                "request_id": res.request_id,
+                "perf_metrics": res.outputs[0].request_perf_metrics
+            }
+            if output.disaggregated_params:
+                item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
+            if self.perf_metrics is not None:
+                async with self.perf_metrics_lock:
+                    self.perf_metrics.append(item)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
@@ -264,8 +349,7 @@ class OpenAIServer:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             async for res in promise:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                if res.finished and self.metrics_collector:
-                    self.metrics_collector.log_metrics_dict(res.metrics_dict)
+                await self._extract_metrics(res)
                 for pp_res in pp_results:
                     yield pp_res
             yield "data: [DONE]\n\n"
@@ -283,8 +367,7 @@ class OpenAIServer:
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
-            if promise.finished and self.metrics_collector:
-                self.metrics_collector.log_metrics_dict(promise.metrics_dict)
+            await self._extract_metrics(promise)
             return chat_response
 
         try:
@@ -364,6 +447,82 @@ class OpenAIServer:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
+    async def openai_mm_encoder(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+
+        async def create_mm_embedding_response(promise: RequestOutput):
+            await promise.aresult()
+            # TODO: Replace mm_embedding_handle with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
+            mm_embedding_handle = getattr(promise, "mm_embedding_handle", None)
+            if not mm_embedding_handle or "tensor_size" not in mm_embedding_handle:
+                return self.create_error_response(
+                    message="Multimodal embedding handle missing in response",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            num_tokens = int(mm_embedding_handle["tensor_size"][0])
+            return ChatCompletionResponse(
+                id=str(promise.request_id),
+                model=self.model,
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatMessage(role="assistant", content="dummy"),
+                        mm_embedding_handle=mm_embedding_handle,
+                        finish_reason="length",
+                    )
+                ],
+                usage=UsageInfo(
+                    prompt_tokens=num_tokens,
+                    completion_tokens=1,
+                    total_tokens=num_tokens + 1,
+                ),
+            )
+
+        try:
+            check_multiple_response(request.n, self.llm.args.backend)
+            conversation: List[ConversationMessage] = []
+            tool_dicts = None if request.tools is None else [
+                tool.model_dump() for tool in request.tools
+            ]
+
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
+
+            if request.prompt_token_ids is not None:
+                prompt = request.prompt_token_ids
+            else:
+                prompt: str = apply_chat_template(
+                    model_type=self.model_config.model_type,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    conversation=conversation,
+                    add_generation_prompt=request.add_generation_prompt,
+                    mm_placeholder_counts=mm_placeholder_counts,
+                    tools=tool_dicts,
+                    documents=request.documents,
+                    chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs or {},
+                )
+            prompt = prompt_inputs(prompt)
+
+            mm_data = await mm_coroutines
+            if mm_data is not None:
+                prompt["multi_modal_data"] = mm_data
+
+            promise = self.llm.generate_async(
+                inputs=prompt,
+            )
+            asyncio.create_task(self.await_disconnected(raw_request, promise))
+
+            response = await create_mm_embedding_response(promise)
+            return JSONResponse(content=response.model_dump())
+
+        except CppExecutorError:
+            logger.error(traceback.format_exc())
+            # If internal executor error is raised, shutdown the server
+            signal.raise_signal(signal.SIGINT)
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(str(e))
+
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
 
         async def completion_response(promise: RequestOutput,
@@ -377,8 +536,7 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            if response.finished and self.metrics_collector:
-                self.metrics_collector.log_metrics_dict(response.metrics_dict)
+            await self._extract_metrics(response)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -414,8 +572,7 @@ class OpenAIServer:
                     pp_result = post_processor(output, args)
                 else:
                     pp_result = output.outputs[0]._postprocess_result
-                if output.finished and self.metrics_collector:
-                    self.metrics_collector.log_metrics_dict(output.metrics_dict)
+                await self._extract_metrics(output)
                 for pp_res in pp_result:
                     yield pp_res
 
