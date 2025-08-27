@@ -247,7 +247,17 @@ public:
     explicit FP8BlockScaleMoeRunner(int64_t tileTokensDim)
         : mTileTokensDim(tileTokensDim)
     {
-        mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim);
+        mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim, true /* useTmaOobOpt */);
+    }
+
+    [[nodiscard]] int64_t getNumPrependTokensFc1OutputBuffer() const
+    {
+        return mRunner->getNumPrependTokensFc1OutputBuffer();
+    }
+
+    [[nodiscard]] int64_t getNumPrependTokensFc2OutputBuffer() const
+    {
+        return mRunner->getNumPrependTokensFc2OutputBuffer();
     }
 
     [[nodiscard]] std::vector<int64_t> getValidConfigs(
