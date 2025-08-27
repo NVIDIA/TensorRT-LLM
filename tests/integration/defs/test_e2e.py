@@ -2178,7 +2178,7 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
 # This test is specifically to be run on 2 GPUs on Blackwell RTX 6000 Pro (SM120) architecture
 # TODO: remove once we have a node with 8 GPUs and reuse test_ptp_quickstart_advanced_8gpus
 @skip_no_sm120
-@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device_memory(160000)
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("model_name,model_path", [
     ('Nemotron-Super-49B-v1-BF16',
@@ -2186,7 +2186,7 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
     pytest.param('Llama3.1-70B-BF16',
                  'llama-3.1-model/Meta-Llama-3.1-70B',
-                 marks=pytest.mark.skip_less_device_memory(95000)),
+                 marks=pytest.mark.skip_less_device_memory(190000)),
 ])
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
                                              model_path):

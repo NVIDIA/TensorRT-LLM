@@ -661,15 +661,15 @@ class TestStrictBaseModelArbitraryArgs:
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""
         # Valid arguments should work
-        config = CacheTransceiverConfig(backend="ucx",
+        config = CacheTransceiverConfig(backend="UCX",
                                         max_tokens_in_buffer=1024)
-        assert config.backend == "ucx"
+        assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            CacheTransceiverConfig(backend="ucx", invalid_config="should_fail")
+            CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
 
     def test_torch_compile_config_arbitrary_args(self):
