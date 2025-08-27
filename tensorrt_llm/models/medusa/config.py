@@ -19,8 +19,8 @@ from typing import Optional, Union
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
 from ..llama.config import LLaMAConfig
-from ..qwen.config import QWenConfig
 from ..modeling_utils import PretrainedConfig, QuantConfig
+from ..qwen.config import QWenConfig
 
 
 # Medusa-specific config is stored and retrieved from GenericMedusaConfig.
