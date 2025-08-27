@@ -41,6 +41,7 @@ using Connection = tensorrt_llm::executor::kv_cache::Connection;
 using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TransferSession = kv_cache_manager::TransferSession;
+using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 
 struct TransceiverTag
 {
