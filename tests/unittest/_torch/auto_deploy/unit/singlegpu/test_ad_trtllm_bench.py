@@ -136,31 +136,23 @@ def run_benchmark(
     config_path = f"{temp_dir}/extra_llm_api_options.yaml"
 
     # Build the command to run the benchmark
-    cmd = [
-        "python",
-        "-m",
-        "tensorrt_llm.commands.bench",
-        "--model",
-        model_name
-    ]
+    cmd = ["python", "-m", "tensorrt_llm.commands.bench", "--model", model_name]
 
     # If the model exists locally, then using the local copy will make the test robust to CI network issues
     if os.path.isdir(model_path):
         cmd.extend(["--model_path", model_path])
 
-    cmd.extend([
-        "throughput",
-        "--backend",
-        backend,
-        "--dataset",
-        str(dataset_path),
-        "--max_batch_size",
-        str(max_batch_size),
-        ])
-
-    # If the model exists locally, then using the local copy will make the test robust to CI network issues
-    if os.path.isdir(model_path):
-        cmd.extend(["--model_path", model_path])
+    cmd.extend(
+        [
+            "throughput",
+            "--backend",
+            backend,
+            "--dataset",
+            str(dataset_path),
+            "--max_batch_size",
+            str(max_batch_size),
+        ]
+    )
 
     # Add report_json argument if path is provided
     if report_json_path:
