@@ -12,16 +12,16 @@ jobs:
   pr-checklist:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout private action repository
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          repository: poweiw/goggles_action
-          path: ./.github/actions/goggles_action
-          token: ${{ secrets.GOGGLES_ACTION_REPO_TOKEN}}
-          ref: 0dc6365
 
-      - name: Validate PR Checklist
-        uses: ./.github/actions/goggles_action/actions/pr_checklist
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
+          python-version: '3.10'
+
+      - name: Run validation script
+        env:
           PR_BODY: ${{ github.event.pull_request.body }}
           ENFORCE_PR_HAS_CHECKLIST: true
+        run: python scripts/pr_checklist_check.py
