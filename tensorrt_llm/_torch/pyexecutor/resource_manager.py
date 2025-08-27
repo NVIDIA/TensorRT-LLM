@@ -14,7 +14,7 @@ from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
+from ..._utils import binding_dtype_size, binding_to_str_dtype, mpi_rank, nvtx_range
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
@@ -330,6 +330,7 @@ class KVCacheManager(BaseResourceManager):
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
+        
         if self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
@@ -339,9 +340,10 @@ class KVCacheManager(BaseResourceManager):
                     attention_dp_events_gather_period_ms=self.
                     attention_dp_events_gather_period_ms,
                 )
-            else:
+            elif mpi_rank() == 0:
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size)
+
 
         self.impl = KVCacheManagerCpp(**kwargs)
 
