@@ -849,6 +849,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         # use llm.config as config for pytorch model engine
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
     @nvtx_range("Qwen2.5-VL prepare_mrope_config")
     def prepare_mrope_config(self, multimodal_params: List[MultimodalParams],
