@@ -41,7 +41,8 @@ container_image=${22}
 mounts=${23}
 workdir=${24}
 model_dir=${25}
-trtllm_repo=${26}
+benchmark_mode=${26}
+trtllm_repo=${27}
 
 echo "================= parameters ================="
 echo "num_ctx_servers: ${num_ctx_servers}"
