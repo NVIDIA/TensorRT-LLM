@@ -9,13 +9,13 @@ from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
+# with bias=None
 def _fp8_ref_pattern_1(
     x: torch.Tensor,
     w_fp8: torch.Tensor,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
-    # Matches: torch_fake_quant_fp8_linear(input, weight_fp8, bias, [in_s], [w_s], [], [])
     return torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default(
         x,
         w_fp8,
@@ -33,9 +33,6 @@ def _fp8_ref_repl_1(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
-    # Map lists -> scalars for fused op
-    # in_s = input_scale[0]
-    # w_s = weight_scale[0]
     return torch.ops.auto_deploy.torch_quant_fp8_linear(
         x,
         w_fp8,
@@ -45,6 +42,7 @@ def _fp8_ref_repl_1(
     )
 
 
+# with bias!=None
 def _fp8_ref_pattern_2(
     x: torch.Tensor,
     w_fp8: torch.Tensor,
@@ -52,7 +50,6 @@ def _fp8_ref_pattern_2(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
-    # Matches: torch_fake_quant_fp8_linear(input, weight_fp8, bias, [in_s], [w_s], [], [])
     return torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default(
         x,
         w_fp8,
@@ -71,9 +68,6 @@ def _fp8_ref_repl_2(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
-    # Map lists -> scalars for fused op
-    # in_s = input_scale[0]
-    # w_s = weight_scale[0]
     return torch.ops.auto_deploy.torch_quant_fp8_linear(
         x,
         w_fp8,
@@ -83,7 +77,7 @@ def _fp8_ref_repl_2(
     )
 
 
-# NVFP4: reference (search) and fused (replacement)
+# NVFP4: with bias=None
 def _fp4_ref_pattern_1(
     x: torch.Tensor,
     w_fp4: torch.Tensor,
@@ -91,7 +85,6 @@ def _fp4_ref_pattern_1(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
 ):
-    # Matches: torch_fake_quant_fp4_linear(x, w_fp4, bias, [s_in2], [cutlass_scale, alpha], [], [])
     return torch.ops.auto_deploy.torch_fake_quant_fp4_linear(
         x,
         w_fp4,
@@ -120,6 +113,7 @@ def _fp4_ref_repl_1(
     )
 
 
+# with bias!=None
 def _fp4_ref_pattern_2(
     x: torch.Tensor,
     w_fp4: torch.Tensor,
@@ -128,7 +122,6 @@ def _fp4_ref_pattern_2(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
 ):
-    # Matches: torch_fake_quant_fp4_linear(x, w_fp4, bias, [s_in2], [cutlass_scale, alpha], [], [])
     return torch.ops.auto_deploy.torch_fake_quant_fp4_linear(
         x,
         w_fp4,
@@ -162,10 +155,8 @@ def _register_quant_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     """
     Register the FP8 and FP4 patterns with robust dummy args and minimal ignores.
     """
-    # Use harmless meta tensors; no dtype/device constraints during tracing.
-    # Shapes mirror your unit tests but can be arbitrary as long as tracing succeeds.
     x_fp8 = torch.randn(3, 16, device="meta", dtype=torch.float16)
-    w_fp8 = torch.randn(32, 16, device="meta", dtype=torch.float16)  # dtype not enforced in trace
+    w_fp8 = torch.randn(32, 16, device="meta", dtype=torch.float16)
     bias32 = torch.randn(32, device="meta", dtype=torch.float32)
     one = torch.tensor(1.0, device="meta", dtype=torch.float32)
 
@@ -189,47 +180,43 @@ def _register_quant_linear_patterns(patterns: ADPatternMatcherPass) -> None:
         replace_fn=_fp8_ref_repl_1,
         patterns=patterns,
         dummy_args=dummy_args_fp8,
-        # No special scalar_workaround or op_ignore_types needed here.
     )
     register_ad_pattern(
         search_fn=_fp8_ref_pattern_2,
         replace_fn=_fp8_ref_repl_2,
         patterns=patterns,
         dummy_args=dummy_args_fp8_2,
-        # No special scalar_workaround or op_ignore_types needed here.
     )
 
     # FP4 dummy args
     N = 32
     K_packed = 32  # weight is packed by 2 FP4 per byte
-    K_eff = 2 * K_packed  # <- effective K after repeat(1, 2) in the fake impl
+    K_eff = 2 * K_packed
 
-    x_fp4 = torch.randn(3, K_eff, device="meta", dtype=torch.float16)  # was 3 x 32, must be 3 x 64
+    x_fp4 = torch.randn(3, K_eff, device="meta", dtype=torch.float16)
     w_fp4 = torch.randint(0, 255, (N, K_packed), device="meta", dtype=torch.uint8)
 
     s_in2 = torch.tensor(0.01, device="meta", dtype=torch.float32)
     alpha = torch.tensor(1.2345, device="meta", dtype=torch.float32)
 
-    # Optional: give a realistic-length CUTLASS scale vector (one uint8 per 16-wide block)
-    # num_blocks = N * (K_eff // 16)
     cutlass_len = N * (K_eff // 16)  # 32 * (64/16) = 128
     cutlass_vec = torch.randint(0, 255, (cutlass_len,), device="meta", dtype=torch.uint8)
 
     dummy_args_fp4_1 = [
         x_fp4,
         w_fp4,
-        s_in2,  # input_scale list
+        s_in2,
         cutlass_vec,
-        alpha,  # weight_scale list: [per-block vec, alpha]
+        alpha,
     ]
 
     dummy_args_fp4_2 = [
         x_fp4,
         w_fp4,
         torch.randn(N, device="meta", dtype=torch.float16),  # bias
-        s_in2,  # input_scale list
+        s_in2,
         cutlass_vec,
-        alpha,  # weight_scale list: [per-block vec, alpha]
+        alpha,
     ]
 
     register_ad_pattern(
