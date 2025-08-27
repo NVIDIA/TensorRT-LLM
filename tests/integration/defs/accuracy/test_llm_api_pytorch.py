@@ -2842,66 +2842,92 @@ class TestBeamSearch(LlmapiAccuracyTestHarness):
 
     kv_cache_config = KvCacheConfig(max_tokens=10000)
 
-    def test_beam_search_cuda_graph(self):
+    @parametrize_with_ids("disable_overlap_scheduler", [False, True])
+    @parametrize_with_ids("enable_padding", [True, False])
+    def test_beam_search_cuda_graph_and_overlap_scheduler(
+            self, enable_padding, disable_overlap_scheduler):
         max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
         with LLM(
                 model=self.MODEL_PATH,
                 kv_cache_config=self.kv_cache_config,
                 max_batch_size=max_beam_width,
-                max_seq_len=32,
-                enable_trtllm_sampler=True,
+                max_seq_len=2048,
                 max_beam_width=max_beam_width,
-                disable_overlap_scheduler=False,
-                cuda_graph_config=CudaGraphConfig(enabled=True),
+                disable_overlap_scheduler=disable_overlap_scheduler,
+                cuda_graph_config=CudaGraphConfig(
+                    batch_sizes=[1, 2, 4, 8], enable_padding=enable_padding),
         ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="type=cuda_graph,beam_width=2")
 
     @skip_pre_ada
-    def test_beam_search_cuda_graph_fp8(self):
+    @parametrize_with_ids("disable_overlap_scheduler", [False, True])
+    @parametrize_with_ids("enable_padding", [True, False])
+    def test_beam_search_cuda_graph_and_overlap_scheduler_fp8(
+            self, enable_padding, disable_overlap_scheduler):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
         max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
         with LLM(
                 model=model_path,
                 kv_cache_config=self.kv_cache_config,
                 max_batch_size=max_beam_width,
-                max_seq_len=32,
-                enable_trtllm_sampler=True,
+                max_seq_len=2048,
                 max_beam_width=max_beam_width,
-                disable_overlap_scheduler=False,
-                cuda_graph_config=CudaGraphConfig(enabled=True),
+                disable_overlap_scheduler=disable_overlap_scheduler,
+                cuda_graph_config=CudaGraphConfig(
+                    batch_sizes=[1, 2, 4, 8], enable_padding=enable_padding),
         ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="type=cuda_graph,beam_width=2")
 
     def test_beam_search_overlap_scheduler(self):
         max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
         with LLM(
                 model=self.MODEL_PATH,
                 kv_cache_config=self.kv_cache_config,
                 max_batch_size=max_beam_width,
-                max_seq_len=32,
-                enable_trtllm_sampler=True,
+                max_seq_len=2048,
                 max_beam_width=max_beam_width,
                 disable_overlap_scheduler=False,
                 cuda_graph_config=None,
         ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="type=overlap_scheduler,beam_width=2")
 
     @skip_pre_ada
     def test_beam_search_overlap_scheduler_fp8(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
         max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
         with LLM(
                 model=model_path,
                 kv_cache_config=self.kv_cache_config,
                 max_batch_size=max_beam_width,
-                max_seq_len=32,
-                enable_trtllm_sampler=True,
+                max_seq_len=2048,
                 max_beam_width=max_beam_width,
                 disable_overlap_scheduler=False,
                 cuda_graph_config=None,
         ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="type=overlap_scheduler,beam_width=2")

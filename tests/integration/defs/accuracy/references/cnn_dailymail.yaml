@@ -153,6 +153,16 @@ meta-llama/Llama-3.1-8B-Instruct:
   - quant_algo: FP8
     extra_acc_spec: beam_width=4
     accuracy: 31.391
+  - extra_acc_spec: type=cuda_graph,beam_width=2
+    accuracy: 31.201
+  - quant_algo: FP8
+    extra_acc_spec: type=cuda_graph,beam_width=2
+    accuracy: 31.201
+  - extra_acc_spec: type=overlap_scheduler,beam_width=2
+    accuracy: 31.201
+  - quant_algo: FP8
+    extra_acc_spec: type=overlap_scheduler,beam_width=2
+    accuracy: 31.201
 meta-llama/Llama-3.2-1B:
   - accuracy: 27.427
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
