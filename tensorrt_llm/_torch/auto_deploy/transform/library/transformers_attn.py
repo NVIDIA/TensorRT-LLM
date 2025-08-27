@@ -5,12 +5,13 @@ from functools import partial
 from typing import Optional, Tuple
 
 import torch
+import torch.fx as fx
 from torch.fx import GraphModule
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...custom_ops.attention_interface import AttentionRegistry
 from ...models.factory import ModelFactory
-from ...shim.interface import CachedSequenceInterface, SequenceInfo
+from ...shim.interface import CachedSequenceInterface
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -100,7 +101,41 @@ def forward_cached(module: torch.nn.Module, *cm_args):
         "buffers": buffers,
     }
 
-    return module.forward_with_kwargs(input_ids, position_ids, **hf_input_kwargs)
+    return module.original_forward(
+        input_ids=input_ids, position_ids=position_ids, **hf_input_kwargs
+    )
+
+
+def _get_fake_attn_node(num_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype):
+    """Return a fake attn node for the cache initializers."""
+    q_fake = fx.Node(
+        graph=fx.Graph(),
+        name="q_fake",
+        op="call_function",
+        target=lambda x: x,
+        args=(1,),
+        kwargs={},
+    )
+    q_fake.meta["val"] = torch.empty(1, 1, num_heads, head_dim, device="meta", dtype=dtype)
+    k_fake = fx.Node(
+        graph=fx.Graph(),
+        name="k_fake",
+        op="call_function",
+        target=lambda x: x,
+        args=(1,),
+        kwargs={},
+    )
+    k_fake.meta["val"] = torch.empty(1, 1, num_kv_heads, head_dim, device="meta", dtype=dtype)
+
+    dummpy_node = fx.Node(
+        graph=fx.Graph(),
+        name="dummy",
+        op="call_function",
+        target=lambda x: x,
+        args=(q_fake, k_fake),
+        kwargs={},
+    )
+    return dummpy_node
 
 
 @TransformRegistry.register("transformers_replace_cached_attn")
@@ -140,21 +175,13 @@ class HFReplaceCachedAttn(BaseTransform):
         num_cm_args += num_cached_attn_args
 
         # Add cache and update map
-        # equivalent to attn_descriptor.get_cache_initializers()
-        def _get_cache(si: SequenceInfo):
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
-                hf_config.num_key_value_heads,
-                hf_config.head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or hf_config.torch_dtype,
-            )
-
-        cache_initializers = {
-            "k_cache": _get_cache,
-            "v_cache": _get_cache,
-        }
+        dummy_attn_node = _get_fake_attn_node(
+            hf_config.num_attention_heads,
+            hf_config.num_key_value_heads,
+            hf_config.head_dim,
+            gm.factory_model.dtype,
+        )
+        cache_initializers = attn_descriptor.get_cache_initializers(dummy_attn_node, cache_config)
         per_layer_kvcache_slice = []
         for layer_idx in range(hf_config.num_hidden_layers):
             for k_or_v, get_cache in cache_initializers.items():
@@ -166,16 +193,17 @@ class HFReplaceCachedAttn(BaseTransform):
         cm_args_index_map["kvcache_args"] = per_layer_kvcache_slice
 
         # Add buffer and update map
-        # equivalent to attn_descriptor.get_global_buffer_initializers
-        def _init_workspace(si: SequenceInfo) -> torch.Tensor:
-            # NOTE (lucaslie): avoid OOM for many cudagraphs,
-            # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
-            buffer = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device=si.device)
-            attn_descriptor._get_planner().init_workspace(buffer)
-            return buffer
-
-        cm.add_cache("workspace_buffer", _init_workspace)
-        cm_args_index_map["buffer_args"] = slice(num_cm_args, num_cm_args + 1)
+        existing_buffers = set()
+        for layer_idx in range(hf_config.num_hidden_layers):
+            for k, get_buffer in attn_descriptor.get_global_buffer_initializers(
+                dummy_attn_node
+            ).items():
+                if k in existing_buffers:
+                    continue
+                cm.add_cache(k, get_buffer)
+                existing_buffers.add(k)
+                cm_args_index_map["buffer_args"] = slice(num_cm_args, num_cm_args + 1)
+                num_cm_args += 1
 
         # prepare get_metadata function
         get_metadata, _ = attn_descriptor.get_prepare_metadata_op()
