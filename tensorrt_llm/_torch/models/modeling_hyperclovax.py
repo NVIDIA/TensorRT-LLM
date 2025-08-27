@@ -995,6 +995,7 @@ class HCXVisionForCausalLM(PreTrainedModel):
         llm_model_config.pretrained_config = PretrainedConfig.from_dict(
             llm_model_config.pretrained_config.language_config)
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         logger.info(f"{self.dtype=} {self.model_dtype=}")

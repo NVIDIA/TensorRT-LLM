@@ -1157,6 +1157,7 @@ class VilaModel(PreTrainedModel):
         self.tokenizer, self.llm, self.llm_path, self.vocab_size = init_llm(
             self.llm_path, model_config, *args, **kwargs
         )  # self.llm_path may be updated if ckpt re-saving is needed & existing path is read-only
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
         device = kwargs.get("device", "cuda")
         self.llm.to(device=device, dtype=self.model_dtype)
 

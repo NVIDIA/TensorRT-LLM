@@ -425,6 +425,7 @@ class LlavaNextModel(PreTrainedModel):
         llm_model_config.pretrained_config.mlp_bias = False
 
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
         self.model_config = model_config
         self.model_dtype = getattr(config.text_config, "torch_dtype",

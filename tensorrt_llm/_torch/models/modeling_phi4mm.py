@@ -504,6 +504,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         llm_model_config.pretrained_config.architectures = ["Phi3ForCausalLM"]
         # Only build the language model architecture without loading weights.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
         self.vocab_size = config.vocab_size
         self.model_dtype = getattr(config, "torch_dtype", torch.float16)
