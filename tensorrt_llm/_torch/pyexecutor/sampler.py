@@ -158,6 +158,12 @@ class EarlyStopWithMMResult(Sampler):
 def top_k_sampling_batch(logits,
                          top_k=50,
                          generator: Optional[torch.Generator] = None):
+    """Sample tokens using top_k sampling.
+    Returns:
+        next_tokens: [batch_size, 1] (sampled tokens)
+        softmax: [batch_size, vocab_size] (probability distribution)
+        indices: [batch_size, top_k] (indices of top_k logits)
+    """
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
@@ -186,6 +192,12 @@ def top_p_sampling_batch(logits: torch.Tensor,
                          top_p: float = 0.9,
                          temperature: float = 1.0,
                          generator: Optional[torch.Generator] = None):
+    """Sample tokens using top_p sampling.
+    Returns:
+        next_tokens: [batch_size, 1] (sampled tokens)
+        softmax: [batch_size, vocab_size] (probability distribution)
+        indices: [batch_size, top_k] (indices of top_k logits)
+    """
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
@@ -224,6 +236,12 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
                                top_p: float,
                                temperature: float = 1.0,
                                generator: Optional[torch.Generator] = None):
+    """Sample tokens using top_k_top_p sampling.
+    Returns:
+        next_tokens: [batch_size, 1] (sampled tokens)
+        softmax: [batch_size, vocab_size] (probability distribution)
+        indices: [batch_size, top_k] (indices of top_k logits)
+    """
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
@@ -266,6 +284,12 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
 
 
 def greedy_search_sampling_batch(logits):
+    """Sample tokens using greedy search.
+    Returns:
+        next_tokens: [batch_size, 1] (sampled tokens)
+        softmax: [batch_size, vocab_size] (probability distribution)
+        indices: None (greedy search does not return indices)
+    """
     next_tokens = torch.argmax(logits, dim=-1)
     softmax = torch.softmax(logits, dim=-1)
     return next_tokens, softmax, None
@@ -437,6 +461,10 @@ class TorchSampler(Sampler):
         self._global_seed = 42
         self._generator = None
 
+    @property
+    def calculate_top_logprobs(self):
+        return self.max_top_logprobs > 0
+
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
 
@@ -462,15 +490,30 @@ class TorchSampler(Sampler):
             top_log_probs = state.host.top_log_probs[request.py_seq_slot,
                                                      beam, :count]
             top_current_tokens = state.host.top_tokens[current_slice]
-            token_log_probs = [{
-                int(token): Logprob(logprob=logprob, rank=1)
-            } for token, logprob in zip(current_tokens, log_probs.tolist())]
             token_top_log_probs = [{
                 int(token[k]):
                 Logprob(logprob=logprob[k], rank=k)
                 for k in range(request.py_top_logprobs)
             } for token, logprob in zip(top_current_tokens,
                                         top_log_probs.tolist())]
+            return [token_top_log_probs]
+        else:
+            return None
+
+    def handle_logprobs(self, request: LlmRequest, state: SampleState, *,
+                        beam: int, count: int):
+        current_slice = slice(0, count), request.py_seq_slot, beam
+        if request.py_return_log_probs:
+            assert state.host.log_probs is not None
+            log_probs = state.host.log_probs[request.py_seq_slot, beam, :count]
+            current_tokens = state.host.new_tokens[current_slice]
+            token_log_probs = [{
+                int(token): Logprob(logprob=logprob, rank=1)
+            } for token, logprob in zip(current_tokens, log_probs.tolist())]
+            token_top_log_probs = self._maybe_get_top_logprobs(request,
+                                                               state,
+                                                               beam=beam,
+                                                               count=count)
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs(
                 [token_log_probs], top_log_probs=[token_top_log_probs])
@@ -595,7 +638,8 @@ class TorchSampler(Sampler):
             req.py_decoding_iter += 1
 
     def log_probs_host(self, scheduled_requests: ScheduledRequests):
-        """Shape: max_num_sequences, max_beam_width == 1, max_tokens, 1 + max_top_logprobs)"""
+        """Shape: max_num_sequences, max_beam_width == 1, max_tokens, 1 + max_top_logprobs)
+        The last dimension contains log_probs for the sampled tokens and additionally log_probs for the top tokens if top_logprobs is specified"""
         if any(req.py_return_log_probs
                for req in scheduled_requests.all_requests()):
             return torch.empty((self.max_num_sequences, self.MAX_BEAM_WIDTH,
@@ -631,6 +675,15 @@ class TorchSampler(Sampler):
 
         new_tokens_host = new_tokens.to(device="cpu", non_blocking=True)
         finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
+        # Setup these optional values if possible
+        log_probs = None
+        top_log_probs = None
+        top_tokens = None
+        if log_probs_host is not None:
+            log_probs = log_probs_host[..., 0]
+            if self.calculate_top_logprobs:
+                top_log_probs = log_probs_host[..., 1:]
+                top_tokens = new_tokens[..., 1:]
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         return SampleStateTorch(
@@ -957,7 +1010,10 @@ class TorchSampler(Sampler):
         offset = 0
         for i, (strategy, slot, steps, request) in enumerate(
                 zip(strategies, seq_slots_host, num_steps, requests)):
-            if request.py_top_logprobs > self.max_top_logprobs:
+            # if request.calculate_top_logprobs, then request.py_top_logprobs is the number of top tokens to sample
+            # otherwise, it is None and should be defaulted to0
+            num_top_tokens = request.py_top_logprobs if request.calculate_top_logprobs else 0
+            if num_top_tokens > self.max_top_logprobs:
                 raise ValueError(
                     f"top_logprobs {request.py_top_logprobs} cannot exceed max_top_logprobs {self.max_top_logprobs}"
                 )
@@ -978,13 +1034,12 @@ class TorchSampler(Sampler):
                     input_slice] if strategy != GREEDY else None
 
             current_slice = slice(0, steps), slot, BEAM_0, slice(
-                0, 1 + request.py_top_logprobs)
-            if request.py_top_logprobs > 0:
-                next_tokens = torch.cat([
-                    next_tokens.unsqueeze(1),
-                    indices[:, :request.py_top_logprobs]
-                ],
-                                        dim=1)
+                0, 1 + num_top_tokens)
+            if request.calculate_top_logprobs and strategy != GREEDY:
+                # concatenate the sampled tokens with the top tokens
+                next_tokens = torch.cat(
+                    [next_tokens.unsqueeze(1), indices[:, :num_top_tokens]],
+                    dim=1)
             else:
                 next_tokens = next_tokens.unsqueeze(1)
             new_tokens[current_slice] = next_tokens
@@ -997,9 +1052,8 @@ class TorchSampler(Sampler):
                                                steps, -1)
 
                 log_probs = torch.log(token_probs)
-                log_probs_host[slot, BEAM_0, :steps, :1 +
-                               request.py_top_logprobs].copy_(log_probs,
-                                                                non_blocking=True)
+                log_probs_host[slot, BEAM_0, :steps, :1 + num_top_tokens].copy_(
+                      log_probs, non_blocking=True)
             offset += steps
 
 

@@ -191,17 +191,19 @@ void initRequestBindings(pybind11::module_& m)
     auto outputConfigGetstate = [](tle::OutputConfig const& self)
     {
         return py::make_tuple(self.returnLogProbs, self.returnContextLogits, self.returnGenerationLogits,
-            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics, self.additionalModelOutputs);
+            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics, self.additionalModelOutputs,
+            self.topLogProbs);
     };
     auto outputConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 7)
+        if (state.size() != 8)
         {
             throw std::runtime_error("Invalid OutputConfig state!");
         }
         return tle::OutputConfig(state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(),
             state[3].cast<bool>(), state[4].cast<bool>(), state[5].cast<bool>(),
-            state[6].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>());
+            state[6].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(),
+            state[7].cast<std::optional<SizeType32>>());
     };
     py::class_<tle::OutputConfig>(m, "OutputConfig")
         .def(py::init<bool, bool, bool, bool, bool, bool, std::optional<std::vector<tle::AdditionalModelOutput>>,
@@ -209,7 +211,7 @@ void initRequestBindings(pybind11::module_& m)
             py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
             py::arg("return_generation_logits") = false, py::arg("exclude_input_from_output") = false,
             py::arg("return_encoder_output") = false, py::arg("return_perf_metrics") = false,
-            py::arg("additional_model_outputs") = py::none(), py::arg("top_logprobs") = 0)
+            py::arg("additional_model_outputs") = py::none(), py::arg("top_logprobs") = py::none())
         .def_readwrite("return_log_probs", &tle::OutputConfig::returnLogProbs)
         .def_readwrite("return_context_logits", &tle::OutputConfig::returnContextLogits)
         .def_readwrite("return_generation_logits", &tle::OutputConfig::returnGenerationLogits)

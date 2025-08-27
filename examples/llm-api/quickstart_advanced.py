@@ -147,7 +147,7 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--logprobs', default=False, action='store_true')
-    parser.add_argument('--top_logprobs', type=int, default=0)
+    parser.add_argument('--top_logprobs', type=int, default=None)
     parser.add_argument('--max_top_logprobs', type=int, default=0)
     return parser
 
@@ -216,7 +216,7 @@ def setup_llm(args, **kwargs):
     )
 
     # if only top_logprobs is set, set max_top_logprobs to top_logprobs
-    if args.max_top_logprobs < args.top_logprobs:
+    if args.top_logprobs is not None and args.max_top_logprobs < args.top_logprobs:
         args.max_top_logprobs = args.top_logprobs
     # Remove this once torch sampler stops using enable_mixed_sampler
     is_greedy = (not args.max_beam_width > 1) and (
