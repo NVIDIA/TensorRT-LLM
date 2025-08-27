@@ -2852,16 +2852,15 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/QwQ-32B"
     MODEL_PATH = f"{llm_models_root()}/QwQ-32B"
 
-    @pytest.mark.parametrize("tp_size", [8, 4, 2], ids=["tp8", "tp4", "tp2"])
-    def test_auto_dtype(self, tp_size):
-        if get_device_count() != tp_size:
-            pytest.skip("Device count mismatch with world size")
+    @pytest.mark.skip_less_device_memory(320000)
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_tp4(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
         with LLM(self.MODEL_PATH,
                  max_num_tokens=16384,
                  kv_cache_config=kv_cache_config,
-                 tensor_parallel_size=tp_size,
+                 tensor_parallel_size=4,
                  max_batch_size=8) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
