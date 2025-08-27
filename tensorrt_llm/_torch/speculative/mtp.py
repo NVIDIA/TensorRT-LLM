@@ -229,6 +229,9 @@ class MTPSampler(Sampler):
 
     SampleState = SampleStateMTP
 
+    def is_generation_model(self) -> bool:
+        return True
+
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
         self.draft_len = nextn
