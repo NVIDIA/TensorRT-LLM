@@ -223,11 +223,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    gen_config_file(args.work_dir, args.ctx_tp_size,  args.ctx_pp_size, args.ctx_batch_size,
-                    args.ctx_max_num_tokens, args.ctx_max_seq_len,
-                    args.ctx_free_gpu_memory_fraction,
-                    args.ctx_enable_attention_dp, args.gen_tp_size, args.gen_pp_size,
-                    args.gen_batch_size, args.gen_max_num_tokens,
-                    args.gen_max_seq_len, args.gen_enable_attention_dp,
-                    args.gen_gpu_memory_fraction, args.eplb_num_slots,
-                    args.mtp_size, args.cache_transceiver_max_num_tokens)
+    gen_config_file(args.work_dir, args.ctx_tp_size, args.ctx_pp_size,
+                    args.ctx_batch_size, args.ctx_max_num_tokens,
+                    args.ctx_max_seq_len, args.ctx_free_gpu_memory_fraction,
+                    args.ctx_enable_attention_dp, args.gen_tp_size,
+                    args.gen_pp_size, args.gen_batch_size,
+                    args.gen_max_num_tokens, args.gen_max_seq_len,
+                    args.gen_enable_attention_dp, args.gen_gpu_memory_fraction,
+                    args.eplb_num_slots, args.mtp_size,
+                    args.cache_transceiver_max_num_tokens)
