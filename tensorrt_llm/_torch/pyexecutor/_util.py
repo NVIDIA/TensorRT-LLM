@@ -184,7 +184,7 @@ class KvCacheCreator:
         cuda_graph_warmup_block = (
             self._model_engine.max_seq_len + 1
         ) // executor_config.tokens_per_block + self._model_engine._max_cuda_graph_batch_size - 1
-        # num_cache_blocks = max(cuda_graph_warmup_block, num_cache_blocks)
+        num_cache_blocks = max(cuda_graph_warmup_block, num_cache_blocks)
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
         return num_cache_blocks * executor_config.tokens_per_block * self._dummy_reqs[
