@@ -80,8 +80,6 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
-    TLLM_CHECK_WITH_INFO(hopper_inputs.swap_ab, "swap_ab must be true for mixed dtype WS grouped GEMM");
-
     /////////////////////////////////////////////////////////////////////////////////////////////////
     /// GEMM kernel configurations
     /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -214,6 +212,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
         TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, %d < %d.",
             gemm.get_workspace_size(arguments), hopper_inputs.gemm_workspace_size);
     }
+
+    // This is not initialized during workspace size calculation so check after
+    TLLM_CHECK_WITH_INFO(hopper_inputs.swap_ab, "swap_ab must be true for mixed dtype WS grouped GEMM");
 
     auto can_implement = gemm.can_implement(arguments);
     if (can_implement != cutlass::Status::kSuccess)

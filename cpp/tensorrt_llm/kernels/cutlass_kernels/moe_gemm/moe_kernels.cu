@@ -3878,6 +3878,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
         gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
         gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
+        TLLM_CHECK_WITH_INFO(!(gemm1_tma_ws_input.swap_ab || gemm2_tma_ws_input.swap_ab) || !use_w4_groupwise,
+            "W4 groupwise does not support swap_ab");
 
         bool apply_bias = parallelism_config.tp_rank == 0;
         auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;
@@ -4445,6 +4447,11 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
     bool const finalize_fusion_not_supported = !mInterface->use_fused_finalize_ || mMinLatencyMode || use_w4_groupwise
         || mGemmToProfile != GemmToProfile::GEMM_2;
     if (use_finalize_fusion && finalize_fusion_not_supported)
+    {
+        return;
+    }
+
+    if (use_w4_groupwise && !swap_ab)
     {
         return;
     }
