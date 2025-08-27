@@ -204,11 +204,12 @@ void initRequestBindings(pybind11::module_& m)
             state[6].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>());
     };
     py::class_<tle::OutputConfig>(m, "OutputConfig")
-        .def(py::init<bool, bool, bool, bool, bool, bool, std::optional<std::vector<tle::AdditionalModelOutput>>>(),
+        .def(py::init<bool, bool, bool, bool, bool, bool, std::optional<std::vector<tle::AdditionalModelOutput>>,
+                 SizeType32>(),
             py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
             py::arg("return_generation_logits") = false, py::arg("exclude_input_from_output") = false,
             py::arg("return_encoder_output") = false, py::arg("return_perf_metrics") = false,
-            py::arg("additional_model_outputs") = py::none())
+            py::arg("additional_model_outputs") = py::none(), py::arg("top_logprobs") = 0)
         .def_readwrite("return_log_probs", &tle::OutputConfig::returnLogProbs)
         .def_readwrite("return_context_logits", &tle::OutputConfig::returnContextLogits)
         .def_readwrite("return_generation_logits", &tle::OutputConfig::returnGenerationLogits)
@@ -216,6 +217,7 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("return_encoder_output", &tle::OutputConfig::returnEncoderOutput)
         .def_readwrite("return_perf_metrics", &tle::OutputConfig::returnPerfMetrics)
         .def_readwrite("additional_model_outputs", &tle::OutputConfig::additionalModelOutputs)
+        .def_readwrite("top_logprobs", &tle::OutputConfig::topLogProbs)
         .def(py::pickle(outputConfigGetstate, outputConfigSetstate));
 
     auto externalDraftTokensConfigGetstate = [](tle::ExternalDraftTokensConfig const& self)

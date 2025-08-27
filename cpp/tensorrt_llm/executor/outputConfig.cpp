@@ -22,7 +22,7 @@ namespace tensorrt_llm::executor
 
 OutputConfig::OutputConfig(bool inReturnLogProbs, bool inReturnContextLogits, bool inReturnGenerationLogits,
     bool inExcludeInputFromOutput, bool inReturnEncoderOutput, bool inReturnPerfMetrics,
-    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs)
+    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs, SizeType32 topLogProbs)
     : returnLogProbs(inReturnLogProbs)
     , returnContextLogits(inReturnContextLogits)
     , returnGenerationLogits(inReturnGenerationLogits)
@@ -30,6 +30,7 @@ OutputConfig::OutputConfig(bool inReturnLogProbs, bool inReturnContextLogits, bo
     , returnEncoderOutput(inReturnEncoderOutput)
     , returnPerfMetrics(inReturnPerfMetrics)
     , additionalModelOutputs(std::move(additionalModelOutputs))
+    , topLogProbs(topLogProbs)
 {
 }
 

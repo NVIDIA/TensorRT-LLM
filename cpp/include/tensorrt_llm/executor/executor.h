@@ -215,7 +215,8 @@ public:
     explicit OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false,
         bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false,
         bool returnPerfMetrics = false,
-        std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt);
+        std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
+        SizeType32 topLogProbs = 0);
 
     /// @brief Controls if Result should contain log probabilities. Default is false.
     bool returnLogProbs;
@@ -233,6 +234,8 @@ public:
 
     /// @brief The additional outputs to gather from the model.
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs;
+    /// @brief The number of logprobs to return. Default is 0.
+    std::optional<SizeType32> topLogProbs;
 };
 
 /// @brief Configuration for speculative decoding with external draft tokens.

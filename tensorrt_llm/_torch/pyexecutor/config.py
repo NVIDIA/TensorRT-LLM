@@ -113,6 +113,9 @@ class PyTorchConfig:
     # If false, set the PyTorch CUDA memory fraction to 1.0.
     _limit_torch_cuda_mem_fraction: bool = True
 
+    # The max number of logprobs to return per token
+    max_top_logprobs: int = 0
+
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',

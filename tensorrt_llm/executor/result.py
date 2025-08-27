@@ -112,6 +112,7 @@ class CompletionOutput:
     logprobs: Optional[TokenLogprobs
                        | List[float]] = field(default_factory=list)
     prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
+    top_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
@@ -260,6 +261,12 @@ class GenerationResultBase:
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
                 assert len(output.logprobs) == output.length
+            if response_tensors.top_log_probs is not None:
+                output.top_logprobs = response_tensors.top_log_probs[src_idx]
+                if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                    if len(output.top_logprobs) > output.length:
+                        output.top_logprobs = output.top_logprobs[:output.
+                                                                  length]
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]

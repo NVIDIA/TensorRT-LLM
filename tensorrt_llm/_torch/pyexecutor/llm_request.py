@@ -117,16 +117,21 @@ class LogitsStorage:
 class LogProbStorage:
     beam_width: int = -1
     log_probs: list[TokenLogprobs]
+    top_log_probs: list[TokenLogprobs]
     cum_log_probs: list[float]
 
     def _init(self, first_input: list[TokenLogprobs]):
         self.beam_width = len(first_input)
         self.log_probs = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
+        self.top_log_probs = [[] for _ in range(self.beam_width)]
 
-    def append(self,
-               new_probs: list[TokenLogprobs],
-               cum_log_probs: Optional[list[float]] = None):
+    def append(
+        self,
+        new_probs: list[TokenLogprobs],
+        cum_log_probs: Optional[list[float]] = None,
+        top_log_probs: Optional[list[TokenLogprobs]] = None,
+    ):
         """
         new_probs: [beam_width, num_tokens]
         cum_log_probs: [beam_width]
@@ -137,14 +142,18 @@ class LogProbStorage:
         assert len(new_probs) == self.beam_width, "Beam width mismatch"
         for beam_idx, probs in enumerate(new_probs):
             self.log_probs[beam_idx].extend(probs)
+            if top_log_probs is not None:
+                self.top_log_probs[beam_idx].extend(top_log_probs[beam_idx])
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             else:
                 self.cum_log_probs[beam_idx] += sum(
                     next(iter(prob.values())).logprob for prob in probs)
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+    def set_log_probs(self,
+                      log_probs: list[TokenLogprobs],
+                      cum_log_probs: list[float],
+                      top_log_probs: Optional[list[TokenLogprobs]] = None):
         """
         Reset the storage and refill it with new values
         log_probs: [beam_width, num_tokens]
@@ -153,7 +162,7 @@ class LogProbStorage:
         # reinitialize the storage to clear the lists
         self._init(log_probs)
         # append the new values
-        self.append(log_probs, cum_log_probs)
+        self.append(log_probs, cum_log_probs, top_log_probs)
 
 
 class PyResult:
@@ -187,23 +196,34 @@ class PyResult:
 
     def append_log_probs(self,
                          log_probs: list[TokenLogprobs],
-                         cum_log_probs: Optional[list[float]] = None):
+                         cum_log_probs: Optional[list[float]] = None,
+                         top_log_probs: Optional[list[TokenLogprobs]] = None):
+        """
+        Append log_probs and optionally cum_log_probs and top_log_probs
+        log_probs: [beam_width, num_tokens]
+        cum_log_probs: [beam_width]
+        top_log_probs: [beam_width, num_tokens]
+        """
         if self._log_probs:
-            self._log_probs.append(log_probs, cum_log_probs)
+            self._log_probs.append(log_probs, cum_log_probs, top_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
         self._mm_embeddings = SharedTensorContainer.from_tensor(
             mm_embeddings).dump_to_dict()
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+    def set_log_probs(self,
+                      log_probs: list[TokenLogprobs],
+                      cum_log_probs: list[float],
+                      top_log_probs: Optional[list[TokenLogprobs]] = None):
         """
-        Set log_probs and cum_log_probs to the new values
+        Set log_probs, cum_log_probs and top_log_probs to the new values
         log_probs: [beam_width, num_tokens]
         cum_log_probs: [beam_width]
+        top_log_probs: [beam_width, num_tokens]
         """
         if self._log_probs:
-            self._log_probs.set_log_probs(log_probs, cum_log_probs)
+            self._log_probs.set_log_probs(log_probs, cum_log_probs,
+                                          top_log_probs)
 
     @property
     def context_logits(self) -> torch.Tensor | None:
@@ -229,6 +249,10 @@ class PyResult:
         return self._log_probs and self._log_probs.log_probs
 
     @property
+    def top_log_probs(self) -> list[TokenLogprobs] | None:
+        return self._log_probs and self._log_probs.top_log_probs
+
+    @property
     def cum_log_probs(self) -> list[float] | None:
         return self._log_probs and self._log_probs.cum_log_probs
 
@@ -241,7 +265,7 @@ class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handle'))
+         'top_log_probs', 'mm_embedding_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
@@ -291,6 +315,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             # Detour handling of some parameters
             client_id: int = None,
             return_log_probs: bool = False,
+            top_logprobs: int = 0,
             return_context_logits: bool = False,
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
@@ -346,6 +371,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             TaskLayerModuleConfig] | None = None
 
         self.py_return_log_probs = return_log_probs
+        self.py_top_logprobs = top_logprobs
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
@@ -564,7 +590,8 @@ def executor_request_to_llm_request(
         cache_salt_id=executor_request.cache_salt_id,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None))
+                                   None),
+        top_logprobs=executor_request.output_config.top_logprobs)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
