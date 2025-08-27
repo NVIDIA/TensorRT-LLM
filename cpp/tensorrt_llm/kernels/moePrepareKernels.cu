@@ -60,6 +60,10 @@ public:
     __forceinline__ __device__ void releaseValue(uint64_t value, int index)
     {
         // Avoid block on 0
+        while (fifoConnInfo->values[index] != 0)
+        {
+            // loop wait until value reset
+        }
         fifoConnInfo->values[index] = value + 1;
     }
 

@@ -514,6 +514,21 @@ __device__ __forceinline__ void startWorkspaceS2G(
     cp_async_bulk_commit_group();
 }
 
+__device__ __forceinline__ void startWorkspaceS2GReg(
+    uint64_t* fifoEntry, uint8_t* sharedMemoryBase, int send128ByteCount, int fifo128ByteOffset, int warpId, int laneId)
+{
+    int copyInt4Count = send128ByteCount * MoeCommFieldInfo::BYTES_PER_128B_BLOCK / sizeof(int4);
+    int4* sharedMemoryInt4 = reinterpret_cast<int4*>(sharedMemoryBase);
+    uint64_t* fifoPtr = fifoEntry + fifo128ByteOffset * MoeCommFieldInfo::BYTES_PER_128B_BLOCK / sizeof(int64_t);
+    int4* fifoPtrInt4 = reinterpret_cast<int4*>(fifoPtr);
+#pragma unroll 4
+    for (int i = laneId; i < copyInt4Count; i += WARP_SIZE)
+    {
+        fifoPtrInt4[i] = sharedMemoryInt4[i];
+    }
+    __syncwarp();
+}
+
 __device__ __forceinline__ uint64_t startWorkspaceG2S(uint8_t* sharedMemoryBase, uint64_t* fifoEntry,
     int allLoad128ByteCount, int fifo128ByteOffset, int loaded128ByteCount, uint64_t* smemBar, int warpId, int laneId)
 {
@@ -761,10 +776,10 @@ public:
             FusedMoeProto::protoPack(
                 mShmemBase, mHead, mSingleCompactData128ByteCount, mFifoEntry128ByteIndexBase, mWarpId, mLaneId);
 
-            tensorrt_llm::kernels::fused_moe_impl::startWorkspaceS2G(getFifoEntryPtr(), mShmemBase,
+            tensorrt_llm::kernels::fused_moe_impl::startWorkspaceS2GReg(getFifoEntryPtr(), mShmemBase,
                 mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, mWarpId, mLaneId);
 
-            tensorrt_llm::kernels::fused_moe_impl::waitS2GBulkRead();
+            // tensorrt_llm::kernels::fused_moe_impl::waitS2GBulkRead();
 
             nextToken();
         }
