@@ -1036,6 +1036,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         # use llm.config as config for pytorch model engine
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:

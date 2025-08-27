@@ -22,6 +22,7 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
+from ..utils import attach_attention_metadata
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_siglip import SiglipVisionModel
@@ -259,6 +260,9 @@ class Gemma3VLM(PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
+        self.model_config.extra_attrs.update(
+            self.siglip_tower.model_config.extra_attrs)
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
@@ -316,7 +320,9 @@ class Gemma3VLM(PreTrainedModel):
     def _get_image_features(self, pixel_values):
         attn_metadata = self.siglip_tower.prepare_attn_metadata(
             pixel_values.shape[0])
-        with torch.autocast(device_type="cuda", dtype=self.model_dtype):
+        with torch.autocast(device_type="cuda",
+                            dtype=self.model_dtype), attach_attention_metadata(
+                                attn_metadata):
             image_features = self.siglip_tower(pixel_values,
                                                attn_metadata=attn_metadata)[-1]
             image_features = self.mm_projector(image_features)

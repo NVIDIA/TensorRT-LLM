@@ -1,6 +1,7 @@
 import contextlib
 import os
 import threading
+import weakref
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Dict, List
@@ -110,6 +111,17 @@ def with_model_extra_attrs(get_attrs):
         return wrapper
 
     return decorator
+
+
+@contextlib.contextmanager
+def attach_attention_metadata(attention_metadata):
+    extra_attrs = get_model_extra_attrs()
+    old_attn_metadata = extra_attrs.get("attention_metadata", None)
+    extra_attrs["attention_metadata"] = weakref.ref(attention_metadata)
+    try:
+        yield
+    finally:
+        extra_attrs["attention_metadata"] = old_attn_metadata
 
 
 def make_weak_ref(x):

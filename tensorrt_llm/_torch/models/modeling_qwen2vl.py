@@ -884,6 +884,8 @@ class Qwen2VLModelBase(PreTrainedModel):
             mm_encoder_config = copy.deepcopy(model_config)
             self.mm_encoder = Qwen2VisionModelBase(
                 mm_encoder_config, kwargs.get('vision_model_class', None))
+         self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
+         self.model_config.extra_attrs.update(self.mm_encoder_config.model_config.extra_attrs)
 
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config

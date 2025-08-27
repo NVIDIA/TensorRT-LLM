@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from copy import deepcopy
 from typing import Any
 
@@ -13,6 +14,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_vila import (VilaConfig, VilaModel,
                                                       fuse_input_embeds)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -548,7 +550,9 @@ class TestVila(unittest.TestCase):
         model, input_ids, position_ids, past_seen_tokens, attn_metadata, kv_cache_manager = \
             self._prepare_sanity_test(config_dict, param_cnt)
 
-        with torch.inference_mode():
+        extra_attrs = deepcopy(model.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = model.forward(input_ids=input_ids,
                                    position_ids=position_ids,
@@ -556,7 +560,7 @@ class TestVila(unittest.TestCase):
 
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
-        with torch.inference_mode():
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
             attn_metadata.prepare()
             logits = model.forward(input_ids=input_ids,
                                    position_ids=position_ids,

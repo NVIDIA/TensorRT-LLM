@@ -51,7 +51,7 @@ from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.utils import SpecDecodingTensor
-from ..utils import (get_model_extra_attrs,
+from ..utils import (attach_attention_metadata, get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .config_utils import is_mla
@@ -2733,7 +2733,6 @@ class PyTorchModelEngine(ModelEngine):
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
-        attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
         attrs.update(self.model.model_config.extra_attrs)
 
         if self._torch_compile_backend is not None:
@@ -2743,10 +2742,11 @@ class PyTorchModelEngine(ModelEngine):
             attrs["events"] = weakref.ref(self._torch_compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 
-        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-            return trace_func(self.model.forward)(**kwargs)
-        else:
-            return self.model.forward(**kwargs)
+        with attach_attention_metadata(kwargs['attn_metadata']):
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                return trace_func(self.model.forward)(**kwargs)
+            else:
+                return self.model.forward(**kwargs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self,
@@ -2804,6 +2804,9 @@ class PyTorchModelEngine(ModelEngine):
                 for request in scheduled_requests.context_requests
                 if request.multimodal_lengths is not None
             ]
+
+        extra_attrs = get_model_extra_attrs()
+        extra_attrs.update(self.model.model_config.extra_attrs)
         # For mm_encoder_only mode, we only run the vision encoder part
         # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
         mm_embeddings = self.model.forward(multimodal_params)

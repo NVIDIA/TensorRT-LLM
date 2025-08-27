@@ -62,6 +62,7 @@ def inplace_info():
         },
         torch.ops.trtllm.attn_custom_op_inplace.default: {
             1: "output",
+            2: "output_sf",
         },
         torch.ops.trtllm.mla_custom_op_inplace.default: {
             1: "output"

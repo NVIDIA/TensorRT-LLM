@@ -1247,6 +1247,7 @@ class VilaModel(PreTrainedModel):
         # use llm.config as config for pytorch model engine
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
 
 AutoConfig.register(VilaConfig.model_type, VilaConfig)

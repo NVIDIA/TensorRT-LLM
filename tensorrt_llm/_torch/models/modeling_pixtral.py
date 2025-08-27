@@ -10,6 +10,7 @@ from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import gated_mlp as trtllm_gated_mlp
 from tensorrt_llm._torch.modules import rms_norm as trtllm_rmsnorm
+from tensorrt_llm._torch.utils import attach_attention_metadata
 
 
 class PixtralAttention(trtllm_attention.Attention):
@@ -228,12 +229,13 @@ class PixtralVisionModel(torch.nn.Module):
             batch_size=pixel_values.size(0),
             seq_lengths=[x.size(0) for x in flattened_embeds],
         )
-        out = self.transformer(
-            patch_embeds,
-            position_embeddings=position_embeddings,
-            position_ids=position_ids,
-            attn_metadata=attn_metadata,
-        )
+        with attach_attention_metadata(attn_metadata):
+            out = self.transformer(
+                patch_embeds,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                attn_metadata=attn_metadata,
+            )
 
         return out
 

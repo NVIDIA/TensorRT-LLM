@@ -399,6 +399,7 @@ class Mistral3VLM(PreTrainedModel):
     def _post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
     def load_weights(self, weights: Dict, *args, **kwargs):
         llm_weights = _filter_weights(weights, "language_model.")
