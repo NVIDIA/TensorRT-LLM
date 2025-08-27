@@ -107,7 +107,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
             && (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
-            && tileSize == mOptions.tileSize)
+            && tileSize == mOptions.tileSize && mOptions.useTmaOobOpt == options.mUseTmaOobOpt)
         {
             // FIXME: Disable split-k for now.
             if (options.mClusterDimZ != 1)
@@ -130,7 +130,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         }
     }
 
-    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(), "No kernel found for the given options");
+    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(),
+        "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, mUseDeepSeekFp8: %d, "
+        "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d, mUseTmaOobOpt: %d",
+        tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
+        tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
+        mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize, mOptions.useTmaOobOpt);
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
@@ -242,7 +247,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     auto envVarVal = std::getenv("TLLM_BATCHED_GEMM_PRINT_NAME");
     if (envVarVal && std::atoi(envVarVal) == 1)
     {
-        TLLM_LOG_INFO("numBatches %d Gemm %d %d %d Kernel %s\n", numBatches, m, n, k, config.mFunctionName);
+        TLLM_LOG_INFO("NumBatches %d, MaxNumCtasInBatchDim %d, ShapeMNK %d %d %d, Kernel %s", numBatches,
+            maxNumCtasInBatchDim, m, n, k, config.mFunctionName);
     }
     // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
@@ -362,18 +368,18 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     };
     // Tier 2+: When previous comparators are the same, and when number of estimated CTAs is on the larger side, prefer
     // persistent tile scheduler. The threshold is hardcoded as >148 CTAs at the moment.
-    auto cmpTier3 = [&configs, &gemmData](int64_t idx0, int64_t idx1)
+    auto cmpTier3 = [maxNumCtasInBatchDim, bmm, &configs, &gemmData](int64_t idx0, int64_t idx1)
     {
-        int32_t sizeM = gemmData.mProblemDimensions.mM;
-        int32_t sizeN = gemmData.mProblemDimensions.mN;
         auto const& optionsA = configs[idx0].mOptions;
         auto const& optionsB = configs[idx1].mOptions;
         if (optionsA.mTileK == optionsB.mTileK && optionsA.mUseUnrollLoop2xForMma == optionsB.mUseUnrollLoop2xForMma
             && optionsA.mTileM == optionsB.mTileM)
         {
-            int64_t numTilesM = divUp(sizeM, optionsA.mTileM);
-            int64_t numTilesN = divUp(sizeN, optionsA.mTileN);
-            if (numTilesM * numTilesN > 148)
+            auto options = configs[idx0].mOptions;
+            // M/N in kernel options are stale values. Update the before sending them in for calculation.
+            options.mM = gemmData.mProblemDimensions.mM;
+            options.mN = gemmData.mProblemDimensions.mN;
+            if (bmm.getNumCtas(options, maxNumCtasInBatchDim) > 148)
             {
                 return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
             }
