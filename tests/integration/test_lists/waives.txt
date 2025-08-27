@@ -349,3 +349,4 @@ accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_fp8_eagle3[tp
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_fp8_eagle3[tp8-torch_compile=True] SKIP (https://nvbugs/5483615)
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend SKIP (https://nvbugs/5448748)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend SKIP (https://nvbugs/5448748)
+accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-CUTLASS] SKIP (https://nvbugs/5483913)
