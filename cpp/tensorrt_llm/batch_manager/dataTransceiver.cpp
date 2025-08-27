@@ -176,7 +176,7 @@ public:
         std::unique_lock lkResp(mResponderMutex);
         auto it = mReadyResponses.find(llmRequest.mRequestId);
         // If the request is not the current request and already in the ready queue, we can cancel it.
-        if (it != mReadyResponses.end() && getCurrentRequestId() != llmRequest.mRequestId)
+        if (it != mReadyResponses.end() && (!isSending() || getCurrentRequestId() != llmRequest.mRequestId))
         {
             mCancelledRequests.insert(llmRequest.mRequestId);
             isCancelled = true;
@@ -486,7 +486,7 @@ private:
         bool isReady = mReceiver->receiveReadySignal(session);
         if (!isReady)
         {
-            TLLM_THROW("Request %zu is not ready to be received.", llmRequest.mRequestId);
+            // TODO: set the error state for the request
             return;
         }
         mReceiver->receiveSync(session);
