@@ -2863,7 +2863,7 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=1)
         with LLM(self.MODEL_PATH,
                  max_num_tokens=16384,
-                 kv_cache_config=self.kv_cache_config) as llm:
+                 kv_cache_config=kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
