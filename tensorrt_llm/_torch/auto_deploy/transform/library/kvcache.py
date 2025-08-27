@@ -232,7 +232,8 @@ class ResizeKVCache(BaseTransform):
         current_cache_size = cm.current_cache_size_bytes()
         current_num_pages = cm.info.num_pages
         ad_logger.info(
-            f"Current cache size: {current_cache_size}, Current num pages: {current_num_pages}"
+            f"Current cache size (MB): {current_cache_size // 1024 // 1024}, "
+            f"Current num pages (MB): {current_num_pages}"
         )
 
         if free_mem_ratio == 0.0:
