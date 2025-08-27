@@ -188,6 +188,8 @@ class MultimodalParams:
     multimodal_input: Optional[MultimodalInput] = None
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
+    text_token_indices: Optional[torch.Tensor] = None
+    mm_token_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         """Ensure default values are properly set."""
