@@ -2834,3 +2834,74 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
                  kv_cache_config=self.kv_cache_config) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestBeamSearch(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    kv_cache_config = KvCacheConfig(max_tokens=10000)
+
+    def test_beam_search_cuda_graph(self):
+        max_beam_width = 2
+        with LLM(
+                model=self.MODEL_PATH,
+                kv_cache_config=self.kv_cache_config,
+                max_batch_size=max_beam_width,
+                max_seq_len=32,
+                enable_trtllm_sampler=True,
+                max_beam_width=max_beam_width,
+                disable_overlap_scheduler=False,
+                cuda_graph_config=CudaGraphConfig(enabled=True),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    def test_beam_search_cuda_graph_fp8(self):
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        max_beam_width = 2
+        with LLM(
+                model=model_path,
+                kv_cache_config=self.kv_cache_config,
+                max_batch_size=max_beam_width,
+                max_seq_len=32,
+                enable_trtllm_sampler=True,
+                max_beam_width=max_beam_width,
+                disable_overlap_scheduler=False,
+                cuda_graph_config=CudaGraphConfig(enabled=True),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_beam_search_overlap_scheduler(self):
+        max_beam_width = 2
+        with LLM(
+                model=self.MODEL_PATH,
+                kv_cache_config=self.kv_cache_config,
+                max_batch_size=max_beam_width,
+                max_seq_len=32,
+                enable_trtllm_sampler=True,
+                max_beam_width=max_beam_width,
+                disable_overlap_scheduler=False,
+                cuda_graph_config=None,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    def test_beam_search_overlap_scheduler_fp8(self):
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        max_beam_width = 2
+        with LLM(
+                model=model_path,
+                kv_cache_config=self.kv_cache_config,
+                max_batch_size=max_beam_width,
+                max_seq_len=32,
+                enable_trtllm_sampler=True,
+                max_beam_width=max_beam_width,
+                disable_overlap_scheduler=False,
+                cuda_graph_config=None,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
