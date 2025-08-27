@@ -707,6 +707,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cache_name="block_ids_per_seq",
                     dtype=torch.int32,
                 )
+                self.block_ids_per_seq.fill_(0)
                 self.kv_block_ids_per_seq = get_empty(
                     [
                         self.kv_cache_manager.max_batch_size,
@@ -715,6 +716,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cache_name="kv_block_ids_per_seq",
                     dtype=torch.int32,
                 )
+                self.kv_block_ids_per_seq.fill_(0)
             if self.enable_paged_context_mla:
                 # for kv cache reuse/chunked context in MLA
                 self.ctx_cached_token_indptr = get_empty(
