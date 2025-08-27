@@ -922,7 +922,10 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         module.register_parameter("fc31_act_scale", fc31_act_scale)
 
         fc2_act_scale = nn.Parameter(torch.empty(
-            1, module.intermediate_size_per_partition, 1, dtype=module.dtype),
+            module.expert_size_per_partition,
+            module.intermediate_size_per_partition,
+            1,
+            dtype=module.dtype),
                                      requires_grad=False)
         module.register_parameter("fc2_act_scale", fc2_act_scale)
 
@@ -1250,23 +1253,31 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                                   device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
-            all_w2_pre_quant_scales_max = torch.max(
-                torch.stack(all_w2_pre_quant_scales).to(module.dtype),
-                dim=0).values
+            all_w2_pre_quant_scales = torch.stack(all_w2_pre_quant_scales).to(
+                module.dtype)
+            all_w2_input_scales = torch.stack(all_w2_input_scales).to(
+                module.dtype)
+            all_w2_pre_quant_scales_div_input_scales = (
+                all_w2_pre_quant_scales.permute(1, 0) *
+                (1 / (all_w2_input_scales.reshape(
+                    module.expert_size_per_partition).float()))).permute(1, 0)
             module.fc2_act_scale.data.copy_(
-                torch.ones_like(module.fc2_act_scale, device=self.device) *
-                (all_w2_pre_quant_scales_max.unsqueeze(-1)) *
-                (1 / all_w2_input_scales_max))
+                all_w2_pre_quant_scales_div_input_scales.reshape(
+                    module.fc2_act_scale.shape))
             # In vanilla ckpt (at least from ModelOpt), per-tensor weight_scale_2 is separately stored
             all_w2_weight_scale_2 = [
                 load_weight_shard(weights[f"{expert_id}.w2.weight_scale_2"],
                                   device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
-            all_w2_weight_scale_2_max = torch.stack(all_w2_weight_scale_2).to(
-                module.dtype).max()
-            module.fc2_alpha.data.copy_(all_w2_weight_scale_2_max.float() *
-                                        all_w2_input_scales_max.float())
+            all_w2_weight_scale_2 = torch.stack(all_w2_weight_scale_2).to(
+                module.dtype)
+            all_w2_weight_scale_2_mul_input_scales = (
+                all_w2_weight_scale_2.reshape(module.expert_size_per_partition,
+                                              1) *
+                all_w2_input_scales.reshape(module.expert_size_per_partition,
+                                            1))
+            module.fc2_alpha.data.copy_(all_w2_weight_scale_2_mul_input_scales)
 
         # Per-group weight_scale
         all_w2_scales = [
@@ -1285,7 +1296,11 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                 module.dtype)
 
         if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-            w2_scales /= all_w2_weight_scale_2_max.float()
+            w2_scales = w2_scales.permute(1, 2, 0)
+            all_w2_weight_scale_2 = all_w2_weight_scale_2.reshape(
+                module.expert_size_per_partition)
+            w2_scales /= (all_w2_weight_scale_2.float())
+            w2_scales = w2_scales.permute(2, 0, 1)
         w2_s_shape = w2_scales.shape
         w2_scales_interleaved = w2_scales.reshape(
             w2_s_shape[0], w2_s_shape[1],
