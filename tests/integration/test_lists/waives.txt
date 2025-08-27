@@ -448,4 +448,3 @@ full:L40S/test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8
 full:L40S/test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image] SKIP (https://nvbugspro.nvidia.com/bug/5376229)
 full:L40S/test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image] SKIP (https://nvbugspro.nvidia.com/bug/5376229)
 full:L40S/test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-video] SKIP (https://nvbugspro.nvidia.com/bug/5376229)
-full:H100_PCIe/unittest/_torch/modeling -k "modeling_gemma3" SKIP (https://nvbugspro.nvidia.com/bug/5401936)
