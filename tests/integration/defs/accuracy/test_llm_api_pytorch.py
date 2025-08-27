@@ -2859,12 +2859,25 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
         presence_penalty=1.0,
     )
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-
     def test_auto_dtype(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=1)
         with LLM(self.MODEL_PATH,
                  max_num_tokens=16384,
                  kv_cache_config=self.kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(2)
+    def test_auto_dtype_tp2(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=1)
+
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=16384,
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=2,
+                 max_batch_size=8) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
