@@ -173,6 +173,7 @@ class SamplingParams:
 
         logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
+        top_logprobs (int, optional): Number of top log probabilities to return per output token. Defaults to 0.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
@@ -241,6 +242,7 @@ class SamplingParams:
     # Keep the below fields in sync with tllme.OutputConfig
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
+    top_logprobs: int = 0
     return_context_logits: bool = False
     return_generation_logits: bool = False
     exclude_input_from_output: bool = True
@@ -322,6 +324,20 @@ class SamplingParams:
         # correct types as users might pass in logprob=True for Top-1 logprobs
         self.logprobs = self.logprobs and int(self.logprobs)
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
+
+        if self.top_logprobs < 0:
+            raise ValueError(f"top_logprobs must be >= 0, got {self.top_logprobs}")
+
+        if self._greedy_decoding and self.top_logprobs > 0:
+            # check for greedy sampling
+            raise ValueError(
+                f"top_logprobs {self.top_logprobs} cannot exceed 0 for greedy sampling"
+            )
+        elif self.top_k is not None and self.top_k < self.top_logprobs:
+            # check for top-k sampling
+            raise ValueError(f"top_logprobs {self.top_logprobs} cannot exceed top_k {self.top_k}")
+        if self.top_logprobs > 0 and self.use_beam_search:
+            raise ValueError("top_logprobs + beam search is not supported")
 
     @property
     def _greedy_decoding(self) -> bool:
