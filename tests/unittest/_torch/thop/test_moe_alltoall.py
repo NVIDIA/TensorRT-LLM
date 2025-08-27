@@ -164,6 +164,9 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                 128,
             ], torch.float16, True
         ),  # large input count with small vector dim that requires more indices per fifo
+        (8, 256, [
+            7168,
+        ], torch.bfloat16, True),
     ])
     def test_moe_alltoall_multi_rank_single_gpu(self,
                                                 world_size,
