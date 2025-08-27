@@ -12,7 +12,7 @@ If more than one pool is created, available memory is divided among the pools. T
 
 Blocks containing KV state computed for previous requests are stored in a radix search tree as soon as they are filled. A search is performed when a new request is added, matched blocks are reused instead of calculated. Blocks that are reused can be shared among multiple requests, thus reuse saves memory as well as computations. Blocks remain reusable until they are evicted from the search tree. Eviction happens when a new (blank) block is needed. The core eviction scheme is prioritized LRU. All blocks are assigned a priority between 0 and 100 (100 being most important), all blocks of the lowest priority must be evicted before any blocks of the next priority can be evicted. If all blocks have the same priority, the least recently used block is evicted. When a block is evicted from primary memory, it's KV state is copied to a block in secondary memory. The secondary memory block remains in the search tree, hence the block remains reusable until it is evicted from secondary memory. Eviction from secondary memory happens when a new block in secondary memory is needed to offload a primary block. The eviction scheme is the same for primary and secondary blocks.
 
-One caveat in the current code is that only leaf blocks can be evicted (leafs are blocks with no descendants in the radix tree). This design works well for full attention layers, but it doesn't work at all for sliding window attention. This issue will be fixed in a future version.
+One caveat in the current code is that only leaf blocks can be evicted (leafs are blocks with no descendants in the radix tree). This design works well for full attention layers, but not for limited attention layers. This will be fixed in a future version.
 
 ### Retention Policy
 
@@ -67,4 +67,5 @@ Property ```max_attention_window``` specifies the maximum attention window size 
 ### Deprecated Properties
 
 Properties ```use_uvm``` and ```sink_token_length``` have been deprecated and will be removed in a future release.
+
 
