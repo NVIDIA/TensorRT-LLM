@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from itertools import pairwise
+
 from tensorrt_llm.bindings.executor import FinishReason
 
 from .llm_request import LlmRequest
@@ -27,17 +29,21 @@ def max_token_criteria_1_beam(request: LlmRequest, max_seq_len: int) -> bool:
             >= request.py_max_new_tokens) or (num_tokens >= max_seq_len)
 
 
+def produce_stop_words(py_stop_words_list: list[list[int]]):
+    """inverts `.../llm_request::def convert_wordlist()`"""
+    stop_words_list, prefix_sum = py_stop_words_list
+    for start, end in pairwise((0, *prefix_sum)):  # first element: prepend 0
+        if end == -1:  # -1 is a sentinel value in convert_wordlist
+            break
+        yield stop_words_list[start:end]
+
+
 def stop_token_criteria(py_stop_words_list: list[list[int]] | None,
                         tokens: list[int]) -> bool:
     if py_stop_words_list:
         assert isinstance(py_stop_words_list,
                           list), "request.py_stop_words_list should be a list"
-        stop_words_list, prefix_sum = py_stop_words_list
-        offset = 0
-        for i, offset_end in enumerate(prefix_sum):
-            if i > 0:
-                offset = prefix_sum[i - 1]
-            stop_word = stop_words_list[offset:offset_end]
+        for stop_word in produce_stop_words(py_stop_words_list):
             if len(stop_word) > len(tokens):
                 continue
             if tokens[-len(stop_word):] == stop_word:

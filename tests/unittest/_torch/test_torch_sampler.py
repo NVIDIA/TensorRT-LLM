@@ -1,10 +1,12 @@
 import random
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
 from tensorrt_llm._torch.pyexecutor.sampler import (BEAM_0, LlmRequest,
                                                     TorchSampler)
+from tensorrt_llm._torch.pyexecutor.sampler_utils import produce_stop_words
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
 
@@ -150,3 +152,18 @@ actual={[FinishReason(reason) for reason in actual]} != expected={expected}
 For {request}
 """
         assert actual == [reason.value for reason in expected], msg
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        [[]],
+        [[1]],
+        [[1, 2, 3]],
+        [[1], [2, 3]],
+        [[1, 2, 3], [4, 5]],
+        [[10], [20], [30, 40], [50]],
+    ],
+)
+def test_produce_stop_words(original):
+    assert original == list(produce_stop_words(convert_wordlist(original)))
