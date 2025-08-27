@@ -198,17 +198,19 @@ void initRequestBindings(nb::module_& m)
     auto outputConfigGetstate = [](tle::OutputConfig const& self)
     {
         return nb::make_tuple(self.returnLogProbs, self.returnContextLogits, self.returnGenerationLogits,
-            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics, self.additionalModelOutputs);
+            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics, self.additionalModelOutputs,
+            self.topLogProbs);
     };
     auto outputConfigSetstate = [](tle::OutputConfig& outputConfig, nb::tuple const& state)
     {
-        if (state.size() != 7)
+        if (state.size() != 8)
         {
             throw std::runtime_error("Invalid OutputConfig state!");
         }
         new (&outputConfig) tle::OutputConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]),
             nb::cast<bool>(state[2]), nb::cast<bool>(state[3]), nb::cast<bool>(state[4]), nb::cast<bool>(state[5]),
-            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(state[6]));
+            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(state[6]),
+            nb::cast<std::optional<SizeType32>>(state[7]));
     };
     nb::class_<tle::OutputConfig>(m, "OutputConfig")
         .def(
@@ -222,7 +224,7 @@ void initRequestBindings(nb::module_& m)
                 new (&self) tle::OutputConfig(return_log_probs.value_or(false), return_context_logits.value_or(false),
                     return_generation_logits.value_or(false), exclude_input_from_output.value_or(false),
                     return_encoder_output.value_or(false), return_perf_metrics.value_or(false),
-                    additional_model_outputs, top_logprobs.value_or(0));
+                    additional_model_outputs, top_logprobs);
             },
             nb::arg("return_log_probs") = nb::none(), nb::arg("return_context_logits") = nb::none(),
             nb::arg("return_generation_logits") = nb::none(), nb::arg("exclude_input_from_output") = nb::none(),

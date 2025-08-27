@@ -216,7 +216,7 @@ public:
         bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false,
         bool returnPerfMetrics = false,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        SizeType32 topLogProbs = 0);
+        std::optional<SizeType32> topLogProbs = std::nullopt);
 
     /// @brief Controls if Result should contain log probabilities. Default is false.
     bool returnLogProbs;

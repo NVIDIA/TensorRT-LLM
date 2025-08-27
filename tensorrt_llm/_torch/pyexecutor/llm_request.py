@@ -315,7 +315,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             # Detour handling of some parameters
             client_id: int = None,
             return_log_probs: bool = False,
-            top_logprobs: int = 0,
             return_context_logits: bool = False,
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
@@ -327,6 +326,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_draft: bool = False,
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
+            top_logprobs: Optional[int] = None,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -419,6 +419,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     @property
     def is_dummy(self):
         return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
+
+    @property
+    def calculate_top_logprobs(self):
+        return self.py_top_logprobs is not None
 
     def finish_by(self, reason: FinishReason, beam: int) -> None:
         """CPP finish by reason does not support beam_width > 1"""
