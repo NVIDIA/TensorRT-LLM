@@ -46,25 +46,6 @@ def get_optimal_jobs():
     return optimal_jobs
 
 
-# @pytest.fixture(autouse=True, scope="module")
-# def mistral_example_root(llm_venv):
-#     if platform.system() != "Windows":
-#         # https://github.com/Dao-AILab/flash-attention/issues/345
-#         # No wheel for flash-attn on windows and compilation fails locally.
-#         max_jobs = get_optimal_jobs()
-#         install_cmd = [
-#             f"MAX_JOBS={max_jobs}",
-#             "python3",
-#             "-m",
-#             "pip",
-#             "install",
-#             "--upgrade",
-#             "flash-attn==2.4.2",
-#         ]
-
-#         check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
-
-
 @skip_post_blackwell  #nvbug 5298661
 @pytest.mark.parametrize(
     "run_type",
