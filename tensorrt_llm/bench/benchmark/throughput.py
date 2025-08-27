@@ -126,12 +126,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Do not skip tokenizer initialization when loading the model.",
 )
 @optgroup.option(
-    "--eos_id",
-    type=int,
-    default=-1,
+    "--ignore_eos",
+    type=bool,
+    default=True,
     required=False,
     help=
-    "Set the end-of-sequence token for the benchmark. Set to -1 to disable EOS.",
+    "Ignore EOS token in the dataset by setting the eos_id to -1. Set to False to use the EOS token in the dataset.",
 )
 @optgroup.option(
     "--modality",
@@ -411,9 +411,14 @@ def throughput_command(
 
         llm = get_llm(runtime_config, kwargs)
 
+        eos_id = tokenizer.eos_token_id if not options.ignore_eos else -1
+        pad_id = tokenizer.pad_token_id if not options.ignore_eos else -1
+        if pad_id is None:  # LLAMA2 does not have a pad token
+            pad_id = eos_id
+
         sampler_args = {
-            "end_id": options.eos_id,
-            "pad_id": options.eos_id,
+            "end_id": eos_id,
+            "pad_id": pad_id,
             "n": options.beam_width,
             "use_beam_search": options.beam_width > 1
         }

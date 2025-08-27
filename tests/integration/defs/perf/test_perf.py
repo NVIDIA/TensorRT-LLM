@@ -1336,7 +1336,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [
                 f"--lora_num_device_mod_layers={32 * num_layers * num_lora_mods * max_lora_rank}"
             ]
-            benchmark_cmd += [f"--eos_id={eos_id}"]
+            # If using trtllm-bench, use --ignore_eos instead of --eos_id.
+            # If using cpp benchmarking scripts like bertBenchmark, gptManagerBenchmark, use --eos_id.
+            benchmark_cmd += [f"--eos_id={eos_id}"
+                              ] if "trtllm-bench" not in benchmark_cmd else [
+                                  f"--ignore_eos=False"
+                              ]
             benchmark_cmd += [f"--lora_dir={lora_dir}"]
         else:
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")

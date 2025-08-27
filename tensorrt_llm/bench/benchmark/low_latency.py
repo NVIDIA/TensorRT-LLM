@@ -296,6 +296,8 @@ def latency_command(
         ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
         pad_id = tokenizer.pad_token_id if not ignore_eos else -1
+        if pad_id is None:  # LLAMA2 does not have a pad token
+            pad_id = eos_id
 
         sampler_args = {
             "end_id": eos_id,
