@@ -70,4 +70,4 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
           ENFORCE_PR_HAS_CHECKLIST: true
-        run: python scripts/pr_checklist_check.py
+        run: python .github/scripts/pr_checklist_check.py
