@@ -423,7 +423,7 @@ class TorchSampler(Sampler):
                                   new_tokens,
                                   beam=BEAM_0,
                                   step=num_accepted)
-            if self.finish_if_reason(finish_reasons, request,
+            if self.finish_if_reason(request, finish_reasons,
                                      step=num_accepted):
                 break
         return num_accepted
