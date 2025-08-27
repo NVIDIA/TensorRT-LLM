@@ -188,11 +188,6 @@ def calculate_metrics(
         print(f"Error type: {exception_type}, Count: {count} requests")
     print(f"Total failed requests: {total_error_count}")
 
-    total_error_count = sum(error_counts.values())
-    for exception_type, count in error_counts.items():
-        print(f"Error type: {exception_type}, Count: {count} requests")
-    print(f"Total failed requests: {total_error_count}")
-
     if goodput_config_dict:
         valid_metrics = []
         slo_values = []
