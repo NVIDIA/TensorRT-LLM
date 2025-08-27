@@ -115,11 +115,9 @@ class QuantizationFusionMixin:
             fused_buffers: Dict[str, Tensor] to register as buffers on the fused module
     """
 
-    # required class attributes in subclasses:
     target_op: Callable
     scale_groups: List[List[str]]
 
-    # required method in subclasses:
     def fuse_rule(
         self, weights: List[torch.Tensor], **scales
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -141,7 +139,7 @@ class QuantizationFusionMixin:
             """Split the output tensor of the fused linear node to obtain the original outputs."""
             return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
 
-        # 2) Load scale buffers grouped by flattened scale names
+        # Load scale buffers grouped by flattened scale names
         flat_scale_names = list(chain.from_iterable(self.scale_groups))
         scales: Dict[str, List[torch.Tensor]] = {}
         for weight_key in keys_unfused:
