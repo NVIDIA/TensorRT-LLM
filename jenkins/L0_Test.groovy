@@ -399,31 +399,10 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     String outputPath = "${jobWorkspace}/job-output.log"
                     taskArgs = [
                         *taskArgs,
-                        "--output=${outputPath}",
                     ]
-                    def runTestCmd = SlurmConfig.generateTrtllmCommand("sbatch", partition, taskArgs.join(" "), scriptRunNode)
+                    def runTestCmd = SlurmConfig.generateTrtllmCommand("srun", partition, taskArgs.join(" "), scriptRunNode)
                     scriptContent += """
-                    touch ${outputPath}
-                    jobId=\$(${runTestCmd} | awk '{print \$4}')
-                    if [ -z "\$jobId" ]; then
-                        echo "Error: Job submission failed, no job ID returned."
-                        exit 1
-                    fi
-                    echo "Submitted job \$jobId"
-                    tail -f ${outputPath} &
-                    tailPid=\$!
-                    # Wait until sbatch job is done..
-                    while squeue -j \$jobId -o %T >/dev/null 2>&1; do
-                        sleep 300
-                    done
-                    # Kill tail -f process
-                    kill \$tailPid
-                    # Check if the job failed or not
-                    EXIT_CODE=\$(sacct -j \$jobId --format=ExitCode -Pn --allocations | awk -F: '{print \$1}')
-                    if [ "\$EXIT_CODE" -ne 0 ]; then
-                        echo "Pytest failed in Slurm job \$jobId with exit code \$EXIT_CODE"
-                        exit \$EXIT_CODE
-                    fi
+                    ${runTestCmd}
                     """
                 }
                 scriptContent = scriptContent.replaceAll('\t','').stripIndent()
