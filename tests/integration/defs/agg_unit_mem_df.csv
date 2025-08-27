@@ -103,5 +103,7 @@ unittest/trt/model/test_mamba.py,NVIDIA H100,10,
 "unittest/trt/attention/test_gpt_attention.py -k ""xqa_generic""",NVIDIA L40,3,
 unittest/_torch/speculative,NVIDIA Graphics Device,4,B200 Bring Up Board
 unittest/_torch/thop,NVIDIA Graphics Device,32,B200 Bring Up Board
+"unittest/_torch/auto_deploy/unit/singlegpu -k ""not test_trtllm_bench_backend_comparison""",NVIDIA Graphics Device,4,B200 Bring Up Board
 unittest/_torch/speculative,NVIDIA B200,4,
 unittest/_torch/thop,NVIDIA B200,32,
+"unittest/_torch/auto_deploy/unit/singlegpu -k ""not test_trtllm_bench_backend_comparison""",NVIDIA B200,4,
