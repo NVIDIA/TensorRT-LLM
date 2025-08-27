@@ -161,8 +161,7 @@ def test_nemotron_nano_8b_lora_torch(nemotron_nas_example_root, llm_venv,
 
 
 @pytest.mark.skip(
-    reason=
-    "TODO: The model has VGQA where different layers have different KV shapes, which breaks LoRA."
+    reason="TODO: Upload the LoRA adapter to llm-models repo and rerun the test"
 )
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
