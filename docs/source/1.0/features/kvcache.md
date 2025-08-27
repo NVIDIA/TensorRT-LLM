@@ -32,7 +32,7 @@ Reuse across requests is only supported for one model MTP, all other [speculativ
 
 ## Limited Attention Window Size
 
-TensorRT-LLM takes advantage of layers with limited attention window size in order to reduce computations and memory usage. Blocks that leave the attention window are freed and placed on the radix search tree so they can be reused. 
+TensorRT-LLM takes advantage of layers with limited attention window size in order to reduce computations and memory usage. Blocks that leave the attention window are freed and placed on the radix search tree so they can be reused.
 
 ## MQA / GQA
 
@@ -44,7 +44,7 @@ Many of the features in the KV cache system are optional or have user defined pr
 
 ### Datatype
 
-Perhaps the most important property is ```dtype``` which specifies what data type is held in KV cache. The default 'auto' specifies that data type should be inferred from model config. 
+Perhaps the most important property is ```dtype``` which specifies what data type is held in KV cache. The default 'auto' specifies that data type should be inferred from model config.
 
 ### How Much Memory is Allocated to KV Cache
 
@@ -73,5 +73,3 @@ Property ```max_attention_window``` specifies the maximum attention window size 
 ### Deprecated Properties
 
 Properties ```use_uvm``` and ```sink_token_length``` have been deprecated and will be removed in a future release.
-
-
