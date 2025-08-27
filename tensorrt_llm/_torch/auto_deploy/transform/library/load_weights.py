@@ -55,7 +55,7 @@ class LoadWeightsToDevice(BaseTransform):
         return gm, info
 
 
-@TransformRegistry.register("load_factory_model_weights")
+@TransformRegistry.register("move_cm_to_device")
 class LoadFactoryModelWeights(LoadWeightsToDevice):
     """Load weights for the factory model in the transformers mode."""
 
@@ -66,11 +66,6 @@ class LoadFactoryModelWeights(LoadWeightsToDevice):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        factory.load_or_random_init(
-            gm.factory_model,
-            device=self.config.adconfig_checkpoint_device or self.config.device,
-        )
-        move_to_device(gm.factory_model, self.config.device)
         cm.to(self.config.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
