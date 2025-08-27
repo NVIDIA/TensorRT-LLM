@@ -216,17 +216,18 @@ void initRequestBindings(nb::module_& m)
             [](tle::OutputConfig& self, std::optional<bool> return_log_probs, std::optional<bool> return_context_logits,
                 std::optional<bool> return_generation_logits, std::optional<bool> exclude_input_from_output,
                 std::optional<bool> return_encoder_output, std::optional<bool> return_perf_metrics,
-                std::optional<std::vector<tle::AdditionalModelOutput>> additional_model_outputs)
+                std::optional<std::vector<tle::AdditionalModelOutput>> additional_model_outputs,
+                std::optional<SizeType32> top_logprobs)
             {
                 new (&self) tle::OutputConfig(return_log_probs.value_or(false), return_context_logits.value_or(false),
                     return_generation_logits.value_or(false), exclude_input_from_output.value_or(false),
                     return_encoder_output.value_or(false), return_perf_metrics.value_or(false),
-                    additional_model_outputs);
+                    additional_model_outputs, top_logprobs.value_or(0));
             },
             nb::arg("return_log_probs") = nb::none(), nb::arg("return_context_logits") = nb::none(),
             nb::arg("return_generation_logits") = nb::none(), nb::arg("exclude_input_from_output") = nb::none(),
             nb::arg("return_encoder_output") = nb::none(), nb::arg("return_perf_metrics") = nb::none(),
-            nb::arg("additional_model_outputs") = nb::none())
+            nb::arg("additional_model_outputs") = nb::none(), nb::arg("top_logprobs") = nb::none())
         .def_rw("return_log_probs", &tle::OutputConfig::returnLogProbs)
         .def_rw("return_context_logits", &tle::OutputConfig::returnContextLogits)
         .def_rw("return_generation_logits", &tle::OutputConfig::returnGenerationLogits)
@@ -234,6 +235,7 @@ void initRequestBindings(nb::module_& m)
         .def_rw("return_encoder_output", &tle::OutputConfig::returnEncoderOutput)
         .def_rw("return_perf_metrics", &tle::OutputConfig::returnPerfMetrics)
         .def_rw("additional_model_outputs", &tle::OutputConfig::additionalModelOutputs)
+        .def_rw("top_logprobs", &tle::OutputConfig::topLogProbs)
         .def("__getstate__", outputConfigGetstate)
         .def("__setstate__", outputConfigSetstate);
 

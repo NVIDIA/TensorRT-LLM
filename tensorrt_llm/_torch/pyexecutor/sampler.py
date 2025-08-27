@@ -34,6 +34,8 @@ from .scheduler import ScheduledRequests
 class SampleStateTensors:
     new_tokens: torch.Tensor
     log_probs: torch.Tensor | None = None
+    top_tokens: torch.Tensor | None = None
+    top_log_probs: torch.Tensor | None = None
 
     def values(self):
         return vars(self).values()
@@ -177,7 +179,7 @@ def top_k_sampling_batch(logits,
     # sample from the distribution and generate result of [batch_size, 1]
     next_tokens = torch.multinomial(softmax, num_samples=1,
                                     generator=generator).squeeze(-1)
-    return next_tokens, softmax
+    return next_tokens, softmax, indices
 
 
 def top_p_sampling_batch(logits: torch.Tensor,
@@ -214,7 +216,7 @@ def top_p_sampling_batch(logits: torch.Tensor,
     # sample from the distribution and generate result of [batch_size, 1]
     next_tokens = torch.multinomial(softmax, num_samples=1,
                                     generator=generator).squeeze(-1)
-    return next_tokens, softmax
+    return next_tokens, softmax, sorted_indices
 
 
 def top_k_top_p_sampling_batch(logits: torch.Tensor,
@@ -260,13 +262,13 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
     # sample from the distribution and generate result of [batch_size, 1]
     next_tokens = torch.multinomial(softmax, num_samples=1,
                                     generator=generator).squeeze(-1)
-    return next_tokens, softmax
+    return next_tokens, softmax, indices
 
 
 def greedy_search_sampling_batch(logits):
     next_tokens = torch.argmax(logits, dim=-1)
     softmax = torch.softmax(logits, dim=-1)
-    return next_tokens, softmax
+    return next_tokens, softmax, None
 
 
 def get_rejected_indices(draft_probs: torch.Tensor, target_probs: torch.Tensor,
@@ -414,6 +416,7 @@ class TorchSampler(Sampler):
         max_draft_len: int
         max_num_sequences: int
         max_beam_width: int
+        max_top_logprobs: int
         enable_mixed_sampler: bool
 
     def __init__(self, args: Args):
@@ -454,14 +457,23 @@ class TorchSampler(Sampler):
         current_slice = slice(0, count), request.py_seq_slot, beam
         if request.py_return_log_probs:
             assert state.host.log_probs is not None
-            log_probs = state.host.log_probs[request.py_seq_slot][beam][:count]
+            log_probs = state.host.log_probs[request.py_seq_slot, beam, :count]
             current_tokens = state.host.new_tokens[current_slice]
-
+            top_log_probs = state.host.top_log_probs[request.py_seq_slot,
+                                                     beam, :count]
+            top_current_tokens = state.host.top_tokens[current_slice]
             token_log_probs = [{
                 int(token): Logprob(logprob=logprob, rank=1)
             } for token, logprob in zip(current_tokens, log_probs.tolist())]
+            token_top_log_probs = [{
+                int(token[k]):
+                Logprob(logprob=logprob[k], rank=k)
+                for k in range(request.py_top_logprobs)
+            } for token, logprob in zip(top_current_tokens,
+                                        top_log_probs.tolist())]
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
-            request.py_result.append_log_probs([token_log_probs])
+            request.py_result.append_log_probs(
+                [token_log_probs], top_log_probs=[token_top_log_probs])
 
     FinishReasons: TypeAlias = list[list[int]]
     """`(num_seq_slots, num_steps)`"""
@@ -583,13 +595,13 @@ class TorchSampler(Sampler):
             req.py_decoding_iter += 1
 
     def log_probs_host(self, scheduled_requests: ScheduledRequests):
-        """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
+        """Shape: max_num_sequences, max_beam_width == 1, max_tokens, 1 + max_top_logprobs)"""
         if any(req.py_return_log_probs
                for req in scheduled_requests.all_requests()):
-            return torch.empty(
-                (self.max_num_sequences, SINGLE_BEAM_WIDTH, self.max_tokens),
-                device="cpu",
-                pin_memory=True)
+            return torch.empty((self.max_num_sequences, self.MAX_BEAM_WIDTH,
+                                self.max_tokens, 1 + self.max_top_logprobs),
+                               device="cpu",
+                               pin_memory=True)
         return None
 
     def sample_async(
@@ -916,8 +928,8 @@ class TorchSampler(Sampler):
             next_tokens = torch.argmax(logits, dim=-1)
             self.append_eagle3(next_tokens, model_outputs)
             int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
-            next_tokens = int_next_tokens.view(1, -1, SINGLE_BEAM_WIDTH)
-            new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
+            next_tokens = int_next_tokens.view(1, -1, SINGLE_BEAM_WIDTH, 1)
+            new_tokens[:1, ..., :1].index_copy_(1, seq_slots, next_tokens)
             return
 
         strategies = sampling_strategies(requests)
@@ -938,13 +950,17 @@ class TorchSampler(Sampler):
             ]
             logits = self._apply_embedding_bias(logits, requests,
                                                 steps_per_request)
-            batched_next_tokens, batched_softmax = sample(
+            batched_next_tokens, batched_softmax, batched_indices = sample(
                 batched_strategy, logits, generator)
             self.append_eagle3(batched_next_tokens, model_outputs)
 
         offset = 0
         for i, (strategy, slot, steps, request) in enumerate(
                 zip(strategies, seq_slots_host, num_steps, requests)):
+            if request.py_top_logprobs > self.max_top_logprobs:
+                raise ValueError(
+                    f"top_logprobs {request.py_top_logprobs} cannot exceed max_top_logprobs {self.max_top_logprobs}"
+                )
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
 
@@ -952,22 +968,38 @@ class TorchSampler(Sampler):
 
             if batched_next_tokens is None:
                 logits = self._apply_embedding_bias(logits, [req])
-                next_tokens, softmax = sample(strategy, logits, generator)
+                next_tokens, softmax, indices = sample(strategy, logits,
+                                                       generator)
             else:
                 # Batched processing already applied bias, just use the results
                 next_tokens = batched_next_tokens[input_slice]
                 softmax = batched_softmax[input_slice]
-            current_slice = slice(0, steps), slot, BEAM_0
+                indices = batched_indices[
+                    input_slice] if strategy != GREEDY else None
+
+            current_slice = slice(0, steps), slot, BEAM_0, slice(
+                0, 1 + request.py_top_logprobs)
+            if request.py_top_logprobs > 0:
+                next_tokens = torch.cat([
+                    next_tokens.unsqueeze(1),
+                    indices[:, :request.py_top_logprobs]
+                ],
+                                        dim=1)
+            else:
+                next_tokens = next_tokens.unsqueeze(1)
             new_tokens[current_slice] = next_tokens
             if request.py_draft_logits is not None:
                 request.py_target_probs = softmax.clone()
             if log_probs_host is not None:
                 assert BEAM_0 == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
-                token_probs = torch.gather(
-                    softmax, dim=1, index=next_tokens.unsqueeze(1)).squeeze(-1)
+                token_probs = torch.gather(softmax, dim=1,
+                                           index=next_tokens).reshape(
+                                               steps, -1)
+
                 log_probs = torch.log(token_probs)
-                log_probs_host[slot, BEAM_0, :steps].copy_(log_probs,
-                                                           non_blocking=True)
+                log_probs_host[slot, BEAM_0, :steps, :1 +
+                               request.py_top_logprobs].copy_(log_probs,
+                                                                non_blocking=True)
             offset += steps
 
 

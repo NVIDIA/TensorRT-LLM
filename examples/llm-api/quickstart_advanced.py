@@ -147,6 +147,8 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--logprobs', default=False, action='store_true')
+    parser.add_argument('--top_logprobs', type=int, default=0)
+    parser.add_argument('--max_top_logprobs', type=int, default=0)
     return parser
 
 
@@ -213,6 +215,15 @@ def setup_llm(args, **kwargs):
         batching_wait_iters=args.attention_dp_batching_wait_iters,
     )
 
+    # if only top_logprobs is set, set max_top_logprobs to top_logprobs
+    if args.max_top_logprobs < args.top_logprobs:
+        args.max_top_logprobs = args.top_logprobs
+    # Remove this once torch sampler stops using enable_mixed_sampler
+    is_greedy = (not args.max_beam_width > 1) and (
+        args.top_k is None or args.top_k == 0) and (args.top_p is None
+                                                    or args.top_p == 0.0)
+
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -246,6 +257,8 @@ def setup_llm(args, **kwargs):
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
+        max_top_logprobs=args.max_top_logprobs,
+        enable_mixed_sampler=not is_greedy,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
@@ -265,6 +278,7 @@ def setup_llm(args, **kwargs):
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
         logprobs=args.logprobs,
+        top_logprobs=args.top_logprobs,
         n=args.n,
         best_of=best_of,
         use_beam_search=use_beam_search)
@@ -306,6 +320,10 @@ def main():
                 )
             if args.logprobs:
                 print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
+            if args.top_logprobs:
+                print(
+                    f"[{i}]{sequence_id_text} Top logprobs: {sequence.top_logprobs}"
+                )
 
 
 if __name__ == '__main__':

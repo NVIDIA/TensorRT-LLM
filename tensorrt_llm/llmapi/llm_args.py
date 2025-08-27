@@ -1345,6 +1345,9 @@ class BaseLlmArgs(StrictBaseModel):
     max_beam_width: Optional[int] = Field(default=None,
                                           description="The maximum beam width.")
 
+    max_top_logprobs: int = Field(
+        default=0, description="The maximum number of top logprobs.")
+
     max_num_tokens: Optional[int] = Field(
         default=None, description="The maximum number of tokens.")
 
@@ -2609,7 +2612,9 @@ class TorchLlmArgs(BaseLlmArgs):
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
             AttentionDpConfig.model_fields['batching_wait_iters'].default,
-            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            max_top_logprobs=self.max_top_logprobs,
+        )
 
 
 def update_llm_args_with_extra_dict(
