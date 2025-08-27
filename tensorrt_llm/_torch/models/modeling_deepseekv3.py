@@ -622,10 +622,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.mapping = model_config.mapping
         mapping = self.mapping
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy,
-                                   dtype=config.torch_dtype)
-        self.moe_allreduce = MoEAllReduce(self.mapping)
 
         self.self_attn = DeepseekV3Attention(
             model_config,
@@ -647,6 +643,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
         has_tp = mapping.has_tp()
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
+        self.moe_allreduce = MoEAllReduce(self.mapping)
 
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
