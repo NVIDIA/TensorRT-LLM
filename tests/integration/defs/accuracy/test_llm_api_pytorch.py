@@ -2697,6 +2697,8 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(100000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
     extra_evaluator_kwargs = {
@@ -2708,8 +2710,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
-    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"],
-                             ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (True, True),
     ])
@@ -2737,7 +2742,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"])
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 1, False, True, True),
