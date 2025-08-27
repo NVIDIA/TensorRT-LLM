@@ -24,18 +24,6 @@
 #include <cuda_fp4.h>
 #endif
 
-#if !defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED)
-namespace cutlass::arch
-{
-using Sm103 = Sm100;
-}
-
-namespace cutlass::gemm
-{
-using KernelPtrArrayTmaWarpSpecialized1SmBlockScaled3xOmmaVs16Sm103 = void;
-using KernelPtrArrayTmaWarpSpecialized2SmBlockScaled3xOmmaVs16Sm103 = void;
-} // namespace cutlass::gemm
-#endif
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
 
