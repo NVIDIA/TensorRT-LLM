@@ -2847,7 +2847,6 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
-@pytest.mark.skip_less_device_memory(80000)
 class TestQwQ_32B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/QwQ-32B"
     MODEL_PATH = f"{llm_models_root()}/QwQ-32B"
