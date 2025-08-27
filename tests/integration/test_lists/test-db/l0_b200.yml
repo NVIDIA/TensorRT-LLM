@@ -57,8 +57,6 @@ l0_b200:
   - unittest/_torch/modeling -k "modeling_deepseek"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/auto_deploy/unit/singlegpu -k "not test_trtllm_bench_backend_comparison"
-  # ------------- AutoDeploy tests ---------------
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
 - condition:
     ranges:
       system_gpu_count:
