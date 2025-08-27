@@ -144,11 +144,12 @@ def calculate_metrics(
     e2els: list[float] = []
     tput_user: list[float] = []
     latest_avg_decoded_tokens_per_iter: float = 0.0
-    error_counts: dict[int, int] = {}
+    error_counts: dict[str, int] = {}
     for i in range(len(outputs)):
         if outputs[i].exception_type:
-            error_counts[outputs[i].exception_type] = error_counts.get(
-                outputs[i].exception_type, 0) + 1
+            exception_type = outputs[i].exception_type
+            error_counts[exception_type] = error_counts.get(exception_type,
+                                                            0) + 1
         if outputs[i].success:
             output_len = outputs[i].output_tokens
             if not output_len:

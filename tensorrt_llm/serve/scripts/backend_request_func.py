@@ -264,10 +264,11 @@ async def async_request_openai_completions(
                 print(f"HTTP Error {response.status}: {response}")
                 output.error = response.reason or ""
                 output.success = False
-    except Exception:
+    except Exception as e:
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
+        output.exception_type = e.__class__.__name__
     finally:
         if session is None:
             await request_session.close()
