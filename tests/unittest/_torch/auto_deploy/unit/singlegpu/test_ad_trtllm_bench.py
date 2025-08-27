@@ -75,7 +75,7 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
 
     # Simple patterns based on actual log format
     patterns = {
-        "current_cache_size": r"Current cache size:\s*(\d+)",
+        "current_cache_size": r"Current cache size \(MB\):\s*(\d+)",
         "free_mem_pre_mb": r"Free memory before forward pass \(MB\):\s*(\d+)",
         "free_mem_post_mb": r"Free memory after forward pass \(MB\):\s*(\d+)",
     }
