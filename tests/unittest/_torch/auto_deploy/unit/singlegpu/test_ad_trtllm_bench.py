@@ -83,7 +83,7 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
 
     # Simple patterns based on actual log format
     patterns = {
-        "current_cache_size": r"Current cache size:\s*(\d+)",
+        "current_cache_size": r"Current cache size \(MB\):\s*(\d+)",
         "free_mem_pre_mb": r"Free memory before forward pass \(MB\):\s*(\d+)",
         "free_mem_post_mb": r"Free memory after forward pass \(MB\):\s*(\d+)",
     }
@@ -97,6 +97,11 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
             print(f"  ✅ Found {metric_name}: {value}")
         else:
             print(f"  ❌ Could not find {metric_name}")
+
+    try:
+        metrics["current_cache_size"] = metrics["current_cache_size"] * 1024 * 1024
+    except KeyError:
+        print("  ❌ Could not find current_cache_size")
 
     # Calculate new_cache_size using the same formula as in resize_kv_cache
     # new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
@@ -136,7 +141,14 @@ def run_benchmark(
         "-m",
         "tensorrt_llm.commands.bench",
         "--model",
-        model_name,
+        model_name
+    ]
+
+    # If the model exists locally, then using the local copy will make the test robust to CI network issues
+    if os.path.isdir(model_path):
+        cmd.extend(["--model_path", model_path])
+
+    cmd.extend([
         "throughput",
         "--backend",
         backend,
@@ -144,9 +156,7 @@ def run_benchmark(
         str(dataset_path),
         "--max_batch_size",
         str(max_batch_size),
-        # "--warmup",
-        # "10",
-    ]
+        ])
 
     # If the model exists locally, then using the local copy will make the test robust to CI network issues
     if os.path.isdir(model_path):
@@ -522,6 +532,7 @@ def print_kv_cache_metrics(kv_cache_metrics):
 
 def run_multiple_benchmarks_with_outlier_removal(
     model_name: str,
+    model_path: str,
     dataset_path: str,
     temp_dir: str,
     backend: str,
@@ -552,6 +563,7 @@ def run_multiple_benchmarks_with_outlier_removal(
             print(f"🔄 Iteration {i + 1}/{num_iterations}")
             report_data = run_benchmark(
                 model_name,
+                model_path,
                 dataset_path,
                 temp_dir,
                 backend,
