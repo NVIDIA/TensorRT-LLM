@@ -50,7 +50,7 @@ fi
 #check if nsys_folder is provided
 if [ -z "${nsys_folder:-}" ]; then
     echo "nsys is not enabled, start normal flow"
-    trtllm-llmapi-launch trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file}
+    trtllm-llmapi-launch numactl -m 0,1 trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file}
 else
     nsys_prefix=""
     nsys_file=${nsys_folder}/nsys_worker_proc_${instance_id}_${SLURM_PROCID}
@@ -63,7 +63,7 @@ else
     elif [ "${role}" = "CTX" ]; then
         echo "nsys is not enabled on ctx_gpus"
     fi
-    trtllm-llmapi-launch ${nsys_prefix} \
+    trtllm-llmapi-launch numactl -m 0,1 ${nsys_prefix} \
         trtllm-serve ${model_path} \
             --host $(hostname) --port ${port} \
             --extra_llm_api_options ${config_file}
