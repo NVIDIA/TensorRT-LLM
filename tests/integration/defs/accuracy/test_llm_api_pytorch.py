@@ -2846,29 +2846,9 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_host_memory(100000)
 class TestQwQ_32B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/QwQ-32B"
     MODEL_PATH = f"{llm_models_root()}/QwQ-32B"
-
-    # NOTE: according to Sampling Parameters section
-    sampling_params = SamplingParams(
-        temperature=0.6,
-        top_p=0.95,
-        top_k=30,
-        presence_penalty=1.0,
-    )
-
-    def test_auto_dtype(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-        with LLM(self.MODEL_PATH,
-                 max_num_tokens=16384,
-                 kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            print("end cnndaily\n")
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
     def test_auto_dtype_tp2(self):
@@ -2881,6 +2861,33 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
                  max_batch_size=8) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            print("end cnndaily\n")
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_tp4(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=16384,
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=4,
+                 max_batch_size=8) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(8)
+    def test_auto_dtype_tp8(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=16384,
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=8,
+                 max_batch_size=8) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
