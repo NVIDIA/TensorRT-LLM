@@ -43,6 +43,7 @@ from ..metadata import KVCacheParams
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
@@ -1260,6 +1261,18 @@ class PyTorchModelEngine(ModelEngine):
 
         return total_num_tokens, False, attn_all_rank_num_tokens
 
+    def _prepare_multimodal_indices(self, input_ids: list[int]):
+        input_ids = torch.tensor(input_ids, dtype=torch.int, device="cpu")
+        vocab_size = self.model.config.vocab_size
+        if hasattr(self.model, '_image_token_ids'):
+            mm_token_ids = self.model._image_token_ids
+        else:
+            mm_token_ids = None
+
+        text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+            input_ids, vocab_size=vocab_size, mm_token_ids=mm_token_ids)
+        return text_token_indices, mm_token_indices
+
     def _prepare_tp_inputs(
             self,
             scheduled_requests: ScheduledRequests,
@@ -1336,6 +1349,10 @@ class PyTorchModelEngine(ModelEngine):
 
             request.py_batch_idx = request.py_seq_slot
 
+        if len(multimodal_params_list) > 0:
+            _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
+        else:
+            mm_token_indices = None
         num_ctx_requests = len(scheduled_requests.context_requests)
         num_ctx_tokens = len(input_ids)
 
@@ -1699,11 +1716,20 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
 
+        if mm_token_indices is not None:
+            mask = torch.ones(total_num_tokens, dtype=torch.bool)
+            mask[mm_token_indices] = False
+            inputs['mm_token_indices'] = mm_token_indices.pin_memory().to(
+                "cuda", non_blocking=True)
+            inputs['text_token_indices'] = torch.where(mask)[0].pin_memory().to(
+                "cuda", non_blocking=True)
+
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)
         self.iter_states['num_ctx_requests'] = num_ctx_requests
         self.iter_states['num_ctx_tokens'] = num_ctx_tokens
         self.iter_states['num_generation_tokens'] = num_generation_tokens
+
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
 
