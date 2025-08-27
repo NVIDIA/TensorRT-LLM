@@ -2851,7 +2851,7 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/QwQ-32B"
     MODEL_PATH = f"{llm_models_root()}/QwQ-32B"
 
-    @pytest.mark.skip_less_device_memory(320000)
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.skip_less_device(4)
     def test_auto_dtype_tp4(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
