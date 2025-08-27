@@ -16,7 +16,6 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
-@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5453949")
 @pytest.mark.parametrize(
     "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill",
     [
