@@ -3878,8 +3878,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
         gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
         gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
-        TLLM_CHECK_WITH_INFO(!(gemm1_tma_ws_input.swap_ab || gemm2_tma_ws_input.swap_ab) || !use_w4_groupwise,
-            "W4 groupwise does not support swap_ab");
+        TLLM_CHECK_WITH_INFO((gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) || !use_w4_groupwise,
+            "Hopper w4 mixed input groupwise requires swap_ab");
 
         bool apply_bias = parallelism_config.tp_rank == 0;
         auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;
