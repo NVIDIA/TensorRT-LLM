@@ -97,9 +97,12 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
     uint8_t* const globalScaleOutBytes = compact_ptr + numGroups * outputBlockSizeInBytes;
 
     // 4) Per-16 group quantization
+    int const swizzle_idy = laneId / 4;
+    int const swizzle_idx = (laneId % 4) * 8;
+
     for (int groupId = 0; groupId < numGroups; groupId++)
     {
-        int groupStart = laneId * 16 + groupId * (WARP_SIZE * 16);
+        int groupStart = groupId * (WARP_SIZE * 16);
         float vecMax = 0.f;
         float2 raw[8];
 
@@ -113,7 +116,7 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
 #pragma unroll
             for (int i = 0; i < 8; ++i)
             {
-                int const pi = pairBase + i;
+                int const pi = pairBase + swizzle_idy * 32 + swizzle_idx + (i + swizzle_idy) % 8;
                 if (pi < numPairs)
                 {
                     DType2 v2 = in2Ptr[pi];
@@ -130,6 +133,7 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
         }
         else
         {
+            groupStart += laneId * 16;
 #pragma unroll
             for (int i = 0; i < 8; ++i)
             {
@@ -169,7 +173,15 @@ __device__ __forceinline__ void quantize_nvfp4_sharedmem(uint8_t* compact_ptr, i
         uint8_t* const outScalePtr
             = compact_ptr + groupId * outputBlockSizeInBytes + WARP_SIZE * sizeof(uint64_t) + laneId * sizeof(uint8_t);
 
-        reinterpret_cast<uint64_t*>(outValPtr)[0] = e2m1Vec;
+        if (laneId < 16)
+        {
+            reinterpret_cast<uint64_t*>(outValPtr)[0] = e2m1Vec;
+        }
+        __syncwarp();
+        if (laneId >= 16)
+        {
+            reinterpret_cast<uint64_t*>(outValPtr)[0] = e2m1Vec;
+        }
         outScalePtr[0] = sf8.__x;
     }
 
@@ -265,23 +277,9 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
             packed = reinterpret_cast<uint64_t const*>(valBase)[laneId];
         }
 
-        // Conflict-free read of per-lane 1-byte scales via subgroup leader loading 2x32-bit and broadcasting.
+        // Read per-lane 1-byte scales to match quantize access pattern
         uint8_t const* const scalesBase = compact_ptr + groupId * inputBlockSizeInBytes + WARP_SIZE * sizeof(uint64_t);
-        int const subgroupId = laneId >> 3; // 0..3
-        int const laneInGroup = laneId & 7; // 0..7
-        unsigned const subgroupMask = 0xFFu << (subgroupId * 8);
-        uint32_t w0 = 0, w1 = 0;
-        if (laneInGroup == 0)
-        {
-            uint32_t const* scaleIn32 = reinterpret_cast<uint32_t const*>(scalesBase + subgroupId * 8);
-            w0 = scaleIn32[0];
-            w1 = scaleIn32[1];
-        }
-        w0 = __shfl_sync(subgroupMask, w0, (subgroupId << 3) | 0);
-        w1 = __shfl_sync(subgroupMask, w1, (subgroupId << 3) | 0);
-        uint32_t word = (laneInGroup < 4) ? w0 : w1;
-        int shift = (laneInGroup & 3) * 8;
-        uint8_t sfByte = static_cast<uint8_t>((word >> shift) & 0xFFu);
+        uint8_t sfByte = scalesBase[laneId];
         __nv_fp8_e4m3 sf8;
         sf8.__x = sfByte;
         float const SFValueNarrow = static_cast<float>(sf8);
@@ -291,18 +289,44 @@ __device__ __forceinline__ void dequantize_nvfp4_sharedmem(uint8_t* compact_ptr,
         float2 tmp[8];
         e2m1_to_fp32_vec(packed, tmp);
 
-        // Vectorized 32-bit stores (two DType per transaction) for higher bandwidth and fewer bank splits.
-#pragma unroll
-        for (int t = 0; t < 8; ++t)
+        // Vectorized stores with swizzle to avoid bank conflicts, matching quantize path
+        if constexpr (std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>)
         {
-            int idx0 = groupStart + (t << 1);
-            if (idx0 < numElems)
+            using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
+            DType2* out2 = reinterpret_cast<DType2*>(out);
+            int const numPairs = numElems / 2;
+            int const pairBase = (groupId * (WARP_SIZE * 16)) >> 1;
+            int const swizzle_idy = laneId / 4;
+            int const swizzle_idx = (laneId % 4) * 8;
+
+#pragma unroll
+            for (int t = 0; t < 8; ++t)
             {
-                using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
-                DType2 v2;
-                v2.x = tensorrt_llm::common::cuda_cast<DType>(tmp[t].x * dequantScale);
-                v2.y = tensorrt_llm::common::cuda_cast<DType>(tmp[t].y * dequantScale);
-                reinterpret_cast<DType2*>(out + idx0)[0] = v2;
+                int const pi = pairBase + swizzle_idy * 32 + swizzle_idx + (t + swizzle_idy) % 8;
+                if (pi < numPairs)
+                {
+                    DType2 v2;
+                    v2.x = tensorrt_llm::common::cuda_cast<DType>(tmp[t].x * dequantScale);
+                    v2.y = tensorrt_llm::common::cuda_cast<DType>(tmp[t].y * dequantScale);
+                    out2[pi] = v2;
+                }
+            }
+        }
+        else
+        {
+            // Fallback linear layout for non-16-bit types
+#pragma unroll
+            for (int t = 0; t < 8; ++t)
+            {
+                int idx0 = groupStart + (t << 1);
+                if (idx0 < numElems)
+                {
+                    using DType2 = typename tensorrt_llm::common::packed_as<DType, 2>::type;
+                    DType2 v2;
+                    v2.x = tensorrt_llm::common::cuda_cast<DType>(tmp[t].x * dequantScale);
+                    v2.y = tensorrt_llm::common::cuda_cast<DType>(tmp[t].y * dequantScale);
+                    reinterpret_cast<DType2*>(out + idx0)[0] = v2;
+                }
             }
         }
         __syncwarp();
