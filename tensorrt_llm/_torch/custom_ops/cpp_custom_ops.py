@@ -492,17 +492,19 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
-    def _(router_logits, topk):
+    def _(router_logits, topk, output_dtype: torch.dtype = None):
         num_tokens = router_logits.shape[0]
         sz = (num_tokens, topk)
+        output_dtype = output_dtype if output_dtype is not None else torch.float32
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
-                                                            dtype=torch.float32)
+                                                            dtype=output_dtype)
 
     @torch.library.register_fake("trtllm::default_moe_routing_op")
-    def _(router_logits, topk):
+    def _(router_logits, topk, output_dtype: torch.dtype = None):
         num_tokens = router_logits.shape[0]
         sz = (num_tokens, topk)
+        output_dtype = output_dtype if output_dtype is not None else torch.float32
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
-                                                            dtype=torch.float32)
+                                                            dtype=output_dtype)
