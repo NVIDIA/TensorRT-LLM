@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ..attention_backend import AttentionMetadata
@@ -473,9 +474,23 @@ class MTPWorker(nn.Module):
         for _, mtp_layer in enumerate(draft_model.mtp_layers):
             hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                       **draft_inputs)
-            logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
+            token_count = hidden_states.view(-1,
+                                             hidden_states.shape[-1]).shape[0]
+            all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
+            pad_len = all_rank_max_num_tokens - token_count
+            if pad_len > 0:
+                padded_hidden_states = F.pad(hidden_states.view(
+                    -1, hidden_states.shape[-1]), (0, 0, 0, pad_len),
+                                             mode="constant",
+                                             value=0)
+            else:
+                padded_hidden_states = hidden_states.view(
+                    -1, hidden_states.shape[-1])
+            logits = mtp_layer.shared_head(padded_hidden_states,
+                                           draft_model.lm_head,
                                            attn_metadata).float()
             new_draft_token = self.draft_sampler(logits)
+            new_draft_token = new_draft_token[:token_count]
             next_draft_tokens.append(new_draft_token)
             # shift input_ids and hidden_states
             input_ids = draft_inputs["input_ids"]
@@ -840,12 +855,18 @@ class MTPWorker(nn.Module):
             else:
                 # Do greedy sampling for the input logits
                 target_tokens = torch.argmax(logits, dim=-1)
-                print(f"In sample_and_accept_draft_tokens, target_tokens.shape: {target_tokens.shape}")
+                print(
+                    f"In sample_and_accept_draft_tokens, target_tokens.shape: {target_tokens.shape}"
+                )
 
                 # context
                 accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
-                print(f"In sample_and_accept_draft_tokens, accepted_tokens.shape: {accepted_tokens.shape}, num_contexts: {num_contexts}")
-                print(f"In sample_and_accept_draft_tokens, target_tokens.shape: {target_tokens.shape}, num_gens: {num_gens}, mtp_num_modules: {mtp_num_modules}")
+                print(
+                    f"In sample_and_accept_draft_tokens, accepted_tokens.shape: {accepted_tokens.shape}, num_contexts: {num_contexts}"
+                )
+                print(
+                    f"In sample_and_accept_draft_tokens, target_tokens.shape: {target_tokens.shape}, num_gens: {num_gens}, mtp_num_modules: {mtp_num_modules}"
+                )
                 # generation
                 gen_target_tokens = target_tokens[num_contexts:].reshape(
                     num_gens, mtp_num_modules + 1)
@@ -1099,10 +1120,10 @@ class MTPWorker(nn.Module):
             gathered = allgather(combined, self.model_config.mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
         elif (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size
-                > 1) and (self.model_config.mapping.enable_attention_dp and
-                          getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+              and hasattr(self.model_config, 'mapping')
+              and self.model_config.mapping.tp_size > 1) and (
+                  self.model_config.mapping.enable_attention_dp and getattr(
+                      self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
             # For ADP + LM TP mode, we need to find the global argmax across all TP ranks
             # First, get local argmax and max values
             # print(f"In draft_sampler, initial logits.shape: {logits.shape}")
@@ -1110,12 +1131,16 @@ class MTPWorker(nn.Module):
             gathered = allgather(logits, self.model_config.mapping, dim=-1)
             batch_size = logits.shape[0]
             local_batch_size = batch_size // self.model_config.mapping.tp_size
-            gathered = gathered.view(self.model_config.mapping.tp_size, local_batch_size, -1)
+            gathered = gathered.view(self.model_config.mapping.tp_size,
+                                     local_batch_size, -1)
             sliced_gathered = gathered[self.model_config.mapping.tp_rank]
             # print(f"In draft_sampler, gathered.shape: {gathered.shape}")
-            print(f"In draft_sampler, iter: {iter}, rank: {self.model_config.mapping.tp_rank}, sliced_gathered.shape: {sliced_gathered.shape}")
+            print(
+                f"In draft_sampler, iter: {iter}, rank: {self.model_config.mapping.tp_rank}, sliced_gathered.shape: {sliced_gathered.shape}"
+            )
             # draft_tokens = self.get_draft_tokens_from_gathered(sliced_gathered)
-            draft_tokens = torch.argmax(sliced_gathered, dim=-1).type(torch.int32)
+            draft_tokens = torch.argmax(sliced_gathered,
+                                        dim=-1).type(torch.int32)
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
