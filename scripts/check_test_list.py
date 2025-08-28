@@ -108,19 +108,19 @@ def verify_waive_list(llm_src, args):
         if "perf/test_perf.py" in line:
             continue
 
-        # Check for duplicate lines for the raw line
-        if line in dedup_lines:
-            with open(dup_cases_record, "a") as f:
-                f.write(f"Duplicate waive record found: {line}\n")
-        else:
-            dedup_lines.add(line)
-
         # Check for SKIP marker in waives.txt and split by the first occurrence
         line = line.split(" SKIP", 1)[0].strip()
 
         # If the line starts with 'full:', process it
         if line.startswith("full:"):
             line = line.split("/", 1)[1].lstrip("/")
+
+        # Check for duplicate lines for the raw line
+        if line in dedup_lines:
+            with open(dup_cases_record, "a") as f:
+                f.write(f"Duplicate waive record found: {line}\n")
+        else:
+            dedup_lines.add(line)
 
         # Check waived cases also in l0_text.txt and qa_text.txt
         found_in_l0_qa = False
@@ -140,7 +140,9 @@ def verify_waive_list(llm_src, args):
                         break
         if not found_in_l0_qa:
             with open(non_existent_cases_record, "a") as f:
-                f.write(f"Non-existent test name found in waives.txt: {line}\n")
+                f.write(
+                    f"Non-existent test name in l0 or qa list found in waives.txt: {line}\n"
+                )
 
         processed_lines.add(line)
 
@@ -183,17 +185,21 @@ def main():
 
     # Verify QA test lists
     if args.qa:
-        print("-----------Starting QA test list verification...-----------")
+        print("-----------Starting QA test list verification...-----------",
+              flush=True)
         verify_qa_test_lists(llm_src)
     else:
-        print("-----------Skipping QA test list verification.-----------")
+        print("-----------Skipping QA test list verification.-----------",
+              flush=True)
 
     # Verify waive test lists
     if args.waive:
-        print("-----------Starting waive list verification...-----------")
+        print("-----------Starting waive list verification...-----------",
+              flush=True)
         verify_waive_list(llm_src, args)
     else:
-        print("-----------Skipping waive list verification.-----------")
+        print("-----------Skipping waive list verification.-----------",
+              flush=True)
 
     invalid_json_file = os.path.join(llm_src, "invalid_tests.json")
     if os.path.isfile(invalid_json_file) and os.path.getsize(
@@ -211,7 +217,7 @@ def main():
         with open(duplicate_cases_file, "r") as f:
             print(f.read())
         print(
-            "Duplicate test names found in waives.txt, please correct them first!!!\n"
+            "Duplicate test names found in waives.txt, please delete one or combine them first!!!\n"
         )
         pass_flag = False
 
@@ -222,7 +228,7 @@ def main():
         with open(non_existent_cases_file, "r") as f:
             print(f.read())
         print(
-            "Test name in waives.txt but not in l0 test list or qa list, please correct them first!!!\n"
+            "Test name in waives.txt but not in l0 test list or qa list, please delete them first!!!\n"
         )
         pass_flag = False
 
