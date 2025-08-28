@@ -104,7 +104,9 @@ class MnnvlMemory:
         if MnnvlMemory.comm is not None:
             return MnnvlMemory.comm
         comm = mpi_comm().Split(
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
+            (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
+            + mapping.moe_tp_rank,
+            mapping.tp_rank,
         )
         MnnvlMemory.comm = comm
         return comm
@@ -362,12 +364,12 @@ class MnnvlMoe:
 
         MnnvlMoe.moe_mapping = mapping
         workspace_size_per_rank = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(
-            mapping.tp_size
+            mapping.moe_ep_size
         )
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(torch.uint64)
         torch.ops.trtllm.moe_initialize_workspace(
-            MnnvlMoe.moe_workspace_tensor, mapping.tp_rank, mapping.tp_size
+            MnnvlMoe.moe_workspace_tensor, mapping.moe_ep_rank, mapping.moe_ep_size
         )
         MnnvlMoe.moe_workspace.comm.barrier()
         return MnnvlMoe.moe_workspace_tensor
@@ -378,7 +380,7 @@ class MnnvlMoe:
             assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
             return MnnvlMoe.moe_prepare_workspace_tensor
         workspace_size_per_rank = torch.ops.trtllm.get_moe_prepare_workspace_size_per_rank(
-            mapping.tp_size
+            mapping.moe_ep_size
         )
         MnnvlMoe.moe_prepare_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_prepare_workspace_tensor = (
