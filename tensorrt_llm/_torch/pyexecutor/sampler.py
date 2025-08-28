@@ -240,7 +240,7 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
     Returns:
         next_tokens: [batch_size, 1] (sampled tokens)
         softmax: [batch_size, vocab_size] (probability distribution)
-        indices: [batch_size, top_k] (indices of top_k logits)
+        indices: [batch_size, top_k] (indices after applying top-k then top-p mask)
     """
     logits_dim = logits.dim()
     if logits_dim == 1:
