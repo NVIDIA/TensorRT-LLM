@@ -13,7 +13,7 @@
         "HF_HOME": "/huggingface",
         "HISTFILE": "${containerWorkspaceFolder}/.cache/._bash_history"
       },
-      "workspaceFolder": "/workspaces/tensorrt_llm",
+      "workspaceFolder": "/workspaces/tensorrt_llm", # zuker-remove me
       "initializeCommand": "cd ${localWorkspaceFolder} && ./.devcontainer/make_env.py",
       // Note: sourcing .profile is required since we use a local user and the python interpreter is
       // global (/usr/bin/python). In this case, pip will default to a local user path which is not
