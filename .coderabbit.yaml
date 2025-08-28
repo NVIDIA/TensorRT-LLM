@@ -30,7 +30,8 @@ reviews:
   suggested_reviewers: true
   poem: false
   auto_review:
-    drafts: true
+    auto_incremental_review: false
+    drafts: false
     base_branches: ["main", "release/.+"]
 knowledge_base:
   code_guidelines:
