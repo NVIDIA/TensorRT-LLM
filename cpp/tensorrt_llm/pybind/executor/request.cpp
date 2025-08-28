@@ -207,7 +207,7 @@ void initRequestBindings(pybind11::module_& m)
     };
     py::class_<tle::OutputConfig>(m, "OutputConfig")
         .def(py::init<bool, bool, bool, bool, bool, bool, std::optional<std::vector<tle::AdditionalModelOutput>>,
-                 SizeType32>(),
+                 std::optional<SizeType32>>(),
             py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
             py::arg("return_generation_logits") = false, py::arg("exclude_input_from_output") = false,
             py::arg("return_encoder_output") = false, py::arg("return_perf_metrics") = false,
