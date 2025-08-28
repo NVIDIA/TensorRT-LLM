@@ -345,6 +345,7 @@ def create_autodeploy_executor(ad_config: LlmArgs):
         max_seq_len=ad_config.max_seq_len,
         max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
+        max_top_logprobs=ad_config.max_top_logprobs,
         max_beam_width=ad_config.max_beam_width,
         enable_mixed_sampler=ad_config.enable_mixed_sampler,
     )
