@@ -5,7 +5,7 @@
 | Gemma3ForConditionalGeneration     | Yes               | Yes        | N/A             | Yes           | Yes              | N/A            | Yes                   | No                        |
 | HCXVisionForCausalLM               | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        |
 | LlavaLlamaModel (VILA)             | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        |
-| LlavaNextForConditionalGeneration  | Yes               | Yes        | No              | Yes           | Yes              | Yes            | Yes                   | No                        |
+| LlavaNextForConditionalGeneration  | Yes               | Yes        | No              | Yes           | Yes              | No            | Yes                   | No                        |
 | Llama4ForConditionalGeneration     | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        |
 | Mistral3ForConditionalGeneration   | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        |
 | Phi4MMForCausalLM                  | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        |
