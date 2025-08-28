@@ -29,6 +29,9 @@ def _is_disagg() -> bool:
     return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
 
+IMAGE_TOKEN_ID = 131072
+
+
 class SquaredReLU(nn.Module):
 
     def forward(self, x):
@@ -77,25 +80,22 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         self.llm_hidden_size = config.llm_config.hidden_size
 
         self.mlp1 = nn.Sequential(
-            # nn.LayerNorm(self.vit_hidden_size *
-            #              int(1 / self.downsample_ratio)**2,
-            #              bias=False),
             RMSNorm(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
                     eps=1e-5),
             nn.Linear(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
                       self.vision_projection_hidden_size,
-                      bias=False),
-            SquaredReLU(),
+                      bias=False), SquaredReLU(),
             nn.Linear(self.vision_projection_hidden_size,
                       self.llm_hidden_size,
                       bias=False))
         self.mlp1 = self.mlp1.to(config.torch_dtype)
 
-        # self.img_context_token_id = None
         WITH_HF_CODES = False
         if WITH_HF_CODES:
             self.vision_model = transformers.AutoModel.from_config(
                 config.vision_config, trust_remote_code=True)
+            # set input_condition as Identity module.
+            self.vision_model.radio_model.make_preprocessor_external()
             self.vision_model.to(config.torch_dtype)
 
             with open("hf_vision_encoder_arch.txt", "w") as f:
@@ -113,7 +113,6 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
 
                 with open("trtllm_vision_encoder_arch.txt", "w") as f:
                     f.write(str(self.vision_model))
-
             else:
                 # Update the vision model with customized one.
                 from .modeling_radio import RADIOModel
@@ -123,6 +122,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
                 with open("user_vision_encoder_arch.txt", "w") as f:
                     f.write(str(self.vision_model))
 
+    @torch.compile
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
         # N, W, H, C --> N, W, H * scale, C // scale
@@ -218,6 +218,7 @@ class NanoV2VLInputProcessor(InputProcessor):
         self.img_context_token = "<image>"
         self.img_start_token = "<img>"
         self.img_end_token = "</img>"
+        self.dtype = model_config.torch_dtype
 
     @torch.inference_mode()
     def __call__(
@@ -258,7 +259,8 @@ class NanoV2VLInputProcessor(InputProcessor):
 
         # Will package inputs for language model forward in AGGREGATE mode.
         multimodal_data = {}
-        multimodal_data['pixel_values'] = processed_images['pixel_values']
+        multimodal_data['pixel_values'] = processed_images['pixel_values'].to(
+            self.dtype)
         multimodal_data['num_patches'] = processed_images['num_patches']
         return input_ids[0].to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
@@ -271,7 +273,7 @@ class NanoV2VLInputProcessor(InputProcessor):
     model_type="NemotronH_Nano_VL_V2",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
-            "image": "<image>",
+            "image": "<image>\n",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
@@ -315,44 +317,49 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         }
         missing_keys, unexpected_keys = self.vision_encoder.load_state_dict(
             filter_weights, strict=False)
+        missing_keys.remove("vision_model.radio_model.summary_idxs")
+        unexpected_keys.remove(
+            "vision_model.radio_model.input_conditioner.norm_mean")
+        unexpected_keys.remove(
+            "vision_model.radio_model.input_conditioner.norm_std")
         for m in missing_keys:
-            if not m.startswith(
-                    'vision_model.radio_model.model.blocks.'
-            ) and m != "vision_model.radio_model.summary_idxs":
+            if not m.startswith('vision_model.radio_model.model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
             if not u.startswith('vision_model.radio_model.model.blocks.'):
                 raise ValueError(f"Unexpected key: {u}")
 
-        # Load weights for vision transformer module.
-        model_weights = {
-            k.replace('vision_model.radio_model.model.', ''): v
-            for k, v in weights.items()
-            if k.startswith('vision_model.radio_model.model.')
-        }
-        converted_weights = dict()
-        for name in model_weights:
-            # Handle with weights and bias for vision transformer's qkv projection.
-            if "attn.qkv." in name:
-                q_name = name.replace("attn.qkv.", "attn.q_proj.")
-                k_name = name.replace("attn.qkv.", "attn.k_proj.")
-                v_name = name.replace("attn.qkv.", "attn.v_proj.")
-                dim_shape = model_weights[name].shape[0] // 3
-                converted_weights[q_name] = model_weights[name][:dim_shape]
-                converted_weights[k_name] = model_weights[name][dim_shape:2 *
-                                                                dim_shape]
-                converted_weights[v_name] = model_weights[name][2 * dim_shape:]
-            else:
-                converted_weights[name] = model_weights[name]
-        pattern_mapping = {
-            r'(.*?)attn.proj.(.*)': r'\1attn.o_proj.\2',
-            r'(.*?)mlp.fc1.(.*)': r'\1mlp.up_proj.\2',
-            r'(.*?)mlp.fc2.(.*)': r'\1mlp.down_proj.\2',
-        }
-        modeling_utils._load_weights_impl(
-            self.vision_encoder.vision_model.radio_model.model,
-            converted_weights,
-            params_map=pattern_mapping)
+        if len(unexpected_keys) > 0 or len(missing_keys) > 0:
+            # Load weights for vision transformer module.
+            model_weights = {
+                k.replace('vision_model.radio_model.model.', ''): v
+                for k, v in weights.items()
+                if k.startswith('vision_model.radio_model.model.')
+            }
+            converted_weights = dict()
+            for name in model_weights:
+                # Handle with weights and bias for vision transformer's qkv projection.
+                if "attn.qkv." in name:
+                    q_name = name.replace("attn.qkv.", "attn.q_proj.")
+                    k_name = name.replace("attn.qkv.", "attn.k_proj.")
+                    v_name = name.replace("attn.qkv.", "attn.v_proj.")
+                    dim_shape = model_weights[name].shape[0] // 3
+                    converted_weights[q_name] = model_weights[name][:dim_shape]
+                    converted_weights[k_name] = model_weights[name][
+                        dim_shape:2 * dim_shape]
+                    converted_weights[v_name] = model_weights[name][2 *
+                                                                    dim_shape:]
+                else:
+                    converted_weights[name] = model_weights[name]
+            pattern_mapping = {
+                r'(.*?)attn.proj.(.*)': r'\1attn.o_proj.\2',
+                r'(.*?)mlp.fc1.(.*)': r'\1mlp.up_proj.\2',
+                r'(.*?)mlp.fc2.(.*)': r'\1mlp.down_proj.\2',
+            }
+            modeling_utils._load_weights_impl(
+                self.vision_encoder.vision_model.radio_model.model,
+                converted_weights,
+                params_map=pattern_mapping)
 
         # Load language model weights.
         filtered_weights = {
@@ -405,11 +412,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embedding,
-            mm_token_ids=torch.tensor([
-                131072
-            ], dtype=torch.int32),  # 131072 is the token id for the image token
+            mm_token_ids=torch.tensor([IMAGE_TOKEN_ID], dtype=torch.int32),
         )
-
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
