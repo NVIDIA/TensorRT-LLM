@@ -112,6 +112,7 @@ else:
     ]
 
 package_data += [
+    'bindings.pyi',
     'bindings/*.pyi',
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
