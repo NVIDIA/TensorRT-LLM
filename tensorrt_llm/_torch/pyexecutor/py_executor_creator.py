@@ -404,6 +404,7 @@ def create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
+            rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
             # To deal with cases like this, we instantiate them both concurrently.
@@ -411,7 +412,7 @@ def create_py_executor(
                 connector_worker_task = executor.submit(worker_cls,
                                                         executor_config)
 
-                if scheduler_cls is not None:
+                if scheduler_cls is not None and rank == 0:
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, executor_config)
                     connector_scheduler = connector_scheduler_task.result()
