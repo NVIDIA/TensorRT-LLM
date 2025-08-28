@@ -177,16 +177,13 @@ def test_are_stop_words_isnt_called_when_no_stop_words():
     _ = run_without_stop_words()
 
 
-@pytest.mark.parametrize(
-    "original",
-    [
+def test_produce_stop_words():
+    for original in [
         [[]],
         [[1]],
         [[1, 2, 3]],
         [[1], [2, 3]],
         [[1, 2, 3], [4, 5]],
         [[10], [20], [30, 40], [50]],
-    ],
-)
-def test_produce_stop_words(original):
-    assert original == list(produce_stop_words(convert_wordlist(original)))
+    ]:
+        assert original == list(produce_stop_words(convert_wordlist(original)))
