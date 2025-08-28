@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, TypeAlias
 
 import numpy as np
 import torch
@@ -431,7 +431,7 @@ class TorchSampler(Sampler):
             self._generator.manual_seed(self._global_seed)
         return self._generator
 
-    def handle_logprobs(self, request: LlmRequest, state: SampleState, *,
+    def handle_logprobs(self, request: LlmRequest, state: SampleStateTorch, *,
                         beam: int, count: int):
         current_slice = slice(0, count), request.py_seq_slot, beam
         if request.py_return_log_probs:
@@ -445,22 +445,24 @@ class TorchSampler(Sampler):
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs([token_log_probs])
 
-    _REASONS = {
-        FinishReason.END_ID, FinishReason.LENGTH, FinishReason.STOP_WORDS
-    }
+    FinishReasons: TypeAlias = list[list[int]]
+    """`(num_seq_slots, num_steps)`"""
 
     @classmethod
-    def finish_if_reason(cls, request: LlmRequest, finish_reasons: torch.Tensor,
-                         *, step: int) -> bool:
-        reason = FinishReason(finish_reasons[step, request.py_seq_slot, BEAM_0])
-        if reason in cls._REASONS:
+    def finish_if_reason(cls, request: LlmRequest,
+                         finish_reasons: FinishReasons, *, step: int) -> bool:
+        reason = FinishReason(finish_reasons[request.py_seq_slot][step])
+        valid_reasons = {
+            FinishReason.END_ID, FinishReason.LENGTH, FinishReason.STOP_WORDS
+        }
+        if reason in valid_reasons:
             request.finish_by(reason, BEAM_0)
             return True
         return False
 
     def _process_draft_tokens_greedy(self, request: LlmRequest, *,
                                      new_tokens: torch.Tensor,
-                                     finish_reasons: torch.Tensor) -> int:
+                                     finish_reasons: FinishReasons) -> int:
         new_token = add_token(request, new_tokens, beam=BEAM_0)
         stop = self.finish_if_reason(request, finish_reasons, step=0)
         if stop or get_draft_token_length(request) == 0:
@@ -526,12 +528,12 @@ class TorchSampler(Sampler):
 
         return num_accepted
 
-    def update_requests(self, state: SampleState) -> None:
-        assert isinstance(state, SampleState)
+    def update_requests(self, state: SampleStateTorch) -> None:
+        assert isinstance(state, SampleStateTorch)
         if state.sampler_event:
             state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
-        finish_reasons = state.host.finish_reasons
+        finish_reasons = state.host.finish_reasons[:, :, BEAM_0].T.tolist()
 
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
@@ -568,9 +570,10 @@ class TorchSampler(Sampler):
                 pin_memory=True)
         return None
 
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs: dict[str, torch.Tensor],
-                     num_context_logits_prefix_sum: list[int]) -> SampleState:
+    def sample_async(
+            self, scheduled_requests: ScheduledRequests,
+            model_outputs: dict[str, torch.Tensor],
+            num_context_logits_prefix_sum: list[int]) -> SampleStateTorch:
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
         finish_reasons = self.store.finish_reasons
