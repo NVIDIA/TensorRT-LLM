@@ -110,7 +110,6 @@ def main():
     print(f"[RESPONSE 1] [COT] {reasoning}")
     print(f"[RESPONSE 1] [FUNCTION CALL] {tool.__name__}(**{kwargs})")
     answer = tool(**kwargs)
-    print(answer)
 
     messages.extend([{
         "role": "assistant",
