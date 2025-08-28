@@ -220,7 +220,7 @@ def setup_llm(args, **kwargs):
         args.max_top_logprobs = args.top_logprobs
     # Remove this once torch sampler stops using enable_mixed_sampler
     is_greedy = (not args.max_beam_width > 1) and (
-        args.top_k is None or args.top_k == 0) and (args.top_p is None
+        args.top_k is None or args.top_k == 1) and (args.top_p is None
                                                     or args.top_p == 0.0)
 
 
