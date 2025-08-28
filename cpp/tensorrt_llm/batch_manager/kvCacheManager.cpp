@@ -131,7 +131,7 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         // Check if this multimodal content overlaps with the current block
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)
         {
-            SizeType32 mmStartInBlock = (startPos >= startTokenIdx) ? 0 : startTokenIdx - startPos;
+            uint64_t mmStartInBlock = (startPos >= startTokenIdx) ? 0 : static_cast<uint64_t>(startTokenIdx - startPos);
             extraKeys.emplace_back(mmHashArray, mmStartInBlock);
         }
     }
@@ -151,7 +151,7 @@ std::vector<BlockKey> buildBlockKeys(
         currentTokenIdx += uniqueTokens.size();
 
         blockKeys.emplace_back(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(),
-            std::move(uniqueTokens), std::move(extraKeys));
+            std::move(uniqueTokens), std::move(extraKeys), llmRequest.getCacheSaltID());
     }
     return blockKeys;
 }
@@ -166,6 +166,16 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     // https://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
     // Constants provide very good distribution - each input bit affects each output bit with ~50% probability.
     size_t seed = blockKey.uniqueTokens.size() ^ parentHash * UINT64_C(0xbf58476d1ce4e5b9);
+
+    if (parentHash == 0 && blockKey.cacheSaltID)
+    {
+        // Only hashing the cache salt ID for the first block in the sequence
+        uint64_t c = blockKey.cacheSaltID.value();
+        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
+        c = c ^ (c >> 31);
+        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
 
     for (auto const& uniqueToken : blockKey.uniqueTokens)
     {
