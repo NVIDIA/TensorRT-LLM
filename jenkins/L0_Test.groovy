@@ -429,7 +429,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         }
     } finally {
         uploadResults(pipeline, cluster, jobUID, stageName)
-        cleanUpNodeResources(pipeline, cluster, jobUID)
+        //cleanUpNodeResources(pipeline, cluster, jobUID)
     }
 }
 
