@@ -61,6 +61,5 @@ etcd3
 blake3
 llguidance==0.7.29
 soundfile
-triton==3.3.1; platform_machine == "x86_64"
 tiktoken
 blobfile
