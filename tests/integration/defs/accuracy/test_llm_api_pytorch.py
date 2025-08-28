@@ -2876,7 +2876,7 @@ class TestBeamSearch(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_acc_spec="type=cuda_graph,beam_width=2")
 
-    @skip_pre_ada
+    @skip_pre_hopper
     @parametrize_with_ids("disable_overlap_scheduler", [False, True])
     @parametrize_with_ids("enable_padding", [True, False])
     def test_beam_search_cuda_graph_and_overlap_scheduler_fp8(
@@ -2921,7 +2921,7 @@ class TestBeamSearch(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_acc_spec="type=overlap_scheduler,beam_width=2")
 
-    @skip_pre_ada
+    @skip_pre_hopper
     def test_beam_search_overlap_scheduler_fp8(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
         max_beam_width = 2
