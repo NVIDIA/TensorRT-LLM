@@ -2201,12 +2201,6 @@ class TorchLlmArgs(BaseLlmArgs):
                               description="Attention backend to use.",
                               status="beta")
 
-    enable_mixed_sampler: bool = Field(
-        default=False,
-        description=
-        "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
-        status="beta")
-
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
         description=
@@ -2538,7 +2532,6 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
-            enable_mixed_sampler=self.enable_mixed_sampler,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,

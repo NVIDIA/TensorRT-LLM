@@ -636,7 +636,7 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
-                              *, max_seq_len: int, enable_mixed_sampler: bool):
+                              *, max_seq_len: int):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
     max_draft_len = (0 if executor_config.speculative_config is None else
                      executor_config.speculative_config.max_draft_len)
@@ -645,7 +645,6 @@ def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
         max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
-        enable_mixed_sampler=enable_mixed_sampler,
     )
 
 
@@ -653,11 +652,9 @@ def instantiate_sampler(engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
                         mapping: Mapping):
-    sampler_args = create_torch_sampler_args(
-        executor_config,
-        mapping,
-        max_seq_len=engine.max_seq_len,
-        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
+    sampler_args = create_torch_sampler_args(executor_config,
+                                             mapping,
+                                             max_seq_len=engine.max_seq_len)
     decoding_mode = get_decoding_mode(executor_config)
     if mapping.cp_config.get('cp_type') == CpType.STAR:
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
