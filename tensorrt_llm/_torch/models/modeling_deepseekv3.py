@@ -279,10 +279,16 @@ class Deepseekv3RoutingImpl():
         self.routed_scaling_factor = routed_scaling_factor
         self.is_fused = is_fused
 
-    def noaux_tc(self, logits, e_score_correction_bias):
-        n_group = self.n_group
+    @torch.compile(options={"max-autotune": True})
+    def get_scores(self, logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias
+        return scores, scores_with_bias
+
+    def noaux_tc(self, logits, e_score_correction_bias):
+        n_group = self.n_group
+        scores, scores_with_bias = self.get_scores(logits,
+                                                   e_score_correction_bias)
         scores_shape = list(scores_with_bias.shape)
 
         if enable_llm_debug():
@@ -605,7 +611,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                        torch.cuda.Stream]):
         super().__init__()
         self.model_config = model_config
-        config = model_config.pretrained_config
+        self.config = model_config.pretrained_config
+        config = self.config
 
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -636,6 +643,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
         has_tp = mapping.has_tp()
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
+        self.moe_allreduce = MoEAllReduce(self.mapping)
 
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
@@ -688,10 +699,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy,
-                                   dtype=config.torch_dtype)
-        self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
@@ -737,10 +744,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 intermediate_size // block_size,
                 self.mapping.tp_size,
             )
-            mlp_tp_size = math.gcd(
-                tp,
-                self.mapping.gpus_per_node,
-            ) if tp > self.mapping.gpus_per_node else tp  # Avoid costly inter-node TP
+
+            if tp > self.mapping.gpus_per_node and not self.allreduce.is_mnnvl(
+            ):
+                mlp_tp_size = math.gcd(
+                    tp,
+                    self.mapping.gpus_per_node,
+                )  # Avoid costly inter-node TP when MNNVL is not supported
+            else:
+                mlp_tp_size = tp
         return mlp_tp_size
 
     def forward(
