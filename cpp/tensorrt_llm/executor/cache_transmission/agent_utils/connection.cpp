@@ -42,17 +42,17 @@ std::string genUniqueAgentName()
 // num, since the buffer size is ratio is equal to the layer num ratio except the VSWA case.
 
 auto computeSendOffsetRatio(
-    CacheState const& peerCacheState, int peerIdx, CacheState const& selfCacheState, int valideConnectionIdx)
+    CacheState const& peerCacheState, int peerIdx, CacheState const& selfCacheState, int validConnectionIdx)
 {
     auto peerTargetInfo = targetIRanks(selfCacheState, peerCacheState, peerIdx);
     // int ppRank = valideConnectionIdx % peerTargetInfo.mDomainPPSize;
     size_t offsetLayer = 0;
-    for (int i = 0; i < valideConnectionIdx; i++)
+    for (int i = 0; i < validConnectionIdx; i++)
     {
         offsetLayer += peerTargetInfo.getPeerPPDomainLayerNum(i);
     }
 
-    size_t selfSendLayer = peerTargetInfo.getPeerPPDomainLayerNum(valideConnectionIdx);
+    size_t selfSendLayer = peerTargetInfo.getPeerPPDomainLayerNum(validConnectionIdx);
 
     return std::make_pair(offsetLayer, selfSendLayer);
 }

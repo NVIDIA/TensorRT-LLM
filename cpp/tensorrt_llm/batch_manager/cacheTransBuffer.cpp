@@ -340,9 +340,7 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
     TLLM_CHECK(bufferId.has_value() || mOnlyUseDynamicBuffer);
     TLLM_CHECK(targetBufferEleSizes.size() >= static_cast<size_t>(targetNum));
     std::vector<runtime::ITensor::SharedPtr> retSplitCaches;
-    // size_t bufferCoverTargetNum = std::min(
-    //     static_cast<size_t>(targetNum), mTransferBufferSize / (targetBufferEleSize *
-    //     common::getDTypeSize(mDataType)));
+
     size_t bufferCoverTargetNum = 0;
     size_t preBufferByteSize = 0;
     for (int i = 0; i < targetNum; i++)

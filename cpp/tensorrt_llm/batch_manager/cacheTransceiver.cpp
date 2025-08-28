@@ -99,9 +99,9 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
     auto ppSize = worldConfig.getPipelineParallelism();
 
     std::vector<SizeType32> attentionLayerNumPerPP(ppSize, 0);
-    for (int pp_rank = 0; pp_rank < ppSize; pp_rank++)
+    for (int ppRank = 0; ppRank < ppSize; ppRank++)
     {
-        attentionLayerNumPerPP[pp_rank] = modelConfig.getNbAttentionLayers(ppSize, pp_rank);
+        attentionLayerNumPerPP[ppRank] = modelConfig.getNbAttentionLayers(ppSize, ppRank);
     }
 
     return std::make_unique<CacheTransceiver>(cacheManager, cacheStateCfg, worldConfig, attentionLayerNumPerPP,

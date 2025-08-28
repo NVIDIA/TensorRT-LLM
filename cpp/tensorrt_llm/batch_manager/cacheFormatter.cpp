@@ -285,7 +285,7 @@ void CacheFormatter::format(TransferSession& session)
         }
 
         // formatter flow
-        // 1. gather cache blocks of the request.
+        // 1. collect cache blocks of the request.
         // 2. compute the buffer size for each target.
         // 3. prepare the pre-allocated buffer for each target according to the buffer size.
         // 4. call splitKVCacheDispatch to split the cache blocks according to the different parallelis and gather the
@@ -618,7 +618,7 @@ void CacheFormatter::unformat(TransferSession& session)
                 return;
             }
             // unformatted flow
-            // 1. gather cache blocks of the request.
+            // 1. collect cache blocks of the request.
             // 2. compute the buffer size for each target.
             // 3. prepare the pre-allocated buffer for each target according to the buffer size.
             // 4. receive the buffer from the corresponding target. Ideally, we receive only once (one buffer) for each

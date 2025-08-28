@@ -1137,7 +1137,6 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + inputBlockNumSum + outputSplitBlocks.size();
 
     int const tokensPerBlock = selfModelConfig.mTokensPerBlock;
-    // int const numLayers = selfModelConfig.mNbKvHeadsPerLayer.size() / oPPNum;
     int const numLayers
         = selfParallelConfig.mAttentionLayerNumPerPP.at(selfIdx / selfParallelConfig.mTensorParallelism);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
@@ -1145,8 +1144,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     int const DomainPPSize = targetRankInfo.mDomainPPSize;
     int const DomainTPSize = targetRankInfo.mDomainTPSize;
     // int const layerNumDomainPP = numLayers / DomainPPSize;
-    int const headNumDomainTP
-        = headNum / (DomainTPSize / targetRankInfo.mPeerDupHeadFactor); // TODO: duplicate head factor
+    int const headNumDomainTP = headNum / (DomainTPSize / targetRankInfo.mPeerDupHeadFactor);
     int const kvFactor = selfAttentionConfig.mKvFactor;
     bool const isMLA = selfAttentionConfig.mAttentionType == CacheState::AttentionType::kMLA;
     constexpr int mlaSubWarpSize = 16;
