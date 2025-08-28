@@ -85,27 +85,29 @@ class RADIOConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-class InputConditioner(nn.Module):
+# class InputConditioner(nn.Module):
 
-    def __init__(
-        self,
-        input_scale: float,
-        norm_mean: norm_t,
-        norm_std: norm_t,
-        dtype: torch.dtype = None,
-    ):
-        super().__init__()
+#     def __init__(
+#         self,
+#         input_scale: float,
+#         norm_mean: norm_t,
+#         norm_std: norm_t,
+#         dtype: torch.dtype = None,
+#     ):
+#         super().__init__()
 
-        self.dtype = dtype
+#         self.dtype = dtype
 
-        self.register_buffer("norm_mean", _to_tensor(norm_mean) / input_scale)
-        self.register_buffer("norm_std", _to_tensor(norm_std) / input_scale)
+#         self.register_buffer("norm_mean", _to_tensor(norm_mean) / input_scale)
+#         self.register_buffer("norm_std", _to_tensor(norm_std) / input_scale)
 
-    def forward(self, x: torch.Tensor):
-        y = (x - self.norm_mean) / self.norm_std
-        if self.dtype is not None:
-            y = y.to(self.dtype)
-        return y
+#     def forward(self, x: torch.Tensor):
+#         y = (x - self.norm_mean) / self.norm_std
+#         if self.dtype is not None:
+#             y = y.to(self.dtype)
+#         return y
+
+InputConditioner = nn.Identity
 
 
 class ClsToken(nn.Module):
@@ -232,6 +234,7 @@ class ViTPatchGenerator(nn.Module):
         self.patch_normalizer = nn.LayerNorm(
             embed_dim) if normalize_patches else nn.Identity()
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         patches = self.embed_patches(x)
         patches, pos_enc = self.apply_pos_enc(patches, input_size=x.shape[2:])
@@ -727,8 +730,9 @@ class VisionTransformer(nn.Module):
         act_layer = get_act_layer(act_layer) or nn.GELU
 
         self.model_config = model_config
-        self.config = model_config.pretrained_config
-        self.config.num_key_value_heads = num_heads
+        if self.model_config is not None:
+            self.config = model_config.pretrained_config
+            self.config.num_key_value_heads = num_heads
 
         self.num_classes = num_classes
         self.global_pool = global_pool
@@ -810,8 +814,11 @@ class VisionTransformer(nn.Module):
         self.patch_size = patch_size
         self.num_cls_tokens = num_cls_tokens
         self.num_registers = self.patch_generator.num_registers
-        self.metadata_cls = attention_utils.get_attention_backend(
-            model_config.attn_backend).Metadata
+        if self.model_config is not None:
+            self.metadata_cls = attention_utils.get_attention_backend(
+                model_config.attn_backend).Metadata
+        else:
+            self.metadata_cls = None
 
     def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int]):
         """
@@ -1034,6 +1041,7 @@ class RADIOModelBase(nn.Module):
         ret = self._extract_final(x, y, feature_fmt=feature_fmt)
         return ret
 
+    @torch.compile
     def _extract_final(self,
                        x: torch.Tensor,
                        y: torch.Tensor,
@@ -1392,6 +1400,7 @@ class RADIOVisionModelBase(nn.Module):
         ret = self._extract_final(x, y, feature_fmt=feature_fmt)
         return ret
 
+    @torch.compile
     def _extract_final(self,
                        x: torch.Tensor,
                        y: torch.Tensor,
