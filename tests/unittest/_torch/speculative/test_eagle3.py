@@ -46,7 +46,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     max_batch_size = 1
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    free_gpu_memory_fraction=0.5)
+                                    max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
 
@@ -190,7 +190,7 @@ def test_deepseek_eagle3():
         max_batch_size = 16
         max_draft_len = 3
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                        free_gpu_memory_fraction=0.5)
+                                        max_tokens=8192)
         cuda_graph_config = CudaGraphConfig(
             batch_sizes=[1]) if use_cuda_graph else None
 
