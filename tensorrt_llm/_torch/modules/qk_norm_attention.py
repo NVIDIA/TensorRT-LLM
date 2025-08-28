@@ -43,9 +43,10 @@ def compute_yarn_parameters(
         attention_factor: float, the post-processing scaling factor applied to the computed cos/sin
     """
 
-    # The config does not contain rope_scaling, which means the model is not using yarn
+    # If config does not contain rope_scaling or rope_type is not yarn, it means the model is not using yarn
     rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling is None:
+    if rope_scaling is None or getattr(rope_scaling, "rope_type",
+                                       None) != "yarn":
         return 1.0, 0, 0, 1.0
 
     base = config.rope_theta
