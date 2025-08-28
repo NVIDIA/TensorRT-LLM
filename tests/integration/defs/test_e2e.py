@@ -19,7 +19,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union
 
@@ -30,11 +29,12 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
                                        check_output)
 
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
-                     prune_checkpoint, quantize_data, refit_model,
+                     prune_checkpoint, quantize_data, refit_model, similar,
                      venv_check_call)
-from .conftest import (llm_models_root, skip_no_sm120, skip_nvlink_inactive,
-                       skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper,
-                       tests_path, unittest_path, get_device_count)
+from .conftest import (get_device_count, llm_models_root, skip_no_sm120,
+                       skip_nvlink_inactive, skip_post_blackwell,
+                       skip_pre_blackwell, skip_pre_hopper, tests_path,
+                       unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -3014,60 +3014,42 @@ def test_llmapi_lora(workflow, model_path, lora_path, tp_size):
     llm = LLM(f"{llm_models_root()}/{model_path}",
               lora_config=lora_config,
               tensor_parallel_size=tp_size)
+    try:
+        # Create LoRA request
+        lora_request = LoRARequest("my-lora-task", 0,
+                                   f"{llm_models_root()}/{lora_path}")
 
-    # Create LoRA request
-    lora_request = LoRARequest("my-lora-task", 0, f"/code/tensorrt_llm/{lora_path}")
+        # Test multiple prompts
+        prompts = [
+            "Hello, how are you?",
+            "What is the capital of France?",
+            "Explain the concept of machine learning.",
+        ]
 
-    # Test multiple prompts
-    prompts = [
-        "Hello, how are you?",
-        "What is the capital of France?",
-        "Explain the concept of machine learning.",
-    ]
-    
-    sampling_params = SamplingParams(max_tokens=50)
+        sampling_params = SamplingParams(max_tokens=50,
+                                         add_special_tokens=False,
+                                         temperature=0.0,
+                                         top_k=1)
 
-    # Generate with LoRA
-    print("=== Generating with LoRA adapter ===")
-    lora_outputs = llm.generate(prompts,
-                                sampling_params,
-                                lora_request=[lora_request] * len(prompts))
+        # Generate with LoRA
+        print("=== Generating with LoRA adapter ===")
+        lora_outputs = llm.generate(prompts,
+                                    sampling_params,
+                                    lora_request=[lora_request] * len(prompts))
 
-    # Generate without LoRA (baseline)
-    print("=== Generating without LoRA adapter (baseline) ===")
-    baseline_outputs = llm.generate(
-        prompts,
-        sampling_params,
-        lora_request=[None] * len(prompts)
-    )
+        # Generate without LoRA (baseline)
+        print("=== Generating without LoRA adapter (baseline) ===")
+        baseline_outputs = llm.generate(prompts,
+                                        sampling_params,
+                                        lora_request=[None] * len(prompts))
 
-    # Compare outputs using token_ids for more accurate overlap calculation
-    print("\n=== Token-based Overlap Analysis ===")
-    total_overlap_ratio = 0
-    
-    for i, (prompt, lora_out, baseline_out) in enumerate(zip(prompts, lora_outputs, baseline_outputs)):
-        lora_tokens = lora_out.outputs[0].token_ids
-        baseline_tokens = baseline_out.outputs[0].token_ids
-        
-        # Calculate overlap between token sequences
-        min_len = min(len(lora_tokens), len(baseline_tokens))
-        if min_len == 0:
-            overlap_ratio = 0.0
-        else:
-            # Count matching tokens at each position
-            matching_tokens = sum(1 for j in range(min_len) if lora_tokens[j] in baseline_tokens)
-            overlap_ratio = matching_tokens / min_len
-        
-        total_overlap_ratio += overlap_ratio
-        
-        print(f"\nPrompt {i+1}: {prompt}")
-        print(f"LoRA text:       {lora_out.outputs[0].text.strip()}")
-        print(f"Baseline text:   {baseline_out.outputs[0].text.strip()}")
-        print("-" * 80)
-    
-    # Calculate average overlap across all prompts
-    avg_overlap = total_overlap_ratio / len(prompts)
-    print(f"\n=== Final Results ===")
-    print(f"Average token overlap: {avg_overlap:.2%}")
-    
-    assert avg_overlap >= 0.6, f"Average token overlap {avg_overlap:.2%} is below 60%"
+        for i, (prompt, lora_out, baseline_out) in enumerate(
+                zip(prompts, lora_outputs, baseline_outputs)):
+            print(f"\nPrompt {i+1}: {prompt}")
+            print(f"LoRA text:       {lora_out.outputs[0].text.strip()}")
+            print(f"Baseline text:   {baseline_out.outputs[0].text.strip()}")
+            print("-" * 80)
+            assert similar(lora_out.outputs[0].text,
+                           baseline_out.outputs[0].text)
+    finally:
+        llm.shutdown()
