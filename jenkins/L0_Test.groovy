@@ -37,11 +37,16 @@ LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE_12_9="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.1-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE_12_9="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.1-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+
 LLM_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
 LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
 
+DLFW_IMAGE_12_9 = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
+
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.08-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -769,6 +774,16 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
+    // TODO: remove this after GH200 driver upgrade
+    def hostnameMatch = ""
+    if (type == "gh200") {
+        hostnameMatch = """
+                              - key: "kubernetes.io/hostname"
+                                operator: In
+                                values:
+                                - "lego-cg1-qct-066.ipp3a2.colossus\""""
+    }
+
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -788,7 +803,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
-                                - "core"
+                                - "core"${hostnameMatch}
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -1354,7 +1369,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
         }
         if (stageName.contains("-CU12")) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && sed -i 's/-cu13/-cu12/g' requirements.txt && cat requirements.txt")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' requirements.txt && cat requirements.txt")
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
         if (!skipInstallWheel) {
@@ -1616,7 +1631,7 @@ def checkPipInstall(pipeline, wheel_path)
 }
 
 
-def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
+def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312", is_cu12=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -1624,7 +1639,10 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
     if (env.alternativeTRT) {
-        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+        sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+    }
+    if (is_cu12) {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd tensorrt_llm/ && sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' requirements.txt && cat requirements.txt")
     }
 
     // Random sleep to avoid resource contention
@@ -2013,17 +2031,17 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
-        "PY312-DLFW": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+        "PY312-DLFW-CU12": [
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE_12_9,
             "B200_PCIe",
             X86_64_TRIPLE,
             true,
             "dlfw/",
-            DLFW_IMAGE,
+            DLFW_IMAGE_12_9,
             false,
         ],
-        "PY310-UB2204": [
-            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+        "PY310-UB2204-CU12": [
+            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE_12_9,
             "A10",
             X86_64_TRIPLE,
             true,
@@ -2031,8 +2049,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             UBUNTU_22_04_IMAGE,
             false,
         ],
-        "PY312-UB2404": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+        "PY312-UB2404-CU12": [
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE_12_9,
             "RTX5090",
             X86_64_TRIPLE,
             true,
@@ -2043,7 +2061,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
 
     aarch64SanityCheckConfigs = [
-        "PY312-UB2404": [
+        "PY312-UB2404-CU12": [
             LLM_SBSA_DOCKER_IMAGE_12_9,
             "GH200",
             AARCH64_TRIPLE,
@@ -2052,13 +2070,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 12.8 install
         ],
-        "PY312-DLFW": [
+        "PY312-DLFW-CU12": [
             LLM_SBSA_DOCKER_IMAGE_12_9,
             "GH200",
             AARCH64_TRIPLE,
             false,
             "dlfw/",
-            DLFW_IMAGE,
+            DLFW_IMAGE_12_9,
             false,
         ],
     ]
@@ -2114,7 +2132,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                     env = ["LD_LIBRARY_PATH+=:/usr/local/cuda/compat"]
                 }
                 withEnv(env) {
-                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver)
+                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver, key.contains("CU12"))
                 }
             }
 
@@ -2139,7 +2157,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         echo "###### Prerequisites Start ######"
                         echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
-                        if (values[5] == DLFW_IMAGE) {
+                        if (values[5] == DLFW_IMAGE || values[5] == DLFW_IMAGE_12_9) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
@@ -2148,21 +2166,30 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
-                        if (values[5] != DLFW_IMAGE) {
+                        if (values[5] != DLFW_IMAGE && values[5] != DLFW_IMAGE_12_9) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
-
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install 'cuda-python>=12,<13' 'nvidia-ml-py>=12,<13'")
+                            if (key.contains("CU12")) {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
+                            } else {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-13-0")
+                            }
                         }
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "sed -i 's/-cu13/-cu12/g' ${LLM_ROOT}/requirements.txt")
+                        if (key.contains("CU12")) {
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' ${LLM_ROOT}/requirements.txt")
+                            sh "cat ${LLM_ROOT}/requirements.txt"
+                        }
                         // Extra PyTorch CUDA 12.8 install for SBSA platform and Blackwell GPUs bare-metal environments
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            if (key.contains("CU12")) {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            } else {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            }
                         }
 
                         def libEnv = []
@@ -2181,9 +2208,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             }
                         }
                         echo "###### Run LLMAPI tests Start ######"
-                        def config = VANILLA_CONFIG_CU12
+
+                        def config = key.contains("CU12") ? VANILLA_CONFIG_CU12 : VANILLA_CONFIG
                         if (cpu_arch == AARCH64_TRIPLE) {
-                            config = LINUX_AARCH64_CONFIG_CU12
+                            config = key.contains("CU12") ? LINUX_AARCH64_CONFIG_CU12 : LINUX_AARCH64_CONFIG
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
