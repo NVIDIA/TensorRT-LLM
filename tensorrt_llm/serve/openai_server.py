@@ -103,8 +103,8 @@ class OpenAIServer:
 
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
-        disable_harmoy = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
-        if disable_harmoy:
+        disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
+        if disable_harmony:
             self.use_harmony = False
         else:
             self.use_harmony = (self.model_config.model_type == "gpt_oss"
