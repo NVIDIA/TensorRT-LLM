@@ -1431,10 +1431,10 @@ class PyExecutor:
         return ctx_transmission_reqs
 
     def _check_request_error_state(self):
-        error_requests = []
-        for req in self.active_requests:
-            if req.state == LlmRequestState.DISAGG_TRANS_ERROR:
-                error_requests.append(req)
+        error_requests = [
+            req for req in self.active_requests
+            if req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        ]
 
         return error_requests
 
