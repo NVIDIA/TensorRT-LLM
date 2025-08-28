@@ -11,6 +11,10 @@ from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
 
 MAX_NUM_SEQUENCES = 128
+NOT_FINISHED = FinishReason.NOT_FINISHED
+STOP_WORDS = FinishReason.STOP_WORDS
+END_ID = FinishReason.END_ID
+LENGTH = FinishReason.LENGTH
 
 
 class RequestCase:
@@ -45,29 +49,51 @@ class RequestCase:
     def __repr__(self):
         return f"RequestCase({self.prompt=}, {self.new_tokens=}, {self.finish_reasons=}, {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.stop_words_list=})"
 
+    @staticmethod
+    def setup(requests: list["RequestCase"]):
+        max_tokens = set(len(req.new_tokens) for req in requests)
+        assert len(max_tokens) == 1
+        max_draft_len = max_tokens.pop() - 1
+        sampler_args = TorchSampler.Args(
+            max_seq_len=20,
+            max_draft_len=max_draft_len,
+            # Fill with many more max requests than below, so we can test that write_finish_reasons uses seq_slots correctly
+            max_num_sequences=MAX_NUM_SEQUENCES,
+            max_beam_width=1,
+            enable_mixed_sampler=False)
+        sampler = TorchSampler(args=sampler_args)
+
+        # fill with garbage value so we can observe that finish reasons are filled with NOT_FINISHED before we write to them.
+        sampler.store.finish_reasons.fill_(205)
+        seq_slots = torch.tensor([req.request.py_seq_slot for req in requests],
+                                 device="cuda",
+                                 dtype=torch.int64)
+        new_tokens = torch.tensor([req.new_tokens for req in requests],
+                                  dtype=torch.int32,
+                                  device="cuda").T
+        sampler.store.new_tokens[:, seq_slots, BEAM_0] = new_tokens
+
+        def run():
+            sampler._write_finish_reasons(
+                [req.request for req in requests],
+                finish_reasons=sampler.store.finish_reasons,
+                new_tokens=sampler.store.new_tokens,
+                seq_slots=seq_slots)
+
+            reasons = sampler.store.finish_reasons[:, seq_slots,
+                                                   BEAM_0].T.tolist()
+
+            for actual, request in zip(reasons, requests, strict=True):
+                expected = request.finish_reasons
+                msg = f"actual={[FinishReason(reason) for reason in actual]} != expected={expected}\nFor {request}"
+                assert actual == [reason.value for reason in expected], msg
+
+        return run, sampler
+
 
 def test_write_finish_reasons():
-    NOT_FINISHED = FinishReason.NOT_FINISHED
-    STOP_WORDS = FinishReason.STOP_WORDS
-    END_ID = FinishReason.END_ID
-    LENGTH = FinishReason.LENGTH
     """We don't really care about the finish reason past the first infraction, because we're not going to use it, although in some instance it is written anyway."""
-
-    MAX_DRAFT_LEN = 2
-    sampler_args = TorchSampler.Args(
-        max_seq_len=20,
-        max_draft_len=MAX_DRAFT_LEN,
-        # Fill with many more max requests than below, so we can test that write_finish_reasons uses seq_slots correctly
-        max_num_sequences=MAX_NUM_SEQUENCES,
-        max_beam_width=1,
-        enable_mixed_sampler=False)
-    sampler = TorchSampler(args=sampler_args)
-    assert sampler.max_tokens == MAX_DRAFT_LEN + 1
-
-    # fill with garbage value so we can observe that finish reasons are filled with NOT_FINISHED before we write to them.
-    sampler.store.finish_reasons.fill_(205)
-
-    requests = [
+    run, _ = RequestCase.setup([
         RequestCase(
             prompt=[13, 14],
             new_tokens=[60, 61, 62],
@@ -124,34 +150,31 @@ def test_write_finish_reasons():
             # The latest infraction check overrides the earlier infraction checks, hence the first finish_reason is END_ID
             finish_reasons=[END_ID, LENGTH, LENGTH],
         ),
-    ]
+    ])
+    run()
 
-    assert sampler.max_tokens == 3
 
-    seq_slots = torch.tensor([req.request.py_seq_slot for req in requests],
-                             device="cuda",
-                             dtype=torch.int64)  # for index_fill_
+def test_are_stop_words_isnt_called_when_no_stop_words():
+    """We don't want to call are_stop_words when there are no stop words because it's expensive"""
 
-    new_tokens = torch.tensor([req.new_tokens for req in requests],
-                              dtype=torch.int32,
-                              device="cuda").T
+    def stop_words_that_raises(*args, **kwargs):
+        raise AssertionError
 
-    sampler.store.new_tokens[:, seq_slots, BEAM_0] = new_tokens
-    sampler._write_finish_reasons([req.request for req in requests],
-                                  finish_reasons=sampler.store.finish_reasons,
-                                  new_tokens=sampler.store.new_tokens,
-                                  seq_slots=seq_slots)
+    run_with_stop_words, sampler = RequestCase.setup([
+        RequestCase(prompt=[1],
+                    stop_words_list=[[1]],
+                    new_tokens=[4],
+                    finish_reasons=[NOT_FINISHED])
+    ])
+    sampler._are_stop_words = stop_words_that_raises
+    with pytest.raises(AssertionError):
+        run_with_stop_words()
 
-    actual_finish_reasons = sampler.store.finish_reasons[:, seq_slots,
-                                                         BEAM_0].T.tolist()
-
-    for actual, request in zip(actual_finish_reasons, requests, strict=True):
-        expected = request.finish_reasons
-        msg = f"""\
-actual={[FinishReason(reason) for reason in actual]} != expected={expected}
-For {request}
-"""
-        assert actual == [reason.value for reason in expected], msg
+    run_without_stop_words, sampler = RequestCase.setup([
+        RequestCase(prompt=[1], new_tokens=[4], finish_reasons=[NOT_FINISHED])
+    ])
+    sampler._are_stop_words = stop_words_that_raises
+    _ = run_without_stop_words()
 
 
 @pytest.mark.parametrize(
