@@ -28,7 +28,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
 
     max_batch_size = 2
     max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
 
@@ -41,7 +41,6 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         max_num_tokens=2048,
-        use_torch_sampler=True,
     )
 
     spec_config = DraftTargetDecodingConfig(

@@ -9,8 +9,8 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.guided_decoder import GuidedDecoder
-from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
-                                      get_draft_token_length)
+from ..pyexecutor.handle_logits import HandleLogits
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState, TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -266,7 +266,21 @@ class ModelDrafter(Drafter):
         """Sample tokens from draft model outputs."""
         try:
             if self.sampler is not None:
-                return self.sampler.sample_async(draft_batch, outputs)
+                num_context_logits_prefix_sum = [0]
+                prefix_sum = 0
+                for request in draft_batch.context_requests:
+                    prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
+                    num_context_logits_prefix_sum.append(prefix_sum)
+
+                HandleLogits()(
+                    draft_batch.context_requests,
+                    draft_batch.generation_requests, outputs["logits"],
+                    self.sampler.beam_width(draft_batch.all_requests()),
+                    num_context_logits_prefix_sum,
+                    self.sampler.is_generation_model())
+
+                return self.sampler.sample_async(draft_batch, outputs,
+                                                 num_context_logits_prefix_sum)
             return None
         except Exception as e:
             logger.error(f"Error in sampling: {str(e)}")
@@ -310,15 +324,6 @@ class ModelDrafter(Drafter):
                 self.draft_seq_slot_manager.free_resources(req)
 
         return new_requests
-
-    def _pad_to_max_draft_tokens(self,
-                                 scheduled_requests: ScheduledRequests) -> None:
-        """Pad draft tokens to maximum length for all generation requests."""
-        for req in scheduled_requests.generation_requests:
-            max_draft_tokens = self.max_draft_tokens
-            num_draft_tokens = get_draft_token_length(req)
-            req.py_draft_tokens.extend(
-                0 for _ in range(max_draft_tokens - num_draft_tokens))
 
     def _execute_guided_decoder(self,
                                 scheduled_batch: ScheduledRequests,
@@ -403,7 +408,6 @@ class ModelDrafter(Drafter):
                 self._update_requests(previous_batch)
                 self._process_decoded_tokens(previous_batch.scheduled_requests,
                                              req_id_to_old_request)
-            self._pad_to_max_draft_tokens(scheduled_requests)
 
             if self.guided_decoder is not None:
                 self.guided_decoder.rollback_draft_tokens(scheduled_requests)

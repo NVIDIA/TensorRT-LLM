@@ -179,6 +179,31 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Thus, v_stride_in_bytes always equals to k_stride_in_bytes so far.
             mKernelParams.v_stride_in_bytes = mKernelParams.k_stride_in_bytes;
         }
+        else if (mFixedParams.attentionInputLayout == AttentionInputLayout::SEPARATE_Q_K_V)
+        {
+            // Separate QKV input layout, [total_kv_seqlen, H_KV, D] + [total_kv_seqlen, H_KV, DV]
+            TLLM_CHECK_WITH_INFO(runnerParams.kPtr != nullptr && runnerParams.vPtr != nullptr,
+                "SEPARATE_Q_K_V requires valid K and V pointers.");
+            mKernelParams.k_ptr = runnerParams.kPtr;
+            mKernelParams.v_ptr = runnerParams.vPtr;
+            // Tensor K is contiguous.
+            mKernelParams.k_stride_in_bytes
+                = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
+            if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
+            {
+                // Non-FP8 context MLA: tensor V is not contiguous. The token stride is numKvHeads * (headSizeQkNope +
+                // headSizeV).
+                mKernelParams.v_stride_in_bytes = get_size_in_bytes(
+                    mFixedParams.numKvHeads * (mFixedParams.headSizeQkNope + mFixedParams.headSizeV),
+                    mFixedParams.dataType);
+            }
+            else
+            {
+                // Tensor V is contiguous for other cases.
+                mKernelParams.v_stride_in_bytes
+                    = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSizeV, mFixedParams.dataType);
+            }
+        }
     }
 
     mKernelParams.o_ptr = runnerParams.outputPtr;
@@ -428,14 +453,13 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.force_unroll = true;
         mLaunchParams.kernel_s = 0;
 
-        // Now we have SM90 FP8 generation and BF16 context MLA kernels
+        // Now we have SM90 context and FP8 generation MLA kernels
+        bool isHopperContextMLA = isSm90 && mFixedParams.headSizeV == 128;
         bool isHopperFP8GenerationMLA
             = isSm90 && mFixedParams.dataType == DATA_TYPE_E4M3 && mFixedParams.headSizeV == 512;
-        bool isHopperBF16ContextMLA
-            = isSm90 && mFixedParams.dataType == DATA_TYPE_BF16 && mFixedParams.headSizeV == 128;
 
         // These treatments are only for other MLA cases
-        if (!isHopperFP8GenerationMLA && !isHopperBF16ContextMLA)
+        if (!isHopperContextMLA && !isHopperFP8GenerationMLA)
         {
             mLaunchParams.granular_tiling = true;
             // Even on SM90, we use ampere-style kernel, will be optimized later
@@ -464,13 +488,12 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     {
         bool isHopperBF16ContextMLA = (mFixedParams.headSize == mFixedParams.headSizeV + 64) && isSm90
             && mFixedParams.dataType == DATA_TYPE_BF16 && mFixedParams.headSizeV == 128;
-        // TODO: add support for separate QKV input layout
         mLaunchParams.supportReturnSoftmaxStats = (runnerParams.softmaxStatsPtr != nullptr
             && mLaunchParams.flash_attention && mLaunchParams.warp_specialization
             && ((!isHopperBF16ContextMLA
                     && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
                 || (isHopperBF16ContextMLA
-                    && (mLaunchParams.attention_input_layout == AttentionInputLayout::Q_PAGED_KV))));
+                    && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 }
 
@@ -622,6 +645,12 @@ void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
             // Layout, [B, S, H_kv * D + H_kv * Dv].
             k_ptr = reinterpret_cast<char const*>(mKernelParams.kv_ptr);
             v_ptr = k_ptr + h_kv * d_in_bytes;
+        }
+        else if (layout == AttentionInputLayout::SEPARATE_Q_K_V)
+        {
+            // Layout: [total_kv_seqlen, H_KV, D] + [total_kv_seqlen, H_KV, DV]
+            k_ptr = reinterpret_cast<char const*>(mKernelParams.k_ptr);
+            v_ptr = reinterpret_cast<char const*>(mKernelParams.v_ptr);
         }
 
         Multiple_tma_descriptor<3> kv_tma_descriptor;

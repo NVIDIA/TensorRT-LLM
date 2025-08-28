@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 -c constraints.txt
-accelerate>=0.25.0
+accelerate>=1.7.0
 build
 colored
 cuda-python>=12,<13
@@ -67,3 +67,4 @@ soundfile
 triton==3.3.1; platform_machine == "x86_64"
 tiktoken
 blobfile
+openai-harmony==0.0.4

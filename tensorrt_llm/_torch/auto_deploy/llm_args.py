@@ -3,8 +3,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 import torch
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
@@ -157,6 +159,17 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
     )
 
+    use_sharding_from_factory: bool = Field(
+        default=False,
+        description="If True, use sharding from the model factory. If False, use sharding from the "
+        "AutoDeployConfig.",
+    )
+
+    sharding_dims: List[str] = Field(
+        default=["tp", "ep", "dp"],
+        description="The sharding methods to apply by the heuristic sharding stage.",
+    )
+
     compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
         Field(
             default="torch-compile",
@@ -259,7 +272,29 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     )
     garbage_collection_gen0_threshold: int = Field(default=20000, description="See TorchLlmArgs.")
 
+    _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
+
+    @property
+    def quant_config(self) -> QuantConfig:
+        if self._quant_config is None:
+            self._quant_config = QuantConfig()
+        return self._quant_config
+
+    @quant_config.setter
+    def quant_config(self, value: QuantConfig):
+        self._quant_config = value
+
     ### VALIDATION #################################################################################
+    @field_validator("max_seq_len", mode="before")
+    @classmethod
+    def ensure_max_seq_len(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None:
+            # Fallback to the AutoDeployConfig default when not provided
+            return AutoDeployConfig.model_fields["max_seq_len"].get_default(
+                call_default_factory=True
+            )
+        return value
+
     @field_validator("build_config", mode="before")
     @classmethod
     def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:

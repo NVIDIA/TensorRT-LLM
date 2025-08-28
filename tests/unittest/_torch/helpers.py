@@ -75,6 +75,19 @@ def calc_diff(x, y):
     return 1 - sim
 
 
+def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
+    # align with woq_assert_near_eq function in tests/unittest/trt/quantization/_utils.py
+    if weight_dtype == torch.int8:
+        bits_in_type = 8
+    elif weight_dtype == torch.quint4x2:
+        bits_in_type = 4
+    quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
+    max_val = torch.max(abs(x)).item()
+    atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
+
+    return atol
+
+
 def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,
                         final_scales: torch.Tensor, num_experts: int,
                         weights: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -149,3 +162,32 @@ def reference_block_scale_moe_torch(
         results[batch_idx] += final_scales[batch_idx, nth_expert, None] * output
 
     return results.view_as(x)
+
+
+class MockPytorchBackendConfig:
+
+    def __init__(self, use_cuda_graph, cuda_graph_padding_enabled):
+        self.use_cuda_graph = use_cuda_graph
+        self.cuda_graph_padding_enabled = cuda_graph_padding_enabled
+
+
+class MockEngine:
+    """A replacement for SimpleNamespace that supports weak references."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def create_mock_engine(batch_size: int):
+
+    return MockEngine(
+        pytorch_backend_config=MockPytorchBackendConfig(
+            use_cuda_graph=True, cuda_graph_padding_enabled=False),
+        _cuda_graph_batch_sizes=[batch_size],
+        _max_cuda_graph_batch_size=batch_size,
+        max_beam_width=1,
+        is_spec_decode=False,
+        spec_config=None,
+        _cuda_graph_mem_pool=None,
+        use_mrope=False,
+    )

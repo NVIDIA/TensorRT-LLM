@@ -192,6 +192,8 @@ struct KvCacheStats
     float cacheHitRate;
     // Number of free blocks for every configured attention-window size.
     std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
+    // GPU bytes allocated for KV-cache
+    std::size_t allocatedBytes{};
 };
 
 // Basic building block of a paged KV cache - a single
@@ -551,7 +553,7 @@ public:
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
-    void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
+    void addSequence(GenerationRequest& sequence, SizeType32 numContextBlocks, bool isShareLastContextBlock);
 
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
@@ -869,8 +871,13 @@ public:
     void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
         LlmRequest& llmRequest, SizeType32 windowSize);
 
+    //! \brief Assign blocks for a new sequence.
+    //! \param sequence  The GenerationRequest to process.
+    //! \param numContextBlocks  Number of context blocks to allocate.
+    //! \param windowSize  Attention window size
+    //! \param isShareLastContextBlock  If true, the last context block is shared among beams.
     void addSequence(
-        GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize);
+        GenerationRequest& sequence, SizeType32 numContextBlocks, SizeType32 windowSize, bool isShareLastContextBlock);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1105,6 +1112,15 @@ public:
         auto const relativePoolIndex = mAbsolutePoolToRelativePoolIndex.at(poolIdx);
         return mWindowBlockManagers.at(windowSize).getPool(relativePoolIndex);
     }
+
+    //! \brief Update cache offsets for blocks initiated from sequence
+    void updateSequenceCacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
+
+    //! \brief Update cache offsets for last block
+    void updateLastCacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
+
+    //! \brief Update cache offsets for block at index
+    void updateCacheBlockOffsetsAtIdx(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
 
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
@@ -1460,6 +1476,7 @@ public:
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
         kvCacheStats.numFreeBlocksPerWindowSize = getNumFreeBlocksPerWindowSize();
+        kvCacheStats.allocatedBytes = mAllocatedBytes;
         return kvCacheStats;
     }
 
@@ -1638,12 +1655,6 @@ public:
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
 private:
-    void cacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-    void cacheNewBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-    void updateNewBlockPointer(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
-    void updateToken(GenerationRequest& sequence, bool addToken);
-
-private:
     // Maximum number of sequences
     SizeType32 mMaxNumSequences;
     // Maximum beam width
@@ -1669,6 +1680,8 @@ private:
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;
     runtime::ITensor::SharedPtr mBlockScalePoolPointers;
+    // GPU bytes allocated for KV-cache
+    std::size_t mAllocatedBytes{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

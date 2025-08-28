@@ -16,10 +16,12 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
+from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
 
 __all__ = [
     'LLM',
+    'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
     'GuidedDecodingParams',

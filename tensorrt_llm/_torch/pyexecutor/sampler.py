@@ -1,11 +1,10 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
 from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
@@ -30,7 +29,6 @@ from .scheduler import ScheduledRequests
 @dataclass(kw_only=True)
 class SampleStateTensors:
     new_tokens: torch.Tensor
-    logits: torch.Tensor | None = None
     log_probs: torch.Tensor | None = None
 
     def values(self):
@@ -58,12 +56,22 @@ class Sampler(ABC):
         return None
 
     @abstractmethod
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleState:
+    def sample_async(self, scheduled_requests: ScheduledRequests, model_outputs,
+                     num_context_logits_prefix_sum: list[int]) -> SampleState:
         raise NotImplementedError
 
     @abstractmethod
     def update_requests(self, state: SampleState) -> None:
+        raise NotImplementedError
+
+    @staticmethod
+    def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
+        for req in scheduled_requests:
+            return req.sampling_config.beam_width
+        return 0
+
+    @abstractmethod
+    def is_generation_model(self) -> bool:
         raise NotImplementedError
 
 
@@ -73,10 +81,9 @@ class EarlyStopSampler(Sampler):
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
     """
 
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleState:
-        host = SampleStateTensors(logits=model_outputs['logits'],
-                                  new_tokens=torch.empty(0))
+    def sample_async(self, scheduled_requests: ScheduledRequests, model_outputs,
+                     num_context_logits_prefix_sum: list[int]) -> SampleState:
+        host = SampleStateTensors(new_tokens=torch.empty(0))
         return SampleState(scheduled_requests=scheduled_requests, host=host)
 
     def update_requests(self, state: SampleState) -> None:
@@ -87,14 +94,59 @@ class EarlyStopSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            if request.py_return_context_logits:
-                logits = state.host.logits[idx]
-                if logits.ndim == 1:
-                    # For BERT: Add axis to be compatible with LogitsStorage
-                    # (LogitsStorage will interpret this dim as the prompt_len which
-                    # is not relevant for outputting logits of encoder only model).
-                    logits = logits.unsqueeze(0)
-                request.py_result.append_context_logits(logits)
+
+    def is_generation_model(self) -> bool:
+        return False
+
+
+@dataclass(kw_only=True)
+class MultimodalResult:
+    mm_embeddings: List[torch.Tensor] = None
+
+    def values(self):
+        return vars(self).values()
+
+
+@dataclass(kw_only=True)
+class SampleStateWithMMResult:
+    scheduled_requests: ScheduledRequests
+
+    data: MultimodalResult = None
+
+
+class EarlyStopWithMMResult(Sampler):
+    """
+    Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
+    """
+
+    def sample_async(
+            self, scheduled_requests: ScheduledRequests, model_outputs,
+            num_context_logits_prefix_sum: list[int]
+    ) -> SampleStateWithMMResult:
+        # from model_outputs to MultimodalResult
+        data = MultimodalResult(mm_embeddings=model_outputs['mm_embeddings'])
+        return SampleStateWithMMResult(scheduled_requests=scheduled_requests,
+                                       data=data)
+
+    def update_requests(self, state: SampleStateWithMMResult) -> None:
+        assert isinstance(state, SampleStateWithMMResult)
+        scheduled_requests = state.scheduled_requests
+        assert (not scheduled_requests.generation_requests)
+        mm_embeddings = state.data.mm_embeddings
+        for request, mm_embedding in zip(scheduled_requests.context_requests,
+                                         mm_embeddings):
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            # NOTE: This is a hack: set finish reason manually and set the beam 0
+            request.set_finished_reason(FinishReason.LENGTH, 0)
+            if len(mm_embedding) != sum(request.multimodal_lengths):
+                raise ValueError(
+                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
+                )
+
+            request.py_result.append_mm_embeddings(mm_embedding)
+
+    def is_generation_model(self) -> bool:
+        return False
 
 
 def top_k_sampling_batch(logits,
@@ -107,12 +159,13 @@ def top_k_sampling_batch(logits,
     batch_size, vocab_size = logits.size()
 
     # get first top_k logits of each sample and their indices
-    values, indices = torch.topk(logits, top_k, dim=-1)
-    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+    if top_k > 0:
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
 
-    # set the logits who is less than first top_k logits to -inf
-    logits = torch.where(logits < min_values,
-                         torch.full_like(logits, float('-inf')), logits)
+        # set the logits who is less than first top_k logits to -inf
+        logits = torch.where(logits < min_values,
+                             torch.full_like(logits, float('-inf')), logits)
 
     # compute probability distribution
     softmax = torch.softmax(logits, dim=-1)
@@ -173,12 +226,13 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
         logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
     # get first top_k logits of each sample and their indices
-    values, indices = torch.topk(logits, top_k, dim=-1)
-    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+    if top_k > 0:
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
 
-    # set the logits who is less than first top_k logits to -inf
-    logits = torch.where(logits < min_values,
-                         torch.full_like(logits, float('-inf')), logits)
+        # set the logits who is less than first top_k logits to -inf
+        logits = torch.where(logits < min_values,
+                             torch.full_like(logits, float('-inf')), logits)
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
 
@@ -305,6 +359,9 @@ class TorchSampler(Sampler):
     BEAM = 0
     MAX_BEAM_WIDTH = BEAM + 1
 
+    def is_generation_model(self) -> bool:
+        return True
+
     @dataclass(frozen=True, kw_only=True)
     class Store:
         new_tokens: torch.Tensor
@@ -398,13 +455,9 @@ class TorchSampler(Sampler):
 
         return False
 
-    def handle_logits(self, request: LlmRequest, state: SampleState, *,
-                      beam: int, count: int):
+    def handle_logprobs(self, request: LlmRequest, state: SampleState, *,
+                        beam: int, count: int):
         current_slice = slice(0, count), request.py_seq_slot, beam
-        if request.py_return_generation_logits:
-            assert state.host.logits is not None
-            current_logits = state.host.logits[current_slice]
-            request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
             assert state.host.log_probs is not None
             log_probs = state.host.log_probs[request.py_seq_slot][beam][:count]
@@ -499,7 +552,7 @@ class TorchSampler(Sampler):
                 continue
             new_token = add_token(req, new_tokens, beam=self.BEAM)
             self._handle_stop_criteria(req, new_token)
-            self.handle_logits(req, state, beam=self.BEAM, count=1)
+            self.handle_logprobs(req, state, beam=self.BEAM, count=1)
             req.py_decoding_iter += 1
 
         for req in state.scheduled_requests.generation_requests:
@@ -513,37 +566,28 @@ class TorchSampler(Sampler):
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
             processed += num_accepted
-            self.handle_logits(req, state, beam=self.BEAM, count=processed)
+            self.handle_logprobs(req, state, beam=self.BEAM, count=processed)
             req.py_decoding_iter += 1
 
-    def log_probs_host(self, requests: Iterable[LlmRequest]):
+    def log_probs_host(self, scheduled_requests: ScheduledRequests):
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
-        if any(req.py_return_log_probs for req in requests):
+        if any(req.py_return_log_probs
+               for req in scheduled_requests.all_requests()):
             return torch.empty(
                 (self.max_num_sequences, self.MAX_BEAM_WIDTH, self.max_tokens),
                 device="cpu",
                 pin_memory=True)
         return None
 
-    def gen_logits_host(self, requests: Iterable[LlmRequest], vocab_size: int):
-        if any(req.py_return_generation_logits for req in requests):
-            return torch.empty((self.max_tokens, self.max_num_sequences,
-                                self.MAX_BEAM_WIDTH, vocab_size),
-                               device="cpu",
-                               pin_memory=True)
-        return None
-
     def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs: dict[str, torch.Tensor]) -> SampleState:
-        requests = scheduled_requests.all_requests()
+                     model_outputs: dict[str, torch.Tensor],
+                     num_context_logits_prefix_sum: list[int]) -> SampleState:
         new_tokens = self.store.new_tokens
-        vocab_size = model_outputs["logits"].shape[-1]
-        log_probs_host = self.log_probs_host(requests)
-        gen_logits_host = self.gen_logits_host(requests, vocab_size)
-        self._process_requests(requests,
+        log_probs_host = self.log_probs_host(scheduled_requests)
+        self._process_requests(scheduled_requests,
                                model_outputs,
                                new_tokens,
-                               gen_logits_host=gen_logits_host,
+                               num_context_logits_prefix_sum,
                                log_probs_host=log_probs_host)
         new_tokens_host = new_tokens.to(device="cpu", non_blocking=True)
         sampler_event = torch.cuda.Event()
@@ -551,8 +595,7 @@ class TorchSampler(Sampler):
         return SampleState(scheduled_requests=scheduled_requests,
                            device=SampleStateTensors(new_tokens=new_tokens),
                            host=SampleStateTensors(new_tokens=new_tokens_host,
-                                                   log_probs=log_probs_host,
-                                                   logits=gen_logits_host),
+                                                   log_probs=log_probs_host),
                            sampler_event=sampler_event)
 
     @staticmethod
@@ -614,19 +657,37 @@ class TorchSampler(Sampler):
         return logits
 
     def _process_requests(self,
-                          requests: list[LlmRequest],
+                          scheduled_requests: ScheduledRequests,
                           model_outputs: dict[str, torch.Tensor],
                           new_tokens: torch.Tensor,
+                          num_context_logits_prefix_sum: list[int],
                           *,
-                          gen_logits_host: torch.Tensor | None = None,
                           log_probs_host: torch.Tensor | None = None):
         beam_width = self.MAX_BEAM_WIDTH
         beam = self.BEAM
-        raw_logits = model_outputs["logits"]
+
+        # raw_logits should contain only the logits from the gen requests.
+        # If return context logits is requested, fetch only the logits from gen requests.
+        if any(r.py_return_context_logits
+               for r in scheduled_requests.context_requests):
+            gen_logits_indices = []
+            total_context_logits = num_context_logits_prefix_sum[-1]
+            for i in range(len(scheduled_requests.context_requests)):
+                gen_logits_indices.append(num_context_logits_prefix_sum[i + 1] -
+                                          1)
+            gen_logits_indices.extend(
+                range(
+                    total_context_logits, total_context_logits +
+                    len(scheduled_requests.generation_requests)))
+            raw_logits = model_outputs["logits"][gen_logits_indices]
+        else:
+            raw_logits = model_outputs["logits"]
+
+        requests = scheduled_requests.all_requests()
         num_steps = [1 + get_draft_token_length(req) for req in requests]
         sum_steps = sum(num_steps)
         no_draft_tokens = len(requests) == sum_steps
-        fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
+        fast_path = not self.enable_mixed_sampler and no_draft_tokens and log_probs_host is None
 
         seq_slots_host = torch.as_tensor([r.py_seq_slot for r in requests])
         seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
@@ -682,8 +743,6 @@ class TorchSampler(Sampler):
             new_tokens[current_slice] = next_tokens
             if request.py_draft_logits is not None:
                 request.py_target_probs = softmax.clone()
-            if gen_logits_host is not None:
-                gen_logits_host[current_slice].copy_(logits, non_blocking=True)
             if log_probs_host is not None:
                 assert beam == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
                 token_probs = torch.gather(
@@ -747,6 +806,9 @@ class SampleStateTRTLLM(SampleState):
 class TRTLLMSampler(Sampler):
     MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
     SampleState = SampleStateTRTLLM
+
+    def is_generation_model(self) -> bool:
+        return True
 
     def __init__(
         self,
@@ -843,7 +905,6 @@ class TRTLLMSampler(Sampler):
             speculative_decoding_fast_logits=False,
             is_leader_in_orch_mode=False,
             is_normalize_log_probs=False)
-        self.algs.handle_logits = HandleLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
 
@@ -877,13 +938,6 @@ class TRTLLMSampler(Sampler):
         slots = torch.tensor([r.py_seq_slot for r in adp], dtype=torch.int32)
         self.algs.decoder.underlying_decoder().setup(config, batch_size, slots)
 
-    @staticmethod
-    @torch.inference_mode()
-    def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
-        for req in scheduled_requests:
-            return req.sampling_config.beam_width
-        return 0
-
     def get_cache_indirection(self) -> torch.Tensor | None:
         return self.store["decoder_state"].cache_indirection_output
 
@@ -899,8 +953,9 @@ class TRTLLMSampler(Sampler):
 
     @torch.inference_mode()
     @nvtx_range("sample_async")
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleStateTRTLLM:
+    def sample_async(
+            self, scheduled_requests: ScheduledRequests, model_outputs,
+            num_context_logits_prefix_sum: list[int]) -> SampleStateTRTLLM:
 
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
@@ -913,28 +968,9 @@ class TRTLLMSampler(Sampler):
 
         self.setup_sampler_step(scheduled_requests)
 
-        num_context_logits_prefix_sum = [0]
-        prefix_sum = 0
-        for request in scheduled_requests.context_requests:
-            prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
-            num_context_logits_prefix_sum.append(prefix_sum)
-
-        if any(r.py_return_context_logits or r.py_return_generation_logits
-               for r in scheduled_requests.all_requests()):
-            self.algs.handle_logits(scheduled_requests.context_requests,
-                                    scheduled_requests.generation_requests,
-                                    model_outputs["logits"],
-                                    num_context_logits_prefix_sum,
-                                    self.max_num_sequences, beam_width)
-
         # For beam search, cache indirection needs to be updated
         if beam_width > 1:
             self._update_cache_indirection_buffer(scheduled_requests)
-
-        # TODO: Enable this back once nanobind is merged and/or llm request is a pure python object
-        # decoding_input = self.algs.make_decoding_batch_input_output(
-        #     scheduled_requests, model_outputs["logits"], beam_width,
-        #     num_context_logits_prefix_sum)
 
         self.store["decoding_input"][
             self.micro_batch_idx] = make_decoding_batch_input(

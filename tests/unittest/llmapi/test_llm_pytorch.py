@@ -4,6 +4,7 @@ from contextlib import contextmanager, nullcontext
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -255,14 +256,11 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
-    llm_test_harness(
-        llama_model_path,
-        prompts,
-        ["Z Z Z Z Z Z"],
-        sampling_params=sampling_params,
-        backend="pytorch",
-        use_torch_sampler=True,  # Use TorchSampler to test all 3 paths
-        enable_mixed_sampler=enable_mixed_sampler)
+    llm_test_harness(llama_model_path,
+                     prompts, ["Z Z Z Z Z Z"],
+                     sampling_params=sampling_params,
+                     backend="pytorch",
+                     enable_mixed_sampler=enable_mixed_sampler)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
@@ -821,3 +819,40 @@ class TestLlmError:
                            match="should not exceed max_num_tokens"):
             ids = [random.randint(10, 100) for _ in range(101)]
             llm.generate([ids])
+
+
+class FailingExecutorWorker(GenerationExecutorWorker):
+    """Mock worker that fails during initialization to test error handling."""
+
+    def __init__(self, *args, **kwargs):
+        # Simulate a constructor failure
+        raise RuntimeError(
+            "Mock GenerationExecutorWorker initialization failed")
+
+
+FailingExecutor = type(
+    "FailingExecutor", (), {
+        "create":
+        classmethod(
+            lambda cls, *args, **kwargs: FailingExecutorWorker(*args, **kwargs))
+    })
+
+
+def test_llm_with_proxy_error():
+    """Test that LLM properly handles GenerationExecutorWorker constructor failures.
+
+    This test mocks the GenerationExecutorWorker to fail during __init__ and
+    verifies that the LLM class properly catches and re-raises the error.
+    """
+    from unittest.mock import patch
+
+    # Test that the error is properly caught and re-raised by LLM
+    # We patch GenerationExecutor.create directly to return our failing worker
+    with patch('tensorrt_llm.executor.executor.GenerationExecutor.create',
+               side_effect=lambda *args, **kwargs: FailingExecutorWorker(
+                   *args, **kwargs)):
+        with pytest.raises(
+                RuntimeError,
+                match="Mock GenerationExecutorWorker initialization failed"):
+            llm = LLM(model=llama_model_path,
+                      kv_cache_config=global_kvcache_config)
