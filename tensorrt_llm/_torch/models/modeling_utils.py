@@ -352,13 +352,15 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
-        if config.mapping.enable_attention_dp:
+        if config.mapping.enable_attention_dp and not getattr(config.mapping, 'enable_lm_tp_in_adp', False):
+            print(f"In DecoderModelForCausalLM, creating LMHead without TP")
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
             )
         else:
+            print(f"In DecoderModelForCausalLM, creating LMHead with TP")
             # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
             # will considering per layer QuantConfig in the future.
             if (hasattr(config, 'lora_config')
@@ -402,7 +404,7 @@ class DecoderModelForCausalLM(nn.Module,
             if config.mapping.is_last_pp_rank():
                 self.model.keep_embed_tokens = True
 
-        self.logits_processor = LogitsProcessor()
+        self.logits_processor = LogitsProcessor(config)
 
         self.prologue = []
         self.epilogue = [self.lm_head]

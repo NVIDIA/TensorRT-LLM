@@ -433,6 +433,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 attn_metadata,
                 True,
             )
+            # print(f"lm_head.weight.data_ptr: {self.lm_head.weight.data_ptr()}")
+            # print(f"lm_head.weight.shape: {self.lm_head.weight.shape}")
+            print(f"In SpecDecOneEngineForCausalLM, before spec_worker, logits.shape: {logits.shape}")
+            # print(f"draft_model.lm_head.weight.data_ptr: {self.draft_model.lm_head.weight.data_ptr()}")
+            # print(f"draft_model.lm_head.weight.shape: {self.draft_model.lm_head.weight.shape}")
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=input_ids,
                                     position_ids=position_ids,

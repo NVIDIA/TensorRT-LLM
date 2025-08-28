@@ -1,14 +1,16 @@
 import torch
 import torch.nn as nn
 
+from ..model_config import ModelConfig
 from ..attention_backend import AttentionMetadata
 from .linear import Linear
 
 
 class LogitsProcessor(nn.Module):
 
-    def __init__(self):
+    def __init__(self, model_config: ModelConfig):
         super().__init__()
+        self.model_config = model_config
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -27,6 +29,29 @@ class LogitsProcessor(nn.Module):
             else:
                 hidden_states = hidden_states[-1]
 
+        # Add pre-lm gather logic
+        if (self.model_config.mapping.enable_attention_dp and 
+            getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+            # ADP + LM TP mode: perform All-Gather before LM_head
+            from ..distributed import allgather
+            hidden_states = allgather(hidden_states, self.model_config.mapping, dim=0)
+
+        # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
+        if (not self.model_config.mapping.enable_attention_dp) or (self.model_config.mapping.enable_attention_dp and
+                getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+            lm_head.gather_output = False
         logits = lm_head(hidden_states)
+        if (not self.model_config.mapping.enable_attention_dp) or (self.model_config.mapping.enable_attention_dp and
+                getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+            lm_head.gather_output = True
+        # print(f"In LogitsProcessor, lm_head.weight.data_ptr: {lm_head.weight.data_ptr()}")
+        # print(f"In LogitsProcessor, lm_head.weight.shape: {lm_head.weight.shape}")
+        # print(f"In LogitsProcessor, logits.shape: {logits.shape}")
+        logits = allgather(logits, self.model_config.mapping, dim=-1)
+        batch_size = logits.shape[0]
+        local_batch_size = batch_size // self.model_config.mapping.tp_size
+        logits = logits.view(self.model_config.mapping.tp_size, local_batch_size, -1)
+        logits = logits[self.model_config.mapping.tp_rank]
+        print(f"In LogitsProcessor, final logits.shape: {logits.shape}")
         logits = logits.float()
         return logits

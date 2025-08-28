@@ -160,10 +160,20 @@ class DeepseekV3MTPHead(nn.Module):
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
-        if not (self.model_config.mapping.enable_attention_dp):
+        # Add pre-lm gather logic
+        if (self.model_config.mapping.enable_attention_dp and 
+            getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+            # ADP + LM TP mode: perform All-Gather before LM_head
+            from ..distributed import allgather
+            hidden_states = allgather(hidden_states, self.model_config.mapping, dim=0)
+
+        # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
+        if (not self.model_config.mapping.enable_attention_dp) or (self.model_config.mapping.enable_attention_dp and
+                getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
             lm_head.gather_output = False
         logits = lm_head(hidden_states)
-        if not (self.model_config.mapping.enable_attention_dp):
+        if (not self.model_config.mapping.enable_attention_dp) or (self.model_config.mapping.enable_attention_dp and
+                getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
             lm_head.gather_output = True
         return logits
 

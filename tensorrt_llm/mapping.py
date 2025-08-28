@@ -141,7 +141,8 @@ class Mapping(object):
             attn_tp_size=-1,
             attn_cp_size=-1,
             auto_parallel=False,
-            enable_attention_dp=False):
+            enable_attention_dp=False,
+            enable_lm_tp_in_adp=False):
         # set default values for non-moe cases
         # or where only one MOE parallelism size is specified
         if moe_cluster_size == -1:
@@ -224,6 +225,7 @@ class Mapping(object):
         self.auto_parallel = auto_parallel
         self.world_size = world_size
         self.enable_attention_dp = enable_attention_dp
+        self.enable_lm_tp_in_adp = enable_lm_tp_in_adp
         self.rank = rank
         self.gpus_per_node = gpus_per_node
         self.pp_groups = []

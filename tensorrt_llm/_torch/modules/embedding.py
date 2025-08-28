@@ -37,8 +37,8 @@ class LMHead(Linear):
         mapping = mapping or Mapping()
         tp_size = mapping.tp_size
 
-        # Attention DP doesn't work with embedding parallelization.
-        if mapping.enable_attention_dp:
+        # Attention DP doesn't work with embedding parallelization, unless enable_lm_tp_in_adp is set.
+        if mapping.enable_attention_dp and not getattr(mapping, 'enable_lm_tp_in_adp', False):
             tensor_parallel_mode = None
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -69,6 +69,9 @@ class LMHead(Linear):
         self.embedding_dim = embedding_dim
 
         weight_shape = (self.out_features, self.in_features)
+        print('*' * 50)
+        print(f"enable_attention_dp: {mapping.enable_attention_dp}, enable_lm_tp_in_adp: {getattr(mapping, 'enable_lm_tp_in_adp', False)}")
+        print(f"In LMHead, weight_shape: {weight_shape}")
         self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
         self.register_parameter("bias", None)
 
