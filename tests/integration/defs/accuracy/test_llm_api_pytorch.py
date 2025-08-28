@@ -2861,15 +2861,23 @@ class TestBeamSearch(LlmapiAccuracyTestHarness):
         sampling_params = SamplingParams(n=max_beam_width,
                                          best_of=max_beam_width,
                                          use_beam_search=True)
+
+        max_batch_size = 2
+        # Need to make batch_size not equal to max_batch_size to enable padding.
+        if enable_padding:
+            batch_sizes = [1, 8]
+        else:
+            batch_sizes = [1, 2, 4, 8]
+
         with LLM(
                 model=self.MODEL_PATH,
                 kv_cache_config=self.kv_cache_config,
-                max_batch_size=max_beam_width,
+                max_batch_size=max_batch_size,
                 max_seq_len=2048,
                 max_beam_width=max_beam_width,
                 disable_overlap_scheduler=disable_overlap_scheduler,
                 cuda_graph_config=CudaGraphConfig(
-                    batch_sizes=[1, 2, 4, 8], enable_padding=enable_padding),
+                    batch_sizes=batch_sizes, enable_padding=enable_padding),
         ) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
