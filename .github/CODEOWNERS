@@ -151,6 +151,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /cpp/tensorrt_llm/batch_manager/dataTransceiver.h @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.cpp @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.h @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
 
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
