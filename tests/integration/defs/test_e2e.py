@@ -19,7 +19,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union
 
@@ -30,23 +29,12 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
                                        check_output)
 
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
-                     prune_checkpoint, quantize_data, refit_model,
+                     prune_checkpoint, quantize_data, refit_model, similar,
                      venv_check_call)
 from .conftest import (get_device_count, llm_models_root, skip_no_sm120,
                        skip_nvlink_inactive, skip_post_blackwell,
                        skip_pre_blackwell, skip_pre_hopper, tests_path,
                        unittest_path)
-
-
-def similarity_score(a, b):
-    "similar compare a and b "
-    return SequenceMatcher(None, a, b).ratio()
-
-
-def similar(a, b, threshold=0.8):
-    "similar compare a and b "
-    return similarity_score(a, b) >= threshold
-
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -2788,36 +2776,42 @@ def test_llmapi_lora(workflow, model_path, lora_path, tp_size):
     llm = LLM(f"{llm_models_root()}/{model_path}",
               lora_config=lora_config,
               tensor_parallel_size=tp_size)
+    try:
+        # Create LoRA request
+        lora_request = LoRARequest("my-lora-task", 0,
+                                   f"{llm_models_root()}/{lora_path}")
 
-    # Create LoRA request
-    lora_request = LoRARequest("my-lora-task", 0,
-                               f"{llm_models_root()}/{lora_path}")
+        # Test multiple prompts
+        prompts = [
+            "Hello, how are you?",
+            "What is the capital of France?",
+            "Explain the concept of machine learning.",
+        ]
 
-    # Test multiple prompts
-    prompts = [
-        "Hello, how are you?",
-        "What is the capital of France?",
-        "Explain the concept of machine learning.",
-    ]
+        sampling_params = SamplingParams(max_tokens=50,
+                                         add_special_tokens=False,
+                                         temperature=0.0,
+                                         top_k=1)
 
-    sampling_params = SamplingParams(max_tokens=50, add_special_tokens=False)
-
-    # Generate with LoRA
-    print("=== Generating with LoRA adapter ===")
-    lora_outputs = llm.generate(prompts,
-                                sampling_params,
-                                lora_request=[lora_request] * len(prompts))
-
-    # Generate without LoRA (baseline)
-    print("=== Generating without LoRA adapter (baseline) ===")
-    baseline_outputs = llm.generate(prompts,
+        # Generate with LoRA
+        print("=== Generating with LoRA adapter ===")
+        lora_outputs = llm.generate(prompts,
                                     sampling_params,
-                                    lora_request=[None] * len(prompts))
+                                    lora_request=[lora_request] * len(prompts))
 
-    for i, (prompt, lora_out, baseline_out) in enumerate(
-            zip(prompts, lora_outputs, baseline_outputs)):
-        print(f"\nPrompt {i+1}: {prompt}")
-        print(f"LoRA text:       {lora_out.outputs[0].text.strip()}")
-        print(f"Baseline text:   {baseline_out.outputs[0].text.strip()}")
-        print("-" * 80)
-        assert similar(lora_out.outputs[0].text, baseline_out.outputs[0].text)
+        # Generate without LoRA (baseline)
+        print("=== Generating without LoRA adapter (baseline) ===")
+        baseline_outputs = llm.generate(prompts,
+                                        sampling_params,
+                                        lora_request=[None] * len(prompts))
+
+        for i, (prompt, lora_out, baseline_out) in enumerate(
+                zip(prompts, lora_outputs, baseline_outputs)):
+            print(f"\nPrompt {i+1}: {prompt}")
+            print(f"LoRA text:       {lora_out.outputs[0].text.strip()}")
+            print(f"Baseline text:   {baseline_out.outputs[0].text.strip()}")
+            print("-" * 80)
+            assert similar(lora_out.outputs[0].text,
+                           baseline_out.outputs[0].text)
+    finally:
+        llm.shutdown()
