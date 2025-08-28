@@ -401,6 +401,121 @@ TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFP8)
 }
 #endif
 
+// type - Data type for KV cache
+// windowSize - Attention window size
+// seqLen0 - Sequence length of first and last sequence
+// numMatching - Number of matching tokens in second sequence (< seqLen0)
+template <nvinfer1::DataType type, int windowSize, int seqLen0, int numMatching>
+void runSlidingWindowAttentionTest()
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 8;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 4;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+
+    auto constexpr batchSize = 1;
+    auto constexpr maxBlocksPerSeq = 10;
+    auto constexpr bytesPerToken = 4;
+    auto constexpr maxAttentionWindow = 4096;
+    auto constexpr sinkTokenLen = 0;
+    auto constexpr canUseOneMoreBlock = true;
+
+    SizeType32 constexpr maxNewTokens{0};
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const blocksPerWindow = BlocksPerWindow{{windowSize, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
+        blocksPerWindow, maxNumSequences, stream, maxAttentionWindow, beamWidth,
+        std::vector<BlockManager::SizeType32>{windowSize}, std::nullopt, type, 0, onboardBlocks);
+    blockManager.allocatePools(false);
+
+    // Add first sequence that contributes reusable tokens
+    VecTokens firstSequenceTokens(seqLen0);
+    std::iota(firstSequenceTokens.begin(), firstSequenceTokens.end(), 1);
+    printf("1st :: ");   for (auto ll : firstSequenceTokens) printf("%d, ",ll);   printf("\b\b \n");
+    auto inputTokens = std::make_shared<VecTokens>(firstSequenceTokens);
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+    LlmRequest::RequestIdType requestId0{0};
+    auto llmRequest0 = std::make_shared<LlmRequest>(requestId0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    GenerationRequest seq0{requestId0, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
+    auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
+    auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
+    blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, windowSize);
+    auto cacheBlockIds0 = seq0.getCacheBlockIds(windowSize).at(beamIdx);
+    auto constexpr numBlocks = (seqLen0 + tokensPerBlock - 1) / tokensPerBlock;
+    std::vector<int> expectedBlocks(numBlocks);
+    std::iota(expectedBlocks.begin(), expectedBlocks.end(), 0);
+    EXPECT_THAT(cacheBlockIds0, ::testing::ElementsAreArray(expectedBlocks));
+    // Offload blocks before storage
+    for (auto cacheBlockId : cacheBlockIds0)
+    {
+        auto block = blockManager.getBlockById(cacheBlockId, windowSize);
+        EXPECT_TRUE(block->isPrimary());
+        // offload so we can write to block in CPU code
+        blockManager.offloadBlock(block, windowSize);
+        EXPECT_FALSE(block->isPrimary());
+    }
+    // Store blocks for reuse (last token cannot be reused)
+    blockManager.releaseBlocks(seq0, llmRequest0);
+
+    // Add second sequence
+    VecTokens secondSequenceTokens(seqLen0);
+    std::iota(secondSequenceTokens.begin(), secondSequenceTokens.end(), 1);
+    for (int i = numMatching; i < seqLen0; ++i) secondSequenceTokens[i] += 1;
+    printf("2nd :: ");   for (auto ll : secondSequenceTokens) printf("%d, ",ll);   printf("\b\b \n");
+    auto inputTokens1 = std::make_shared<VecTokens>(secondSequenceTokens);
+    auto inputLength1 = static_cast<SizeType32>(inputTokens1->size());
+    LlmRequest::RequestIdType requestId1{1};
+    auto llmRequest1 = std::make_shared<LlmRequest>(requestId1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
+    GenerationRequest seq1{requestId1, inputLength1, beamWidth, blockManager.getWindowSizesMetadata()};
+    auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
+    auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
+    blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, windowSize);
+    auto cacheBlockIds1 = seq1.getCacheBlockIds(windowSize).at(beamIdx);
+    auto constexpr fullyReusedBlocks = numMatching / tokensPerBlock;
+    auto constexpr firstOnboardedBlock = std::max(0, (numMatching - windowSize) / tokensPerBlock);
+    std::vector<int> expectedBlocks1(numBlocks); // both sequences are same length
+    for (int i = 0; i < fullyReusedBlocks; ++i) expectedBlocks1[i] = i;
+    for (int i = fullyReusedBlocks; i < numBlocks; ++i) expectedBlocks1[i] = numBlocks + i - fullyReusedBlocks;
+    EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray(expectedBlocks1));
+    // Verify that the right blocks were onboarded
+    int blockIdx = 0;
+    for (auto cacheBlockId : cacheBlockIds1)
+    {
+        auto block = blockManager.getBlockById(cacheBlockId, windowSize);
+        auto shouldBeOnboarded = blockIdx >= firstOnboardedBlock;
+        EXPECT_EQ(block->isPrimary(), shouldBeOnboarded);
+        ++blockIdx;
+    }
+}
+
+TEST_F(KVCacheManagerTest, BlockManagerTestOnboardFullAttention)
+{
+    // attention window size, sequence length, num reused tokens second request
+    runSlidingWindowAttentionTest<nvinfer1::DataType::kHALF, 4096, 25, 14>();
+}
+
+TEST_F(KVCacheManagerTest, BlockManagerTestOnboardSWAFullReuse)
+{
+    // attention window size, sequence length, num reused tokens second request
+    runSlidingWindowAttentionTest<nvinfer1::DataType::kHALF, 8, 25, 24>();
+}
+
+TEST_F(KVCacheManagerTest, BlockManagerTestOnboardSWAHalfReuse)
+{
+    // attention window size, sequence length, num reused tokens second request
+    runSlidingWindowAttentionTest<nvinfer1::DataType::kHALF, 8, 25, 13>();
+}
+
 TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare)
 {
     auto constexpr numPrimaryBlocks = 16384;
