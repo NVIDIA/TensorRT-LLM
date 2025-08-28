@@ -93,12 +93,14 @@ def verify_waive_list(llm_src, args):
     dup_cases_record = f"{llm_src}/dup_cases.txt"
     non_existent_cases_record = f"{llm_src}/nonexits_cases.json"
     # Remove prefix and markers in wavies.txt
-    dedup_lines = set()
+    dedup_lines = {
+    }  # Track all occurrences: processed_line -> [(line_no, original_line), ...]
     processed_lines = set()
     with open(waives_list_path, "r") as f:
         lines = f.readlines()
 
-    for line in lines:
+    for line_no, line in enumerate(lines, 1):
+        original_line = line.strip()
         line = line.strip()
 
         if not line:
@@ -115,12 +117,11 @@ def verify_waive_list(llm_src, args):
         if line.startswith("full:"):
             line = line.split("/", 1)[1].lstrip("/")
 
-        # Check for duplicate lines for the raw line
+        # Track all occurrences of each processed line
         if line in dedup_lines:
-            with open(dup_cases_record, "a") as f:
-                f.write(f"Duplicate waive record found: {line}\n")
+            dedup_lines[line].append((line_no, original_line))
         else:
-            dedup_lines.add(line)
+            dedup_lines[line] = [(line_no, original_line)]
 
         # Check waived cases also in l0_text.txt and qa_text.txt
         found_in_l0_qa = False
@@ -145,6 +146,19 @@ def verify_waive_list(llm_src, args):
                 )
 
         processed_lines.add(line)
+
+    # Write duplicate report after processing all lines
+    for processed_line, occurrences in dedup_lines.items():
+        if len(occurrences) > 1:
+            with open(dup_cases_record, "a") as f:
+                f.write(
+                    f"Duplicate waive records found for '{processed_line}' ({len(occurrences)} occurrences):\n"
+                )
+                for i, (line_no, original_line) in enumerate(occurrences, 1):
+                    f.write(
+                        f"  Occurrence {i} at line {line_no}: '{original_line}'\n"
+                    )
+                f.write(f"\n")
 
     # Write the processed lines to a tmp file
     tmp_waives_file = f"{llm_src}/processed_waive_list.txt"
@@ -178,10 +192,12 @@ def main():
     pass_flag = True
     # Verify L0 test lists
     if args.l0:
-        print("-----------Starting L0 test list verification...-----------")
+        print("-----------Starting L0 test list verification...-----------",
+              flush=True)
         verify_l0_test_lists(llm_src)
     else:
-        print("-----------Skipping L0 test list verification.-----------")
+        print("-----------Skipping L0 test list verification.-----------",
+              flush=True)
 
     # Verify QA test lists
     if args.qa:
