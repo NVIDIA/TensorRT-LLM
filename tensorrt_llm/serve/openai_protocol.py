@@ -751,7 +751,7 @@ class ResponsesRequest(OpenAIBaseModel):
         if self.text is not None and self.text.format is not None:
             response_format = self.text.format
             if response_format.type == "json_schema":
-                guided_decoding = GuidedDecodingParams.from_optional(
+                guided_decoding = GuidedDecodingParams(
                     json=response_format.schema_)
             elif response_format.type == "json_object":
                 raise NotImplementedError("json_object is not supported")
@@ -766,6 +766,7 @@ class ResponsesRequest(OpenAIBaseModel):
         )
 
     @model_validator(mode="before")
+    @classmethod
     def validate_background(cls, data):
         if not data.get("background"):
             return data
@@ -774,6 +775,7 @@ class ResponsesRequest(OpenAIBaseModel):
         return data
 
     @model_validator(mode="before")
+    @classmethod
     def validate_prompt(cls, data):
         if data.get("prompt") is not None:
             raise ValueError("prompt template is not supported")

@@ -176,7 +176,7 @@ class ConversationHistoryStore:
                 self.conversations[conversation_id].extend(resp_msgs)
                 while len(self.conversations[conversation_id]
                           ) > self.conversation_capacity:
-                    self._pop_conversation()
+                    self._pop_conversation(resp_id)
             else:
                 conversation_id = random_uuid()
                 self.conversations[conversation_id] = resp_msgs
@@ -206,7 +206,7 @@ class ConversationHistoryStore:
             self.conversations[conversation_id] = msgs
             if len(self.conversations[conversation_id]
                    ) > self.conversation_capacity:
-                self._pop_conversation()
+                self._pop_conversation(resp_id)
 
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
@@ -226,7 +226,7 @@ class ConversationHistoryStore:
             self.conversations[conversation_id].extend(msgs)
             if len(self.conversations[conversation_id]
                    ) > self.conversation_capacity:
-                self._pop_conversation()
+                self._pop_conversation(resp_id)
             self._update_visited_conversation(conversation_id)
 
     async def get_conversation_history(self, resp_id: str) -> list[Message]:
@@ -256,7 +256,10 @@ class ConversationHistoryStore:
             self.conversation_to_response.pop(removed_id)
 
     def _pop_conversation(self, resp_id) -> None:
-        conversation_id = self.response_to_conversation[resp_id]
+        conversation_id = self.response_to_conversation.get(resp_id, None)
+        if conversation_id is None:
+            return
+
         conversation = self.conversations[conversation_id]
         first_conversation_range = []
         for i, msg in enumerate(conversation):
@@ -337,9 +340,7 @@ def construct_harmony_messages(
     prev_response: Optional[ResponsesResponse],
     prev_msgs: list[Message] = [],
 ) -> list[Message]:
-    """
-        Construct messages from request input, includes conversation history messages if exists.
-        """
+    """Construct messages from request input, includes conversation history messages if exists."""
     messages: list[Message] = []
     if prev_response is None:
         # New conversation.
@@ -657,7 +658,7 @@ async def process_streaming_events(
         ))
 
     tools = [tool.model_dump() for tool in request.tools]
-    stream_request_id = f"reponses-api-{request.request_id}"
+    stream_request_id = f"responses-api-{request.request_id}"
     async for res in generator:
         final_res = res
         output = res.outputs[0]
