@@ -691,8 +691,8 @@ class WideEPMoE(MoE):
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
                 if self.use_low_precision_combine:
-                    global_scales = (448 * 6) / final_hidden_states.abs().max(
-                        dim=-1, keepdim=True).values.to(torch.float32)
+                    global_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
+                        final_hidden_states, recv_expert_count)
                     final_hidden_states = self.deep_ep_buffer.low_latency_combine_fp4(
                         final_hidden_states, global_scales, deep_ep_topk_idx,
                         deep_ep_topk_weights, deep_ep_handle)

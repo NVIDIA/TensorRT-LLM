@@ -94,6 +94,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -120,6 +121,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -143,6 +145,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -176,6 +179,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -661,6 +665,7 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             cuda_graph_config=CudaGraphConfig(max_batch_size=8),
@@ -1036,6 +1041,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1074,7 +1080,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1113,6 +1120,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1164,6 +1172,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         torch_compile_config = (TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1262,7 +1271,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1322,6 +1332,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         torch_compile_config = (TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1448,7 +1459,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,
-            max_num_streams=1) if torch_compile else None
+            capture_num_tokens=[2048, 8192],
+            max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -1497,7 +1509,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -2262,7 +2275,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                               cuda_graph, overlap_scheduler, torch_compile):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
 
         pytorch_config = dict(
@@ -2289,7 +2303,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                  overlap_scheduler, torch_compile):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
 
         pytorch_config = dict(
@@ -2341,7 +2356,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
-            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
             max_num_streams=3) if torch_compile else None
 
         pytorch_config = dict(
@@ -2693,24 +2709,28 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(100000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+    extra_evaluator_kwargs = {
+        "fewshot_as_multiturn": True,
+        "apply_chat_template": True,
+        "scores_filter": "exact_match,flexible-extract",
+        "MAX_OUTPUT_LEN": 8192
+    }
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
-    def update_task_kwargs(self, task):
-        task.EVALUATOR_KWARGS["fewshot_as_multiturn"] = True
-        task.EVALUATOR_KWARGS["apply_chat_template"] = True
-        task.EVALUATE_KWARGS["scores_filter"] = "exact_match,flexible-extract"
-        task.MAX_OUTPUT_LEN = 8192
-        return task
-
-    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"],
-                             ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (True, True),
     ])
-    def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler):
+    def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler, mocker):
         if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
             pytest.skip("Triton kernels are not available")
 
@@ -2728,12 +2748,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
+            mocker.patch.object(GSM8K, {"MAX_OUTPUT_LEN": 8192})
             task = GSM8K(model_name)
-            task = self.update_task_kwargs(task)
-            task.evaluate(llm)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"])
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 1, False, True, True),
@@ -2742,7 +2767,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ],
         ids=["tp4", "ep4", "dp4"])
     def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
-                      attention_dp, cuda_graph, overlap_scheduler):
+                      attention_dp, cuda_graph, overlap_scheduler, mocker):
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
@@ -2763,8 +2788,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with llm:
             model_name = "GPT-OSS/MXFP4"
             task = GSM8K(model_name)
-            task = self.update_task_kwargs(task)
-            task.evaluate(llm)
+            mocker.patch.object(GSM8K, {"MAX_OUTPUT_LEN": 8192})
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
@@ -2773,7 +2799,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ],
         ids=["dp4"])
     def test_w4a16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                   overlap_scheduler, monkeypatch):
+                   overlap_scheduler, monkeypatch, mocker):
         if not IS_TRITON_KERNELS_AVAILABLE:
             pytest.skip("Triton kernels are not available")
         monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
@@ -2793,8 +2819,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with llm:
             model_name = "GPT-OSS/BF16"
             task = GSM8K(model_name)
-            task = self.update_task_kwargs(task)
-            task.evaluate(llm)
+            mocker.patch.object(GSM8K, {"MAX_OUTPUT_LEN": 8192})
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
 
 class TestEXAONE4(LlmapiAccuracyTestHarness):
