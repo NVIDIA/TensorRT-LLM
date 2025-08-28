@@ -41,7 +41,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
                                                 ModelList, ResponsesRequest,
-                                                ResponsesResponse, UsageInfo,
+                                                UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
@@ -771,13 +771,13 @@ class OpenAIServer:
             return self.create_error_response(message=str(e), err_type="internal_error")
 
     async def openai_responses(self, request: ResponsesRequest, raw_request: Request) -> Response:
-        async def create_stream_response(generator, request: ResponsesRequest, sampling_params) -> ResponsesResponse:
+        async def create_stream_response(generator, request: ResponsesRequest, sampling_params) -> AsyncGenerator[str, None]:
             async for event_data in responses_api_process_streaming_events(
                 request=request,
                 sampling_params=sampling_params,
                 generator=generator,
                 harmony_adapter=self.harmony_adapter,
-                model_name=self.model_config.model_type,
+                model_name=self.model,
                 conversation_store=self.conversation_store,
                 enable_store=self.enable_store
             ):
@@ -829,7 +829,7 @@ class OpenAIServer:
                     generator=promise,
                     request=request,
                     sampling_params=sampling_params,
-                    model_name=self.model_config.model_type,
+                    model_name=self.model,
                     conversation_store=self.conversation_store,
                     generation_result=None,
                     enable_store=self.enable_store)
