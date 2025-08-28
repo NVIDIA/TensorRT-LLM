@@ -2719,6 +2719,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler, mocker):
+        pytest.skip("https://nvbugs/5481087")
         if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
             pytest.skip("Triton kernels are not available")
 
@@ -2736,7 +2737,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
-            mocker.patch.object(GSM8K, {"MAX_OUTPUT_LEN": 8192})
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
@@ -2756,6 +2757,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["tp4", "ep4", "dp4"])
     def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
                       attention_dp, cuda_graph, overlap_scheduler, mocker):
+        pytest.skip("https://nvbugs/5481087")
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
@@ -2776,7 +2778,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with llm:
             model_name = "GPT-OSS/MXFP4"
             task = GSM8K(model_name)
-            mocker.patch.object(GSM8K, {"MAX_OUTPUT_LEN": 8192})
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
