@@ -273,10 +273,11 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where per request information is written to.",
 )
 @optgroup.option(
-    "--enable_chunked_context/--disable_chunked_context",
-    default=True,
-    help=
-    "Enable/disable chunking in prefill stage for enhanced throughput benchmark. "
+    "--enable_chunked_context",
+    is_flag=True,
+    default=None,
+    help="Enable chunking in prefill stage for enhanced throughput benchmark. "
+    "Default is True for TensorRT backend, False for PyTorch/AutoDeploy backend."
 )
 @optgroup.option(
     "--scheduler_policy",
@@ -304,7 +305,7 @@ def throughput_command(
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
     max_num_tokens = params.get("max_num_tokens")
-    enable_chunked_context: bool = params.get("enable_chunked_context")
+    enable_chunked_context = params.get("enable_chunked_context")
     scheduler_policy: str = params.get("scheduler_policy")
 
     custom_module_dirs: list[Path] = params.pop("custom_module_dirs", [])
@@ -373,6 +374,10 @@ def throughput_command(
         raise RuntimeError(
             f"Invalid backend: {options.backend}, please use one of the following: "
             "pytorch, tensorrt, _autodeploy.")
+
+    # Set chunked context default based on backend if not explicitly specified
+    if enable_chunked_context is None:
+        enable_chunked_context = options.backend.lower() == "tensorrt"
 
     exec_settings["model"] = options.model
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
