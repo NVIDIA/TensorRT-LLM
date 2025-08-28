@@ -151,15 +151,14 @@ Welcome to TensorRT-LLM's Documentation!
 .. toctree::
    :maxdepth: 2
    :caption: Blogs
-   :hidden:
+   :glob:
 
    blogs/H100vsA100.md
    blogs/H200launch.md
    blogs/Falcon180B-H200.md
    blogs/quantization-in-TRT-LLM.md
    blogs/XQA-kernel.md
-   blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md
-   blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md
+   blogs/tech_blog/*
 
 
 Indices and tables

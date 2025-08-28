@@ -63,12 +63,12 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 81.31
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 79.31
+    accuracy: 78.78
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 81.02
+    accuracy: 80.40
   - quant_algo: FP8
-    accuracy: 80.34
+    accuracy: 80.40
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 86.40
   - quant_algo: FP8

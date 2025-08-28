@@ -32,8 +32,7 @@ def test_kv_cache_reuse(use_cuda_graph: bool, attn_backend: str):
     # that ref and spec does not match 100%
     max_batch_size = 1
     max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True,
-                                    free_gpu_memory_fraction=0.5)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
 
