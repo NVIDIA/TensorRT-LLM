@@ -1745,6 +1745,7 @@ def parse_output(text):
             item = item[end:]
     return results
 
+
 def test_ptp_quickstart(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
 
