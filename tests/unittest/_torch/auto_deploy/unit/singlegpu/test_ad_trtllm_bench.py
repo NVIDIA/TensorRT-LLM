@@ -97,6 +97,10 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
             print(f"  ✅ Found {metric_name}: {value}")
         else:
             print(f"  ❌ Could not find {metric_name}")
+    try:
+        metrics["current_cache_size"] = metrics["current_cache_size"] * 1024 * 1024
+    except KeyError:
+        print("  ❌ Could not find current_cache_size")
 
     try:
         metrics["current_cache_size"] = metrics["current_cache_size"] * 1024 * 1024
