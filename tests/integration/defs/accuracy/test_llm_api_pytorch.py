@@ -1138,7 +1138,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     # Chunked Prefill for MLA can only be enabled on SM100
     @parametrize_with_ids(
         "enable_chunked_prefill",
-        [False, pytest.param(True, marks=skip_pre_blackwell)])
+        [False, pytest.param(True, marks=skip_pre_hopper)])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, False, False),
