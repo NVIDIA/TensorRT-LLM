@@ -339,3 +339,8 @@ accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_fp8_eagle3[tp
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend SKIP (https://nvbugs/5448748)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend SKIP (https://nvbugs/5448748)
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-CUTLASS] SKIP (https://nvbugs/5483913)
+test_e2e.py::test_llmapi_lora[llama-3.1-model/Llama-3.1-8B-Instruct-lora/evian2-8b-instruct_vhf-lora-v1_jetart-tp1-torch] SKIP (https://nvbugs/5484088)
+test_e2e.py::test_llmapi_lora[llama-3.3-models/Llama-3.3-70B-Instruct-lora/llama-3.3-70b-instruct_vhf-squad-lora-031925331-v2-tp8-torch] SKIP (https://nvbugs/5484088)
+test_e2e.py::test_llmapi_lora[Mixtral-8x7B-v0.1-lora/mixtral-8x7b-instruct-v0-1_vhf-lora-v1-tp8-torch] SKIP (https://nvbugs/5484088)
+test_e2e.py::test_llmapi_lora[Mistral-7B-Instruct-v0.3-lora/mistral-7b-instruct-v0-3_vhf_lora_squad-tp1-torch] SKIP (https://nvbugs/5484088)
+test_e2e.py::test_llmapi_lora[starcoder2-7b-lora/starcoder2-7b_vhf-lora-squad-030325211133-tp1-torch] SKIP (https://nvbugs/5484088)
