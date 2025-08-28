@@ -135,7 +135,7 @@ extern "C"
 
 extern "C"
 {
-    [[nodiscard]] std::unique_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config);
+    [[nodiscard]] std::shared_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config);
 }
 
 #if defined(__clang__)

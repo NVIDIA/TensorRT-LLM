@@ -567,10 +567,10 @@ extern "C"
 
 extern "C"
 {
-    std::unique_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config)
+    std::shared_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config)
     {
         TLLM_CHECK(config);
-        return std::make_unique<NixlLoopbackAgent>(*config);
+        return std::make_shared<NixlLoopbackAgent>(*config);
     }
 }
 

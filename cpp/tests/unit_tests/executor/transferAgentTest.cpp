@@ -367,7 +367,7 @@ public:
             std::cerr << "Warning: Failed to clean up test directory: " << ec.message() << std::endl;
     }
 
-    [[nodiscard]] std::unique_ptr<BaseLoopbackAgent> makeLoopbackAgent(BaseAgentConfig const& config)
+    [[nodiscard]] std::shared_ptr<BaseLoopbackAgent> makeLoopbackAgent(BaseAgentConfig const& config)
     {
         return tensorrt_llm::executor::kv_cache::makeLoopbackAgent("nixl", &config);
     }

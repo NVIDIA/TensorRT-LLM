@@ -88,7 +88,7 @@ static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string con
 }
 
 KVCacheTransferManager::KVCacheTransferManager(
-    tr::BufferManager const& bufferManager, kvc::BaseLoopbackAgent* loopbackAgent)
+    tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent)
     : mBufferManager{bufferManager}
     , mOnboardManager(std::make_shared<tr::CudaStream>())
     , mOffloadManager(std::make_shared<tr::CudaStream>())
@@ -96,11 +96,6 @@ KVCacheTransferManager::KVCacheTransferManager(
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
-
-    if (!mLoopbackAgent)
-    {
-        TLLM_LOG_DEBUG("KVCacheTransferManager: No loopback agent provided; non-DRAM modes will be unavailable.");
-    }
 }
 
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
@@ -167,6 +162,13 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
         TLLM_LOG_DEBUG("copyBlock: DRAM mode complete. Returning...");
         return;
+    }
+
+    if (mLoopbackAgent == nullptr)
+    {
+        TLLM_LOG_DEBUG("KVCacheTransferManager: creating mLoopbackAgent lazily");
+        kvc::BaseAgentConfig config{std::string("GDSAgent"), true, true};
+        mLoopbackAgent = kvc::makeLoopbackAgent("nixl", &config);
     }
 
     std::vector<kvc::FileDesc> fileBlobs;

@@ -34,7 +34,7 @@ class KVCacheTransferManager
 {
 public:
     explicit KVCacheTransferManager(
-        tr::BufferManager const& bufferManager, kvc::BaseLoopbackAgent* loopbackAgent = nullptr);
+        tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr);
 
     //! \brief Onboard a block to gpu memory.
     void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools,
@@ -78,7 +78,7 @@ private:
     // Track the block ids offloaded in this iteration.
     std::unordered_map<int32_t, tr::CudaEvent> mPendingOffloads;
     // Reference to parent loopback agent
-    kvc::BaseLoopbackAgent* mLoopbackAgent;
+    std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;
 };
 
