@@ -28,7 +28,7 @@ def test_llama_user_provided(disable_overlap_scheduler: bool,
 
     max_batch_size = 2
     max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
 
