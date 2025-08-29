@@ -707,13 +707,13 @@ public:
 
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mGemmProfilerBackend.init(mMoERunner, GemmProfilerBackend::GemmToProfile::Undefined, typeToDtypeID<DataType>(),
-            typeToDtypeID<WeightType>(), typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize,
-            mGroupSize, mActType, mUseBias, mUseLora, /*min_latency_mode=*/false,
+            typeToDtypeID<WeightType>(), typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mHiddenSize,
+            mInterSize, mGroupSize, mActType, mUseBias, mUseLora, /*min_latency_mode=*/false,
             /*need_weights=*/false, parallelism_config, /*enable_alltoall=*/false);
 #else
         mGemmProfilerBackend.init(mMoERunner, GemmProfilerBackend::GemmToProfile::Undefined, typeToDtypeID<DataType>(),
-            typeToDtypeID<WeightType>(), typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize,
-            mGroupSize, mActType, mUseBias, mUseLora, /*min_latency_mode=*/false,
+            typeToDtypeID<WeightType>(), typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mHiddenSize,
+            mInterSize, mGroupSize, mActType, mUseBias, mUseLora, /*min_latency_mode=*/false,
             /*need_weights=*/false, parallelism_config);
 #endif
 
@@ -989,7 +989,7 @@ public:
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
                 ActivationParams(mActType), mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
                 mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
-                mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
+                mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
                 mFinalOutput + mFinalOutputSize * mBufferIndex,
                 mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config,
                 /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
@@ -1001,10 +1001,10 @@ public:
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
                 ActivationParams(mActType), mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
                 mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
-                mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
+                mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
                 mFinalOutput + mFinalOutputSize * mBufferIndex,
-                mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config, mUseLora,
-                mLoraParams[mBufferIndex],
+                mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config,
+                /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
                 /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
 #endif
             break;

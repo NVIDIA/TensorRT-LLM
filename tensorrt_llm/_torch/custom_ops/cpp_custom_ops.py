@@ -179,6 +179,10 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::calculate_nvfp4_global_scale")
+    def _(input: torch.Tensor, tokens_per_batch: Optional[torch.Tensor]):
+        return input.new_empty((input.shape[:-1], 1), dtype=torch.float32)
+
     @torch.library.register_fake("trtllm::moe_comm")
     def _(
         inputs: List[torch.Tensor],
@@ -425,6 +429,7 @@ def _register_fake():
         expert_first_token_offset_tensor: torch.Tensor,
         num_rows: torch.SymInt,
         hidden_size: torch.SymInt,
+        unpadded_hidden_size: torch.SymInt,
         experts_per_token: int,
         num_experts_per_node: int,
         tp_size: int,
@@ -433,8 +438,8 @@ def _register_fake():
         ep_rank: int,
     ):
         num_rows_val = int(num_rows)
-        hidden_size_val = int(hidden_size)
-        return gemm2_output.new_empty((num_rows_val, hidden_size_val),
+        unpadded_hidden_size_val = int(unpadded_hidden_size)
+        return gemm2_output.new_empty((num_rows_val, unpadded_hidden_size_val),
                                       dtype=gemm2_output.dtype)
 
     @torch.library.register_fake("trtllm::allgather_list")
