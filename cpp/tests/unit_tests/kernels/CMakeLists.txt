@@ -91,3 +91,4 @@ add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
 
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
+add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)

@@ -30,7 +30,7 @@ def parse_arguments():
     # Build config
     parser.add_argument('--attention_backend',
                         type=str,
-                        default='VANILLA',
+                        default='TRTLLM',
                         choices=[
                             'VANILLA', 'TRTLLM', 'FLASHINFER',
                             'FLASHINFER_STAR_ATTENTION'
@@ -61,7 +61,7 @@ def parse_arguments():
 
     parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
 
-    parser.add_argument('--num_samples', type=int, default=3)
+    parser.add_argument('--num_samples', type=int, default=1)
 
     args = parser.parse_args()
     return args
@@ -105,8 +105,7 @@ def main():
         max_num_tokens=args.max_num_tokens,
         tensor_parallel_size=args.tensor_parallel_size,
         cuda_graph_config=None,
-        disable_overlap_scheduler=
-        False,  # some memory issues may happen, if so, comment this and set estimating_kv_cache=False
+        disable_overlap_scheduler=True,
     )
 
     # Sample prompts.
@@ -129,11 +128,12 @@ def main():
                                      temperature=0.8,
                                      top_p=0.95)
 
-    prompts = example_prompts
+    # prompts = example_prompts
     outputs = llm.generate(prompts, sampling_params)
     for idx, output in enumerate(outputs):
         print(
-            f'Prompt: {prompts[idx]}, Generated text: {output.outputs[0].text!r}'
+            # f'Prompt: {prompts[idx]}, Generated text: {output.outputs[0].text!r}'
+            f'Generated text: {output.outputs[0].text!r}, ref: {reference[idx]}'
         )
     # Got output like
     # Prompt: 'Hello, my name is', Generated text: '\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming'

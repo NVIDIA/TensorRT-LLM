@@ -225,7 +225,12 @@ public:
             }
         }
 
-        if (op.useSparseAttention())
+        op.mRuntimeSparseAttentionParams.sparse_kv_offsets = nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_kv_indices = nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_offsets = nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_attn_indices = nullptr;
+
+        if (op.useSparseAttention() && num_seqs > 0)
         {
             int num_indices_offset = sparse_batch_offsets.value().index({seq_offset}).item<int32_t>();
             if (is_context)
@@ -234,13 +239,11 @@ public:
                     = sparse_batch_offsets.value().slice(0, seq_offset).data_ptr<int32_t>();
                 op.mRuntimeSparseAttentionParams.sparse_kv_indices
                     = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
-                op.mRuntimeSparseAttentionParams.num_sparse_kv_indices
-                    = sparse_batch_offsets.value().index({num_seqs}).item<int32_t>();
             }
             else
             {
                 op.mRuntimeSparseAttentionParams.sparse_attn_offsets
-                    = sparse_batch_offsets.value().slice(0, seq_offset + 1).data_ptr<int32_t>();
+                    = sparse_batch_offsets.value().slice(0, seq_offset).data_ptr<int32_t>();
                 op.mRuntimeSparseAttentionParams.sparse_attn_indices
                     = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
             }
@@ -530,9 +533,9 @@ void attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optiona
     torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
     torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
     torch::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    c10::ArrayRef<int64_t> attention_config_params, std::optional<int64_t> const tokens_per_block,
-    double const q_scaling, c10::ArrayRef<int64_t> rotary_embedding_int_params, double const rotary_embedding_base,
-    c10::ArrayRef<double> rotary_embedding_scales, c10::ArrayRef<int64_t> rotary_embedding_max_position_info,
+    std::vector<int64_t> attention_config_params, std::optional<int64_t> const tokens_per_block, double const q_scaling,
+    std::vector<int64_t> rotary_embedding_int_params, double const rotary_embedding_base,
+    std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,

@@ -10,6 +10,7 @@ from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.vanilla import (
     VanillaAttention, VanillaAttentionMetadata, repeat_kv)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import ExecutorConfig, KvCacheConfig
@@ -46,6 +47,22 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
                             i] += self.prompt_budget - self.prompt_lens[i]
 
         super().prepare()
+
+        # Update prompt lens for sparse attention
+        if self.kv_cache_manager is not None:
+            _prompt_lens = self.prompt_lens.copy()
+            for i in range(num_requests):
+                if i >= num_contexts:
+                    _prompt_lens[i] = min(_prompt_lens[i], self.prompt_budget)
+            _prompt_lens = torch.tensor(_prompt_lens,
+                                        dtype=torch.int,
+                                        device='cpu')
+            self.prompt_lens_cpu[:self.num_seqs].copy_(_prompt_lens)
+            self.prompt_lens_cuda[:self.num_seqs].copy_(
+                self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+            self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.
+                                                                  num_seqs]
+            self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
 
 
 class RocketTrtllmAttention(TrtllmAttention):
@@ -116,8 +133,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
 
         all_sparse_indices = []
-        batch_sparse_kv_offsets = [0]
-        batch_sparse_attn_offsets = [0]
+        batch_sparse_offsets = [0]
 
         q_offset = 0
         k_offset = 0
@@ -149,10 +165,10 @@ class RocketTrtllmAttention(TrtllmAttention):
                 if sparse_kv_indices is not None:
                     all_sparse_indices.append(
                         sparse_kv_indices.squeeze(0))  # [budget, num_kv_heads]
-                    batch_sparse_kv_offsets.append(batch_sparse_kv_offsets[-1] +
-                                                   sparse_kv_indices.size(0))
+                    batch_sparse_offsets.append(batch_sparse_offsets[-1] +
+                                                sparse_kv_indices.size(1))
                 else:
-                    batch_sparse_kv_offsets.append(batch_sparse_kv_offsets[-1])
+                    batch_sparse_offsets.append(batch_sparse_offsets[-1])
             else:
                 # Generation phase: RocketKV sparse attention indices
                 sparse_attn_indices = self._rocketkv_selection(
@@ -161,12 +177,10 @@ class RocketTrtllmAttention(TrtllmAttention):
                 if sparse_attn_indices is not None:
                     all_sparse_indices.append(
                         sparse_attn_indices.squeeze(0))  # [topk, num_kv_heads]
-                    batch_sparse_attn_offsets.append(
-                        batch_sparse_attn_offsets[-1] +
-                        sparse_attn_indices.size(0))
+                    batch_sparse_offsets.append(batch_sparse_offsets[-1] +
+                                                sparse_attn_indices.size(1))
                 else:
-                    batch_sparse_attn_offsets.append(
-                        batch_sparse_attn_offsets[-1])
+                    batch_sparse_offsets.append(batch_sparse_offsets[-1])
 
             q_offset += seq_len
             k_offset += seq_len_kv
@@ -176,10 +190,8 @@ class RocketTrtllmAttention(TrtllmAttention):
 
         all_sparse_indices = torch.cat(all_sparse_indices,
                                        dim=0).to(torch.int32)
-        batch_sparse_offsets = torch.tensor(batch_sparse_kv_offsets +
-                                            batch_sparse_attn_offsets,
-                                            device=all_sparse_indices.device,
-                                            dtype=torch.int32)
+        batch_sparse_offsets = torch.tensor(batch_sparse_offsets,
+                                            dtype=torch.int32).to(q.device)
 
         return all_sparse_indices, batch_sparse_offsets
 
@@ -192,7 +204,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         The shape of output is (1, prompt_budget, num_kv_heads)
         """
         bsz = 1
-        seq_len = k.size(2)  # k shape: (1, num_kv_heads, seq_len, head_dim)
+        seq_len = k.size(1)  # k shape: (1, seq_len, num_kv_heads, head_dim)
 
         # If the sequence length is less than the prompt budget, do not enable sparse kv cache
         if seq_len <= self.prompt_budget:
@@ -202,7 +214,8 @@ class RocketTrtllmAttention(TrtllmAttention):
         # (1, num_heads, window_size, head_dim)
         q_obs = q[:, :, -self.window_size:]
         # (1, num_kv_heads, seq_len, head_dim)
-        k_pre = repeat_kv(k, self.num_heads // self.num_kv_heads)
+        k_pre = repeat_kv(k.transpose(1, 2),
+                          self.num_heads // self.num_kv_heads)
 
         dist = (torch.arange(0, self.window_size, device=q.device)[:, None] -
                 torch.arange(0, seq_len, device=q.device)[None, :] + seq_len -
@@ -247,20 +260,23 @@ class RocketTrtllmAttention(TrtllmAttention):
             device=k.device).unsqueeze(0).unsqueeze(0).expand(
                 bsz, self.num_kv_heads, -1)
         selected_indices = torch.cat([selected_prefix_indices, window_indices],
-                                     dim=-1).transpose(1, 2)
+                                     dim=-1)
 
+        k = k.reshape(1, -1, self.num_kv_heads, self.head_dim)
+        k_snap = triton_index_gather(k, selected_indices)
         # Update KT cache
         kt_cache_tensor = metadata.kv_cache_manager.get_kt_buffers(
             self.layer_idx)
-        target_seq_len = past_seen_token + selected_indices.size(1)
+        target_seq_len = past_seen_token + k_snap.size(1)
         kt_cache_position = torch.arange(past_seen_token // self.page_size,
                                          math.ceil(target_seq_len /
                                                    self.page_size),
                                          device=q.device)
-        self._single_request_update_kt_cache(k, kt_cache_tensor, target_seq_len,
-                                             kt_cache_slot, kt_cache_position)
+        self._single_request_update_kt_cache(k_snap, kt_cache_tensor,
+                                             target_seq_len, kt_cache_slot,
+                                             kt_cache_position)
 
-        return selected_indices
+        return selected_indices.transpose(1, 2)
 
     def _rocketkv_selection(self, q: Tensor, k: Tensor, past_seen_token: int,
                             kt_cache_slot: int,
@@ -685,7 +701,9 @@ class RocketKVCacheManager(KVCacheManager):
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
         is_draft: bool = False,
+        kv_connector_manager: Optional["KvCacheConnectorManager"] = None,
         sparse_attn_config: Optional["SparseAttentionConfig"] = None,
+        **kwargs,
     ) -> None:
 
         assert not kv_cache_config.enable_block_reuse, "RocketKV cache requires block reuse to be disabled in KV cache config"
@@ -707,8 +725,10 @@ class RocketKVCacheManager(KVCacheManager):
             model_config=model_config,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
+            **kwargs,
         )
         self.page_size = sparse_attn_config.page_size
+        self.prompt_budget = sparse_attn_config.prompt_budget
         self.max_batch_size = max_batch_size
 
         self.kt_cache = {}
@@ -793,15 +813,23 @@ class RocketKVCacheManager(KVCacheManager):
                 cache_idx = self.get_cache_indices(request)[0]
                 self.block_id_to_slot[cache_idx] = slot
 
+    def update_resources(self, scheduled_batch):
+        for request in scheduled_batch.context_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                seq_len = request.get_num_tokens(0)
+                rewind_len = max(seq_len - 1 - self.prompt_budget, 0)
+                self.rewind_kv_cache(request, rewind_len)
+
     def free_resources(self, request):
         request_id = request.py_request_id
 
         if request_id in self.request_to_slot:
             slot = self.request_to_slot.pop(request_id)
             cache_idx = self.get_cache_indices(request)[0]
-            self.block_id_to_slot.pop(cache_idx)
+            if cache_idx in self.block_id_to_slot:
+                self.block_id_to_slot.pop(cache_idx)
             self.free_slots.append(slot)
-            self.free_slots.sort()  # Keep it sorted
+            self.free_slots.sort()
 
         super().free_resources(request)
 

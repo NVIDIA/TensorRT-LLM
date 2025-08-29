@@ -1659,7 +1659,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Sparse KV write
         preprocessingParams.sparse_kv_indices = mRuntimeSparseAttentionParams.sparse_kv_indices;
         preprocessingParams.sparse_kv_offsets = mRuntimeSparseAttentionParams.sparse_kv_offsets;
-        preprocessingParams.num_sparse_kv_indices = mRuntimeSparseAttentionParams.num_sparse_kv_indices;
 
         // Scalars
         preprocessingParams.batch_size = params.batch_size;
@@ -1690,6 +1689,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         preprocessingParams.rotary_vision_start = mVisionStart;
         preprocessingParams.rotary_vision_length = mVisionLength;
+        preprocessingParams.is_last_chunk
+            = !mAttentionChunkSize.has_value() || (params.input_seq_length == params.max_past_kv_length);
 
         {
             std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(mLayerIdx);
@@ -1853,6 +1854,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             this->template ulyssesContextPostprocess<T>(gatherOutBuffer, reinterpret_cast<T*>(params.context_buf),
                 gatherInBuffer, params, cu_q_seqlens, cu_cp_partial_seqlens, stream);
+            sync_check_cuda_error(stream);
+        }
+
+        if (!mIsMLAEnabled) // Only for non-MLA attention
+        {
+            invokeKvCachePostprocessing(preprocessingParams, stream);
             sync_check_cuda_error(stream);
         }
     }

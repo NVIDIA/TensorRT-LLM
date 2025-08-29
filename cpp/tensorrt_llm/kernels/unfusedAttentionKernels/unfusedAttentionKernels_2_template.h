@@ -1711,6 +1711,127 @@ void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename T, typename TCache, int BLOCK_SIZE, int Dh, typename KVCacheBuffer>
+__global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
+    QKVPreprocessingParams<T, KVCacheBuffer> params)
+{
+    // The number of 16B vectors per head size in the kv cache.
+    constexpr int VECS_PER_HEAD = Dh * sizeof(TCache) / 16;
+    static_assert(BLOCK_SIZE % VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
+
+    int const batch_idx = blockIdx.z;
+    int const kv_head_idx = blockIdx.y;
+
+    int const sparse_start_idx = params.sparse_kv_offsets[batch_idx];
+    int const sparse_end_idx = params.sparse_kv_offsets[batch_idx + 1];
+    int const num_sparse_tokens = sparse_end_idx - sparse_start_idx;
+
+    int const tokens_per_block = blockDim.y;
+    int const vecs_per_block = blockDim.x;
+
+    extern __shared__ uint4 smem[];
+    uint4* k_smem = smem;
+    uint4* v_smem = k_smem + tokens_per_block * VECS_PER_HEAD;
+
+    for (int token_block_offset = blockIdx.x * tokens_per_block; token_block_offset < num_sparse_tokens;
+         token_block_offset += gridDim.x * tokens_per_block)
+    {
+        int const sparse_token_offset = token_block_offset + threadIdx.y;
+
+        if (sparse_token_offset < num_sparse_tokens)
+        {
+            int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
+            int const sparse_idx_offset = global_sparse_idx * params.kv_head_num + kv_head_idx;
+
+            int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
+
+            void* src_k_ptr = params.kv_cache_buffer.getKBlockPtr(batch_idx, src_token_idx);
+            void* src_v_ptr = params.kv_cache_buffer.getVBlockPtr(batch_idx, src_token_idx);
+            auto const src_k_block_ptr = reinterpret_cast<uint4*>(src_k_ptr);
+            auto const src_v_block_ptr = reinterpret_cast<uint4*>(src_v_ptr);
+
+            for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
+            {
+                auto const src_k_vec_idx
+                    = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                auto const src_v_vec_idx
+                    = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+
+                k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_k_block_ptr[src_k_vec_idx];
+                v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_v_block_ptr[src_v_vec_idx];
+            }
+        }
+        __syncthreads();
+
+        if (sparse_token_offset < num_sparse_tokens)
+        {
+            int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
+            int const sparse_idx_offset = global_sparse_idx * params.kv_head_num + kv_head_idx;
+
+            int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
+            int const dst_token_idx = sparse_token_offset;
+
+            if (src_token_idx != dst_token_idx)
+            {
+                void* dst_k_ptr = params.kv_cache_buffer.getKBlockPtr(batch_idx, dst_token_idx);
+                void* dst_v_ptr = params.kv_cache_buffer.getVBlockPtr(batch_idx, dst_token_idx);
+                auto const dst_k_block_ptr = reinterpret_cast<uint4*>(dst_k_ptr);
+                auto const dst_v_block_ptr = reinterpret_cast<uint4*>(dst_v_ptr);
+
+                for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
+                {
+                    auto const dst_k_vec_idx
+                        = params.kv_cache_buffer.getKVLocalIdx(dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                    auto const dst_v_vec_idx
+                        = params.kv_cache_buffer.getKVLocalIdx(dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                    dst_k_block_ptr[dst_k_vec_idx] = k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
+                    dst_v_block_ptr[dst_v_vec_idx] = v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int Dh, typename T, typename TCache, typename KVCacheBuffer>
+void kernelSparseDispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
+{
+    constexpr int VECS_PER_HEAD = Dh * sizeof(TCache) / 16;
+    constexpr int BLOCK_SIZE = 1024;
+    dim3 block(32, 32); // x: head vectors, y: tokens
+
+    int smem_size = 2 * block.y * VECS_PER_HEAD * sizeof(uint4);
+    dim3 grid(1, params.kv_head_num, params.batch_size);
+
+    updateSparseKvCacheAfterFmha<T, TCache, BLOCK_SIZE, Dh, KVCacheBuffer><<<grid, block, smem_size, stream>>>(params);
+}
+
+template <typename T, typename TCache, typename KVCacheBuffer>
+void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
+{
+    if (params.sparse_kv_indices == nullptr)
+    {
+        return;
+    }
+
+    switch (params.size_per_head)
+    {
+    case 16: kernelSparseDispatchHeadSize<16, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 32: kernelSparseDispatchHeadSize<32, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 64: kernelSparseDispatchHeadSize<64, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 128: kernelSparseDispatchHeadSize<128, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 256: kernelSparseDispatchHeadSize<256, T, TCache, KVCacheBuffer>(params, stream); break;
+    default:
+        TLLM_CHECK_WITH_INFO(
+            false, "updateSparseKvCacheAfterFmha kernel doesn't support head size = %d", params.size_per_head);
+        break;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 #define INSTANTIATE_ATTENTION_INPUT_PROCESSING(T, TCache, KVCacheBuffer)                                               \
     template void invokeApplyBiasRopeUpdateKVCacheDispatch<T, TCache, KVCacheBuffer>(                                  \
         QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
@@ -1719,9 +1840,10 @@ void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
     template void invokeApplyBiasRopeUpdateKVCacheDispatch<T, TCache, KVCacheBuffer>(                                  \
         QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);                                         \
     template void invokeUpdateCyclicKvCacheAfterFmha<T, TCache, KVCacheBuffer>(                                        \
-        QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
+        QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);                                         \
+    template void invokeUpdateSparseKvCacheAfterFmha<T, TCache, KVCacheBuffer>(                                        \
+        QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);                                         \
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
 } // namespace tensorrt_llm

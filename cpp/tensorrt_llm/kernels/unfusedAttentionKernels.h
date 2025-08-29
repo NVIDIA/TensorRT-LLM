@@ -171,13 +171,12 @@ struct QKVPreprocessingParams
     int sink_token_len{0};
     int token_num{0};
     bool remove_padding{true};
+    bool is_last_chunk{true};
     bool cross_attention{false};
     int head_num{0};
     int kv_head_num{0};
     int qheads_per_kv_head{0};
     int size_per_head{0};
-    // sparse kv write num
-    int num_sparse_kv_indices{0};
     // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
     float fmha_host_bmm1_scale{1.f};
     int rotary_embedding_dim{0};
@@ -252,17 +251,11 @@ struct QKVPreprocessingParams
                << *(runtime::ITensor::wrap(
                       (void*) cu_kv_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
         }
-        if (sparse_kv_offsets && num_sparse_kv_indices > 0)
+        if (sparse_kv_offsets)
         {
             ss << "sparse_kv_offsets: "
                << *(runtime::ITensor::wrap((void*) sparse_kv_offsets, nvinfer1::DataType::kINT32,
                       runtime::ITensor::makeShape({batch_size + 1})));
-        }
-        if (sparse_kv_indices && num_sparse_kv_indices > 0)
-        {
-            ss << "sparse_kv_indices: "
-               << *(runtime::ITensor::wrap((void*) sparse_kv_indices, nvinfer1::DataType::kINT32,
-                      runtime::ITensor::makeShape({num_sparse_kv_indices, kv_head_num}))); // NOTE
         }
         if (rotary_embedding_inv_freq && batch_size > 0 && rotary_embedding_dim > 0)
         {
@@ -280,6 +273,7 @@ struct QKVPreprocessingParams
         ss << "sink_token_len: " << sink_token_len << std::endl;
         ss << "token_num: " << token_num << std::endl;
         ss << "remove_padding: " << remove_padding << std::endl;
+        ss << "is_last_chunk: " << is_last_chunk << std::endl;
         ss << "cross_attention: " << cross_attention << std::endl;
         ss << "head_num: " << head_num << std::endl;
         ss << "kv_head_num: " << kv_head_num << std::endl;
@@ -297,7 +291,6 @@ struct QKVPreprocessingParams
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
         ss << "generation_phase: " << generation_phase << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
-        ss << "num_sparse_kv_indices: " << num_sparse_kv_indices << std::endl;
 
         return ss.str();
     }
@@ -399,23 +392,56 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
 template <typename T, typename T_cache, typename KVCacheBuffer>
 void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
 
+template <typename T, typename T_cache, typename KVCacheBuffer>
+void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
+
+// Debug function to test basic parameter access
+template <typename T, typename KVCacheBuffer>
+void invokeDebugSparseKvCacheParams(
+    QKVPreprocessingParams<T, KVCacheBuffer> params, int* debug_output, cudaStream_t stream);
+
 template <typename T, typename KVCacheBuffer>
 void invokeKvCachePostprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
 {
     params.setCommonParameters();
-    if (params.cache_type == KvCacheDataType::INT8)
+
+    // handle sparse KV cache update if needed
+    if (params.sparse_kv_indices != nullptr && params.sparse_kv_offsets != nullptr && params.is_last_chunk)
     {
-        invokeUpdateCyclicKvCacheAfterFmha<T, int8_t, KVCacheBuffer>(params, stream);
-    }
+        if (params.cache_type == KvCacheDataType::INT8)
+        {
+            invokeUpdateSparseKvCacheAfterFmha<T, int8_t, KVCacheBuffer>(params, stream);
+        }
 #ifdef ENABLE_FP8
-    else if (params.cache_type == KvCacheDataType::FP8)
-    {
-        invokeUpdateCyclicKvCacheAfterFmha<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
-    }
+        else if (params.cache_type == KvCacheDataType::FP8)
+        {
+            invokeUpdateSparseKvCacheAfterFmha<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
+        }
 #endif // ENABLE_FP8
-    else
+        else
+        {
+            invokeUpdateSparseKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
+        }
+    }
+
+    // handle cyclic KV cache update if needed
+    // now we don't update cyclic KV cache
+    if (false)
     {
-        invokeUpdateCyclicKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
+        if (params.cache_type == KvCacheDataType::INT8)
+        {
+            invokeUpdateCyclicKvCacheAfterFmha<T, int8_t, KVCacheBuffer>(params, stream);
+        }
+#ifdef ENABLE_FP8
+        else if (params.cache_type == KvCacheDataType::FP8)
+        {
+            invokeUpdateCyclicKvCacheAfterFmha<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
+        }
+#endif // ENABLE_FP8
+        else
+        {
+            invokeUpdateCyclicKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
+        }
     }
 }
 
