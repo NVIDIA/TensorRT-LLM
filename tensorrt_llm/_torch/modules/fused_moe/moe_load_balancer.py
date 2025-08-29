@@ -177,15 +177,20 @@ class HostMoeTensorSharer:
                 total_size += aligned_size
 
         shm_name = self.get_shared_memory_name()
-        shm_full_path = os.path.join('/dev/shm/', shm_name)
-        if os.path.exists(shm_full_path):
+        try:
+            shm = shared_memory.SharedMemory(name=shm_name,
+                                             create=True,
+                                             size=total_size)
+        except FileExistsError:
             tensorrt_llm.logger.warning(
-                f'Found exist EPLB shared memory name: {shm_name}, unlinking {shm_full_path}'
+                f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
             )
-            os.unlink(shm_full_path)
-        shm = shared_memory.SharedMemory(name=shm_name,
-                                         create=True,
-                                         size=total_size)
+            existing_shm = shared_memory.SharedMemory(name=shm_name)
+            existing_shm.close()
+            existing_shm.unlink()
+            shm = shared_memory.SharedMemory(name=shm_name,
+                                             create=True,
+                                             size=total_size)
         self.own_shm = shm
 
         offset = 0
