@@ -7,7 +7,7 @@ import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
-
+from ..pyexecutor.resource_manager import BaseResourceManager
 
 class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
@@ -62,13 +62,6 @@ class SpeculativeDecodingMode(IntEnum):
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target()
 
-    def needs_kv_cache_recompute(self):
-        """
-        Whether the draft model needs to recompute the kv cache.
-        If true, the 1st draft model forward will recompute the kv cache for
-        the accepted draft tokens.
-        """
-        return self.is_eagle3()
 
     def need_load_draft_weights(self):
         """
@@ -99,11 +92,11 @@ class SpeculativeDecodingMode(IntEnum):
         return not issubclass(attention_backend,
                               TrtllmAttention) or get_sm_version() != 100
 
-    def attention_need_spec_dec_mode(self):
+    def attention_need_spec_dec_mode(self, spec_resource_manager: Optional[BaseResourceManager]):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         """
-        return self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or (self.is_eagle3() and spec_resource_manager.is_first_draft)
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":

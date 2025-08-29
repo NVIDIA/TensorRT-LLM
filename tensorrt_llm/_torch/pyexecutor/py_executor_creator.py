@@ -255,9 +255,6 @@ def create_py_executor(
             draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
             if spec_config.load_format == "dummy":
                 draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
-            # The draft model won't have any draft tokens attached to
-            # generation requests when we invoke it autoregressively
-            draft_spec_config.max_draft_len = 0
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
