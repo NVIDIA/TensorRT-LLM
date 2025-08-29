@@ -1,3 +1,4 @@
+import os
 import threading
 from contextlib import nullcontext
 from multiprocessing import resource_tracker, shared_memory
@@ -176,6 +177,12 @@ class HostMoeTensorSharer:
                 total_size += aligned_size
 
         shm_name = self.get_shared_memory_name()
+        shm_full_path = os.path.join('/dev/shm/', shm_name)
+        if os.path.exists(shm_full_path):
+            tensorrt_llm.logger.warning(
+                f'Found exist EPLB shared memory name: {shm_name}, unlinking {shm_full_path}'
+            )
+            os.unlink(shm_full_path)
         shm = shared_memory.SharedMemory(name=shm_name,
                                          create=True,
                                          size=total_size)
@@ -722,7 +729,7 @@ class MoeLoadBalancer:
                  ep_rank: int,
                  ep_size: int,
                  layer_updates_per_iter: int,
-                 shared_memory_base_name: str = 'moe_shared'):
+                 shared_memory_base_name: Optional[str] = None):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -740,6 +747,9 @@ class MoeLoadBalancer:
                                                        layer_updates_per_iter)
         self._previous_balancer = None
         self.single_layer_load_balancers = []
+        if shared_memory_base_name is None:
+            shared_memory_base_name = os.environ.get('TRTLLM_EPLB_SHM_NAME',
+                                                     'moe_shared')
         self.shared_memory_base_name = shared_memory_base_name
         self._setup_mpi_comm()
         self.is_shutdown = False
