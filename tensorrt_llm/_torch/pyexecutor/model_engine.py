@@ -644,9 +644,11 @@ class PyTorchModelEngine(ModelEngine):
                 return None
 
             num_extra_decoding_steps = get_num_extra_decoding_steps()
-
-            assert num_tokens > num_extra_decoding_steps
-            num_tokens -= num_extra_decoding_steps
+            if num_extra_decoding_steps > 0:
+                # Disable autotuning for fused drafting loops for now.
+                # There are a few bugs that can cause illegal memory accesses
+                # during warmup.
+                return None
 
             num_ctx_tokens = num_tokens - num_gen_tokens
             num_ctx_requests = 0
@@ -690,7 +692,6 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=ctx_token_nums,
                     is_gen=False,
                     max_num_draft_tokens=self.runtime_draft_len,
-                    num_extra_decoding_steps=num_extra_decoding_steps,
                 )
 
                 if spec_resource_manager is not None:
@@ -705,7 +706,6 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=[1] * num_gen_tokens,
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
-                    num_extra_decoding_steps=num_extra_decoding_steps,
                 )
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(request_ids=list(
