@@ -52,6 +52,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
 from ..speculative import SpecMetadata, get_spec_metadata
+from ..speculative.speculation_gate import SpeculationGate
 from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
@@ -62,7 +63,6 @@ from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .scheduler import ScheduledRequests
-from .speculation_gate import SpeculationGate
 
 MAX_UINT64 = (1 << 64) - 1
 
