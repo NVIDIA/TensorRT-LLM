@@ -374,6 +374,22 @@ struct ScaledAccPerRowBias
 };
 
 template<
+  class ElementOutput_,
+  class ElementCompute_,
+  class ElementBias_ = ElementOutput_,
+  class ElementScalar_ = ElementCompute_,
+  int AlignmentBias_ = 128 / cute::sizeof_bits_v<ElementBias_>,
+  FloatRoundStyle RoundStyle_ = FloatRoundStyle::round_to_nearest
+>
+struct ScaledAccPerColBias
+    : ScaledAcc<ElementOutput_, ElementCompute_, ElementScalar_, RoundStyle_>
+{
+  using ElementBias = ElementBias_;
+  static constexpr int AlignmentBias = AlignmentBias_;
+  static constexpr bool IsPerColBiasSupported = true;
+};
+
+template<
   class GmemLayoutTagOut,
   class ElementOutput,
   class ElementCompute,
@@ -386,6 +402,26 @@ template<
 >
 struct ScaledAccPerRowBiasPerColScaleScatter
     : ScaledAccPerRowBias<ElementOutput, ElementCompute, ElementBias, ElementScalar, AlignmentBias, RoundStyle>
+{
+  using ElementAux = ElementOutput;
+  using GmemLayoutTagAux = GmemLayoutTagOut;
+  static constexpr int AlignmentAux = AlignmentOutput;
+  static constexpr bool IsAuxOutSupported = true;
+};
+
+template<
+  class GmemLayoutTagOut,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBias = ElementOutput,
+  class ElementScale = ElementCompute,
+  class ElementScalar = ElementCompute,
+  int AlignmentBias = 128 / cute::sizeof_bits_v<ElementBias>,
+  int AlignmentOutput = 128 / cute::sizeof_bits_v<ElementOutput>,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+struct ScaledAccPerColBiasPerRowScaleScatter
+    : ScaledAccPerColBias<ElementOutput, ElementCompute, ElementBias, ElementScalar, AlignmentBias, RoundStyle>
 {
   using ElementAux = ElementOutput;
   using GmemLayoutTagAux = GmemLayoutTagOut;
@@ -412,6 +448,22 @@ using Sm90ScaledAccPerRowBiasPtrArray =
 
 template<
   class CtaTileShapeMNK,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBias = ElementOutput,
+  class ElementScalar = ElementCompute,
+  int AlignmentBias = 128 / sizeof_bits_v<ElementBias>,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+using Sm90ScaledAccPerColBiasPtrArray =
+  Sm90EVT<Sm90Compute<homogeneous_multiply_add, ElementOutput, ElementCompute, RoundStyle>, // alpha * acc + bias
+    Sm90ScalarBroadcastPtrArray<ElementScalar, Stride<_0,_0,int64_t>>, // alpha
+    Sm90AccFetch, // acc
+    Sm90RowBroadcast<0, CtaTileShapeMNK, ElementBias *, ElementCompute, Stride<_0,_1,int64_t>, AlignmentBias> // bias
+  >;
+
+template<
+  class CtaTileShapeMNK,
   class EpilogueTile,
   class StrideOutput,
   class SmemLayoutAtom,
@@ -430,6 +482,29 @@ using Sm90ScaledAccPerRowBiasPerColScaleScatterPtrArray =
     Sm90EVT<Sm90Compute<multiplies, ElementCompute, ElementCompute, RoundStyle>, // scale * (alpha * acc + bias)
       Sm90RowBroadcast<0, CtaTileShapeMNK, ElementScalar *, ElementCompute, Stride<_0,_1,int64_t>, 1>, // scale
       Sm90ScaledAccPerRowBiasPtrArray<CtaTileShapeMNK, ElementCompute, ElementCompute, ElementBias, ElementScalar, AlignmentBias, RoundStyle> // alpha * acc + bias
+    >
+  >;
+
+template<
+  class CtaTileShapeMNK,
+  class EpilogueTile,
+  class StrideOutput,
+  class SmemLayoutAtom,
+  class CopyOpR2S,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBias = ElementOutput,
+  class ElementScale = ElementCompute,
+  class ElementScalar = ElementCompute,
+  int AlignmentBias = 128 / cute::sizeof_bits_v<ElementBias>,
+  int AlignmentOutput = 128 / cute::sizeof_bits_v<ElementOutput>,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+using Sm90ScaledAccPerColBiasPerRowScaleScatterPtrArray =
+  Sm90EVT<Sm90ScatterPtrArray<EpilogueTile, StrideOutput, SmemLayoutAtom, CopyOpR2S, ElementOutput, AlignmentOutput, RoundStyle>, // scatter store
+    Sm90EVT<Sm90Compute<multiplies, ElementCompute, ElementCompute, RoundStyle>, // scale * (alpha * acc + bias)
+      Sm90ColBroadcast<0, CtaTileShapeMNK, ElementScalar *, ElementCompute, Stride<_1,_0,int64_t>, 1>, // scale
+      Sm90ScaledAccPerColBiasPtrArray<CtaTileShapeMNK, ElementCompute, ElementCompute, ElementBias, ElementScalar, AlignmentBias, RoundStyle> // alpha * acc + bias
     >
   >;
 
@@ -531,6 +606,129 @@ struct FusionCallbacks<
     int index_modulo{};            // modulo used to transform the index before store
     int shape_override = -1;       // override value for contiguous output tensor mode
     bool use_reduction = true;     // use reduction or regular store
+
+    operator typename Impl::Arguments() const {
+      return
+        {                                                           // unary op: reduce(scale * (beta * C + (alpha * acc)))
+          {                                                             // binary op: scale * (beta * C + (alpha * acc))
+            { scale_ptr_array, ElementScalar(1), dScale },                  // leaf args : scale broadcast
+            {                                                                 // ternary op : alpha * acc + bias
+              {{alpha}, {alpha_ptr}, {alpha_ptr_array}, {dAlpha}},                // leaf args : alpha
+              {},                                                                 // leaf args : acc
+              {bias_ptr, ElementBias(0), dBias},                                  // leaf args : bias
+              {}                                                                  // ternary args : multiply_add
+            },                                                                // end binary op
+            {}                                                              // binary args: multiply
+          },                                                            // end binary op
+          //scatter                                                       // unary args: reduce
+          { ptr_out, dOut, ptr_index, index_modulo, shape_override, use_reduction }
+        };                                                          // end unary op
+    }
+  };
+
+  // Ctor inheritance
+  using Impl::Impl;
+
+};
+
+template <
+  int StagesC,
+  int StagesD,
+  int FragmentSize,
+  bool ReuseSmemC,
+  bool DelayTmaStore,
+  int NumEpilogueWarpGroups,
+  class GmemLayoutTagOut,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBias,
+  class ElementScale,
+  class ElementScalar,
+  int AlignmentBias,
+  int AlignmentOutput,
+  FloatRoundStyle RoundStyle,
+  class CtaTileShapeMNK,
+  class EpilogueTile,
+  class SmemLayoutAtom,
+  class CopyOpR2S
+>
+struct FusionCallbacks<
+    epilogue::Sm90PtrArrayTmaWarpSpecialized<StagesC,
+                                             StagesD,
+                                             FragmentSize,
+                                             ReuseSmemC,
+                                             DelayTmaStore,
+                                             NumEpilogueWarpGroups
+                                            >,
+    fusion::ScaledAccPerColBiasPerRowScaleScatter<GmemLayoutTagOut,
+                                                  ElementOutput,
+                                                  ElementCompute,
+                                                  ElementBias,
+                                                  ElementScale,
+                                                  ElementScalar,
+                                                  AlignmentBias,
+                                                  AlignmentOutput,
+                                                  RoundStyle>,
+    CtaTileShapeMNK,
+    EpilogueTile,
+    SmemLayoutAtom,
+    CopyOpR2S
+> : Sm90ScaledAccPerColBiasPerRowScaleScatterPtrArray<
+      CtaTileShapeMNK,
+      EpilogueTile,
+      cutlass::gemm::TagToStrideC_t<GmemLayoutTagOut>,
+      SmemLayoutAtom, CopyOpR2S,
+      ElementOutput, ElementCompute, ElementBias, ElementScale, ElementScalar,
+      AlignmentBias, AlignmentOutput, RoundStyle
+    > {
+
+  using StrideOutput = cutlass::gemm::TagToStrideC_t<GmemLayoutTagOut>;
+
+  using Impl = Sm90ScaledAccPerColBiasPerRowScaleScatterPtrArray<
+    CtaTileShapeMNK,
+    EpilogueTile,
+    StrideOutput,
+    SmemLayoutAtom, CopyOpR2S,
+    ElementOutput, ElementCompute, ElementBias, ElementScale, ElementScalar,
+    AlignmentBias, AlignmentOutput, RoundStyle
+  >;
+  using Operation = fusion::ScaledAccPerColBiasPerRowScaleScatter<
+    GmemLayoutTagOut,
+    ElementOutput,
+    ElementCompute,
+    ElementBias,
+    ElementScale,
+    ElementScalar,
+    AlignmentBias,
+    AlignmentOutput,
+    RoundStyle>;
+
+  struct Arguments {
+
+    using StrideAlpha = Stride<_0,_0,int64_t>;
+    ElementScalar alpha = ElementScalar(1);
+    ElementScalar const* alpha_ptr{};
+    ElementScalar const* const* alpha_ptr_array{};
+    StrideAlpha dAlpha{};
+
+    using StrideBias = Stride<_0,_1,int64_t>;
+    ElementBias const* const* bias_ptr{};
+    StrideBias dBias{};
+
+    using StrideScale = Stride<_1,_0,int64_t>;
+    ElementScalar const* const* scale_ptr_array{};
+    StrideScale dScale{};
+
+    // Nested args not usable due to a compiler bug with constexpr evaluation
+    // using ScatterArguments = typename Sm90ScatterPtrArray<EpilogueTile, StrideOutput, SmemLayoutAtom, CopyOpR2S, ElementOutput, AlignmentOutput, RoundStyle>::Arguments;
+    // ScatterArguments scatter{};
+
+    ElementOutput* ptr_out = nullptr;
+    StrideOutput dOut = {};
+    int const* const* ptr_index{};   // per-group pointer to the scatter index
+    int index_modulo{}; // modulo used to transform the index before store
+    int shape_override = -1; // override value for contiguous output tensor mode
+    bool use_reduction = true;
 
     operator typename Impl::Arguments() const {
       return

@@ -905,7 +905,8 @@ class WideEPMoE(MoE):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             top_k=top_k,
-            token_count=token_count)
+            token_count=token_count,
+            use_low_precision_combine=self.use_low_precision_combine)
 
         return final_hidden_states
 

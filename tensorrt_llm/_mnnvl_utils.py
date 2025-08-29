@@ -598,6 +598,7 @@ class MnnvlMoe:
         ep_size: int,
         top_k: int,
         token_count: int,
+        use_low_precision_combine: bool = False,
     ):
         assert x.dim() == 2, "2D tensor supported, please reshape."
         output_tensors = torch.ops.trtllm.moe_comm(
@@ -611,6 +612,7 @@ class MnnvlMoe:
             ep_rank,
             ep_size,
             [True],
+            use_low_precision_combine,
         )
         output_tensor = output_tensors[0]
         return torch.sum(

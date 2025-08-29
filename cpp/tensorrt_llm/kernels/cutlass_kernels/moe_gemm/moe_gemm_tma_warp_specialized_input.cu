@@ -31,20 +31,20 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     int num_experts, FpXBlockScalingType scaling_type)
 {
     size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
-    size_t stride_a_size = sizeof(StrideA) * num_experts;
-    size_t stride_b_size = sizeof(StrideB) * num_experts;
-    size_t stride_c_size = sizeof(StrideC) * num_experts;
-    size_t stride_d_size = sizeof(StrideD) * num_experts;
+    size_t stride_act_size = std::max(sizeof(StrideA), sizeof(StrideB)) * num_experts;
+    size_t stride_weight_size = std::max(sizeof(StrideA), sizeof(StrideB)) * num_experts;
+    size_t stride_c_size = std::max(sizeof(StrideC), sizeof(StrideC_T)) * num_experts;
+    size_t stride_d_size = std::max(sizeof(StrideD), sizeof(StrideD_T)) * num_experts;
 
     size_t ptr_buf_size = sizeof(void*) * num_experts;
     size_t scale_buf_size = sizeof(float*) * num_experts;
 
-    size_t sf_a_size = sizeof(ElementSF*) * num_experts;
-    size_t sf_b_size = sizeof(ElementSF*) * num_experts;
-    size_t stride_sf_a_size = scaling_type == FpXBlockScalingType::MXFPX
+    size_t sf_act_size = sizeof(ElementSF*) * num_experts;
+    size_t sf_weight_size = sizeof(ElementSF*) * num_experts;
+    size_t stride_sf_act_size = scaling_type == FpXBlockScalingType::MXFPX
         ? sizeof(MXFPXBlockScaledConfig::LayoutSF) * num_experts
         : sizeof(NVFP4BlockScaledConfig::LayoutSF) * num_experts;
-    size_t stride_sf_b_size = scaling_type == FpXBlockScalingType::MXFPX
+    size_t stride_sf_weight_size = scaling_type == FpXBlockScalingType::MXFPX
         ? sizeof(MXFPXBlockScaledConfig::LayoutSF) * num_experts
         : sizeof(NVFP4BlockScaledConfig::LayoutSF) * num_experts;
 
@@ -55,10 +55,10 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
 
     size_t ptr_token_map_size = sizeof(int**) * num_experts;
 
-    return std::array{problem_shape_size, stride_a_size, stride_b_size, stride_c_size, stride_d_size, ptr_buf_size,
-        ptr_buf_size, ptr_buf_size, ptr_buf_size, scale_buf_size, sf_a_size, sf_b_size, stride_sf_a_size,
-        stride_sf_b_size, int4_groupwise_problem_shape_size, int4_groupwise_sf_a_size, int4_groupwise_stride_sf_a_size,
-        ptr_buf_size, scale_buf_size, ptr_token_map_size};
+    return std::array{problem_shape_size, stride_act_size, stride_weight_size, stride_c_size, stride_d_size,
+        ptr_buf_size, ptr_buf_size, ptr_buf_size, ptr_buf_size, scale_buf_size, sf_act_size, sf_weight_size,
+        stride_sf_act_size, stride_sf_weight_size, int4_groupwise_problem_shape_size, int4_groupwise_sf_a_size,
+        int4_groupwise_stride_sf_a_size, ptr_buf_size, scale_buf_size, ptr_token_map_size};
 }
 
 size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts, FpXBlockScalingType scaling_type)
@@ -82,23 +82,23 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
     shape_info.num_groups = num_experts;
     shape_info.problem_shapes = reinterpret_cast<ProblemShape::UnderlyingProblemShape*>(pointers[0]);
     shape_info.host_problem_shapes = nullptr;
-    stride_a = reinterpret_cast<StrideA*>(pointers[1]);
-    stride_b = reinterpret_cast<StrideB*>(pointers[2]);
-    stride_c = reinterpret_cast<StrideC*>(pointers[3]);
-    stride_d = reinterpret_cast<StrideD*>(pointers[4]);
+    stride_act = reinterpret_cast<void*>(pointers[1]);
+    stride_weight = reinterpret_cast<void*>(pointers[2]);
+    stride_c = reinterpret_cast<void*>(pointers[3]);
+    stride_d = reinterpret_cast<void*>(pointers[4]);
 
-    ptr_a = reinterpret_cast<void const**>(pointers[5]);
-    ptr_b = reinterpret_cast<void const**>(pointers[6]);
+    ptr_act = reinterpret_cast<void const**>(pointers[5]);
+    ptr_weight = reinterpret_cast<void const**>(pointers[6]);
     ptr_c = reinterpret_cast<void const**>(pointers[7]);
     ptr_d = reinterpret_cast<void**>(pointers[8]);
 
     alpha_scale_ptr_array = reinterpret_cast<float const**>(pointers[9]);
 
-    fpX_block_scaling_factors_A = reinterpret_cast<ElementSF const**>(pointers[10]);
-    fpX_block_scaling_factors_B = reinterpret_cast<ElementSF const**>(pointers[11]);
+    fpX_block_scaling_factors_act = reinterpret_cast<ElementSF const**>(pointers[10]);
+    fpX_block_scaling_factors_weight = reinterpret_cast<ElementSF const**>(pointers[11]);
 
-    fpX_block_scaling_factors_stride_A = pointers[12];
-    fpX_block_scaling_factors_stride_B = pointers[13];
+    fpX_block_scaling_factors_stride_act = pointers[12];
+    fpX_block_scaling_factors_stride_weight = pointers[13];
 
     int4_groupwise_params.shape.problem_shapes
         = reinterpret_cast<INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape*>(pointers[14]);
@@ -120,7 +120,9 @@ void TmaWarpSpecializedGroupedGemmInput::setFinalizeFusionParams(
     fused_finalize_epilogue.ptr_final_output = final_output;
 
     fused_finalize_epilogue.stride_final_output = cutlass::make_cute_packed_stride(
-        FusedFinalizeEpilogue::StrideFinalOutput{}, cute::make_shape(hidden_size, num_output_tokens, 1));
+        FusedFinalizeEpilogue::StrideFinalOutput{}, cute::make_shape(num_output_tokens, hidden_size, 1));
+    fused_finalize_epilogue.stride_final_output_transposed = cutlass::make_cute_packed_stride(
+        FusedFinalizeEpilogue::StrideFinalOutput_T{}, cute::make_shape(hidden_size, num_output_tokens, 1));
 
     fused_finalize_epilogue.num_rows_in_final_output = num_output_tokens;
     fused_finalize_epilogue.shape_override = hidden_size;
@@ -134,8 +136,8 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const
     if (isValid())
     {
         using PrintType = void const*;
-        ss << "Ptr A: " << (PrintType) ptr_a << " with Stride: " << (PrintType) stride_a << ",\n"
-           << "Ptr B: " << (PrintType) ptr_b << " with Stride: " << (PrintType) stride_b << ",\n"
+        ss << "Ptr Act: " << (PrintType) ptr_act << " with Stride: " << (PrintType) stride_act << ",\n"
+           << "Ptr Weight: " << (PrintType) ptr_weight << " with Stride: " << (PrintType) stride_weight << ",\n"
            << "Ptr C: " << (PrintType) ptr_c << " with Stride: " << (PrintType) stride_c << "\n";
         ss << "Epilogue Fusion: " << (int) fusion << ",\n";
         if (fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE)
@@ -155,10 +157,10 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const
         ss << "Alpha scale ptr: " << (PrintType) alpha_scale_ptr_array << "\n";
 
         ss << "FpX Block Scaling Type: " << (int) fpX_block_scaling_type << "\n";
-        ss << "Fp4 Block Scaling Factors A: " << (PrintType) fpX_block_scaling_factors_A
-           << ", with Stride: " << (PrintType) fpX_block_scaling_factors_stride_A << "\n";
-        ss << "Fp4 Block Scaling Factors B: " << (PrintType) fpX_block_scaling_factors_B
-           << ", with Stride: " << (PrintType) fpX_block_scaling_factors_stride_B << "\n";
+        ss << "Fp4 Block Scaling Factors Act: " << (PrintType) fpX_block_scaling_factors_act
+           << ", with Stride: " << (PrintType) fpX_block_scaling_factors_stride_act << "\n";
+        ss << "Fp4 Block Scaling Factors Weight: " << (PrintType) fpX_block_scaling_factors_weight
+           << ", with Stride: " << (PrintType) fpX_block_scaling_factors_stride_weight << "\n";
         ss << "Gemm Workspace: " << (PrintType) gemm_workspace << ", with Size: " << gemm_workspace_size << "\n";
     }
 
