@@ -880,25 +880,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         )
         remain_buffer_len = total_chunk_size
         current_batch_idx = 0
-        max_chunk_len_per_loop = []
+        max_chunk_len_per_loop.clear()
         temp_max_chunk_len = 0
         # cal chunked_seq_len
         for b_id in range(num_contexts):
-            temp_cached_kv_len = cached_kv_lens[b_id]
+            temp_cached_kv_len = cached_kv_lens[b_id].item()
             while temp_cached_kv_len > 0:
-                if temp_cached_kv_len <= remain_buffer_len:
-                    chunked_seq_len[current_batch_idx,
-                                    b_id] = temp_cached_kv_len
-                    remain_buffer_len -= temp_cached_kv_len
-                    temp_cached_kv_len = 0
-                    temp_max_chunk_len = max(temp_max_chunk_len,
-                                             temp_cached_kv_len)
-                else:
-                    chunked_seq_len[current_batch_idx, b_id] = remain_buffer_len
-                    temp_cached_kv_len -= remain_buffer_len
-                    remain_buffer_len = 0
-                    temp_max_chunk_len = max(temp_max_chunk_len,
-                                             remain_buffer_len)
+                used_buffer_len = min(remain_buffer_len, temp_cached_kv_len)
+                chunked_seq_len[current_batch_idx, b_id] = used_buffer_len
+                temp_max_chunk_len = max(temp_max_chunk_len, used_buffer_len)
+                remain_buffer_len -= used_buffer_len
+                temp_cached_kv_len -= used_buffer_len
                 chunked_ld_global_offset[
                     current_batch_idx + 1, b_id] = chunked_ld_global_offset[
                         current_batch_idx,
@@ -910,7 +902,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     temp_max_chunk_len = 0
         if len(max_chunk_len_per_loop) < chunked_loop_num:
             max_chunk_len_per_loop.append(temp_max_chunk_len)
-
+        assert len(
+            max_chunk_len_per_loop
+        ) == chunked_loop_num, f"max_chunk_len_per_loop size {len(max_chunk_len_per_loop)} != chunked_loop_num {chunked_loop_num}"
         for loop_idx in range(chunked_loop_num):
             cu_chunked_seq_len[loop_idx, 0] = 0
             torch.cumsum(chunked_seq_len[loop_idx, :num_contexts],

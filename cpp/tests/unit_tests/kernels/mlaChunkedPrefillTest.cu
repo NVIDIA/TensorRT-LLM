@@ -675,13 +675,13 @@ protected:
             = bufferCast<int64_t>(*(this->h_chunked_ld_global_offset)); // {chunked_loop_num + 1, batch_size}
 
         this->max_chunk_len_per_loop.clear();
-        std::vector<int64_t> chunked_seq_len((chunked_loop_num + 1) * (this->mBatchSize), 0);
+        std::vector<int64_t> chunked_seq_len_vec((chunked_loop_num + 1) * (this->mBatchSize), 0);
         // 0 -> chunked_loop_num -1
         int remain_buffer_len = total_chunk_size;
         int curr_loop_idx = 0;
         int temp_max_chunk_len = 0;
 
-#define chunked_seq_len(chunked_loop_idx, b_idx) chunked_seq_len[(chunked_loop_idx) * (this->mBatchSize) + (b_idx)]
+#define chunked_seq_len(chunked_loop_idx, b_idx) chunked_seq_len_vec[(chunked_loop_idx) * (this->mBatchSize) + (b_idx)]
 #define cu_chunked_seq_len(chunked_loop_idx, b_idx)                                                                    \
     h_cu_chunk_lens_ptr[(chunked_loop_idx) * (this->mBatchSize + 1) + (b_idx)]
 #define chunked_ld_global_offset(chunked_loop_idx, b_idx)                                                              \
