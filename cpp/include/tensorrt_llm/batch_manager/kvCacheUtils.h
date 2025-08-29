@@ -48,6 +48,37 @@ public:
         return BlockRange(cacheManager, blockIds, requestId);
     }
 
+    static BlockRange fromReuseTree(
+        BaseKVCacheManager const& cacheManager, std::vector<BlockKey> const& allBlockKeys, SizeType32 indexFromEnd)
+    {
+        auto const windowSize = firstWindowSize(cacheManager);
+        // Find the last block in the reuse tree for the provided full sequence of block keys
+        auto lastBlock = *cacheManager.findBlocksInReuseTreeByBlockKeys(allBlockKeys, windowSize);
+        // TODO: handle the case where the last block is not found
+        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
+        // Validate indexFromEnd and determine how many trailing blocks to collect
+        auto const totalNumBlocks = static_cast<SizeType32>(allBlockKeys.size());
+        TLLM_CHECK_WITH_INFO(
+            indexFromEnd < totalNumBlocks, "indexFromEnd=%d is out of range (total=%d)", indexFromEnd, totalNumBlocks);
+
+        // Number of blocks to return equals suffix length starting at the block located indexFromEnd from the end
+        // Example: indexFromEnd=0 -> return last block only; indexFromEnd=2 -> return last 3 blocks
+        SizeType32 const numBlocksToCollect = indexFromEnd + 1;
+
+        std::vector<SizeType32> blockIds;
+        blockIds.reserve(numBlocksToCollect);
+        for (SizeType32 i = 0; i < numBlocksToCollect; ++i)
+        {
+            blockIds.emplace_back(lastBlock->getBlockId());
+            if (i + 1 < numBlocksToCollect)
+            {
+                lastBlock = lastBlock->getPrevBlock();
+                TLLM_CHECK_WITH_INFO(lastBlock, "Previous block not found while traversing reuse tree");
+            }
+        }
+        return BlockRange(cacheManager, blockIds, 0);
+    }
+
     BlockRange(runtime::ITensor::SharedPtr pool, std::vector<SizeType32> const& blockIds) // Only used in tests
         : mManager{nullptr}
         , mPool{std::move(pool)}

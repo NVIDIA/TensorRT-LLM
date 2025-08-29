@@ -204,6 +204,7 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        self.block_reuse_enabled = self.kv_cache_manager.enable_block_reuse
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
 
         self.max_input_len = max_input_len
@@ -1773,7 +1774,10 @@ class PyExecutor:
 
             if request_done:
                 if request.is_disagg_context_transmission_state:
-                    self.ctx_in_transmission_requests.append(request)
+                    if self.block_reuse_enabled:
+                        requests_to_terminate.append(request)
+                    else:
+                        self.ctx_in_transmission_requests.append(request)
                 else:
                     requests_to_terminate.append(request)
             else:

@@ -93,6 +93,8 @@ void MLACacheFormatter::format(TransferSession& session)
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto& blockKeys = session.getAllBlockKeys();
+    auto indexFromEnd = session.getIndexFromEnd();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
@@ -106,7 +108,7 @@ void MLACacheFormatter::format(TransferSession& session)
     // diff end
 
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, blockKeys, indexFromEnd);
 
     auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
     bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();

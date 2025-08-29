@@ -18,11 +18,11 @@
 #pragma once
 
 #include "cacheTransBuffer.h"
-#include "dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -34,9 +34,229 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    std::vector<BlockKey> const& allBlockKeys, SizeType32 indexFromEnd);
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
+
+class KvCacheMeasureHelper
+{
+public:
+    struct Measure
+    {
+        double delay;     // from last token (ctx) or arrival time (gen), in ms
+        double duration;  // in ms
+        double bandwidth; // in Gbps
+    };
+
+    KvCacheMeasureHelper(std::string output_path)
+        : mOutputPath(std::move(output_path))
+    {
+    }
+
+    void markAsSender(bool isSender)
+    {
+        mIsSender = isSender;
+    }
+
+    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double delay, double duration, size_t size)
+    {
+        auto bandwidth = size * 8 / (duration / 1000) / 1e9;
+        if (mOutputPath.empty())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        mRequestKVCacheTranfserMeasure[requestId].emplace_back(Measure{delay, duration, bandwidth});
+    }
+
+    ~KvCacheMeasureHelper()
+    {
+        if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
+        {
+            TLLM_CHECK(mIsSender.has_value());
+            auto rank = mpi::MpiComm::world().getRank();
+            std::string outFilePath
+                = mOutputPath + "rank_" + std::to_string(rank) + "_" + (mIsSender.value() ? "send" : "recv") + ".csv";
+            std::ofstream outFile(outFilePath);
+
+            TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
+
+            size_t numTransferMeasure = mRequestKVCacheTranfserMeasure.begin()->second.size();
+
+            outFile << "RequestID";
+            for (size_t i = 0; i < numTransferMeasure; i++)
+            {
+                outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
+            }
+            outFile << '\n';
+
+            for (auto const& [requestID, measures] : mRequestKVCacheTranfserMeasure)
+            {
+                outFile << requestID;
+
+                for (auto const& measure : measures)
+                {
+                    outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
+                }
+                outFile << '\n';
+            }
+
+            outFile.close();
+        }
+    }
+
+private:
+    std::map<LlmRequest::RequestIdType, std::vector<Measure>> mRequestKVCacheTranfserMeasure;
+    std::string mOutputPath;
+    std::mutex mMutex;
+    std::optional<bool> mIsSender;
+};
+
+using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using Connection = tensorrt_llm::executor::kv_cache::Connection;
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
+class TransferSession
+{
+public:
+    struct Measure
+    {
+        double delay;     // from last token (ctx) or arrival time (gen), in ms
+        double duration;  // in ms
+        double bandwidth; // in Gbps
+    };
+
+    TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
+        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
+        runtime::BufferManager const& bufferManager, std::vector<BlockKey> allBlockKeys = {},
+        SizeType32 indexFromEnd = 0, LlmRequest const* llmRequest = nullptr)
+        : mConnections(std::move(connections))
+        , mDataContext(dataContext)
+        , mSelfState(&selfState)
+        , mOtherState(std::move(otherState))
+        , mBufferManager(&bufferManager)
+        , mAllBlockKeys(std::move(allBlockKeys))
+        , mIndexFromEnd(indexFromEnd)
+        , mRequest(llmRequest)
+    {
+        TLLM_CHECK(!mConnections.empty());
+    }
+
+    [[nodiscard]] std::vector<Connection const*> const& getConnections() const
+    {
+        return mConnections;
+    }
+
+    // should be called only during the initialization of the TransferSession
+    void setConnection(size_t idx, Connection const* conn)
+    {
+        mConnections.at(idx) = conn;
+    }
+
+    [[nodiscard]] DataContext const& getDataContext() const
+    {
+        return mDataContext;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const
+    {
+        return *mSelfState;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getOtherState() const
+    {
+        return mOtherState;
+    }
+
+    [[nodiscard]] runtime::BufferManager const& getBufferManager() const
+    {
+        return *mBufferManager;
+    }
+
+    void send(size_t idx, void const* data, size_t size)
+    {
+        mConnections.at(idx)->send(mDataContext, data, size);
+    }
+
+    void recv(size_t idx, void* data, size_t size)
+    {
+        mConnections.at(idx)->recv(mDataContext, data, size);
+    }
+
+    [[nodiscard]] LlmRequest const& getLlmRequest() const
+    {
+        TLLM_CHECK(mRequest != nullptr);
+        return *mRequest;
+    }
+
+    // in CacheSender, the LlmRequest is not available until the sendSync is called
+    void setLlmRequest(LlmRequest const& llmRequest)
+    {
+        mRequest = &llmRequest;
+    }
+
+    void appendMeasure(double delay, double duration, size_t size)
+    {
+        if (!mRecordMeasure)
+        {
+            return;
+        }
+        auto bandwidth = size * 8 / (duration / 1000) / 1e9; // byte, ms => Gbps
+        mMeasures.emplace_back(Measure{delay, duration, bandwidth});
+    }
+
+    // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
+    void exportMeasure(std::ofstream& outFile, bool isContext) const
+    {
+        if (mMeasures.empty())
+        {
+            return;
+        }
+        // write header if not exist
+        if (outFile.tellp() == 0)
+        {
+            outFile << "RequestID";
+            for (size_t i = 0; i < mMeasures.size(); i++)
+            {
+                outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
+            }
+            outFile << '\n';
+        }
+        // write measures
+        TLLM_CHECK(isContext || mRequest->getContextPhaseParams().has_value());
+        auto reqId = isContext ? mRequest->mRequestId : mRequest->getContextPhaseParams().value().getReqId();
+        outFile << reqId;
+        for (auto const& measure : mMeasures)
+        {
+            outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
+        }
+        outFile << '\n' << std::flush;
+    }
+
+    [[nodiscard]] std::vector<BlockKey> const& getAllBlockKeys() const
+    {
+        return mAllBlockKeys;
+    }
+
+    [[nodiscard]] SizeType32 getIndexFromEnd() const
+    {
+        return mIndexFromEnd;
+    }
+
+private:
+    std::vector<Connection const*> mConnections;
+    DataContext mDataContext;
+    executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
+    executor::DataTransceiverState mOtherState;
+    runtime::BufferManager const* mBufferManager;
+    std::vector<Measure> mMeasures;
+    bool mRecordMeasure{false};
+    std::vector<BlockKey> mAllBlockKeys;
+    SizeType32 mIndexFromEnd;
+    LlmRequest const* mRequest;
+};
 
 // Used to support the cache transmission with different layouts and different protocols.
 class BaseCacheFormatter

@@ -50,32 +50,6 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
-//! \brief Split vector into list of blocks of given size.
-//! \param vec vector to split
-//! \param usableSize part of the vector that is processed
-//! \param elementsPerBlock desired size of blocks
-//! \param allowPartial whether to append a block smaller than `elementsPerBlock` at the end
-//! \return list of blocks
-template <typename T>
-std::list<std::vector<T>> chopVectorIntoBlocks(
-    std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
-{
-    TLLM_CHECK_WITH_INFO(
-        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
-    std::list<std::vector<T>> blockedVectors;
-    auto const vecEnd = vec.begin() + usableSize;
-    for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
-    {
-        auto blockSize = std::min(elementsPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
-        auto end = begin + blockSize;
-        if (blockSize == elementsPerBlock || allowPartial)
-        {
-            blockedVectors.emplace_back(begin, end);
-        }
-    }
-    return blockedVectors;
-}
-
 inline uint8_t getNthByte(SizeType32 hashPart, uint8_t byteIdx) noexcept
 {
     return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
@@ -139,6 +113,11 @@ std::vector<MmKey> generateBlockHashExtraKeys(
     return extraKeys;
 }
 
+} // namespace
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+
 std::vector<BlockKey> buildBlockKeys(
     std::list<VecUniqueTokens>& blockedUniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
@@ -156,10 +135,21 @@ std::vector<BlockKey> buildBlockKeys(
     return blockKeys;
 }
 
-} // namespace
-
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+bool BlockKey::operator==(BlockKey const& other) const noexcept
 {
+    if (hash != 0)
+    {
+        return hash == BlockKeyHasher::hash(other);
+    }
+    if (other.hash != 0)
+    {
+        return other.hash == BlockKeyHasher::hash(*this);
+    }
+
+    return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens
+        && extraKeys == other.extraKeys);
+}
+
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
 {
     // Hashing algorithm adapted from StackOverflow:
@@ -395,7 +385,7 @@ void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
 std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
     BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const
 {
-    if (blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0)
+    if ((blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0) && !blockKey.hash)
     {
         return {false, 0, nullptr};
     }
@@ -1015,6 +1005,34 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
+std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReuseTreeByBlockKeys(
+    std::vector<BlockKey> const& blockKeys) const
+{
+    std::cout << "findBlocksInReuseTreeByBlockKeys: " << blockKeys.size() << std::endl;
+    for (auto const& key : blockKeys)
+    {
+        std::cout << key.hash << " ";
+    }
+    std::cout << std::endl;
+
+    auto searchRoot = mCachedBlocksRoot;
+    for (auto const& blockKey : blockKeys)
+    {
+        std::cout << "findBlocksInReuseTreeByBlockKeys: searching for block key: " << blockKey.hash << std::endl;
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, true, true)
+            : std::make_tuple(false, 0, nullptr);
+        if (matchingBlock == nullptr)
+        {
+            std::cout << "findBlocksInReuseTreeByBlockKeys: no matching block found" << std::endl;
+            return std::nullopt;
+        }
+        std::cout << "findBlocksInReuseTreeByBlockKeys: matching block found" << matchingBlock->getHash() << std::endl;
+        searchRoot = std::move(matchingBlock);
+    }
+    return searchRoot;
+}
+
 SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
     GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions)
 {
@@ -1313,6 +1331,8 @@ void WindowBlockManager::storeBlocks(
     for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
     {
         auto const bid = blockIds[blockCnt];
+        // std::cout << "Storing block " << bid << " block hash: " << BlockKeyHasher::hash(blockKeys[blockCnt])
+        //   << std::endl;
         TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
         auto& block = mAllBlocksById[bid];
         auto const& blockKey = blockKeys[blockCnt];
@@ -1488,6 +1508,24 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
             manager.storeBlocksForReuse(sequence, llmRequest);
         }
         manager.releaseBlocks(sequence);
+    }
+}
+
+void BlockManager::pinBlocks(GenerationRequest& sequence)
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.pinBlocks(sequence);
+    }
+}
+
+void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
+{
+    auto const requestId = sequence.getRequestId();
+    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    for (auto& block : allocatedBlocks)
+    {
+        block->incRefCount();
     }
 }
 
@@ -2076,6 +2114,12 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
 {
     // Mimic Free all blocks for this sequence
     mBlockManager.schedulingReleaseBlocks(requestId);
+}
+
+void KVCacheManager::pinBlocks(RequestIdType requestId)
+{
+    auto& sequence = getSequence(requestId);
+    mBlockManager.pinBlocks(sequence);
 }
 
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const

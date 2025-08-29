@@ -1831,16 +1831,6 @@ public:
         }
     }
 
-    void setRequestedBlockHashes(std::vector<size_t> hashes)
-    {
-        mRequestedBlockHashes = std::move(hashes);
-    }
-
-    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const
-    {
-        return mRequestedBlockHashes;
-    }
-
     void setIsDummyRequest(bool isDummyRequest)
     {
         mIsDummyRequest = isDummyRequest;
@@ -2031,9 +2021,6 @@ protected:
 
     // Tensors containing the additional generation output.
     TensorMap mAdditionalGenerationOutputTensors;
-
-    // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
-    std::vector<size_t> mRequestedBlockHashes;
 
     bool mIsDummyRequest{false};
 
