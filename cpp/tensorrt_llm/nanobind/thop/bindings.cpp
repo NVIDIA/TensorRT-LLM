@@ -28,7 +28,7 @@ namespace tensorrt_llm::nanobind::thop
 
 void initBindings(nb::module_& m)
 {
-    m.def("attention", &torch_ext::attention,
+    m.def("attention", &torch_ext::attention, nb::call_guard<nb::gil_scoped_release>(),
         // Parameters with default values using std::nullopt for optional arguments
         nb::arg("q"), nb::arg("k") = std::nullopt, nb::arg("v") = std::nullopt, nb::arg("output"),
         nb::arg("output_sf") = std::nullopt, nb::arg("out_dtype") = std::nullopt, nb::arg("workspace_") = std::nullopt,
