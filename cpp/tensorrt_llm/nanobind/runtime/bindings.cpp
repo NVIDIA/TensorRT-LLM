@@ -340,7 +340,7 @@ void initBindings(nb::module_& m)
         "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
-        .def(nb::init<size_t, uint32_t, uint32_t, at::Device, bool>())
+        .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, at::Device, bool>())
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
 
