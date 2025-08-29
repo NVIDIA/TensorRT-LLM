@@ -78,9 +78,6 @@ def _joint_transform(gm: GraphModule) -> None:
     ["eager", "sdpa"],
 )
 def test_match_llama_attention(config: Dict[str, Any], attn_implementation: str):
-    if attn_implementation == "sdpa":
-        pytest.skip("https://nvbugspro.nvidia.com/bug/5170222")
-
     def verify_matcher(gm: GraphModule):
         """Ensure that there is exactly one torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
         call in the graph. Also check that there is no repeat_kv pattern left.

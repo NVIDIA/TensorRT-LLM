@@ -86,7 +86,9 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(
             self)  # TODO: make it weakref
         self._executor_config = executor_config
-        self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
+            "pytorch", "_autodeploy"
+        ]
         self.llm_args = llm_args
 
         if not self._is_pytorch_backend and kv_connector_config is not None:
@@ -474,7 +476,6 @@ class GenerationExecutorWorker(GenerationExecutor):
                 )
 
         if self._is_pytorch_backend:
-            assert isinstance(self.llm_args, TorchLlmArgs)
             if not self.llm_args.disable_overlap_scheduler:
                 is_disaggregated = self.engine.kv_cache_transceiver is not None
                 if is_disaggregated and (

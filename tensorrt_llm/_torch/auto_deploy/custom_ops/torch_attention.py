@@ -63,6 +63,7 @@ def scaled_dot_product_attention(
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
+    enable_gqa: bool = False,
 ) -> torch.Tensor:
     """A carbon copy of torch.nn.functional.scaled_dot_product_attention as custom op.
 
@@ -78,12 +79,13 @@ def scaled_dot_product_attention(
         dropout_p=dropout_p,
         is_causal=is_causal,
         scale=scale,
+        enable_gqa=enable_gqa,
     )
 
 
 @scaled_dot_product_attention.register_fake
 def scaled_dot_product_attention_fake(
-    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None
+    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False
 ):
     """Fake implementation of scaled_dot_product_attention."""
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
