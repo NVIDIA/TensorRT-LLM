@@ -315,7 +315,8 @@ class Attention(nn.Module):
         if self.attn_backend == "TRTLLM":
             has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                                or self.o_proj.has_fp8_block_scales
-                               or self.o_proj.has_fp8_rowwise)
+                               or self.o_proj.has_fp8_rowwise
+                               or self.o_proj.has_w4a8_nvfp4_fp8)
             if has_quant_scale and self.attn.has_fp8_kv_cache:
                 out_dtype = torch.float8_e4m3fn
         output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
@@ -355,7 +356,8 @@ class Attention(nn.Module):
         out_scale_sf = None
         has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                            or self.o_proj.has_fp8_block_scales
-                           or self.o_proj.has_fp8_rowwise)
+                           or self.o_proj.has_fp8_rowwise
+                           or self.o_proj.has_w4a8_nvfp4_fp8)
         if has_quant_scale:
             out_scale = self.o_proj.inv_input_scale
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output:
