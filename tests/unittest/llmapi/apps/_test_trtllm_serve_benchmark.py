@@ -3,7 +3,10 @@ import subprocess
 import sys
 
 import pytest
+from transformers import AutoTokenizer
 from utils.util import skip_gpu_memory_less_than_80gb
+
+from tensorrt_llm.serve.scripts.benchmark_dataset import RandomDataset
 
 from .openai_server import RemoteOpenAIServer
 
@@ -58,3 +61,39 @@ def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
                    stderr=subprocess.PIPE,
                    text=True,
                    check=True)
+
+
+@pytest.mark.parametrize("prefix_length", [0, 10, 100])
+@pytest.mark.parametrize("model_name", [
+    "llama-3.1-model/Meta-Llama-3.1-8B", "DeepSeek-R1/DeepSeek-R1",
+    "Qwen2-7B-Instruct", "gpt_oss/gpt-oss-20b"
+])
+def test_trtllm_serve_benchmark_with_chat_template(prefix_length: int,
+                                                   model_name: str):
+    dataset = RandomDataset(
+        sample_from_sharegpt=False,
+        return_text=True,
+        random_seed=0,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(get_model_path(model_name))
+    dataset.sample(tokenizer,
+                   10,
+                   use_chat_template=True,
+                   prefix_len=prefix_length)
+
+    # Check that all returned SampleRequest instances have the correct input length
+    sample_requests = dataset.sample(tokenizer,
+                                     10,
+                                     prefix_len=prefix_length,
+                                     use_chat_template=True)
+    for req in sample_requests:
+        # The prompt_len attribute should match the expected input length
+        prompt_len = RandomDataset.DEFAULT_INPUT_LEN + prefix_length
+        assert req.prompt_len <= prompt_len, (
+            f"SampleRequest prompt_len ({req.prompt_len} + {prefix_length}) exceeds the default input length {RandomDataset.DEFAULT_INPUT_LEN}"
+        )
+        input_ids = tokenizer.encode(req.prompt)["input_ids"]
+        assert len(input_ids) <= prompt_len, (
+            f"SampleRequest prompt length ({len(input_ids)}) exceeds the default input length {RandomDataset.DEFAULT_INPUT_LEN}"
+        )
