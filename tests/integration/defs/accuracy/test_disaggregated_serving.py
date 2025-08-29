@@ -4,6 +4,7 @@
 # Please take a look at the existing test_llm_api_pytorch.py file for reference.
 import concurrent
 import contextlib
+import itertools
 import json
 import os
 import tempfile
@@ -47,6 +48,9 @@ class Result(GenerationResultBase):
 
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
+DEFAULT_TEST_TIMEOUT = 1800
+DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
 
@@ -67,13 +71,15 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 
 
 @contextlib.contextmanager
-def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
-                             ctx_server_config: Dict[str, Any],
-                             gen_server_config: Dict[str, Any],
-                             model_name: str,
-                             tensor_parallel_size: int = 1,
-                             ctx_model: str = None,
-                             gen_model: str = None):
+def launch_disaggregated_llm(
+        disaggregated_server_config: Dict[str, Any],
+        ctx_server_config: Dict[str, Any],
+        gen_server_config: Dict[str, Any],
+        model_name: str,
+        tensor_parallel_size: int = 1,
+        ctx_model: str = None,
+        gen_model: str = None,
+        server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -197,16 +203,22 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             )
             raise
 
+    server_cmd = [
+        trtllm_serve_path, "disaggregated", "-c",
+        disaggregated_serving_config_path, "--server_start_timeout",
+        str(server_waiting_timeout)
+    ]
     with (MyThreadPoolExecutor(max_workers=16) as
-          thread_pool, temp_dir, multi_popen(ctx_servers + gen_servers),
-          popen([
-              trtllm_serve_path, "disaggregated", "-c",
-              disaggregated_serving_config_path, "--server_start_timeout",
-              "3600"
-          ])):
+          thread_pool, temp_dir, multi_popen(ctx_servers + gen_servers) as
+          worker_processes, popen(server_cmd) as server_process):
         start_time = time.time()
-        while time.time() - start_time < 3600:
-            time.sleep(1)
+        while time.time() - start_time < server_waiting_timeout:
+            time.sleep(5)
+            for process in itertools.chain(worker_processes, [server_process]):
+                if process.poll() is not None:
+                    raise Exception(
+                        f"process {process.pid} exited with code {process.returncode}"
+                    )
             try:
                 print("Checking health endpoint")
                 response = requests.get("http://localhost:8000/health")
@@ -339,7 +351,7 @@ def run_parallel_test(model_name: str,
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -596,7 +608,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.skip_less_device_memory(140000)
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
@@ -635,7 +647,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
@@ -719,7 +731,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
@@ -774,7 +786,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8"
@@ -889,7 +901,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
 
 @skip_pre_blackwell
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     FP4_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf"
     FP8_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf"
