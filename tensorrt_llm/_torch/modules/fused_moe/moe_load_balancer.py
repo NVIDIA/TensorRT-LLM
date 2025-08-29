@@ -742,7 +742,7 @@ class MoeLoadBalancer:
             ep_rank: The rank of the current process in expert parallelism
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
-            shared_memory_base_name: Shared memory base name
+            shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
         """
         self.is_shutdown = True
         self.ep_rank = ep_rank
@@ -753,8 +753,8 @@ class MoeLoadBalancer:
         self._previous_balancer = None
         self.single_layer_load_balancers = []
         if shared_memory_base_name is None:
-            shared_memory_base_name = os.environ.get('TRTLLM_EPLB_SHM_NAME',
-                                                     'moe_shared')
+            shared_memory_base_name = shared_memory_base_name = os.getenv(
+                'TRTLLM_EPLB_SHM_NAME') or 'moe_shared'
         self.shared_memory_base_name = shared_memory_base_name
         self._setup_mpi_comm()
         self.is_shutdown = False
