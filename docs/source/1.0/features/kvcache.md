@@ -42,6 +42,8 @@ TensorRT-LLM takes advantage of grouped query attention in order to save memory.
 
 Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of KV cache system.
 
+See [KvCacheConfig example](examples.kvcacheconfig) for an example of how to use KvCacheConfig to control KV cache behavior.
+
 ### Datatype
 
 Perhaps the most important property is ```dtype``` which specifies what data type is held in KV cache. The default 'auto' specifies that data type should be inferred from model config.
