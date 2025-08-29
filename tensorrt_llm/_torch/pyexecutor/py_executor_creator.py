@@ -31,6 +31,7 @@ from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
+from ..utils import _get_allow_chain_drafter
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
@@ -40,12 +41,6 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-
-
-# Development function to control chain drafter feature.
-# It's here so that unit tests can mock it and turn it off.
-def _get_allow_chain_drafter() -> bool:
-    return True
 
 
 class _ExecutorCreationStage(enum.Enum):
@@ -346,9 +341,6 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-            # The draft model won't have any draft tokens attached to
-            # generation requests when we invoke it autoregressively
-            draft_spec_config.max_draft_len = 0
 
             if _get_allow_chain_drafter():
                 use_chain_drafter = (
