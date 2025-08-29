@@ -408,7 +408,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         appendParam(&launchParams.num_k_heads);
         appendParam(&headGrpSize);
         appendParam(&launchParams.cu_seq_lens);
-        bool const allowSlidingWindow = !isSpecDec;
+        bool const allowSlidingWindow
+            = !(isSpecDec && xqaParams.is_spec_dec_tree); // sliding windows does not support spec dec with tree-based
+                                                          // token, only chained tokens
         if (allowSlidingWindow)
         {
             appendParam(&launchParams.slidingWindowSize);
@@ -421,6 +423,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         }
         appendParam(&kernel_input_tokens);
         appendParam(&xqaParams.spec_decoding_packed_mask);
+        appendParam(&xqaParams.attention_sinks);
         appendParam(&launchParams.kvCacheParams);
         if (xqaParams.beam_width > 1)
         {
@@ -432,12 +435,11 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         appendParam(&launchParams.scratch);
 
         uint32_t multi_block = 1;
-        if (xqaParams.multi_block_mode)
-        {
-            multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-        }
-        uint32_t const nbKVHeads = xqaParams.num_kv_heads;
-        auto const gridDim = (dim3{multi_block, nbKVHeads, xqaParams.batch_size});
+        // if (xqaParams.multi_block_mode)
+        // {
+        //     multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
+        // }
+        auto const gridDim = (dim3{multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp, xqaParams.batch_size});
         dim3 const blockDim(128, 1, 2);
 
         cubinObj->launch(gridDim, blockDim, stream, kernelParams);
