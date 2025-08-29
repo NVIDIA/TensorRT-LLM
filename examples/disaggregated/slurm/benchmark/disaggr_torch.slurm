@@ -83,8 +83,11 @@ echo "ntasks_per_node: ${ntasks_per_node}"
 echo "==========================================="
 
 
-ctx_max_seq_len=$((isl + 1))
-gen_max_seq_len=$((isl + osl))
+nsys_on=""
+# nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
+numa_bind=true # Only allocate memory from nodes, this only works on GB200
+ctx_max_seq_len=$((isl + 10))
+gen_max_seq_len=$((isl + osl + 10))
 ctx_gpu_frac=${ctx_gpu_memory_fraction}
 cache_transceiver_max_num_tokens=8448
 
@@ -119,9 +122,6 @@ if [ -z "${TRT_LLM_GIT_COMMIT:-}" ]; then
     export TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
 fi
-
-nsys_on=""
-# nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
 
 # start the container
 srun -l --container-image=${container_image} \
@@ -193,7 +193,7 @@ for i in $(seq 0 $((num_gen_servers - 1))); do
         --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix \
-        bash ${workdir}/start_worker.sh "GEN" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
+        bash ${workdir}/start_worker.sh "GEN" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${numa_bind} ${full_logdir} ${nsys_on} \
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
@@ -206,7 +206,7 @@ for i in $(seq 0 $((num_ctx_servers - 1))); do
         --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix \
-        bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${full_logdir} ${nsys_on} \
+        bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${numa_bind} ${full_logdir} ${nsys_on} \
             &> ${full_logdir}/output_ctx_${i}.log &
 done
 

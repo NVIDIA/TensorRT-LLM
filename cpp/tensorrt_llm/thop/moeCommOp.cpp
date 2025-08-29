@@ -32,13 +32,14 @@ void setMoeCommFieldInfo(tensorrt_llm::kernels::MoeCommFieldInfo& fieldInfo, tor
 {
     TORCH_CHECK(tensor.dim() == 2, "tensor must be a 2D tensor");
     int eltSize = tensor.dtype().itemsize();
-    fieldInfo.fillFieldInfo(static_cast<uint8_t*>(tensor.data_ptr()), eltSize, tensor.size(1), tensor.stride(0));
+    fieldInfo.fillFieldInfo(static_cast<uint8_t*>(tensor.data_ptr()), eltSize, tensor.size(1), tensor.stride(0),
+        convert_torch_dtype(tensor.scalar_type()));
 }
 
 c10::List<torch::Tensor> moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum,
     torch::Tensor sendIndiceTensor, torch::Tensor recvRankCumSum, torch::Tensor recvIndiceTensor,
     torch::Tensor allWorkspaces, int64_t outputAllocationCount, int64_t epRank, int64_t epSize,
-    std::optional<c10::List<bool>> needZeroOutput = std::nullopt)
+    std::optional<c10::List<bool>> needZeroOutput = std::nullopt, c10::optional<bool> useLowPrecision = std::nullopt)
 {
     CHECK_INPUT(sendRankCumSum, torch::kInt32);
     CHECK_INPUT(sendIndiceTensor, torch::kInt32);
@@ -108,8 +109,12 @@ c10::List<torch::Tensor> moeCommOp(c10::List<torch::Tensor> inputs, torch::Tenso
     params.recvFieldInfo = recvFieldInfo;
     // Do not need expertParallelInfo for fused moe comm now
 
-    params.sendFieldInfo.fillMetaInfo(&(params.sendCommMeta), params.expertParallelInfo.topK, false, false);
-    params.recvFieldInfo.fillMetaInfo(&(params.recvCommMeta), params.expertParallelInfo.topK, false, false);
+    bool useLowPrecisionVal = useLowPrecision.value_or(false);
+    params.isLowPrecision = useLowPrecisionVal;
+    params.sendFieldInfo.fillMetaInfo(
+        &(params.sendCommMeta), params.expertParallelInfo.topK, false, false, useLowPrecisionVal);
+    params.recvFieldInfo.fillMetaInfo(
+        &(params.recvCommMeta), params.expertParallelInfo.topK, false, false, useLowPrecisionVal);
 
     tensorrt_llm::kernels::FusedMoeWorkspace fusedMoeWorkspace;
     tensorrt_llm::kernels::constructWorkspace(
@@ -249,7 +254,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_comm(Tensor[] inputs, Tensor send_rank_cum_sum, Tensor send_indices, Tensor "
         "recv_rank_cum_sum, Tensor recv_indices, Tensor all_workspaces, int output_allocation_count, int ep_rank, int "
-        "ep_size, bool[]? need_zero_output=None) -> Tensor[]");
+        "ep_size, bool[]? need_zero_output=None, bool? use_low_precision=None) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
