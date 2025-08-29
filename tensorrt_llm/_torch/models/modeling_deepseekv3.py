@@ -585,6 +585,11 @@ class Deepseekv3MoE(nn.Module):
                                                        do_finalize)
             return routed_output
 
+        @torch.compile(dynamic=True)
+        def _reduce_add_shared_output(routed_output, shared_output):
+            routed_output = torch.sum(routed_output, dim=1, keepdim=False)
+            return shared_output + routed_output
+
         routed_output, shared_output = maybe_execute_in_parallel(
             _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
@@ -593,9 +598,17 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
-            assert shared_output.size() == routed_output.size(
-            ), f'unmatched tensor shape'
-            final_hidden_states = shared_output + routed_output
+            if routed_output.dim() == 3:
+                assert shared_output.numel(
+                ) * self.top_k == routed_output.numel(
+                ), f'unmatched tensor shape'
+                final_hidden_states = _reduce_add_shared_output(
+                    routed_output, shared_output)
+            else:
+                assert shared_output.size() == routed_output.size(
+                ), f'unmatched tensor shape'
+                final_hidden_states = shared_output + routed_output
+
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
                     final_hidden_states,
