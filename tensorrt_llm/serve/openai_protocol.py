@@ -264,7 +264,7 @@ class CompletionRequest(OpenAIBaseModel):
             max_tokens=self.max_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
-            seed=self.seed,
+            seed=to_unsigned(self.seed, 64) if self.seed is not None else None,
             stop=self.stop,
             temperature=self.temperature,
             top_p=self.top_p,
@@ -594,14 +594,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             max_tokens=self.max_completion_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
-            seed=self.seed,
+            seed=to_unsigned(self.seed, 64) if self.seed is not None else None,
             stop=self.stop,
             temperature=self.temperature,
 
             # chat-completion-sampling-params
             best_of=self.best_of,
             use_beam_search=self.use_beam_search,
-            top_k=self.top_k,
+            top_k=max(0, self.top_k), # web users sometimes pass in -1
             top_p=self.top_p,
             top_p_min=self.top_p_min if self.top_p_min > 0 else None,
             min_p=self.min_p,
@@ -664,6 +664,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError("suffix is not supported")
         return data
 
+def to_unsigned(x: int, bits: int) -> int:
+    return x & (2 ** bits - 1)
 
 def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:
     if opaque_state is None:
