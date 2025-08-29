@@ -51,7 +51,8 @@ l0_b200:
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
   - unittest/_torch/speculative
-  - unittest/_torch/thop
+  - unittest/_torch/thop/parallel
+  - unittest/_torch/thop/serial
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_deepseek"

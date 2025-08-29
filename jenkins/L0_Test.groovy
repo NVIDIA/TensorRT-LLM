@@ -44,8 +44,9 @@ DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
 
-POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
-POD_TIMEOUT_SECONDS_TMP = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+POD_TIMEOUT_SECONDS_TEST = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
+POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+POD_TIMEOUT_SECONDS_SLURM = env.podTimeoutSeconds ? env.podTimeoutSeconds : "79200"  // Use 22 hours to allow for 2 hour of buffer.
 
 // Literals for easier access.
 @Field
@@ -133,7 +134,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 }
 
 //TODO: consolidate slurm related code for both multi nodes and single nodes
-def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID){
+def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID, String slurmOutputFile) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
             ip           : cluster.ip,
@@ -144,20 +145,50 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
         ]
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-        pipeline.stage('Clean up SLURM Agent Resources') {
-            Utils.exec(
-                pipeline,
-                timeout: false,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID}"
-                )
-            )
+
+        def slurmJobID = Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"sed -n " +
+                "-e 's/.*Submitted batch job \\([0-9]\\+\\).*/\\1/p' " +
+                "-e 's/.*srun: job \\([0-9]\\+\\) queued.*/\\1/p' " +
+                "-e 's/.*srun: job \\([0-9]\\+\\) has been allocated.*/\\1/p' " +
+                "${slurmOutputFile} | tail -n1\""
+            ),
+            returnStdout: true
+        ).trim()
+
+        if (!slurmJobID || !slurmJobID.isNumber()) {
+            Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"cat ${slurmOutputFile}\""))
+            error("Slurm job did not submit successfully. No job ID found.")
         }
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow slurm job termination; sleep 30")
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
+            )
+        )
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID}"
+            )
+        )
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
     }
 }
 
-def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
+def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, String slurmJobID) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
             ip           : cluster.ip,
@@ -168,17 +199,26 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
         ]
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-        pipeline.stage('Clean up SLURM Agent Resources') {
-            Utils.exec(
-                pipeline,
-                timeout: false,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh"
-                )
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
-            Utils.exec(pipeline, script: "echo done")
-        }
+        )
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh"
+            )
+        )
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
     }
 }
 
@@ -224,6 +264,8 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     def customWorkspace = "/tmp/${nodeName}"
     def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
 
+    def slurmJobID = null
+
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
@@ -245,22 +287,47 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3,)
 
-                Utils.exec(
+                Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
+
+                def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
-                            remote,
-                            """${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}"""
-                    )
+                        remote,
+                        "\"${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}\""
+                    ),
+                    returnStdout: true
                 )
+
+                def jobIDs = slurmSubmitOutput
+                    .readLines()
+                    .collect { it.trim() }
+                    .collectMany { line ->
+                        def ids = []
+                        def m1 = (line =~ /Submitted batch job (\d+)/)
+                        if (m1) ids << m1[0][1]  // Extract the first captured group
+                        def m2 = (line =~ /srun: job (\d+) (queued|has been allocated)/)
+                        if (m2) ids << m2[0][1]  // Extract the first captured group
+                        return ids
+                    }
+
+                slurmJobID = jobIDs ? jobIDs[-1] : null
+
+                if (!slurmJobID || !slurmJobID.isNumber()) {
+                    error("Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}")
+                }
+                Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
                 Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
             }
         }
 
         stage('Checking if the Node is Online') {
             def counter = 0
-            while (!CloudManager.isNodeOnline(nodeName) && counter < 12) {
-                sleep(time: 10, unit: 'MINUTES')  // Wait 10 minutes to check status of the node again
+            // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
+            // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
+            while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
+                // Wait 10 minutes to check status of the node again
+                sleep(time: 10, unit: 'MINUTES')
                 counter++
             }
 
@@ -291,12 +358,16 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
             } else {
-                echo "The node does not come online in 2 hours, terminating the job"
+                error "The Slurm node does not come online in the waiting period. Terminating the job."
             }
         }
     } finally {
-        cleanUpNodeResources(pipeline, cluster, nodeName)
-        CloudManager.destroyNode(nodeName)
+        stage('Clean up SLURM Resources') {
+            Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
+            CloudManager.destroyNode(nodeName)
+            Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
+            cleanUpNodeResources(pipeline, cluster, nodeName, slurmJobID)
+        }
     }
 }
 
@@ -315,7 +386,13 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
-    def jobUID = "${cluster.host}-multi_node_test-${UUID.randomUUID().toString()}"
+    // Create a unique suffix for the job name
+    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
+
+    Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
+
+    def slurmOutputFile = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -341,7 +418,9 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
-            def scriptRunNode = "${jobWorkspace}/slurm_run.sh"
+            def scriptRunNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
+            def scriptLaunch = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
+            slurmOutputFile = "${jobWorkspace}/${jobUID}-slurm_output.log"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def isAarch64 = config.contains("aarch64")
@@ -358,7 +437,10 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // Upload slurm_run_sh to Frontend node
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
+
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}", numRetries: 3,)
+                Utils.exec(pipeline, script: "cat ${scriptRunLocalPath}")
+
                 // Upload waives.txt to Frontend node
                 def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}", numRetries: 3,)
@@ -390,7 +472,6 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ].join(" ")
 
-                def scriptLaunch = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_launch.sh"
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
                 scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
                 def scriptContent = """#!/bin/bash
@@ -410,27 +491,33 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export MODEL_CACHE_DIR=$MODEL_CACHE_DIR
                     export NVIDIA_IMEX_CHANNELS=0
                     chmod +x ${scriptRunNode}
-                    ${srunCmd}
+                    ${srunCmd} 2>&1 | tee ${slurmOutputFile}
                 """.stripIndent()
                 pipeline.writeFile(file: scriptLaunchDestPath, text: scriptContent)
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}", numRetries: 3,)
+                Utils.exec(pipeline, script: "cat ${scriptLaunchDestPath}")
             }
+
             stage('Run Test') {
-                def scriptLaunch = "${jobWorkspace}/slurm_launch.sh"
                 Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        """bash ${scriptLaunch}"""
+                        "\"bash ${scriptLaunch}\""
                     )
                 )
             }
+
+            echo "Finished test stage execution."
         }
     } finally {
         uploadResults(pipeline, cluster, jobUID, stageName)
-        cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID)
+
+        stage('Clean up SLURM Resources') {
+            cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID, slurmOutputFile)
+        }
     }
 }
 
@@ -559,6 +646,14 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         } else {
             sh 'if [ "$(id -u)" -eq 0 ]; then dmesg; fi'
             if (noResultIfSuccess && !stageIsFailed) {
+                // Clean up the workspace
+                sh """
+                    env | sort
+                    pwd && ls -alh
+                    rm -rf ./*
+                """
+
+                echo "Finished test stage execution."
                 return
             }
             echo "noResultIfSuccess: ${noResultIfSuccess}, stageIsFailed: ${stageIsFailed}"
@@ -579,14 +674,16 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                 "${UPLOAD_PATH}/test-results/"
             )
             junit(testResults: "${stageName}/results*.xml")
-
-            // Clean up the workspace
-            sh """
-                env | sort
-                pwd && ls -alh
-                rm -rf ./*
-            """
         }
+
+        // Clean up the workspace
+        sh """
+            env | sort
+            pwd && ls -alh
+            rm -rf ./*
+        """
+
+        echo "Finished test stage execution."
     }
 }
 
@@ -629,7 +726,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_SLURM}]
                     tty: true
                     resources:
                       requests:
@@ -647,7 +744,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TMP}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_BUILD}]
                     volumeMounts:
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
@@ -713,7 +810,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TEST}]
                     tty: true
                     resources:
                       requests:
@@ -2153,10 +2250,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         }
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
+                            // Retry 2 times if timeout occurs.
                             sh "env | sort"
-                            timeout(time: 30, unit: 'MINUTES') {
-                                checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
-                            }
+                            trtllm_utils.llmRetry(1, "checkPipInstall", {
+                                timeout(time: 30, unit: 'MINUTES') {
+                                    checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                                }
+                            })
                         }
                         echo "###### Run LLMAPI tests Start ######"
                         def config = VANILLA_CONFIG

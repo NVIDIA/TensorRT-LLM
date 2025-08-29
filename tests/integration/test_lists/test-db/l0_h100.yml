@@ -23,7 +23,8 @@ l0_h100:
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
   - unittest/_torch/speculative
-  - unittest/_torch/thop
+  - unittest/_torch/thop/parallel
+  - unittest/_torch/thop/serial
   # Only key models in H100: llama/mixtral/nemotron/deepseek
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
@@ -102,6 +103,7 @@ l0_h100:
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-enable_request_rate] # negative test
   - test_e2e.py::test_trtllm_bench_help_sanity[meta-llama/Llama-3.1-8B]
+  - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-True]
   # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
