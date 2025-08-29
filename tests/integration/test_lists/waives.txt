@@ -330,7 +330,6 @@ accuracy/test_cli_flow.py::TestLongAlpaca7B::test_auto_dtype SKIP (https://nvbug
 accuracy/test_llm_api.py::TestPhi4MiniInstruct::test_fp8 SKIP (https://nvbugs/5465143)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput] SKIP (https://nvbugs/5471106)
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype SKIP (https://nvbugs/5481090)
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-cutlass] SKIP (https://nvbugs/5481080)
 test_e2e.py::test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k[Llama-4-Maverick-17B-128E-Instruct-FP8-llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8-False] SKIP (https://nvbugs/5481094)
 test_e2e.py::test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k[Llama-4-Maverick-17B-128E-Instruct-FP8-llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8-True] SKIP (https://nvbugs/5481094)
 test_e2e.py::test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k[Llama-4-Scout-17B-16E-Instruct-FP8-llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8-True] SKIP (https://nvbugs/5481094)
