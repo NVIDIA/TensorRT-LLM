@@ -58,6 +58,7 @@ from ..utils import (get_model_extra_attrs,
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
+from .guided_decoder import GuidedWorker
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
