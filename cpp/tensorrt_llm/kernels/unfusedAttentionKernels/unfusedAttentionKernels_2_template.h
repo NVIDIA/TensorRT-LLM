@@ -559,7 +559,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE)
                 {
                     mmha::convert_from_float(
-                        &scaleOrigQuant, params.kvScaleOrigQuant ? params.kvScaleOrigQuant[0] : 1.0f);
+                        &scaleOrigQuant, params.qkv_scale_orig_quant ? params.qkv_scale_orig_quant[0] : 1.0f);
                 }
 
                 if constexpr (FP8_OUTPUT)
@@ -611,9 +611,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                                 params.kv_cache_block_scales_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
                             auto* vBlockScales = reinterpret_cast<uint8_t*>(
                                 params.kv_cache_block_scales_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
-                            float kSecondLevelSF = params.kv_cache_scale_factors[0];
-                            float vSecondLevelSF = params.kv_cache_scale_factors[1];
-
+                            float kSecondLevelSF = params.qkv_scale_orig_quant[1];
+                            float vSecondLevelSF = params.qkv_scale_orig_quant[2];
                             auto& kPacked = reinterpret_cast<PackedVec<T>&>(k_to_cache);
                             auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
                             quantizeAndWriteFP4KVCache<T>(kBlockScales, vBlockScales, reinterpret_cast<uint32_t*>(kDst),
@@ -640,13 +639,24 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             params.fmha_tile_counter[0] = 0u;
         }
         // Take the quantization scales into consideration.
-        float q_scale_quant_orig = params.q_scale_quant_orig ? params.q_scale_quant_orig[0] : 1.f;
-        float kv_scale_quant_orig = params.kv_scale_quant_orig ? params.kv_scale_quant_orig[0] : 1.f;
+        float q_scale_quant_orig, k_scale_quant_orig, v_scale_quant_orig;
+        if constexpr (ENABLE_4BITS_CACHE)
+        {
+            q_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+            k_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[1] : 1.f;
+            v_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[2] : 1.f;
+        }
+        else
+        {
+            q_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+            k_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+            v_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+        }
         float o_scale_orig_quant = params.o_scale_orig_quant ? params.o_scale_orig_quant[0] : 1.f;
         if (params.fmha_bmm1_scale)
         {
             // The scale after fmha bmm1.
-            params.fmha_bmm1_scale[0] = q_scale_quant_orig * kv_scale_quant_orig * params.fmha_host_bmm1_scale;
+            params.fmha_bmm1_scale[0] = q_scale_quant_orig * k_scale_quant_orig * params.fmha_host_bmm1_scale;
             // The scale prepared for log2 optimization.
             constexpr float kLog2e = 1.4426950408889634074f;
             params.fmha_bmm1_scale[1] = params.fmha_bmm1_scale[0] * kLog2e;
@@ -654,7 +664,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
         if (params.fmha_bmm2_scale)
         {
             // The scale after fmha bmm2.
-            params.fmha_bmm2_scale[0] = o_scale_orig_quant * kv_scale_quant_orig;
+            params.fmha_bmm2_scale[0] = o_scale_orig_quant * v_scale_quant_orig;
         }
     }
 }
@@ -951,7 +961,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             [[maybe_unused]] TScale scaleOrigQuant;
             if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE)
             {
-                mmha::convert_from_float(&scaleOrigQuant, params.kvScaleOrigQuant ? params.kvScaleOrigQuant[0] : 1.0f);
+                mmha::convert_from_float(
+                    &scaleOrigQuant, params.qkv_scale_orig_quant ? params.qkv_scale_orig_quant[0] : 1.0f);
             }
 
             if constexpr (FP8_OUTPUT)
@@ -996,7 +1007,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                         // Cast float scale to dst data type.
                         using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
                         TScale scaleOrigQuant;
-                        mmha::convert_from_float(&scaleOrigQuant, params.kvScaleOrigQuant[0]);
+                        mmha::convert_from_float(&scaleOrigQuant, params.qkv_scale_orig_quant[0]);
                         // Store 8bits kv cache.
                         mmha::store_8bits_vec(kDst, k, inBlockIdx, scaleOrigQuant);
                         mmha::store_8bits_vec(vDst, v, inBlockIdx, scaleOrigQuant);
@@ -1007,9 +1018,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                             params.kv_cache_block_scales_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
                         auto* vBlockScales = reinterpret_cast<uint8_t*>(
                             params.kv_cache_block_scales_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
-                        float kSecondLevelSF = params.kv_cache_scale_factors[0];
-                        float vSecondLevelSF = params.kv_cache_scale_factors[1];
-
+                        float kSecondLevelSF = params.qkv_scale_orig_quant[1];
+                        float vSecondLevelSF = params.qkv_scale_orig_quant[2];
                         auto& kPacked = reinterpret_cast<PackedVec<T>&>(k);
                         auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
                         quantizeAndWriteFP4KVCache<T>(kBlockScales, vBlockScales, reinterpret_cast<uint32_t*>(kDst),
@@ -1035,13 +1045,24 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             params.fmha_tile_counter[0] = 0u;
         }
         // Take the quantization scales into consideration.
-        float q_scale_quant_orig = params.q_scale_quant_orig ? params.q_scale_quant_orig[0] : 1.f;
-        float kv_scale_quant_orig = params.kv_scale_quant_orig ? params.kv_scale_quant_orig[0] : 1.f;
+        float q_scale_quant_orig, k_scale_quant_orig, v_scale_quant_orig;
+        if constexpr (ENABLE_4BITS_CACHE)
+        {
+            q_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+            k_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[1] : 1.f;
+            v_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[2] : 1.f;
+        }
+        else
+        {
+            q_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+            k_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+            v_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+        }
         float o_scale_orig_quant = params.o_scale_orig_quant ? params.o_scale_orig_quant[0] : 1.f;
         if (params.fmha_bmm1_scale)
         {
             // The scale after fmha bmm1.
-            params.fmha_bmm1_scale[0] = q_scale_quant_orig * kv_scale_quant_orig * params.fmha_host_bmm1_scale;
+            params.fmha_bmm1_scale[0] = q_scale_quant_orig * k_scale_quant_orig * params.fmha_host_bmm1_scale;
             // The scale prepared for log2 optimization.
             constexpr float kLog2e = 1.4426950408889634074f;
             params.fmha_bmm1_scale[1] = params.fmha_bmm1_scale[0] * kLog2e;
@@ -1049,7 +1070,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         if (params.fmha_bmm2_scale)
         {
             // The scale after fmha bmm2.
-            params.fmha_bmm2_scale[0] = o_scale_orig_quant * kv_scale_quant_orig;
+            params.fmha_bmm2_scale[0] = o_scale_orig_quant * v_scale_quant_orig;
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -1378,7 +1399,8 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
     [[maybe_unused]] TScale scale_orig_quant;
     if constexpr (sizeof(TCache) == 1 || FP8_OUTPUT)
     {
-        mmha::convert_from_float(&scale_orig_quant, params.kvScaleOrigQuant ? params.kvScaleOrigQuant[0] : 1.0f);
+        mmha::convert_from_float(
+            &scale_orig_quant, params.qkv_scale_orig_quant ? params.qkv_scale_orig_quant[0] : 1.0f);
     }
 
     // For loop in the sequence length dimension.
