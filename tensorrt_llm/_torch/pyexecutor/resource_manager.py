@@ -508,8 +508,9 @@ class KVCacheManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
 
+    @staticmethod
     def calculate_scaling_factor_size_bytes(
-            self, cache_size: int, quant_vector_size: int,
+            cache_size: int, quant_vector_size: int,
             scaling_factor_dtype: DataType) -> int:
         assert cache_size % quant_vector_size == 0, "NVFP4 cache size must be divisible by quant vector size"
         return get_size_in_bytes(cache_size // quant_vector_size,
@@ -733,7 +734,7 @@ class KVCacheManager(BaseResourceManager):
             cache_size_bytes_per_token = get_size_in_bytes(
                 cache_size_per_token, dtype)
             if dtype == DataType.NVFP4:
-                cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
+                cache_size_bytes_per_token += KVCacheManager.calculate_scaling_factor_size_bytes(
                     cache_size_per_token,
                     quant_vector_size=16,
                     scaling_factor_dtype=DataType.FP8)
@@ -766,7 +767,7 @@ class KVCacheManager(BaseResourceManager):
                 cache_size_bytes_per_token = get_size_in_bytes(
                     cache_size_per_token, dtype)
                 if dtype == DataType.NVFP4:
-                    cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
+                    cache_size_bytes_per_token += KVCacheManager.calculate_scaling_factor_size_bytes(
                         cache_size_per_token,
                         quant_vector_size=16,
                         scaling_factor_dtype=DataType.FP8)
