@@ -69,12 +69,14 @@ struct SendRecvIndices
 struct MoeCommFieldInfo
 {
     uint8_t* dataPtrBase;
-    uint8_t alignedUnitBit;      // 0, 1, 2, 3, 4 (for 1, 2, 4, 8, 16 Bytes), smallest aligned unit.
-    uint16_t alignedUnitCount;   // data count in aligned unit
-    uint16_t alignedUnitStride;  // data stride in aligned unit
+    uint8_t alignedUnitBit;          // 0, 1, 2, 3, 4 (for 1, 2, 4, 8, 16 Bytes), smallest aligned unit.
+    uint16_t alignedUnitCount;       // data count in aligned unit
+    uint16_t alignedUnitStride;      // data stride in aligned unit
 
-    uint8_t unalignedFieldIndex; // the index of unaligned Field, no decrease with field index
-    uint16_t compact16BOffset;   // aligned to 16 Bytes, offset is count of 16 Byte
+    uint8_t unalignedFieldIndex;     // the index of unaligned Field, no decrease with field index
+    uint16_t compact16BOffset;       // aligned to 16 Bytes, offset is count of 16 Byte
+
+    cudaDataType_t originalDataType; // original data type, used for low precision alltoall.
 
     static constexpr uint64_t kAlign16BytePtrMask = (1ULL << 4) - 1;
     static constexpr uint32_t kAligned16BMask = (1 << 4) - 1;
@@ -87,7 +89,8 @@ struct MoeCommFieldInfo
     // Will pad one 16 byte for each unaligned field, then head and tail 16 byte might not be aligned
 
     // Fill single field info, the fields that need global info is not filled here.
-    __host__ void fillFieldInfo(uint8_t* dataPtr, size_t elementSize, int vectorSize, int stride);
+    __host__ void fillFieldInfo(
+        uint8_t* dataPtr, size_t elementSize, int vectorSize, int stride, cudaDataType_t originalDataType);
 
     __host__ void setUnused()
     {
@@ -97,13 +100,6 @@ struct MoeCommFieldInfo
         alignedUnitStride = 0;
         unalignedFieldIndex = 0;
         compact16BOffset = 0;
-    }
-
-    template <typename T>
-    __host__ void fillFieldInfo(T* dataPtr, int vectorSize, int stride)
-    {
-        size_t elementSize = sizeof(T);
-        fillFieldInfo(reinterpret_cast<uint8_t*>(dataPtr), elementSize, vectorSize, stride);
     }
 
     __device__ __host__ __forceinline__ int getFieldUncompactSize() const
@@ -407,7 +403,8 @@ struct FusedMoeFieldInfo
         return getBasicFieldPtr<float, false>(tokenIndex, selectedIndex, topK);
     }
 
-    void fillMetaInfo(MoeSingleCommMeta* singleCommMeta, int topK, bool hasScales, bool hasBasicFields) const;
+    void fillMetaInfo(
+        MoeSingleCommMeta* singleCommMeta, int topK, bool hasScales, bool hasBasicFields, bool isLowPrecision) const;
 
     void fillFieldPlacementInfo(int topK, bool hasBasicFields);
 };
@@ -422,6 +419,7 @@ struct FusedMoeCommKernelParam
     SendRecvIndices recvIndices;
     FusedMoeFieldInfo sendFieldInfo;
     FusedMoeFieldInfo recvFieldInfo;
+    bool isLowPrecision;
 };
 
 /*

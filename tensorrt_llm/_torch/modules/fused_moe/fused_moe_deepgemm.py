@@ -411,7 +411,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
     def get_workspace(self, m_max: int, group_size: int):
         hidden_size = self.hidden_size
-        intermediate_size = self.intermediate_size
+        intermediate_size = self.intermediate_size_per_partition
         num_experts = self.expert_size_per_partition
 
         # create workspace
@@ -564,7 +564,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # grouped gemm 1
         h1 = set_strides(workspace["workspace_1"],
                          self.expert_size_per_partition, m_max,
-                         self.intermediate_size * 2)
+                         self.intermediate_size_per_partition * 2)
 
         deepgemm_fp8_group_blockwise_gemm(
             d=h1,
@@ -579,9 +579,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # activation and quantization
         act_input_fp8 = set_strides(workspace["workspace_0"],
                                     self.expert_size_per_partition, m_max,
-                                    self.intermediate_size)
+                                    self.intermediate_size_per_partition)
 
-        scale_k = fp8_utils.ceil_div(self.intermediate_size, 128)
+        scale_k = fp8_utils.ceil_div(self.intermediate_size_per_partition, 128)
         scale_k_padded = fp8_utils.align(scale_k, 4)
         act_input_sf = set_strides(workspace["workspace_sf"],
                                    self.expert_size_per_partition,

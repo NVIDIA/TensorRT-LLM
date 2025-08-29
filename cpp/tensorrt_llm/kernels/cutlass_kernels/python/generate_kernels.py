@@ -139,7 +139,8 @@ class TrtLlm_GemmLauncher:
                  mainloop_schedule,
                  epi_schedule,
                  epi_fusion=None,
-                 is_mx_fpx=False):
+                 is_mx_fpx=False,
+                 swap_ab=False):
         self.gemm_kind = gemm_kind
         self.arch = arch
         self.act_type = act_type
@@ -157,6 +158,7 @@ class TrtLlm_GemmLauncher:
         self.epi_schedule = epi_schedule
         self.epi_fusion = epi_fusion
         self.is_mx_fpx = is_mx_fpx
+        self.swap_ab = swap_ab
 
     def __repr__(self):
         kernel_prefix = "{}_sm{}_{}_{}_{}_{}_{}_{}_{}_{}x{}x{}_{}x{}x{}_{}".format(
@@ -170,11 +172,13 @@ class TrtLlm_GemmLauncher:
             self.cta_shape[2], self.warp_shape[0], self.warp_shape[1],
             self.warp_shape[2], self.stages)
 
-        hopper_suffix = "_{}x{}x{}{}{}{}".format(
+        hopper_suffix = "_{}x{}x{}{}{}{}{}{}".format(
             self.cga_shape[0], self.cga_shape[1], self.cga_shape[2],
             KernelScheduleSuffixes[self.mainloop_schedule],
             EpilogueScheduleSuffixes[self.epi_schedule],
-            EpiFusionSuffixes[self.epi_fusion])
+            EpiFusionSuffixes[self.epi_fusion],
+            "_mxfpx_" if self.is_mx_fpx else "",
+            "_swap_ab" if self.swap_ab else "")
 
         if self.arch >= 90:
             return kernel_prefix + hopper_suffix
@@ -261,7 +265,7 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             # """
             instantiation = f"""
 #if {guard_act} && {guard_weight}
-        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag}, {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, false);
+        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag}, {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, false, {"true" if operation.swap_ab else "false"});
 #endif"""
     return instantiation
 
@@ -503,13 +507,15 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
         TrtLlm_EpilogueFusion.epilogue_fusion_finalize
     ]
 
+    swap_ab = [True, False]
+
     cga_shapes = product([1, 2], [1, 2], [1])
 
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mn, cga_shapes)
+                           cta_shapes_mn, cga_shapes, swap_ab)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape, swap_ab in partial_args:
         max_k_bits = 128 * 8
         cta_shape_k = max_k_bits // GetDataTypeBits(dtype)
         cta_shape_mnk = cta_shape_mn + (cta_shape_k, )
@@ -522,10 +528,23 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cta_shape_mnk, warp_shape, stages, cga_shape,
-                mainloop_schedule, epi_schedule, epi_fusion)
+            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
+                                                     arch,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     otype,
+                                                     quant_op,
+                                                     epi_tag,
+                                                     cta_shape_mnk,
+                                                     warp_shape,
+                                                     stages,
+                                                     cga_shape,
+                                                     mainloop_schedule,
+                                                     epi_schedule,
+                                                     epi_fusion,
+                                                     swap_ab=swap_ab)
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
@@ -632,11 +651,13 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
 
     cga_shapes = [[1, 1, 1]]
 
+    swap_ab = [True, False]
+
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mnk, cga_shapes)
+                           cta_shapes_mnk, cga_shapes, swap_ab)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape in partial_args:
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape, swap_ab in partial_args:
 
         # Ignored
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
@@ -647,10 +668,23 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cta_shape_mnk, warp_shape, stages, cga_shape,
-                mainloop_schedule, epi_schedule, epi_fusion)
+            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
+                                                     arch,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     otype,
+                                                     quant_op,
+                                                     epi_tag,
+                                                     cta_shape_mnk,
+                                                     warp_shape,
+                                                     stages,
+                                                     cga_shape,
+                                                     mainloop_schedule,
+                                                     epi_schedule,
+                                                     epi_fusion,
+                                                     swap_ab=swap_ab)
 
             operations.append(moe_gemm_operation)
     return operations
@@ -685,11 +719,13 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
 
     cga_shapes = list(product([1, 2], [1, 2], [1]))
 
+    swap_ab = [True, False]
+
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mn, cga_shapes)
+                           cta_shapes_mn, cga_shapes, swap_ab)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape, swap_ab in partial_args:
         if isinstance(dtype, tuple):
             dtype, weight_type = dtype
         else:
@@ -723,7 +759,8 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
                 mainloop_schedule,
                 epi_schedule,
                 epi_fusion,
-                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1))
+                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1),
+                swap_ab=swap_ab)
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
