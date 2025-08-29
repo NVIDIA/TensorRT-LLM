@@ -312,6 +312,7 @@ class MNNVLAllReduce(nn.Module):
     def get_supported_dtypes():
         return (torch.float16, torch.bfloat16, torch.float32)
 
+    # Check if MNNVL is supported
     @staticmethod
     def is_mnnvl(mapping: Mapping, dtype: torch.dtype) -> bool:
         from tensorrt_llm._mnnvl_utils import MnnvlMemory
@@ -455,8 +456,14 @@ class AllReduce(nn.Module):
                 self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
-            if self.strategy == AllReduceStrategy.MNNVL:
-                if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
+            if self.strategy in (AllReduceStrategy.AUTO,
+                                 AllReduceStrategy.MNNVL):
+                if self.mapping.tp_size != self.mapping.world_size:
+                    logger.debug(
+                        f"MNNVLAllReduce is disabled due to tp_size:{self.mapping.tp_size} "
+                        f"!= world_size:{self.mapping.world_size}")
+                    self.mnnvl_allreduce = None
+                elif MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     try:
                         self.mnnvl_allreduce = MNNVLAllReduce(
                             self.mapping, dtype) if dtype else None
@@ -473,6 +480,9 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+
+    def is_mnnvl(self) -> bool:
+        return self.mnnvl_allreduce is not None
 
     def forward(
         self,

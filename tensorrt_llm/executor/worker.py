@@ -18,7 +18,7 @@ from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import PybindMirror, TorchLlmArgs
+from ..llmapi.llm_args import KvCacheConnectorConfig, PybindMirror, TorchLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
@@ -61,6 +61,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[TorchLlmArgs] = None,
@@ -86,6 +87,10 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._executor_config = executor_config
         self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
         self.llm_args = llm_args
+
+        if not self._is_pytorch_backend and kv_connector_config is not None:
+            raise ValueError(
+                "KV connector config is only supported for PyTorch backend")
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -127,6 +132,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 args["lora_config"] = lora_config
                 args[
                     "garbage_collection_gen0_threshold"] = llm_args.garbage_collection_gen0_threshold
+                args["kv_connector_config"] = kv_connector_config
             elif executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
@@ -680,6 +686,7 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
+    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     hf_model_dir: Optional[Path] = None,
     tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[TorchLlmArgs] = None,
@@ -809,6 +816,7 @@ def worker_main(
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
+            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
             llm_args=llm_args)
