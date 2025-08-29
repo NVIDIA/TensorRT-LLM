@@ -71,7 +71,7 @@ Note: MoE module load balancing is handled separately by the Expert Parallel Loa
 The $sol\\_tps$ represents the theoretical upper-bound throughput achievable with perfect load balancing:
 
 ```math
-sol\_time = \sum_{i=0}^{\infty} \frac{time_i}{balance\_ratio_i}
+sol\_time = \sum_{i=0}^{\infty} time_i * balance\_ratio_i
 ```
 
 ```math
