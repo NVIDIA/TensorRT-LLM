@@ -31,11 +31,12 @@ if __name__ == '__main__':
 This example runs with default KV cache properties. The default for ```free_gpu_memory_fraction``` is 0.9, which means TRTLLM will try to allocate 90% of free GPU memory for KV cache. Depending on your system, this may be too aggressive, so you decide to dial that back to 0.7. This is done by adding the following lines to the quickstart example:
 
 ```
+from tensorrt_llm.llmapi import KvCacheConfig
 kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 llm = LLM(model='TinyLlama/TinyLlama-1.1B-Chat-v1.0', kv_cache_config=kv_cache_config)
 ```
 
-You can also set properties after you create KvCacheConfig instance:
+You can also set properties after you create KvCacheConfig, for instance
 
 ```
 kv_cache_config = KvCacheConfig()
@@ -44,5 +45,4 @@ llm = LLM(model='TinyLlama/TinyLlama-1.1B-Chat-v1.0', kv_cache_config=kv_cache_c
 ```
 
 will disable block reuse for the quickstart example.
-
 
