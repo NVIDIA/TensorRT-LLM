@@ -580,24 +580,21 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByHashesTest)
 
     blockManager.storeContextBlocks(seq0, *llmRequest0);
 
-    std::vector<size_t> emptyHashes{};
-    auto result = blockManager.findBlocksInReuseTreeByHashes(emptyHashes, maxAttentionWindow);
+    std::vector<BlockKey> emptyKeys{};
+    auto result = blockManager.findBlocksInReuseTreeByBlockKeys(emptyKeys, maxAttentionWindow);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ((*result)->getBlockId(), KVCacheBlock::kCachedBlocksRootId);
 
     auto block0 = blockManager.getBlockById(cacheBlockIds[0], maxAttentionWindow);
     // Corrupt the valid hash to guarantee a miss
-    std::vector<size_t> badHashes{block0->getHash() ^ static_cast<size_t>(0x9e3779b97f4a7c15ULL)};
-    result = blockManager.findBlocksInReuseTreeByHashes(badHashes, maxAttentionWindow);
+    std::vector<BlockKey> badKeys{BlockKey{block0->getHash() ^ static_cast<size_t>(0x9e3779b97f4a7c15ULL)}};
+    result = blockManager.findBlocksInReuseTreeByBlockKeys(badKeys, maxAttentionWindow);
     EXPECT_FALSE(result.has_value());
 
-    std::vector<size_t> hashes{block0->getHash()};
-    result = blockManager.findBlocksInReuseTreeByHashes(hashes, maxAttentionWindow);
+    std::vector<BlockKey> keys{BlockKey{block0->getHash()}};
+    result = blockManager.findBlocksInReuseTreeByBlockKeys(keys, maxAttentionWindow);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ((*result)->getBlockId(), block0->getBlockId());
-
-    // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16] (17 tokens, three blocks)
-    BlockKey
 }
 
 #ifdef ENABLE_FP4

@@ -35,7 +35,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    std::vector<size_t> const& allBlockHashes, std::vector<size_t> const& requestedBlockHashes);
+    std::vector<BlockKey> const& allBlockKeys, SizeType32 indexFromEnd);
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
 
@@ -130,15 +130,15 @@ public:
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, std::vector<size_t> allBlockHashes = {},
-        std::vector<size_t> requestedBlockHashes = {}, LlmRequest const* llmRequest = nullptr)
+        runtime::BufferManager const& bufferManager, std::vector<BlockKey> allBlockKeys = {},
+        SizeType32 indexFromEnd = 0, LlmRequest const* llmRequest = nullptr)
         : mConnections(std::move(connections))
         , mDataContext(dataContext)
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
-        , mAllBlockHashes(std::move(allBlockHashes))
-        , mRequestedBlockHashes(std::move(requestedBlockHashes))
+        , mAllBlockKeys(std::move(allBlockKeys))
+        , mIndexFromEnd(indexFromEnd)
         , mRequest(llmRequest)
     {
         TLLM_CHECK(!mConnections.empty());
@@ -235,14 +235,14 @@ public:
         outFile << '\n' << std::flush;
     }
 
-    [[nodiscard]] std::vector<size_t> const& getAllBlockHashes() const
+    [[nodiscard]] std::vector<BlockKey> const& getAllBlockKeys() const
     {
-        return mAllBlockHashes;
+        return mAllBlockKeys;
     }
 
-    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const
+    [[nodiscard]] SizeType32 getIndexFromEnd() const
     {
-        return mRequestedBlockHashes;
+        return mIndexFromEnd;
     }
 
 private:
@@ -253,8 +253,8 @@ private:
     runtime::BufferManager const* mBufferManager;
     std::vector<Measure> mMeasures;
     bool mRecordMeasure{false};
-    std::vector<size_t> mAllBlockHashes;
-    std::vector<size_t> mRequestedBlockHashes;
+    std::vector<BlockKey> mAllBlockKeys;
+    SizeType32 mIndexFromEnd;
     LlmRequest const* mRequest;
 };
 

@@ -113,6 +113,11 @@ std::vector<MmKey> generateBlockHashExtraKeys(
     return extraKeys;
 }
 
+} // namespace
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+
 std::vector<BlockKey> buildBlockKeys(
     std::list<VecUniqueTokens>& blockedUniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
@@ -129,11 +134,6 @@ std::vector<BlockKey> buildBlockKeys(
     }
     return blockKeys;
 }
-
-} // namespace
-
-namespace tensorrt_llm::batch_manager::kv_cache_manager
-{
 
 bool BlockKey::operator==(BlockKey const& other) const noexcept
 {
@@ -1010,34 +1010,29 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
-std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReuseTreeByHashes(
-    std::vector<size_t> const& hashes) const
+std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReuseTreeByBlockKeys(
+    std::vector<BlockKey> const& blockKeys) const
 {
-    std::cout << "findBlocksInReuseTreeByHashes: " << hashes.size() << std::endl;
-    for (auto hash : hashes)
+    std::cout << "findBlocksInReuseTreeByBlockKeys: " << blockKeys.size() << std::endl;
+    for (auto const& key : blockKeys)
     {
-        std::cout << hash << " ";
+        std::cout << key.hash << " ";
     }
     std::cout << std::endl;
-    std::vector<BlockKey> blockKeys;
-    for (auto const& hash : hashes)
-    {
-        blockKeys.emplace_back(hash);
-    }
 
     auto searchRoot = mCachedBlocksRoot;
     for (auto const& blockKey : blockKeys)
     {
-        std::cout << "findBlocksInReuseTreeByHashes: searching for block key: " << blockKey.hash << std::endl;
+        std::cout << "findBlocksInReuseTreeByBlockKeys: searching for block key: " << blockKey.hash << std::endl;
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(blockKey, false, false)
+            ? searchRoot->findMatchingBlock(blockKey, true, true)
             : std::make_tuple(false, 0, nullptr);
         if (matchingBlock == nullptr)
         {
-            std::cout << "findBlocksInReuseTreeByHashes: no matching block found" << std::endl;
+            std::cout << "findBlocksInReuseTreeByBlockKeys: no matching block found" << std::endl;
             return std::nullopt;
         }
-        std::cout << "findBlocksInReuseTreeByHashes: matching block found" << matchingBlock->getHash() << std::endl;
+        std::cout << "findBlocksInReuseTreeByBlockKeys: matching block found" << matchingBlock->getHash() << std::endl;
         searchRoot = std::move(matchingBlock);
     }
     return searchRoot;
@@ -1341,8 +1336,8 @@ void WindowBlockManager::storeBlocks(
     for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
     {
         auto const bid = blockIds[blockCnt];
-        std::cout << "Storing block " << bid << " block hash: " << BlockKeyHasher::hash(blockKeys[blockCnt])
-                  << std::endl;
+        // std::cout << "Storing block " << bid << " block hash: " << BlockKeyHasher::hash(blockKeys[blockCnt])
+        //   << std::endl;
         TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
         auto& block = mAllBlocksById[bid];
         auto const& blockKey = blockKeys[blockCnt];

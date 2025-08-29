@@ -48,37 +48,33 @@ public:
         return BlockRange(cacheManager, blockIds, requestId);
     }
 
-    static BlockRange fromReuseTree(BaseKVCacheManager const& cacheManager, std::vector<size_t> const& allBlockHashes,
-        std::vector<size_t> const& requestedBlockHashes)
+    static BlockRange fromReuseTree(
+        BaseKVCacheManager const& cacheManager, std::vector<BlockKey> const& allBlockKeys, SizeType32 indexFromEnd)
     {
         auto const windowSize = firstWindowSize(cacheManager);
-        std::cout << "allBlockHashes: " << allBlockHashes.size() << std::endl;
-        for (auto hash : allBlockHashes)
-        {
-            std::cout << hash << " ";
-        }
-        std::cout << std::endl;
-        std::cout << "requestedBlockHashes: " << requestedBlockHashes.size() << std::endl;
-        for (auto hash : requestedBlockHashes)
-        {
-            std::cout << hash << " ";
-        }
-        std::cout << std::endl;
-
-        auto lastBlock = *cacheManager.findBlocksInReuseTreeByHashes(allBlockHashes, windowSize);
+        // Find the last block in the reuse tree for the provided full sequence of block keys
+        auto lastBlock = *cacheManager.findBlocksInReuseTreeByBlockKeys(allBlockKeys, windowSize);
         // TODO: handle the case where the last block is not found
         TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
-        // Assume the the last block is the requested block
+        // Validate indexFromEnd and determine how many trailing blocks to collect
+        auto const totalNumBlocks = static_cast<SizeType32>(allBlockKeys.size());
+        TLLM_CHECK_WITH_INFO(
+            indexFromEnd < totalNumBlocks, "indexFromEnd=%d is out of range (total=%d)", indexFromEnd, totalNumBlocks);
+
+        // Number of blocks to return equals suffix length starting at the block located indexFromEnd from the end
+        // Example: indexFromEnd=0 -> return last block only; indexFromEnd=2 -> return last 3 blocks
+        SizeType32 const numBlocksToCollect = indexFromEnd + 1;
+
         std::vector<SizeType32> blockIds;
-        for (auto const& hash : requestedBlockHashes)
+        blockIds.reserve(numBlocksToCollect);
+        for (SizeType32 i = 0; i < numBlocksToCollect; ++i)
         {
-            if (lastBlock->getHash() != hash)
-            {
-                return BlockRange(cacheManager, {}, 0);
-            }
             blockIds.emplace_back(lastBlock->getBlockId());
-            lastBlock = lastBlock->getPrevBlock();
-            TLLM_CHECK_WITH_INFO(lastBlock, "Last block is not found");
+            if (i + 1 < numBlocksToCollect)
+            {
+                lastBlock = lastBlock->getPrevBlock();
+                TLLM_CHECK_WITH_INFO(lastBlock, "Previous block not found while traversing reuse tree");
+            }
         }
         return BlockRange(cacheManager, blockIds, 0);
     }
