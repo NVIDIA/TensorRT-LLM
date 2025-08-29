@@ -4121,15 +4121,15 @@ def allreduce(
             final_output = _create_tensor(layer.get_output(0),
                                           layer).cast(tensor.dtype)
         if all_reduce_params.strategy == AllReduceStrategy.UB:
-            if all_reduce_params.has_scale() == 1:
+            if all_reduce_params.has_scale(
+            ) == 1 or all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
                 final_output.mark_output("allreduce_ub_1_" +
                                          str(allreduce_ub_counter))
                 if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     scale_factor.mark_output("allreduce_ub_2_" +
                                              str(allreduce_ub_counter))
                     return (final_output, scale_factor), inter_output
-            else:
-                assert all_reduce_params.fusion_op == AllReduceFusionOp.LAST_PROCESS_FOR_UB
+            elif all_reduce_params.fusion_op == AllReduceFusionOp.LAST_PROCESS_FOR_UB:
                 inter_output.mark_output("allreduce_ub_1_" +
                                          str(allreduce_ub_counter))
         return final_output, inter_output

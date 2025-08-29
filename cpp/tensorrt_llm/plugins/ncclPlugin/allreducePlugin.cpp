@@ -457,6 +457,13 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             TLLM_CUDA_CHECK(
                 cudaMemcpyAsync(outputs[0], ub_buffer0.addr, size * dtype_size, cudaMemcpyDeviceToDevice, stream));
         }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        {
+            void* residual = const_cast<void*>(inputs[1]);
+            void* gamma = const_cast<void*>(inputs[2]);
+            tensorrt_llm::kernels::ub::allreduce2_userbuff_rmsnorm_launcher(ub_buffer0.handle, 0, ub_buffer1.handle, 0,
+                size, hidden_size, nullptr, gamma, mEps, residual, outputs[1], mType, ub_comm, stream);
+        }
         else if (mOp == AllReduceFusionOp::NONE)
         {
             tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_launcher(
