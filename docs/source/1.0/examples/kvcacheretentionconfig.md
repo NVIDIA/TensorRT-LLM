@@ -32,7 +32,7 @@ The blocks from the prompts will be stored for reuse with the default priotity o
 
 ```
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheRetentionConfig, TokenRangeRetentionConfig
+from tensorrt_llm.llmapi import KvCacheRetentionConfig
 
 
 def main():
@@ -48,7 +48,7 @@ def main():
 
     # Set priority for first 4 prompt tokens to 100. All other tokens set to default (35) priority.
     # This policy never lapses.
-    tokenRangeRetentionConfig = TokenRangeRetentionConfig(0, 4, 100, None)
+    tokenRangeRetentionConfig = KvCacheRetentionConfig.TokenRangeRetentionConfig(0, 4, 100, None)
     kv_cache_retention_config = KvCacheRetentionConfig(
         token_range_retention_configs=[tokenRangeRetentionConfig],
         decode_retention_priority=35, # Set generated tokens to default priority
@@ -65,5 +65,4 @@ if __name__ == '__main__':
     main()
 ```
 
-Here we used a single kv_cache_retention_config object for all the prompts. Alternatively; you can also provide a list of retention configs, the list must have the same length as the list of prompts.
-
+Here we used a single kv_cache_retention_config object for all the prompts. Alternatively, you can also provide a list, the list must have the same length as the list of prompts.
