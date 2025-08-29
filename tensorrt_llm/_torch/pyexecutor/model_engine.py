@@ -325,7 +325,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
         self._disable_overlap_scheduler = self.pytorch_backend_config.disable_overlap_scheduler
-        self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
 
@@ -782,6 +781,9 @@ class PyTorchModelEngine(ModelEngine):
                         bs, draft_len)) as batch:
                     if batch is None:
                         # No KV cache space!
+                        logger.info(
+                            f"No KV cache space stop capturing! batch size={bs}, draft_len={draft_len}"
+                        )
                         return
                     logger.info(
                         f"Run generation only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
