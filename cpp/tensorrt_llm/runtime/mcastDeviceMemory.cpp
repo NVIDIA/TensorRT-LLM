@@ -48,6 +48,7 @@ McastDeviceMemory::McastDeviceMemory(
     , mAllocationSize(0)
     , mMcPtr(0)
     , mMcHandle(0)
+    , mGroupComm(tensorrt_llm::mpi::MpiComm::session().split(splitColor, mGroupRank))
 {
 
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
@@ -62,8 +63,6 @@ McastDeviceMemory::McastDeviceMemory(
     // From pytorch implementation for alignment
     constexpr size_t kSignalPadAlignment = 16UL;
     mSignalPadOffset = roundUp(mBufSize, kSignalPadAlignment);
-    // Initialize the MPI communicator for this group
-    mGroupComm = tensorrt_llm::mpi::MpiComm::session().split(splitColor, mGroupRank);
     int const world_rank{tensorrt_llm::mpi::MpiComm::session().getRank()};
 
     TLLM_LOG_DEBUG(
@@ -213,7 +212,8 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
 {
     // Get the world ranks for ranks in this group
-    std::set<int> ranks{tensorrt_llm::mpi::getWorldRanks(mGroupComm)};
+    auto ranks_ = tensorrt_llm::mpi::getWorldRanks(mGroupComm);
+    std::set<int> ranks(ranks_.begin(), ranks_.end());
     // Reuse existing implementation
     mNvlsHandle = tensorrt_llm::runtime::ipcNvlsAllocate(bufSize, ranks);
     mMcHandle = mNvlsHandle->mc_handle;

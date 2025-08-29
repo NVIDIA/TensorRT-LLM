@@ -771,8 +771,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.mapping.tp_size,
             )
 
-            if tp > self.mapping.gpus_per_node and not self.allreduce.is_mnnvl(
-            ):
+            if tp > self.mapping.gpus_per_node:
                 mlp_tp_size = math.gcd(
                     tp,
                     self.mapping.gpus_per_node,
