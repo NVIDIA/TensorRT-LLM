@@ -407,8 +407,11 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             },
             py::call_guard<py::gil_scoped_release>())
-        .def("get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); }, py::call_guard<py::gil_scoped_release>())
-        .def("get_block_offsets_of_batch",
+        .def(
+            "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)
             {
