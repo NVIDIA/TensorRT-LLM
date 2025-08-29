@@ -922,8 +922,15 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
-            self.use_spec_decode = self.drafter.should_use_spec_decode(
-                self.active_requests)
+            # Honor permanent disable flag based on rolling acceptance first
+            if getattr(self.model_engine, 'speculation_permanently_disabled',
+                       False):
+                self.use_spec_decode = False
+            else:
+                self.use_spec_decode = self.drafter.should_use_spec_decode(
+                    self.active_requests, self.max_batch_size,
+                    self.model_engine.max_num_tokens,
+                    self.model_engine.spec_config.max_draft_len)
             self.model_engine.enable_spec_decode = self.use_spec_decode
             # If speculation is off, this function sets py_draft_tokens to None
             # for all active requests. If it's on, we initialize py_draft_tokens
@@ -1772,6 +1779,30 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
+                # Update rolling acceptance stats on request completion
+                logger.info(
+                    f"[PyExecutor] _handle_responses: request_done={request_done}, request.py_request_id={request.py_request_id}"
+                )
+                try:
+                    if self.model_engine.is_spec_decode and not self.model_engine.speculation_permanently_disabled:
+                        logger.info(
+                            f"[PyExecutor] _handle_responses: self.model_engine.is_spec_decode={self.model_engine.is_spec_decode}, self.model_engine.speculation_permanently_disabled={self.model_engine.speculation_permanently_disabled}"
+                        )
+                        if self.model_engine.speculation_gate is not None:
+                            avg_decoded = getattr(
+                                request, 'avg_decoded_tokens_per_iter', None)
+                            disabled_now, _ = self.model_engine.speculation_gate.record_avg_decoded(
+                                avg_decoded,
+                                request_id=getattr(request, 'py_request_id',
+                                                   None))
+                            if disabled_now:
+                                self.model_engine.speculation_permanently_disabled = True
+                                self.model_engine.enable_spec_decode = False
+                except Exception as e:
+                    # Best effort; do not break response handling
+                    logger.warning(
+                        f"Error updating rolling acceptance stats for request {request.py_request_id}: {str(e)}"
+                    )
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:
