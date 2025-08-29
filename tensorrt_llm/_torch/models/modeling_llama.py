@@ -424,11 +424,12 @@ class Llama4DecoderLayer(DecoderLayer):
                 overridden_tp_size=1 if self.enable_attention_dp else None,
                 layer_idx=layer_idx,
             )
-
+            # TODO(TRTLLM-7809): Fix fusion with PP>1
             self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
-            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
+            ) and not self.enable_attention_dp and self.enable_fusion and not model_config.mapping.has_pp(
+            )
+            self.fusion_config.POST_MLP_FUSION = self.fusion_config.PRE_MLP_FUSION
+
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -442,9 +443,9 @@ class Llama4DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx)
 
             self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
-            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and self.enable_fusion
+            ) and not self.enable_attention_dp and self.enable_fusion and not model_config.mapping.has_pp(
+            )
+            self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
