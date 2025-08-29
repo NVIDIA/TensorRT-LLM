@@ -8,12 +8,12 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.resource_manager import (BaseResourceManager, SlotManager,
-                                           SpecTreeManager)
+from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 from .mtp import MTPSampler
+from .spec_tree_manager import SpecTreeManager
 
 
 class Eagle3ResourceManager(BaseResourceManager):

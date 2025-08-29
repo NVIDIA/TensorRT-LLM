@@ -8,8 +8,8 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         SamplingConfig)
-from tensorrt_llm._torch.pyexecutor.resource_manager import SpecTreeManager
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
+from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.llmapi import EagleDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))

@@ -21,10 +21,10 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
 
+from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
-from .resource_manager import (ResourceManager, ResourceManagerType,
-                               SpecTreeManager)
+from .resource_manager import ResourceManager, ResourceManagerType
 from .scheduler import ScheduledRequests
 
 

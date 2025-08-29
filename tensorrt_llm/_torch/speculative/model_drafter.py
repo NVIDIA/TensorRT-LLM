@@ -11,7 +11,8 @@ from tensorrt_llm.logger import logger
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
-from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager, ResourceManagerType
+from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
+                                           ResourceManagerType)
 from ..pyexecutor.sampler import Sampler, SampleState, TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
