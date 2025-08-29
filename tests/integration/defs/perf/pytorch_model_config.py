@@ -168,6 +168,44 @@ def get_model_yaml_config(model_label: str,
                     ]
                 }
             }
+        },
+        # GPT-OSS 120B max throughput test
+        {
+            'patterns': [
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:1000',
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:1500',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 720,
+                },
+                'moe_config': {
+                    'backend': 'CUTLASS'
+                },
+                'stream_interval': 10,
+                'num_postprocess_workers': 4
+            }
+        },
+        # GPT-OSS 120B min latency test
+        {
+            'patterns': [
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:8',
+                'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:100'
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 720,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM'
+                },
+                'stream_interval': 10,
+                'num_postprocess_workers': 4
+            }
         }
     ]
 
