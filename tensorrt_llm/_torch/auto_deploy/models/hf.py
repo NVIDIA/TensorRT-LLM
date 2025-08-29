@@ -173,6 +173,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         model.forward = types.MethodType(self._simple_forward, model)
 
         model.eval()
+        model.to(torch.bfloat16)
 
         return model
 
