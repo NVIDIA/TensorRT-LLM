@@ -301,9 +301,8 @@ void initBindings(nb::module_& m)
         .def("finalize", &tr::GptDecoderBatched::finalize, nb::arg("decoder_state"), nb::arg("batch_idx"),
             nb::arg("sampling_config"), nb::arg("streaming"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
-            "decoder_stream",
-            [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
-            nb::rv_policy::reference);
+            "decoder_stream", [](tr::GptDecoderBatched& self) -> tr::CudaStream const&
+            { return *self.getDecoderStream(); }, nb::rv_policy::reference);
 
     m.def(
         "lamport_initialize_all",
@@ -314,8 +313,7 @@ void initBindings(nb::module_& m)
         },
         "Lamport initialize all buffers", nb::call_guard<nb::gil_scoped_release>());
     m.def(
-        "lamport_initialize",
-        [](intptr_t buffer, size_t size)
+        "lamport_initialize", [](intptr_t buffer, size_t size)
         { tensorrt_llm::kernels::ar_fusion::lamport_initialize(reinterpret_cast<void*>(buffer), size, 0); },
         "Lmaport initialize buffer", nb::call_guard<nb::gil_scoped_release>());
     m.def(
@@ -361,7 +359,8 @@ void initBindings(nb::module_& m)
         nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
-        .def(nb::init<size_t, uint32_t, uint32_t, at::Device, bool>(), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, at::Device, bool>(),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
