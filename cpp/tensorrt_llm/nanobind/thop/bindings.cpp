@@ -28,7 +28,7 @@ namespace tensorrt_llm::nanobind::thop
 
 void initBindings(nb::module_& m)
 {
-    m.def("attention", &torch_ext::attention, nb::call_guard<nb::gil_scoped_release>(),
+    m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         nb::arg("q"), nb::arg("k") = std::nullopt, nb::arg("v") = std::nullopt, nb::arg("output"),
         nb::arg("output_sf") = std::nullopt, nb::arg("out_dtype") = std::nullopt, nb::arg("workspace_") = std::nullopt,
@@ -53,6 +53,7 @@ void initBindings(nb::module_& m)
         nb::arg("qk_rope_head_dim") = std::nullopt, nb::arg("v_head_dim") = std::nullopt,
         nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
         nb::arg("attention_chunk_size") = std::nullopt, nb::arg("softmax_stats_tensor") = std::nullopt,
-        nb::arg("spec_decoding_bool_params"), nb::arg("spec_decoding_tensor_params"), "Multi-head attention operation");
+        nb::arg("spec_decoding_bool_params"), nb::arg("spec_decoding_tensor_params"), "Multi-head attention operation",
+        nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::nanobind::thop

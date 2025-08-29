@@ -31,15 +31,20 @@ void UserBufferBindings::initBindings(pybind11::module_& m)
         .def_readonly("size", &tub::UBBuffer::size)
         .def_property_readonly("addr", [](tub::UBBuffer& self) { return reinterpret_cast<intptr_t>(self.addr); })
         .def_readonly("handle", &tub::UBBuffer::handle)
-        .def("invalid", &tub::UBBuffer::invalid);
+        .def("invalid", &tub::UBBuffer::invalid, py::call_guard<py::gil_scoped_release>());
 
-    m.def("ub_initialize", [](int tp_size) { tub::ub_initialize(tp_size); });
-    m.def("ub_is_initialized", &tub::ub_is_initialized);
-    m.def("ub_allocate", [](size_t bytes) { return tub::ub_allocate(bytes); });
-    m.def("ub_deallocate", [](intptr_t addr) { return tub::ub_deallocate(reinterpret_cast<void*>(addr)); });
-    m.def("ub_get", &tub::ub_get);
-    m.def("ub_supported", &tub::ub_supported);
+    m.def(
+        "ub_initialize", [](int tp_size) { tub::ub_initialize(tp_size); }, py::call_guard<py::gil_scoped_release>());
+    m.def("ub_is_initialized", &tub::ub_is_initialized, py::call_guard<py::gil_scoped_release>());
+    m.def(
+        "ub_allocate", [](size_t bytes) { return tub::ub_allocate(bytes); }, py::call_guard<py::gil_scoped_release>());
+    m.def(
+        "ub_deallocate", [](intptr_t addr) { return tub::ub_deallocate(reinterpret_cast<void*>(addr)); },
+        py::call_guard<py::gil_scoped_release>());
+    m.def("ub_get", &tub::ub_get, py::call_guard<py::gil_scoped_release>());
+    m.def("ub_supported", &tub::ub_supported, py::call_guard<py::gil_scoped_release>());
 
-    m.def("initialize_userbuffers_manager", &tub::initialize_userbuffers_manager);
+    m.def("initialize_userbuffers_manager", &tub::initialize_userbuffers_manager,
+        py::call_guard<py::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::kernels::userbuffers

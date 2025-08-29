@@ -28,7 +28,7 @@ namespace tensorrt_llm::pybind::thop
 
 void initBindings(pybind11::module_& m)
 {
-    m.def("attention", &torch_ext::attention, py::call_guard<py::gil_scoped_release>(),
+    m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         py::arg("q"), py::arg("k") = std::nullopt, py::arg("v") = std::nullopt, py::arg("output"),
         py::arg("output_sf") = std::nullopt, py::arg("out_dtype") = std::nullopt, py::arg("workspace_") = std::nullopt,
@@ -53,6 +53,7 @@ void initBindings(pybind11::module_& m)
         py::arg("qk_rope_head_dim") = std::nullopt, py::arg("v_head_dim") = std::nullopt,
         py::arg("mrope_rotary_cos_sin") = std::nullopt, py::arg("mrope_position_deltas") = std::nullopt,
         py::arg("attention_chunk_size") = std::nullopt, py::arg("softmax_stats_tensor") = std::nullopt,
-        py::arg("spec_decoding_bool_params"), py::arg("spec_decoding_tensor_params"), "Multi-head attention operation");
+        py::arg("spec_decoding_bool_params"), py::arg("spec_decoding_tensor_params"), "Multi-head attention operation",
+        py::call_guard<py::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::pybind::thop
