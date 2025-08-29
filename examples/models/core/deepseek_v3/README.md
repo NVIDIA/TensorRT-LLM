@@ -336,7 +336,7 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-For DeepSeek-R1 FP4, use the model name `nvidia/DeepSeek-R1-FP4`.  
+For DeepSeek-R1 FP4, use the model name `nvidia/DeepSeek-R1-FP4-v2`.  
 For DeepSeek-V3, use the model name `deepseek-ai/DeepSeek-V3`.
 
 ### Disaggregated Serving
