@@ -2774,7 +2774,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(100000)
-class TestGPTOSS(LlmapiAccuracyTestHarness):
+class TestGPTOSS_120B(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
     extra_evaluator_kwargs = {
         "fewshot_as_multiturn": True,
@@ -2785,11 +2785,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
-    @pytest.mark.parametrize(
-        "moe_backend",
-        ["CUTLASS",
-         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
-        ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("moe_backend", [
+        "CUTLASS",
+        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRITON", marks=pytest.mark.install_triton)
+    ],
+                             ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (True, True),
     ])
@@ -2818,11 +2819,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize(
-        "moe_backend",
-        ["CUTLASS",
-         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
-        ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("moe_backend", [
+        "CUTLASS",
+        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRITON", marks=pytest.mark.install_triton)
+    ],
+                             ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 1, False, True, True),
@@ -2885,6 +2887,92 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             model_name = "GPT-OSS/BF16"
             task = GSM8K(model_name)
             mocker.patch.object(GSM8K, {"MAX_OUTPUT_LEN": 8192})
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(100000)
+class TestGPTOSS_20B(LlmapiAccuracyTestHarness):
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+    extra_evaluator_kwargs = {
+        "fewshot_as_multiturn": True,
+        "apply_chat_template": True,
+        "scores_filter": "exact_match,flexible-extract",
+        "MAX_OUTPUT_LEN": 8192
+    }
+
+    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
+
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (True, True),
+    ])
+    def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler, mocker):
+        if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=self.kv_cache_config,
+                  max_seq_len=8192,
+                  **pytorch_config,
+                  moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/MXFP4"
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (2, 1, 1, False, True, True),
+            (2, 1, 2, False, True, True),
+            (2, 1, 2, True, True, True),
+        ],
+        ids=["tp2", "ep2", "dp2"])
+    def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
+                      attention_dp, cuda_graph, overlap_scheduler, mocker):
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("Triton kernels are not available")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  kv_cache_config=self.kv_cache_config,
+                  max_seq_len=8192,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/MXFP4"
+            task = GSM8K(model_name)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
