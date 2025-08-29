@@ -26,6 +26,8 @@ Blocks are assigned priority in line with the [retention policy](https://nvidia.
 
 Not in use: ```transfer_mode``` is a debug option and should not be used.
 
+See [this example](../examples/kvcacheretentionconfig.md) of how to change block priorities of specific requests by altering their retention policy.
+
 ### Speculative Decoding
 
 Reuse across requests is only supported for one model MTP, all other [speculative decoding](speculative-decoding.md) algorithms must disable block reuse.
@@ -42,7 +44,7 @@ TensorRT-LLM takes advantage of grouped query attention in order to save memory.
 
 Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of KV cache system.
 
-See [KvCacheConfig example](../examples/kvcacheconfig.md) for an example of how to use KvCacheConfig to control KV cache behavior.
+See [this example](../examples/kvcacheconfig.md) of how to use KvCacheConfig to control KV cache behavior.
 
 ### Datatype
 
