@@ -52,7 +52,7 @@ Property ```free_gpu_memory_fraction``` is a ratio > 0 and < 1 that specifies ho
 
 ### Enable/Disable Cross Request Reuse
 
-Block reuse across requests is enabled by default, but can be disabled by setting ```enable_block_reuse``` to False. Note that block reuse requires the model engine to support paged context attention, which is enabled by default, but can be enabled or disabled explicitly when the model engine is built: ```trtllm-build --use_paged_context_fmha enable```.
+Block reuse across requests is enabled by default, but can be disabled by setting ```enable_block_reuse``` to False.
 
 ### Enable Offloading to Host Memory
 
