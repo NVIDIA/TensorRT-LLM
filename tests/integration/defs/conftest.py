@@ -2402,24 +2402,23 @@ def torch_empty_cache() -> None:
 
 
 @pytest.fixture
-def install_triton(trt_llm_root, llm_venv):
+def install_triton(llm_root, llm_venv):
     """
     Install triton from source before each test.
     """
 
-    triton_root = f"{trt_llm_root}/triton"
+    triton_root = f"{llm_root}/triton"
 
     if not os.path.exists(triton_root):
         raise FileNotFoundError(f"Triton root {triton_root} does not exist")
 
-    llm_venv.run_cmd(["-m", "pip", "install", f"{triton_root}/dist/*.whl"])
+    call(f"pip install {triton_root}/dist/*.whl", shell=True)
     os.environ["TRITON_ROOT"] = triton_root
 
     yield
 
-    llm_venv.run_cmd(["-m", "pip", "uninstall", "-y", "triton"])
-    llm_venv.run_cmd(
-        ["-m", "pip", "install", f"{trt_llm_root}/requirements.txt"])
+    call("pip uninstall -y triton", shell=True)
+    call(f"pip install -r {llm_root}/requirements.txt", shell=True)
     os.environ.pop("TRITON_ROOT")
 
 
