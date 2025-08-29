@@ -40,9 +40,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    std::vector<size_t> const& allBlockHashes, std::vector<size_t> const& requestedBlockHashes)
+    std::vector<BlockKey> const& allBlockKeys, SizeType32 indexFromEnd)
 {
-    size_t requestBlockNum = requestedBlockHashes.size();
     constexpr SizeType32 beam{0};
     auto poolNum = cacheManager->getBlockManager().getNumPools();
     if (poolNum > 1 || !cacheManager->isEnableBlockReuse())
@@ -50,7 +49,7 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
         auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
         return blockRange;
     }
-    return BlockRange::fromReuseTree(*cacheManager, allBlockHashes, requestedBlockHashes);
+    return BlockRange::fromReuseTree(*cacheManager, allBlockKeys, indexFromEnd);
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
@@ -151,18 +150,17 @@ void CacheFormatter::format(TransferSession& session)
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
-    auto& allBlockHashes = session.getAllBlockHashes();
-    auto& requestedBlockHashes = session.getRequestedBlockHashes();
-    TLLM_CHECK_WITH_INFO(allBlockHashes.size() >= requestedBlockHashes.size(),
-        "allBlockHashes must be greater than or equal to requestedBlockHashes");
+    auto& allBlockKeys = session.getAllBlockKeys();
+    auto indexFromEnd = session.getIndexFromEnd();
+    TLLM_CHECK_WITH_INFO(indexFromEnd < allBlockKeys.size(), "indexFromEnd is out of range");
     auto& bufferManager = session.getBufferManager();
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
     }
     auto& blockManager = mCacheManager->getBlockManager();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, allBlockHashes, requestedBlockHashes);
-
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, allBlockKeys, indexFromEnd);
+    std::cout << "blockRange size is: " << blockRange.getBlockIds().size() << std::endl;
     auto const numPools = blockManager.getNumPools();
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
 
@@ -211,7 +209,11 @@ void CacheFormatter::format(TransferSession& session)
         std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocks;
         for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
-            blockRange.updatePoolIdx(poolIdx);
+            if (numPools > 1)
+            {
+                blockRange.updatePoolIdx(poolIdx);
+            }
+            std::cout << "blockRange size is: " << blockRange.getBlockIds().size() << std::endl;
             SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
             TLLM_CHECK_WITH_INFO(inputKvCacheBlocks.find(window) == inputKvCacheBlocks.end(),
                 "window size already exists, which is not supported");

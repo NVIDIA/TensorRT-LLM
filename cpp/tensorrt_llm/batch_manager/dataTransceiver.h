@@ -42,6 +42,7 @@ using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TransferSession = kv_cache_manager::TransferSession;
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
+using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
 
 struct TransceiverTag
 {
@@ -68,8 +69,8 @@ public:
     /// @param transState The state of the data transceiver.
     RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState);
 
-    RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> allBlockHashes,
-        executor::DataTransceiverState transState, std::vector<size_t> requestedBlockHashes);
+    RequestInfo(LlmRequest::RequestIdType requestId, std::vector<BlockKey> allBlockKeys,
+        executor::DataTransceiverState transState, SizeType32 indexFromEnd);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
@@ -80,14 +81,14 @@ public:
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
 
-    [[nodiscard]] std::vector<size_t> const& getAllBlockHashes() const noexcept
+    [[nodiscard]] std::vector<BlockKey> const& getAllBlockKeys() const noexcept
     {
-        return mAllBlockHashes;
+        return mAllBlockKeys;
     }
 
-    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const noexcept
+    [[nodiscard]] SizeType32 getIndexFromEnd() const noexcept
     {
-        return mRequestedBlockHashes;
+        return mIndexFromEnd;
     }
 
     /// @brief Return the state of the data transceiver.
@@ -113,10 +114,10 @@ private:
     LlmRequest::RequestIdType mRequestId;
 
     // The block hashes of the request.
-    std::vector<size_t> mAllBlockHashes;
+    std::vector<BlockKey> mAllBlockKeys;
 
-    // The block hashes of the requested data.
-    std::vector<size_t> mRequestedBlockHashes;
+    // Index from end indicating how many trailing blocks to transfer (index+1)
+    SizeType32 mIndexFromEnd{0};
 
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;

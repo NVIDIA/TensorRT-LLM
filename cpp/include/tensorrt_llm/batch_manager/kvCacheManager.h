@@ -776,8 +776,8 @@ public:
         return 0;
     }
 
-    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByHashes(
-        std::vector<size_t> const& hashes) const;
+    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys) const;
 
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -1116,10 +1116,10 @@ public:
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
     }
 
-    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByHashes(
-        std::vector<size_t> const& hashes, SizeType32 windowSize) const
+    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) const
     {
-        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByHashes(hashes);
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKeys(blockKeys);
     }
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
@@ -1405,8 +1405,8 @@ public:
 
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
 
-    [[nodiscard]] virtual std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByHashes(
-        std::vector<size_t> const& hashes, SizeType32 windowSize) const
+    [[nodiscard]] virtual std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) const
         = 0;
 };
 
@@ -1698,10 +1698,10 @@ public:
         mBlockManager.flushIterationEvents();
     }
 
-    std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByHashes(
-        std::vector<size_t> const& hashes, SizeType32 windowSize) const override
+    std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) const override
     {
-        return mBlockManager.findBlocksInReuseTreeByHashes(hashes, windowSize);
+        return mBlockManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
     }
 
     /// @brief Finds the maximum attention window that can be used on a sequence, given some kv-cache block capacity.

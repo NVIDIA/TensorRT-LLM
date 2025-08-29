@@ -62,19 +62,19 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 {
 }
 
-RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> allBlockHashes,
-    executor::DataTransceiverState transState, std::vector<size_t> requestedBlockHashes)
+RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, std::vector<BlockKey> allBlockKeys,
+    executor::DataTransceiverState transState, SizeType32 indexFromEnd)
     : mRequestId{requestId}
-    , mAllBlockHashes{std::move(allBlockHashes)}
-    , mRequestedBlockHashes{std::move(requestedBlockHashes)}
+    , mAllBlockKeys{std::move(allBlockKeys)}
+    , mIndexFromEnd{indexFromEnd}
     , mTransState{std::move(transState)}
 {
 }
 
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
-    return mRequestId == rhs.mRequestId && mAllBlockHashes == rhs.mAllBlockHashes
-        && mRequestedBlockHashes == rhs.mRequestedBlockHashes && mTransState == rhs.mTransState;
+    return mRequestId == rhs.mRequestId && mAllBlockKeys == rhs.mAllBlockKeys && mIndexFromEnd == rhs.mIndexFromEnd
+        && mTransState == rhs.mTransState;
 }
 
 LlmRequest::RequestIdType RequestInfo::getRequestId() const noexcept
@@ -91,8 +91,8 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
 {
     namespace su = executor::serialize_utils;
     su::serialize(requestInfo.mRequestId, os);
-    su::serialize(requestInfo.mAllBlockHashes, os);
-    su::serialize(requestInfo.mRequestedBlockHashes, os);
+    su::serialize(requestInfo.mAllBlockKeys, os);
+    su::serialize(requestInfo.mIndexFromEnd, os);
     su::serialize(requestInfo.mTransState, os);
 }
 
@@ -100,10 +100,10 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
 {
     namespace su = executor::serialize_utils;
     auto requestId = su::deserialize<decltype(mRequestId)>(is);
-    auto allBlockHashes = su::deserialize<decltype(mAllBlockHashes)>(is);
-    auto requestedBlockHashes = su::deserialize<decltype(mRequestedBlockHashes)>(is);
+    auto allBlockKeys = su::deserialize<decltype(mAllBlockKeys)>(is);
+    auto indexFromEnd = su::deserialize<decltype(mIndexFromEnd)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    return RequestInfo{requestId, std::move(allBlockHashes), std::move(transState), std::move(requestedBlockHashes)};
+    return RequestInfo{requestId, std::move(allBlockKeys), std::move(transState), indexFromEnd};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -111,8 +111,8 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     namespace su = executor::serialize_utils;
     std::size_t totalSize = 0;
     totalSize += su::serializedSize(requestInfo.mRequestId);
-    totalSize += su::serializedSize(requestInfo.mAllBlockHashes);
-    totalSize += su::serializedSize(requestInfo.mRequestedBlockHashes);
+    totalSize += su::serializedSize(requestInfo.mAllBlockKeys);
+    totalSize += su::serializedSize(requestInfo.mIndexFromEnd);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
 }
@@ -218,7 +218,7 @@ public:
             {
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
                     DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager,
-                    info.getAllBlockHashes(), info.getRequestedBlockHashes());
+                    info.getAllBlockKeys(), info.getIndexFromEnd());
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
@@ -495,25 +495,17 @@ public:
 
             auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
             auto blockedUniqueTokens = tensorrt_llm::batch_manager::kv_cache_manager::chopVectorIntoBlocks<UniqueToken>(
-                uniqueTokens, uniqueTokens.size() - 1, mFormatter->getCacheManager()->getTokensPerBlock(), false);
+                uniqueTokens, uniqueTokens.size() - 1, mFormatter->getCacheManager()->getTokensPerBlock(), true);
             auto blockKeys
                 = tensorrt_llm::batch_manager::kv_cache_manager::buildBlockKeys(blockedUniqueTokens, llmRequest);
-            std::vector<size_t> allBlockHashes;
-            for (auto const& blockKey : blockKeys)
-            {
-                allBlockHashes.push_back(tensorrt_llm::batch_manager::kv_cache_manager::BlockKeyHasher::hash(blockKey));
-            }
-            // Figure out the size difference for computing the requested block hashes
-            std::vector<size_t> requestedBlockHashes;
-            for (auto i = 0; i < allBlockHashes.size(); i++)
-            {
-                if (i >= requestedBlockRange.getBlockHashes().size())
-                {
-                    requestedBlockHashes.push_back(allBlockHashes[i]);
-                }
-            }
+            // Compute indexFromEnd from the number of requested blocks
+            size_t totalBlockSize = allBlockRange.getBlockIds().size();
+            size_t requestedBlockSize = requestedBlockRange.getBlockIds().size();
+            std::cout << "requestedBlockSize: " << requestedBlockSize << std::endl;
+            TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
+            SizeType32 indexFromEnd = static_cast<SizeType32>(requestedBlockSize - 1);
 
-            requestInfo = RequestInfo(requestId, allBlockHashes, mSelfState, requestedBlockHashes);
+            requestInfo = RequestInfo(requestId, blockKeys, mSelfState, indexFromEnd);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -558,8 +550,8 @@ public:
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
-            contextState, resource->mBufferManager, requestInfo.getAllBlockHashes(),
-            requestInfo.getRequestedBlockHashes(), &llmRequest);
+            contextState, resource->mBufferManager, requestInfo.getAllBlockKeys(), requestInfo.getIndexFromEnd(),
+            &llmRequest);
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
