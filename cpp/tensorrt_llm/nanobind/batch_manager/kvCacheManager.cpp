@@ -294,7 +294,7 @@ public:
 void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 {
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
-        .def(nb::init<>())
+        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
         .def_rw("max_num_blocks", &tbk::KvCacheStats::maxNumBlocks)
         .def_rw("free_num_blocks", &tbk::KvCacheStats::freeNumBlocks)
         .def_rw("used_num_blocks", &tbk::KvCacheStats::usedNumBlocks)
@@ -308,35 +308,37 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_ro("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
 
     nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
-        .def(nb::init<>())
+        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
         .def_rw("paged_context_fmha", &tbk::TempAttentionWindowInputs::pagedContextFMHA)
         .def_rw("max_input_len", &tbk::TempAttentionWindowInputs::maxInputLen)
         .def_rw("max_num_tokens", &tbk::TempAttentionWindowInputs::maxNumTokens);
 
     nb::class_<tbk::BlockKey>(m, "BlockKey")
-        .def(nb::init<>())
+        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
         .def(nb::init<VecTokens const&, std::optional<tr::LoraTaskIdType>>(), nb::arg("tokens"),
-            nb::arg("lora_task_id") = std::nullopt)
+            nb::arg("lora_task_id") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def(nb::init<bool, std::optional<tr::LoraTaskIdType>, VecUniqueTokens const&>(), nb::arg("uses_extra_ids"),
-            nb::arg("lora_task_id"), nb::arg("unique_tokens"))
+            nb::arg("lora_task_id"), nb::arg("unique_tokens"), nb::call_guard<nb::gil_scoped_release>())
         .def_ro("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
         .def_ro("lora_task_id", &tbk::BlockKey::loraTaskId)
         .def_ro("unique_tokens", &tbk::BlockKey::uniqueTokens);
 
     nb::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
-        .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0);
+        .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0,
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tbk::KVCacheEventManager>(m, "KVCacheEventManager")
         .def(nb::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),
             nb::arg("max_kv_event_entries"), nb::arg("attention_dp_rank") = std::nullopt,
-            nb::arg("attention_dp_size") = std::nullopt, nb::arg("attention_dp_events_gather_period_ms") = 5);
+            nb::arg("attention_dp_size") = std::nullopt, nb::arg("attention_dp_events_gather_period_ms") = 5,
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
-        .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks,
-            nb::call_guard<nb::gil_scoped_release>(), nb::arg("config"), nb::arg("is_cross_attention"),
-            nb::arg("dtype"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("window_size_to_layers"),
-            nb::arg("allotted_primary_mem_bytes"), nb::arg("allotted_secondary_mem_bytes"),
-            nb::arg("extra_cost_memory"), nb::arg("kv_factor"))
+        .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, nb::arg("config"),
+            nb::arg("is_cross_attention"), nb::arg("dtype"), nb::arg("model_config"), nb::arg("world_config"),
+            nb::arg("window_size_to_layers"), nb::arg("allotted_primary_mem_bytes"),
+            nb::arg("allotted_secondary_mem_bytes"), nb::arg("extra_cost_memory"), nb::arg("kv_factor"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("allocate_pools", &BaseKVCacheManager::allocatePools, nb::call_guard<nb::gil_scoped_release>())
         .def("release_pools", &BaseKVCacheManager::releasePools, nb::call_guard<nb::gil_scoped_release>())
         .def("start_scheduling", &BaseKVCacheManager::startScheduling, nb::call_guard<nb::gil_scoped_release>())
@@ -494,35 +496,39 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("enable_block_reuse") = false, nb::arg("onboard_blocks") = true,
             nb::arg("cache_type") = tbk::CacheType::kSELF, nb::arg("secondary_offload_min_priority") = std::nullopt,
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
-            nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr);
+            nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
+            nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
 {
     nb::class_<tb::BasePeftCacheManager, PyBasePeftCacheManager>(m, "BasePeftCacheManager")
         .def("add_request_peft", &tb::BasePeftCacheManager::addRequestPeft, nb::arg("request"),
-            nb::arg("try_gpu_cache") = true)
+            nb::arg("try_gpu_cache") = true, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "ensure_batch",
             [](tb::BasePeftCacheManager& self, tb::RequestVector const& contextRequests,
                 tb::RequestVector const& generationRequests, bool resetGpuCache)
-            {
-                nb::gil_scoped_release release;
-                return self.ensureBatch(contextRequests, generationRequests, resetGpuCache);
-            },
-            nb::arg("context_requests"), nb::arg("generation_requests"), nb::arg("reset_gpu_cache") = false)
-        .def("reset_device_cache", &tb::BasePeftCacheManager::resetDeviceCache)
+            { return self.ensureBatch(contextRequests, generationRequests, resetGpuCache); },
+            nb::arg("context_requests"), nb::arg("generation_requests"), nb::arg("reset_gpu_cache") = false,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "reset_device_cache", &tb::BasePeftCacheManager::resetDeviceCache, nb::call_guard<nb::gil_scoped_release>())
         .def("mark_request_done", &tb::BasePeftCacheManager::markRequestDone, nb::arg("request"),
-            nb::arg("pause") = false)
+            nb::arg("pause") = false, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_device_pages", &tb::BasePeftCacheManager::getMaxDevicePages)
         .def_prop_ro("max_host_pages", &tb::BasePeftCacheManager::getMaxHostPages)
-        .def("determine_num_pages", &tb::BasePeftCacheManager::determineNumPages, nb::arg("request"))
+        .def("determine_num_pages", &tb::BasePeftCacheManager::determineNumPages, nb::arg("request"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("enabled", &tb::BasePeftCacheManager::enabled);
 
     nb::class_<tb::PeftCacheManager, tb::BasePeftCacheManager>(m, "PeftCacheManager")
         .def(nb::init<tb::PeftCacheManagerConfig, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
-            nb::arg("config"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"))
-        .def("is_task_cached", &tb::PeftCacheManager::isTaskCached, nb::arg("taskId"));
+            nb::arg("config"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_task_cached", &tb::PeftCacheManager::isTaskCached, nb::arg("taskId"),
+            nb::call_guard<nb::gil_scoped_release>());
 
-    nb::class_<tb::NoOpPeftCacheManager, tb::BasePeftCacheManager>(m, "NoOpPeftCacheManager").def(nb::init<>());
+    nb::class_<tb::NoOpPeftCacheManager, tb::BasePeftCacheManager>(m, "NoOpPeftCacheManager")
+        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>());
 }
