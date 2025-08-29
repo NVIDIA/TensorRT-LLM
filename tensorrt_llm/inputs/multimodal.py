@@ -435,13 +435,20 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
     """Apply hashing to multimodal data items."""
 
     def _hash_image(image):
-        # only support single modality w/ PIL.Image.Image for now
         # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
         hasher = hash_lib()
         if isinstance(image, torch.Tensor):
-            # TODO: Device tensor hashing is an open issue. Limited hashing to CPU for now.
-            image = image.cpu()
-        hasher.update(serialize_item(image))
+            # Ensure tensor is on CPU and contiguous for consistent hashing
+            image = image.detach().cpu().contiguous()
+            hasher.update(serialize_item(image))
+        elif isinstance(image, list):
+            # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
+            for frame in image:
+                hasher.update(b"<frame>")
+                hasher.update(serialize_item(frame))
+        else:
+            hasher.update(serialize_item(image))
+
         return hasher.hexdigest()
 
     mm_items = {
@@ -483,31 +490,35 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
     num_mm_tokens = {}
 
     for modality, items in mm_items.items():
-        if modality != "image":
-            #TODO: support other modalities
-            raise ValueError(
-                f"Unsupported modality: {modality}. Only 'image' modality is currently supported for hashing."
-            )
-        if not hasattr(input_processor, "get_num_tokens_per_image"):
-            #TODO: backward compatibility for models that don't yet have get_num_tokens_per_image implemented
-            #TODO: only support qwen2_vl for now
+        if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
             raise AttributeError(
-                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_image' method required for multimodal hashing."
+                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
             )
 
         modality_token_lengths = []
         for item in items:
-            if isinstance(item, torch.Tensor):
-                item = ToPILImage()(item)
-            num_tokens = input_processor.get_num_tokens_per_image(
-                image_width=item.width,
-                image_height=item.height,
-            )
-            modality_token_lengths.append(num_tokens)
+            if modality == "image":
+                if isinstance(item, torch.Tensor):
+                    item = ToPILImage()(item)
+                num_tokens = input_processor.get_num_tokens_per_image(
+                    image_width=item.width,
+                    image_height=item.height,
+                )
+                modality_token_lengths.append(num_tokens)
+            elif modality == "video":
+                assert isinstance(item, list), "Video must be a list of frames"
+                if isinstance(item[0], torch.Tensor):
+                    item = [ToPILImage()(frame) for frame in item]
+                num_tokens = input_processor.get_num_tokens_per_video(
+                    video_width=item[0].width,
+                    video_height=item[0].height,
+                    num_frames=len(item),
+                )
+                modality_token_lengths.append(num_tokens)
 
         num_mm_tokens[modality] = modality_token_lengths
 
-    return num_mm_tokens['image']  # flatten all mm instances to a single list
+    return num_mm_tokens  # flatten all mm instances to a single list
 
 
 def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
