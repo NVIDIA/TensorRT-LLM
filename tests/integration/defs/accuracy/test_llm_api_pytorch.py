@@ -220,30 +220,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           extra_acc_spec="temperature=0.8,top_p=0.95")
 
     @skip_pre_hopper
-    def test_fp8_beam_search(self):
-        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-        pytorch_config = dict(disable_overlap_scheduler=True)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-        max_beam_width = 4
-        sampling_params = SamplingParams(n=max_beam_width,
-                                         best_of=max_beam_width,
-                                         use_beam_search=True)
-
-        llm = LLM(model=model_path,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  max_beam_width=max_beam_width,
-                  max_batch_size=16,
-                  max_seq_len=1024,
-                  build_config=None)
-
-        with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_acc_spec="beam_width=4")
-
-    @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("eagle3_one_model", [True, False])
     def test_eagle3(self, overlap_scheduler, eagle3_one_model):
@@ -383,6 +359,93 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  max_batch_size=64) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @parametrize_with_ids("disable_overlap_scheduler", [False, True])
+    @parametrize_with_ids(
+        "enable_cuda_graph,enable_padding",
+        [
+            (False, False),  # No CUDA Graph (padding irrelevant)
+            (True, False),  # CUDA Graph without padding
+            (True, True),  # CUDA Graph with padding
+        ])
+    def test_auto_dtype_beam_search(self, enable_cuda_graph, enable_padding,
+                                    disable_overlap_scheduler):
+        max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
+
+        if enable_cuda_graph:
+            # enable_padding only matters when CUDA Graph is enabled
+            if enable_padding:
+                batch_sizes = [
+                    1, 8
+                ]  # Need batch_size != max_batch_size to enable padding
+            else:
+                batch_sizes = [1, 2, 4, 8]
+            cuda_graph_config = CudaGraphConfig(batch_sizes=batch_sizes,
+                                                enable_padding=enable_padding)
+        else:
+            cuda_graph_config = None
+
+        with LLM(
+                model=self.MODEL_PATH,
+                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
+                max_batch_size=max_beam_width,
+                max_seq_len=2048,
+                max_beam_width=max_beam_width,
+                disable_overlap_scheduler=disable_overlap_scheduler,
+                cuda_graph_config=cuda_graph_config,
+        ) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="beam_width=2")
+
+    @skip_pre_hopper
+    @parametrize_with_ids("disable_overlap_scheduler", [False, True])
+    @parametrize_with_ids(
+        "enable_cuda_graph,enable_padding",
+        [
+            (False, False),  # No CUDA Graph (padding irrelevant)
+            (True, False),  # CUDA Graph without padding
+            (True, True),  # CUDA Graph with padding
+        ])
+    def test_fp8_beam_search(self, enable_cuda_graph, enable_padding,
+                             disable_overlap_scheduler):
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
+        if enable_cuda_graph:
+            # enable_padding only matters when CUDA Graph is enabled
+            if enable_padding:
+                batch_sizes = [
+                    1, 8
+                ]  # Need batch_size != max_batch_size to enable padding
+            else:
+                batch_sizes = [1, 2, 4, 8]
+            cuda_graph_config = CudaGraphConfig(batch_sizes=batch_sizes,
+                                                enable_padding=enable_padding)
+        else:
+            cuda_graph_config = None
+
+        llm = LLM(
+            model=model_path,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
+            max_batch_size=max_beam_width,
+            max_seq_len=2048,
+            max_beam_width=max_beam_width,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            cuda_graph_config=cuda_graph_config,
+        )
+
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="beam_width=2")
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
