@@ -218,6 +218,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
         model.eval()
+        model.to(torch.bfloat16)
 
         return model
 
