@@ -508,6 +508,13 @@ class KVCacheManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
 
+    def calculate_scaling_factor_size_bytes(
+            self, cache_size: int, quant_vector_size: int,
+            scaling_factor_dtype: DataType) -> int:
+        assert cache_size % quant_vector_size == 0, "NVFP4 cache size must be divisible by quant vector size"
+        return get_size_in_bytes(cache_size // quant_vector_size,
+                                 scaling_factor_dtype)
+
     def calculate_max_num_blocks(self,
                                  kv_cache_config: KvCacheConfigCpp,
                                  head_dim: int,
@@ -529,8 +536,10 @@ class KVCacheManager(BaseResourceManager):
         cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
                                                        dtype)
         if dtype == DataType.NVFP4:
-            # NVFP4 needs additional block scales. Vector Size is 16. Each scaling factor is 1 byte.
-            cache_size_bytes_per_token += cache_size_per_token / 16
+            cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
+                cache_size_per_token,
+                quant_vector_size=16,
+                scaling_factor_dtype=DataType.FP8)
 
         free_mem, total_mem = torch.cuda.mem_get_info()
 
@@ -724,8 +733,10 @@ class KVCacheManager(BaseResourceManager):
             cache_size_bytes_per_token = get_size_in_bytes(
                 cache_size_per_token, dtype)
             if dtype == DataType.NVFP4:
-                # NVFP4 needs additional block scales. Vector Size is 16. Each scaling factor is 1 byte.
-                cache_size_bytes_per_token += cache_size_per_token / 16
+                cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
+                    cache_size_per_token,
+                    quant_vector_size=16,
+                    scaling_factor_dtype=DataType.FP8)
             required_mem_bytes_per_seq += window_size * cache_size_bytes_per_token
         logger.debug(
             f'Required memory per sequence: {required_mem_bytes_per_seq} bytes')
@@ -755,8 +766,10 @@ class KVCacheManager(BaseResourceManager):
                 cache_size_bytes_per_token = get_size_in_bytes(
                     cache_size_per_token, dtype)
                 if dtype == DataType.NVFP4:
-                    # NVFP4 needs additional block scales. Vector Size is 16. Each scaling factor is 1 byte.
-                    cache_size_bytes_per_token += cache_size_per_token / 16
+                    cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
+                        cache_size_per_token,
+                        quant_vector_size=16,
+                        scaling_factor_dtype=DataType.FP8)
                 logger.debug(
                     f'Cache size per token for {len(remaining_layers)} layers: '
                     f'{cache_size_bytes_per_token} bytes')
