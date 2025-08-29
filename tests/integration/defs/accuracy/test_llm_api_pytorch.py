@@ -2791,6 +2791,25 @@ class TestBielik11BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestPhi4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "microsoft/phi-4"
+
+    def test_auto_dtype(self):
+        with LLM(f"{llm_models_root()}/Phi-4") as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        with LLM(f"{llm_models_root()}/Phi-4-FP8") as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestPhi4MM(LlmapiAccuracyTestHarness):
     # phi4-mm can also support text input.
     MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
