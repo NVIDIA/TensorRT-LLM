@@ -52,48 +52,11 @@ enum class RoutingMethodType : int64_t
     Unspecified = 5,
 };
 
-inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType)
-{
-    switch (routingMethodType)
-    {
-    case RoutingMethodType::Default: return "Default";
-    case RoutingMethodType::Renormalize: return "Renormalize";
-    case RoutingMethodType::DeepSeekV3: return "DeepSeekV3";
-    case RoutingMethodType::Llama4: return "Llama4";
-    case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
-    default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
-    };
-}
+std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType);
 
-inline int32_t getMaxPermutedPaddedCount(
-    int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding)
-{
-    auto const expandedRowCount = numTokens * expertsPerToken;
-    auto const maxPaddingRequired = (padding - 1) * numExperts;
-    return common::roundUp(expandedRowCount + maxPaddingRequired, padding);
-}
+int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim);
 
-inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim)
-{
-    // Get maximum number of CTAs in batch dim per expert.
-    auto const maxCtasInBatchDimPerExpert = common::ceilDiv(numTokens, tileTokensDim);
-    // Get maximum enabled experts.
-    auto const maxEnabledExperts = std::min(numTokens * topK, numExperts);
-    // Get maximum number of CTAs in batch dim.
-    auto maxNumCtasInBatchDim = maxEnabledExperts * maxCtasInBatchDimPerExpert;
-
-    // For large token counts, the above bound can be pessimistic since not all the tokens can
-    // be routed to all the enabled experts. Instead we can essentially bound the number of CTAs
-    // by permuted buffer size. However, this method will be overly pessimistic for low-token
-    // counts
-    auto const tilesForPermutedBuffer
-        = common::ceilDiv(getMaxPermutedPaddedCount(numTokens, topK, numExperts, tileTokensDim), tileTokensDim);
-
-    // Set maxNumCtasInBatchDim to be the minimum of the two methods
-    maxNumCtasInBatchDim = std::min(maxNumCtasInBatchDim, tilesForPermutedBuffer);
-
-    return maxNumCtasInBatchDim;
-}
+int32_t getMaxPermutedPaddedCount(int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding);
 
 class Runner
 {
