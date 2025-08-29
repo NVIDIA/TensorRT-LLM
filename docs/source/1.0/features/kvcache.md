@@ -22,7 +22,7 @@ One caveat in the current code is that only leaf blocks can be evicted (leaves a
 
 ### Retention Policy
 
-Blocks are assigned priority in line with the [retention policy](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [TokenRangeRetentionConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.KvCacheRetentionConfig) objects, each specifying priority for a given range of tokens, such as "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect, priority will revert to the default after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect, after which priority will revert to the default. Default priority is 35. Any property that expects a duration can be set to None, which indicates retention policy never expires.
+Blocks are assigned priority in line with the [retention policy](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [TokenRangeRetentionConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig) objects, each specifying priority for a given range of tokens, such as "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect, priority will revert to the default after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect, after which priority will revert to the default. Default priority is 35. Any property that expects a duration can be set to None, which indicates retention policy never expires.
 
 Not in use: ```transfer_mode``` is a debug option and should not be used.
 
@@ -40,7 +40,7 @@ TensorRT-LLM takes advantage of grouped query attention in order to save memory.
 
 ## Controlling KV Cache Behavior
 
-Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of KV cache system.
+Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of KV cache system.
 
 See [KvCacheConfig example](../examples/kvcacheconfig.md) for an example of how to use KvCacheConfig to control KV cache behavior.
 
