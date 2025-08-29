@@ -57,7 +57,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="The path to the model checkpoint or the model name from the Hugging Face Hub."
     )
 
-    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
+    model_factory: str = Field(
         default="AutoModelForCausalLM",
         description="The model factory to use for loading the model.",
     )
