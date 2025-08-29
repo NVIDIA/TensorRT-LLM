@@ -29,7 +29,7 @@ from transformers.utils import (
 from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
-from .factory import ModelFactory, ModelFactoryRegistry, ShardingConfigSource
+from .factory import ModelFactory, ModelFactoryRegistry
 from .quant_config_reader import QuantConfigReader, QuantConfigReaderRegistry
 
 
@@ -93,9 +93,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
                 dtype = getattr(torch, self.model_kwargs["torch_dtype"])
             assert isinstance(dtype, torch.dtype), f"Invalid dtype: {dtype}"
             self.model_kwargs["torch_dtype"] = dtype
-
-        # set sharding config source to huggingface
-        self._sharding_config["source"] = ShardingConfigSource.HUGGINGFACE
 
     @property
     def autoconfig_from_pretrained(self):
@@ -164,29 +161,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
         if hasattr(model, "post_init"):
             model.post_init()
 
-        # if present, initialize sharding config. We need head_dim for colwise sharding.
-        self._set_sharding_config(model.config)
-
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
 
         model.eval()
 
         return model
-
-    def _set_sharding_config(self, model_config: PretrainedConfig):
-        """Set the sharding config for the model."""
-        self._sharding_config["head_dim"] = 1
-        if hasattr(model_config, "base_model_tp_plan"):
-            self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
-        if hasattr(model_config, "head_dim") and model_config.head_dim is not None:
-            self._sharding_config["head_dim"] = model_config.head_dim
-        elif hasattr(model_config, "hidden_size") and hasattr(model_config, "num_attention_heads"):
-            self._sharding_config["head_dim"] = (
-                model_config.hidden_size // model_config.num_attention_heads
-            )
-        if hasattr(model_config, "num_hidden_layers"):
-            self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""
@@ -358,19 +338,6 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             "use_cache": False,
         },
     }
-
-    def _set_sharding_config(self, model_config: PretrainedConfig):
-        """Override the sharding config for the model with text_config."""
-        super()._set_sharding_config(model_config)
-
-        if hasattr(model_config, "text_config"):
-            text_config = model_config.text_config
-            if hasattr(text_config, "base_model_tp_plan"):
-                self._sharding_config["tp_plan"] = text_config.base_model_tp_plan
-            if hasattr(text_config, "head_dim"):
-                self._sharding_config["head_dim"] = text_config.head_dim
-            if hasattr(text_config, "num_hidden_layers"):
-                self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
     @property
     def automodel_from_config(self):

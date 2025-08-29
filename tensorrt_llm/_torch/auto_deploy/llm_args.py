@@ -159,17 +159,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
     )
 
-    use_sharding_from_factory: bool = Field(
-        default=False,
-        description="If True, use sharding from the model factory. If False, use sharding from the "
-        "AutoDeployConfig.",
-    )
-
-    sharding_dims: List[str] = Field(
-        default=["tp", "ep", "dp"],
-        description="The sharding methods to apply by the heuristic sharding stage.",
-    )
-
     compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
         Field(
             default="torch-compile",
