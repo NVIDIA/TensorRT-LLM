@@ -3,7 +3,7 @@
 import os
 import types
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,7 @@ from accelerate import init_empty_weights, load_checkpoint_in_model
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
+from PIL import Image
 from torch._prims_common import DeviceLikeType
 from transformers import (
     AutoConfig,
@@ -27,7 +28,7 @@ from transformers.utils import (
     WEIGHTS_NAME,
 )
 
-from ..custom_ops.attention_interface import CacheConfig
+from ..custom_ops.attention_interface import CacheConfig, Dim, DynamicShapeCallback
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry, ShardingConfigSource
@@ -387,3 +388,87 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         if self.tokenizer is None:
             return None
         return AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+
+    @staticmethod
+    def _simple_forward(
+        model: nn.Module,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+    ):
+        """A simple forward pass for the model to functionalize the args.
+
+        This follows the standard function signature as expected by factory.py.
+        """
+        return type(model).forward(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            pixel_values=pixel_values,
+        )
+
+    def get_example_inputs(self) -> Dict[str, torch.Tensor]:
+        """Return a dictionary of example inputs for the model."""
+
+        def _prep_seq(text, img1, img2):
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img1},
+                        {"type": "image", "image": img2},
+                        {"type": "text", "text": text},
+                    ],
+                }
+            ]
+
+        # Create a batch of conversations (batch_size = 2)
+        batch_messages = [
+            _prep_seq(
+                "Describe what you see in the two images and their differences.",
+                Image.new("RGB", (16, 16), color=(128, 128, 128)),
+                Image.new("RGB", (16, 16), color=(64, 64, 64)),
+            ),
+            _prep_seq(
+                "What are the main differences between these two images?",
+                Image.new("RGB", (16, 16), color=(255, 0, 0)),
+                Image.new("RGB", (16, 16), color=(0, 255, 0)),
+            ),
+        ]
+
+        processor = AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        inputs = processor.apply_chat_template(
+            batch_messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True,
+            return_attention_mask=False,
+        )
+
+        return {
+            "input_ids": inputs["input_ids"],
+            "pixel_values": inputs["pixel_values"],
+        }
+
+    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
+        """Return a dictionary of extra inputs for the model.
+
+        Returns:
+            A dictionary of extra inputs for the model where the key corresponds to the argument
+            name and the value corresponds to a tuple of (example_input, dynamic_shape_callback).
+            The dynamic shape callback is a function that returns the dynamic shape of the extra
+            input.
+        """
+
+        def _get_dynamic_shape():
+            return {
+                # TODO (lucaslie): how to set default values for dynamic shapes?
+                0: Dim("img_batch_size", max=10),
+                2: Dim("img_height", min=32, max=2048),
+                3: Dim("img_width", min=32, max=2048),
+            }
+
+        none_pixel_values = torch.zeros(0, 3, 336, 336)
+        return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
