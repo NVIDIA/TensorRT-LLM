@@ -9,6 +9,19 @@ At step *n*, the system launches GPU computation for step *n+1* without waiting 
 - CPU work (step *n*) and GPU computation (step *n+1*) to run concurrently.
 - Better GPU occupancy by reducing idle time.
 
+This concurrent execution pipeline is illustrated in the `PyExecutor`'s logic:
+
+```python
+# Schedule and launch GPU work for the current step (n)
+scheduled_batch, _, _ = self._schedule()
+batch_outputs = self._forward_step(scheduled_batch, previous_tensors_device)
+sample_state = self._sample_async(scheduled_batch, batch_outputs)
+
+# While the GPU is busy, process the CPU-bound results from the previous step (n-1)
+if self.previous_batch is not None:
+    self._process_previous_batch()
+```
+
 ## Tradeoff
 
 The optimization introduces one extra decoding step but significantly improves throughput.

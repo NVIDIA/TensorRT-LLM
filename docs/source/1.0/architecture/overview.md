@@ -44,7 +44,7 @@ During each iteration of its background loop, the `PyExecutor` performs the foll
 
 ## Runtime Optimizations
 
-TensorRT-LLM integrates several runtime optimizations to enhance inference throughput and reduce latency. Key among these are the CUDA Graph and the Overlap Scheduler.
+TensorRT-LLM enhances inference throughput and reduces latency by integrating a suite of runtime optimizations, including CUDA Graph, [Overlap Scheduler](../features/overlap-scheduler.md), [Speculative decoding](../features/speculative-decoding.md), etc.
 
 ### CUDA Graph
 
