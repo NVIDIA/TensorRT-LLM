@@ -71,7 +71,6 @@ def test_engine(engine_cls: Type[ADEngine], attn_backend: str, attn_page_size: i
         input_ids = [torch.tensor([0, 1, 2], device=device)]
         sequence_info.reset()
         sequence_info.nest_sequences(input_ids)
-        engine.cache_seq_interface.info.sync(sequence_info)
         logits = engine._compute_logits()
         logits = torch.stack(logits)
         assert logits is not None, "Logits are None"
@@ -106,7 +105,6 @@ def test_demo_engine_sampling(attn_page_size: int):
         input_ids = [torch.tensor([1, 2, 3, 4], device=device)]
         sequence_info.reset()
         sequence_info.nest_sequences(input_ids)
-        engine.cache_seq_interface.info.sync(sequence_info)
         logits = engine._compute_logits()
         logits = torch.stack(logits)
 
