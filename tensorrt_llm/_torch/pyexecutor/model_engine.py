@@ -2213,11 +2213,10 @@ class PyTorchModelEngine(ModelEngine):
 
                     def capture_forward_fn(inputs: Dict[str, Any]):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
-                            outputs = self._forward_step(
+                            return self._forward_step(
                                 inputs,
                                 gather_ids=gather_ids,
                                 gather_context_logits=gather_context_logits)
-                            return outputs
 
                     def capture_postprocess_fn(inputs: Dict[str, Any]):
                         self._postprocess_inputs(inputs)
