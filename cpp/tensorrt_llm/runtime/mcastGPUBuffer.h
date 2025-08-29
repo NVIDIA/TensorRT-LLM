@@ -34,10 +34,12 @@ public:
     //! \param bufSize The total size of the buffer in bytes.
     //! \param groupSize The number of ranks in the communication group.
     //! \param groupRank The rank of the local process within the group.
+    //! \param splitColor The color of the split for topology split.
     //! \param device The CUDA device for buffer allocation.
     //! \param mnNvlink Flag indicating if multi-node NVLink is used.
-    McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, at::Device device, bool mnNvlink)
-        : mMcastDeviceMemory(bufSize, groupSize, groupRank, device.index(), mnNvlink)
+    McastGPUBuffer(
+        size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t splitColor, at::Device device, bool mnNvlink)
+        : mMcastDeviceMemory(bufSize, groupSize, groupRank, splitColor, device.index(), mnNvlink)
         , mBufSize(bufSize)
         , mLocalDevice(device)
     {

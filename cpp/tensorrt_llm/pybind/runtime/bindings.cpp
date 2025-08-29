@@ -434,7 +434,7 @@ void initBindings(pybind11::module_& m)
         "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
 
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
-        .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
+        .def(py::init<size_t, uint32_t, uint32_t, uint32_t, at::Device, bool>())
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
 
