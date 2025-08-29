@@ -265,10 +265,8 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-            # The draft model won't have any draft tokens attached to
-            # generation requests when we invoke it autoregressively
-            draft_spec_config.max_draft_len = 0
-
+            
+            
             use_chain_drafter = (
                 executor_config.guided_decoding_config is None
                 and not pytorch_backend_config.enable_mixed_sampler
