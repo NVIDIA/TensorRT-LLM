@@ -2785,11 +2785,12 @@ class TestGPTOSS_120B(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
-    @pytest.mark.parametrize(
-        "moe_backend",
-        ["CUTLASS",
-         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
-        ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("moe_backend", [
+        "CUTLASS",
+        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRITON", marks=pytest.mark.install_triton)
+    ],
+                             ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (True, True),
     ])
@@ -2818,11 +2819,12 @@ class TestGPTOSS_120B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize(
-        "moe_backend",
-        ["CUTLASS",
-         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
-        ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("moe_backend", [
+        "CUTLASS",
+        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRITON", marks=pytest.mark.install_triton)
+    ],
+                             ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 1, False, True, True),

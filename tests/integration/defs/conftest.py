@@ -2131,6 +2131,10 @@ def pytest_configure(config):
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
 
+    # Register custom marks
+    config.addinivalue_line(
+        "markers", "install_triton: mark test to install triton from source")
+
 
 def deselect_by_regex(regexp, items, test_prefix, config):
     """Filter out tests based on the patterns specified in the given list of regular expressions.
@@ -2395,3 +2399,36 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@pytest.fixture
+def install_triton(trt_llm_root, llm_venv):
+    """
+    Install triton from source before each test.
+    """
+
+    triton_root = f"{trt_llm_root}/triton"
+
+    if not os.path.exists(triton_root):
+        raise FileNotFoundError(f"Triton root {triton_root} does not exist")
+
+    llm_venv.run_cmd(["-m", "pip", "install", f"{triton_root}/dist/*.whl"])
+    os.environ["TRITON_ROOT"] = triton_root
+
+    yield
+
+    llm_venv.run_cmd(["-m", "pip", "uninstall", "-y", "triton"])
+    llm_venv.run_cmd(
+        ["-m", "pip", "install", f"{trt_llm_root}/requirements.txt"])
+    os.environ.pop("TRITON_ROOT")
+
+
+def pytest_collection_modifyitems(config, items):
+    """
+    Automatically apply the install_triton fixture to tests marked with install_triton.
+    """
+    for item in items:
+        if item.get_closest_marker("install_triton"):
+            # Add the install_triton fixture to the test's fixturenames
+            if "install_triton" not in item.fixturenames:
+                item.fixturenames.append("install_triton")
