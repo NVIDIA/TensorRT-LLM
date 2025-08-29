@@ -601,12 +601,12 @@ class Deepseekv3MoE(nn.Module):
             if routed_output.dim() == 3:
                 assert shared_output.numel(
                 ) * self.top_k == routed_output.numel(
-                ), f'unmatched tensor shape'
+                ), 'unmatched tensor shape'
                 final_hidden_states = _reduce_add_shared_output(
                     routed_output, shared_output)
             else:
                 assert shared_output.size() == routed_output.size(
-                ), f'unmatched tensor shape'
+                ), 'unmatched tensor shape'
                 final_hidden_states = shared_output + routed_output
 
             if not self.use_dp and self.mapping.tp_size > 1:
