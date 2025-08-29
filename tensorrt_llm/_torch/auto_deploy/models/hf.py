@@ -16,6 +16,7 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoProcessor,
     AutoTokenizer,
     PretrainedConfig,
 )
@@ -101,10 +102,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
     def autoconfig_from_pretrained(self):
         return AutoConfig.from_pretrained
 
-    @property
-    def autotokenizer_from_pretrained(self):
-        return AutoTokenizer.from_pretrained
-
     # TODO (@lucaslie): Do we ever want to switch to from_pretrained?
     @property
     def automodel_from_config(self):
@@ -158,11 +155,13 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = self.automodel_from_config(model_config, trust_remote_code=True)
-
-        # post-init --> this must be called explicitly for HF models the way we initialize them since
-        # this "gets lost" with the init_empty_weights context manager.
-        if hasattr(model, "post_init"):
-            model.post_init()
+        if device == "meta":
+            # post-init --> this must be called explicitly for HF models the way we initialize them
+            # since this "gets lost" with the init_empty_weights context manager.
+            if hasattr(model, "post_init"):
+                model.post_init()
+        else:
+            model.to(device)
 
         # if present, initialize sharding config. We need head_dim for colwise sharding.
         self._set_sharding_config(model.config)
@@ -211,7 +210,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """Initialize the tokenizer—either a custom name or the model's default."""
         if self.tokenizer is None:
             return None
-        return self.autotokenizer_from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        return AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
     @staticmethod
     def _get_ignore_patterns(repo_id: str, skip_prefetch_weights: bool) -> List[str]:
@@ -375,3 +374,16 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     @property
     def automodel_from_config(self):
         return AutoModelForImageTextToText.from_config
+
+    def init_tokenizer(self) -> Optional[Any]:
+        """Initialize the tokenizer—either a custom name or the model's default."""
+        processor = self.init_processor()
+        if processor is None:
+            return None
+        return processor.tokenizer
+
+    def init_processor(self) -> Optional[Any]:
+        """Initialize the processor for the model."""
+        if self.tokenizer is None:
+            return None
+        return AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)

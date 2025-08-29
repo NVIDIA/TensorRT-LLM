@@ -127,6 +127,15 @@ class ModelFactory(ABC):
         """
         return None
 
+    def init_processor(self) -> Optional[Any]:
+        """Initialize the (multi-modal) processor for the model.
+
+        Returns:
+            The initialized processor for the model. If the processor is not available, then this
+            method should return None.
+        """
+        return None
+
     def prefetch_checkpoint(self, force: bool = False):
         """Try or skip prefetching the checkpoint for the model and tokenizer.
 
