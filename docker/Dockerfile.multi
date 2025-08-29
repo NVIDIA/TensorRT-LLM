@@ -6,6 +6,15 @@ ARG TRITON_BASE_TAG=25.06-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
+COPY docker/common/install.sh install.sh
+COPY docker/common/install_base.sh install_base.sh
+COPY docker/common/install_cmake.sh install_cmake.sh
+COPY docker/common/install_ccache.sh install_ccache.sh
+COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
+COPY docker/common/install_tensorrt.sh install_tensorrt.sh
+COPY docker/common/install_polygraphy.sh install_polygraphy.sh
+COPY docker/common/install_mpi4py.sh install_mpi4py.sh
+COPY docker/common/install_pytorch.sh install_pytorch.sh
 
 # Add NVIDIA EULA and AI Terms labels
 LABEL com.nvidia.eula="https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/"
@@ -24,61 +33,38 @@ RUN [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
 
 FROM base AS devel
 
-ARG PYTHON_VERSION="3.12.3"
-RUN echo "Using Python version: $PYTHON_VERSION"
-COPY docker/common/install_base.sh install_base.sh
-RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_base.sh $PYTHON_VERSION && rm install_base.sh
-
-COPY docker/common/install_cmake.sh install_cmake.sh
-RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_cmake.sh && rm install_cmake.sh
-
-COPY docker/common/install_ccache.sh install_ccache.sh
-RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_ccache.sh && rm install_ccache.sh
-
-# Only take effect when the base image is Rocky Linux 8 with old CUDA version.
-COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
-RUN bash ./install_cuda_toolkit.sh && rm install_cuda_toolkit.sh
-
-# Download & install latest TRT release
 ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
-COPY docker/common/install_tensorrt.sh install_tensorrt.sh
-RUN bash ./install_tensorrt.sh \
-    --TRT_VER=${TRT_VER} \
-    --CUDA_VER=${CUDA_VER} \
-    --CUDNN_VER=${CUDNN_VER} \
-    --NCCL_VER=${NCCL_VER} \
-    --CUBLAS_VER=${CUBLAS_VER} && \
-    rm install_tensorrt.sh
 
-# Install latest Polygraphy
-COPY docker/common/install_polygraphy.sh install_polygraphy.sh
-RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
-
-# Install mpi4py
-COPY docker/common/install_mpi4py.sh install_mpi4py.sh
-RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_mpi4py.sh && rm install_mpi4py.sh
-
-# Install PyTorch
-ARG TORCH_INSTALL_TYPE="skip"
-COPY docker/common/install_pytorch.sh install_pytorch.sh
-RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
-#
-# NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
+RUN bash ./install.sh --base
+RUN bash ./install.sh --cmake
+RUN bash ./install.sh --ccache
+RUN bash ./install.sh --cuda_toolkit
+RUN export TRT_VER=${TRT_VER} \
+    && export CUDA_VER=${CUDA_VER} \
+    && export CUDNN_VER=${CUDNN_VER} \
+    && export NCCL_VER=${NCCL_VER} \
+    && export CUBLAS_VER=${CUBLAS_VER} \
+    && bash ./install.sh --tensorrt
+RUN bash ./install.sh --polygraphy
+RUN bash ./install.sh --mpi4py
+RUN bash ./install.sh --pytorch
+RUN bash ./install.sh --opencv
+RUN bash ./install.sh --protobuf
 
-# Install OpenCV with FFMPEG support
-RUN pip3 uninstall -y opencv && \
-    rm -rf /usr/local/lib/python3*/dist-packages/cv2/ && \
-    pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
-
-# WARs against security issues inherited from pytorch:25.06
-# * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
-RUN pip3 install --upgrade --no-cache-dir \
-    "protobuf>=4.25.8"
+RUN rm install.sh \
+    install_base.sh \
+    install_cmake.sh \
+    install_ccache.sh \
+    install_cuda_toolkit.sh \
+    install_tensorrt.sh \
+    install_polygraphy.sh \
+    install_mpi4py.sh \
+    install_pytorch.sh
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
