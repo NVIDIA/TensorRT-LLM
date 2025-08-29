@@ -774,14 +774,12 @@ protected:
                     mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
             }
 
-            std::vector<int> contextRankVec(mContextRankSize);
-            std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
-
             if (isUcx || isNixl)
             {
                 auto commState = mConnectionManager->getCommState();
                 namespace su = tensorrt_llm::executor::serialize_utils;
 
+                // Rank 0 sends its commState to all generation ranks.
                 if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
                 {
                     std::ostringstream oStream;
@@ -802,6 +800,7 @@ protected:
                     }
                 }
 
+                // Each generation rank receives commState from rank 0 and sets its contextCommState.
                 if (mIsGeneration)
                 {
                     int64_t bufferSize;
@@ -820,6 +819,7 @@ protected:
                         su::deserialize<tensorrt_llm::executor::kv_cache::CommState>(is));
                 }
 
+                // Each context rank also sets the same contextCommState.
                 if (mIsContext)
                 {
                     mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
@@ -830,6 +830,8 @@ protected:
             }
             else
             {
+                std::vector<int> contextRankVec(mContextRankSize);
+                std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
                 mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(contextRankVec);
             }
         }
@@ -843,6 +845,7 @@ protected:
     {
 
         constexpr SizeType32 maxNewTokens{1};
+        // @B: Might want to make it iota to test CP.
         texec::Request request{VecTokens(length, length), maxNewTokens};
 
         auto state = std::make_unique<texec::DataTransceiverState>();
