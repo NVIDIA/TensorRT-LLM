@@ -32,6 +32,7 @@ The blocks from the prompts will be stored for reuse with the default priotity o
 
 ```
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import KvCacheRetentionConfig, TokenRangeRetentionConfig
 
 
 def main():
@@ -64,4 +65,5 @@ if __name__ == '__main__':
     main()
 ```
 
-Here we used a single kv_cache_retention_config object for all the prompts. Alternatively, you can also provide a list, the list must have the same length as the list of prompts.
+Here we used a single kv_cache_retention_config object for all the prompts. Alternatively; you can also provide a list of retention configs, the list must have the same length as the list of prompts.
+
