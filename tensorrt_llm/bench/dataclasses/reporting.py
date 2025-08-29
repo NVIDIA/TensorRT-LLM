@@ -286,8 +286,8 @@ class ReportUtility:
             raise ValueError(
                 f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
 
-        kv_cache_mem_percent = f"{kv_cache_mem_percent * 100.0:.2f}%" \
-             if kv_cache_mem_percent is not None else "None"
+        kv_cache_mem_percent = kv_cache_mem_percent \
+            if kv_cache_mem_percent is not None else None
 
         # Engine/Backend details
         if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
@@ -522,6 +522,10 @@ class ReportUtility:
                 # f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
                 f"\n")
 
+        kv_cache_percentage = world_info.get("kv_cache_percentage", None)
+        if kv_cache_percentage is not None:
+            kv_cache_percentage = f"{kv_cache_percentage * 100.0:.2f}%"
+
         world_info = (
             "===========================================================\n"
             "= WORLD + RUNTIME INFORMATION \n"
@@ -532,7 +536,7 @@ class ReportUtility:
             f"Max Runtime Batch Size: {world_info['max_batch_size']}\n"
             f"Max Runtime Tokens:     {world_info['max_num_tokens']}\n"
             f"Scheduling Policy:      {world_info['scheduling_policy']}\n"
-            f"KV Memory Percentage:   {world_info['kv_cache_percentage']}\n"
+            f"KV Memory Percentage:   {kv_cache_percentage}\n"
             f"Issue Rate (req/sec):   {world_info['issue_rate']:.4E}\n"
             f"\n")
 
