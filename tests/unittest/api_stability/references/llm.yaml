@@ -167,6 +167,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
         default: null
         status: deprecated
+      kv_connector_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConnectorConfig]
+        default: null
+        status: prototype
     return_annotation: None
   generate:
     parameters:

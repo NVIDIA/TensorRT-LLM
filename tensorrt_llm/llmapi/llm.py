@@ -983,6 +983,8 @@ class _TorchLLM(BaseLLM):
             ),
             is_llm_executor=True,
             lora_config=self.args.lora_config,
+            # Autodeploy does not support kv_connector_config
+            kv_connector_config=getattr(self.args, "kv_connector_config", None),
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,
             llm_args=self.args)
