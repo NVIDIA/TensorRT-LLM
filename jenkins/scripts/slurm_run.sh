@@ -11,12 +11,6 @@ set_value_in_command() {
     # Transform the key
     local placeholder="__PLACEHOLDER_${key}__"
 
-    # Check if placeholder exists
-    if [[ "$command" != *"$placeholder"* ]]; then
-        echo "Error: placeholder '$placeholder' not found in the command" >&2
-        return 1
-    fi
-
     # Replace all occurrences
     local result="${command//${placeholder}/${value}}"
 
