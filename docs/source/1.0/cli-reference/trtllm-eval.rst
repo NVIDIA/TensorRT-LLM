@@ -45,6 +45,10 @@ The following tasks are currently supported:
      - 1,024
      - 512
 
+.. note::
+
+    ``trtllm-eval`` originates from the TensorRT-LLM accuracy test suite and serves as a lightweight utility for verifying and debugging accuracy. At this time, ``trtllm-eval`` is intended solely for development and is not recommended for production use.
+
 
 Usage and Examples
 ------------------
