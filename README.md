@@ -18,6 +18,9 @@ TensorRT-LLM
 <div align="left">
 
 ## Tech Blogs
+* [08/29] ADP Balance Strategy
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog10_ADP_Balance_Strategy.md)
+
 * [08/05] Running a High-Performance GPT-OSS-120B Inference Server with TensorRT-LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.md)
 
