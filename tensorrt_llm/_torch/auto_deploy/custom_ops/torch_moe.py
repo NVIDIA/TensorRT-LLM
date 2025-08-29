@@ -324,3 +324,63 @@ def torch_quant_nvfp4_moe_fake(
     w3_alpha: List[torch.Tensor],
 ) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+# Shapes (per expert):
+#   gate_up_w:   [E, H, 2I]
+#   gate_up_b:   [E, 2I]
+#   down_w:      [E, 2I, H]
+#   down_b:      [E, H]
+#
+# Inputs:
+#   hidden_states:   [B, S, H]
+#   routing_weights: [B*S, E]   (softmax over E; top-k or dense)
+# Returns:
+#   next_states:     [B, S, H]
+
+
+@torch.library.custom_op("auto_deploy::torch_moe_dense_mlp", mutates_args=())
+def torch_moe_dense_mlp(
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_w: torch.Tensor,
+    gate_up_b: torch.Tensor,
+    down_w: torch.Tensor,
+    down_b: torch.Tensor,
+    alpha: float = 1.0,
+    limit: float = 10.0,
+) -> torch.Tensor:
+    batch_size = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[2]  # to check
+    hidden_states = hidden_states.reshape(-1, hidden_size)  # (num_tokens, hidden_size)
+    num_experts = routing_weights.shape[1]
+
+    hidden_states = hidden_states.repeat(num_experts, 1)
+    hidden_states = hidden_states.view(num_experts, -1, hidden_size)
+    gate_up = torch.bmm(hidden_states, gate_up_w) + gate_up_b[..., None, :]
+    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    glu = gate * torch.sigmoid(gate * alpha)
+    next_states = torch.bmm(((up + 1) * glu), down_w)
+    next_states = next_states + down_b[..., None, :]
+    next_states = next_states.view(num_experts, batch_size, -1, hidden_size)
+    next_states = (
+        next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
+    )
+    next_states = next_states.sum(dim=0)
+    return next_states
+
+
+@torch_moe_dense_mlp.register_fake
+def _torch_moe_dense_mlp_fake(
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_w: torch.Tensor,
+    gate_up_b: torch.Tensor,
+    down_w: torch.Tensor,
+    down_b: torch.Tensor,
+    alpha: float = 1.0,
+    limit: float = 10.0,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
