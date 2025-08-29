@@ -639,6 +639,161 @@ def set_tensor_value_4(x, num_row, num_cols):
 
 
 @skip_pre_blackwell
+@pytest.mark.skipif(torch.cuda.device_count() < 4,
+                    reason="needs 4 GPUs to run this test")
+@pytest.mark.parametrize(
+    "alltoall_method_type",
+    [AlltoallMethodType.MNNVL, AlltoallMethodType.NotEnabled],
+    ids=lambda s: s.name)
+def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
+    """Test WideEPMoE with FP8 block-wise quantization using DeepGemmFusedMoE as reference."""
+
+    world_size = 4
+    dtype = torch.bfloat16
+    # Reduce model size to avoid MPI int32 overflow
+    HIDDEN_SIZE = 768
+    INTERMEDIATE_SIZE = 512
+    NUM_EXPERTS = 16
+    TOP_K = 2
+    MAX_NUM_TOKENS = 256
+
+    # The MPI can not support FP8, so create weights on each rank
+    def per_rank_test_fused_moe_alltoall_fp8_blockwise(job_id):
+        routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
+        mapping = Mapping(world_size=world_size,
+                          rank=mpi_rank(),
+                          tp_size=world_size,
+                          moe_ep_size=world_size,
+                          moe_tp_size=1,
+                          enable_attention_dp=True)
+        torch.cuda.set_device(mapping.rank)
+        # Use same seed for all ranks to ensure consistency
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        # Generate test data locally on each rank
+        x_list = []
+        m = MAX_NUM_TOKENS
+        while m >= 1:
+            x = torch.randn((m, HIDDEN_SIZE), dtype=dtype, device="cuda")
+            set_tensor_value_2(x, m, HIDDEN_SIZE)
+            x_list.append(x)
+            m //= 2
+
+        # Generate weights locally on each rank (same weights due to same seed)
+        weights = {}
+        for expert_id in range(NUM_EXPERTS):
+            w1_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") / HIDDEN_SIZE
+            w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                                    dtype=dtype,
+                                    device="cuda")
+            w3_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") / HIDDEN_SIZE
+
+            set_tensor_value_3(w1_weight, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+            set_tensor_value_4(w2_weight, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+            set_tensor_value_3(w3_weight, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+
+            # FP8 block-wise quantization
+            w1_weight_fp8, w1_weight_scale = per_block_cast_to_fp8_e8m0(
+                w1_weight)
+            w1_weight_fp8 = w1_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+            w2_weight_fp8, w2_weight_scale = per_block_cast_to_fp8_e8m0(
+                w2_weight)
+            w2_weight_fp8 = w2_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+            w3_weight_fp8, w3_weight_scale = per_block_cast_to_fp8_e8m0(
+                w3_weight)
+            w3_weight_fp8 = w3_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+            weights[f"{expert_id}.w1.weight"] = w1_weight_fp8
+            weights[f"{expert_id}.w2.weight"] = w2_weight_fp8
+            weights[f"{expert_id}.w3.weight"] = w3_weight_fp8
+            weights[f"{expert_id}.w1.weight_scale_inv"] = w1_weight_scale
+            weights[f"{expert_id}.w2.weight_scale_inv"] = w2_weight_scale
+            weights[f"{expert_id}.w3.weight_scale_inv"] = w3_weight_scale
+            weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale
+            weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale
+            weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale
+
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+
+        # Test WideEPMoE with alltoall method
+        with mock.patch.object(WideEPMoE,
+                               "select_alltoall_method_type",
+                               return_value=alltoall_method_type):
+            alltoall_model = WideEPMoE(
+                num_experts=NUM_EXPERTS,
+                routing_method=routing_method,
+                hidden_size=HIDDEN_SIZE,
+                intermediate_size=INTERMEDIATE_SIZE,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=ModelConfig(mapping=mapping,
+                                         max_num_tokens=MAX_NUM_TOKENS,
+                                         quant_config=quant_config),
+            )
+        alltoall_model.to("cuda")
+        alltoall_model.load_weights([weights])
+
+        # Use DeepGemmFusedMoE as reference
+        ref_model = DeepGemmFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=ModelConfig(mapping=mapping,
+                                     max_num_tokens=MAX_NUM_TOKENS,
+                                     quant_config=quant_config),
+        )
+        ref_model.to("cuda")
+        ref_model.load_weights([weights])
+
+        # Evaluate the outputs on variant sequence lengths
+        m = MAX_NUM_TOKENS
+        i = 0
+        while m >= 1:
+            x = x_list[i]
+            i += 1
+            router_logits = torch.randn((m, NUM_EXPERTS),
+                                        dtype=dtype,
+                                        device="cuda")
+            all_rank_num_tokens = [m] * mapping.world_size
+            with torch.inference_mode():
+                output = alltoall_model.forward(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    all_rank_max_num_tokens=m,
+                    use_dp_padding=False)
+                ref_output = ref_model.forward(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    all_rank_max_num_tokens=m,
+                    use_dp_padding=False)
+
+            # Evaluate outputs with relaxed tolerance for FP8
+            # If WideEPMoE output has TOP_K dimension, reduce it to match DeepGemmFusedMoE
+            if output.dim() == 3 and output.shape[1] == TOP_K:
+                output = output.sum(dim=1)
+            torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+            m //= 2
+
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(per_rank_test_fused_moe_alltoall_fp8_blockwise,
+                               range(world_size))
+        for r in results:
+            assert r is None
+
+
+@skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
     product(
