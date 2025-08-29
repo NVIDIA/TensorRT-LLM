@@ -424,6 +424,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
+        if spec_metadata is not None and spec_metadata.is_final_output_capture(
+        ):
+            spec_metadata.maybe_capture_final_hidden_states(hidden_states)
 
         if attn_metadata.padded_num_tokens is not None:
             hidden_states = hidden_states[:attn_metadata.num_tokens]
