@@ -1892,15 +1892,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
-    multiNodesSBSAConfigs = [
-        // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-6": ["gb200-multi-node", "l0_gb200_multi_nodes", 6, 6, 8, 2],
-    ]
+    multiNodesSBSAConfigs = (1..7).collectEntries { i ->
+        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-multi-node", "l0_gb200_multi_nodes", i, 7, 8, 2]]
+    }
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
