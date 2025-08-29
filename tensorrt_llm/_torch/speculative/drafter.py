@@ -45,7 +45,7 @@ class Drafter(ABC):
         if not requests or max_batch_size <= 0 or max_num_tokens <= 0:
             return False
 
-        tokens_per_request = 1 + max(0, max_draft_len)
+        tokens_per_request = 1 + max_draft_len
         token_cap = max_num_tokens // tokens_per_request
         if token_cap <= 0:
             return False
