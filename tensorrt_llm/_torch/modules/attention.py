@@ -316,7 +316,8 @@ class Attention(nn.Module):
             has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                                or self.o_proj.has_fp8_block_scales
                                or self.o_proj.has_fp8_rowwise)
-            if has_quant_scale and self.attn.has_fp8_kv_cache:
+            if has_quant_scale and (self.attn.has_fp8_kv_cache
+                                    or self.attn.has_fp4_kv_cache):
                 out_dtype = torch.float8_e4m3fn
         output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
         return output

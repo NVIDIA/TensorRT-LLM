@@ -305,8 +305,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM"])
     def test_nvfp4_kv(self, attn_backend, torch_compile):
-        if torch_compile:
-            pytest.skip("NVFP4 KV does not support torch compile currently.")
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=True,
