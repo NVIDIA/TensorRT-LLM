@@ -80,6 +80,15 @@ echo "$LD_LIBRARY_PATH"
 env | sort
 echo "Running: $testCase"
 echo "Full Command: $pytestCommand"
+
+# For single node testing
+# Unset Env variables that set by Slurm srun
+# This will disable MPI when run pytest
+if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]; then
+    for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
+        unset "$v"
+    done
+fi
 eval $pytestCommand
 
 if [ "$perfMode" = "true" ]; then
