@@ -347,16 +347,21 @@ class GenerationExecutor(ABC):
         return self._iter_kv_events_result
 
     @staticmethod
-    def _create_ray_executor(worker_kwargs: Dict, model_world_size: int,
-                             postproc_worker_config: PostprocWorkerConfig,
-                             is_llm_executor: bool, tp_size: int):
+    def _create_ray_executor(
+            worker_kwargs: Dict,
+            model_world_size: int,
+            postproc_worker_config: PostprocWorkerConfig,
+            is_llm_executor: bool,
+            tp_size: int,
+            kv_connector_config: Optional[KvCacheConnectorConfig] = None):
         from .ray_executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
                            model_world_size=model_world_size,
                            postproc_worker_config=postproc_worker_config,
                            is_llm_executor=is_llm_executor,
-                           tp_size=tp_size)
+                           tp_size=tp_size,
+                           kv_connector_config=kv_connector_config)
 
     @staticmethod
     def create(
@@ -375,7 +380,6 @@ class GenerationExecutor(ABC):
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[TorchLlmArgs] = None,
-        orchestrator_type: Optional[str] = None,
         **args,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
@@ -411,13 +415,15 @@ class GenerationExecutor(ABC):
         if lora_config:
             worker_kwargs["lora_config"] = lora_config
 
+        orchestrator_type = None if llm_args is None else llm_args.orchestrator_type
         if orchestrator_type == "ray":
             return GenerationExecutor._create_ray_executor(
                 worker_kwargs,
                 model_world_size,
                 postproc_worker_config,
                 is_llm_executor=is_llm_executor,
-                tp_size=args.get("tp_size", 1))
+                tp_size=args.get("tp_size", 1),
+                kv_connector_config=kv_connector_config)
         elif orchestrator_type is not None:
             raise ValueError(
                 f"Unsupported orchestrator_type: {orchestrator_type}")

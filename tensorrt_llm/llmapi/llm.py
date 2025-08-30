@@ -121,7 +121,7 @@ class BaseLLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
-        self._orchestrator_type = kwargs.pop("orchestrator_type", None)
+        self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
 
         log_level = logger.level

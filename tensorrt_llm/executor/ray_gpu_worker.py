@@ -1,5 +1,4 @@
 import copy
-import json
 import os
 from pathlib import Path
 from queue import Queue
@@ -8,10 +7,13 @@ from typing import Dict, Optional, Union
 import ray
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
-from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import PybindMirror
+from ..builder import Engine, EngineConfig
+from ..llmapi.llm_args import KvCacheConnectorConfig, PybindMirror, TorchLlmArgs
+from ..llmapi.tokenizer import TokenizerBase
 from ..lora_manager import LoraConfig, LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
@@ -126,7 +128,10 @@ class RayGPUWorker(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[TorchLlmArgs] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -144,10 +149,15 @@ class RayGPUWorker(GenerationExecutor):
         self._client_id_to_request_id: Dict[int, int] = {}
 
         self._executor_config = executor_config
-        self._is_pytorch_backend = getattr(self._executor_config, "backend",
-                                           None) == "pytorch"
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
+        self.llm_args = llm_args
+
         if not self._is_pytorch_backend:
             raise ValueError(f"Ray GPU worker only supports pytorch backend")
+
+        if not self._is_pytorch_backend and kv_connector_config is not None:
+            raise ValueError(
+                "KV connector config is only supported for PyTorch backend")
 
         if self.global_rank > 1:
             from tensorrt_llm.logger import logger
@@ -156,53 +166,52 @@ class RayGPUWorker(GenerationExecutor):
         if isinstance(engine, list):
             engine = engine[self.rank]
 
-        if executor_config is None:
-            executor_config = tllm.ExecutorConfig(1)
-
-        executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-            processor_batched=batched_logits_processor, replicate=False)
-
-        def _create_engine():
+        def _get_comm_ranks_device_id():
             # Make sure C++ executor would use same devices/ranks as py_executor
             global_rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
-
             comm_ranks = [None] * world_size
             device_ids = [None] * world_size
+
             torch.distributed.all_gather_object(comm_ranks, global_rank)
             torch.distributed.all_gather_object(device_ids, self.device_id)
+            return comm_ranks, device_ids
+
+        def _create_py_executor(executor_config):
+            # Largely adapted from GenerationExecutorWorker. WAR: Keep in sync manually.
+
+            assert executor_config is None, "expect an empty executor_config in _create_py_executor"
+            executor_config = llm_args.get_executor_config(
+                hf_model_dir, tokenizer)
+            # Persist so downstream code (e.g., default max_tokens deduction) has access
+            self._executor_config = executor_config
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_batched=batched_logits_processor, replicate=False)
+            comm_ranks, device_ids = _get_comm_ranks_device_id()
             executor_config.parallel_config = tllm.ParallelConfig(
                 participant_ids=comm_ranks, device_ids=device_ids)
-
-            if isinstance(engine, Engine):
-                return tllm.Executor(engine.engine,
-                                     json.dumps(engine.config.to_dict(),
-                                                cls=ConfigEncoder),
-                                     tllm.ModelType.DECODER_ONLY,
-                                     executor_config=executor_config,
-                                     managed_weights=engine.managed_weights)
-
-            if not hasattr(executor_config, "backend"):
-                return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                     executor_config)
             args = {
                 "executor_config": executor_config,
                 "checkpoint_dir": executor_config.hf_model_dir,
             }
+            assert hasattr(
+                executor_config, "backend"
+            ), "executor_config should be with backend in _create_py_executor"
             if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
                 args["lora_config"] = lora_config
                 args[
-                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
+                    "garbage_collection_gen0_threshold"] = llm_args.garbage_collection_gen0_threshold
+                args["kv_connector_config"] = kv_connector_config
             else:
                 raise ValueError(
-                    f"Unsupported backend config: {executor_config.backend}")
-
+                    f"Unsupported backend config in RayGPUWorker: {executor_config.backend}"
+                )
             return create_executor(**args)
 
-        self.engine = _create_engine()
+        self.engine = _create_py_executor(executor_config)
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
@@ -249,16 +258,22 @@ class RayGPUWorker(GenerationExecutor):
                 return
             self.engine.cancel_request(request_id)
 
-    def _load_lora_adapter(self, lora_request: LoRARequest):
-        self._lora_manager.load_from_ckpt(
+    def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
+        """Returns True if the adapter was loaded by this call, False if it was already loaded"""
+        # WAR: Copied from GenerationExecutorWorker. Keep in sync manually.
+        adapter_id = str(lora_request.adapter_id)
+        newly_loaded_uids = self._lora_manager.load_from_ckpt(
             [lora_request.path],
             model_config=self._runtime_model_config if
             self._runtime_model_config is not None else self._lora_model_config,
             runtime_mapping=None,
-            uids=[str(lora_request.adapter_id)])
+            uids=[adapter_id],
+            ckpt_source=lora_request.ckpt_source)
+        return adapter_id in newly_loaded_uids
 
     def _load_prompt_adapter(self,
                              prompt_adapter_request: PromptAdapterRequest):
+        # WAR: Copied from GenerationExecutorWorker. Keep in sync manually.
         self._prompt_adapter_manager.load_from_ckpt(
             [prompt_adapter_request.local_path],
             model_config=self._runtime_model_config,
@@ -267,6 +282,7 @@ class RayGPUWorker(GenerationExecutor):
     def enqueue_request(self,
                         request: GenerationRequest,
                         result_wait_queue: Queue | None = None) -> int:
+        # Largely adapted from GenerationExecutorWorker. WAR: Keep in sync manually.
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
@@ -324,38 +340,56 @@ class RayGPUWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        is_overlap_enabled = self._is_pytorch_backend and not self._executor_config.pytorch_backend_config.disable_overlap_scheduler
-        if is_overlap_enabled:
-            is_disaggregated = self.engine.kv_cache_transceiver is not None
-            if is_disaggregated and (
-                    request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
-                raise ValueError(
-                    "Context only requests are not supported in pytorch backend when overlap is enabled."
-                )
+        if self._is_pytorch_backend:
+            assert isinstance(self.llm_args, TorchLlmArgs)
+            if not self.llm_args.disable_overlap_scheduler:
+                is_disaggregated = self.engine.kv_cache_transceiver is not None
+                if is_disaggregated and (
+                        request_type
+                        == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
+                    raise ValueError(
+                        "Context only requests are not supported in pytorch backend when overlap is enabled."
+                    )
 
         assert request.id is not None
 
         def _deduce_max_tokens(request: GenerationRequest,
                                executor_config: tllm.ExecutorConfig) -> int:
-            if request.sampling_params.max_tokens:
-                return request.sampling_params.max_tokens
             # deduce max_tokens when it's not set by user
+            max_tokens = request.sampling_params.max_tokens
             query_token_len = len(
                 request.query_token_ids) if request.query_token_ids else 0
             cp_size = 1 if (not hasattr(executor_config, "mapping")
                             or executor_config.mapping.cp_size
                             is None) else executor_config.mapping.cp_size
             if not hasattr(executor_config, "max_seq_len"):
-                raise RuntimeError(
-                    "max_tokens for sampling is not set and cannot be deduced")
+                logger.warning("`default_max_tokens` cannot be deduced")
+                if max_tokens is None:
+                    raise ValueError(
+                        "`max_tokens` must be set when `default_max_tokens` cannot be deduced"
+                    )
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = executor_config.max_seq_len - splited_prompt_len - query_token_len
-            if default_max_tokens < 0:
-                raise ValueError(
-                    f"Deduced max_tokens {default_max_tokens} is less than 0, because"
-                    f"prompt length {splited_prompt_len} plus query length {query_token_len} "
-                    f"is larger than max_seq_len {executor_config.max_seq_len}")
-            return default_max_tokens
+            if default_max_tokens <= 0:
+                logger.warning(
+                    f"`default_max_tokens` ({default_max_tokens}) should be greater than 0, "
+                    f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({executor_config.max_seq_len})"
+                    f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
+                )
+                if max_tokens is None:
+                    raise ValueError(
+                        "`max_tokens` must be set when `default_max_tokens` is illegal"
+                    )
+            # default_max_tokens is the biggest available value
+            if max_tokens is None:
+                return default_max_tokens
+            elif max_tokens > default_max_tokens:
+                logger.warning(
+                    f"User-specified `max_tokens` ({max_tokens}) is greater than deduced "
+                    f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
+                )
+                return default_max_tokens
+            return max_tokens
 
         try:
             executor_request = tllm.Request(
@@ -428,8 +462,9 @@ class RayGPUWorker(GenerationExecutor):
         except Exception as e:
             raise RequestError(str(e)) from e
 
-    def submit(self, request: GenerationRequest) -> GenerationResult:
-        raise NotImplementedError("Ray GPU worker does not support submit")
+    def submit(self, request: GenerationRequest):
+        raise NotImplementedError(
+            "Ray GPU worker does not support submit() yet.")
 
     def shutdown(self):
 
@@ -463,11 +498,12 @@ class RayGPUWorker(GenerationExecutor):
         logger.debug(f"Worker {mpi_rank()} shutdown done.")
 
     def block_subordinates(self):
+        # WAR: Copied from GenerationExecutorWorker. Keep in sync manually.
         if self.rank != 0:
             if isinstance(self.engine, tllm.Executor):
                 self.shutdown()
                 raise self.WorkerExit(
-                    "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
+                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
                 )
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
