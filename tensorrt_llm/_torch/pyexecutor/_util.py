@@ -171,7 +171,7 @@ class KvCacheCreator:
 
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
-                self._max_seq_len - 1)
+                max(1, self._max_seq_len - 1))
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
@@ -386,7 +386,7 @@ class KvCacheCreator:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
         # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
-        if kv_cache_manager != None:
+        if kv_cache_manager is not None:
             self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
