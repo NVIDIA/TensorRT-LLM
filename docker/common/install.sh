@@ -1,10 +1,5 @@
 #!/bin/bash
-
-echo "TRT_VER: $TRT_VER"
-echo "CUDA_VER: $CUDA_VER"
-echo "CUDNN_VER: $CUDNN_VER"
-echo "NCCL_VER: $NCCL_VER"
-echo "CUBLAS_VER: $CUBLAS_VER"
+set -Eeuo pipefail
 
 # Default values
 base=0
