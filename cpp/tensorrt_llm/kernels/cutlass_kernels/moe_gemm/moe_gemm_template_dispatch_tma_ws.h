@@ -113,6 +113,9 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
                 "passing 103-real as an arch to build_wheel.py.");
             first_time = false;
         }
+        return dispatchMoeGemmSelectBiasTmaWarpSpecialized<cutlass::arch::Sm100, T, WeightType, OutputType, EpilogueTag,
+            FUSION, TileShape, ClusterShape>(
+            hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
     }
 #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
