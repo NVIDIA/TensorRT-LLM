@@ -207,48 +207,34 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
 
 
 def filtered_nodes(
-    nodes: Iterable[Node],
-    target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,
-    ops: Union[OperatorLike, Iterable[OperatorLike]] = None,
+    nodes: Iterable[Node], ops: Union[OperatorLike, Iterable[OperatorLike]]
 ) -> Iterable[Node]:
-    """Iterate over nodes that are filtered by the given operations or target function.
+    """Iterate over nodes that are filtered by the given operations.
 
     This utility function simplifies the common pattern of iterating through nodes
-    and filtering by operation type or custom function.
+    and filtering by operation type.
 
     Args:
         nodes: Iterable of nodes to filter (e.g., gm.graph.nodes)
-        target: Either a callable function that takes a Node and returns bool,
-               or operation(s) to match against (deprecated, use ops parameter)
-        ops: Operation(s) to match against (preferred over target for operations)
+        ops: Operation(s) to match against
 
     Yields:
-        Node: Nodes that match the given operations or target function
+        Node: Nodes that match the given operations
 
     Example:
-        # Using callable function:
-        for node in filtered_nodes(gm.graph.nodes, is_linear_op):
+        # Instead of:
+        for node in gm.graph.nodes:
+            if not is_op(node, torch.ops.aten.linear):
+                continue
             # process node
 
-        # Using operations:
-        for node in filtered_nodes(gm.graph.nodes, ops=torch.ops.aten.linear):
-            # process node
-
-        # Using multiple operations:
-        for node in filtered_nodes(gm.graph.nodes, ops=[torch.ops.aten.linear, torch.ops.aten.bmm]):
+        # Use:
+        for node in filtered_nodes(gm.graph.nodes, torch.ops.aten.linear):
             # process node
     """
-    # Handle the case where target is a callable function
-    if callable(target) and not isinstance(target, (OpOverloadPacket, OpOverload)):
-        for node in nodes:
-            if target(node):
-                yield node
-    else:
-        # Handle the case where target or ops contains operations
-        operations = ops if ops is not None else target
-        for node in nodes:
-            if is_op(node, operations):
-                yield node
+    for node in nodes:
+        if is_op(node, ops):
+            yield node
 
 
 def is_linear_op(node: Node, include_quantization: bool = False) -> bool:

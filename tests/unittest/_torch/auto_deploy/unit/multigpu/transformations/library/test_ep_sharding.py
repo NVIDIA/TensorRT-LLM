@@ -24,16 +24,11 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
     ).to(device=device, dtype=torch.bfloat16)
     x = model.get_input(device=device, dtype=torch.bfloat16)
 
-    if world_size > num_experts:
-        print(f"world_size {world_size} > num_experts {num_experts}, skipping test")
-        return
-
     def _get_expected_num_params(rank: int, world_size: int, num_p_og: int) -> int:
         if world_size <= 1:
             return num_p_og
         # the gate's weight and bias node
-        # NOTE:gate layer is also distributed using simple_shard during tp_transform
-        n_gate = num_experts * (hidden_size + 1)  # // world_size
+        n_gate = num_experts * (hidden_size + 1)
         num_experts_per_rank = num_experts // world_size
         if rank == world_size - 1:
             num_experts_per_rank += num_experts % world_size
@@ -44,10 +39,8 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
     gm_transformed = InferenceOptimizer(
         None,
         {
-            "detect_sharding": {
+            "detect_ep_shard": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
-                "sharding_dims": ["ep"],
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -103,9 +96,8 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
     optimizer = InferenceOptimizer(
         None,
         {
-            "detect_sharding": {
+            "detect_ep_shard": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
             },
         },
     )

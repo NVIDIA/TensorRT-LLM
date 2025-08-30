@@ -52,11 +52,13 @@ transforms:
   quantize_moe:
     stage: pattern_matcher
   # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
-  detect_sharding:
+  detect_column_row_shard:
     stage: sharding
     simple_shard_only: false
-    use_sharding_from_factory: false
-    sharding_dims: ['tp', 'ep', 'dp']
+  detect_ep_shard:
+    stage: sharding
+  detect_dp_bmm_shard:
+    stage: sharding
   # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding
