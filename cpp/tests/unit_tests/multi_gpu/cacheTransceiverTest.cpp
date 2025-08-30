@@ -1373,6 +1373,26 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1ForMLA, AsymmetricalCacheTest,
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false)));
 
+/*************************************************************************/
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPForMLA, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/testing::Values(1),
+                     /*contextPp*/testing::Values(1),
+                     /*contextCp*/testing::Values(1),
+                     /*genTp*/testing::Values(1),
+                     /*genPp*/testing::Values(1),
+                     /*genCp*/ testing::Values(2),
+                     /*numLayers*/ testing::Values(1),
+                     /*numHeads*/ testing::Values(1),
+                     /*sizePerHead*/ testing::Values(4),
+                     /*tokensPerBlock*/ testing::Values(4),
+                     /*dataType*/ testing::Values(nvinfer1::DataType::kINT8),
+                     /*kvFactor*/ testing::Values(2),
+                     /*isMLA*/testing::Values(true),
+                     /*contextDP*/ testing::Values(false),
+                     /*generationDP*/ testing::Values(false),
+                     /*isWindow*/ testing::Values(false)));
+/*************************************************************************/
+
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),

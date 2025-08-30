@@ -564,14 +564,6 @@ void MLACacheFormatter::unformat(TransferSession& session)
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be divisible by DP size");
         return false;
     }
-    if (selfConfig.getParallelConfig().mContextParallelism != 1
-        || destConfig.getParallelConfig().mContextParallelism != 1)
-    {
-        TLLM_LOG_WARNING(
-            "MLACacheFormatter::inquireSupport: context parallelism is not currently supported (selfCP=%d, destCP=%d).",
-            selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
-        return false;
-    }
     if (destConfig.getParallelConfig().mEnableAttentionDP
         && (destConfig.getParallelConfig().mTensorParallelism % destConfig.getParallelConfig().mDPsize != 0))
     {
