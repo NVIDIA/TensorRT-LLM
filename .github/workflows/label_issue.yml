@@ -44,4 +44,5 @@ jobs:
             Prefer selecting only one label that represents the main topic or problem. Only suggest multiple labels if the issue genuinely spans multiple distinct areas that are equally important.
             Respond with ONLY the chosen label name (e.g., 'bug', 'feature-request') or comma-separated names if multiple are truly needed.
             If no labels seem appropriate, respond with 'NONE'.
+            When labeling bugs, include secondary labels from Customized kernels, Decoding, Disaggregated serving, Doc, Frontend, General perf, Inference runtime, Infra, LLM API, Model customization, Model optimization, OOTB, Pytorch, Scale-out, Speculative Decoding, Testing, Triton backend, and Windows.
             Do not add any other text, explanation, or markdown formatting.
