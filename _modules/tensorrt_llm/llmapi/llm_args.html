@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc1" />
+  <meta name="docsearch:version" content="1.1.0rc2" />
 
 
   </head>
@@ -328,6 +328,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
@@ -349,6 +350,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -451,8 +453,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT-LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT‑LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</a></li>
 </ul>
 </div>
 </nav></div>
@@ -519,7 +529,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span><span class="p">,</span> <span class="n">EnumMeta</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span>
-                    <span class="n">Type</span><span class="p">,</span> <span class="n">TypeAlias</span><span class="p">,</span> <span class="n">TypeVar</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span><span class="p">)</span>
+                    <span class="n">Set</span><span class="p">,</span> <span class="n">Type</span><span class="p">,</span> <span class="n">TypeAlias</span><span class="p">,</span> <span class="n">TypeVar</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">get_args</span><span class="p">,</span> <span class="n">get_origin</span><span class="p">)</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">yaml</span>
@@ -554,7 +564,8 @@
                                  <span class="n">KvCacheConfig</span> <span class="k">as</span> <span class="n">_KvCacheConfig</span><span class="p">,</span>
                                  <span class="n">LookaheadDecodingConfig</span> <span class="k">as</span> <span class="n">_LookaheadDecodingConfig</span><span class="p">,</span>
                                  <span class="n">PeftCacheConfig</span> <span class="k">as</span> <span class="n">_PeftCacheConfig</span><span class="p">,</span>
-                                 <span class="n">SchedulerConfig</span> <span class="k">as</span> <span class="n">_SchedulerConfig</span><span class="p">)</span> <span class="c1"># isort: skip</span>
+                                 <span class="n">SchedulerConfig</span> <span class="k">as</span> <span class="n">_SchedulerConfig</span><span class="p">,</span>
+                                 <span class="n">GuidedDecodingConfig</span> <span class="k">as</span> <span class="n">_GuidedDecodingConfig</span><span class="p">)</span> <span class="c1"># isort: skip</span>
 <span class="c1"># isort: on</span>
 
 <span class="c1"># yapf: enable</span>
@@ -566,7 +577,8 @@
                                      <span class="n">SpeculativeDecodingMode</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">BatchedLogitsProcessor</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.build_cache</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildCacheConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">tokenizer_factory</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_llguidance_tokenizer_info</span><span class="p">,</span>
+                        <span class="n">_xgrammar_tokenizer_info</span><span class="p">,</span> <span class="n">tokenizer_factory</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">generate_api_docs_as_docstring</span><span class="p">,</span> <span class="n">get_type_repr</span>
 
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
@@ -699,7 +711,7 @@
     <span class="n">load_balancer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">object</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Configuration for MoE load balancing.&quot;</span><span class="p">,</span>
-        <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Union[MoeLoadBalancerConfig, str]&quot;</span><span class="p">})</span>
+        <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Union[MoeLoadBalancerConfig, dict, str]&quot;</span><span class="p">})</span>
 
     <span class="n">disable_finalize_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -889,6 +901,7 @@
     <span class="c1"># When specified, speculation will be disabled at batch sizes above</span>
     <span class="c1"># this value. Otherwise, speculation will always be on.</span>
     <span class="n">max_concurrency</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">load_format</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
@@ -938,6 +951,21 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">decoding_type</span><span class="o">.</span><span class="n">upper</span><span class="p">())</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">KvCacheConnectorConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Configuration for the KV Cache Connector.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">connector_module</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="o">...</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The import path to the connector module. It will be imported with `importlib.import_module`.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">connector_scheduler_class</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="o">...</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The class name of the scheduler within the module.&quot;</span><span class="p">)</span>
+    <span class="n">connector_worker_class</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="o">...</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The class name of the worker within the module.&quot;</span><span class="p">)</span>
+
+
 <div class="viewcode-block" id="MedusaDecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">MedusaDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
@@ -972,6 +1000,7 @@
     <span class="n">num_eagle_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">max_non_leaves_per_layer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">eagle3_one_model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">eagle3_layers_to_capture</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="EagleDecodingConfig.from_dict">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.from_dict">[docs]</a>
@@ -995,7 +1024,18 @@
             <span class="n">SpeculativeDecodingMode</span> <span class="k">as</span> <span class="n">TorchSpeculativeDecodingMode</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_one_model</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">EAGLE3_ONE_MODEL</span>
-        <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">EAGLE3</span></div>
+        <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">EAGLE3</span>
+
+    <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">num_capture_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Returns the number of layers to capture of the target model.</span>
+<span class="sd">        If eagle3_layers_to_capture is not None, return the length of the set.</span>
+<span class="sd">        Otherwise, assume Eagle3 base set and return 3.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span><span class="p">)</span>
+        <span class="k">return</span> <span class="mi">3</span></div>
 
 
 
@@ -1106,7 +1146,9 @@
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
-        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">data</span><span class="p">)</span></div>
+        <span class="n">out</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">data</span><span class="p">)</span>
+        <span class="n">out</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">out</span><span class="o">.</span><span class="n">num_nextn_predict_layers</span>
+        <span class="k">return</span> <span class="n">out</span></div>
 
 
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;MTP&quot;</span>
@@ -1623,6 +1665,11 @@
     <span class="p">)</span>
     <span class="n">use_uvm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                           <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to use UVM for the KV cache.&quot;</span><span class="p">)</span>
+    <span class="n">max_gpu_total_bytes</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The maximum size in bytes of GPU memory that can be allocated for the KV cache. If both `max_gpu_total_bytes` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated.&quot;</span>
+    <span class="p">)</span>
 
     <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
     <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
@@ -1653,7 +1700,44 @@
             <span class="n">use_uvm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_uvm</span><span class="p">,</span>
             <span class="n">attention_dp_events_gather_period_ms</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
             <span class="n">attention_dp_events_gather_period_ms</span><span class="p">,</span>
-        <span class="p">)</span></div>
+            <span class="n">max_gpu_total_bytes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_gpu_total_bytes</span><span class="p">)</span>
+
+<div class="viewcode-block" id="KvCacheConfig.validate_max_gpu_total_bytes">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_gpu_total_bytes">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;max_gpu_total_bytes&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_max_gpu_total_bytes</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;kv_cache_config.max_gpu_total_bytes must be non-negative&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_max_attention_window">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_attention_window">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;max_attention_window&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_max_attention_window</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]):</span>
+        <span class="c1"># Allow unset</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">v</span>
+
+        <span class="c1"># Must be a non-empty list of positive integers</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;kv_cache_config.max_attention_window must be a non-empty list of positive integers&quot;</span>
+            <span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">v</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;kv_cache_config.max_attention_window must contain only integers&quot;</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;kv_cache_config.max_attention_window values must be positive&quot;</span>
+                <span class="p">)</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+</div>
 
 
 
@@ -2459,6 +2543,81 @@
                 <span class="n">moe_tp_size</span><span class="o">=</span><span class="n">moe_tp_size</span><span class="p">,</span>
                 <span class="n">moe_ep_size</span><span class="o">=</span><span class="n">moe_ep_size</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_executor_config</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">_hf_model_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_ExecutorConfig</span><span class="p">:</span>
+        <span class="n">executor_config</span> <span class="o">=</span> <span class="n">_ExecutorConfig</span><span class="p">(</span>
+            <span class="n">max_beam_width</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
+            <span class="n">scheduler_config</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">scheduler_config</span><span class="p">),</span>
+            <span class="n">max_batch_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span>
+            <span class="n">max_num_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">,</span>
+            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">,</span>
+            <span class="n">fail_fast_on_attention_window_too_large</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span>
+                <span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;fail_fast_on_attention_window_too_large&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span><span class="p">:</span>
+            <span class="c1"># Disable KV cache reuse for deterministic mode</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_block_reuse</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_partial_reuse</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">peft_cache_config</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;xgrammar&#39;</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">tokenizer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">_GuidedDecodingConfig</span><span class="p">(</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">_GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span><span class="n">XGRAMMAR</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">_xgrammar_tokenizer_info</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">))</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;llguidance&#39;</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">tokenizer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">_GuidedDecodingConfig</span><span class="p">(</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">_GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span><span class="n">LLGUIDANCE</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">_llguidance_tokenizer_info</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">))</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Unsupported guided decoding backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding_backend</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+
+        <span class="n">executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
+        <span class="n">executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_beam_width</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">cache_transceiver_config</span><span class="p">)</span>
+
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">update_executor_config</span>
+
+        <span class="n">spec_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span>
+        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">executor_config</span><span class="o">.</span><span class="n">max_batch_size</span>
+
+        <span class="k">if</span> <span class="n">spec_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">spec_config</span><span class="o">.</span><span class="n">decoding_type</span> <span class="o">==</span> <span class="s2">&quot;AUTO&quot;</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative</span><span class="w"> </span><span class="kn">import</span> <span class="n">suggest_spec_config</span>
+            <span class="n">spec_config</span> <span class="o">=</span> <span class="n">suggest_spec_config</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">)</span>
+
+        <span class="n">update_executor_config</span><span class="p">(</span>
+            <span class="n">executor_config</span><span class="p">,</span>
+            <span class="n">backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
+            <span class="n">pytorch_backend_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">get_pytorch_backend_config</span><span class="p">()</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">to_mapping</span><span class="p">(),</span>
+            <span class="n">speculative_config</span><span class="o">=</span><span class="n">spec_config</span><span class="p">,</span>
+            <span class="n">hf_model_dir</span><span class="o">=</span><span class="n">_hf_model_dir</span><span class="p">,</span>
+            <span class="n">max_input_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_input_len</span><span class="p">,</span>
+            <span class="n">max_seq_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span>
+            <span class="n">checkpoint_format</span><span class="o">=</span><span class="kc">None</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;_autodeploy&quot;</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_format</span><span class="p">,</span>
+            <span class="n">checkpoint_loader</span><span class="o">=</span><span class="kc">None</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;_autodeploy&quot;</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_loader</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">executor_config</span>
+
 
 <div class="viewcode-block" id="TrtLlmArgs">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs">[docs]</a>
@@ -2626,6 +2785,8 @@
     <span class="n">AUTO</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="c1"># Initialize all weights randomly.</span>
     <span class="n">DUMMY</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="c1"># Only load the multimodal(vision) encoder weights</span>
+    <span class="n">VISION_ONLY</span> <span class="o">=</span> <span class="mi">2</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">SamplerType</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
@@ -2769,6 +2930,12 @@
                                  <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Print iteration logs.&quot;</span><span class="p">,</span>
                                  <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 
+    <span class="n">perf_metrics_max_requests</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The maximum number of requests for perf metrics. Must also set request_perf_metrics to true to get perf metrics.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
     <span class="n">batch_wait_timeout_ms</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -2834,6 +3001,18 @@
     <span class="n">checkpoint_format</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The format of the provided checkpoint.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">kv_connector_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">KvCacheConnectorConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The config for KV cache connector.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">mm_encoder_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Only load/execute the vision encoder part of the full model. Defaults to False.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
@@ -2935,7 +3114,15 @@
                     <span class="o">**</span><span class="n">moe_load_balancer_config</span><span class="p">)</span>
             <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;Failed to load MoE load balancer config file: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">load_balancer</span><span class="si">}</span><span class="s2">&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;Failed to load MoE load balancer config file: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span> <span class="o">=</span> <span class="n">MoeLoadBalancerConfig</span><span class="p">(</span>
+                    <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Failed to load MoE load balancer config: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span><span class="si">}</span><span class="s2">&quot;</span>
                 <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -3056,6 +3243,18 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">batch_wait_timeout_ms</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;batch_wait_timeout_ms must be greater than 0&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="TorchLlmArgs.get_executor_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.get_executor_config">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_executor_config</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">_hf_model_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_ExecutorConfig</span><span class="p">:</span>
+        <span class="n">executor_config</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">get_executor_config</span><span class="p">(</span><span class="n">_hf_model_dir</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">)</span>
+        <span class="n">executor_config</span><span class="o">.</span><span class="n">mm_encoder_only</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mm_encoder_only</span>
+        <span class="k">return</span> <span class="n">executor_config</span></div>
 
 
     <span class="c1"># TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig</span>
@@ -3321,9 +3520,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 19, 2025.</p>
+  <p>Last updated on August 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/7334f93">7334f93</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15ec2b8">15ec2b8</a>.</p>
   
 </div></div>
       

@@ -22,6 +22,7 @@ _____________
    llm_logits_processor
    llm_multilora
    llm_speculative_decoding
+   llm_kv_cache_connector
    llm_runtime
    llm_sampling
 

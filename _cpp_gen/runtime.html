@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc1" />
+  <meta name="docsearch:version" content="1.1.0rc2" />
 
 
   </head>
@@ -335,6 +335,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
@@ -356,6 +357,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -458,8 +460,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT-LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT‑LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</a></li>
 </ul>
 </div>
 </nav></div>
@@ -10311,6 +10321,11 @@
 <dd></dd></dl>
 
 <dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs15draftLogitsHostE">
+<span id="_CPPv3N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs15draftLogitsHostE"></span><span id="_CPPv2N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs15draftLogitsHostE"></span><span id="tensorrt_llm::runtime::DecodingInput::ExternalDraftTokensInputs::draftLogitsHost__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1DecodingInput_1_1ExternalDraftTokensInputs_1abb1bb917c00ed0b124c278c6271594d4"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput9TensorPtrE" title="tensorrt_llm::runtime::DecodingInput::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">draftLogitsHost</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs15draftLogitsHostE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs10draftProbsE">
 <span id="_CPPv3N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs10draftProbsE"></span><span id="_CPPv2N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs10draftProbsE"></span><span id="tensorrt_llm::runtime::DecodingInput::ExternalDraftTokensInputs::draftProbs__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1DecodingInput_1_1ExternalDraftTokensInputs_1ab39186249926f9f16fc399f1f47db321"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput9TensorPtrE" title="tensorrt_llm::runtime::DecodingInput::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">draftProbs</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs10draftProbsE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
@@ -10333,6 +10348,11 @@
 <dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs13draftTokenIdsE">
 <span id="_CPPv3N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs13draftTokenIdsE"></span><span id="_CPPv2N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs13draftTokenIdsE"></span><span id="tensorrt_llm::runtime::DecodingInput::ExternalDraftTokensInputs::draftTokenIds__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1DecodingInput_1_1ExternalDraftTokensInputs_1a8ff083621c48c2ef0a74847f17925c6a"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput9TensorPtrE" title="tensorrt_llm::runtime::DecodingInput::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">draftTokenIds</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs13draftTokenIdsE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs17draftTokenIdsHostE">
+<span id="_CPPv3N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs17draftTokenIdsHostE"></span><span id="_CPPv2N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs17draftTokenIdsHostE"></span><span id="tensorrt_llm::runtime::DecodingInput::ExternalDraftTokensInputs::draftTokenIdsHost__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1DecodingInput_1_1ExternalDraftTokensInputs_1a5061c395b16712e6a8fdc0d65ad47f94"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput9TensorPtrE" title="tensorrt_llm::runtime::DecodingInput::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">draftTokenIdsHost</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs17draftTokenIdsHostE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp var">
@@ -11676,100 +11696,6 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dd></dd></dl>
 
 </div>
-</dd></dl>
-
-</dd></dl>
-
-</dd></dl>
-
-</section>
-<section id="request-h">
-<h2>request.h<a class="headerlink" href="#request-h" title="Link to this heading">#</a></h2>
-<dl class="cpp type">
-<dt class="sig sig-object cpp">
-<span class="target" id="namespacetensorrt__llm"></span><span class="k"><span class="pre">namespace</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">tensorrt_llm</span></span></span><br /></dt>
-<dd><dl class="cpp type">
-<dt class="sig sig-object cpp">
-<span class="target" id="namespacetensorrt__llm_1_1runtime"></span><span class="k"><span class="pre">namespace</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">runtime</span></span></span><br /></dt>
-<dd><dl class="cpp type">
-<dt class="sig sig-object cpp">
-<span class="target" id="namespacetensorrt__llm_1_1runtime_1_1decoder__batch"></span><span class="k"><span class="pre">namespace</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">decoder_batch</span></span></span><br /></dt>
-<dd><dl class="cpp class">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7RequestE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7RequestE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7RequestE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request"></span><span class="k"><span class="pre">class</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">Request</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7RequestE" title="Link to this definition">#</a><br /></dt>
-<dd><div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-types">Public Types</p>
-<dl class="cpp type">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request14TensorConstPtrE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request14TensorConstPtrE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request14TensorConstPtrE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a6d5f16a0733fae53d2f6a74805cb012b"></span><span class="k"><span class="pre">using</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">TensorConstPtr</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7ITensorE" title="tensorrt_llm::runtime::ITensor"><span class="n"><span class="pre">ITensor</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7ITensor14SharedConstPtrE" title="tensorrt_llm::runtime::ITensor::SharedConstPtr"><span class="n"><span class="pre">SharedConstPtr</span></span></a><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request14TensorConstPtrE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp type">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9TensorPtrE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request9TensorPtrE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request9TensorPtrE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a95d9dd610e7a6295d06f75a33cbb4c43"></span><span class="k"><span class="pre">using</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">TensorPtr</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7ITensorE" title="tensorrt_llm::runtime::ITensor"><span class="n"><span class="pre">ITensor</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7ITensor9SharedPtrE" title="tensorrt_llm::runtime::ITensor::SharedPtr"><span class="n"><span class="pre">SharedPtr</span></span></a><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9TensorPtrE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp type">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9BufferPtrE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request9BufferPtrE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request9BufferPtrE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a78becbf7fa5928420a994c0d9d9ddb65"></span><span class="k"><span class="pre">using</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">BufferPtr</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7IBufferE" title="tensorrt_llm::runtime::IBuffer"><span class="n"><span class="pre">IBuffer</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7IBuffer9SharedPtrE" title="tensorrt_llm::runtime::IBuffer::SharedPtr"><span class="n"><span class="pre">SharedPtr</span></span></a><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9BufferPtrE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-<div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-functions">Public Functions</p>
-<dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request7RequestE10SizeType32">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request7RequestE10SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request7RequestE10SizeType32"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::Request__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a10293965fee8d59099e33f86de220a50"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="k"><span class="pre">explicit</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">Request</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">inputLen</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request7RequestE10SizeType32" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-<div class="breathe-sectiondef docutils container">
-<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-members">Public Members</p>
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request8inputLenE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request8inputLenE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request8inputLenE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::inputLen__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a8762d6cd8c7a7efecb04d08c1d28e837"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">inputLen</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request8inputLenE" title="Link to this definition">#</a><br /></dt>
-<dd><p>Mandatory parameters. </p>
-</dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request28generatedTokensPerEngineStepE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request28generatedTokensPerEngineStepE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request28generatedTokensPerEngineStepE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::generatedTokensPerEngineStep__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1ad0961016791825df1e39e2d4c8bced7a"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">generatedTokensPerEngineStep</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="p"><span class="pre">{</span></span><span class="m"><span class="pre">1</span></span><span class="p"><span class="pre">}</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request28generatedTokensPerEngineStepE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftTokensE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request11draftTokensE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request11draftTokensE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::draftTokens__BufferPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a1a524b5348e2d8ea442050f50ff3f1c7"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9BufferPtrE" title="tensorrt_llm::runtime::decoder_batch::Request::BufferPtr"><span class="n"><span class="pre">BufferPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">draftTokens</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftTokensE" title="Link to this definition">#</a><br /></dt>
-<dd><p>Optional parameters for speculative decoding. </p>
-</dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftLogitsE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request11draftLogitsE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request11draftLogitsE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::draftLogits__std::optional:TensorPtr:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1afa9181bc52e25fe7dc0e925c69dc8d86"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9TensorPtrE" title="tensorrt_llm::runtime::decoder_batch::Request::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">draftLogits</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftLogitsE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11medusaPathsE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request11medusaPathsE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request11medusaPathsE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::medusaPaths__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a2095b0e38974e5704d49f7b7226d1d62"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9TensorPtrE" title="tensorrt_llm::runtime::decoder_batch::Request::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">medusaPaths</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11medusaPathsE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request13medusaTreeIdsE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request13medusaTreeIdsE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request13medusaTreeIdsE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::medusaTreeIds__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a53cd490ea4a4acc421b66a24ede31697"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9TensorPtrE" title="tensorrt_llm::runtime::decoder_batch::Request::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">medusaTreeIds</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request13medusaTreeIdsE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request22lookaheadRuntimeConfigE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request22lookaheadRuntimeConfigE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request22lookaheadRuntimeConfigE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::lookaheadRuntimeConfig__std::optional:executor::LookaheadDecodingConfig:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1a724413e68cfc7bea981a1b1b334a1704"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="executor.html#_CPPv4N12tensorrt_llm8executorE" title="tensorrt_llm::executor"><span class="n"><span class="pre">executor</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="executor.html#_CPPv4N12tensorrt_llm8executor23LookaheadDecodingConfigE" title="tensorrt_llm::executor::LookaheadDecodingConfig"><span class="n"><span class="pre">LookaheadDecodingConfig</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">lookaheadRuntimeConfig</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request22lookaheadRuntimeConfigE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-<dl class="cpp var">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11eagleConfigE">
-<span id="_CPPv3N12tensorrt_llm7runtime13decoder_batch7Request11eagleConfigE"></span><span id="_CPPv2N12tensorrt_llm7runtime13decoder_batch7Request11eagleConfigE"></span><span id="tensorrt_llm::runtime::decoder_batch::Request::eagleConfig__std::optional:executor::EagleConfig:"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder__batch_1_1Request_1aaa297b6687699e8f43792997f503bef0"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="executor.html#_CPPv4N12tensorrt_llm8executorE" title="tensorrt_llm::executor"><span class="n"><span class="pre">executor</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="executor.html#_CPPv4N12tensorrt_llm8executor11EagleConfigE" title="tensorrt_llm::executor::EagleConfig"><span class="n"><span class="pre">EagleConfig</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">eagleConfig</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11eagleConfigE" title="Link to this definition">#</a><br /></dt>
-<dd></dd></dl>
-
-</div>
-</dd></dl>
-
 </dd></dl>
 
 </dd></dl>
@@ -14388,11 +14314,13 @@ one more than decoding draft tokens for prediction from primary head </p>
 </li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputsE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime::DecodingInput::ExternalDraftTokensInputs</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs11draftLogitsE"><code class="docutils literal notranslate"><span class="pre">draftLogits</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs15draftLogitsHostE"><code class="docutils literal notranslate"><span class="pre">draftLogitsHost</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs10draftProbsE"><code class="docutils literal notranslate"><span class="pre">draftProbs</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs11targetProbsE"><code class="docutils literal notranslate"><span class="pre">targetProbs</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs14numDraftTokensE"><code class="docutils literal notranslate"><span class="pre">numDraftTokens</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs18numDraftTokensHostE"><code class="docutils literal notranslate"><span class="pre">numDraftTokensHost</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs13draftTokenIdsE"><code class="docutils literal notranslate"><span class="pre">draftTokenIds</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs17draftTokenIdsHostE"><code class="docutils literal notranslate"><span class="pre">draftTokenIdsHost</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs14useDraftLogitsE"><code class="docutils literal notranslate"><span class="pre">useDraftLogits</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs18useDraftLogitsHostE"><code class="docutils literal notranslate"><span class="pre">useDraftLogitsHost</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13DecodingInput25ExternalDraftTokensInputs4stepE"><code class="docutils literal notranslate"><span class="pre">step</span></code></a></li>
@@ -14619,24 +14547,6 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4I0EN12tensorrt_llm7runtime14SamplingConfig6OptVecE"><code class="docutils literal notranslate"><span class="pre">OptVec</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4I0EN12tensorrt_llm7runtime14SamplingConfig11validateVecEbNSt6stringERK6OptVecI1TE1TNSt8optionalI1TEE"><code class="docutils literal notranslate"><span class="pre">validateVec()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4I0EN12tensorrt_llm7runtime14SamplingConfig10fuseValuesE6OptVecI1TERKNSt6vectorI14SamplingConfigEENSt8functionIF6OptVecI1TE6size_tEEE1T"><code class="docutils literal notranslate"><span class="pre">fuseValues()</span></code></a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-h">request.h</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7RequestE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::runtime::decoder_batch::Request</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request14TensorConstPtrE"><code class="docutils literal notranslate"><span class="pre">TensorConstPtr</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9TensorPtrE"><code class="docutils literal notranslate"><span class="pre">TensorPtr</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9BufferPtrE"><code class="docutils literal notranslate"><span class="pre">BufferPtr</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request7RequestE10SizeType32"><code class="docutils literal notranslate"><span class="pre">Request()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request8inputLenE"><code class="docutils literal notranslate"><span class="pre">inputLen</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request28generatedTokensPerEngineStepE"><code class="docutils literal notranslate"><span class="pre">generatedTokensPerEngineStep</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftTokensE"><code class="docutils literal notranslate"><span class="pre">draftTokens</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftLogitsE"><code class="docutils literal notranslate"><span class="pre">draftLogits</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11medusaPathsE"><code class="docutils literal notranslate"><span class="pre">medusaPaths</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request13medusaTreeIdsE"><code class="docutils literal notranslate"><span class="pre">medusaTreeIds</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request22lookaheadRuntimeConfigE"><code class="docutils literal notranslate"><span class="pre">lookaheadRuntimeConfig</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11eagleConfigE"><code class="docutils literal notranslate"><span class="pre">eagleConfig</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -14882,9 +14792,9 @@ one more than decoding draft tokens for prediction from primary head </p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 19, 2025.</p>
+  <p>Last updated on August 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/7334f93">7334f93</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15ec2b8">15ec2b8</a>.</p>
   
 </div></div>
       
