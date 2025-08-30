@@ -395,9 +395,8 @@ void initBindings(pybind11::module_& m)
         .def("finalize", &tr::GptDecoderBatched::finalize, py::arg("decoder_state"), py::arg("batch_idx"),
             py::arg("sampling_config"), py::arg("streaming"), py::call_guard<py::gil_scoped_release>())
         .def_property_readonly(
-            "decoder_stream",
-            [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
-            py::return_value_policy::reference);
+            "decoder_stream", [](tr::GptDecoderBatched& self) -> tr::CudaStream const&
+            { return *self.getDecoderStream(); }, py::return_value_policy::reference);
 
     m.def(
         "lamport_initialize_all",
@@ -408,8 +407,7 @@ void initBindings(pybind11::module_& m)
         },
         "Lamport initialize all buffers", py::call_guard<py::gil_scoped_release>());
     m.def(
-        "lamport_initialize",
-        [](intptr_t buffer, size_t size)
+        "lamport_initialize", [](intptr_t buffer, size_t size)
         { tensorrt_llm::kernels::ar_fusion::lamport_initialize(reinterpret_cast<void*>(buffer), size, 0); },
         "Lmaport initialize buffer", py::call_guard<py::gil_scoped_release>());
     m.def(
@@ -455,7 +453,9 @@ void initBindings(pybind11::module_& m)
         py::call_guard<py::gil_scoped_release>());
 
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
-        .def(py::init<size_t, uint32_t, uint32_t, uint32_t, at::Device, bool>(), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<size_t, uint32_t, uint32_t, uint32_t, uint32_t, bool>(), py::arg("buf_size"),
+            py::arg("group_size"), py::arg("group_rank"), py::arg("split_color"), py::arg("device_idx"),
+            py::arg("mn_nvlink"), py::call_guard<py::gil_scoped_release>())
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             py::call_guard<py::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,

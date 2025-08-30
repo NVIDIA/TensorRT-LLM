@@ -775,7 +775,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 mlp_tp_size = math.gcd(
                     tp,
                     self.mapping.gpus_per_node,
-                )  # Avoid costly inter-node TP when MNNVL is not supported
+                )  # Avoid costly inter-node TP
             else:
                 mlp_tp_size = tp
         return mlp_tp_size
