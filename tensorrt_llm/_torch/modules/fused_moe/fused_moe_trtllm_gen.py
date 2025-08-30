@@ -76,6 +76,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            layer_idx=layer_idx,
         )
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
@@ -179,7 +180,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
