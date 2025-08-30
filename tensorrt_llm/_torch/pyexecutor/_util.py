@@ -510,7 +510,8 @@ def create_py_executor_instance(
     guided_decoder: Optional[GuidedDecoder] = None,
     lora_config: Optional[LoraConfig] = None,
     garbage_collection_gen0_threshold: Optional[int] = None,
-    kv_connector_manager: Optional[KvCacheConnectorManager] = None
+    kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+    max_seq_len: Optional[int] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -659,7 +660,8 @@ def create_py_executor_instance(
         guided_decoder=guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-        kv_connector_manager=kv_connector_manager)
+        kv_connector_manager=kv_connector_manager,
+        max_seq_len=max_seq_len)
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
