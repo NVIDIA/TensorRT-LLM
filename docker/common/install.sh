@@ -1,25 +1,10 @@
 #!/bin/bash
 
-# Function to assert that all provided variable names are non-empty
-assert_non_empty() {
-    for var_name in "$@"; do
-        local var_value="${!var_name}"
-        
-        # Check if the variable is empty or not set
-        if [[ -z "$var_value" ]]; then
-            echo "Error: Variable '$var_name' is empty or not set" >&2
-            exit 1
-        fi
-    done
-}
-
 echo "TRT_VER: $TRT_VER"
 echo "CUDA_VER: $CUDA_VER"
 echo "CUDNN_VER: $CUDNN_VER"
 echo "NCCL_VER: $NCCL_VER"
 echo "CUBLAS_VER: $CUBLAS_VER"
-
-
 
 # Default values
 base=0
@@ -101,8 +86,12 @@ export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
 if [ $base -eq 1 ]; then
     echo "Installing base dependencies..."
+    # Clean up the pip constraint file from the base NGC PyTorch image.
+    [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
+
     PYTHON_VERSION="3.12.3"
     echo "Using Python version: $PYTHON_VERSION"
+
     GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_base.sh $PYTHON_VERSION
 fi
 

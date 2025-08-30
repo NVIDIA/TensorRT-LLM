@@ -28,9 +28,6 @@ ARG GITHUB_MIRROR=""
 RUN echo "Using GitHub mirror: $GITHUB_MIRROR"
 SHELL ["/bin/bash", "-c"]
 
-# Clean up the pip constraint file from the base NGC PyTorch image.
-RUN [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
-
 FROM base AS devel
 
 ARG TRT_VER
