@@ -137,6 +137,9 @@ class ADEngine(ModelEngine):
         self.pytorch_backend_config.attention_dp_time_out_iters = 50
         self.pytorch_backend_config.attention_dp_batching_wait_iters = 10
         self.pytorch_backend_config.batch_wait_timeout_ms = 0
+        self.pytorch_backend_config.batch_wait_timeout_iters = 0
+        self.pytorch_backend_config.batch_wait_max_tokens_ratio = 0.0
+        self.pytorch_backend_config.max_num_tokens = 8192
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
