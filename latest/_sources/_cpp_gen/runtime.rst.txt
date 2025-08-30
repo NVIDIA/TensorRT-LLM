@@ -196,12 +196,6 @@ ________________
 .. doxygenfile:: samplingConfig.h
    :project: TensorRT-LLM
 
-request.h
-_________
-
-.. doxygenfile:: request.h
-   :project: TensorRT-LLM
-
 decoderState.h
 ______________
 

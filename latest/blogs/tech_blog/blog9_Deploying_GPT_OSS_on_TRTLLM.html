@@ -59,17 +59,18 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
     <link rel="icon" href="../../_static/favicon.png"/>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
+    <link rel="prev" title="Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc1" />
+  <meta name="docsearch:version" content="1.1.0rc2" />
 
 
   </head>
@@ -333,6 +334,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
@@ -354,6 +356,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
@@ -450,14 +453,22 @@
 <li class="toctree-l1"><a class="reference internal" href="../../reference/dev-containers.html">Using Dev Containers</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
-<ul class="nav bd-sidenav">
+<ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT-LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT‑LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</a></li>
 </ul>
 </div>
 </nav></div>
@@ -527,10 +538,10 @@ high-performance TensorRT-LLM server for <strong>gpt-oss-120b</strong> for infer
 <section id="install-tensorrt-llm">
 <h2>Install TensorRT-LLM<a class="headerlink" href="#install-tensorrt-llm" title="Link to this heading">#</a></h2>
 <p>In this section, we introduce several ways to install TensorRT-LLM.</p>
-<section id="ngc-docker-image-of-dev-branch">
-<h3>NGC Docker Image of dev branch<a class="headerlink" href="#ngc-docker-image-of-dev-branch" title="Link to this heading">#</a></h3>
-<p>Day-0 support for gpt-oss is provided via the NGC container image <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev</span></code>. This image was built on top of the pre-day-0 <strong>dev branch</strong>. This container is multi-platform and will run on both x64 and arm64 architectures.</p>
-<p>Run the following docker command to start the TensorRT-LLM container in interactive mode:</p>
+<section id="ngc-docker-image">
+<h3>NGC Docker Image<a class="headerlink" href="#ngc-docker-image" title="Link to this heading">#</a></h3>
+<p>Visit the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release">NGC TensorRT-LLM Release page</a> to find the most up-to-date NGC container image to use. You can also check the latest <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">release notes</a> to keep track of the support status of the latest releases.</p>
+<p>Run the following Docker command to start the TensorRT-LLM container in interactive mode (change the image tag to match latest release):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--ipc<span class="o">=</span>host<span class="w"> </span>-it<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span><span class="se">\</span>
@@ -538,7 +549,7 @@ high-performance TensorRT-LLM server for <strong>gpt-oss-120b</strong> for infer
 <span class="w">  </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-e<span class="w"> </span><span class="nv">TRTLLM_ENABLE_PDL</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-v<span class="w"> </span>~/.cache:/root/.cache:rw<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc1<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>/bin/bash
 </pre></div>
 </div>
@@ -557,9 +568,9 @@ high-performance TensorRT-LLM server for <strong>gpt-oss-120b</strong> for infer
 <h3>Build from source<a class="headerlink" href="#build-from-source" title="Link to this heading">#</a></h3>
 <p>Support for gpt-oss has been <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/6645">merged</a> into the <strong>main branch</strong> of TensorRT-LLM. As we continue to optimize gpt-oss performance, you can build TensorRT-LLM from source to get the latest features and support. Please refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html">doc</a> if you want to build from source yourself.</p>
 </section>
-<section id="regular-release-of-tensorrt-llm">
-<h3>Regular Release of TensorRT-LLM<a class="headerlink" href="#regular-release-of-tensorrt-llm" title="Link to this heading">#</a></h3>
-<p>Since gpt-oss has been supported on the main branch, you can get TensorRT-LLM out of the box through its regular release in the future. Please check the latest <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">release notes</a> to keep track of the support status. The release is provided as <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Container Image</a> or <a class="reference external" href="https://pypi.org/project/tensorrt-llm/#history">pip Python wheel</a>. You can find instructions on pip install <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/installation/linux.html">here</a>.</p>
+<section id="tensorrt-llm-python-wheel-install">
+<h3>TensorRT-LLM Python Wheel Install<a class="headerlink" href="#tensorrt-llm-python-wheel-install" title="Link to this heading">#</a></h3>
+<p>Regular releases of TensorRT-LLM are also provided as <a class="reference external" href="https://pypi.org/project/tensorrt-llm/#history">Python wheels</a>. You can find instructions on the pip install <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/installation/linux.html">here</a>.</p>
 </section>
 </section>
 <section id="performance-benchmarking-and-model-serving">
@@ -698,9 +709,10 @@ s- <code class="docutils literal notranslate"><span class="pre">cuda_graph_confi
 </section>
 <section id="launch-the-tensorrt-llm-server">
 <h2>Launch the TensorRT-LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h2>
-<p>We can use <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> to serve the model by translating the benchmark commands above. For low-latency configuration, run:</p>
+<p>We can use <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> to serve the model by translating the benchmark commands above. For low-latency configuration, run:<br />
+<strong>Note:</strong> You can also point to a local path containing the model weights instead of the HF repo (e.g., <code class="docutils literal notranslate"><span class="pre">${local_model_path}</span></code>).</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>gpt-oss-120b<span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># Or ${local_model_path}</span>
+<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
@@ -715,7 +727,7 @@ s- <code class="docutils literal notranslate"><span class="pre">cuda_graph_confi
 <p>The initialization may take several minutes as it loads and optimizes the models.</p>
 <p>For max-throughput configuration, run:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>gpt-oss-120b<span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># Or ${local_model_path}</span>
+<span class="w">  </span>openai/gpt-oss-120b<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
@@ -741,12 +753,12 @@ very first query may take longer due to initialization and compilation.</p>
 <span class="s1">    &quot;messages&quot;: [</span>
 <span class="s1">        {</span>
 <span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
-<span class="s1">            &quot;content&quot;: &quot;What is NVIDIA&#39;</span>s<span class="w"> </span>advantage<span class="w"> </span><span class="k">for</span><span class="w"> </span>inference?<span class="s2">&quot;</span>
-<span class="s2">        }</span>
-<span class="s2">    ],</span>
-<span class="s2">    &quot;</span>max_tokens<span class="s2">&quot;: 1024,</span>
-<span class="s2">    &quot;</span>top_p<span class="s2">&quot;: 0.9</span>
-<span class="s2">}&#39; -w &quot;</span><span class="se">\n</span><span class="s2">&quot;</span>
+<span class="s1">            &quot;content&quot;: &quot;What is NVIDIAs advantage for inference?&quot;</span>
+<span class="s1">        }</span>
+<span class="s1">    ],</span>
+<span class="s1">    &quot;max_tokens&quot;: 1024,</span>
+<span class="s1">    &quot;top_p&quot;: 0.9</span>
+<span class="s1">}&#39;</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;\n&quot;</span>
 </pre></div>
 </div>
 <details><summary><b>Show Example Output</b></summary>
@@ -824,11 +836,7 @@ others according to your needs.</p>
 </section>
 <section id="h200-h100-only-using-openai-triton-kernels-for-moe">
 <h2>(H200/H100 Only) Using OpenAI Triton Kernels for MoE<a class="headerlink" href="#h200-h100-only-using-openai-triton-kernels-for-moe" title="Link to this heading">#</a></h2>
-<p>OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper-based GPUs like NVIDIA’s H200 for optimal performance. <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> MoE backend is not supported on Hopper, and <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> backend support is still ongoing.  Please enable <code class="docutils literal notranslate"><span class="pre">TRITON</span></code> backend with the steps below if you are running on Hopper GPUs.</p>
-<section id="installing-openai-triton">
-<h3>Installing OpenAI Triton<a class="headerlink" href="#installing-openai-triton" title="Link to this heading">#</a></h3>
-<p>The <code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev</span></code> has prepared Triton already (<code class="docutils literal notranslate"><span class="pre">echo</span> <span class="pre">$TRITON_ROOT</span></code> could reveal the path). In other situations, you will need to build and install a specific version of Triton. Please follow the instructions in this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe">link</a>.</p>
-</section>
+<p>OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper-based GPUs like NVIDIA’s H200 for optimal performance. <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> MoE backend is not supported on Hopper, and <code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> backend support is still ongoing. Please follow the instructions in this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe">link</a> to install and enable the <code class="docutils literal notranslate"><span class="pre">TRITON</span></code> MoE kernels on Hopper GPUs.</p>
 <section id="selecting-triton-as-the-moe-backend">
 <h3>Selecting Triton as the MoE backend<a class="headerlink" href="#selecting-triton-as-the-moe-backend" title="Link to this heading">#</a></h3>
 <p>To use the Triton MoE backend with <strong>trtllm-serve</strong> (or other commands), add this snippet to the YAML file passed via <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code>:</p>
@@ -860,6 +868,15 @@ others according to your needs.</p>
                 <footer class="prev-next-footer d-print-none">
                   
 <div class="prev-next-area">
+    <a class="left-prev"
+       href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)</p>
+      </div>
+    </a>
 </div>
                 </footer>
               
@@ -883,9 +900,9 @@ others according to your needs.</p>
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-tensorrt-llm">Install TensorRT-LLM</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ngc-docker-image-of-dev-branch">NGC Docker Image of dev branch</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ngc-docker-image">NGC Docker Image</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#build-from-source">Build from source</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#regular-release-of-tensorrt-llm">Regular Release of TensorRT-LLM</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt-llm-python-wheel-install">TensorRT-LLM Python Wheel Install</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-benchmarking-and-model-serving">Performance Benchmarking and Model Serving</a><ul class="nav section-nav flex-column">
@@ -907,7 +924,6 @@ others according to your needs.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#h200-h100-only-using-openai-triton-kernels-for-moe">(H200/H100 Only) Using OpenAI Triton Kernels for MoE</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#installing-openai-triton">Installing OpenAI Triton</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#selecting-triton-as-the-moe-backend">Selecting Triton as the MoE backend</a></li>
 </ul>
 </li>
@@ -1006,9 +1022,9 @@ others according to your needs.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 19, 2025.</p>
+  <p>Last updated on August 29, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/7334f93">7334f93</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15ec2b8">15ec2b8</a>.</p>
   
 </div></div>
       
