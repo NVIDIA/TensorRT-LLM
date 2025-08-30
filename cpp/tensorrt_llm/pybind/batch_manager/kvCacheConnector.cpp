@@ -41,7 +41,7 @@ void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindi
 {
     py::class_<tb::kv_connector::KvCacheConnectorManager, PyKvCacheConnectorManager, py::smart_holder>(
         m, "KvCacheConnectorManager")
-        .def(py::init<>())
+        .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
         .def("get_num_new_matched_tokens", &tb::kv_connector::KvCacheConnectorManager::getNumNewMatchedTokens,
-            py::arg("request"), py::arg("num_computed_tokens"));
+            py::arg("request"), py::arg("num_computed_tokens"), py::call_guard<py::gil_scoped_release>());
 }
