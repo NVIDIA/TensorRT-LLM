@@ -165,6 +165,13 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "AutoDeployConfig.",
     )
 
+    support_partial_config: bool = Field(
+        default=False,
+        description="If True, factory sharding will be applied to the subset of transformations  "
+        "that are currently supported. If False, sharding from factory will be performed only if"
+        "all provided transformations are supported.",
+    )
+
     sharding_dims: List[str] = Field(
         default=["tp", "ep", "dp"],
         description="The sharding methods to apply by the heuristic sharding stage.",

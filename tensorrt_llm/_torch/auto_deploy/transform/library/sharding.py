@@ -126,6 +126,7 @@ class ShardingTransformConfig(TransformConfig):
 
     simple_shard_only: bool = Field(default=False)
     use_sharding_from_factory: bool = Field(default=False)
+    support_partial_config: bool = Field(default=False)
     # Which sharding families to run: any subset of {"tp", "ep", "bmm"}
     sharding_dims: List[str] = Field(default_factory=lambda: ["tp", "ep", "bmm"])
 
@@ -184,6 +185,7 @@ class Sharding(BaseTransform):
             else ShardingConfigSource.UNKNOWN
         )
         shared_config.sharding_config.simple_shard_only = self.config.simple_shard_only
+        shared_config.sharding_config.support_partial_config = self.config.support_partial_config
         shared_config.sharding_config.use_sharding_from_factory = (
             self.config.use_sharding_from_factory
         )

@@ -488,6 +488,7 @@ class ShardingConfig(BaseModel):
     predefined_config: Optional[Dict[str, Any]] = None
     simple_shard_only: bool = Field(default=False)
     use_sharding_from_factory: bool = False
+    support_partial_config: bool = False
     sharding_dims: List[str] = Field(default_factory=list)
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
@@ -532,7 +533,7 @@ class ShardingConfig(BaseModel):
         tp_plan = self.predefined_config["tp_plan"]
 
         values = set(tp_plan.values())
-        allowed_values = {
+        supported_modes = {
             "colwise",  # row split and no collective
             "rowwise",  # column split and all-reduce
             "gather",  # simple shard (row + all_gather)
@@ -544,7 +545,7 @@ class ShardingConfig(BaseModel):
             # "local_packed_rowwise",
             # "local",
         }
-        if not values.issubset(allowed_values):
+        if not self.support_partial_config and not values.issubset(supported_modes):
             ad_logger.warning("Sharding config contains invalid values. Skipping.")
             # invalidate the config
             self.predefined_config = {}
