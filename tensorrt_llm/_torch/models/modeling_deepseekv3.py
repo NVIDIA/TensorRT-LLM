@@ -128,6 +128,12 @@ def weight_dequant(x: torch.Tensor,
     return y
 
 
+@torch.compile(dynamic=True)
+def moe_reduce_add_shared_output(routed_output, shared_output):
+    routed_output = torch.sum(routed_output, dim=1, keepdim=False)
+    return shared_output + routed_output
+
+
 class DeepseekV3MTPHead(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
@@ -585,10 +591,7 @@ class Deepseekv3MoE(nn.Module):
                                                        do_finalize)
             return routed_output
 
-        @torch.compile(dynamic=True)
-        def _reduce_add_shared_output(routed_output, shared_output):
-            routed_output = torch.sum(routed_output, dim=1, keepdim=False)
-            return shared_output + routed_output
+        # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
         routed_output, shared_output = maybe_execute_in_parallel(
             _compute_routed_output, _compute_shared_output,
@@ -602,7 +605,7 @@ class Deepseekv3MoE(nn.Module):
                 assert shared_output.numel(
                 ) * self.top_k == routed_output.numel(
                 ), 'unmatched tensor shape'
-                final_hidden_states = _reduce_add_shared_output(
+                final_hidden_states = moe_reduce_add_shared_output(
                     routed_output, shared_output)
             else:
                 assert shared_output.size() == routed_output.size(
