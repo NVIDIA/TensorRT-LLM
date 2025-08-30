@@ -260,12 +260,28 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-            draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
-            if spec_config.load_format == "dummy":
-                draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
             # The draft model won't have any draft tokens attached to
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
+
+            use_chain_drafter = (
+                executor_config.guided_decoding_config is None
+                and not pytorch_backend_config.enable_mixed_sampler
+                and pytorch_backend_config.attn_backend == "TRTLLM")
+
+            if use_chain_drafter:
+
+                def drafting_loop_wrapper(model):
+                    from tensorrt_llm._torch.speculative.drafting_loops import \
+                        ChainDrafter
+
+                    return ChainDrafter(spec_config.max_draft_len, model)
+            else:
+                drafting_loop_wrapper = None
+
+            draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
+            if spec_config.load_format == "dummy":
+                draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
@@ -282,6 +298,7 @@ def create_py_executor(
                 spec_config=draft_spec_config,
                 checkpoint_loader=executor_config.checkpoint_loader,
                 is_draft_model=True,
+                drafting_loop_wrapper=drafting_loop_wrapper,
             )
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(

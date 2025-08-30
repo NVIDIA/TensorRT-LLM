@@ -67,6 +67,7 @@ class DummyModelEngine(PyTorchModelEngine):
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
+        self.model_is_wrapped = False
         super().__init__(model_path="",
                          pytorch_backend_config=pytorch_backend_config,
                          checkpoint_loader=None,
