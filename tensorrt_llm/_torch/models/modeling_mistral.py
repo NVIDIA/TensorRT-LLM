@@ -258,13 +258,19 @@ class Mistral3InputProcessor(InputProcessor):
         if pixel_values is not None:
             # We have no use for the `attention_mask`.
             processed.pop("attention_mask")
+            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
+            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
+            # reaching the model forward. Since its values are used to infer the amount of padding
+            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
+            # list here to avoid this.
+            processed["image_sizes"] = processed["image_sizes"].tolist()
             # NOTE: `processed` is a dict-like object, but not actually a dict.
             extra_processed_inputs = {
                 "multimodal_data": {
                     "image": {
                         **processed
                     }
-                },
+                }
             }
 
         return input_ids, extra_processed_inputs
@@ -385,6 +391,7 @@ class Mistral3VLM(PreTrainedModel):
                     f"Expected as many `pixel_values` ({len(pixel_values)}) and "
                     f"`image_sizes` ({len(image_sizes)}) as number of multimodal parameters "
                     f"({multimodal_params_len}).")
+            image_sizes = [torch.tensor(x) for x in image_sizes]
             batched_pixel_values, batched_image_sizes = self._batch_pixel_values(
                 pixel_values=pixel_values, image_sizes=image_sizes)
             mm_embeds = [
