@@ -1,4 +1,3 @@
-import logging
 import math
 import os
 import platform
@@ -17,7 +16,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 _thread_local = threading.local()
-logger = logging.getLogger(__name__)
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -61,8 +59,9 @@ def get_allreduce_mnnvl_workspace(
         setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
                 {})
     # Support topology split
-    comm = mpi_comm().Split(mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
-                            mapping.tp_rank)
+    comm = mpi_comm().Split(
+        int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
+        mapping.tp_rank)
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
 
     allreduce_mnnvl_workspaces = getattr(
@@ -82,7 +81,7 @@ def get_allreduce_mnnvl_workspace(
             mapping.tp_rank,
             # Split the communicator according to the topology
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
-            torch.device("cuda", mapping.local_rank),
+            mapping.local_rank,
             True,  # mnNvlink
         )
 
@@ -463,12 +462,7 @@ class AllReduce(nn.Module):
             # Initialize MNNVL AllReduce if needed
             if self.strategy in (AllReduceStrategy.AUTO,
                                  AllReduceStrategy.MNNVL):
-                if self.mapping.tp_size != self.mapping.world_size:
-                    logger.debug(
-                        f"MNNVLAllReduce is disabled due to tp_size:{self.mapping.tp_size} "
-                        f"!= world_size:{self.mapping.world_size}")
-                    self.mnnvl_allreduce = None
-                elif MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
+                if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     try:
                         self.mnnvl_allreduce = MNNVLAllReduce(
                             self.mapping, dtype) if dtype else None
