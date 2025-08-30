@@ -1,10 +1,13 @@
+import contextlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, TypeVar
 
+import filelock
 import torch
 import transformers
+from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
@@ -55,6 +58,35 @@ class MoeLoadBalancerConfig:
             return self.initial_global_assignments[layer_idx]
         else:
             return None
+
+
+@contextlib.contextmanager
+def config_file_lock(timeout: int = 10):
+    """
+    Context manager for file locking when loading pretrained configs.
+
+    This prevents race conditions when multiple processes try to download/load
+    the same model configuration simultaneously.
+
+    Args:
+        timeout: Maximum time to wait for lock acquisition in seconds
+    """
+    # Use a single global lock file in HF cache directory
+    # This serializes all model loading operations to prevent race conditions
+    lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
+
+    # Create and acquire the lock
+    lock = filelock.FileLock(str(lock_path), timeout=timeout)
+
+    try:
+        with lock:
+            yield
+    except filelock.Timeout:
+        logger.warning(
+            f"Failed to acquire config lock within {timeout} seconds, proceeding without lock"
+        )
+        # Fallback: proceed without locking to avoid blocking indefinitely
+        yield
 
 
 @dataclass(kw_only=True)
@@ -182,16 +214,20 @@ class ModelConfig(Generic[TConfig]):
                         checkpoint_dir: str,
                         trust_remote_code=False,
                         **kwargs):
-        pretrained_config = transformers.AutoConfig.from_pretrained(
-            checkpoint_dir,
-            trust_remote_code=trust_remote_code,
-        )
+        # Use file lock to prevent race conditions when multiple processes
+        # try to import/cache the same remote model config file
+        with config_file_lock():
+            pretrained_config = transformers.AutoConfig.from_pretrained(
+                checkpoint_dir,
+                trust_remote_code=trust_remote_code,
+            )
 
-        # Find the cache path by looking for the config.json file which should be in all
-        # huggingface models
-        model_dir = Path(
-            transformers.utils.hub.cached_file(checkpoint_dir,
-                                               'config.json')).parent
+            # Find the cache path by looking for the config.json file which should be in all
+            # huggingface models
+            model_dir = Path(
+                transformers.utils.hub.cached_file(checkpoint_dir,
+                                                   'config.json')).parent
+
         quant_config = QuantConfig()
         layer_quant_config = None
         # quantized ckpt in modelopt format
