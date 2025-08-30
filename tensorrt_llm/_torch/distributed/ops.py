@@ -1,5 +1,4 @@
 import math
-import os
 import platform
 import threading
 from typing import List, Optional, Tuple, Union
@@ -19,11 +18,11 @@ _thread_local = threading.local()
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
-    if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}', {})
+    if not hasattr(_thread_local, f"allreduce_workspaces_{mapping.pp_rank}"):
+        setattr(_thread_local, f"allreduce_workspaces_{mapping.pp_rank}", {})
 
     allreduce_workspaces = getattr(_thread_local,
-                                   f'allreduce_workspaces_{mapping.pp_rank}')
+                                   f"allreduce_workspaces_{mapping.pp_rank}")
     if mapping not in allreduce_workspaces:
         ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
             mapping,
@@ -35,7 +34,7 @@ def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
 
 
 def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
-    if not hasattr(_thread_local, 'lowprecision_allreduce_workspaces'):
+    if not hasattr(_thread_local, "lowprecision_allreduce_workspaces"):
         _thread_local.lowprecision_allreduce_workspaces = {}
     lowprecision_allreduce_workspaces = _thread_local.lowprecision_allreduce_workspaces
     if mapping not in lowprecision_allreduce_workspaces:
@@ -55,8 +54,8 @@ def get_allreduce_mnnvl_workspace(
 ) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
 
     if not hasattr(_thread_local,
-                   f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
+                   f"allreduce_mnnvl_workspaces_{mapping.pp_rank}"):
+        setattr(_thread_local, f"allreduce_mnnvl_workspaces_{mapping.pp_rank}",
                 {})
     # Support topology split
     comm = mpi_comm().Split(
@@ -65,18 +64,15 @@ def get_allreduce_mnnvl_workspace(
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
 
     allreduce_mnnvl_workspaces = getattr(
-        _thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}')
+        _thread_local, f"allreduce_mnnvl_workspaces_{mapping.pp_rank}")
     if mapping not in allreduce_mnnvl_workspaces:
-        # buffer shape: [3, 2, buffer_tokens, hidden_dim]
-        stride = 3 * 2 * dtype.itemsize
-        # Max hidden_size_to_support
-        max_hidden_dim = 16384
-        buffer_size_in_bytes = math.ceil(
-            12_000_000 / (max_hidden_dim * stride)) * (max_hidden_dim * stride)
-        max_num_elements = buffer_size_in_bytes // stride
+        # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
+        init_buffer_size_bytes = 1024 * 8192 * dtype.itemsize
+        # Lamport requires 3 buffers
+        init_workspace_size = 3 * init_buffer_size_bytes
 
         mcast_buffer = McastGPUBuffer(
-            buffer_size_in_bytes,
+            init_workspace_size,
             mapping.tp_size,
             mapping.tp_rank,
             # Split the communicator according to the topology
@@ -120,7 +116,7 @@ def get_output_info(input: torch.Tensor, dim: int) -> List[int]:
         val if idx != dim else -1 for idx, val in enumerate(input.shape)
     ]
     numel_base = -math.prod(output_shape)
-    return {'output_shape': output_shape, 'numel_base': numel_base}
+    return {"output_shape": output_shape, "numel_base": numel_base}
 
 
 def filter_valid_input(
@@ -148,7 +144,7 @@ def allgather(
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
-    '''
+    """
     Add an operation that performs a collective all-gather.
 
     If 'sizes' is 'None', the input tensors in the different ranks must have the same shape.
@@ -172,7 +168,7 @@ def allgather(
         sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
     Returns:
         The gathered tensor or tensor list.
-    '''
+    """
     if mapping.tp_size == 1:
         return input
 
@@ -190,13 +186,13 @@ def allgather(
     if isinstance(input, torch.Tensor):
         torch_op = torch.ops.trtllm.allgather
         output_info = get_output_info(input, dim)
-        input = input.contiguous().view(-1, output_info['numel_base'])
+        input = input.contiguous().view(-1, output_info["numel_base"])
     else:
         input, valid = filter_valid_input(input)
         torch_op = torch.ops.trtllm.allgather_list
         output_info = [get_output_info(val, dim) for val in input]
         input = [
-            val.contiguous().view(-1, val_info['numel_base'])
+            val.contiguous().view(-1, val_info["numel_base"])
             for val, val_info in zip(input, output_info)
         ]
 
@@ -208,13 +204,13 @@ def allgather(
 
     def convert_output(x, x_info):
         if dim == 0:
-            x = x.view(x_info['output_shape'])
+            x = x.view(x_info["output_shape"])
         else:
             if sizes is None:
                 x_list = x.chunk(mapping.tp_size)
             else:
                 x_list = x.split(sizes)
-            x = torch.cat([x.reshape(x_info['output_shape']) for x in x_list],
+            x = torch.cat([x.reshape(x_info["output_shape"]) for x in x_list],
                           dim=dim)
         return x
 
@@ -252,13 +248,13 @@ def reducescatter(
     def convert_input(x, x_info):
         # Inputs are reshaped in this way to pass necessary shape information to the reducescatter op
         if dim == 0:
-            x = x.contiguous().view(-1, x_info['numel_base'])
+            x = x.contiguous().view(-1, x_info["numel_base"])
         else:
             if sizes is None:
                 x_list = x.chunk(mapping.tp_size, dim=dim)
             else:
                 x_list = x.split(sizes, dim=dim)
-            x = torch.cat([x.reshape(-1, x_info['numel_base']) for x in x_list])
+            x = torch.cat([x.reshape(-1, x_info["numel_base"]) for x in x_list])
         return x
 
     if isinstance(input, torch.Tensor):
@@ -281,10 +277,10 @@ def reducescatter(
     )
 
     if isinstance(input, torch.Tensor):
-        output = output.view(output_info['output_shape'])
+        output = output.view(output_info["output_shape"])
     else:
         output = [
-            val.view(val_info['output_shape'])
+            val.view(val_info["output_shape"])
             for val, val_info in zip(output, output_info)
         ]
         output = restore_full_output(output, valid)
@@ -304,13 +300,12 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
-        assert (
-            dtype in MNNVLAllReduce.get_supported_dtypes()
-            and (not mapping.has_cp())
+        assert dtype in MNNVLAllReduce.get_supported_dtypes() and (
+            not mapping.has_cp()
         ), "MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
 
-        self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
-            self.mapping, dtype)
+        self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = (
+            get_allreduce_mnnvl_workspace(self.mapping, dtype))
 
     @staticmethod
     def get_supported_dtypes():
@@ -403,10 +398,12 @@ class MNNVLAllReduce(nn.Module):
 
 class AllReduce(nn.Module):
 
-    def __init__(self,
-                 mapping: Mapping,
-                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 dtype: Optional[torch.dtype] = None):
+    def __init__(
+        self,
+        mapping: Mapping,
+        strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+        dtype: Optional[torch.dtype] = None,
+    ):
         super().__init__()
         """
         AllReduce is a module that performs an all-reduce operation on a tensor.
@@ -489,7 +486,7 @@ class AllReduce(nn.Module):
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        '''
+        """
         The input tensors in the different ranks must have the same shape.
         The output tensor will have that same shape with the input tensor.
         The output tensor will be replicated among the TP group.
@@ -511,7 +508,7 @@ class AllReduce(nn.Module):
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
             RESIDUAL_RMS_NORM_QUANT_NVFP4: [norm_quant_fp4, scale_factor, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: [norm, norm_quant_fp4, scale_factor, residual]
-        '''
+        """
         if self.mapping.tp_size == 1 or (all_reduce_params is not None
                                          and all_reduce_params.enable_allreduce
                                          == False):
@@ -625,8 +622,8 @@ class MoEAllReduce(nn.Module):
                 eps=all_reduce_params.eps,
             )
         else:
-            assert all_reduce_params.residual.shape[
-                0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+            assert (all_reduce_params.residual.shape[0] <= self.max_token
+                    ), "Num tokens must be less than or equal to max_token"
 
             return torch.ops.trtllm.moe_finalize_allreduce(
                 input=input,
