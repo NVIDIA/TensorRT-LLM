@@ -215,7 +215,7 @@ if use_precompiled:
             precompiled_location = download_precompiled(tempdir, version)
         extract_from_precompiled(precompiled_location, package_data, tempdir)
 
-# sanity_check()
+sanity_check()
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
