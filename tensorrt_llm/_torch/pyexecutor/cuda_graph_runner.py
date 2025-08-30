@@ -137,7 +137,7 @@ class CUDAGraphRunner:
         return (batch_size, self.draft_len) not in self.graph_outputs
 
     def capture(self, batch_size: int, forward_fn: Callable,
-                initial_inputs: Dict[str, Any]):
+                postprocess_fn: Callable, initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
         key = (batch_size, self.draft_len)
@@ -181,8 +181,10 @@ class CUDAGraphRunner:
         with with_multi_stream(True), piecewise_cuda_graph(False):
             for _ in range(self.WARMUP_STEPS):
                 forward_fn(capture_inputs)
+                postprocess_fn(capture_inputs)
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
+            postprocess_fn(capture_inputs)
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
