@@ -344,6 +344,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 def dockerArgs = "--gpus ${gpuCount} " +
                     "--cap-add=SYS_ADMIN " +
                     "--ipc=host " +
+                    "--entrypoint=\"\" " +
                     "--security-opt seccomp=unconfined " +
                     "-u root:root " +
                     "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
