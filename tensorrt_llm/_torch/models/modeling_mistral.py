@@ -14,8 +14,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_pixtral
-from tensorrt_llm._torch.models.modeling_multimodal_utils import \
-    fuse_input_embeds
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    find_uncached_mm_embeds, fuse_input_embeds)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
@@ -29,7 +29,8 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs import (ExtraProcessedInputs, InputProcessor,
+from tensorrt_llm.inputs import (BaseMultimodalInputProcessor,
+                                 ExtraProcessedInputs, InputProcessor,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
@@ -212,7 +213,7 @@ class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
         )
 
 
-class Mistral3InputProcessor(InputProcessor):
+class Mistral3InputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(
         self,
@@ -275,6 +276,19 @@ class Mistral3InputProcessor(InputProcessor):
             }
 
         return input_ids, extra_processed_inputs
+
+    def get_vocab_size(self) -> int:
+        """Return the vocab size of the model."""
+        # Unlike some other VLMs, mistral3's vocab size is stored in its `text_config`, not the top-level
+        # config.
+        return self.model_config.text_config.vocab_size
+
+    def get_mm_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            self._processor.image_token_id,
+            self._processor.image_break_token_id,
+            self._processor.image_end_token_id,
+        ])
 
 
 @register_auto_model("Mistral3ForConditionalGeneration")
@@ -401,6 +415,8 @@ class Mistral3VLM(PreTrainedModel):
                 self._get_image_features(pixel_values=batched_pixel_values,
                                          image_sizes=batched_image_sizes)
             ]
+            mm_embeds = find_uncached_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
 
         with nvtx_range("[mistral] Fuse input embeds"):
             input_ids, inputs_embeds = fuse_input_embeds(
