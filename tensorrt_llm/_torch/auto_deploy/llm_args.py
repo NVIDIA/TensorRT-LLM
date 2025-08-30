@@ -58,7 +58,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     )
 
     model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
-        default="AutoModelForImageTextToText",
+        default="AutoModelForCausalLM",
         description="The model factory to use for loading the model.",
     )
 
