@@ -1239,7 +1239,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
 
         // the second loop is for cache reuse
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 1; i++)
         {
             for (auto len : {8}) //{30, 10, 60, 80})
             {

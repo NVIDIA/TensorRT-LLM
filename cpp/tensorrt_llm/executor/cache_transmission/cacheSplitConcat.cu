@@ -934,7 +934,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     auto outputCacheNum = targetRankInfo.mIRanks.size();
     if (selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA)
     {
-        outputCacheNum = targetRankInfo.mDomainPPSize;
+        outputCacheNum = targetRankInfo.mDomainPPSize * targetRankInfo.mDomainCPSize;
     }
     else
     {
