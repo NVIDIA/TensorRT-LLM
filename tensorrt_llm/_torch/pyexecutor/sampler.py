@@ -707,7 +707,6 @@ class TorchSampler(Sampler):
                                    FinishReason.NOT_FINISHED.value)
 
         if with_stop_words := self._requests_with_stop_words(requests):
-            longest = self._longest_stop_word_len(with_stop_words)
             stop_seq_slots = torch.tensor(
                 [r.py_seq_slot for r in with_stop_words],
                 pin_memory=True).to("cuda", non_blocking=True)
@@ -715,8 +714,7 @@ class TorchSampler(Sampler):
             self._write_reason(
                 finish_reasons,
                 FinishReason.STOP_WORDS,
-                where=self._are_stop_words(with_stop_words, stop_tokens,
-                                           longest),
+                where=self._are_stop_words(with_stop_words, stop_tokens),
                 seq_slots=stop_seq_slots,
             )
 
@@ -762,8 +760,8 @@ class TorchSampler(Sampler):
                           dtype=torch.bool,
                           pin_memory=True).to("cuda", non_blocking=True).tril()
 
-    def _are_stop_words(self, requests: list[LlmRequest], tokens: torch.Tensor,
-                        _) -> torch.Tensor:
+    def _are_stop_words(self, requests: list[LlmRequest],
+                        tokens: torch.Tensor) -> torch.Tensor:
         per_step = torch.zeros((self.max_tokens, len(requests)),
                                dtype=torch.bool,
                                pin_memory=True).to("cuda", non_blocking=True)
