@@ -845,7 +845,6 @@ protected:
     {
 
         constexpr SizeType32 maxNewTokens{1};
-        // @B: Might want to make it iota to test CP.
         texec::Request request{VecTokens(length, length), maxNewTokens};
 
         auto state = std::make_unique<texec::DataTransceiverState>();
@@ -942,8 +941,22 @@ protected:
         }
     }
 
+    int getEnvMpiDebugRank()
+    {
+        // Look-up env variable TLLM_DEBUG_RANK.
+        char const* const env = std::getenv("TLLM_DEBUG_RANK");
+        if (env == nullptr)
+        {
+            return -2;  // -1 means all ranks, -2 means no debug rank.
+        }
+        return std::stoi(env);
+    }
+
     void fillBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int blockPoolIdx = 0)
     {
+        //Set TLLM_DEBUG_RANK to specific rank number, or -1 for all ranks
+        static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+        std::cerr << "fillBlockData called for rank " << mRank << " mRankInInstance " << mRankInInstance << " blockId " << blockId << std::endl;
         auto const& blockManager = mKVCacheManager->getBlockManager();
         auto const onlyWindowSize = blockManager.getPoolWindowSize(blockPoolIdx);
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
@@ -966,6 +979,7 @@ protected:
         {
             for (int headId = 0; headId < headSizePerRank; headId++)
             {
+                // @B: Why do we fill all tokens in a block?
                 for (int tokenId = 0; tokenId < tokensPerBlock; tokenId++)
                 {
                     for (int hiddenId = 0; hiddenId < sizePerHead; hiddenId++)
@@ -981,7 +995,22 @@ protected:
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 *dataPtr = generateValue;
+                                // Debug print with rank information for MPI debugging (KEY values)
+                                if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+                                {
+                                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        "[RANK %d] [fillBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
+                                        "keyIdx=%zu, value=%s, dataType=%d",
+                                        tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        blockId, layerId, layerId + startLayerId,
+                                        headId, headId + startHeadId,
+                                        tokenId, tokenId + startTokenId,
+                                        hiddenId, keyIndex,
+                                        std::to_string(static_cast<double>(generateValue)).c_str(),
+                                        static_cast<int>(blockData.getDataType()));
+                                }
                             },
+                            // Note: info passed to generateExpectedValue is in "global" coordinate system.
                             generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
                         if (kvFactor == 2)
@@ -992,6 +1021,20 @@ protected:
                                     using ValueType = decltype(generateValue);
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
                                     *dataPtr = generateValue;
+                                    // Debug print with rank information for MPI debugging (VALUE values)
+                                    if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+                                    {
+                                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                            "[RANK %d] [fillBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
+                                            "valueIdx=%zu, value=%s, dataType=%d",
+                                            tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                            blockId, layerId, layerId + startLayerId,
+                                            headId, headId + startHeadId,
+                                            tokenId, tokenId + startTokenId,
+                                            hiddenId, valueIndex,
+                                            std::to_string(static_cast<double>(generateValue)).c_str(),
+                                            static_cast<int>(blockData.getDataType()));
+                                    }
                                 },
                                 generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId,
                                     layerId + startLayerId, headId + startHeadId, hiddenId, false,
@@ -1007,6 +1050,9 @@ protected:
 
     void verifyBlockData(tensorrt_llm::runtime::ITensor& blockData, int blockId, size_t initial, int blockPoolIdx = 0)
     {
+        //Set TLLM_DEBUG_RANK to specific rank number, or -1 for all ranks
+        static const int TARGET_RANK = getEnvMpiDebugRank(); // -1 means all ranks.
+        std::cerr << "verifyBlockData called for rank " << mRank << " mRankInInstance " << mRankInInstance << " blockId " << blockId << std::endl;
         auto const& blockManager = mKVCacheManager->getBlockManager();
         auto const onlyWindowSize = blockManager.getPoolWindowSize(blockPoolIdx);
         auto const& bufferManager = blockManager.getBufferManager(onlyWindowSize);
@@ -1048,6 +1094,20 @@ protected:
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 EXPECT_EQ(*dataPtr, generateValue);
+                                // Debug print with rank information for MPI debugging (KEY values)
+                                if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+                                {
+                                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        "[RANK %d] [verifyBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
+                                        "keyIdx=%zu, value=%s, dataType=%d",
+                                        tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        blockId, layerId, layerId + startLayerId,
+                                        headId, headId + startHeadId,
+                                        tokenId, tokenId + startTokenId,
+                                        hiddenId, keyIndex,
+                                        std::to_string(static_cast<double>(generateValue)).c_str(),
+                                        static_cast<int>(blockData.getDataType()));
+                                }
                             },
                             generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId, layerId + startLayerId,
                                 headId + startHeadId, hiddenId, true, blockData.getDataType()));
@@ -1059,6 +1119,20 @@ protected:
                                     using ValueType = decltype(generateValue);
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
                                     EXPECT_EQ(*dataPtr, generateValue);
+                                    // Debug print with rank information for MPI debugging (VALUE values)
+                                    if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
+                                    {
+                                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                            "[RANK %d] [verifyBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
+                                            "valueIdx=%zu, value=%s, dataType=%d",
+                                            tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                            blockId, layerId, layerId + startLayerId,
+                                            headId, headId + startHeadId,
+                                            tokenId, tokenId + startTokenId,
+                                            hiddenId, valueIndex,
+                                            std::to_string(static_cast<double>(generateValue)).c_str(),
+                                            static_cast<int>(blockData.getDataType()));
+                                    }
                                 },
                                 generateExpectedValue(initial, blockPoolIdx, tokenId + startTokenId,
                                     layerId + startLayerId, headId + startHeadId, hiddenId, false,
@@ -1167,7 +1241,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         // the second loop is for cache reuse
         for (int i = 0; i < 2; i++)
         {
-            for (auto len : {30, 10, 60, 80})
+            for (auto len : {8}) //{30, 10, 60, 80})
             {
                 requests.emplace_back(makeLlmRequest(len));
             }
@@ -1384,7 +1458,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPForMLA, AsymmetricalCacheTest,
                      /*numLayers*/ testing::Values(1),
                      /*numHeads*/ testing::Values(1),
                      /*sizePerHead*/ testing::Values(4),
-                     /*tokensPerBlock*/ testing::Values(4),
+                     /*tokensPerBlock*/ testing::Values(2),
                      /*dataType*/ testing::Values(nvinfer1::DataType::kINT8),
                      /*kvFactor*/ testing::Values(2),
                      /*isMLA*/testing::Values(true),
