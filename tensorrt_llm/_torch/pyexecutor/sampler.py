@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import cached_property
 from typing import List, Literal, Optional, TypeAlias
 
 import numpy as np
@@ -10,8 +11,7 @@ from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
 from tensorrt_llm._torch.pyexecutor.sampler_utils import (BEAM_0,
                                                           SINGLE_BEAM_WIDTH,
-                                                          handle_stop_1_beam,
-                                                          stop_token_criteria)
+                                                          handle_stop_1_beam)
 from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
@@ -756,28 +756,58 @@ class TorchSampler(Sampler):
                 >= max_lengths_tensor).T.pin_memory().to(device="cuda",
                                                          non_blocking=True)
 
+    @cached_property
+    def tril(self):
+        return torch.ones((self.max_tokens, self.max_tokens),
+                          dtype=torch.bool,
+                          pin_memory=True).to("cuda", non_blocking=True).tril()
+
     def _are_stop_words(self, requests: list[LlmRequest], tokens: torch.Tensor,
-                        longest_stop_word_len: int) -> torch.Tensor:
-        lookback = longest_stop_word_len - 1
+                        _) -> torch.Tensor:
+        per_step = torch.zeros((self.max_tokens, len(requests)),
+                               dtype=torch.bool,
+                               pin_memory=True).to("cuda", non_blocking=True)
 
-        def request_stop_words(request: LlmRequest,
-                               new_tokens: torch.Tensor) -> list[bool]:
-            per_step = [False] * self.max_tokens
+        def request_stop_words(request: LlmRequest, new_tokens: torch.Tensor):
+            swl, ends = request.py_stop_words_list
+            if -1 in ends:
+                ends = ends[:ends.index(-1)]
+            lens = np.diff(ends, prepend=0)
+            lens_device = torch.tensor(list(lens),
+                                       pin_memory=True).to("cuda",
+                                                           non_blocking=True)
+            max_len = np.max(lens)
+
+            words = torch.zeros(len(lens),
+                                max_len,
+                                dtype=torch.int32,
+                                pin_memory=True)
+            for step, (start, l) in enumerate(zip([0] + ends, lens)):
+                words[step, :l] = torch.tensor(swl[start:start + l],
+                                               dtype=torch.int32)
+            words_device = words.to("cuda", non_blocking=True)
+
+            lookback = max_len - 1
             # TODO: make sure only the lookback tokens are pulled into the list
-            old_tokens = request.get_tokens(BEAM_0)[-lookback:]
-            new_tokens_list = new_tokens.tolist()
-            for step in range(self.max_tokens):
-                suspect_tokens = (old_tokens + new_tokens_list[:step + 1])
-                if stop_token_criteria(request.py_stop_words_list,
-                                       suspect_tokens):
-                    per_step[step] = True
-                    break  # We don't care about subsequent steps because we already found a stop word
-            return per_step
+            old_tokens = torch.tensor([request.get_tokens(BEAM_0)[-lookback:]] *
+                                      self.max_tokens,
+                                      pin_memory=True).to("cuda",
+                                                          non_blocking=True)
+            new_tokens = new_tokens * self.tril
+            suspect_tokens_device = torch.cat((old_tokens, new_tokens), dim=-1)
+            for step, seq in enumerate(suspect_tokens_device):
+                for word, L in zip(words_device, lens_device):
+                    truncated_seq = seq[:max_len + step][-L:]
+                    if torch.equal(truncated_seq, word[-L:]):
+                        # We don't care about subsequent steps because we already found a stop word match
+                        return step
+            return None
 
-        return torch.tensor([
-            request_stop_words(request, tokens[:, i])
-            for i, request in enumerate(requests)
-        ]).T.pin_memory().to(device="cuda", non_blocking=True)
+        for request_idx, request in enumerate(requests):
+            step = request_stop_words(request, tokens[:, request_idx])
+            if step is not None:
+                per_step[step][request_idx] = True
+        return per_step
 
     def _process_requests(self,
                           scheduled_requests: ScheduledRequests,
