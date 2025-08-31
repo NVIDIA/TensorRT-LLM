@@ -765,10 +765,10 @@ class TorchSampler(Sampler):
         mask.pin_memory()
         return mask.to("cuda", non_blocking=True)
 
-    def padded_old_tokens(self,
-                          requests: list[LlmRequest],
-                          new_tokens: torch.Tensor,
-                          pad_id: int = _PAD_ID) -> torch.Tensor:
+    def _padded_old_tokens(self,
+                           requests: list[LlmRequest],
+                           new_tokens: torch.Tensor,
+                           pad_id: int = _PAD_ID) -> torch.Tensor:
         # TODO: make sure only the lookback tokens are pulled into the list
         lookback = self._longest_stop_word_len(requests) - 1
         old_tokens = []
@@ -793,7 +793,7 @@ class TorchSampler(Sampler):
                                dtype=torch.bool,
                                pin_memory=True).to("cuda", non_blocking=True)
 
-        padded_tokens = self.padded_old_tokens(requests, tokens)
+        padded_tokens = self._padded_old_tokens(requests, tokens)
 
         def request_stop_words(request: LlmRequest, new_tokens: torch.Tensor):
             swl, ends = request.py_stop_words_list
