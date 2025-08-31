@@ -754,18 +754,21 @@ class TorchSampler(Sampler):
                 >= max_lengths_tensor).T.pin_memory().to(device="cuda",
                                                          non_blocking=True)
 
+    _PAD_ID = -1
+    """Pad with negative, doesn't matter what"""
+
     @cached_property
     def _pad_steps_mask(self):
         square = torch.ones(self.max_tokens, self.max_tokens, dtype=torch.bool)
-        # Pad with negative, doesn't matter what
-        mask = torch.where(square.tril(), torch.tensor(1), torch.tensor(-1))
+        pad_id = torch.tensor(self._PAD_ID)
+        mask = torch.where(square.tril(), torch.tensor(1), pad_id)
         mask.pin_memory()
         return mask.to("cuda", non_blocking=True)
 
     def padded_old_tokens(self,
                           requests: list[LlmRequest],
                           new_tokens: torch.Tensor,
-                          pad_id: int = -1) -> torch.Tensor:
+                          pad_id: int = _PAD_ID) -> torch.Tensor:
         # TODO: make sure only the lookback tokens are pulled into the list
         lookback = self._longest_stop_word_len(requests) - 1
         old_tokens = []
