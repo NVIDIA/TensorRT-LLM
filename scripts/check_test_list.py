@@ -113,15 +113,15 @@ def verify_waive_list(llm_src, args):
         # Check for SKIP marker in waives.txt and split by the first occurrence
         line = line.split(" SKIP", 1)[0].strip()
 
-        # If the line starts with 'full:', process it
-        if line.startswith("full:"):
-            line = line.split("/", 1)[1].lstrip("/")
-
         # Track all occurrences of each processed line
         if line in dedup_lines:
             dedup_lines[line].append((line_no, original_line))
         else:
             dedup_lines[line] = [(line_no, original_line)]
+
+        # If the line starts with 'full:', process it
+        if line.startswith("full:"):
+            line = line.split("/", 1)[1].lstrip("/")
 
         # Check waived cases also in l0_text.txt and qa_text.txt
         found_in_l0_qa = False
