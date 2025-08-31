@@ -755,16 +755,42 @@ class TorchSampler(Sampler):
                                                          non_blocking=True)
 
     @cached_property
-    def tril(self):
-        return torch.ones((self.max_tokens, self.max_tokens),
-                          dtype=torch.bool,
-                          pin_memory=True).to("cuda", non_blocking=True).tril()
+    def _pad_steps_mask(self):
+        square = torch.ones(self.max_tokens, self.max_tokens, dtype=torch.bool)
+        # Pad with negative, doesn't matter what
+        mask = torch.where(square.tril(), torch.tensor(1), torch.tensor(-1))
+        mask.pin_memory()
+        return mask.to("cuda", non_blocking=True)
+
+    def padded_old_tokens(self,
+                          requests: list[LlmRequest],
+                          new_tokens: torch.Tensor,
+                          pad_id: int = -1) -> torch.Tensor:
+        # TODO: make sure only the lookback tokens are pulled into the list
+        lookback = self._longest_stop_word_len(requests) - 1
+        old_tokens = []
+        for request in requests:
+            old = request.get_tokens(BEAM_0)[-lookback:]
+            padded = [pad_id] * (lookback - len(old)) + old
+            old_tokens.append([padded] * self.max_tokens)
+        old_tokens_tensor = torch.tensor(old_tokens,
+                                         pin_memory=True).to("cuda",
+                                                             non_blocking=True)
+        assert old_tokens_tensor.shape == (len(requests), self.max_tokens,
+                                           lookback)
+        new_tokens = new_tokens.T.unsqueeze(1) * self._pad_steps_mask
+        ret = torch.cat((old_tokens_tensor, new_tokens), dim=-1)
+        assert ret.shape == (len(requests), self.max_tokens,
+                             lookback + self.max_tokens)
+        return ret
 
     def _are_stop_words(self, requests: list[LlmRequest],
                         tokens: torch.Tensor) -> torch.Tensor:
         per_step = torch.zeros((self.max_tokens, len(requests)),
                                dtype=torch.bool,
                                pin_memory=True).to("cuda", non_blocking=True)
+
+        padded_tokens = self.padded_old_tokens(requests, tokens)
 
         def request_stop_words(request: LlmRequest, new_tokens: torch.Tensor):
             swl, ends = request.py_stop_words_list
@@ -785,24 +811,16 @@ class TorchSampler(Sampler):
                                                dtype=torch.int32)
             words_device = words.to("cuda", non_blocking=True)
 
-            lookback = max_len - 1
-            # TODO: make sure only the lookback tokens are pulled into the list
-            old_tokens = torch.tensor([request.get_tokens(BEAM_0)[-lookback:]] *
-                                      self.max_tokens,
-                                      pin_memory=True).to("cuda",
-                                                          non_blocking=True)
-            new_tokens = new_tokens * self.tril
-            suspect_tokens_device = torch.cat((old_tokens, new_tokens), dim=-1)
-            for step, seq in enumerate(suspect_tokens_device):
+            for step, step_seq in enumerate(new_tokens):
                 for word, L in zip(words_device, lens_device):
-                    truncated_seq = seq[:max_len + step][-L:]
+                    truncated_seq = step_seq[step_seq >= 0][-L:]
                     if torch.equal(truncated_seq, word[-L:]):
                         # We don't care about subsequent steps because we already found a stop word match
                         return step
             return None
 
         for request_idx, request in enumerate(requests):
-            step = request_stop_words(request, tokens[:, request_idx])
+            step = request_stop_words(request, padded_tokens[request_idx])
             if step is not None:
                 per_step[step][request_idx] = True
         return per_step
