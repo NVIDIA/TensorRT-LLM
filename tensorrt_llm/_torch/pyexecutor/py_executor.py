@@ -228,6 +228,14 @@ class PyExecutor:
 
         self.inflight_req_ids = ReqIdsSet()
 
+        # Request termination synchronization across PP ranks
+        # {request_id: {'ready_to_terminate': [ranks], 'terminated': [ranks]}}
+        self.pending_termination = {}
+        self.termination_handles = [None] * self.num_micro_batches
+
+        # Local map from request_id -> local LlmRequest awaiting consensus termination
+        self.local_termination = {}
+
         # During warmup, we don't enable the profiler
         self.is_warmup = True
         self.model_engine.warmup(self.resource_manager)
@@ -718,6 +726,11 @@ class PyExecutor:
                 batch_state.sample_state.scheduled_requests), req_stats)
 
     def _executor_loop_cleanup(self):
+
+        for req in self.send_handles:
+            if req is not None:
+                req.wait()
+
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
@@ -826,6 +839,7 @@ class PyExecutor:
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
+                            assert sample_state is not None, "Sampling failed"
                             self._update_request_states(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
@@ -901,6 +915,10 @@ class PyExecutor:
 
                     self.wait_on_pp_send_handles(prev_microbatch_id)
                     self.micro_batches[prev_microbatch_id] = None
+
+                # Synchronize and apply request terminations across PP ranks
+                if self.dist.pp_size > 1:
+                    self._sync_termination(prev_microbatch_id)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
@@ -1828,7 +1846,17 @@ class PyExecutor:
         self.active_requests.extend(new_active_requests)
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
-            self._terminate_request(request)
+            if self.dist.pp_size > 1:
+                req_key = request.py_request_id
+                self.local_termination[req_key] = request
+                state = self.pending_termination.get(req_key)
+                if state is None:
+                    state = {'ready_to_terminate': [], 'terminated': []}
+                    self.pending_termination[req_key] = state
+                if self.dist.rank not in state['ready_to_terminate']:
+                    state['ready_to_terminate'].append(self.dist.rank)
+            else:
+                self._terminate_request(request)
         return requests_to_terminate
 
     @nvtx_range("_terminate_ctx_finished_requests")
@@ -1837,6 +1865,70 @@ class PyExecutor:
             if request.is_disagg_context_complete_state:
                 self._terminate_request(request)
                 self.ctx_in_transmission_requests.remove(request)
+
+    def _sync_termination(self, microbatch_id: int):
+        """Ring-communicate pending termination state and apply local terminations upon consensus.
+
+        Each rank sends its current pending_termination snapshot to the next PP rank
+        and receives the previous rank's snapshot. After merging, apply any terminations
+        that have reached consensus (i.e., all PP ranks are ready).
+
+        Args:
+            microbatch_id: The microbatch ID for the current batch
+        """
+        snapshot = {
+            req_id: {
+                'ready_to_terminate': list(state.get('ready_to_terminate', [])),
+                'terminated': list(state.get('terminated', [])),
+            }
+            for req_id, state in self.pending_termination.items()
+        }
+
+        if self.termination_handles[microbatch_id] is not None:
+            self.termination_handles[microbatch_id].wait()
+
+        self.termination_handles[microbatch_id] = self.dist.isend_object(
+            snapshot,
+            dest=self.dist.next_pp_rank,
+            tag=microbatch_id,
+        )
+
+        remote_state = self.dist.recv_object(
+            src=self.dist.prev_pp_rank,
+            tag=microbatch_id,
+        )
+
+        if remote_state:
+            for req_id, state in remote_state.items():
+                local = self.pending_termination.get(req_id)
+                if local is None:
+                    self.pending_termination[req_id] = {
+                        'ready_to_terminate':
+                        list(state.get('ready_to_terminate', [])),
+                        'terminated':
+                        list(state.get('terminated', [])),
+                    }
+                else:
+                    for key in ('ready_to_terminate', 'terminated'):
+                        for r in state.get(key, []):
+                            if r not in local[key]:
+                                local[key].append(r)
+
+        to_delete = []
+        for req_id, state in self.pending_termination.items():
+            ready = state.get('ready_to_terminate', [])
+            done = state.get('terminated', [])
+            if len(ready) >= self.dist.pp_size and self.dist.rank not in done:
+                local_req = self.local_termination.get(req_id)
+                if local_req is not None:
+                    self._terminate_request(local_req)
+                done.append(self.dist.rank)
+            if len(done) >= self.dist.pp_size:
+                to_delete.append(req_id)
+                if req_id in self.local_termination:
+                    self.local_termination.pop(req_id, None)
+        for req_id in to_delete:
+            self.pending_termination.pop(req_id, None)
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.
