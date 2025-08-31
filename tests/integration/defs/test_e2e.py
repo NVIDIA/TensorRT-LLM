@@ -2045,7 +2045,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
     pytest.param('Nemotron-Ultra-253B',
                  'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
                  marks=(skip_pre_hopper, pytest.mark.timeout(12600))),
-    pytest.param('DeepSeek-V3-0324',
+    pytest.param('DeepSeek-V3-671B-FP8',
                  'DeepSeek-V3-0324',
                  marks=(skip_post_blackwell,
                         pytest.mark.skip_less_device_memory(90000))),
