@@ -83,8 +83,6 @@ echo "ntasks_per_node: ${ntasks_per_node}"
 echo "==========================================="
 
 
-nsys_on=""
-# nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
 numa_bind=true # Only allocate memory from nodes, this only works on GB200
 ctx_max_seq_len=$((isl + 10))
 gen_max_seq_len=$((isl + osl + 10))
@@ -95,6 +93,9 @@ container_name=disaggregated_serving
 logdir=${workdir}/slurm-${SLURM_JOB_ID}/benchmark-${isl}-${osl}
 mkdir -p ${logdir}
 full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
+
+# nsys_on=""
+nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
 
 echo "concurrency: ${concurrency}"
 

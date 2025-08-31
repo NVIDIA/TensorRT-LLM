@@ -561,9 +561,9 @@ class PyExecutor:
                 if enable_torch_trace:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
-                    logger.info(f"Profiling stopped at iteration {it}, "
-                                f"trace saved to {torch_trace_path}")
+                    logger.info(f"Torch profiler trace saved to {torch_trace_path}.")
                 torch.cuda.cudart().cudaProfilerStop()
+                logger.info(f"Profiling stopped at iteration {it}.")
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
