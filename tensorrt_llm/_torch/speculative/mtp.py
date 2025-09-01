@@ -603,7 +603,7 @@ class MTPWorker(nn.Module):
             # max_length is used as tensor shape, so it should be from host;
             # otherwise, an implicit D2H copy will be triggered.
             max_length = seq_lens_cpu.max().item()
-            num_sequences = seq_lens.shape[0]
+            num_sequences = seq_lens_cuda.shape[0]
             # initialize a zero tensor to store the result
             result = torch.zeros(
                 (num_sequences, max_length, packed_seq_cuda.shape[1]),
