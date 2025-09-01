@@ -282,6 +282,31 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids("attn_backend", ["TRTLLM"])
+    def test_nvfp4_kv(self, attn_backend, torch_compile):
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
+        pytorch_config = dict(
+            torch_compile_config=torch_compile_config,
+            cuda_graph_config=CudaGraphConfig(enable_padding=torch_compile,
+                                              batch_sizes=[4]),
+            attn_backend=attn_backend,
+            disable_overlap_scheduler=torch_compile,
+        )
+        pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="nvfp4")
+        with LLM(f"{llm_models_root()}/Llama-3_1-8B-Instruct_nvfp4_fp8_hf",
+                 **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})

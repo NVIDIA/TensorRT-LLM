@@ -360,6 +360,9 @@ class KvCacheCreator:
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
             kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
+        elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
+        ):
+            kv_cache_dtype = tensorrt_llm.bindings.DataType.NVFP4
         else:
             kv_cache_dtype = str_dtype_to_binding(
                 torch_dtype_to_str(model_engine.dtype))
