@@ -415,27 +415,68 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
     def get_workspace(self, m_max: int, group_size: int):
 
+        def select_buffer_with_more_elements(
+            graph_buffer: Optional[torch.Tensor],
+            runtime_buffer: Optional[torch.Tensor]
+        ) -> tuple[Optional[torch.Tensor], bool]:
+            if graph_buffer is None:
+                return runtime_buffer, False
+            if runtime_buffer is None:
+                return graph_buffer, True
+            use_graph = runtime_buffer.numel() > graph_buffer.numel()
+            return (runtime_buffer if use_graph else graph_buffer, use_graph)
+
         def get_empty(tensor_shape: list[int], dtype: torch.dtype,
                       cache_name: str) -> torch.Tensor:
-            if DeepGemmFusedMoE.allocated_buffer_recorder is not None:
-                # Safely get the list of candidates. Defaults to an empty list if key is missing.
-                candidate_buffers = DeepGemmFusedMoE.allocated_buffer_recorder.get(
-                    cache_name, [])
+            captuer_graph = torch.cuda.is_current_stream_capturing()
+            if DeepGemmFusedMoE.allocated_buffer_in_graph_pool is not None:
                 numel_like = math.prod(tensor_shape)
+                runtime_buffer = None
+                if cache_name in DeepGemmFusedMoE.allocated_buffer_in_runtime:
+                    buffer = DeepGemmFusedMoE.allocated_buffer_in_runtime[
+                        cache_name]
+                    numel_buffer = buffer.numel()
+                    runtime_buffer = buffer if numel_buffer >= numel_like else runtime_buffer
 
+                graph_buffer = None
+                # Safely get the list of candidates. Defaults to an empty list if key is missing.
+                candidate_buffers = DeepGemmFusedMoE.allocated_buffer_in_graph_pool.get(
+                    cache_name, [])
                 for buffer in candidate_buffers:
                     numel_buffer = buffer.numel()
                     # buffer just needs to be large enough.
                     if numel_buffer >= numel_like:
-                        return buffer[0:numel_like].view(
-                            tensor_shape)  # Found a fit, return immediately.
+                        graph_buffer = buffer
+                        break
+
+                if captuer_graph and graph_buffer is not None:
+                    return graph_buffer[0:numel_like].view(tensor_shape)
+                else:
+                    buffer, use_graph = select_buffer_with_more_elements(
+                        graph_buffer, runtime_buffer)
+                    if buffer is not None:
+                        if not use_graph and captuer_graph:
+                            # move the buffer into graph buffers since it's running in graph capturing mode.
+                            DeepGemmFusedMoE.allocated_buffer_in_graph_pool.setdefault(
+                                cache_name, []).append(buffer)
+                            del DeepGemmFusedMoE.allocated_buffer_in_runtime[
+                                cache_name]
+
+                        return buffer[0:numel_like].view(tensor_shape)
+
+            # Reach here, no buffer is found. Then, we will use a new buffer to replace the small one. Release the memory first.
+            if cache_name in DeepGemmFusedMoE.allocated_buffer_in_runtime:
+                del DeepGemmFusedMoE.allocated_buffer_in_runtime[cache_name]
 
             # If we get here, no suitable buffer was found in the cache. Create a new one.
             new_buffer = torch.zeros(tensor_shape, device='cuda', dtype=dtype)
-            if DeepGemmFusedMoE.allocated_buffer_recorder is not None:
-                if torch.cuda.is_current_stream_capturing():
-                    DeepGemmFusedMoE.allocated_buffer_recorder.setdefault(
+            if DeepGemmFusedMoE.allocated_buffer_in_graph_pool is not None:
+                if captuer_graph:
+                    DeepGemmFusedMoE.allocated_buffer_in_graph_pool.setdefault(
                         cache_name, []).append(new_buffer)
+                else:
+                    DeepGemmFusedMoE.allocated_buffer_in_runtime[
+                        cache_name] = new_buffer
             return new_buffer
 
         hidden_size = self.hidden_size
