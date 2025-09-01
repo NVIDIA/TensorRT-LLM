@@ -132,6 +132,8 @@ def weight_dequant(x: torch.Tensor,
 def moe_reduce_add_shared_output(routed_output, shared_output):
     routed_output = torch.sum(routed_output, dim=1, keepdim=False)
     return shared_output + routed_output
+
+
 class DeepseekV3WeightLoader:
 
     def __init__(self, model, is_draft_model: bool = False):
