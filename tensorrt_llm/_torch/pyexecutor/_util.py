@@ -699,7 +699,8 @@ def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
 def instantiate_sampler(engine: PyTorchModelEngine,
                         pytorch_backend_config: PyTorchConfig, mapping: Mapping,
                         mm_encoder_only: bool, max_batch_size, decoding_config,
-                        max_beam_width, kv_cache_config, max_seq_len, speculative_config):
+                        max_beam_width, kv_cache_config, max_seq_len,
+                        speculative_config):
     sampler_args = create_torch_sampler_args(
         mapping,
         max_seq_len=engine.max_seq_len,

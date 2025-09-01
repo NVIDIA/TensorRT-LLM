@@ -1,6 +1,7 @@
 import copy
 import enum
 import importlib
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,11 +14,16 @@ import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
-                                            ContextChunkingPolicy,
-                                            ExecutorConfig)
+                                            ContextChunkingPolicy)
+from tensorrt_llm.bindings.executor import \
+    GuidedDecodingConfig as _GuidedDecodingConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase
+from tensorrt_llm.builder import BuildConfig
+from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig, PybindMirror,
+                                          TorchLlmArgs)
+from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
+                                           _llguidance_tokenizer_info,
+                                           _xgrammar_tokenizer_info)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -29,7 +35,7 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
-from .config import LoadFormat, PyTorchConfig
+from .config import PyTorchConfig, _construct_checkpoint_loader
 from .config_utils import is_mla
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -153,39 +159,100 @@ class _ExecutorMemoryMonitor():
                 ))
 
 
-def _mangle_executor_config(executor_config: ExecutorConfig):
-    if executor_config.pytorch_backend_config is None:
-        executor_config.pytorch_backend_config = PyTorchConfig()
-    pytorch_backend_config = executor_config.pytorch_backend_config
+def create_py_executor(
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: str = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    lora_config: Optional[LoraConfig] = None,
+    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+) -> PyExecutor:
 
-    if executor_config.max_num_tokens is None:
-        executor_config.max_num_tokens = 8192
+    garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
+    pytorch_backend_config = llm_args.get_pytorch_backend_config()
+    if pytorch_backend_config is None:
+        pytorch_backend_config = PyTorchConfig()
+    max_num_tokens = llm_args.max_num_tokens
 
+    kv_cache_config = llm_args.kv_cache_config
+    if kv_cache_config is not None:
+        kv_cache_config = PybindMirror.maybe_to_pybind(llm_args.kv_cache_config)
+    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+        # Disable KV cache reuse for deterministic mode
+        kv_cache_config.enable_block_reuse = False
+        kv_cache_config.enable_partial_reuse = False
+    enable_chunked_context = llm_args.enable_chunked_prefill
+    mm_encoder_only = llm_args.mm_encoder_only
+    mapping = llm_args.parallel_config.to_mapping()
+    cache_transceiver_config = llm_args.cache_transceiver_config
+    if cache_transceiver_config is not None:
+        cache_transceiver_config = PybindMirror.maybe_to_pybind(
+            cache_transceiver_config)
+    scheduler_config = PybindMirror.maybe_to_pybind(llm_args.scheduler_config)
+    peft_cache_config = llm_args.peft_cache_config
+    if peft_cache_config is not None:
+        peft_cache_config = PybindMirror.maybe_to_pybind(peft_cache_config)
+    max_beam_width = llm_args.max_beam_width
+    max_batch_size = llm_args.max_batch_size
+    spec_config = llm_args.speculative_config
+    if spec_config is not None and spec_config.decoding_type == "AUTO":
+        from tensorrt_llm._torch.speculative import suggest_spec_config
+        spec_config = suggest_spec_config(max_batch_size)
+    build_config = BuildConfig()
+    tokens_per_block = build_config.plugin_config.tokens_per_block
+    decoding_config = llm_args.decoding_config
+
+    guided_decoding_config = None
+    if llm_args.guided_decoding_backend == 'xgrammar':
+        assert tokenizer is not None
+        guided_decoding_config = _GuidedDecodingConfig(
+            backend=_GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+            **_xgrammar_tokenizer_info(tokenizer))
+    elif llm_args.guided_decoding_backend == 'llguidance':
+        assert tokenizer is not None
+        guided_decoding_config = _GuidedDecodingConfig(
+            backend=_GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
+            **_llguidance_tokenizer_info(tokenizer))
+    elif llm_args.guided_decoding_backend is not None:
+        raise ValueError(
+            f"Unsupported guided decoding backend {llm_args.guided_decoding_backend}"
+        )
+
+    assert llm_args.backend == "pytorch"
+    checkpoint_format = llm_args.checkpoint_format
+    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
+                                                     llm_args.checkpoint_loader,
+                                                     checkpoint_format)
+
+    max_seq_len = None
+    if llm_args.max_seq_len is not None:
+        max_seq_len = llm_args.max_seq_len
+
+    if max_num_tokens is None:
+        max_num_tokens = 8192
     if pytorch_backend_config.attn_backend in [
             "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
     ]:
         # Workaround for flashinfer and star attention
-        if executor_config.kv_cache_config.enable_block_reuse:
+        if kv_cache_config.enable_block_reuse:
             logger.warning(
                 f"Disabling block reuse for {pytorch_backend_config.attn_backend} backend"
             )
-            executor_config.kv_cache_config.enable_block_reuse = False
+            kv_cache_config.enable_block_reuse = False
 
-    if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and executor_config.enable_chunked_context:
+    if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
         logger.warning(
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
         )
-        executor_config.enable_chunked_context = False
+        enable_chunked_context = False
 
-    spec_config = executor_config.speculative_config
-    if not executor_config.pytorch_backend_config.disable_overlap_scheduler and spec_config is not None:
+    if not pytorch_backend_config.disable_overlap_scheduler and spec_config is not None:
         if not spec_config.spec_dec_mode.support_overlap_scheduler():
             logger.warning(
                 f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
             )
-            executor_config.pytorch_backend_config.disable_overlap_scheduler = True
+            pytorch_backend_config.disable_overlap_scheduler = True
 
-    if executor_config.mm_encoder_only:
+    if mm_encoder_only:
         from tensorrt_llm.llmapi.llm_args import LoadFormat
         pytorch_backend_config.mm_encoder_only = True
         pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
@@ -196,39 +263,17 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
             "when only processing vision encoder inputs.")
         pytorch_backend_config.disable_overlap_scheduler = True
 
-
-def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
-    if executor_config.mapping is None:
+    if mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           gpus_per_node=tensorrt_llm.default_gpus_per_node(),
                           rank=tensorrt_llm.mpi_rank())
     else:
-        mapping = copy.deepcopy(executor_config.mapping)
+        mapping = copy.deepcopy(mapping)
         mapping.rank = tensorrt_llm.mpi_rank()
-    return mapping
-
-
-def create_py_executor(
-    llm_args: TorchLlmArgs,
-    checkpoint_dir: str = None,
-    tokenizer: Optional[TokenizerBase] = None,
-    lora_config: Optional[LoraConfig] = None,
-    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
-) -> PyExecutor:
-
-    executor_config = llm_args.get_executor_config(checkpoint_dir, tokenizer)
-
-    garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
-
-    _mangle_executor_config(executor_config)
-    pytorch_backend_config = executor_config.pytorch_backend_config
-
-    mapping = _get_mapping(executor_config)
 
     dist = MPIDist(mapping=mapping)
 
-    spec_config = executor_config.speculative_config
     has_draft_model_engine = False
     has_spec_drafter = False
     if spec_config is not None:
@@ -237,10 +282,10 @@ def create_py_executor(
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
-        chunked_prefill=executor_config.enable_chunked_context,
-        cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
+        chunked_prefill=enable_chunked_context,
+        cache_reuse=kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
-        chunk_size=executor_config.max_num_tokens,
+        chunk_size=max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
@@ -250,16 +295,16 @@ def create_py_executor(
         model_engine = PyTorchModelEngine(
             model_path=checkpoint_dir,
             pytorch_backend_config=pytorch_backend_config,
-            batch_size=executor_config.max_batch_size,
-            max_beam_width=executor_config.max_beam_width,
-            max_num_tokens=executor_config.max_num_tokens,
-            max_seq_len=executor_config.max_seq_len,
+            batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
             spec_config=spec_config,
             lora_config=lora_config,
-            checkpoint_loader=executor_config.checkpoint_loader,
+            checkpoint_loader=checkpoint_loader,
         )
 
     if has_draft_model_engine:
@@ -276,17 +321,17 @@ def create_py_executor(
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
                 pytorch_backend_config=draft_pytorch_backend_config,
-                batch_size=executor_config.max_batch_size,
-                max_beam_width=executor_config.max_beam_width,
-                max_num_tokens=executor_config.max_num_tokens,
+                batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                max_num_tokens=max_num_tokens,
                 # Note: The draft model engine will infer its own max_seq_len.
                 # We'll stop drafting when we hit the max.
-                max_seq_len=executor_config.max_seq_len,
+                max_seq_len=max_seq_len,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
                 spec_config=draft_spec_config,
-                checkpoint_loader=executor_config.checkpoint_loader,
+                checkpoint_loader=checkpoint_loader,
                 is_draft_model=True,
             )
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
@@ -295,71 +340,69 @@ def create_py_executor(
     else:
         draft_model_engine = None
 
-    # PyTorchModelEngine modifies these fields, update them to executor_config
-    max_seq_len = model_engine.max_seq_len
-    net_max_seq_len = max_seq_len
+    # PyTorchModelEngine modifies these fields, update them
+    model_engine_max_seq_len = model_engine.max_seq_len
+    net_max_seq_len = model_engine_max_seq_len
     if not pytorch_backend_config.disable_overlap_scheduler:
-        max_seq_len = model_engine.max_seq_len + 1
+        model_engine_max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:
-            max_seq_len += spec_config.max_draft_len
+            model_engine_max_seq_len += spec_config.max_draft_len
 
     if spec_config is not None:
-        max_seq_len += get_num_extra_kv_tokens(spec_config)
-        max_seq_len += spec_config.max_draft_len
+        model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
+        model_engine_max_seq_len += spec_config.max_draft_len
 
-    executor_config.max_seq_len = max_seq_len
-    executor_config.max_num_tokens = model_engine.max_num_tokens
+    max_seq_len = model_engine_max_seq_len
+
+    max_num_tokens = model_engine.max_num_tokens
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
-            executor_config.tokens_per_block = 64
+            tokens_per_block = 64
             logger.info(
-                f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
+                f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
             )
 
         sm_version = get_sm_version()
-        if executor_config.kv_cache_config.enable_block_reuse and sm_version not in [
+        if kv_cache_config.enable_block_reuse and sm_version not in [
                 90, 100, 120
         ]:
             logger.warning(
                 f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM120, "
                 f"disable enable_block_reuse for SM{sm_version}")
-            executor_config.kv_cache_config.enable_block_reuse = False
+            kv_cache_config.enable_block_reuse = False
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
-        if executor_config.kv_cache_config.enable_block_reuse and not (
+        if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
                 == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8):
             logger.warning(
                 f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8 quantization, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
-            executor_config.kv_cache_config.enable_block_reuse = False
-        if executor_config.enable_chunked_context and sm_version not in [
-                90, 100
-        ]:
+            kv_cache_config.enable_block_reuse = False
+        if enable_chunked_context and sm_version not in [90, 100]:
             logger.warning(
                 "Chunked Prefill for MLA can only be enabled on SM90/SM100, "
                 f"disable enable_chunked_context for SM{sm_version}")
-            executor_config.enable_chunked_context = False
+            enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
 
-    if executor_config.enable_chunked_context:
-        chunk_unit_size = executor_config.tokens_per_block
-        max_attention_window = executor_config.kv_cache_config.max_attention_window
+    if enable_chunked_context:
+        chunk_unit_size = tokens_per_block
+        max_attention_window = kv_cache_config.max_attention_window
         if max_attention_window and max_seq_len > min(max_attention_window):
             # maxKvStepSizeInFmha = 256
             chunk_unit_size = max(256, chunk_unit_size)
             logger.info(
                 f"ChunkUnitSize is set to {chunk_unit_size} as sliding window attention is used."
             )
-        chunking_policy = (
-            executor_config.scheduler_config.context_chunking_policy
-            if executor_config.scheduler_config.context_chunking_policy
-            is not None else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+        chunking_policy = (scheduler_config.context_chunking_policy if
+                           scheduler_config.context_chunking_policy is not None
+                           else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
         assert chunk_unit_size is not None, "chunk_unit_size must be set"
         ctx_chunk_config = ContextChunkingConfig(chunking_policy,
                                                  chunk_unit_size)
@@ -369,7 +412,7 @@ def create_py_executor(
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.GUIDED_DECODER):
         guided_decoder: Optional[GuidedDecoder] = None
-        if executor_config.guided_decoding_config is not None:
+        if guided_decoding_config is not None:
             if spec_config is not None and not has_spec_drafter:
                 raise ValueError(
                     "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
@@ -379,17 +422,16 @@ def create_py_executor(
                 if spec_config is not None:
                     max_num_draft_tokens = spec_config.max_draft_len
                 guided_decoder = GuidedDecoder(
-                    executor_config.guided_decoding_config,
-                    executor_config.max_batch_size,
+                    guided_decoding_config,
+                    max_batch_size,
                     model_engine.model.vocab_size_padded,
                     max_num_draft_tokens=max_num_draft_tokens)
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
-        sampler = instantiate_sampler(
-            model_engine, pytorch_backend_config, mapping,
-            executor_config.mm_encoder_only, executor_config.max_batch_size,
-            executor_config.decoding_config, executor_config.max_beam_width,
-            executor_config.kv_cache_config, executor_config.max_seq_len, executor_config.speculative_config)
+        sampler = instantiate_sampler(model_engine, pytorch_backend_config,
+                                      mapping, mm_encoder_only, max_batch_size,
+                                      decoding_config, max_beam_width,
+                                      kv_cache_config, max_seq_len, spec_config)
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     if kv_connector_config is not None:
@@ -400,7 +442,7 @@ def create_py_executor(
             raise NotImplementedError(
                 "CUDA graphs are not supported with KV connector hooks.")
 
-        if executor_config.scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+        if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
@@ -422,7 +464,7 @@ def create_py_executor(
 
                 if scheduler_cls is not None and rank == 0:
                     connector_scheduler_task = executor.submit(
-                        scheduler_cls, executor_config.tokens_per_block)
+                        scheduler_cls, tokens_per_block)
                     connector_scheduler = connector_scheduler_task.result()
                 else:
                     connector_scheduler = None
@@ -449,24 +491,22 @@ def create_py_executor(
             mapping=mapping,
             net_max_seq_len=net_max_seq_len,
             kv_connector_manager=kv_connector_manager,
-            kv_cache_config=executor_config.kv_cache_config,
-            max_num_tokens=executor_config.max_num_tokens,
-            max_beam_width=executor_config.max_beam_width,
-            pytorch_backend_config=executor_config.pytorch_backend_config,
-            speculative_config=executor_config.speculative_config,
-            tokens_per_block=executor_config.tokens_per_block,
-            max_seq_len=executor_config.max_seq_len,
-            max_batch_size=executor_config.max_batch_size)
+            kv_cache_config=kv_cache_config,
+            max_num_tokens=max_num_tokens,
+            max_beam_width=max_beam_width,
+            pytorch_backend_config=pytorch_backend_config,
+            speculative_config=spec_config,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size)
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
-        # restore executor_config.kv_cache_config.max_tokens which might be changed in try_prepare_estimation
-        executor_config.kv_cache_config.max_tokens = kv_cache_creator.kv_cache_config.max_tokens
 
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
-            # restore executor_config.max_seq_len which might be changed in build_managers
-            executor_config.max_seq_len = kv_cache_creator.max_seq_len
+            # restore max_seq_len which might be changed in build_managers
+            max_seq_len = kv_cache_creator.max_seq_len
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -503,13 +543,13 @@ def create_py_executor(
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
-            max_seq_len=executor_config.max_seq_len,
-            max_batch_size=executor_config.max_batch_size,
-            max_num_tokens=executor_config.max_num_tokens,
-            max_beam_width=executor_config.max_beam_width,
-            peft_cache_config=executor_config.peft_cache_config,
-            scheduler_config=executor_config.scheduler_config,
-            cache_transceiver_config=executor_config.cache_transceiver_config,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_beam_width=max_beam_width,
+            peft_cache_config=peft_cache_config,
+            scheduler_config=scheduler_config,
+            cache_transceiver_config=cache_transceiver_config,
         )
 
     if estimating_kv_cache:
@@ -517,9 +557,6 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
-            # restore executor_config.kv_cache_config.max_tokens which might be changed in configure_kv_cache_capacity
-            executor_config.kv_cache_config.max_tokens = kv_cache_creator.kv_cache_config.max_tokens
-            executor_config.kv_cache_config.max_gpu_total_bytes = kv_cache_creator.kv_cache_config.max_gpu_total_bytes
         kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
 
@@ -530,10 +567,10 @@ def create_py_executor(
             # the original value before creating the final KV cache.
 
             # update kv_cache_creator.max_seq_len which might be used inside build_managers
-            kv_cache_creator.max_seq_len = max_seq_len
+            kv_cache_creator.max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
             # restore executor_config.max_seq_len which might be changed in build_managers
-            executor_config.max_seq_len = kv_cache_creator.max_seq_len
+            max_seq_len = kv_cache_creator.max_seq_len
 
             for eng in [model_engine, draft_model_engine]:
                 if eng is None:
@@ -560,17 +597,16 @@ def create_py_executor(
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
-                max_seq_len=executor_config.max_seq_len,
-                max_batch_size=executor_config.max_batch_size,
-                max_num_tokens=executor_config.max_num_tokens,
-                max_beam_width=executor_config.max_beam_width,
-                peft_cache_config=executor_config.peft_cache_config,
-                scheduler_config=executor_config.scheduler_config,
-                cache_transceiver_config=executor_config.
-                cache_transceiver_config,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                max_num_tokens=max_num_tokens,
+                max_beam_width=max_beam_width,
+                peft_cache_config=peft_cache_config,
+                scheduler_config=scheduler_config,
+                cache_transceiver_config=cache_transceiver_config,
             )
 
-    _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)
+    _adjust_torch_mem_fraction(pytorch_backend_config)
 
     py_executor.start_worker()
     return py_executor
