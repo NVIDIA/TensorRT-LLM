@@ -444,17 +444,29 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(
-            executor_config=executor_config,
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
             mapping=mapping,
             net_max_seq_len=net_max_seq_len,
-            kv_connector_manager=kv_connector_manager)
+            kv_connector_manager=kv_connector_manager,
+            kv_cache_config=executor_config.kv_cache_config,
+            max_num_tokens=executor_config.max_num_tokens,
+            max_beam_width=executor_config.max_beam_width,
+            pytorch_backend_config=executor_config.pytorch_backend_config,
+            speculative_config=executor_config.speculative_config,
+            tokens_per_block=executor_config.tokens_per_block,
+            max_seq_len=executor_config.max_seq_len,
+            max_batch_size=executor_config.max_batch_size)
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+        # restore executor_config.kv_cache_config.max_tokens which might be changed in try_prepare_estimation
+        executor_config.kv_cache_config.max_tokens = kv_cache_creator.kv_cache_config.max_tokens
+
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
+            # restore executor_config.max_seq_len which might be changed in build_managers
+            executor_config.max_seq_len = kv_cache_creator.max_seq_len
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -505,6 +517,9 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
+            # restore executor_config.kv_cache_config.max_tokens which might be changed in configure_kv_cache_capacity
+            executor_config.kv_cache_config.max_tokens = kv_cache_creator.kv_cache_config.max_tokens
+            executor_config.kv_cache_config.max_gpu_total_bytes = kv_cache_creator.kv_cache_config.max_gpu_total_bytes
         kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
 
@@ -513,8 +528,12 @@ def create_py_executor(
             # Before estimating KV cache size, a minimal KV cache has been allocated using
             # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
             # the original value before creating the final KV cache.
-            executor_config.max_seq_len = max_seq_len
+
+            # update kv_cache_creator.max_seq_len which might be used inside build_managers
+            kv_cache_creator.max_seq_len = max_seq_len
             kv_cache_creator.build_managers(resources, False)
+            # restore executor_config.max_seq_len which might be changed in build_managers
+            executor_config.max_seq_len = kv_cache_creator.max_seq_len
 
             for eng in [model_engine, draft_model_engine]:
                 if eng is None:

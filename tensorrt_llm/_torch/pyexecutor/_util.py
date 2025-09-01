@@ -14,8 +14,9 @@ from tensorrt_llm.bindings.executor import (
     PeftCacheConfig as _PeftCacheConfig,
     SchedulerConfig as _SchedulerConfig,
     CacheTransceiverConfig as _CacheTransceiverConfig,
+    KvCacheConfig as _KvCacheConfig,
 )
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, SamplerType
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, SamplerType, SpeculativeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -47,19 +48,36 @@ GB = 1 << 30
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
-    def __init__(self, *, executor_config: ExecutorConfig,
+    def __init__(self, *,
                  model_engine: PyTorchModelEngine,
                  draft_model_engine: Optional[PyTorchModelEngine],
                  mapping: Mapping, net_max_seq_len: int,
-                 kv_connector_manager: Optional[KvCacheConnectorManager]):
-        self._executor_config = executor_config
+                 kv_connector_manager: Optional[KvCacheConnectorManager],
+                 kv_cache_config: _KvCacheConfig,
+                 max_num_tokens: int,
+                 max_beam_width: int,
+                 pytorch_backend_config: PyTorchConfig,
+                 speculative_config: SpeculativeConfig,
+                 tokens_per_block: int,
+                 max_seq_len: int,
+                 max_batch_size: int):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
         self._mapping = mapping
-        self._max_kv_tokens_in = self._executor_config.kv_cache_config.max_tokens
+        self._max_kv_tokens_in = kv_cache_config.max_tokens
+
+        self._kv_connector_manager = kv_connector_manager
+        self.kv_cache_config = kv_cache_config
+        self.max_num_tokens = max_num_tokens
+        self.max_beam_width = max_beam_width
+        self.pytorch_backend_config = pytorch_backend_config
+        self.speculative_config = speculative_config
+        self.tokens_per_block = tokens_per_block
+        self.max_seq_len = max_seq_len
+        self.max_batch_size = max_batch_size
+
         self._dummy_reqs = self._create_dummy_context_requests(net_max_seq_len -
                                                                1)
-        self._kv_connector_manager = kv_connector_manager
 
     @staticmethod
     def _get_cache_size_per_token(model_config: ModelConfig,
@@ -101,7 +119,7 @@ class KvCacheCreator:
         return mem_per_token
 
     def _get_free_gpu_memory_fraction(self) -> float:
-        fraction = self._executor_config.kv_cache_config.free_gpu_memory_fraction
+        fraction = self.kv_cache_config.free_gpu_memory_fraction
         if fraction is None:
             fraction = 0.9
         return fraction
@@ -138,8 +156,8 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
-        max_num_tokens = self._executor_config.max_num_tokens
-        max_beam_width = self._executor_config.max_beam_width
+        max_num_tokens = self.max_num_tokens
+        max_beam_width = self.max_beam_width
 
         requests = []
         input_seq_len = min(max_num_tokens, input_seq_len)
@@ -164,7 +182,6 @@ class KvCacheCreator:
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
-        executor_config = self._executor_config
         if 'cp_type' in self._mapping.cp_config:
             raise ValueError(
                 "KV cache size estimation not supported with context parallelism."
@@ -172,8 +189,8 @@ class KvCacheCreator:
         # estimate_max_kv_cache_tokens submits self._dummy_reqs
         num_cache_blocks = 0
         num_extra_tokens_per_seq = 1  # account for generated tokens
-        pytorch_backend_config = executor_config.pytorch_backend_config
-        spec_cfg = executor_config.speculative_config
+        pytorch_backend_config = self.pytorch_backend_config
+        spec_cfg = self.speculative_config
         if not pytorch_backend_config.disable_overlap_scheduler:
             num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
             if spec_cfg is not None:
@@ -186,10 +203,10 @@ class KvCacheCreator:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
             num_cache_blocks += (num_req_tokens +
-                                 executor_config.tokens_per_block -
-                                 1) // executor_config.tokens_per_block
+                                 self.tokens_per_block -
+                                 1) // self.tokens_per_block
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        return num_cache_blocks * executor_config.tokens_per_block * self._dummy_reqs[
+        return num_cache_blocks * self.tokens_per_block * self._dummy_reqs[
             0].sampling_config.beam_width
 
     def try_prepare_estimation(self) -> bool:
@@ -201,7 +218,7 @@ class KvCacheCreator:
         estimating_kv_cache = False
         if 'cp_type' not in self._mapping.cp_config:
             estimating_kv_cache = True
-            self._executor_config.kv_cache_config.max_tokens = self._get_token_num_for_estimation(
+            self.kv_cache_config.max_tokens = self._get_token_num_for_estimation(
             )
         return estimating_kv_cache
 
@@ -211,7 +228,6 @@ class KvCacheCreator:
 
         This updates `kv_cache_config`.
         """
-        executor_config = self._executor_config
         mapping = self._mapping
 
         # TODO: support CP by generating dummy requests for it.
@@ -290,7 +306,7 @@ class KvCacheCreator:
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
 
-        max_attention_window = executor_config.kv_cache_config.max_attention_window
+        max_attention_window = self.kv_cache_config.max_attention_window
         is_vswa = max_attention_window and len(set(max_attention_window)) > 1
 
         # NOTE:
@@ -318,41 +334,40 @@ class KvCacheCreator:
             )
         if is_vswa:
             # For VSWA KvCacheManager now it can only use max_gpu_total_bytes
-            executor_config.kv_cache_config.max_tokens = None
+            self.kv_cache_config.max_tokens = None
         else:
             # For non-VSWA KvCacheManager, its logic still relies on max_tokens, need to improve in the future.
-            executor_config.kv_cache_config.max_tokens = int(
+            self.kv_cache_config.max_tokens = int(
                 kv_cache_max_memory // self._get_kv_size_per_token())
         # ---------------------------handle max_tokens---------------------------------
 
         # ---------------------------handle max_gpu_total_bytes---------------------------------
         # if user provided max_gpu_total_bytes, set max memory from max_gpu_total_bytes
-        if executor_config.kv_cache_config.max_gpu_total_bytes > 0:
+        if self.kv_cache_config.max_gpu_total_bytes > 0:
             kv_cache_max_memory = min(
                 kv_cache_max_memory,
-                executor_config.kv_cache_config.max_gpu_total_bytes)
+                self.kv_cache_config.max_gpu_total_bytes)
             logger.info(
-                f"max_gpu_total_bytes={executor_config.kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
+                f"max_gpu_total_bytes={self.kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
             )
 
         logger.info(
             f"Estimated max memory in KV cache : {kv_cache_max_memory / (GB):.2f} GiB"
         )
         # set max_gpu_total_bytes
-        executor_config.kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        self.kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(
             self,
             model_engine: PyTorchModelEngine,
             estimating_kv_cache: bool = False) -> KVCacheManager:
-        executor_config = self._executor_config
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
 
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
-        spec_config = executor_config.speculative_config
+        spec_config = self.speculative_config
 
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -376,25 +391,25 @@ class KvCacheCreator:
 
         if is_mla(config):
             kv_cache_manager = KVCacheManager(
-                executor_config.kv_cache_config,
+                self.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
                 num_layers=num_hidden_layers,
                 num_kv_heads=1,
                 head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
-                tokens_per_block=executor_config.tokens_per_block,
-                max_seq_len=executor_config.max_seq_len,
-                max_batch_size=executor_config.max_batch_size,
+                tokens_per_block=self.tokens_per_block,
+                max_seq_len=self.max_seq_len,
+                max_batch_size=self.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
-                max_beam_width=executor_config.max_beam_width,
+                max_beam_width=self.max_beam_width,
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
             )
         elif is_nemotron_hybrid(config):
-            if executor_config.max_beam_width > 1:
+            if self.max_beam_width > 1:
                 raise ValueError(
                     "MambaHybridCacheManager + beam search is not supported yet."
                 )
@@ -427,49 +442,49 @@ class KvCacheCreator:
                 model_engine.model.model_config.quant_config.
                 mamba_ssm_cache_dtype,
                 # kv cache parameters
-                executor_config.kv_cache_config,
+                self.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_layers,
                 layer_mask=layer_mask,
                 num_kv_heads=num_key_value_heads,
                 head_dim=head_dim,
-                tokens_per_block=executor_config.tokens_per_block,
-                max_seq_len=executor_config.max_seq_len,
-                max_batch_size=executor_config.max_batch_size,
+                tokens_per_block=self.tokens_per_block,
+                max_seq_len=self.max_seq_len,
+                max_batch_size=self.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
             )
         else:
             # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
-            is_vswa = executor_config.kv_cache_config.max_attention_window is not None and len(
-                set(executor_config.kv_cache_config.max_attention_window)) > 1
+            is_vswa = self.kv_cache_config.max_attention_window is not None and len(
+                set(self.kv_cache_config.max_attention_window)) > 1
             binding_model_config = model_engine.model.model_config.get_bindings_model_config(
-                tokens_per_block=executor_config.tokens_per_block
+                tokens_per_block=self.tokens_per_block
             ) if is_vswa else None
 
             kv_cache_manager = KVCacheManager(
-                executor_config.kv_cache_config,
+                self.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
                 num_kv_heads=num_key_value_heads,
                 head_dim=head_dim,
-                tokens_per_block=executor_config.tokens_per_block,
-                max_seq_len=executor_config.max_seq_len,
-                max_batch_size=executor_config.max_batch_size,
+                tokens_per_block=self.tokens_per_block,
+                max_seq_len=self.max_seq_len,
+                max_batch_size=self.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
-                max_num_tokens=executor_config.max_num_tokens,
+                max_num_tokens=self.max_num_tokens,
                 model_config=binding_model_config,
-                max_beam_width=executor_config.max_beam_width,
+                max_beam_width=self.max_beam_width,
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
-            executor_config.max_seq_len = kv_cache_manager.max_seq_len
+            self.max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
 
