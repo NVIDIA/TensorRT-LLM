@@ -102,16 +102,14 @@ class SpeculativeDecodingMode(IntEnum):
         chunked context requests at the kernel level. Required for
         any spec dec mode that uses the SpecExecutor.
         """
-        # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
 
-        if self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle():
-            if get_sm_version() == 100 and issubclass(attention_backend,
-                                                      TrtllmAttention):
-                return False
-            else:
-                return True
-        else:
-            return self.is_ngram() or self.is_user_provided()
+        if self.use_one_engine():
+            # 1-model has separate logic for handling draft tokens
+            return False
+
+        # The special XQA generation kernels only exist with the TRTLLM backend on blackwell.
+        return not issubclass(attention_backend,
+                              TrtllmAttention) or get_sm_version() != 100
 
     def attention_need_spec_dec_mode(self):
         """

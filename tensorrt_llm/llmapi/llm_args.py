@@ -469,7 +469,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.EAGLE3
 
     @functools.cached_property
-    def num_capture_layers(self):
+    def num_capture_layers(self) -> int:
         """
         Returns the number of layers to capture of the target model.
         If eagle3_layers_to_capture is not None, return the length of the set.
@@ -570,9 +570,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
     @functools.cached_property
-    def num_capture_layers(self):
+    def num_capture_layers(self) -> int:
         if not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
             return 1
+        return 0
 
     @functools.cached_property
     def spec_dec_mode(self):

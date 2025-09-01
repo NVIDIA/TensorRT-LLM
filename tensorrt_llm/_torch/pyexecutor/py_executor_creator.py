@@ -268,8 +268,9 @@ def create_py_executor(
             # The draft model won't have any draft tokens attached to
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
-            if model_engine.model.model_config.pretrained_config.architectures[
-                    0] == "DeepseekV3ForCausalLM":
+            is_deepseek_model = model_engine.model.model_config.pretrained_config.architectures[
+                0] == "DeepseekV3ForCausalLM"
+            if is_deepseek_model:
                 draft_model_path = checkpoint_dir
             else:
                 draft_model_path = spec_config.speculative_model_dir
@@ -310,8 +311,7 @@ def create_py_executor(
                 is_draft_model=True,
                 drafting_loop_wrapper=drafting_loop_wrapper,
             )
-            if draft_model_engine.model.model_config.pretrained_config.architectures[
-                    0] == "DeepseekV3ForCausalLM":
+            if is_deepseek_model:
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(

@@ -104,7 +104,10 @@ class Eagle3SpecMetadata(SpecMetadata):
                         "Not enough hidden layers for default EAGLE3 capture")
                 self.layers_to_capture = (1, self.num_layers // 2 - 1,
                                           self.num_layers - 4)
+        else:
+            self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
+
         # Initialize to 0 to avoid reading uninitialized memory during warmup
         self.hidden_states_read_indices = torch.zeros([self.max_num_tokens],
                                                       dtype=torch.long,

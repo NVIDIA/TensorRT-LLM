@@ -32,9 +32,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         if hasattr(config.pretrained_config, "draft_vocab_size"):
             model_arch = "EAGLE3" + model_arch
         if model_arch == "DeepseekV3ForCausalLM" and config.spec_config is not None and config.spec_config.max_draft_len == 0:
-
             model_arch = "MTPDraftModelForCausalLM"
-            print(f"model_arch: {model_arch}")
 
         cls = MODEL_CLASS_MAPPING.get(model_arch)
         if cls is None:
