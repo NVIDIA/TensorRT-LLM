@@ -381,7 +381,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 return block_scale_pool_pointers;
             },
             nb::call_guard<nb::gil_scoped_release>())
-        .def("get_layer_to_pool_mapping",
+        .def(
+            "get_layer_to_pool_mapping",
             [](tbk::BaseKVCacheManager& self)
             {
                 std::optional<at::Tensor> layer_to_pool_mapping{std::nullopt};
