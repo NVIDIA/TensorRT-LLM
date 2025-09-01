@@ -2061,7 +2061,7 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
         "Llama3.1-405B-FP8": 63.2,
         "Mixtral-8x7B-NVFP4": 9.9,
         "Nemotron-Ultra-253B": 72.3,
-        "DeepSeek-V3-0324": 50.0
+        "DeepSeek-V3-671B-FP8": 83.8
     }
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
