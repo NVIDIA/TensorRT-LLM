@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/yiqingy/retry_stage']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1640,9 +1640,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         cd ${llmSrc}/tests/integration/defs && \
                         ${testCmdLine.join(" ")}
                     """
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
+                } catch (hudson.AbortException e) {
+                    def failedSigs = trtllm_utils.getRetryStagesSignaturesList()
+                    def isMachineOrInfraError = failedSigs.any { sig -> e.message?.contains(sig) }
+                    if (isMachineOrInfraError) {
+                        echo "There is a machine or infrastructure error, skip the rerun step."
+                        throw e
+                    }
                     isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
                     if (isRerunFailed) {
                         error "The tests still failed after rerun attempt."
@@ -2444,24 +2448,26 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values -> [key, {
         stage(key) {
-            if (key in testFilter[REUSE_STAGE_LIST]) {
-                stage("Skip - reused") {
-                    echo "Skip - Passed in the last pipeline."
-                }
-            } else if (values instanceof List && dockerNode == null) {
-                trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
-                    values[1]()
-                })
-            } else if (values instanceof List && dockerNode != null) {
-                node(dockerNode) {
-                    deleteDir()
-                    docker.image(LLM_DOCKER_IMAGE).inside(dockerArgs) {
-                        values[1]()
+            trtllm_utils.llmStageWithRetry(pipeline, key, {
+                if (key in testFilter[REUSE_STAGE_LIST]) {
+                    stage("Skip - reused") {
+                        echo "Skip - Passed in the last pipeline."
                     }
+                } else if (values instanceof List && dockerNode == null) {
+                    trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
+                        values[1]()
+                    })
+                } else if (values instanceof List && dockerNode != null) {
+                    node(dockerNode) {
+                        deleteDir()
+                        docker.image(LLM_DOCKER_IMAGE).inside(dockerArgs) {
+                            values[1]()
+                        }
+                    }
+                } else {
+                    values()
                 }
-            } else {
-                values()
-            }
+            }, [sleepTimeInSecs: 120])
         }
     }]}
 
@@ -2528,21 +2534,25 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
         if (values.wheelInstalled) {
             stage(values.name) {
-                echo "Run ${values.name} sanity test."
-                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
-                    sh "env | sort"
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                trtllm_utils.llmStageWithRetry(pipeline, values.name, {
+                    echo "Run ${values.name} sanity test."
+                    imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                    trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                        sh "env | sort"
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
+                        runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                    })
                 })
             }
         } else {
             stage(values.name) {
-                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
-                    sh "env | sort"
-                    def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
-                    runLLMBuild(pipeline, cpuArch, false, "imageTest/")
+                trtllm_utils.llmStageWithRetry(pipeline, values.name, {
+                    imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                    trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                        sh "env | sort"
+                        def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
+                        runLLMBuild(pipeline, cpuArch, false, "imageTest/")
+                    })
                 })
             }
         }
