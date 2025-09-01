@@ -24,7 +24,9 @@ transforms:
   ############################################################################################
   match_dense_moe_pattern:
     stage: pattern_matcher
-  match_moe_router_pattern:
+  # match_moe_router_pattern:
+  #   stage: pattern_matcher
+  insert_mxfp4_mlp:
     stage: pattern_matcher
   match_eager_attention:
     stage: pattern_matcher
