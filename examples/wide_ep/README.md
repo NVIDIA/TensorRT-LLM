@@ -102,7 +102,7 @@ To achieve online load balancing, all expert weights are stored in shared host m
 
 There is one environment variable `TRTLLM_EPLB_SHM_NAME` to specify the base name of the shared memory. This environment variable may need to be specified if there are multiple instances on one node. If not, you can ignore it.
 
-The default value of `TRTLLM_EPLB_SHM_NAME` is `moe_shared`. When `TRTLLM_EPLB_SHM_NAME` is set to `moe_shared`, the shared memory segments will be named as `moe_shared_l0_lr0_all`, `moe_shared_l1_lr0_all`, and so on. Here `l0` means the first layer with EPLB, and `lr0` means that it is the part loaded by local rank 0, and `all` means contains all expert weights of for each expert.
+The default value of `TRTLLM_EPLB_SHM_NAME` is `moe_shared`. When `TRTLLM_EPLB_SHM_NAME` is set to `moe_shared`, the shared memory segments will be named as `moe_shared_l0_lr0_all`, `moe_shared_l1_lr0_all`, and so on. Here `l0` means the first layer with EPLB, and `lr0` means that it is the part loaded by local rank 0, and `all` means it contains all expert weights of each expert.
 
 Normally, these shared memory segments will be cleaned up automatically at process exit. However, they may not get the chance to be cleaned up if an abnormal exit occurs. Therefore, EPLB will automatically clean up leftover shared memory with the same name that already exists before creating new segments.
 
