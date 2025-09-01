@@ -294,7 +294,7 @@ public:
 void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 {
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<>())
         .def_rw("max_num_blocks", &tbk::KvCacheStats::maxNumBlocks)
         .def_rw("free_num_blocks", &tbk::KvCacheStats::freeNumBlocks)
         .def_rw("used_num_blocks", &tbk::KvCacheStats::usedNumBlocks)
@@ -308,30 +308,28 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_ro("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
 
     nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<>())
         .def_rw("paged_context_fmha", &tbk::TempAttentionWindowInputs::pagedContextFMHA)
         .def_rw("max_input_len", &tbk::TempAttentionWindowInputs::maxInputLen)
         .def_rw("max_num_tokens", &tbk::TempAttentionWindowInputs::maxNumTokens);
 
     nb::class_<tbk::BlockKey>(m, "BlockKey")
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<>())
         .def(nb::init<VecTokens const&, std::optional<tr::LoraTaskIdType>>(), nb::arg("tokens"),
-            nb::arg("lora_task_id") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("lora_task_id") = std::nullopt)
         .def(nb::init<bool, std::optional<tr::LoraTaskIdType>, VecUniqueTokens const&>(), nb::arg("uses_extra_ids"),
-            nb::arg("lora_task_id"), nb::arg("unique_tokens"), nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("lora_task_id"), nb::arg("unique_tokens"))
         .def_ro("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
         .def_ro("lora_task_id", &tbk::BlockKey::loraTaskId)
         .def_ro("unique_tokens", &tbk::BlockKey::uniqueTokens);
 
     nb::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
-        .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0,
-            nb::call_guard<nb::gil_scoped_release>());
+        .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0);
 
     nb::class_<tbk::KVCacheEventManager>(m, "KVCacheEventManager")
         .def(nb::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),
             nb::arg("max_kv_event_entries"), nb::arg("attention_dp_rank") = std::nullopt,
-            nb::arg("attention_dp_size") = std::nullopt, nb::arg("attention_dp_events_gather_period_ms") = 5,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("attention_dp_size") = std::nullopt, nb::arg("attention_dp_events_gather_period_ms") = 5);
 
     nb::class_<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, nb::arg("config"),

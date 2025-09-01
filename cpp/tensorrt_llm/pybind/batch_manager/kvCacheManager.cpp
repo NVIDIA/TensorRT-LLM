@@ -296,7 +296,7 @@ public:
 void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
 {
     py::class_<tbk::KvCacheStats>(m, "KvCacheStats")
-        .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<>())
         .def_readwrite("max_num_blocks", &tbk::KvCacheStats::maxNumBlocks)
         .def_readwrite("free_num_blocks", &tbk::KvCacheStats::freeNumBlocks)
         .def_readwrite("used_num_blocks", &tbk::KvCacheStats::usedNumBlocks)
@@ -310,30 +310,28 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_readonly("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
 
     py::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
-        .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<>())
         .def_readwrite("paged_context_fmha", &tbk::TempAttentionWindowInputs::pagedContextFMHA)
         .def_readwrite("max_input_len", &tbk::TempAttentionWindowInputs::maxInputLen)
         .def_readwrite("max_num_tokens", &tbk::TempAttentionWindowInputs::maxNumTokens);
 
     py::class_<tbk::BlockKey>(m, "BlockKey")
-        .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<>())
         .def(py::init<VecTokens const&, std::optional<tr::LoraTaskIdType>>(), py::arg("tokens"),
-            py::arg("lora_task_id") = std::nullopt, py::call_guard<py::gil_scoped_release>())
+            py::arg("lora_task_id") = std::nullopt)
         .def(py::init<bool, std::optional<tr::LoraTaskIdType>, VecUniqueTokens const&>(), py::arg("uses_extra_ids"),
-            py::arg("lora_task_id"), py::arg("unique_tokens"), py::call_guard<py::gil_scoped_release>())
+            py::arg("lora_task_id"), py::arg("unique_tokens"))
         .def_readonly("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
         .def_readonly("lora_task_id", &tbk::BlockKey::loraTaskId)
         .def_readonly("unique_tokens", &tbk::BlockKey::uniqueTokens);
 
     py::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
-        .def_static("hash", &tbk::BlockKeyHasher::hash, py::arg("block_key"), py::arg("parent_hash") = 0,
-            py::call_guard<py::gil_scoped_release>());
+        .def_static("hash", &tbk::BlockKeyHasher::hash, py::arg("block_key"), py::arg("parent_hash") = 0);
 
     py::class_<tbk::KVCacheEventManager, std::shared_ptr<tbk::KVCacheEventManager>>(m, "KVCacheEventManager")
         .def(py::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),
             py::arg("max_kv_event_entries"), py::arg("attention_dp_rank") = std::nullopt,
-            py::arg("attention_dp_size") = std::nullopt, py::arg("attention_dp_events_gather_period_ms") = 5,
-            py::call_guard<py::gil_scoped_release>());
+            py::arg("attention_dp_size") = std::nullopt, py::arg("attention_dp_events_gather_period_ms") = 5);
 
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
@@ -373,7 +371,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 return block_pool_pointers;
             },
             py::call_guard<py::gil_scoped_release>())
-        .def("get_block_scale_pool_pointers",
+        .def(
+            "get_block_scale_pool_pointers",
             [](tbk::BaseKVCacheManager& self)
             {
                 std::optional<at::Tensor> block_scale_pool_pointers{std::nullopt};
@@ -386,8 +385,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 return block_scale_pool_pointers;
             },
             py::call_guard<py::gil_scoped_release>())
-            .def(
-                "get_layer_to_pool_mapping",
+        .def(
+            "get_layer_to_pool_mapping",
             [](tbk::BaseKVCacheManager& self)
             {
                 std::optional<at::Tensor> layer_to_pool_mapping{std::nullopt};

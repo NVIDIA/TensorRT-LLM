@@ -104,7 +104,7 @@ void initBindings(nb::module_& m)
 {
 
     nb::class_<tr::LoraCache::TaskLayerModuleConfig>(m, "TaskLayerModuleConfig")
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<>())
         .def_rw("page_id", &tr::LoraCache::TaskLayerModuleConfig::pageId)
         .def_rw("slot_idx", &tr::LoraCache::TaskLayerModuleConfig::slotIdx)
         .def_rw("in_size", &tr::LoraCache::TaskLayerModuleConfig::inSize)
@@ -189,7 +189,8 @@ void initBindings(nb::module_& m)
 
     nb::class_<tr::ExplicitDraftTokensBuffers::Inputs>(m, "ExplicitDraftTokensBuffersInputs")
         .def("create", &tr::ExplicitDraftTokensBuffers::Inputs::create, nb::arg("max_num_sequences"),
-            nb::arg("runtime"), nb::arg("model_config"), nb::arg("world_config"))
+            nb::arg("runtime"), nb::arg("model_config"), nb::arg("world_config"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_rw("temperatures", &tr::ExplicitDraftTokensBuffers::Inputs::temperatures)
         .def_rw("position_ids_base", &tr::ExplicitDraftTokensBuffers::Inputs::positionIdsBase)
         .def_rw("generation_lengths", &tr::ExplicitDraftTokensBuffers::Inputs::generationLengths)
@@ -326,7 +327,7 @@ void initBindings(nb::module_& m)
             cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
-        "Delay kernel launch on the default stream");
+        "Delay kernel launch on the default stream", nb::call_guard<nb::gil_scoped_release>());
     m.def(
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
@@ -394,17 +395,13 @@ void initBindings(nb::module_& m)
 void initBindingsEarly(nb::module_& m)
 {
     nb::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
-        .def(nb::init<tr::SpeculativeDecodingMode::UnderlyingType>(), nb::arg("state"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_static("NoneType", &tr::SpeculativeDecodingMode::None, nb::call_guard<nb::gil_scoped_release>())
-        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa, nb::call_guard<nb::gil_scoped_release>())
-        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle, nb::call_guard<nb::gil_scoped_release>())
-        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens,
-            nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<tr::SpeculativeDecodingMode::UnderlyingType>(), nb::arg("state"))
+        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
+        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
+        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
+        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle)
+        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
+        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
         .def_prop_ro("is_none", &tr::SpeculativeDecodingMode::isNone)
         .def_prop_ro("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
         .def_prop_ro("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)

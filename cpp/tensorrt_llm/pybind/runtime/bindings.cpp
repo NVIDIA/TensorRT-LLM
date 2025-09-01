@@ -201,7 +201,7 @@ void initBindings(pybind11::module_& m)
 {
     py::classh<tr::ITensor, PyITensor>(m, "ITensor").def(py::init());
     py::class_<tr::LoraCache::TaskLayerModuleConfig>(m, "TaskLayerModuleConfig")
-        .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<>())
         .def_readwrite("page_id", &tr::LoraCache::TaskLayerModuleConfig::pageId)
         .def_readwrite("slot_idx", &tr::LoraCache::TaskLayerModuleConfig::slotIdx)
         .def_readwrite("in_size", &tr::LoraCache::TaskLayerModuleConfig::inSize)
@@ -281,7 +281,8 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::ExplicitDraftTokensBuffers::Inputs>(m, "ExplicitDraftTokensBuffersInputs")
         .def("create", &tr::ExplicitDraftTokensBuffers::Inputs::create, py::arg("max_num_sequences"),
-            py::arg("runtime"), py::arg("model_config"), py::arg("world_config"))
+            py::arg("runtime"), py::arg("model_config"), py::arg("world_config"),
+            py::call_guard<py::gil_scoped_release>())
         .def_readwrite("temperatures", &tr::ExplicitDraftTokensBuffers::Inputs::temperatures)
         .def_readwrite("position_ids_base", &tr::ExplicitDraftTokensBuffers::Inputs::positionIdsBase)
         .def_readwrite("generation_lengths", &tr::ExplicitDraftTokensBuffers::Inputs::generationLengths)
@@ -420,7 +421,7 @@ void initBindings(pybind11::module_& m)
             cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
-        "Delay kernel launch on the default stream");
+        "Delay kernel launch on the default stream", py::call_guard<py::gil_scoped_release>());
     m.def(
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
@@ -489,17 +490,13 @@ void initBindings(pybind11::module_& m)
 void initBindingsEarly(py::module_& m)
 {
     py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
-        .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"),
-            py::call_guard<py::gil_scoped_release>())
-        .def_static("NoneType", &tr::SpeculativeDecodingMode::None, py::call_guard<py::gil_scoped_release>())
-        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal,
-            py::call_guard<py::gil_scoped_release>())
-        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa, py::call_guard<py::gil_scoped_release>())
-        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle, py::call_guard<py::gil_scoped_release>())
-        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding,
-            py::call_guard<py::gil_scoped_release>())
-        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens,
-            py::call_guard<py::gil_scoped_release>())
+        .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
+        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
+        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
+        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
+        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle)
+        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
+        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
         .def_property_readonly("is_none", &tr::SpeculativeDecodingMode::isNone)
         .def_property_readonly("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
         .def_property_readonly("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)

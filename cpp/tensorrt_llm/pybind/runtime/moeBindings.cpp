@@ -52,25 +52,23 @@ void initMoeBindings(pybind11::module_& m)
 {
     // Bind MoeWeight struct
     py::class_<tr::MoeWeight>(m, "MoeWeight")
-        .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<>())
         .def_property("weight_ptr", &tr::MoeWeight::getWeightPtr, &tr::MoeWeight::setWeightPtr)
         .def_readwrite("height", &tr::MoeWeight::mHeight)
         .def_readwrite("width", &tr::MoeWeight::mWidth)
         .def_readwrite("pitch", &tr::MoeWeight::mPitch)
-        .def(
-            "__repr__",
+        .def("__repr__",
             [](tr::MoeWeight const& self)
             {
                 return "<MoeWeight ptr=" + std::to_string(self.getWeightPtr())
                     + " height=" + std::to_string(self.mHeight) + " width=" + std::to_string(self.mWidth)
                     + " pitch=" + std::to_string(self.mPitch) + ">";
-            },
-            py::call_guard<py::gil_scoped_release>());
+            });
 
     // Bind MoeLoadBalanceMetaInfo struct
     py::class_<tk::MoeLoadBalanceMetaInfo>(m, "MoeLoadBalanceMetaInfo")
         .def(py::init<int, int, int, int, int>(), py::arg("expert_count"), py::arg("top_k"), py::arg("ep_rank"),
-            py::arg("ep_size"), py::arg("slot_count_per_rank"), py::call_guard<py::gil_scoped_release>())
+            py::arg("ep_size"), py::arg("slot_count_per_rank"))
         .def_readwrite("expert_count", &tk::MoeLoadBalanceMetaInfo::expertCount)
         .def_readwrite("top_k", &tk::MoeLoadBalanceMetaInfo::topK)
         .def_readwrite("ep_rank", &tk::MoeLoadBalanceMetaInfo::epRank)
@@ -79,7 +77,7 @@ void initMoeBindings(pybind11::module_& m)
 
     // Bind MoePlacementCpuInfo struct
     py::class_<tr::MoePlacementCpuInfo>(m, "MoePlacementCpuInfo")
-        .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<>())
         .def_readwrite("expert_replica_count", &tr::MoePlacementCpuInfo::expertReplicaCount)
         .def_readwrite("rank_expert_ids", &tr::MoePlacementCpuInfo::rankExpertIds);
 
@@ -124,15 +122,15 @@ void initMoeBindings(pybind11::module_& m)
             py::call_guard<py::gil_scoped_release>());
 
     m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
-        "If current system support host accessible device memory", py::call_guard<py::gil_scoped_release>());
+        "If current system support host accessible device memory");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, py::arg("meta_info"), py::arg("expert_load_factor"),
-        py::arg("cpu_placement"), "Do replication", py::call_guard<py::gil_scoped_release>());
+        py::arg("cpu_placement"), "Do replication");
 
     // Bind do_placement function for testing
     m.def("do_placement", &pyDoPlacement, py::arg("meta_info"), py::arg("expert_load_factor"), py::arg("cpu_placement"),
-        "Do placement", py::call_guard<py::gil_scoped_release>());
+        "Do placement");
 }
 
 } // namespace tensorrt_llm::pybind::runtime

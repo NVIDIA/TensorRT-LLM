@@ -77,18 +77,12 @@ public:
 void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 {
     nb::class_<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
-        .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("check_context_transfer_status", &BaseCacheTransceiver::checkContextTransferStatus,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete,
-            nb::call_guard<nb::gil_scoped_release>());
+        .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
+        .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
+        .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
+        .def("check_context_transfer_status", &BaseCacheTransceiver::checkContextTransferStatus)
+        .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
+        .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
@@ -100,12 +94,11 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
                  std::optional<executor::CacheTransceiverConfig>>(),
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("dtype"), nb::arg("attention_type"),
-            nb::arg("cache_transceiver_config") = std::nullopt, nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("cache_transceiver_config") = std::nullopt);
 
     nb::class_<tb::kv_cache_manager::CacheTransBufferManager>(m, "CacheTransBufferManager")
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), nb::arg("cache_manager"),
-            nb::arg("max_num_tokens") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("max_num_tokens") = std::nullopt)
         .def_static("pre_alloc_buffer_size", &tb::kv_cache_manager::CacheTransBufferManager::preAllocBufferSize,
-            nb::arg("cache_size_bytes_per_token_per_window"), nb::arg("cache_transceiver_config") = nb::none(),
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("cache_size_bytes_per_token_per_window"), nb::arg("cache_transceiver_config") = nb::none());
 }

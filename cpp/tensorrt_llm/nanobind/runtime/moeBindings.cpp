@@ -50,25 +50,23 @@ void initMoeBindings(nb::module_& m)
 {
     // Bind MoeWeight struct
     nb::class_<tr::MoeWeight>(m, "MoeWeight")
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<>())
         .def_prop_rw("weight_ptr", &tr::MoeWeight::getWeightPtr, &tr::MoeWeight::setWeightPtr)
         .def_rw("height", &tr::MoeWeight::mHeight)
         .def_rw("width", &tr::MoeWeight::mWidth)
         .def_rw("pitch", &tr::MoeWeight::mPitch)
-        .def(
-            "__repr__",
+        .def("__repr__",
             [](tr::MoeWeight const& self)
             {
                 return "<MoeWeight ptr=" + std::to_string(self.getWeightPtr())
                     + " height=" + std::to_string(self.mHeight) + " width=" + std::to_string(self.mWidth)
                     + " pitch=" + std::to_string(self.mPitch) + ">";
-            },
-            nb::call_guard<nb::gil_scoped_release>());
+            });
 
     // Bind MoeLoadBalanceMetaInfo struct
     nb::class_<tk::MoeLoadBalanceMetaInfo>(m, "MoeLoadBalanceMetaInfo")
         .def(nb::init<int, int, int, int, int>(), nb::arg("expert_count"), nb::arg("top_k"), nb::arg("ep_rank"),
-            nb::arg("ep_size"), nb::arg("slot_count_per_rank"), nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("ep_size"), nb::arg("slot_count_per_rank"))
         .def_rw("expert_count", &tk::MoeLoadBalanceMetaInfo::expertCount)
         .def_rw("top_k", &tk::MoeLoadBalanceMetaInfo::topK)
         .def_rw("ep_rank", &tk::MoeLoadBalanceMetaInfo::epRank)
@@ -77,7 +75,7 @@ void initMoeBindings(nb::module_& m)
 
     // Bind MoePlacementCpuInfo struct
     nb::class_<tr::MoePlacementCpuInfo>(m, "MoePlacementCpuInfo")
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<>())
         .def_rw("expert_replica_count", &tr::MoePlacementCpuInfo::expertReplicaCount)
         .def_rw("rank_expert_ids", &tr::MoePlacementCpuInfo::rankExpertIds);
 
@@ -121,15 +119,15 @@ void initMoeBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>());
 
     m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
-        "If current system support host accessible device memory", nb::call_guard<nb::gil_scoped_release>());
+        "If current system support host accessible device memory");
 
     // Bind do_replication function for testing
     m.def("do_replication", &pyDoReplication, nb::arg("meta_info"), nb::arg("expert_load_factor"),
-        nb::arg("cpu_placement"), "Do replication", nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("cpu_placement"), "Do replication");
 
     // Bind do_placement function for testing
     m.def("do_placement", &pyDoPlacement, nb::arg("meta_info"), nb::arg("expert_load_factor"), nb::arg("cpu_placement"),
-        "Do placement", nb::call_guard<nb::gil_scoped_release>());
+        "Do placement");
 }
 
 } // namespace tensorrt_llm::nanobind::runtime
