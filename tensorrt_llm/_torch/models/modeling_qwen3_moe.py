@@ -109,8 +109,8 @@ class Qwen3MoE(nn.Module):
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
             aux_stream_dict={
-                AuxStreamType.MoeChunkingOverlap: aux_stream, 
-                AuxStreamType.MoeBalancer: torch.cuda.Stream()
+                AuxStreamType.MoeChunkingOverlap: aux_stream,
+                AuxStreamType.MoeBalancer: torch.cuda.Stream(device=aux_stream.device),
             },
             dtype=config.torch_dtype,
             reduce_results=False,
