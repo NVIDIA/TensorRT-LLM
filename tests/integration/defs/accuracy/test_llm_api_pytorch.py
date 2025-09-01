@@ -2792,7 +2792,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler, mocker):
-        pytest.skip("https://nvbugs/5481087")
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
