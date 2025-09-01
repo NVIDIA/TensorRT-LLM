@@ -3822,7 +3822,7 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
         if alibi and enable_attn_logit_softcapping:
             continue
         # for normal attention, we do not need return softmax for ws fp8 kernels currently.
-        skip_combination = return_softmax and input_layout != InputLayout.CONTIGUOUS_Q_KV
+        skip_combination = return_softmax
         # for context mla, we need separate qkv as input layout when returning softmax.
         skip_mla_combination = return_softmax and input_layout != InputLayout.SEPARATE_Q_K_V
         if not skip_combination:
