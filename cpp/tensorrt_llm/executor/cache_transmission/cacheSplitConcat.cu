@@ -501,7 +501,7 @@ nvinfer1::Dims makeShapeFromCacheState(kv_cache::CacheState const& cacheState)
 template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T** __restrict__ outputCaches,
     int tokensPerBlock, int numLayers, int headNum, int dimsPerHead, int inputBlockNum, int DomainPPSize,
-    int DomainTPSize, int layerNumDomainPP, int kvFactor)
+    int DomainTPSize, int DomainCPSize, int layerNumDomainPP, int kvFactor)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
     int const laneId = threadIdx.x % subWarpSize;
@@ -931,6 +931,11 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     auto targetRankInfo = targetIRanks(destCacheState, selfCacheState, selfIdx);
     TLLM_CHECK(targetRankInfo.mIRanks.size()
         == (static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize * targetRankInfo.mDomainCPSize)));
+    TLLM_LOG_INFO("[splitKVCache] targetRankInfo.mIRanks.size(): %d", targetRankInfo.mIRanks.size());
+    for (auto rank : targetRankInfo.mIRanks)
+    {
+        TLLM_LOG_INFO("[splitKVCache] target rank: %d, ", rank);
+    }
     auto outputCacheNum = targetRankInfo.mIRanks.size();
     if (selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA)
     {
@@ -954,6 +959,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     {
         auto cacheBlockSize = blocks.front()->getSize();
         auto cacheDataType = blocks.front()->getDataType();
+        TLLM_LOG_DEBUG("[splitKVCache] cacheBlockSize: %zu, cacheDataType: %d", cacheBlockSize, cacheDataType);
         windowSizes.push_back(window);
         blockNumInwindow.push_back(blocks.size());
         TLLM_LOG_DEBUG("window: %d, blockNum: %d  blockshape:[%d,%d]", window, blocks.size(),
@@ -997,7 +1003,6 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 
         for (auto layerNum : layersInWindow)
         {
-
             TLLM_CHECK_WITH_INFO(
                 layerNum % targetRankInfo.mDomainPPSize == 0, "layerNum in Window must be divisible by domainPPSize");
         }
@@ -1043,6 +1048,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     int const dimsPerHead = selfModelConfig.mSizePerHead;
     int const DomainPPSize = targetRankInfo.mDomainPPSize;
     int const DomainTPSize = targetRankInfo.mDomainTPSize;
+    int const DomainCPSize = targetRankInfo.mDomainCPSize;
     int const layerNumDomainPP = numLayers / DomainPPSize;
     int const headNumDomainTP
         = headNum / (DomainTPSize / targetRankInfo.mPeerDupHeadFactor); // TODO: duplicate head factor
@@ -1051,9 +1057,9 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     constexpr int mlaSubWarpSize = 16;
 
     TLLM_LOG_DEBUG(
-        "splitKVCache - numLayers: %d, headNum: %d, domainPPSize: %d, domainTPSize: %d, "
+        "splitKVCache - numLayers: %d, headNum: %d, domainPPSize: %d, domainTPSize: %d, domainCPSize: %d, "
         "layersPerDomainPP: %d, headsPerDomainTP: %d",
-        numLayers, headNum, DomainPPSize, DomainTPSize, layerNumDomainPP, headNumDomainTP);
+        numLayers, headNum, DomainPPSize, DomainTPSize, DomainCPSize, layerNumDomainPP, headNumDomainTP);
 
     int const remainder = sizePerHead * sizeof(T) % 16;
     switch (remainder)
@@ -1064,7 +1070,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         {
             splitKVCacheForMLAKernel<T, mlaSubWarpSize, 16><<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(
                 inputBlockPtrsDev, outputCachePtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead,
-                inputBlockNumSum, DomainPPSize, DomainTPSize, layerNumDomainPP, kvFactor);
+                inputBlockNumSum, DomainPPSize, DomainTPSize, DomainCPSize, layerNumDomainPP, kvFactor);
         }
         else if (isWindow)
         {
@@ -1088,7 +1094,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         {
             splitKVCacheForMLAKernel<T, mlaSubWarpSize, 8><<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(
                 inputBlockPtrsDev, outputCachePtrsDev, tokensPerBlock, numLayers, headNum, dimsPerHead,
-                inputBlockNumSum, DomainPPSize, DomainTPSize, layerNumDomainPP, kvFactor);
+                inputBlockNumSum, DomainPPSize, DomainTPSize, DomainCPSize, layerNumDomainPP, kvFactor);
         }
         else if (isWindow)
         {
@@ -1116,7 +1122,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheForMLAKernel<T, mlaSubWarpSize, 4>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, DomainPPSize, DomainTPSize,
-                        layerNumDomainPP, kvFactor);
+                        DomainCPSize, layerNumDomainPP, kvFactor);
             }
             else if (isWindow)
             {
@@ -1149,7 +1155,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheForMLAKernel<T, mlaSubWarpSize, 2>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, DomainPPSize, DomainTPSize,
-                        layerNumDomainPP, kvFactor);
+                        DomainCPSize, layerNumDomainPP, kvFactor);
             }
             else if (isWindow)
             {
@@ -1178,7 +1184,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheForMLAKernel<T, mlaSubWarpSize, 1>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, DomainPPSize, DomainTPSize,
-                        layerNumDomainPP, kvFactor);
+                        DomainCPSize, layerNumDomainPP, kvFactor);
             }
             else if (isWindow)
             {

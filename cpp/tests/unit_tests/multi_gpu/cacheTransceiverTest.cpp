@@ -523,9 +523,9 @@ protected:
 #if ENABLE_MULTI_DEVICE
         tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
 
-        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 8)
+        if (tensorrt_llm::mpi::MpiComm::world().getSize() != 4)
         {
-            GTEST_SKIP() << "mpirun with procs=8  is required to run this test.";
+            GTEST_SKIP() << "mpirun with procs=4  is required to run this test.";
         }
         int worldSize = tensorrt_llm::mpi::MpiComm::world().getSize();
         int worldRank = tensorrt_llm::mpi::MpiComm::world().getRank();
@@ -998,7 +998,7 @@ protected:
                                 // Debug print with rank information for MPI debugging (KEY values)
                                 if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                 {
-                                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                    TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         "[RANK %d] [fillBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
                                         "keyIdx=%zu, value=%s, dataType=%d",
                                         tensorrt_llm::mpi::MpiComm::world().getRank(),
@@ -1024,7 +1024,7 @@ protected:
                                     // Debug print with rank information for MPI debugging (VALUE values)
                                     if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                     {
-                                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                             "[RANK %d] [fillBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
                                             "valueIdx=%zu, value=%s, dataType=%d",
                                             tensorrt_llm::mpi::MpiComm::world().getRank(),
@@ -1097,7 +1097,7 @@ protected:
                                 // Debug print with rank information for MPI debugging (KEY values)
                                 if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                 {
-                                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                    TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         "[RANK %d] [verifyBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
                                         "keyIdx=%zu, value=%s, dataType=%d",
                                         tensorrt_llm::mpi::MpiComm::world().getRank(),
@@ -1122,7 +1122,7 @@ protected:
                                     // Debug print with rank information for MPI debugging (VALUE values)
                                     if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                     {
-                                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(),
+                                        TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                             "[RANK %d] [verifyBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
                                             "valueIdx=%zu, value=%s, dataType=%d",
                                             tensorrt_llm::mpi::MpiComm::world().getRank(),

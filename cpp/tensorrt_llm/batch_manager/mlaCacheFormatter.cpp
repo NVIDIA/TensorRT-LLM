@@ -162,8 +162,8 @@ void MLACacheFormatter::format(TransferSession& session)
     auto& outputSplitCaches = std::get<0>(result);
     auto& bufferCoverTargetNum = std::get<1>(result);
     auto& onlyUseDynamicBuffer = std::get<2>(result);
-    auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
-    if (agentConnnecion != nullptr)
+    auto* agentConnnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+    if (agentConnnection != nullptr)
     {
         TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == pPDomainSize * cPDomainSize, "Agent need all buffer pre-allocated");
         TLLM_CHECK(onlyUseDynamicBuffer == false);
