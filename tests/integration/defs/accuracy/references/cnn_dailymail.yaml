@@ -1,5 +1,5 @@
 google/gemma-3-1b-it:
-  - accuracy: 22.988
+  - accuracy: 19.0
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 20.699

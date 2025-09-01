@@ -9,7 +9,7 @@ TensorRT-LLM
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.9.1-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-10.11.0-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-1.1.0rc2-green)](./tensorrt_llm/version.py)
+[![version](https://img.shields.io/badge/release-1.1.0rc2.post1-green)](./tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/torch/arch_overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](./docs/source/performance/perf-overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap)
@@ -18,6 +18,9 @@ TensorRT-LLM
 <div align="left">
 
 ## Tech Blogs
+* [08/29] ADP Balance Strategy
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog10_ADP_Balance_Strategy.md)
+
 * [08/05] Running a High-Performance GPT-OSS-120B Inference Server with TensorRT-LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.md)
 
