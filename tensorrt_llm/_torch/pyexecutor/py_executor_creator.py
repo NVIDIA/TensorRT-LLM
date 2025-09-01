@@ -14,9 +14,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
-                                            ExecutorConfig,
-                                            LogitsPostProcessorConfig,
-                                            ParallelConfig)
+                                            ExecutorConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
@@ -417,12 +415,11 @@ def create_py_executor(
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
             # To deal with cases like this, we instantiate them both concurrently.
             with ThreadPoolExecutor(max_workers=2) as executor:
-                connector_worker_task = executor.submit(worker_cls,
-                                                        executor_config)
+                connector_worker_task = executor.submit(worker_cls)
 
                 if scheduler_cls is not None and rank == 0:
                     connector_scheduler_task = executor.submit(
-                        scheduler_cls, executor_config)
+                        scheduler_cls, executor_config.tokens_per_block)
                     connector_scheduler = connector_scheduler_task.result()
                 else:
                     connector_scheduler = None
@@ -566,7 +563,8 @@ def create_py_executor(
                 max_beam_width=executor_config.max_beam_width,
                 peft_cache_config=executor_config.peft_cache_config,
                 scheduler_config=executor_config.scheduler_config,
-                cache_transceiver_config=executor_config.cache_transceiver_config,
+                cache_transceiver_config=executor_config.
+                cache_transceiver_config,
             )
 
     _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)

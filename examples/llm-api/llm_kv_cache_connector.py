@@ -14,7 +14,6 @@ import torch
 from tensorrt_llm import LLM, SamplingParams, logger
 from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
-from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 
@@ -34,9 +33,8 @@ class PersistentKvCacheConnectorMetadata:
 
 class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
-    def __init__(self, executor_config: ExecutorConfig):
-        super().__init__(executor_config)
-
+    def __init__(self):
+        super().__init__()
         self.kv_cache_tensor = None
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
@@ -81,10 +79,10 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
 class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
-    def __init__(self, executor_config: ExecutorConfig):
-        super().__init__(executor_config)
+    def __init__(self, tokens_per_block):
+        super().__init__()
 
-        self.block_size = self._config.tokens_per_block
+        self.block_size = tokens_per_block
         self.pending_loads = {}
 
         self.cache_folder = os.environ.get(CONNECTOR_CACHE_FOLDER_KEY,
