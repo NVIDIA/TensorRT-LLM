@@ -497,11 +497,11 @@ nvinfer1::Dims makeShapeFromCacheState(kv_cache::CacheState const& cacheState)
 }
 
 // MLA Head 1: One thread block per [(2), tokens, dimsPerHead]
-
+// @B: Why do we not use Domain{P,T,C}PSize?
 template <typename T, int subWarpSize, int vecSizeByte>
 __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T** __restrict__ outputCaches,
-    int tokensPerBlock, int numLayers, int headNum, int dimsPerHead, int inputBlockNum, int DomainPPSize,
-    int DomainTPSize, int DomainCPSize, int layerNumDomainPP, int kvFactor)
+    int tokensPerBlock, int numLayers, int headNum, int dimsPerHead, int inputBlockNum, int domainPPSize,
+    int domainTPSize, int domainCPSize, int layerNumDomainPP, int kvFactor)
 {
     int const subWarpId = threadIdx.x / subWarpSize;
     int const laneId = threadIdx.x % subWarpSize;
@@ -521,16 +521,20 @@ __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T**
 #pragma unroll 1
             for (int headId = 0; headId < headNum; headId++)
             {
+                // Input block memory layout: [Layer][KV_Factor][Head][Token][Dimension].
                 T const* inputBlockPtr = inputBlocks[blockId];
                 T const* kInputPtr = inputBlockPtr + layerId * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + headId * tokensPerBlock * dimsPerHead;
-                int const outputCacheIdx = layerId / layerNumDomainPP;
+                int const outputCacheIdx = (layerId / layerNumDomainPP) * domainCPSize + blockId % domainCPSize;
+                TLLM_LOG_INFO("[splitKVCacheForMLAKernel] layerId: %d, blockId: %d, outputCacheIdx: %d", layerId, blockId, outputCacheIdx);
                 T* outputCachePtr = outputCaches[outputCacheIdx];
                 int const layerIdInDomainPP = layerId % layerNumDomainPP;
                 int const headIdInDomainTP = headId;
+                int const blockIdInDomainCP = blockId / domainCPSize;
 
+                // Unlike inputBlocks which are non-contiguous, blocks in outputCachePtr are contiguous.
                 T* kOutputPtr = outputCachePtr
-                    + blockId * (layerNumDomainPP * kvFactor * headNum * tokensPerBlock * dimsPerHead)
+                    + blockIdInDomainCP * (layerNumDomainPP * kvFactor * headNum * tokensPerBlock * dimsPerHead)
                     + layerIdInDomainPP * kvFactor * headNum * tokensPerBlock * dimsPerHead
                     + headIdInDomainTP * tokensPerBlock * dimsPerHead;
                 int const kvOffset = headNum * tokensPerBlock * dimsPerHead;

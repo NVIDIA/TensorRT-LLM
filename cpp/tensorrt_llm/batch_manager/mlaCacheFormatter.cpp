@@ -97,13 +97,10 @@ void MLACacheFormatter::format(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     TLLM_CHECK(!connections.empty());
-    // diff start
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
     }
-
-    // diff end
 
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
     auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
@@ -156,7 +153,9 @@ void MLACacheFormatter::format(TransferSession& session)
     size_t const pPDomainSize = targetInfo.mDomainPPSize;
     size_t const cPDomainSize = targetInfo.mDomainCPSize;
     TLLM_CHECK((cacheBlockSize * blockNum) % (pPDomainSize * cPDomainSize) == 0);
+    // @B: This works as if all output caches are of the same size. Is this a fair assumption?
     auto const targetBufferSize = (cacheBlockSize * blockNum) / (pPDomainSize * cPDomainSize);
+    TLLM_LOG_INFO("[MLACacheFormatter::format] BEFORE getOrAllocateSendBuffers cacheBlockSize: %zu, blockNum: %d, pPDomainSize: %zu, cPDomainSize: %zu, targetBufferSize: %zu", cacheBlockSize, blockNum, pPDomainSize, cPDomainSize, targetBufferSize);
     auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, pPDomainSize * cPDomainSize, targetBufferSize, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);

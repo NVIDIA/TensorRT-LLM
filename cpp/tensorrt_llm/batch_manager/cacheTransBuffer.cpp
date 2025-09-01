@@ -229,7 +229,7 @@ CacheTransBufferManager::CacheTransBufferManager(
     mPreAllocBufferSize = mTransferBufferSize * (mRecvBufferCount + mSendBufferCount);
     TLLM_LOG_INFO(
         "CacheTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
-        "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld,mOnlyUseDynamicBuffer:%d "
+        "mSendBufferCount:%ld, mTransferBufferSize:%ld, mPreAllocBufferSize:%ld, mOnlyUseDynamicBuffer:%d "
         "mUseFabricMemory:%d mDataType:%d",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
         mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory, mDataType);
