@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -365,6 +366,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     3. moe_finalize_scale_op: finalize the scale of the output tensor.
     """
 
+    # To reuse pytorch memory segments allocated during graph capture.
+    allocated_buffer_recorder: dict[str, list[torch.Tensor]] = {}
+
     def __init__(
         self,
         *,
@@ -410,28 +414,54 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         )
 
     def get_workspace(self, m_max: int, group_size: int):
+
+        def get_empty(tensor_shape: list[int], dtype: torch.dtype,
+                      cache_name: str) -> torch.Tensor:
+            if DeepGemmFusedMoE.allocated_buffer_recorder is not None:
+                # Safely get the list of candidates. Defaults to an empty list if key is missing.
+                candidate_buffers = DeepGemmFusedMoE.allocated_buffer_recorder.get(
+                    cache_name, [])
+                numel_like = math.prod(tensor_shape)
+
+                for buffer in candidate_buffers:
+                    numel_buffer = buffer.numel()
+
+                    # buffer just needs to be large enough.
+                    if numel_buffer >= numel_like:
+                        return buffer[0:numel_like].view(
+                            tensor_shape)  # Found a fit, return immediately.
+
+            # If we get here, no suitable buffer was found in the cache. Create a new one.
+            new_buffer = torch.zeros(tensor_shape, device='cuda', dtype=dtype)
+            if DeepGemmFusedMoE.allocated_buffer_recorder is not None:
+                if torch.cuda.is_current_stream_capturing():
+                    DeepGemmFusedMoE.allocated_buffer_recorder.setdefault(
+                        cache_name, []).append(new_buffer)
+            return new_buffer
+
         hidden_size = self.hidden_size
         intermediate_size = self.intermediate_size_per_partition
         num_experts = self.expert_size_per_partition
 
         # create workspace
         fp8_dim = max(hidden_size, intermediate_size)
-        workspace_0 = torch.empty((num_experts * m_max * fp8_dim),
-                                  dtype=torch.float8_e4m3fn,
-                                  device='cuda')
-        workspace_1 = torch.empty(
-            (num_experts * m_max * max(intermediate_size * 2, hidden_size)),
+        workspace_0 = get_empty((num_experts * m_max * fp8_dim, ),
+                                dtype=torch.float8_e4m3fn,
+                                cache_name='workspace_0')
+        workspace_1 = get_empty(
+            (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
             dtype=torch.bfloat16,
-            device='cuda')
+            cache_name='workspace_1')
 
         # create workspace for scaling factors
         m_padded = fp8_utils.align(m_max, 4)
         scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
         scale_k_padded = fp8_utils.align(scale_k, 4)
-        workspace_sf = torch.empty(
-            (num_experts * (scale_k_padded // 4) * m_padded),
+
+        workspace_sf = get_empty(
+            (num_experts * (scale_k_padded // 4) * m_padded, ),
             dtype=torch.int32,
-            device='cuda')
+            cache_name='workspace_sf')
 
         workspace = {
             "workspace_0": workspace_0,
