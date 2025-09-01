@@ -1,11 +1,9 @@
 import contextlib
-import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Generator, List
+from typing import Dict, List
 
-import pynvml
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
@@ -287,23 +285,9 @@ def get_per_request_piecewise_cuda_graph_flag() -> bool:
     return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
 
 
-@contextlib.contextmanager
-def nvml_context() -> Generator[None, None, None]:
-    pynvml.nvmlInit()
-    try:
-        yield
-    finally:
-        pynvml.nvmlShutdown()
-
-
 def get_device_uuid(device_idx: int) -> str:
-    """Get the UUID of a CUDA device using NVML."""
-    # Convert logical device index to physical device index
-    global_device_idx = (
-        device_idx if "CUDA_VISIBLE_DEVICES" not in os.environ else int(
-            os.environ["CUDA_VISIBLE_DEVICES"].split(",")[device_idx]))
+    """Get the UUID of a CUDA device using torch cuda api"""
 
-    with nvml_context():
-        handle = pynvml.nvmlDeviceGetHandleByIndex(global_device_idx)
-        uuid = pynvml.nvmlDeviceGetUUID(handle)
-        return uuid.decode("utf-8") if isinstance(uuid, bytes) else uuid
+    property = torch.cuda.get_device_properties(device_idx)
+    uuid = "GPU-" + str(property.uuid)
+    return uuid
