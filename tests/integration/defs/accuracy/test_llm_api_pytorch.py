@@ -2028,16 +2028,25 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(1, 1, 1, False, True, True)],
-        ids=["latency"])
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,is_cached",
+        [(1, 1, 1, False, True, True, True),
+         pytest.param(8,
+                      1,
+                      1,
+                      False,
+                      True,
+                      True,
+                      False,
+                      marks=pytest.mark.skip_less_mpi_world_size(8))],
+        ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                  overlap_scheduler):
+                  overlap_scheduler, is_cached):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B"
+                 if is_cached else "Qwen/Qwen3-8B",
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
