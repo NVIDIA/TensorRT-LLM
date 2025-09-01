@@ -9,9 +9,8 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
-from tensorrt_llm._torch.pyexecutor.sampler_utils import (BEAM_0,
-                                                          SINGLE_BEAM_WIDTH,
-                                                          handle_stop_1_beam)
+from tensorrt_llm._torch.pyexecutor.sampler_utils import (
+    BEAM_0, SINGLE_BEAM_WIDTH, handle_stop_single_beam)
 from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
@@ -508,9 +507,9 @@ class TorchSampler(Sampler):
             new_token = request.py_draft_tokens[i]
             new_tokens[i, request.seq_slot, BEAM_0] = new_token
             request.add_new_token(new_token, BEAM_0)
-            if handle_stop_1_beam(request,
-                                  new_token,
-                                  max_seq_len=self.max_seq_len):
+            if handle_stop_single_beam(request,
+                                       new_token,
+                                       max_seq_len=self.max_seq_len):
                 num_accepted = i + 1
                 return num_accepted
         if sample_last:
@@ -518,13 +517,17 @@ class TorchSampler(Sampler):
                                         num_accepted)
             new_tokens[num_accepted, request.seq_slot, BEAM_0] = new_token
             request.add_new_token(new_token, BEAM_0)
-            handle_stop_1_beam(request, new_token, max_seq_len=self.max_seq_len)
+            handle_stop_single_beam(request,
+                                    new_token,
+                                    max_seq_len=self.max_seq_len)
         else:
             new_token = add_token(request,
                                   new_tokens,
                                   beam=BEAM_0,
                                   step=num_accepted)
-            handle_stop_1_beam(request, new_token, max_seq_len=self.max_seq_len)
+            handle_stop_single_beam(request,
+                                    new_token,
+                                    max_seq_len=self.max_seq_len)
 
         return num_accepted
 

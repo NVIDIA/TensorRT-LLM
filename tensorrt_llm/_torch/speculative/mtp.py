@@ -13,7 +13,7 @@ from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
                                   TorchSampler, TorchStore, add_token,
                                   int_tensor)
 from ..pyexecutor.sampler_utils import (BEAM_0, SINGLE_BEAM_WIDTH,
-                                        handle_stop_1_beam)
+                                        handle_stop_single_beam)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 
@@ -261,7 +261,7 @@ class MTPSampler(Sampler):
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
             new_token = add_token(req, new_tokens, beam=BEAM_0)
-            handle_stop_1_beam(req, new_token, max_seq_len=max_seq_len)
+            handle_stop_single_beam(req, new_token, max_seq_len=max_seq_len)
             self._request_common_handling(req, next_draft_tokens_list)
 
         for req in state.scheduled_requests.generation_requests:
@@ -270,7 +270,9 @@ class MTPSampler(Sampler):
             num_new_tokens = new_tokens_lens[req.py_seq_slot]
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam=BEAM_0, step=i)
-                if handle_stop_1_beam(req, new_token, max_seq_len=max_seq_len):
+                if handle_stop_single_beam(req,
+                                           new_token,
+                                           max_seq_len=max_seq_len):
                     break
             req.py_rewind_len = self.draft_len - (num_new_tokens - 1)
             self._request_common_handling(req, next_draft_tokens_list)

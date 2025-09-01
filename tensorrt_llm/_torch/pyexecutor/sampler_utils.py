@@ -21,7 +21,8 @@ BEAM_0 = 0
 SINGLE_BEAM_WIDTH = 1
 
 
-def max_token_criteria_1_beam(request: LlmRequest, max_seq_len: int) -> bool:
+def max_token_criteria_single_beam(request: LlmRequest,
+                                   max_seq_len: int) -> bool:
     num_tokens = request.get_num_tokens(BEAM_0)
     return (num_tokens - request.py_orig_prompt_len
             >= request.py_max_new_tokens) or (num_tokens >= max_seq_len)
@@ -40,15 +41,15 @@ def stop_token_criteria(py_stop_words_list: list[list[int]] | None,
     return False
 
 
-def handle_stop_1_beam(request: LlmRequest, new_token: int, *,
-                       max_seq_len: int) -> bool:
+def handle_stop_single_beam(request: LlmRequest, new_token: int, *,
+                            max_seq_len: int) -> bool:
     """Handle stop criteria and set appropriate finish reasons and state.
     Returns True if generation should stop."""
     if new_token == request.py_end_id:
         request.finish_by(FinishReason.END_ID, BEAM_0)
         return True
 
-    if max_token_criteria_1_beam(request, max_seq_len):
+    if max_token_criteria_single_beam(request, max_seq_len):
         request.finish_by(FinishReason.LENGTH, BEAM_0)
         return True
 
