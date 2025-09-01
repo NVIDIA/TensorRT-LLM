@@ -432,31 +432,33 @@ public:
     // Returns the number of available cubin configurations
     size_t getNumBatchedGemmConfigs() const;
 
-    // Returns the number of CTAs of the last launched kernel.
-    int32_t getNumCtas() const
+    // Returns the CTA information for the given options and batchedGemmData.
+    std::tuple<int32_t, int32_t, int32_t, int32_t, bool> getCtaInfo(
+        BatchedGemmOptions const& options, BatchedGemmData const& batchedGemmData) const;
+
+    // Returns the number of CTAs of the currently launched kernel.
+    int32_t getNumCtas(BatchedGemmOptions const& options, BatchedGemmData const& batchedGemmData) const
     {
-        return mNumCtas;
+        auto ctaInfo = getCtaInfo(options, batchedGemmData);
+        return std::get<0>(ctaInfo) * std::get<1>(ctaInfo) * std::get<2>(ctaInfo);
     }
 
     // Returns true if the configuration of the cubin can be executed for the given params.
     bool isValidConfig(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
+    // Creates GemmOptions from kernel and data.
+    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
+
 private:
     // Aligns the pointer to the alignment
     template <typename Dtype>
     inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
-    // Creates GemmOptions from kernel and data.
-    BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
     // Returns the size of the workspace buffers in bytes
     std::vector<size_t> getWorkspaceSizesInBytes(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
 
     // Returns the size padded to the alignment
     size_t getSizePaddedToAlignment(size_t size, size_t alignment) const;
-
-private:
-    // Number of the CTAs of the last launched kernel.
-    int32_t mNumCtas{0};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -597,37 +599,10 @@ std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
-    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */, bool usePdl,
-    std::optional<std::reference_wrapper<ModuleCache>> moduleCache)
+std::tuple<int32_t, int32_t, int32_t, int32_t, bool> BatchedGemmInterface::getCtaInfo(
+    BatchedGemmOptions const& options, BatchedGemmData const& batchedGemmData) const
 {
-    // Might be used.
-    (void) usePdl;
-    (void) moduleCache;
-    // Get options from config and data.
-    auto options = getOptionsFromConfigAndData(config, batchedGemmData);
-
     bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
-    bool const useDeepSeekFp8
-        = options.mUseDeepSeekFp8 && options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3;
-
-    auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
-    float* dPtrRowMax{nullptr};
-    uint32_t* dPtrRowMaxBars{nullptr};
-
-    // Set the completion barriers to 0 if needed.
-    if (useDeepSeekFp8 && options.mFusedAct)
-    {
-        dPtrRowMax = reinterpret_cast<float*>(alignPtr(reinterpret_cast<char*>(workspace), 1024));
-        dPtrRowMaxBars
-            = reinterpret_cast<uint32_t*>(alignPtr(reinterpret_cast<char*>(dPtrRowMax) + workspaceSizes[0], 1024));
-        auto err = cudaMemsetAsync(
-            (void*) dPtrRowMaxBars, 0x00, workspaceSizes[1], reinterpret_cast<cudaStream_t>(cudaStream));
-        if (err != cudaSuccess)
-        {
-            return 1;
-        }
-    }
 
     int32_t numCtaXy{0};
     if (options.mIsStaticBatch)
@@ -653,7 +628,42 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     auto const numCtaX = batchM ? maxNumCtasInBatchDim : gemm::divUp(options.mM, options.mTileM);
     auto const numCtaY = batchM ? gemm::divUp(options.mN, options.mTileN) : maxNumCtasInBatchDim;
     auto const numCtaZ = options.mNumSlicesForSplitK;
-    mNumCtas = numCtaX * numCtaY * numCtaZ;
+
+    return std::make_tuple(numCtaX, numCtaY, numCtaZ, maxNumCtasInBatchDim, batchM);
+}
+
+int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
+    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */, bool usePdl,
+    std::optional<std::reference_wrapper<ModuleCache>> moduleCache)
+{
+    // Might be used.
+    (void) usePdl;
+    (void) moduleCache;
+    // Get options from config and data.
+    auto options = getOptionsFromConfigAndData(config, batchedGemmData);
+
+    bool const useDeepSeekFp8
+        = options.mUseDeepSeekFp8 && options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3;
+
+    auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
+    float* dPtrRowMax{nullptr};
+    uint32_t* dPtrRowMaxBars{nullptr};
+
+    // Set the completion barriers to 0 if needed.
+    if (useDeepSeekFp8 && options.mFusedAct)
+    {
+        dPtrRowMax = reinterpret_cast<float*>(alignPtr(reinterpret_cast<char*>(workspace), 1024));
+        dPtrRowMaxBars
+            = reinterpret_cast<uint32_t*>(alignPtr(reinterpret_cast<char*>(dPtrRowMax) + workspaceSizes[0], 1024));
+        auto err = cudaMemsetAsync(
+            (void*) dPtrRowMaxBars, 0x00, workspaceSizes[1], reinterpret_cast<cudaStream_t>(cudaStream));
+        if (err != cudaSuccess)
+        {
+            return 1;
+        }
+    }
+
+    auto [numCtaX, numCtaY, numCtaZ, maxNumCtasInBatchDim, batchM] = getCtaInfo(options, batchedGemmData);
 
     auto kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
         batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
