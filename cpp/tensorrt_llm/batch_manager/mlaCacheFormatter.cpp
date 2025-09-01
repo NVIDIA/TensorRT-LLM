@@ -298,10 +298,9 @@ void MLACacheFormatter::unformat(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
     auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
     bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
-    // diff start
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
-    // diff end
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
+    printf("[MLACacheFormatter::unformat] pickUpConnections.size(): %zu, connections.size(): %zu, blockRange.size(): %zu\n", pickUpConnections.size(), connections.size(), blockRange.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
@@ -344,10 +343,10 @@ void MLACacheFormatter::unformat(TransferSession& session)
     }
     else
     {
-        auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
-        if (agentConnnecion != nullptr)
+        auto* agentConnnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+        if (agentConnnection != nullptr)
         {
-            cacheBufferId = agentConnnecion->getCacheBufferId();
+            cacheBufferId = agentConnnection->getCacheBufferId();
             TLLM_CHECK(cacheBufferId.has_value());
         }
         else
@@ -366,7 +365,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
         auto& bufferCoverTargetNum = std::get<1>(result);
         size_t remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
         auto& onlyUseDynamicBuffer = std::get<2>(result);
-        if (agentConnnecion != nullptr)
+        if (agentConnnection != nullptr)
         {
             TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
             TLLM_CHECK(onlyUseDynamicBuffer == false);

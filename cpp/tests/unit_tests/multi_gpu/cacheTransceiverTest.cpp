@@ -684,6 +684,7 @@ protected:
         }
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+        // @B: Should we divide totalNumBlocks by mCpSize?
         auto blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
         std::vector<SizeType32> maxAttentionWindowVec{};
         maxAttentionWindowVec.push_back(maxAttentionWindow);
@@ -982,7 +983,6 @@ protected:
         {
             for (int headId = 0; headId < headSizePerRank; headId++)
             {
-                // @B: Why do we fill all tokens in a block?
                 for (int tokenId = 0; tokenId < tokensPerBlock; tokenId++)
                 {
                     for (int hiddenId = 0; hiddenId < sizePerHead; hiddenId++)
@@ -1003,13 +1003,13 @@ protected:
                                 {
                                     TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         "[RANK %d] [fillBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
-                                        "keyIdx=%zu, value=%s, dataType=%d",
+                                        "keyIdx=%zu, set_value=%s, dataType=%d",
                                         tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         blockId, layerId, layerId + startLayerId,
                                         headId, headId + startHeadId,
                                         tokenId, tokenId + startTokenId,
                                         hiddenId, keyIndex,
-                                        std::to_string(static_cast<double>(generateValue)).c_str(),
+                                        std::to_string(static_cast<double>(*dataPtr)).c_str(),
                                         static_cast<int>(blockData.getDataType()));
                                 }
                             },
@@ -1029,13 +1029,13 @@ protected:
                                     {
                                         TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                             "[RANK %d] [fillBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
-                                            "valueIdx=%zu, value=%s, dataType=%d",
+                                            "valueIdx=%zu, set_value=%s, dataType=%d",
                                             tensorrt_llm::mpi::MpiComm::world().getRank(),
                                             blockId, layerId, layerId + startLayerId,
                                             headId, headId + startHeadId,
                                             tokenId, tokenId + startTokenId,
                                             hiddenId, valueIndex,
-                                            std::to_string(static_cast<double>(generateValue)).c_str(),
+                                            std::to_string(static_cast<double>(*dataPtr)).c_str(),
                                             static_cast<int>(blockData.getDataType()));
                                     }
                                 },
@@ -1105,13 +1105,13 @@ protected:
                                 {
                                     TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         "[RANK %d] [verifyBlockData::key] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
-                                        "keyIdx=%zu, value=%s, dataType=%d",
+                                        "keyIdx=%zu, actual_value=%s, dataType=%d",
                                         tensorrt_llm::mpi::MpiComm::world().getRank(),
                                         blockId, layerId, layerId + startLayerId,
                                         headId, headId + startHeadId,
                                         tokenId, tokenId + startTokenId,
                                         hiddenId, keyIndex,
-                                        std::to_string(static_cast<double>(generateValue)).c_str(),
+                                        std::to_string(static_cast<double>(*dataPtr)).c_str(),
                                         static_cast<int>(blockData.getDataType()));
                                 }
                             },
@@ -1130,13 +1130,13 @@ protected:
                                     {
                                         TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(),
                                             "[RANK %d] [verifyBlockData::value] blockId=%d, layer=%d->%d, head=%d->%d, token=%d->%d, hidden=%d, "
-                                            "valueIdx=%zu, value=%s, dataType=%d",
+                                            "valueIdx=%zu, actual_value=%s, dataType=%d",
                                             tensorrt_llm::mpi::MpiComm::world().getRank(),
                                             blockId, layerId, layerId + startLayerId,
                                             headId, headId + startHeadId,
                                             tokenId, tokenId + startTokenId,
                                             hiddenId, valueIndex,
-                                            std::to_string(static_cast<double>(generateValue)).c_str(),
+                                            std::to_string(static_cast<double>(*dataPtr)).c_str(),
                                             static_cast<int>(blockData.getDataType()));
                                     }
                                 },

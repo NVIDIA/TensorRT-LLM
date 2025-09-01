@@ -193,7 +193,6 @@ CacheTransBufferManager::CacheTransBufferManager(
     : mCacheManager{cacheManager}
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
 {
-
     // TODO: FP4 dataSize
     TLLM_CHECK(mCacheManager);
     mDataType = mCacheManager->getPrimaryPool(0)->getDataType();
@@ -335,6 +334,7 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
     std::optional<int> bufferId, int targetNum, size_t targetBufferEleSize,
     runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource)
 {
+    printf("[CacheTransBufferManager::getOrAllocateBuffers] targetNum:%d, targetBufferEleSize:%ld, mTransferBufferSize:%ld\n", targetNum, targetBufferEleSize, mTransferBufferSize);
     TLLM_CHECK(bufferId.has_value() || mOnlyUseDynamicBuffer);
     std::vector<runtime::ITensor::SharedPtr> retSplitCaches;
     size_t bufferCoverTargetNum = std::min(
