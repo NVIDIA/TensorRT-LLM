@@ -169,6 +169,7 @@ def run_disaggregated_test(example_dir,
     cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
+    run_env["TLLM_LOG_LEVEL"] = "info"
 
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
