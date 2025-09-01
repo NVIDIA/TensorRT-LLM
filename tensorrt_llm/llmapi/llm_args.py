@@ -443,7 +443,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Set[int]] = None
-    is_mtp_eagle: Optional[bool] = False  # which also means eagle2
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -459,8 +458,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def num_capture_layers(self):
         if self.eagle3_layers_to_capture is not None:
             return len(self.eagle3_layers_to_capture)
-        elif self.is_mtp_eagle:
-            return 1
         return 3
 
     @functools.cached_property
@@ -469,8 +466,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         if self.eagle3_one_model:
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
-        elif self.is_mtp_eagle:
-            return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.EAGLE3
 
     @functools.cached_property
@@ -573,6 +568,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    @functools.cached_property
+    def num_capture_layers(self):
+        if not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
+            return 1
 
     @functools.cached_property
     def spec_dec_mode(self):

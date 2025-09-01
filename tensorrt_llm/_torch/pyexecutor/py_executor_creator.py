@@ -268,6 +268,11 @@ def create_py_executor(
             # The draft model won't have any draft tokens attached to
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
+            if model_engine.model.model_config.pretrained_config.architectures[
+                    0] == "DeepseekV3ForCausalLM":
+                draft_model_path = checkpoint_dir
+            else:
+                draft_model_path = spec_config.speculative_model_dir
 
             use_chain_drafter = (
                 executor_config.guided_decoding_config is None
@@ -289,7 +294,7 @@ def create_py_executor(
                 draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model_dir,
+                model_path=draft_model_path,
                 pytorch_backend_config=draft_pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_beam_width=executor_config.max_beam_width,
