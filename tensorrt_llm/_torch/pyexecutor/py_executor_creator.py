@@ -385,8 +385,11 @@ def create_py_executor(
                     max_num_draft_tokens=max_num_draft_tokens)
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
-        sampler = instantiate_sampler(model_engine, executor_config,
-                                      pytorch_backend_config, mapping)
+        sampler = instantiate_sampler(
+            model_engine, pytorch_backend_config, mapping,
+            executor_config.mm_encoder_only, executor_config.max_batch_size,
+            executor_config.decoding_config, executor_config.max_beam_width,
+            executor_config.kv_cache_config, executor_config.max_seq_len, executor_config.speculative_config)
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     if kv_connector_config is not None:
