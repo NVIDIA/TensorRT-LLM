@@ -325,9 +325,10 @@ void initBindings(nb::module_& m)
             // Get the raw stream handle from PyTorch stream object
             auto stream_ptr = nb::cast<int64_t>(py_stream.attr("cuda_stream"));
             cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            nb::gil_scoped_release release;
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
-        "Delay kernel launch on the default stream", nb::call_guard<nb::gil_scoped_release>());
+        "Delay kernel launch on the default stream");
     m.def(
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
