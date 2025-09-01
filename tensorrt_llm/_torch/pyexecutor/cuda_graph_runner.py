@@ -7,10 +7,11 @@ import torch
 
 from ..expert_statistic import ExpertStatistic
 from ..modules.multi_stream_utils import with_multi_stream
-from ..utils import make_weak_ref, piecewise_cuda_graph
-from .resource_manager import ResourceManager, ResourceManagerType, BaseResourceManager
-from .scheduler import ScheduledRequests
 from ..speculative.eagle3 import Eagle3ResourceManager
+from ..utils import make_weak_ref, piecewise_cuda_graph
+from .resource_manager import (BaseResourceManager, ResourceManager,
+                               ResourceManagerType)
+from .scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from .model_engine import PyTorchModelEngine
@@ -41,11 +42,14 @@ class CUDAGraphRunner:
         self.max_beam_width = engine.max_beam_width
         self.spec_config = engine.spec_config
 
-        self.graphs: Dict[Union[Tuple[int, int], Tuple[int, int, int]], torch.cuda.CUDAGraph] = {}
-        self.static_inputs: Dict[Union[Tuple[int, int], Tuple[int, int, int]], Dict[str, torch.Tensor]] = {}
+        self.graphs: Dict[Union[Tuple[int, int], Tuple[int, int, int]],
+                          torch.cuda.CUDAGraph] = {}
+        self.static_inputs: Dict[Union[Tuple[int, int], Tuple[int, int, int]],
+                                 Dict[str, torch.Tensor]] = {}
         self.graph_outputs: Dict[Union[Tuple[int, int], Tuple[int, int, int]],
                                  Callable[[], Optional[torch.Tensor]]] = {}
-        self.graph_metadata: Dict[Union[Tuple[int, int], Tuple[int, int, int]], Dict[str, Any]] = {}
+        self.graph_metadata: Dict[Union[Tuple[int, int], Tuple[int, int, int]],
+                                  Dict[str, Any]] = {}
         self.memory_pool = engine._cuda_graph_mem_pool
         self.padding_dummy_request: Optional["Request"] = None
 
@@ -53,9 +57,13 @@ class CUDAGraphRunner:
     def enable_spec_decode(self):
         return self._get_engine().is_spec_decode
 
-    def get_graph_key(self, batch_size,spec_resource_manager: Optional[BaseResourceManager] = None):
+    def get_graph_key(
+            self,
+            batch_size,
+            spec_resource_manager: Optional[BaseResourceManager] = None):
         engine = self._get_engine()
-        if engine.is_draft_model and spec_resource_manager is not None and isinstance(spec_resource_manager, Eagle3ResourceManager):
+        if engine.is_draft_model and spec_resource_manager is not None and isinstance(
+                spec_resource_manager, Eagle3ResourceManager):
             if spec_resource_manager.is_first_draft:
                 draft_len = engine.original_max_draft_len
             else:
@@ -64,7 +72,7 @@ class CUDAGraphRunner:
         else:
             draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
             key = (batch_size, draft_len)
-        
+
         return key
 
     @property
@@ -90,7 +98,10 @@ class CUDAGraphRunner:
                 "The parent PyTorchModelEngine has been garbage collected.")
         return engine
 
-    def maybe_get_cuda_graph(self, batch: ScheduledRequests, spec_resource_manager: Optional[BaseResourceManager] = None):
+    def maybe_get_cuda_graph(
+            self,
+            batch: ScheduledRequests,
+            spec_resource_manager: Optional[BaseResourceManager] = None):
         """
         Determines if the current batch can be run with a CUDA graph.
 
@@ -104,7 +115,7 @@ class CUDAGraphRunner:
         # disable when doing statistic
         if hasattr(engine, 'iter_counter') and ExpertStatistic.set_iter(
                 engine.iter_counter):
-            return False, None, None,None
+            return False, None, None, None
 
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
@@ -118,18 +129,18 @@ class CUDAGraphRunner:
                 for all_gen_only in all_can_graph_batch)
 
             if not is_all_gen_only or not all_batch_size_equal:
-                return False, None, None,None
+                return False, None, None, None
 
         if not self.enabled or not can_run_cuda_graph:
-            return False, None, None,None
+            return False, None, None, None
         key = self.get_graph_key(batch_size, spec_resource_manager)
 
         if key in self.graphs:
             return True, self.graph_metadata[key][
-                "attn_metadata"], self.graph_metadata[key]["spec_metadata"],key
+                "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
 
         if batch_size not in self.supported_batch_sizes:
-            return False, None, None,None
+            return False, None, None, None
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
@@ -144,12 +155,12 @@ class CUDAGraphRunner:
             spec_metadata = None
         return True, attn_metadata, spec_metadata, key
 
-    def needs_capture(self,key: Union[Tuple[int, int], Tuple[int, int, int]]):
-        
+    def needs_capture(self, key: Union[Tuple[int, int], Tuple[int, int, int]]):
+
         return key not in self.graph_outputs
 
-    def capture(self,key: Union[Tuple[int, int], Tuple[int, int, int]], forward_fn: Callable,
-                initial_inputs: Dict[str, Any]):
+    def capture(self, key: Union[Tuple[int, int], Tuple[int, int, int]],
+                forward_fn: Callable, initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
         batch_size = key[0]
@@ -198,7 +209,7 @@ class CUDAGraphRunner:
                 output = forward_fn(capture_inputs)
 
         self.graphs[key] = graph
-        
+
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 

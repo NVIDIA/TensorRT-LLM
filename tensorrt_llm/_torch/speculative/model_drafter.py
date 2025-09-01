@@ -109,7 +109,6 @@ class ModelDrafter(Drafter):
             new_request.context_chunk_size = end_compute - begin_compute
         return new_request
 
-
     def _create_accepted_tokens_request(self, request: LlmRequest,
                                         input_tokens: Any,
                                         num_accepted_tokens: int) -> LlmRequest:
@@ -118,12 +117,13 @@ class ModelDrafter(Drafter):
         Only applicable if the draft model needs to recompute KV cache for accepted tokens (e.g. eagle 3)
         """
         #pad input_tokens to max_draft_tokens
-        input_tokens.extend(0 for _ in range(self.max_draft_tokens - num_accepted_tokens))
+        input_tokens.extend(
+            0 for _ in range(self.max_draft_tokens - num_accepted_tokens))
         new_request = self._create_draft_request(request, input_tokens)
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         new_request.py_num_accepted_draft_tokens = request.py_num_accepted_draft_tokens
         new_request.py_is_first_draft = True
-        
+
         return new_request
 
     def _create_draft_request_for_request(
@@ -229,7 +229,7 @@ class ModelDrafter(Drafter):
             resource_manager: ResourceManager,
             previous_batch: Optional[SampleState] = None) -> Dict[str, Any]:
         """Forward pass through the draft model."""
-        
+
         new_tensors_device = previous_batch.device if previous_batch else None
         outputs = self.draft_model_engine.forward(
             draft_batch,
