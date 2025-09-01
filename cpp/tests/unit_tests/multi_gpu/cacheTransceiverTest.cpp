@@ -1075,7 +1075,7 @@ protected:
         }
         int kvFactor = mCacheState->getAttentionConfig().mKvFactor;
         int tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        int startTokenId = blockId * tokensPerBlock;
+        int startTokenId = (blockId * mCpSize + mCpRank) * tokensPerBlock;
         int sizePerHead = mCacheState->getModelConfig().mSizePerHead;
 
         bufferManager.copy(blockData, *hostTensor);
@@ -1099,7 +1099,12 @@ protected:
                             {
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
-                                // EXPECT_EQ(*dataPtr, generateValue);
+                                if (*dataPtr != static_cast<ValueType>(0)) {
+                                    EXPECT_EQ(*dataPtr, generateValue);
+                                } else {
+                                    // // TODO: Remove this when over-allocation is fixed.
+                                    // printf("[verifyBlockData::key] SKIPPING 0! \n");
+                                }
                                 // Debug print with rank information for MPI debugging (KEY values)
                                 if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                 {
@@ -1124,7 +1129,12 @@ protected:
                                 {
                                     using ValueType = decltype(generateValue);
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
-                                    // EXPECT_EQ(*dataPtr, generateValue);
+                                    if (*dataPtr != static_cast<ValueType>(0)) {
+                                        EXPECT_EQ(*dataPtr, generateValue);
+                                    } else {
+                                        // // TODO: Remove this when over-allocation is fixed.
+                                        // printf("[verifyBlockData::value] SKIPPING 0! \n");
+                                    }
                                     // Debug print with rank information for MPI debugging (VALUE values)
                                     if (TARGET_RANK == -1 || tensorrt_llm::mpi::MpiComm::world().getRank() == TARGET_RANK)
                                     {
