@@ -93,6 +93,7 @@ class CompletionOutput:
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
         logprobs (TokenLogprobs | List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
         prompt_logprobs (TokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.
+        top_logprobs (TokenLogprobs, optional): The log probabilities of the top probability words at each position if the top_logprobs are requested. Defaults to None.
         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.

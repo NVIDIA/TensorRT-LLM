@@ -175,6 +175,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      max_top_logprobs:
+        annotation: int
+        default: 0
+        status: prototype
     return_annotation: None
   generate:
     parameters:
