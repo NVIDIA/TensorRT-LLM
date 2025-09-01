@@ -273,7 +273,6 @@ examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp
 examples/test_multimodal.py::test_llm_fp8_multimodal_general[fp8-fp8-cnn_dailymail-Qwen2-VL-7B-Instruct-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False] SKIP (https://nvbugs/5453709)
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5453709)
 examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] SKIP (https://nvbugs/5453742)
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-70B-FP8-llama-3.1-model/Llama-3.1-70B-Instruct-FP8] SKIP (https://nvbugs/5453992)
 examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5434372)
 triton_server/test_triton.py::test_gpt_ib[gpt-ib] SKIP (https://nvbugs/5431116)
 accuracy/test_llm_api.py::TestMistralNemo12B::test_fp8 SKIP (https://nvbugs/5413197)
