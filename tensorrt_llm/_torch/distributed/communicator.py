@@ -161,12 +161,14 @@ class TorchDist(Distributed):
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
-        assert dist.is_initialized()
-        self.mapping.dist = self  # Mapping handles device mesh creation
+        assert dist.is_initialized(
+        ), "torch.distributed should be initialized before TorchDist"
+
         self.cluster_info = None
 
-        if self.rank == 0:
-            logger.debug(f"DeviceMesh: {self.mapping.device_mesh}")
+        from tensorrt_llm._utils import set_torch_comm
+        set_torch_comm(self)  # Set as global instance
+        mapping.build_mesh()
 
         self.setup_local_comm()
         self.default_store = torch.distributed.distributed_c10d._get_default_store(
@@ -399,9 +401,9 @@ class TorchDist(Distributed):
         return tensor_list
 
     @log_op
-    def all_reduce(self,
-                   obj: int | float | torch.Tensor,
-                   op=torch.distributed.ReduceOp.SUM):
+    def allreduce(self,
+                  obj: int | float | torch.Tensor,
+                  op=torch.distributed.ReduceOp.SUM):
         is_base_type = isinstance(obj, int) or isinstance(obj, float)
         if is_base_type:
             obj = torch.tensor(obj)

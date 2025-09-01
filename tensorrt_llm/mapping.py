@@ -16,11 +16,9 @@ from enum import IntEnum
 from typing import List
 
 import torch
-from torch.distributed import get_process_group_ranks
-from torch.distributed.device_mesh import init_device_mesh
 
+from tensorrt_llm._torch.device_mesh import DeviceMeshTopology
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.logger import logger
 
 
 class CpType(IntEnum):
@@ -34,104 +32,8 @@ class CpType(IntEnum):
     HELIX = 3
 
 
-class Mapping(object):
-    '''
-    A node with 8 GPUs, tp_size = 4, cp_size = 1, pp_size = 2
-
-    2 tp groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-
-    4 pp groups:
-
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
-
-    A node with 8 GPUs, tp_size = 4, cp_size = 2, pp_size = 1
-
-    2 tp groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-
-    4 cp groups:
-
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
-
-    A node with 8 GPUs, moe_tp_size = 2, moe_ep_size = 4
-
-    4 moe_tp groups:
-
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
-
-    2 moe_ep groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-
-    2 nodes with 16 GPUs, moe_tp_size = 2, moe_ep_size = 4, pp_size = 2
-
-    8 moe_tp groups:
-
-    - [0 4]
-    - [1 5]
-    - [2 6]
-    - [3 7]
-    - [8 12]
-    - [9 13]
-    - [10 14]
-    - [11 15]
-
-    4 moe_ep groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-    - [8, 9, 10, 11]
-    - [12, 13, 14, 15]
-
-    8 pp groups:
-
-    - [0 8]
-    - [1 9]
-    - [2 10]
-    - [3 11]
-    - [4 12]
-    - [5 13]
-    - [6 14]
-    - [7 15]
-
-    2 nodes with 8 GPUs, tp_size 2, pp_size 2, cp_size 2
-
-    4 tp groups:
-    - [0, 1]
-    - [2, 3]
-    - [4, 5]
-    - [6, 7]
-
-    4 pp groups:
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
-
-    4 cp groups:
-    - [0, 2]
-    - [1, 3]
-    - [4, 6]
-    - [5, 7]
-    '''
-    # Static variable to store the device mesh
-    device_mesh = None
-    tp_mesh = None
+class MappingBase:
+    '''Base class for distributed mapping configurations'''
 
     def __init__(
             self,
@@ -238,21 +140,15 @@ class Mapping(object):
         self.rank = rank
         self.gpus_per_node = gpus_per_node
 
-        # For Ray path. store a reference to TorchDist
-        self._dist = None
-        self._disable_mpi = mpi_disabled()
-
-        # TODO: can deprecate if moving to DeviceMesh
-        self._pp_groups = []
-        self._cp_groups = []
-        self._tp_groups = []
-        self._moe_cluster_groups = []
-        self._moe_tp_groups = []
-        self._moe_ep_groups = []
-        self._init_parallel_groups()
+        self.pp_groups = []
+        self.cp_groups = []
+        self.tp_groups = []
+        self.moe_cluster_groups = []
+        self.moe_tp_groups = []
+        self.moe_ep_groups = []
 
     def __eq__(self, other):
-        if not isinstance(other, Mapping):
+        if not isinstance(other, MappingBase):
             return NotImplemented
 
         return (self.world_size == other.world_size and self.rank == other.rank
@@ -287,22 +183,6 @@ class Mapping(object):
         ))
 
     @property
-    def dist(self):
-        return self._dist
-
-    @dist.setter
-    def dist(self, dist):
-        if self._dist is not None:
-            raise RuntimeError(f"Mapping.dist is already set to {dist}")
-        if not self._disable_mpi:
-            logger.warning(
-                "No affect on setting dist for Mapping, unless TLLM_DISABLE_MPI=1."
-            )
-            return
-        self._build_mesh()
-        self._dist = dist
-
-    @property
     def rank(self):
         return self._rank
 
@@ -317,28 +197,6 @@ class Mapping(object):
         self._rank = rank
 
     @property
-    def tp_rank(self):
-        if Mapping.device_mesh:
-            assert self.auto_parallel == False, "Auto parallel not yet implemented in Ray path."
-            return self.tp_group_pg.rank()
-        else:
-            return 0 if self.auto_parallel else self.rank % self.tp_size
-
-    @property
-    def pp_rank(self):
-        if Mapping.device_mesh:
-            assert self.auto_parallel == False, "Auto parallel not yet implemented in Ray path."
-            return self.pp_group_pg.rank()
-        else:
-            return 0 if self.auto_parallel else self.rank // (self.tp_size *
-                                                              self.cp_size)
-
-    @property
-    def cp_rank(self):
-        return 0 if self.auto_parallel else self.rank % (
-            self.tp_size * self.cp_size) // self.tp_size
-
-    @property
     def moe_tp_rank(self):
         return self.tp_rank // (self.moe_ep_size * self.moe_cluster_size)
 
@@ -350,97 +208,10 @@ class Mapping(object):
     def moe_ep_rank(self):
         return self.tp_rank % self.moe_ep_size
 
-    # TODO: Remove parity assertions and old mapping code if moving to use DeviceMesh
-    # for all following xx_group functs.
-    @property
-    def tp_group(self):
-        mapping_old = self._tp_groups[self.pp_rank * self.cp_size +
-                                      self.cp_rank]
-        if Mapping.device_mesh:
-            mapping_dm = get_process_group_ranks(self.tp_group_pg)
-            assert mapping_old == mapping_dm
-            return mapping_dm
-        return mapping_old
-
-    @property
-    def pp_group(self):
-        mapping_old = self._pp_groups[self.cp_rank * self.tp_size +
-                                      self.tp_rank]
-        if Mapping.device_mesh:
-            mapping_dm = get_process_group_ranks(self.pp_group_pg)
-            assert mapping_old == mapping_dm
-            return mapping_dm
-        return mapping_old
-
-    @property
-    def cp_group(self):
-        mapping_old = self._cp_groups[self.pp_rank * self.tp_size +
-                                      self.tp_rank]
-        if Mapping.device_mesh:
-            mapping_dm = get_process_group_ranks(self.cp_group_pg)
-            assert mapping_old == mapping_dm
-            return mapping_dm
-        return mapping_old
-
-    @property
-    def moe_tp_group(self):
-        mapping_old = self._moe_tp_groups[
-            self.pp_rank * self.moe_cluster_size * self.moe_ep_size +
-            self.moe_cluster_rank * self.moe_ep_size + self.moe_ep_rank]
-        if Mapping.device_mesh:
-            mapping_dm = get_process_group_ranks(self.moe_tp_group_pg)
-            assert mapping_old == mapping_dm
-            return mapping_dm
-        return mapping_old
-
-    @property
-    def moe_ep_group(self):
-        mapping_old = self._moe_ep_groups[
-            self.pp_rank * self.moe_tp_size * self.moe_cluster_size +
-            self.moe_tp_rank * self.moe_cluster_size + self.moe_cluster_rank]
-        if Mapping.device_mesh:
-            mapping_dm = get_process_group_ranks(self.moe_ep_group_pg)
-            assert mapping_old == mapping_dm
-            return mapping_dm
-        return mapping_old
-
     @property
     def moe_cluster_group(self):
-        return self._moe_cluster_groups[self.pp_rank * self.moe_tp_size +
-                                        self.moe_tp_rank]
-
-    # == For accessing the Process Group of the current rank for Ray path==
-    def _get_mesh_dim_by_name(self, name: str):
-        if name == 'tp':
-            if 'tp' in Mapping.device_mesh.mesh_dim_names:
-                return Mapping.device_mesh['tp']
-            else:
-                return Mapping.tp_mesh
-        else:
-            assert name in Mapping.device_mesh.mesh_dim_names
-            return Mapping.device_mesh[name]
-
-    @property
-    def tp_group_pg(self):
-        return self._get_mesh_dim_by_name('tp').get_group()
-
-    @property
-    def pp_group_pg(self):
-        return self._get_mesh_dim_by_name('pp').get_group()
-
-    @property
-    def cp_group_pg(self):
-        return self._get_mesh_dim_by_name('cp').get_group()
-
-    @property
-    def moe_tp_group_pg(self):
-        return self._get_mesh_dim_by_name('moe_tp').get_group()
-
-    @property
-    def moe_ep_group_pg(self):
-        return self._get_mesh_dim_by_name('moe_ep').get_group()
-
-    # =========
+        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
+                                       self.moe_tp_rank]
 
     @property
     def node_rank(self):
@@ -563,44 +334,68 @@ class Mapping(object):
             'auto_parallel': self.auto_parallel,
         }
 
-    def _build_mesh(self):
-        if self.world_size == 1:
-            return
-        if Mapping.device_mesh is not None:
-            return
-        if not torch.distributed.is_initialized():
-            raise RuntimeError(
-                "DeviceMesh creation requested but torch.distributed process group "
-                "has not been initialised")
 
-        # TODO: need to decide dim order
-        dims = ["cp", "pp"]
-        shape = [self.cp_size, self.pp_size]
+class MpiTopology:
+    '''MPI-based mapping implementation'''
 
-        if self.moe_ep_size > 1:
-            dims += ["moe_tp", "moe_ep"]
-            shape += [self.moe_tp_size, self.moe_ep_size]
-        else:
-            dims += ["tp"]
-            shape += [self.tp_size]
+    def __init__(self, mapping: 'MappingBase'):
+        self.mapping = mapping
+        self._init_parallel_groups()
 
-        Mapping.device_mesh = init_device_mesh(
-            "cuda",
-            mesh_shape=tuple(shape),
-            mesh_dim_names=tuple(dims),
-        )
+    def __getattr__(self, name):
+        mapping = object.__getattribute__(self, "mapping")
+        return getattr(mapping, name)
 
-        if self.moe_ep_size > 1:
-            Mapping.tp_mesh = Mapping.device_mesh["moe_tp", "moe_ep"]._flatten(
-                mesh_dim_name="tp")
-        logger.debug(f"Mapping.device_mesh {Mapping.device_mesh}")
-        logger.debug(f"Mapping.tp_mesh {Mapping.tp_mesh}")
+    @property
+    def tp_rank(self) -> int:
+        return 0 if self.auto_parallel else self.rank % self.tp_size
+
+    @property
+    def pp_rank(self) -> int:
+        return 0 if self.auto_parallel else self.rank // (self.tp_size *
+                                                          self.cp_size)
+
+    @property
+    def cp_rank(self) -> int:
+        return 0 if self.auto_parallel else self.rank % (
+            self.tp_size * self.cp_size) // self.tp_size
+
+    @property
+    def tp_group(self) -> List[int]:
+        return self.tp_groups[self.pp_rank * self.cp_size + self.cp_rank]
+
+    @property
+    def pp_group(self) -> List[int]:
+        return self.pp_groups[self.cp_rank * self.tp_size + self.tp_rank]
+
+    @property
+    def cp_group(self) -> List[int]:
+        return self.cp_groups[self.pp_rank * self.tp_size + self.tp_rank]
+
+    @property
+    def moe_tp_group(self) -> List[int]:
+        return self.moe_tp_groups[self.pp_rank * self.moe_cluster_size *
+                                  self.moe_ep_size +
+                                  self.moe_cluster_rank * self.moe_ep_size +
+                                  self.moe_ep_rank]
+
+    @property
+    def moe_ep_group(self) -> List[int]:
+        return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
+                                  self.moe_cluster_size +
+                                  self.moe_tp_rank * self.moe_cluster_size +
+                                  self.moe_cluster_rank]
+
+    @property
+    def moe_cluster_group(self) -> List[int]:
+        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
+                                       self.moe_tp_rank]
 
     def _init_parallel_groups(self):
         # init pp group
         for i in range(self.tp_size * self.cp_size):
             ranks = range(i, self.world_size, self.tp_size * self.cp_size)
-            self._pp_groups.append(list(ranks))
+            self.pp_groups.append(list(ranks))
 
         # init cp group
         for i in range(self.pp_size):
@@ -608,7 +403,7 @@ class Mapping(object):
                 ranks = range(i * self.tp_size * self.cp_size + j,
                               (i + 1) * self.tp_size * self.cp_size + j,
                               self.tp_size)
-                self._cp_groups.append(list(ranks))
+                self.cp_groups.append(list(ranks))
 
         # init tp group
         for i in range(self.pp_size):
@@ -616,7 +411,7 @@ class Mapping(object):
                 ranks = range(
                     i * self.tp_size * self.cp_size + j * self.tp_size,
                     i * self.tp_size * self.cp_size + (j + 1) * self.tp_size)
-                self._tp_groups.append(list(ranks))
+                self.tp_groups.append(list(ranks))
 
         # init moe tp group
         for i in range(self.pp_size):
@@ -624,7 +419,7 @@ class Mapping(object):
                 ranks = range(i * self.moe_tp_cluster_ep_size + j,
                               (i + 1) * self.moe_tp_cluster_ep_size,
                               self.moe_cluster_size * self.moe_ep_size)
-                self._moe_tp_groups.append(list(ranks))
+                self.moe_tp_groups.append(list(ranks))
 
         # init moe cluster group
         for i in range(self.pp_size):
@@ -634,7 +429,7 @@ class Mapping(object):
                     j * self.moe_cluster_size * self.moe_ep_size,
                     i * self.moe_tp_cluster_ep_size +
                     (j + 1) * self.moe_cluster_size * self.moe_ep_size)
-                self._moe_cluster_groups.append(list(ranks))
+                self.moe_cluster_groups.append(list(ranks))
 
         # init moe ep group
         for i in range(self.pp_size):
@@ -646,4 +441,187 @@ class Mapping(object):
                         k * self.moe_ep_size, i * self.moe_tp_cluster_ep_size +
                         j * self.moe_cluster_size * self.moe_ep_size +
                         (k + 1) * self.moe_ep_size)
-                    self._moe_ep_groups.append(list(ranks))
+                    self.moe_ep_groups.append(list(ranks))
+
+
+class Mapping(MappingBase):
+    '''
+    A node with 8 GPUs, tp_size = 4, cp_size = 1, pp_size = 2
+
+    2 tp groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+
+    4 pp groups:
+
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    A node with 8 GPUs, tp_size = 4, cp_size = 2, pp_size = 1
+
+    2 tp groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+
+    4 cp groups:
+
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    A node with 8 GPUs, moe_tp_size = 2, moe_ep_size = 4
+
+    4 moe_tp groups:
+
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    2 moe_ep groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+
+    2 nodes with 16 GPUs, moe_tp_size = 2, moe_ep_size = 4, pp_size = 2
+
+    8 moe_tp groups:
+
+    - [0 4]
+    - [1 5]
+    - [2 6]
+    - [3 7]
+    - [8 12]
+    - [9 13]
+    - [10 14]
+    - [11 15]
+
+    4 moe_ep groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+    - [8, 9, 10, 11]
+    - [12, 13, 14, 15]
+
+    8 pp groups:
+
+    - [0 8]
+    - [1 9]
+    - [2 10]
+    - [3 11]
+    - [4 12]
+    - [5 13]
+    - [6 14]
+    - [7 15]
+
+    2 nodes with 8 GPUs, tp_size 2, pp_size 2, cp_size 2
+
+    4 tp groups:
+    - [0, 1]
+    - [2, 3]
+    - [4, 5]
+    - [6, 7]
+
+    4 pp groups:
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    4 cp groups:
+    - [0, 2]
+    - [1, 3]
+    - [4, 6]
+    - [5, 7]
+    '''
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if mpi_disabled():
+            self._impl = DeviceMeshTopology(self)
+        else:
+            self._impl = MpiTopology(self)
+
+    @property
+    def tp_rank(self) -> int:
+        return self._impl.tp_rank
+
+    @property
+    def pp_rank(self) -> int:
+        return self._impl.pp_rank
+
+    @property
+    def cp_rank(self) -> int:
+        return self._impl.cp_rank
+
+    @property
+    def tp_group(self) -> List[int]:
+        return self._impl.tp_group
+
+    @property
+    def pp_group(self) -> List[int]:
+        return self._impl.pp_group
+
+    @property
+    def cp_group(self) -> List[int]:
+        return self._impl.cp_group
+
+    @property
+    def moe_tp_group(self) -> List[int]:
+        return self._impl.moe_tp_group
+
+    @property
+    def moe_ep_group(self) -> List[int]:
+        return self._impl.moe_ep_group
+
+    @property
+    def moe_cluster_group(self) -> List[int]:
+        return self._impl.moe_cluster_group
+
+    # DeviceMesh specific methods
+    @property
+    def tp_group_pg(self):
+        if not mpi_disabled():
+            raise RuntimeError(
+                "tp_group_pg() is only available in Ray orchestrator mode.")
+        return self._impl.tp_group_pg
+
+    @property
+    def pp_group_pg(self):
+        if not mpi_disabled():
+            raise RuntimeError(
+                "pp_group_pg() is only available in Ray orchestrator mode.")
+        return self._impl.pp_group_pg
+
+    @property
+    def cp_group_pg(self):
+        if not mpi_disabled():
+            raise RuntimeError(
+                "cp_group_pg() is only available in Ray orchestrator mode.")
+        return self._impl.cp_group_pg
+
+    @property
+    def moe_tp_group_pg(self):
+        if not mpi_disabled():
+            raise RuntimeError(
+                "moe_tp_group_pg() is only available in Ray orchestrator mode.")
+        return self._impl.moe_tp_group_pg
+
+    @property
+    def moe_ep_group_pg(self):
+        if not mpi_disabled():
+            raise RuntimeError(
+                "moe_ep_group_pg() is only available in Ray orchestrator mode.")
+        return self._impl.moe_ep_group_pg
+
+    def build_mesh(self):
+        if not mpi_disabled():
+            raise RuntimeError(
+                "build_mesh() is only available in Ray orchestrator mode.")
+        return self._impl.build_mesh()

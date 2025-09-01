@@ -110,7 +110,9 @@ class IpcMemory:
             return size
 
         if mpi_disabled():
-            allgather = mapping.dist.tp_allgather
+            from tensorrt_llm._utils import torch_comm
+
+            allgather = torch_comm().tp_allgather
         else:
             comm = mpi_comm().Split(
                 mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank

@@ -491,6 +491,24 @@ def local_mpi_comm():
     return local_comm
 
 
+# Global TorchDist instance for Ray orchestrator
+_torch_comm = None
+
+
+def set_torch_comm(torch_comm_instance):
+    """Set global TorchDist instance"""
+    global _torch_comm
+    _torch_comm = torch_comm_instance
+
+
+def torch_comm():
+    """Get global TorchDist instance"""
+    if _torch_comm is None:
+        raise RuntimeError(
+            "TorchDist not initialized. Call set_torch_comm() first.")
+    return _torch_comm
+
+
 def mpi_disabled() -> bool:
     """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
     return os.environ.get("TLLM_DISABLE_MPI") == "1"

@@ -562,7 +562,8 @@ class KVCacheManager(BaseResourceManager):
         if mapping.world_size > 1:
             # make sure all ranks use same value for maxTokens
             if mpi_disabled():
-                max_tokens = mapping.dist.all_reduce(
+                from tensorrt_llm._utils import torch_comm
+                max_tokens = torch_comm().allreduce(
                     max_tokens, op=torch.distributed.ReduceOp.MIN)
             else:
                 max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)

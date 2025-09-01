@@ -1,25 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import os
-import socket
 import unittest
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
 
 
@@ -59,8 +45,7 @@ class TestMapping(unittest.TestCase):
 
             mp.spawn(
                 self._worker,
-                args=(world_size, self._find_free_port(), tp, pp, cp, moe_tp,
-                      moe_ep),
+                args=(world_size, get_free_port(), tp, pp, cp, moe_tp, moe_ep),
                 nprocs=world_size,
                 join=True,
             )
@@ -79,13 +64,15 @@ class TestMapping(unittest.TestCase):
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["LOCAL_RANK"] = str(rank)
-        os.environ["TLLM_DISABLE_MPI"] = "1"
         torch.cuda.set_device(rank)
 
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        # Create MPI mapping first (no TLLM_DISABLE_MPI)
+        if "TLLM_DISABLE_MPI" in os.environ:
+            del os.environ["TLLM_DISABLE_MPI"]
 
-        mapping = Mapping(
+        mapping_mpi = Mapping(
             world_size=world_size,
+            rank=rank,
             gpus_per_node=world_size,
             tp_size=tp,
             pp_size=pp,
@@ -94,22 +81,38 @@ class TestMapping(unittest.TestCase):
             moe_ep_size=moe_ep,
         )
 
-        mapping.dist = dist
-        mapping.rank = rank
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-        if rank == 0:
-            print(f"Device mesh: {Mapping.device_mesh}")
+        os.environ["TLLM_DISABLE_MPI"] = "1"
 
-        for dim in Mapping.device_mesh.mesh_dim_names:
-            # local-view assertions are tentatively in Mapping attribute getters.
-            getattr(mapping, f"{dim}_group")
+        mapping_device_mesh = Mapping(
+            world_size=world_size,
+            rank=rank,
+            gpus_per_node=world_size,
+            tp_size=tp,
+            pp_size=pp,
+            cp_size=cp,
+            moe_tp_size=moe_tp,
+            moe_ep_size=moe_ep,
+        )
+
+        mapping_device_mesh.build_mesh()
+
+        properties = []
+        for dim in mapping_device_mesh._impl.device_mesh.mesh_dim_names:
+            properties.append(f"{dim}_rank")
+            properties.append(f"{dim}_group")
+
+        for prop in properties:
+            mpi_value = getattr(mapping_mpi, prop)
+            device_mesh_value = getattr(mapping_device_mesh, prop)
+
+            if rank == 0:
+                print(
+                    f"  {prop}: MPI={mpi_value}, DeviceMesh={device_mesh_value}"
+                )
+
+            assert mpi_value == device_mesh_value, \
+                f"Property {prop} mismatch: MPI={mpi_value}, DeviceMesh={device_mesh_value} (rank {rank})"
 
         dist.destroy_process_group()
-
-    @staticmethod
-    def _find_free_port() -> int:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("", 0))
-        port = s.getsockname()[1]
-        s.close()
-        return port
