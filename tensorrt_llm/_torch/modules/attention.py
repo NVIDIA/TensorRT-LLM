@@ -316,7 +316,8 @@ class Attention(nn.Module):
             has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                                or self.o_proj.has_fp8_block_scales
                                or self.o_proj.has_fp8_rowwise)
-            if has_quant_scale and self.attn.has_fp8_kv_cache:
+            if has_quant_scale and (self.attn.has_fp8_kv_cache
+                                    or self.attn.has_fp4_kv_cache):
                 out_dtype = torch.float8_e4m3fn
         output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
         return output
@@ -361,6 +362,13 @@ class Attention(nn.Module):
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output:
             out_scale_sf = self.o_proj.input_scale
 
+        kv_scales_sf = None
+        kv_scales_sf_inv = None
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
+        ):
+            kv_scales_sf = self.qkv_proj.kv_scales
+            kv_scales_sf_inv = self.qkv_proj.inv_kv_scales
+
         mrope_config = None
         if mrope_rotary_cos_sin is not None or mrope_position_deltas is not None:
             mrope_config = dict()
@@ -376,6 +384,8 @@ class Attention(nn.Module):
             attn_metadata,
             out_scale=out_scale,
             out_scale_sf=out_scale_sf,
+            kv_scales_sf=kv_scales_sf,
+            kv_scales_sf_inv=kv_scales_sf_inv,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
             attention_window_size=attention_window_size,

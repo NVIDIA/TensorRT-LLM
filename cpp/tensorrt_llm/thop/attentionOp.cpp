@@ -248,22 +248,55 @@ public:
                     ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
                     : nullptr);
 
-        auto const cache_elem_size = (op.mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
+        // The cache element size in bits.
+        int cache_elem_bits = op.getKvCacheElemSizeInBits<T>();
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
-        auto const bytes_per_block = block_size * cache_elem_size;
+        auto const bytes_per_block = block_size * cache_elem_bits / 8 /*bits*/;
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
-        void* host_primary_pool_pointer = op.useKVCache() && host_kv_cache_pool_pointers.has_value()
-            ? reinterpret_cast<void*>(
+        // Prepare block pool pointers for NVFP4 KV cache.
+        void* host_primary_pool_pointer{nullptr};
+        void* host_secondary_pool_pointer{nullptr};
+        void* host_primary_block_scale_pool_pointer{nullptr};
+        void* host_secondary_block_scale_pool_pointer{nullptr};
+
+        // Whether NVFP4 KV cache is used.
+        bool const use_kv_cache = op.useKVCache() && host_kv_cache_pool_pointers.has_value();
+        bool const use_nvfp4_kv_cache = use_kv_cache && op.mKVCacheQuantMode.hasFp4KvCache();
+        if (use_nvfp4_kv_cache)
+        {
+            // For NVFP4 KV cache, extra block scales are stored in separate pools.
+            // The layout of host_kv_cache_pool_pointers is [num_pools, 2 (primary and secondary), 2 (data and scale)].
+            TORCH_CHECK(host_kv_cache_pool_pointers.value().dim() == 3);
+            host_primary_pool_pointer = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0, 0}).item<int64_t>())
+                + intra_pool_offset);
+            host_secondary_pool_pointer = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1, 0}).item<int64_t>())
+                + intra_pool_offset);
+            // Calculate the intra-pool offset for scaling factors.
+            // Note that NVFP4 block scaling use a fixed vector size of 16.
+            auto constexpr vector_size = 16;
+            auto const bytes_per_block_sf = block_size / vector_size * 1 /*bytes per E4M3 sf*/;
+            auto const intra_pool_offset_sf = layer_idx_in_cache_pool * kv_factor * bytes_per_block_sf;
+            host_primary_block_scale_pool_pointer = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0, 1}).item<int64_t>())
+                + intra_pool_offset_sf);
+            host_secondary_block_scale_pool_pointer = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1, 1}).item<int64_t>())
+                + intra_pool_offset_sf);
+        }
+        else if (use_kv_cache)
+        {
+            TORCH_CHECK(host_kv_cache_pool_pointers.value().dim() == 2);
+            host_primary_pool_pointer = reinterpret_cast<void*>(
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
-                + intra_pool_offset)
-            : nullptr;
-        void* host_secondary_pool_pointer = op.useKVCache() && host_kv_cache_pool_pointers.has_value()
-            ? reinterpret_cast<void*>(
+                + intra_pool_offset);
+            host_secondary_pool_pointer = reinterpret_cast<void*>(
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
-                + intra_pool_offset)
-            : nullptr;
+                + intra_pool_offset);
+        }
 
         float const* kv_scale_orig_quant_ptr = nullptr;
         float const* kv_scale_quant_orig_ptr = nullptr;
@@ -272,6 +305,11 @@ public:
         {
             kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
             kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
+            if (op.mKVCacheQuantMode.hasFp4KvCache())
+            {
+                TORCH_CHECK(kv_scale_orig_quant.value().size(0) == 3);
+                TORCH_CHECK(kv_scale_quant_orig.value().size(0) == 3);
+            }
         }
         // For FP8 output, out_scale represents the output scale.
         float const* out_scale_ptr = (op.mFP8ContextFMHA && !op.mFuseFp4Quant && out_scale.has_value())
@@ -310,6 +348,8 @@ public:
         common_enqueue_params.block_offsets = block_offsets;
         common_enqueue_params.host_primary_pool_pointer = host_primary_pool_pointer;
         common_enqueue_params.host_secondary_pool_pointer = host_secondary_pool_pointer;
+        common_enqueue_params.host_primary_block_scale_pool_pointer = host_primary_block_scale_pool_pointer;
+        common_enqueue_params.host_secondary_block_scale_pool_pointer = host_secondary_block_scale_pool_pointer;
         common_enqueue_params.num_tokens = num_tokens;
         common_enqueue_params.total_kv_len = total_kv_len;
         common_enqueue_params.max_blocks_per_sequence = max_blocks_per_sequence;
@@ -738,7 +778,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     op->mHeadSize = head_size;
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
-    op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache();
+    op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mKVCacheQuantMode.hasFp4KvCache();
     op->mUseKVCache = true;
     op->mPagedKVCache = true;
     op->mTokensPerBlock = tokens_per_block.value_or(0);

@@ -612,6 +612,14 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         mLayerToIndexWithinPool[layerIdx] = layerIndexWithinPool;
     }
 
+    auto numEltsPerContainer = getNumEltsPerContainer();
+#ifdef ENABLE_FP4
+    if (numEltsPerContainer == 2)
+    {
+        TLLM_CHECK_WITH_INFO(sizePerHead % 2 == 0, "sizePerHead must be divisible by 2 for 4-bit KV cache.");
+    }
+#endif
+
     size_t poolIndex = 0;
     for (auto const [numKvHeads, numLayers] : numLayersPerPool)
     {
@@ -622,7 +630,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
                 mLayerToPoolIndex[layerIdx] = poolIndex;
             }
         }
-        mPools.emplace_back(numLayers, mKVFactor, numKvHeads, sizePerHead, tokensPerBlock, 1);
+        mPools.emplace_back(numLayers, mKVFactor, numKvHeads, sizePerHead / numEltsPerContainer, tokensPerBlock);
         ++poolIndex;
     }
 
@@ -707,15 +715,16 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
 
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
 {
+    SizeType32 const numEltsPerContainer = getNumEltsPerContainer();
     auto num_pools = mPools.size();
     for (size_t i = 0; i < num_pools; ++i)
     {
         auto& kv_pool = mPools[i];
-        TLLM_CHECK_WITH_INFO(kv_pool.blockSize % quantBlockSize == 0,
-            "Cannot use FP4 quantization since kv_pool.blockSize is not divisible by FP4 quantBlockSize.");
-
-        mPools.emplace_back(kv_pool.numLayers, kv_pool.kvFactor, kv_pool.numKvHeads, kv_pool.sizePerHead,
-            kv_pool.tokensPerBlock, quantBlockSize,
+        TLLM_CHECK_WITH_INFO((kv_pool.sizePerHead * numEltsPerContainer) % quantBlockSize == 0,
+            "Cannot use FP4 quantization since kv_pool.sizePerHead is not divisible by FP4 quantBlockSize.");
+        auto blockScaleSizePerHead = kv_pool.sizePerHead * numEltsPerContainer / quantBlockSize;
+        mPools.emplace_back(kv_pool.numLayers, kv_pool.kvFactor, kv_pool.numKvHeads, blockScaleSizePerHead,
+            kv_pool.tokensPerBlock,
             /*primaryPool=*/nullptr,
             /*secondaryPool=*/nullptr,
             /*containsBlockScales=*/true);
@@ -749,10 +758,6 @@ void WindowBlockManager::allocatePools(bool useUvm)
 
         if (poolIsFP4)
         {
-            TLLM_CHECK_WITH_INFO(blockSize % 2 == 0, "Block size must be divisible by 2 for FP4 KV cache.");
-            // Divide by 2. We can't create FP4 buffers directly, so we'll have to create a uint8 buffer with
-            // half the expected number of elements.
-            blockSize /= 2;
             poolDtype = nvinfer1::DataType::kINT8;
         }
 
