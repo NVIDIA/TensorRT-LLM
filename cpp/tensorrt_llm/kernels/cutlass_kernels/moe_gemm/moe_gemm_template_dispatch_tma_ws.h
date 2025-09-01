@@ -102,22 +102,22 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
         TLLM_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");
     }
 #endif
-#ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
+    // #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability == 103)
     {
         static bool first_time = true;
         if (first_time)
         {
             TLLM_LOG_WARNING(
-                "Falling back to sm100f version. For best performance please recompile with support for blackwell by "
-                "passing 103-real as an arch to build_wheel.py.");
+                "Falling back to sm100f version due to a bug in cutlass." /*"For best performance please recompile with support for blackwell by "
+                "passing 103-real as an arch to build_wheel.py."*/);
             first_time = false;
         }
         return dispatchMoeGemmSelectBiasTmaWarpSpecialized<cutlass::arch::Sm100, T, WeightType, OutputType, EpilogueTag,
             FUSION, TileShape, ClusterShape>(
             hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
     }
-#endif
+// #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120)
     {
