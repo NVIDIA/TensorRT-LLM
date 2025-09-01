@@ -414,6 +414,7 @@ public:
     bool mFP8AttenOutput = false;
     bool mFP8ContextMLA = false;
     bool mFP8GenerationMLA = false;
+    size_t mChunkPrefillBufferBatchSize = 1;
     bool mDenseContextFMHA = false;
     bool mHasFullAttentionMask = false;
     bool mIsSpecDecodingEnabled = false;

@@ -635,3 +635,4 @@ class MLAParams:
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
+    chunk_prefill_buffer_batch_size: int = 1
