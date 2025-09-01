@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -19,7 +19,9 @@ from tensorrt_llm.bindings.executor import \
     GuidedDecodingConfig as _GuidedDecodingConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig, PybindMirror,
+from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig,
+                                          KvCacheConnectorConfig,
+                                          MTPDecodingConfig, PybindMirror,
                                           TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
@@ -41,6 +43,7 @@ from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+from .sampler import TorchSampler, TRTLLMSampler
 
 
 class _ExecutorCreationStage(enum.Enum):
@@ -157,6 +160,103 @@ class _ExecutorMemoryMonitor():
                     free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
                     free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
                 ))
+
+
+def validate_llm_args(llm_args, model_engine, sampler):
+    # Validate the flags for features' combination
+    def init_feature_status(llm_args) -> Dict[str, bool]:
+        assert isinstance(
+            llm_args, TorchLlmArgs
+        ), "Expect TorchLlmArgs used for feature status validation."
+        feature_list = [
+            "overlap_scheduler",
+            "cuda_graph",
+            "attention_dp",
+            "disaggregated_serving",
+            "chunked_prefill",
+            "mtp",
+            "eagle3_one_model",
+            "eagle3_two_model",
+            "torch_sampler",
+            "tllm_cpp_sampler",
+            "kv_cache_reuse",
+            "slide_window_attention",
+            # "logits_post_processor",
+            "guided_decoding",
+        ]
+        feature_status: Dict[str, bool] = dict.fromkeys(feature_list)
+        feature_status[
+            "overlap_scheduler"] = not llm_args.disable_overlap_scheduler
+        feature_status["cuda_graph"] = llm_args.cuda_graph_config is not None
+        feature_status["attention_dp"] = llm_args.enable_attention_dp
+        feature_status[
+            "disaggregated_serving"] = llm_args.cache_transceiver_config is not None
+        feature_status["chunked_prefill"] = llm_args.enable_chunked_prefill
+        feature_status["mtp"] = (
+            isinstance(llm_args.speculative_config, MTPDecodingConfig)
+            and llm_args.speculative_config.num_nextn_predict_layers > 0)
+        feature_status["eagle3_one_model"] = (
+            isinstance(llm_args.speculative_config, EagleDecodingConfig)
+            and llm_args.speculative_config.eagle3_one_model)
+        feature_status["eagle3_two_model"] = (
+            isinstance(llm_args.speculative_config, EagleDecodingConfig)
+            and not llm_args.speculative_config.eagle3_one_model)
+        feature_status["torch_sampler"] = isinstance(sampler, TorchSampler)
+        feature_status["tllm_cpp_sampler"] = isinstance(sampler, TRTLLMSampler)
+        feature_status[
+            "kv_cache_reuse"] = llm_args.kv_cache_config is not None and llm_args.kv_cache_config.enable_block_reuse
+        feature_status["slide_window_attention"] = (
+            hasattr(model_engine.model.model_config.pretrained_config,
+                    "layer_types") and "sliding_attention"
+            in model_engine.model.model_config.pretrained_config.layer_types)
+        feature_status[
+            "guided_decoding"] = llm_args.guided_decoding_backend is not None
+        assert all(v is not None for v in feature_status.values()
+                   ), "feature status has not been fully initialized."
+        assert all(
+            k in feature_list for k in
+            feature_status.keys()), "unexpected feature type in feature_status."
+        return feature_status
+
+    feature_status: Dict[str, bool] = init_feature_status(llm_args)
+
+    ERR_MSG_TMPL = "{feature1} and {feature2} enabled together is not supported yet."
+    # Some combinations of features are unsupported; the implementation may,
+    # however, implicitly cast arguments to make them appear compatible.
+    # Enabling this flag suppresses that cast and forces an explicit error instead.
+    force_error_on_implicit_cast = False
+    if force_error_on_implicit_cast:
+        if feature_status["overlap_scheduler"] and feature_status[
+                "eagle3_two_model"]:
+            # Overlap scheduler with eagle-3 two models is not supported.
+            # Previously we will disable overlap scheduler with a warning
+            # https://github.com/NVIDIA/TensorRT-LLM/blob/fe7dda834d6d49a9b654ba70a4f1a8a6aaf9c715/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py#L174-L179
+            # Prefer a explicitly error msg here:
+            raise ValueError(
+                ERR_MSG_TMPL.format(feature1="overlap_scheduler",
+                                    feature2="eagle3_two_model"))
+        if (feature_status["mtp"] or feature_status["eagle3_one_model"]
+                or feature_status["eagle3_two_model"]):
+            if feature_status["tllm_cpp_sampler"]:
+                # Mtp with tllm_cpp_sampler is not supported.
+                # Previously we will use torch_sampler implicitly
+                # https://github.com/NVIDIA/TensorRT-LLM/blob/70e352a6f784f1cfd2affc074ac8d83e430abd9a/tensorrt_llm/_torch/pyexecutor/_util.py#L599
+                # Prefer a explicitly error msg here:
+                raise ValueError(
+                    ERR_MSG_TMPL.format(feature1="speculative decoding",
+                                        feature2="tllm_cpp_sampler"))
+    if feature_status["mtp"] and feature_status["slide_window_attention"]:
+        raise ValueError(
+            ERR_MSG_TMPL.format(feature1="mtp",
+                                feature2="slide_window_attention"))
+    if feature_status["guided_decoding"]:
+        if feature_status["mtp"]:
+            raise ValueError(
+                ERR_MSG_TMPL.format(feature1="mtp", feature2="guided_decoding"))
+        if feature_status["eagle3_one_model"]:
+            raise ValueError(
+                ERR_MSG_TMPL.format(feature1="eagle3_one_model",
+                                    feature2="guided_decoding"))
 
 
 def create_py_executor(
@@ -433,6 +533,8 @@ def create_py_executor(
                                       decoding_config, max_beam_width,
                                       kv_cache_config, max_seq_len, spec_config)
         logger.info(f"Using Sampler: {type(sampler).__name__}")
+
+    validate_llm_args(llm_args, model_engine, sampler)
 
     if kv_connector_config is not None:
         logger.info(
