@@ -238,10 +238,10 @@ You need to set `enable_attention_dp`, `tp_size`, `ep_size`, `max_batch_size` an
 
 | **reasoning-effort** | **parallel configuration** | **max_batch_size** | **max_num_tokens** |
 |:--------------------:|:--------------------------:|:------------------:|:------------------:|
-| low/medium           | DP+TP8+EP8 / DP+TP4+EP4    | 128                | 32768              |
-| high                 | DP+TP8+EP8 / DP+TP4+EP4    | 2                  | 133120             |
+| low/medium           | DEP8 / DEP4                | 128                | 32768              |
+| high                 | DEP8 / DEP4                | 2                  | 133120             |
 | low/medium           | TP8 / TP4                  | 1024               | 32768              |
-| high                 | TP8 / TP4                  | 16                 | 133120             |
+| high                 | TP8 / TP4                  | 720                | 133120             |
 
 Below is an example command for evaluating the accuracy of gpt-oss-120b with low and medium reasoning-effort on GPQA and AIME2025.
 
@@ -253,6 +253,7 @@ python -m gpt_oss.evals \
   --model gpt-oss-120b \
   --reasoning-effort low,medium
 ```
+
 
 
 ## Benchmarking Performance
