@@ -67,14 +67,13 @@ class KvCacheCreator:
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
-        self._dummy_reqs = self._create_dummy_context_requests(net_max_seq_len -
-                                                               1)
         self._kv_connector_manager = kv_connector_manager
         self._pytorch_backend_config = pytorch_backend_config
         self._speculative_config = speculative_config
         self._tokens_per_block = tokens_per_block
         self._max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
+        self._dummy_reqs = None
 
     @staticmethod
     def _get_cache_size_per_token(model_config: ModelConfig,
@@ -196,6 +195,10 @@ class KvCacheCreator:
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.max_draft_len
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
+
+        if self._dummy_reqs is None:
+            self._dummy_reqs = self._create_dummy_context_requests(
+                max(1, self._max_seq_len - 1))
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
