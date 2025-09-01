@@ -1027,12 +1027,6 @@ class PyExecutor:
                                 scheduled_requests=scheduled_batch):
                             self.drafter.prepare_draft_tokens(
                                 scheduled_batch, self.resource_manager)
-                        # add_batch must be called again to restore to target requests with updated draft tokens.
-                        if self.guided_decoder is not None:
-                            self.guided_decoder.add_batch(scheduled_batch)
-                            if hasattr(self.drafter, "guided_decoder"):
-                                self.guided_decoder.rollback_draft_tokens()
-
                             # Pad draft tokens to the max draft length. This is for CUDA
                             # graph compatibility.
                             for req in scheduled_batch.generation_requests:
@@ -1041,6 +1035,11 @@ class PyExecutor:
                                 req.py_draft_tokens.extend(
                                     0 for _ in range(max_draft_tokens -
                                                      num_draft_tokens))
+                        # add_batch must be called again to restore to target requests with updated draft tokens.
+                        if self.guided_decoder is not None:
+                            self.guided_decoder.add_batch(scheduled_batch)
+                            if hasattr(self.drafter, "guided_decoder"):
+                                self.guided_decoder.rollback_draft_tokens()
 
                     batch_outputs = self._forward_step(scheduled_batch)
                     if self.guided_decoder is not None:
