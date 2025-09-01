@@ -425,7 +425,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
                 for buffer in candidate_buffers:
                     numel_buffer = buffer.numel()
-
                     # buffer just needs to be large enough.
                     if numel_buffer >= numel_like:
                         return buffer[0:numel_like].view(
