@@ -1640,7 +1640,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         cd ${llmSrc}/tests/integration/defs && \
                         ${testCmdLine.join(" ")}
                     """
-                    error "Infrastructure error"
                 } catch (hudson.AbortException e) {
                     def failedSigs = trtllm_utils.getRetryStagesSignaturesList()
                     def isMachineOrInfraError = failedSigs.any { sig -> e.message?.contains(sig) }
