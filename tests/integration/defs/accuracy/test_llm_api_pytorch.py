@@ -2317,7 +2317,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
         pytorch_config = dict(
             disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+            cuda_graph_config=CudaGraphConfig(),
         )
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
