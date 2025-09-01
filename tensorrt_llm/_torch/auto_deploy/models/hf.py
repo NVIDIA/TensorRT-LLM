@@ -180,7 +180,15 @@ class AutoModelForCausalLMFactory(ModelFactory):
         model.forward = types.MethodType(self._simple_forward, model)
 
         model.eval()
-        model.to(torch.bfloat16)
+        from transformers.quantizers import AutoHfQuantizer
+
+        hf_quantizer = AutoHfQuantizer.from_config(
+            model_config.quantization_config,
+            pre_quantized=True,
+        )
+
+        dtype = hf_quantizer.update_dtype(model_config.dtype)
+        model.to(dtype)
 
         return model
 
