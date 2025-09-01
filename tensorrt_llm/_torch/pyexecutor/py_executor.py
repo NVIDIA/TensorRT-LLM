@@ -230,7 +230,7 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         # Request termination synchronization across PP ranks
-        # {request_id: {'ready_to_terminate': [ranks], 'terminated': [ranks]}}
+        # {request_id: {'ready_to_terminate': set{ranks}, 'terminated': {ranks}}}
         self.pending_termination = {}
         self.termination_handles = [None] * self.num_micro_batches
 
@@ -1715,14 +1715,17 @@ class PyExecutor:
 
     def _terminate_request(self, request: LlmRequest):
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse:
+            # If pp_size > 1 and enable_kv_cache_reuse, we need to sync termination across PP ranks
+            # otherwise, different ranks may have different KV cache blocks and a request may
+            # have different PrepopulatedPromptLen which leads to a NCCL hang.
             req_key = request.py_request_id
             self.local_termination[req_key] = request
-            state = self.pending_termination.get(req_key)
+            state = self.pending_termination.get(req_key, None)
             if state is None:
-                state = {'ready_to_terminate': [], 'terminated': []}
+                state = {'ready_to_terminate': set(), 'terminated': set()}
                 self.pending_termination[req_key] = state
             if self.dist.rank not in state['ready_to_terminate']:
-                state['ready_to_terminate'].append(self.dist.rank)
+                state['ready_to_terminate'].add(self.dist.rank)
         elif self.kv_connector_manager is not None:
             # Only call request_finished on the connector if the request has already been added to the kv cache manager.
             try:
@@ -1877,8 +1880,8 @@ class PyExecutor:
         """
         snapshot = {
             req_id: {
-                'ready_to_terminate': list(state.get('ready_to_terminate', [])),
-                'terminated': list(state.get('terminated', [])),
+                'ready_to_terminate': state.get('ready_to_terminate', set()),
+                'terminated': state.get('terminated', set()),
             }
             for req_id, state in self.pending_termination.items()
         }
@@ -1903,25 +1906,26 @@ class PyExecutor:
                 if local is None:
                     self.pending_termination[req_id] = {
                         'ready_to_terminate':
-                        list(state.get('ready_to_terminate', [])),
+                        state.get('ready_to_terminate', set()),
                         'terminated':
-                        list(state.get('terminated', [])),
+                        state.get('terminated', set()),
                     }
                 else:
                     for key in ('ready_to_terminate', 'terminated'):
                         for r in state.get(key, []):
                             if r not in local[key]:
-                                local[key].append(r)
+                                local[key].add(r)
 
         to_delete = []
         for req_id, state in self.pending_termination.items():
-            ready = state.get('ready_to_terminate', [])
-            done = state.get('terminated', [])
+            ready = state.get('ready_to_terminate', set())
+            done = state.get('terminated', set())
+            # If all PP ranks are ready to terminate the request, we can free the resources
             if len(ready) >= self.dist.pp_size and self.dist.rank not in done:
                 local_req = self.local_termination.get(req_id)
                 if local_req is not None:
                     self._free_resources_for_request(local_req)
-                done.append(self.dist.rank)
+                done.add(self.dist.rank)
             if len(done) >= self.dist.pp_size:
                 to_delete.append(req_id)
                 if req_id in self.local_termination:
