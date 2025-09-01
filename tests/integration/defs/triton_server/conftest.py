@@ -70,11 +70,6 @@ def test_case_name(request):
 
 
 @pytest.fixture(scope="session")
-def output_dir(request):
-    return request.config._trt_config["output_dir"]
-
-
-@pytest.fixture(scope="session")
 def llm_backend_root():
     llm_root = os.environ.get("LLM_ROOT", find_repo_root())
     backend_root = os.path.join(llm_root, "triton_backend")
