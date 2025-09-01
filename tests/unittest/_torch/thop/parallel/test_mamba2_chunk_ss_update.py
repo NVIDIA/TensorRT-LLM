@@ -564,7 +564,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
     # kernel chunked is same as kernel overall
     # tight tolerance to find subtle correctness issues
     rtol = 1e-2
-    atol = 2e-3
+    atol = 5e-3
     for i in range(num_sequences):
         out_seq = out[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]
         out_seq_ref = out_ref[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]

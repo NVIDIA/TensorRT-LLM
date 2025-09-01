@@ -16,6 +16,9 @@ l0_a10:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
+  # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
+  # test list either).
+  - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
@@ -25,6 +28,7 @@ l0_a10:
   - test_e2e.py::test_openai_chat_structural_tag_example
   - test_e2e.py::test_openai_chat_json_example
   - test_e2e.py::test_openai_chat_multimodal_example
+  - test_e2e.py::test_openai_perf_metrics
   - test_e2e.py::test_openai_prometheus
   - test_e2e.py::test_openai_lora
   - test_e2e.py::test_trtllm_serve_multimodal_example
@@ -77,12 +81,23 @@ l0_a10:
   - unittest/trt/model/test_mistral.py
   - unittest/trt/model/test_llama.py
   - test_e2e.py::test_gpt3_175b_1layers_build_only # 6 mins
+  - llmapi/test_llm_api_connector.py::test_connector_simple[True]
+  - llmapi/test_llm_api_connector.py::test_connector_simple[False]
+  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[True]
+  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[False]
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[True]
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[False]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[True]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[False]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[True]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[False]
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
   - llmapi/test_llm_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command_with_lora[llama-llama-models-v2/llama-v2-7b-hf]
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_e2e.py::test_llmapi_exit
   - llmapi/test_llm_examples.py::test_llmapi_server_example
+  - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen2-0.5B]
   - test_e2e.py::test_trtllm_serve_example
   - test_e2e.py::test_openai_misc_example[trt]
   - test_e2e.py::test_openai_completions_example[trt]

@@ -4,6 +4,7 @@ import os
 import re
 import signal
 import traceback
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -48,6 +49,9 @@ from tensorrt_llm.serve.postprocess_handlers import (
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
+from .harmony_adapter import (HarmonyAdapter, handle_non_streaming_response,
+                              handle_streaming_response,
+                              maybe_transform_reasoning_effort)
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -84,12 +88,22 @@ class OpenAIServer:
         else:
             self.model = model
         self.metrics_collector = None
+        self.perf_metrics = None
+        self.perf_metrics_lock = None
         if self.llm.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
                 "model_name": "undefined",
                 "engine_type": "undefined"
             })
+            max_perf_metrics = self.llm.args.perf_metrics_max_requests
+            if max_perf_metrics > 0:
+                self.perf_metrics = deque(maxlen=max_perf_metrics)
+                self.perf_metrics_lock = asyncio.Lock()
+
+        # gpt-oss
+        self.harmony_adapter: HarmonyAdapter | None = None
+        self.use_harmony = self.model_config.model_type == "gpt_oss"
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -151,7 +165,6 @@ class OpenAIServer:
         return JSONResponse(content=error_response.model_dump(),
                             status_code=error_response.code)
 
-
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
@@ -159,13 +172,14 @@ class OpenAIServer:
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
+        self.app.add_api_route("/perf_metrics", self.get_perf_metrics, methods=["GET"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
         self.app.add_api_route("/v1/chat/completions",
-                               self.openai_chat,
+                               self.openai_chat if not self.use_harmony else self.chat_harmony,
                                methods=["POST"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
@@ -255,6 +269,50 @@ class OpenAIServer:
             stats.append(stat)
         return JSONResponse(content=stats)
 
+    async def get_perf_metrics(self) -> JSONResponse:
+        if self.perf_metrics is None:
+            return JSONResponse(content=[])
+        async with self.perf_metrics_lock:
+            perf_metrics = self.perf_metrics
+            self.perf_metrics = deque(maxlen=self.llm.args.perf_metrics_max_requests)
+        for metrics_dict in perf_metrics:
+            metrics = metrics_dict["perf_metrics"]
+            timing_metrics = metrics.timing_metrics
+            kv_cache_metrics = metrics.kv_cache_metrics
+            speculative_decoding = metrics.speculative_decoding
+            metrics_json = {
+                "first_iter": metrics.first_iter,
+                "last_iter": metrics.last_iter,
+                # exclude metrics.iter since it is only meaningful when the request is not finished
+            }
+            metrics_json["timing_metrics"] = {
+                "arrival_time": timing_metrics.arrival_time.total_seconds(),
+                "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds(),
+                "first_token_time": timing_metrics.first_token_time.total_seconds(),
+                "last_token_time": timing_metrics.last_token_time.total_seconds(),
+            }
+            metrics_json["kv_cache_metrics"] = {
+                "num_total_allocated_blocks": kv_cache_metrics.num_total_allocated_blocks,
+                "num_new_allocated_blocks": kv_cache_metrics.num_new_allocated_blocks,
+                "num_reused_blocks": kv_cache_metrics.num_reused_blocks,
+                "num_missed_blocks": kv_cache_metrics.num_missed_blocks,
+            }
+            if timing_metrics.kv_cache_size > 0:
+                metrics_json["timing_metrics"].update({
+                    # TODO: move to kv_cache_metrics
+                    "kv_cache_size": timing_metrics.kv_cache_size,
+                    "kv_cache_transfer_start": timing_metrics.kv_cache_transfer_start.total_seconds(),
+                    "kv_cache_transfer_end": timing_metrics.kv_cache_transfer_end.total_seconds(),
+                })
+            if speculative_decoding.total_draft_tokens > 0:
+                metrics_json["speculative_decoding"] = {
+                    "acceptance_rate": speculative_decoding.acceptance_rate,
+                    "total_accepted_draft_tokens": speculative_decoding.total_accepted_draft_tokens,
+                    "total_draft_tokens": speculative_decoding.total_draft_tokens,
+                }
+            metrics_dict["perf_metrics"] = metrics_json
+        return JSONResponse(content=list(perf_metrics))
+
     async def get_kv_cache_events(self) -> JSONResponse:
         events = []
         try:
@@ -264,6 +322,23 @@ class OpenAIServer:
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
+
+    async def _extract_metrics(self, res: RequestOutput):
+        if not res.finished:
+            return
+        if self.metrics_collector:
+            self.metrics_collector.log_metrics_dict(res.metrics_dict)
+        if self.llm.args.return_perf_metrics:
+            output = res.outputs[0]
+            item = {
+                "request_id": res.request_id,
+                "perf_metrics": res.outputs[0].request_perf_metrics
+            }
+            if output.disaggregated_params:
+                item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
+            if self.perf_metrics is not None:
+                async with self.perf_metrics_lock:
+                    self.perf_metrics.append(item)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
@@ -280,8 +355,7 @@ class OpenAIServer:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             async for res in promise:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                if res.finished and self.metrics_collector:
-                    self.metrics_collector.log_metrics_dict(res.metrics_dict)
+                await self._extract_metrics(res)
                 for pp_res in pp_results:
                     yield pp_res
             yield "data: [DONE]\n\n"
@@ -299,8 +373,7 @@ class OpenAIServer:
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
-            if promise.finished and self.metrics_collector:
-                self.metrics_collector.log_metrics_dict(promise.metrics_dict)
+            await self._extract_metrics(promise)
             return chat_response
 
         try:
@@ -469,8 +542,7 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            if response.finished and self.metrics_collector:
-                self.metrics_collector.log_metrics_dict(response.metrics_dict)
+            await self._extract_metrics(response)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -506,8 +578,7 @@ class OpenAIServer:
                     pp_result = post_processor(output, args)
                 else:
                     pp_result = output.outputs[0]._postprocess_result
-                if output.finished and self.metrics_collector:
-                    self.metrics_collector.log_metrics_dict(output.metrics_dict)
+                await self._extract_metrics(output)
                 for pp_res in pp_result:
                     yield pp_res
 
@@ -595,6 +666,78 @@ class OpenAIServer:
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+
+    async def chat_harmony(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+        """
+        Chat Completion API with harmony format support.
+        Supports both streaming and non-streaming modes.
+        """
+        try:
+            # Initialize HarmonyAdapter
+            # NOTE: WAR for Disagg failure, may affect perf if no warmup
+            if not self.harmony_adapter:
+                self.harmony_adapter = HarmonyAdapter()
+            # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
+            tools_dict = None
+            if request.tools:
+                tools_dict = [tool.model_dump() for tool in request.tools]
+
+            # Reasoning effort precedence: request.reasoning_effort > system message parsing > serving default
+            reasoning_effort = maybe_transform_reasoning_effort(request.reasoning_effort)
+            # Get tool_choice from request
+            tool_choice = getattr(request, 'tool_choice', None)
+
+            try:
+                harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+                    request.messages,
+                    tools_dict,
+                    reasoning_effort=reasoning_effort,
+                    tool_choice=tool_choice
+                )
+            except Exception as e:
+                logger.error(f"messages_dict: {request.messages}")
+                logger.error(f"tools_dict: {tools_dict}")
+                logger.error(f"request: {request}")
+                raise e
+
+            # Get harmony stop tokens
+            harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
+            if request.stop_token_ids:
+                request.stop_token_ids.extend(harmony_stop_tokens)
+            else:
+                request.stop_token_ids = harmony_stop_tokens
+
+            sampling_params = request.to_sampling_params(
+                vocab_size=self.tokenizer.tokenizer.vocab_size)
+            sampling_params.detokenize = False  # Harmony adapter handles detokenization
+
+            # Generate
+            promise = self.llm.generate_async(
+                inputs=harmony_tokens,
+                sampling_params=sampling_params,
+                streaming=bool(request.stream),
+                lora_request=request.lora_request,
+            )
+            # Disconnect cancellation
+            asyncio.create_task(self.await_disconnected(raw_request, promise))
+
+            # Handle streaming
+            if request.stream:
+                return StreamingResponse(
+                    handle_streaming_response(
+                        self.harmony_adapter, promise,
+                        str(promise.request_id), request,
+                    ),
+                    media_type="text/event-stream"
+                )
+            else:
+                response = await handle_non_streaming_response(self.harmony_adapter, promise, request)
+                return JSONResponse(response.model_dump())
+
+        except Exception as e:
+            logger.error("Error in harmony chat completion: %s", e)
+            logger.debug("Error details: %s", traceback.format_exc())
+            return self.create_error_response(message=str(e), err_type="internal_error")
 
     async def __call__(self, host, port):
         # Store the binding address for server registration

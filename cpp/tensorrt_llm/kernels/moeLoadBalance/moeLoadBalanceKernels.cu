@@ -603,7 +603,7 @@ void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal)
     bool ready = false;
     do
     {
-        auto loaded = signal->stepAndOwner;
+        auto loaded = __atomic_load_n(&signal->stepAndOwner, __ATOMIC_ACQUIRE);
         ready = getOwnerDevice(loaded) == MoeLoadBalanceSingleLayerSignal::kCPU;
     } while (!ready);
     std::atomic_thread_fence(std::memory_order_acquire);
@@ -619,7 +619,7 @@ void moeSetSignalForGpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, int64_
     {
         value |= MoeLoadBalanceSingleLayerSignal::kSkipStep;
     }
-    signal->stepAndOwner = value;
+    __atomic_store_n(&signal->stepAndOwner, value, __ATOMIC_RELEASE);
 }
 
 } // namespace kernels

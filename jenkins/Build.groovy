@@ -22,8 +22,7 @@ LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pyt
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64")
 
-POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
-POD_TIMEOUT_SECONDS_TMP = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
 // Literals for easier access.
 @Field
@@ -188,7 +187,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TMP}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_BUILD}]
                     volumeMounts:
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"

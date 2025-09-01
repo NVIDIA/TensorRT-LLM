@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -442,6 +442,7 @@ struct CutlassGemmConfig
     };
 
     EpilogueFusionType epilogue_fusion_type = EpilogueFusionType::NONE;
+    bool swap_ab = false;
 
     CutlassGemmConfig() = default;
 
@@ -514,7 +515,8 @@ struct CutlassGemmConfig
                    << "\n\tcluster shape ID: " << (int) cluster_shape
                    << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule
                    << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false")
-                   << "\n\tepilogue fusion type: " << (int) epilogue_fusion_type;
+                   << "\n\tepilogue fusion type: " << (int) epilogue_fusion_type
+                   << "\n\tswap_ab: " << (swap_ab ? "true" : "false");
         }
         else if (tile_config_sm80 != tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic)
         {
@@ -547,7 +549,8 @@ inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& conf
             << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
             << ", cluster_shape_enum: " << int(config.cluster_shape)
             << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false")
-            << ", epilogue_fusion_type: " << int(config.epilogue_fusion_type);
+            << ", epilogue_fusion_type: " << int(config.epilogue_fusion_type)
+            << ", swap_ab: " << (config.swap_ab ? "true" : "false");
     }
     else
     {

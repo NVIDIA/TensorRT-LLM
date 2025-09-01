@@ -154,11 +154,8 @@ FROM ${DEVEL_IMAGE} AS release
 RUN mkdir -p /root/.cache/pip
 
 WORKDIR /app/tensorrt_llm
-COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install tensorrt_llm*.whl && \
-    rm tensorrt_llm*.whl && \
-    pip cache purge
+RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
+    pip install /tmp/wheel/tensorrt_llm*.whl
 
 COPY README.md ./
 COPY docs docs
