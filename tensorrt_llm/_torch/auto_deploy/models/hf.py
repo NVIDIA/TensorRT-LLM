@@ -172,6 +172,26 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         model.eval()
 
+        # TODO(fridah): this should be handled by QuantConfigReader
+        from transformers.quantizers import AutoHfQuantizer
+
+        hf_quantizer = AutoHfQuantizer.from_config(
+            model_config.quantization_config,
+            pre_quantized=True,
+        )
+
+        dtype = hf_quantizer.update_dtype(model_config.dtype)
+        model.to(dtype)
+
+        hf_quantizer.preprocess_model(
+            model=model,
+            device_map=None,
+            keep_in_fp32_modules=model._keep_in_fp32_modules,
+            config=model.config,
+            use_kernels=False,
+        )
+        print("Model after pre-processing: ", model)
+
         return model
 
     def _set_sharding_config(self, model_config: PretrainedConfig):
