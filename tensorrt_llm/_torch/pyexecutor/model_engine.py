@@ -556,6 +556,22 @@ class PyTorchModelEngine(ModelEngine):
 
         return wrapper
 
+    @staticmethod
+    def warmup_with_kv_cache_cleanup(method):
+
+        @functools.wraps(method)
+        def wrapper(self, resource_manager: ResourceManager, *args, **kwargs):
+            result = method(self, resource_manager, *args, **kwargs)
+            # Zero the KV cache; NaNs may be introduced during warmup
+            kv_cache_manager = resource_manager.get_resource_manager(
+                self.kv_cache_manager_key)
+            if kv_cache_manager is not None:
+                for layer_idx in kv_cache_manager.layer_offsets.keys():
+                    kv_cache_manager.get_buffers(layer_idx).zero_()
+            return result
+
+        return wrapper
+
     @contextlib.contextmanager
     def no_cuda_graph(self):
         _run_cuda_graphs = self.cuda_graph_runner.enabled
@@ -566,6 +582,7 @@ class PyTorchModelEngine(ModelEngine):
             self.cuda_graph_runner.enabled = _run_cuda_graphs
 
     @with_warmup_flag
+    @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
