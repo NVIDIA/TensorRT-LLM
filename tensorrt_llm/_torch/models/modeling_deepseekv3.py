@@ -157,8 +157,7 @@ class DeepseekV3WeightLoader:
                 return v
             if len(v.shape) == 1:
                 return torch.chunk(v, tp_size)[idx].contiguous()
-            else:
-                return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
+            return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
 
         def split_matrix_tp(v, tensor_parallel, rank, dim):
             return split(v, tensor_parallel, rank, dim=dim)
@@ -273,7 +272,9 @@ class DeepseekV3WeightLoader:
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
-            if len(module._parameters) > 0:
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            else:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
                 if "model.layers" in name and int(
