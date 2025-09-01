@@ -303,8 +303,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             preprocessingParams.cu_seq_lens = xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr;
             preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
             preprocessingParams.rotary_coef_cache_buffer = xqaParams.rotary_cos_sin;
-            preprocessingParams.kvScaleOrigQuant = xqaParams.kv_scale_orig_quant;
-            preprocessingParams.kv_cache_scale_factors = nullptr;
+            preprocessingParams.qkv_scale_orig_quant = xqaParams.kv_scale_orig_quant;
             preprocessingParams.spec_decoding_position_offsets = xqaParams.spec_decoding_position_offsets;
             preprocessingParams.mrope_position_deltas = xqaParams.mrope_position_deltas;
             // Scalar parameters.

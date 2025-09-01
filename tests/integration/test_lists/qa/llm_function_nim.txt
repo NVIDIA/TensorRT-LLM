@@ -21,6 +21,7 @@ accuracy/test_llm_api_pytorch.py::TestNemotronH_56B_Base::test_auto_dtype[tp8-cu
 accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype[tp8ep4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8ep4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestQwQ_32B::test_auto_dtype_tp4
 accuracy/test_llm_api.py::TestStarCoder2_7B::test_auto_dtype
 accuracy/test_llm_api.py::TestStarCoder2_7B::test_fp8
 accuracy/test_llm_api.py::TestCodestral_22B_V01::test_auto_dtype
