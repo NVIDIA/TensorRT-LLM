@@ -131,11 +131,8 @@ FROM ${DEVEL_IMAGE} AS release
 RUN mkdir -p /root/.cache/pip
 
 WORKDIR /app/tensorrt_llm
-COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install tensorrt_llm*.whl && \
-    rm tensorrt_llm*.whl && \
-    pip cache purge
+RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
+    pip install /tmp/wheel/tensorrt_llm*.whl
 
 COPY README.md ./
 COPY docs docs
@@ -177,7 +174,8 @@ FROM wheel AS tritonbuild
 WORKDIR /src/tensorrt_llm
 RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
 COPY ./triton_backend/ ./triton_backend/
-RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh
+ARG TRITON_BASE_TAG
+RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh -s "r${TRITON_BASE_TAG%-py3}"
 
 
 FROM release AS tritonrelease

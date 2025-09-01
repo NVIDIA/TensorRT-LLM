@@ -276,13 +276,18 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
             params.fmhaTileCounter[0] = 0u;
         }
         // Take the quantization scales into consideration.
-        float dequantScaleQ = params.dequantScaleQ ? params.dequantScaleQ[0] : 1.f;
-        float dequantScaleKv = params.dequantScaleKv ? params.dequantScaleKv[0] : 1.f;
+        int const q_scale_idx = 0;
+        int const k_scale_idx = params.separateQkvScales ? 1 : 0;
+        int const v_scale_idx = params.separateQkvScales ? 2 : 0;
+        float dequantScaleQ = params.dequantScaleQkv ? params.dequantScaleQkv[q_scale_idx] : 1.f;
+        float dequantScaleK = params.dequantScaleQkv ? params.dequantScaleQkv[k_scale_idx] : 1.f;
+        float dequantScaleV = params.dequantScaleQkv ? params.dequantScaleQkv[v_scale_idx] : 1.f;
+
         float quantScaleO = params.quantScaleO ? params.quantScaleO[0] : 1.f;
         if (params.fmhaBmm1Scale)
         {
             // The scale after fmha bmm1.
-            params.fmhaBmm1Scale[0] = dequantScaleQ * dequantScaleKv * params.fmhaHostBmm1Scale;
+            params.fmhaBmm1Scale[0] = dequantScaleQ * dequantScaleK * params.fmhaHostBmm1Scale;
             // The scale prepared for log2 optimization.
             constexpr float kLog2e = 1.4426950408889634074f;
             params.fmhaBmm1Scale[1] = params.fmhaBmm1Scale[0] * kLog2e;
@@ -290,7 +295,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         if (params.fmhaBmm2Scale)
         {
             // The scale after fmha bmm2.
-            params.fmhaBmm2Scale[0] = quantScaleO * dequantScaleKv;
+            params.fmhaBmm2Scale[0] = quantScaleO * dequantScaleV;
         }
     }
 }
