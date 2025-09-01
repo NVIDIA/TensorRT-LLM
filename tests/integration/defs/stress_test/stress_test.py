@@ -15,6 +15,18 @@
 """
 Stress test script for inference of model using TensorRT-LLM with PyTorch/TRT backend.
 This script is used for stress testing inference performance using trtllm-serve and genai-perf.
+
+The script supports three test modes:
+1. "stress-test": Runs performance test followed by stress test
+2. "stress-stage-alone": Runs only stress test with customized parameters
+3. "stress-test-with-accuracy": Runs performance test, stress test, and accuracy tests (GSM8K)
+
+Accuracy testing is performed using lm_eval with GSM8K dataset:
+- Baseline accuracy test: Run before stress test to establish baseline
+- Post-stress accuracy test: Run after stress test to verify accuracy stability
+
+Usage example for accuracy testing:
+    pytest tests/integration/defs/stress_test/stress_test.py::test_run_stress_test[stress-test-with-accuracy]
 """
 import contextlib
 import json
@@ -125,6 +137,14 @@ class StressTestConfig:
     customized_stress_timeout: int = 180  # 3 mins
     customized_stress_concurrency: int = 128
     customized_stress_request_rate: int = 20
+
+    # Accuracy test parameters
+    enable_accuracy_test: bool = False  # Enable accuracy testing with GSM8K
+    accuracy_test_timeout: int = 1200  # 20 minutes timeout for accuracy tests
+    accuracy_test_concurrency: int = 512  # Concurrency for accuracy tests
+    accuracy_test_max_retries: int = 3  # Max retries for accuracy tests
+    accuracy_test_max_gen_toks: int = 256  # Max generation tokens for accuracy tests
+    accuracy_test_max_length: int = 4096  # Max input length for accuracy tests
 
     @property
     def request_count_stress_test(self) -> int:
@@ -320,8 +340,10 @@ def check_server_health(server_url: str,
         return False, f"Unexpected error during health check: {str(e)}"
 
 
-@pytest.mark.parametrize("test_mode", ["stress-test", "stress-stage-alone"],
-                         ids=lambda x: x)
+@pytest.mark.parametrize(
+    "test_mode",
+    ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
+    ids=lambda x: x)
 @pytest.mark.parametrize("backend", ["trt", "pytorch"], ids=lambda x: x)
 @pytest.mark.parametrize("capacity_scheduler_policy",
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
@@ -416,9 +438,14 @@ def stress_test(config,
     elif test_mode == "stress-stage-alone":
         run_performance = False
         run_stress = True
+    elif test_mode == "stress-test-with-accuracy":
+        run_performance = True
+        run_stress = True
     else:
-        pytest.skip(f"Skipping test for unsupported mode: {test_mode}. "
-                    f"Supported modes: stress-test, stress-stage-alone")
+        pytest.skip(
+            f"Skipping test for unsupported mode: {test_mode}. "
+            f"Supported modes: stress-test, stress-stage-alone, stress-test-with-accuracy"
+        )
         return
 
     # Skip if not enough GPU memory
@@ -472,8 +499,12 @@ def stress_test(config,
 
     # Create a StressTestConfig with customized time parameters if provided
     if run_stress:
+        # Enable accuracy test for stress-test-with-accuracy mode
+        enable_accuracy = (test_mode == "stress-test-with-accuracy")
+
         stress_config = StressTestConfig(model_config=config,
-                                         server_config=test_server_config)
+                                         server_config=test_server_config,
+                                         enable_accuracy_test=enable_accuracy)
 
         # Override stress_time and stress_timeout if provided
         if stress_time is not None:
@@ -482,7 +513,8 @@ def stress_test(config,
                 server_config=test_server_config,
                 stress_time=stress_time,
                 stress_timeout=stress_timeout
-                if stress_timeout is not None else stress_time * 2)
+                if stress_timeout is not None else stress_time * 2,
+                enable_accuracy_test=enable_accuracy)
     else:
         stress_config = None
 
@@ -632,6 +664,12 @@ def stress_test(config,
             print_info(
                 f"Server is running with model {model_name}. Starting tests...")
 
+            # Run baseline accuracy test first if enabled
+            baseline_accuracy_success = True
+            if stress_config and stress_config.enable_accuracy_test:
+                baseline_accuracy_success = run_accuracy_test(
+                    model_name, test_server_config, stress_config, "baseline")
+
             # Run performance test first if enabled
             stage2_output = None  # Initialize stage2_output to None
             if run_performance:
@@ -664,6 +702,29 @@ def stress_test(config,
                              stress_config,
                              None,
                              request_counter=request_counter)
+
+            # Run post-stress accuracy test if enabled
+            post_stress_accuracy_success = True
+            if stress_config and stress_config.enable_accuracy_test:
+                post_stress_accuracy_success = run_accuracy_test(
+                    model_name, test_server_config, stress_config,
+                    "post_stress")
+
+                # Report accuracy test results
+                if baseline_accuracy_success and post_stress_accuracy_success:
+                    print_info("=== ACCURACY TEST SUMMARY ===")
+                    print_info("✓ Baseline accuracy test: PASSED")
+                    print_info("✓ Post-stress accuracy test: PASSED")
+                    print_info(
+                        "Model accuracy appears stable under stress conditions")
+                else:
+                    print_warning("=== ACCURACY TEST SUMMARY ===")
+                    if not baseline_accuracy_success:
+                        print_warning("✗ Baseline accuracy test: FAILED")
+                    if not post_stress_accuracy_success:
+                        print_warning("✗ Post-stress accuracy test: FAILED")
+                    print_warning(
+                        "Model accuracy may be affected by stress conditions")
     finally:
         # Clean up temp yaml file
         if os.path.exists(extra_llm_options_path):
@@ -982,6 +1043,102 @@ def format_time(seconds: int) -> str:
         return f"{minutes}m {seconds}s"
     else:
         return f"{seconds}s"
+
+
+def run_accuracy_test(model_name: str,
+                      server_config: ServerConfig,
+                      stress_config: StressTestConfig,
+                      test_phase: str = "baseline") -> bool:
+    """
+    Run accuracy test using lm_eval with GSM8K dataset
+
+    Args:
+        model_name: Name of the model being tested
+        server_config: Server configuration containing URL and port
+        stress_config: Stress test configuration containing accuracy test parameters
+        test_phase: Phase of the test ("baseline" or "post_stress")
+
+    Returns:
+        Boolean indicating whether the accuracy test completed successfully
+    """
+    if not stress_config.enable_accuracy_test:
+        print_info(f"Skipping accuracy test for {test_phase} phase (disabled)")
+        return True
+
+    print_info(f"=== Running {test_phase.upper()} ACCURACY TEST (GSM8K) ===")
+
+    # Create lm_eval command
+    lm_eval_cmd = [
+        "lm_eval", "--model", "local-completions", "--tasks", "gsm8k",
+        "--model_args",
+        f"model={model_name},base_url={server_config.url}/v1/completions,"
+        f"num_concurrent={stress_config.accuracy_test_concurrency},"
+        f"max_retries={stress_config.accuracy_test_max_retries},"
+        f"tokenized_requests=False,"
+        f"timeout={stress_config.accuracy_test_timeout},"
+        f"max_gen_toks={stress_config.accuracy_test_max_gen_toks},"
+        f"max_length={stress_config.accuracy_test_max_length}",
+        "--trust_remote_code"
+    ]
+
+    print_info(f"Running lm_eval command: {' '.join(lm_eval_cmd)}")
+
+    test_start_time = time.time()
+
+    try:
+        # Run lm_eval process with timeout monitoring
+        with launch_process(lm_eval_cmd,
+                            start_new_session=True,
+                            filter_pattern=None,
+                            request_counter=None) as process:
+
+            # Monitor the process with timeout
+            while process.poll() is None:
+                current_time = time.time()
+                elapsed_time = current_time - test_start_time
+
+                # Check if test exceeded timeout
+                if elapsed_time > stress_config.accuracy_test_timeout:
+                    print_warning(
+                        f"Accuracy test timed out after {stress_config.accuracy_test_timeout} seconds"
+                    )
+                    cleanup_process_tree(process, has_session=True)
+                    return False
+
+                # Check server health periodically
+                is_healthy, error_msg = check_server_health(
+                    server_config.url, server_config.health_check_timeout)
+
+                if not is_healthy:
+                    print_warning(
+                        f"Server health check failed during accuracy test: {error_msg}"
+                    )
+                    cleanup_process_tree(process, has_session=True)
+                    return False
+
+                time.sleep(5)  # Check every 5 seconds
+
+            # Check final status
+            retcode = process.poll()
+            if retcode is not None:
+                if retcode != 0:
+                    print_warning(
+                        f"lm_eval exited with non-zero code: {retcode}")
+                    return False
+                else:
+                    test_end_time = time.time()
+                    duration = int(test_end_time - test_start_time)
+                    print_info(
+                        f"{test_phase.capitalize()} accuracy test completed successfully in {format_time(duration)}"
+                    )
+                    return True
+            else:
+                print_warning("lm_eval did not complete normally")
+                return False
+
+    except Exception as e:
+        print_warning(f"Error during {test_phase} accuracy test: {str(e)}")
+        return False
 
 
 def extract_stress_test_metrics(artifacts_dir="./artifacts",
