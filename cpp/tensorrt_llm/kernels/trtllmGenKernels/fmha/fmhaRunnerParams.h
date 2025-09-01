@@ -192,12 +192,10 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Packed KV scaling factor buffer
+    void const* kvSfPtr;
     // Packed QKV buffer
     void const* qkvPtr;
-    // The scaling factor pointer of K.
-    void const* kSfBasePtr;
-    // The scaling factor pointer of V.
-    void const* vSfBasePtr;
     // The attention sinks pointer (additional value per head in the denominator of the softmax).
     float const* attentionSinksPtr;
     // The custom mask ptr.
@@ -271,9 +269,6 @@ struct TllmGenFmhaRunnerParams
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
     // batching is enabled.
     int mSfStartTokenIdx;
-
-    // The SF scale for Kv.
-    float mScaleSfKv;
     // The cuda stream.
     cudaStream_t stream;
 
