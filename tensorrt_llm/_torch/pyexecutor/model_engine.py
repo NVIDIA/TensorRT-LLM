@@ -707,8 +707,6 @@ class PyTorchModelEngine(ModelEngine):
                     max_num_draft_tokens=self.runtime_draft_len,
                     use_mrope=self.use_mrope)
 
-                requests += final_request
-
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(
                         request_ids=list(range(num_ctx_requests)))
@@ -721,7 +719,7 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=[1] * num_gen_tokens,
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
-                )
+                    use_mrope=self.use_mrope)
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(request_ids=list(
                         range(num_ctx_requests, num_ctx_requests +
@@ -1567,12 +1565,6 @@ class PyTorchModelEngine(ModelEngine):
                             pin_memory=True,
                             keyword=["mrope_config.mrope_position_deltas"])
                         multimodal_params_list.append(multimodal_params)
-                        # multimodal_params.to_device("multimodal_data",
-                        #                             "cuda",
-                        #                             pin_memory=True)
-                        # # re-assign the multimodal_data to the request after strip_for_generation for another generation request,
-                        # request.py_multimodal_data = multimodal_params.multimodal_data
-                        # multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot
             # Do not add a gen_request_seq_slot for CUDA graph dummy requests
@@ -1767,8 +1759,18 @@ class PyTorchModelEngine(ModelEngine):
         virtual_num_tokens = total_num_tokens
         if attn_metadata.padded_num_tokens is not None:
             self.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-            self.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
+            if self.use_mrope and mrope_position_ids:
+                self.mrope_position_ids_cuda[
+                    total_num_tokens:padded_num_tokens].fill_(0)
+                final_position_ids = self.mrope_position_ids_cuda[:, :, :
+                                                                  virtual_num_tokens]
+            else:
+                self.position_ids_cuda[
+                    total_num_tokens:padded_num_tokens].fill_(0)
+                final_position_ids = self.position_ids_cuda[:
+                                                            virtual_num_tokens].unsqueeze(
+                                                                0)
 
         if self.enable_attention_dp:
             attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
@@ -1777,8 +1779,7 @@ class PyTorchModelEngine(ModelEngine):
         inputs = {
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:virtual_num_tokens],
-            'position_ids':
-            self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0),
+            'position_ids': final_position_ids,
             'inputs_embeds': None,
             "multimodal_params": multimodal_params_list,
         }

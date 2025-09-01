@@ -17,8 +17,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    DecodingCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.inputs import (create_input_processor,
@@ -66,7 +65,8 @@ QWEN2_5_VL_7B_CONFIG = {
     "use_cache": True,
     "use_sliding_window": False,
     "vision_config": {
-        "depth": 2,  # NOTE: Only 1 layer for testing, 32 layers for full model
+        "depth":
+        8,  # NOTE: Only 8 layers for testing, 32 layers for full model. At least 8 layer needed for global Attention
         "hidden_act": "silu",
         "hidden_size": 1280,
         "intermediate_size": 3420,
@@ -104,6 +104,27 @@ class Scenario:
 
 class TestQwen2_5_VL(unittest.TestCase):
 
+    def get_test_inputs(self, modality: str):
+        if modality == "image":
+            return ["Describe the natural environment in the image."], \
+                ["https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"]
+        elif modality == "multiple_image":
+            return ["Describe the difference between the two images."], \
+                ["https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+                 "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg"]
+        elif modality == "video":
+            return ["Tell me what you see in the video briefly."], \
+                ["https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4"]
+        elif modality == "mixture_text_image":
+            return ["Describe the scene in the image briefly.",
+                    "Who invented the internet?"], \
+                ["https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+                 ""]
+        elif modality == "text":
+            return ["Who invented the internet?"], []
+        else:
+            raise ValueError(f"Invalid modality: {modality}")
+
     def get_kv_cache_manager(self, dtype: torch.dtype, config: Qwen2_5_VLConfig,
                              tokens_per_block: int, max_seq_len: int,
                              batch_size: int, num_blocks: int):
@@ -135,7 +156,7 @@ class TestQwen2_5_VL(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         return create_input_processor(model_path, tokenizer=tokenizer)
 
-    def get_trtllm_inputs(self, model, scenario: Scenario, device: torch.device,
+    def get_trtllm_inputs(self, model, modality: str, device: torch.device,
                           prompt: List[str], media: List[str]):
         processor = self.get_inputprocessor(
             model.model_config.pretrained_config._name_or_path)
@@ -143,7 +164,7 @@ class TestQwen2_5_VL(unittest.TestCase):
             tokenizer=processor.tokenizer,
             model_dir=model.model_config.pretrained_config._name_or_path,
             model_type="qwen2_5_vl",
-            modality=scenario.modality,
+            modality=modality,
             prompts=prompt,
             media=media,
             image_data_format="pt",
@@ -170,7 +191,7 @@ class TestQwen2_5_VL(unittest.TestCase):
         input_ids = torch.tensor(input_ids, dtype=torch.int32, device=device)
         return input_ids, context_sequence_lengths, multimodal_params_list
 
-    def get_hf_inputs(self, model, scenario: Scenario, device: torch.device,
+    def get_hf_inputs(self, model, modality: str, device: torch.device,
                       prompt: List[str], media: List[str]):
         processor = AutoProcessor.from_pretrained(
             model.model_config.pretrained_config._name_or_path)
@@ -178,7 +199,7 @@ class TestQwen2_5_VL(unittest.TestCase):
             tokenizer=processor.tokenizer,
             model_dir=model.model_config.pretrained_config._name_or_path,
             model_type="qwen2_5_vl",
-            modality=scenario.modality,
+            modality=modality,
             prompts=prompt,
             media=media,
             image_data_format="pt",
@@ -186,9 +207,25 @@ class TestQwen2_5_VL(unittest.TestCase):
             device="cpu")
         inputs = [prompt_inputs(i) for i in inputs]
 
+        images = None
+        videos = None
+
+        if modality in ["image", "multiple_image", "mixture_text_image"]:
+            images = [input['multi_modal_data']['image'] for input in inputs]
+        elif modality == "video":
+            videos = [
+                input['multi_modal_data'][f'{modality}'] for input in inputs
+            ]
+        elif modality == "text":
+            # For text-only modality, no images or videos needed
+            pass
+        else:
+            raise ValueError(f"Invalid modality: {modality}")
+
         processor_inputs = processor(
             text=[input['prompt'] for input in inputs],
-            images=[input['multi_modal_data']['image'] for input in inputs],
+            images=images,
+            videos=videos,
             padding=True,
             return_tensors="pt",
             do_rescale=False,
@@ -206,16 +243,10 @@ class TestQwen2_5_VL(unittest.TestCase):
         qwen2_5_vl = Qwen2_5_VLModel(model_config,
                                      disable_fuse_rope=True).to(device)
 
-        prompt = [
-            "Describe the natural environment in the image.",
-            "Describe the object and the weather condition in the image."
-        ]
-        media = [
-            "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png"
-        ]
+        prompt, media = self.get_test_inputs("image")
+        prompt, media = prompt * 2, media * 2
         input_ids, context_sequence_lengths, multimodal_params_list = self.get_trtllm_inputs(
-            qwen2_5_vl, Scenario(modality="image"), device, prompt, media)
+            qwen2_5_vl, "image", device, prompt, media)
 
         # Add generation input_ids
         input_ids = torch.cat([
@@ -308,11 +339,16 @@ class TestQwen2_5_VL(unittest.TestCase):
         Scenario(modality="image",
                  use_cuda_graph=False,
                  disable_fuse_rope=False),
-        Scenario(modality="image", use_cuda_graph=False,
-                 disable_fuse_rope=True),
         Scenario(modality="image", use_cuda_graph=True,
                  disable_fuse_rope=False),
-        Scenario(modality="image", use_cuda_graph=True, disable_fuse_rope=True),
+        Scenario(modality="image", use_cuda_graph=False,
+                 disable_fuse_rope=True),
+        Scenario(modality="multiple_image",
+                 use_cuda_graph=False,
+                 disable_fuse_rope=False),
+        # TODO: Achieve video accuracy
+        # Scenario(modality="video", use_cuda_graph=False,
+        #          disable_fuse_rope=False),
     ])
     @torch.no_grad()
     def test_qwen2_5_vl_allclose_to_hf(self, scenario: Scenario) -> None:
@@ -343,6 +379,13 @@ class TestQwen2_5_VL(unittest.TestCase):
         weight_mapper.init_model_and_config(qwen2_5_vl, model_config)
         qwen2_5_vl.load_weights(hf_qwen2_5_vl.state_dict(), weight_mapper)
 
+        prompt, media = self.get_test_inputs(scenario.modality)
+        # Context phase.
+        input_ids, context_sequence_lengths, multimodal_params_list = self.get_trtllm_inputs(
+            qwen2_5_vl, scenario.modality, device, prompt, media)
+
+        max_seq_len = max(input_ids.size(-1) + 1, max_seq_len)
+        num_blocks = max_seq_len // tokens_per_block + 1
         kv_cache_manager = self.get_kv_cache_manager(
             dtype=dtype,
             config=qwen2_5_vl_config,
@@ -351,15 +394,6 @@ class TestQwen2_5_VL(unittest.TestCase):
             batch_size=batch_size,
             num_blocks=num_blocks)
 
-        # Context phase.
-        prompt = [
-            "Describe the natural environment in the image.",
-        ]
-        media = [
-            "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-        ]
-        input_ids, context_sequence_lengths, multimodal_params_list = self.get_trtllm_inputs(
-            qwen2_5_vl, Scenario(modality="image"), device, prompt, media)
         num_cached_tokens_per_seq = [0]
         request_ids = [1]
         token_nums = [input_ids.size(-1)]
@@ -369,18 +403,20 @@ class TestQwen2_5_VL(unittest.TestCase):
                                             use_mrope=True)
 
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        seq_lens = torch.tensor([input_ids.size(-1)], dtype=torch.int)
         attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            seq_lens=seq_lens,
             num_contexts=1,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
                 num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             ),
             max_num_requests=1,
-            max_num_tokens=8192,
+            max_num_tokens=8192 if not scenario.modality == "video" else 16384,
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
+            max_seq_len=seq_lens + 1,
         )
 
         # Mrope position ids
@@ -388,8 +424,8 @@ class TestQwen2_5_VL(unittest.TestCase):
             "mrope_config"]["mrope_position_ids"]
         position_ids = position_ids.cuda()
 
-        hf_inputs = self.get_hf_inputs(qwen2_5_vl, Scenario(modality="image"),
-                                       device, prompt, media)
+        hf_inputs = self.get_hf_inputs(qwen2_5_vl, scenario.modality, device,
+                                       prompt, media)
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = qwen2_5_vl.forward(
@@ -398,11 +434,7 @@ class TestQwen2_5_VL(unittest.TestCase):
                 attn_metadata=attn_metadata,
                 multimodal_params=multimodal_params_list)
             # NOTE: HF creates its own position_ids inside forward() call
-            ref = hf_qwen2_5_vl.forward(
-                input_ids=hf_inputs["input_ids"],
-                pixel_values=hf_inputs["pixel_values"],
-                image_grid_thw=hf_inputs["image_grid_thw"],
-                use_cache=True)
+            ref = hf_qwen2_5_vl.forward(**hf_inputs, use_cache=True)
             torch.testing.assert_close(logits,
                                        ref.logits[:, -1].float(),
                                        atol=0.4,
@@ -452,8 +484,8 @@ class TestQwen2_5_VL(unittest.TestCase):
                                           attn_metadata=attn_metadata,
                                           multimodal_params=multimodal_params)
             else:
-                graph_runner = DecodingCUDAGraphRunner(
-                    attn_metadata.max_num_requests, "cuda", attn_metadata)
+                graph_runner = CUDAGraphRunner(attn_metadata.max_num_requests,
+                                               "cuda", attn_metadata)
                 graph_runner.capture(
                     lambda inputs: qwen2_5_vl.forward(**inputs))
 

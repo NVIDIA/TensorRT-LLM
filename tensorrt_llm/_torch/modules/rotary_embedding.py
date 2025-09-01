@@ -134,22 +134,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         rope_params: RopeParams,
         *,
         head_dim: int,
+        mrope_section: List[int],
         is_neox: bool = True,
-        # NOTE: default mrope_section is [16, 24, 24] for Qwen2/2.5-VL
-        mrope_section: List[int] = [16, 24, 24],
     ):
         super().__init__(rope_params, head_dim=head_dim, is_neox=is_neox)
         self.mrope_section = mrope_section
 
-    def forward(
-        self,
-        position_ids: torch.Tensor,
-        targets: List[torch.Tensor],
-    ) -> List[torch.Tensor]:
-        # it is assumed all targets are of the same rank
-        q_or_k = targets[0]
-        remove_input_padding = (len(q_or_k.size()) == 2)
-
+    def get_cos_sin(self, position_ids: torch.Tensor):
         if position_ids.ndim == 3:
             cos_sin = self.rotary_cos_sin[position_ids.view(3, -1)]
             cos, sin = cos_sin[:, :, 0, :], cos_sin[:, :, 1, :]
@@ -168,8 +159,22 @@ class MRotaryEmbedding(RotaryEmbedding):
             cos_sin = self.rotary_cos_sin[position_ids.view(-1)]
             cos, sin = cos_sin[:, 0, :], cos_sin[:, 1, :]
 
-        cos = cos.to(dtype=q_or_k.dtype).unsqueeze(0)
-        sin = sin.to(dtype=q_or_k.dtype).unsqueeze(0)
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+        return cos, sin
+
+    def forward(
+        self,
+        position_ids: torch.Tensor,
+        targets: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        # it is assumed all targets are of the same rank
+        q_or_k = targets[0]
+        remove_input_padding = (len(q_or_k.size()) == 2)
+
+        # TODO: Re-visit this to achieve cos_sin caching
+        cos, sin = self.get_cos_sin(position_ids)
+        cos, sin = cos.to(dtype=q_or_k.dtype), sin.to(dtype=q_or_k.dtype)
         if remove_input_padding:
             bsz = 1
             seq_len, _ = q_or_k.size()
