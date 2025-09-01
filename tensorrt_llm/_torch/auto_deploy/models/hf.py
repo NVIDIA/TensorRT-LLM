@@ -218,7 +218,15 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
         model.eval()
-        model.to(torch.bfloat16)
+        from transformers.quantizers import AutoHfQuantizer
+
+        hf_quantizer = AutoHfQuantizer.from_config(
+            model_config.quantization_config,
+            pre_quantized=True,
+        )
+
+        dtype = hf_quantizer.update_dtype(model_config.dtype)
+        model.to(dtype)
 
         return model
 

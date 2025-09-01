@@ -33,8 +33,6 @@ transforms:
     stage: pattern_matcher
   insert_mxfp4_mlp:
     stage: pattern_matcher
-  match_repeat_kv:
-    stage: pattern_matcher
   match_eager_attention:
     stage: pattern_matcher
   match_grouped_attention:
