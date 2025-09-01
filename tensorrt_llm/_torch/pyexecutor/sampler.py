@@ -770,21 +770,25 @@ class TorchSampler(Sampler):
                            new_tokens: torch.Tensor,
                            pad_id: int = _PAD_ID) -> torch.Tensor:
         # TODO: make sure only the lookback tokens are pulled into the list
-        lookback = self._longest_stop_word_len(requests) - 1
+        longest = self._longest_stop_word_len(requests)
+        assert longest > 0, f"{longest=}, longest stop word length should be greater than 0, as this code path is only reached with requests with stop words"
+        lookback = longest - 1
         old_tokens = []
         for request in requests:
-            old = request.get_tokens(BEAM_0)[-lookback:]
-            padded = [pad_id] * (lookback - len(old)) + old
+            old = request.get_tokens(BEAM_0)[-lookback:] if lookback > 0 else []
+            padded = [pad_id] * max(0, lookback - len(old)) + old
             old_tokens.append([padded] * self.max_tokens)
         old_tokens_tensor = torch.tensor(old_tokens,
                                          pin_memory=True).to("cuda",
                                                              non_blocking=True)
-        assert old_tokens_tensor.shape == (len(requests), self.max_tokens,
-                                           lookback)
+        assert old_tokens_tensor.shape == (
+            len(requests), self.max_tokens, lookback
+        ), f"{old_tokens_tensor.shape} != ({len(requests)=}, {self.max_tokens=}, {lookback=})"
         new_tokens = new_tokens.T.unsqueeze(1) * self._pad_steps_mask
         ret = torch.cat((old_tokens_tensor, new_tokens), dim=-1)
-        assert ret.shape == (len(requests), self.max_tokens,
-                             lookback + self.max_tokens)
+        assert ret.shape == (
+            len(requests), self.max_tokens, lookback + self.max_tokens
+        ), f"{ret.shape} != ({len(requests)=}, {self.max_tokens=}, {lookback + self.max_tokens=})"
         return ret
 
     def _are_stop_words(self, requests: list[LlmRequest],
