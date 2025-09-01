@@ -122,13 +122,6 @@ class GenerationExecutorWorker(GenerationExecutor):
                 args["tokenizer"] = tokenizer
                 args["lora_config"] = lora_config
                 args["kv_connector_config"] = kv_connector_config
-                args[
-                    "logits_post_processor_config"] = tllm.LogitsPostProcessorConfig(
-                        processor_batched=batched_logits_processor,
-                        replicate=False)
-                comm_ranks, device_ids = _get_comm_ranks_device_id()
-                args["parallel_config"] = tllm.ParallelConfig(
-                    participant_ids=comm_ranks, device_ids=device_ids)
             elif self.llm_args.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs
