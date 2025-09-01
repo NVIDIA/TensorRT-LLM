@@ -926,8 +926,9 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        # Encode swap_ab as False (0) and True (1). Currently only add one tactic here.
-        return [0, 1]
+        # Encode swap_ab as False (0) and True (1). Currently enabled when GEMM m <= 128.
+        input, _, _ = inputs
+        return [0, 1] if input.shape[0] <= 128 else [0]
 
     def forward(
         self,
@@ -942,21 +943,13 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
-        swap_ab = tactic == 1
-        if swap_ab:
-            deep_gemm.fp8_gemm_ntt(
-                (a, a_sf),
-                (weight, weight_scale),
-                output,
-                disable_ue8m0_cast=self.disable_ue8m0_cast,
-            )
-        else:
-            deep_gemm.fp8_gemm_nt(
-                (a, a_sf),
-                (weight, weight_scale),
-                output,
-                disable_ue8m0_cast=self.disable_ue8m0_cast,
-            )
+        forward_func = deep_gemm.fp8_gemm_ntt if tactic == 1 else deep_gemm.fp8_gemm_nt
+        forward_func(
+            (a, a_sf),
+            (weight, weight_scale),
+            output,
+            disable_ue8m0_cast=self.disable_ue8m0_cast,
+        )
         return output
 
 
