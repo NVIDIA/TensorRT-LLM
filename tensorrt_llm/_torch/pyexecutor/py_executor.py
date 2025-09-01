@@ -919,8 +919,8 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
-                
-                if self.dist.pp_size > 1 and self.enable_kv_cache_reuse:
+
+                if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
                     self._sync_termination(prev_microbatch_id)
 
                 # march forward in microbatch slots
@@ -1714,7 +1714,7 @@ class PyExecutor:
         self._enqueue_responses(error_responses.items())
 
     def _terminate_request(self, request: LlmRequest):
-        if self.dist.pp_size > 1 and self.enable_kv_cache_reuse:
+        if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
             # If pp_size > 1 and enable_kv_cache_reuse, we need to sync termination across PP ranks
             # otherwise, different ranks may have different KV cache blocks and a request may
             # have different PrepopulatedPromptLen which leads to a NCCL hang.
@@ -1898,17 +1898,18 @@ class PyExecutor:
             src=self.dist.prev_pp_rank,
             tag=microbatch_id,
         )
-        logger.debug(f"received remote state for microbatch {microbatch_id}, prev pp rank: {self.dist.prev_pp_rank} state {remote_state}")
+        logger.debug(
+            f"received remote state for microbatch {microbatch_id}, prev pp rank: {self.dist.prev_pp_rank} state {remote_state}"
+        )
 
         if remote_state:
             for req_id, state in remote_state.items():
                 local = self.pending_termination.get(req_id)
                 if local is None:
                     self.pending_termination[req_id] = {
-                        'ready_to_terminate':
-                        state.get('ready_to_terminate', set()),
-                        'terminated':
-                        state.get('terminated', set()),
+                        'ready_to_terminate': state.get('ready_to_terminate',
+                                                        set()),
+                        'terminated': state.get('terminated', set()),
                     }
                 else:
                     for key in ('ready_to_terminate', 'terminated'):
