@@ -61,6 +61,9 @@ class Eagle3ResourceManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
+        slot_id = self.slot_manager.get_slot(request.request_id)
+        self.seq_lens[slot_id] = 0
+        self.start_indices[slot_id] = 0
         self.slot_manager.remove_slot(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
