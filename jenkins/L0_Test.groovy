@@ -1990,7 +1990,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-TensorRT-Post-Merge-3": ["h100-cr", "l0_h100", 3, 5],
         "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
         "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
-        "H100-Fmha-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-Fmha-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
         "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
         "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
