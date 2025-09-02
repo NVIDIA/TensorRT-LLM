@@ -12,6 +12,7 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -45,7 +46,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         worker_cls: type = GenerationExecutorWorker,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
@@ -87,14 +88,15 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
-        self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+        self.garbage_collection_gen0_threshold = worker_kwargs[
+            "llm_args"].garbage_collection_gen0_threshold if worker_kwargs.get(
+                "llm_args", None) is not None else None
 
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False,
-                             garbage_collection_gen0_threshold=self.
-                             garbage_collection_gen0_threshold)
+                             kv_connector_config=kv_connector_config)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Generic, Optional, Tuple
+from typing import Dict, Generic, Optional, Tuple
 
 import torch
 from torch import nn
@@ -293,18 +293,6 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         if self.load_lm_head_from_target:
             self.lm_head = target_model.lm_head
 
-    # TODO: should input/position IDs be included in this? Keeping it implicit
-    # for now since the shapes/dtypes are the same across all models we have.
-    def get_warmup_extra_inputs(self, batch_size: int,
-                                num_tokens: int) -> Dict[str, Any]:
-
-        hidden_states = torch.empty(batch_size * num_tokens,
-                                    self.model.hidden_size,
-                                    dtype=self.model.dtype,
-                                    device='cuda')
-
-        return {'hidden_states': hidden_states}
-
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Hack for eagle3. We might need to run a matmul to reduce
@@ -425,6 +413,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             **kwargs,
         )
 
+        if attn_metadata.padded_num_tokens is not None:
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+
         if self.draft_model is not None:
             # get logits
             logits = self.logits_processor.forward(
@@ -433,9 +424,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 attn_metadata,
                 True,
             )
+            mtp_input_ids = input_ids
+            mtp_position_ids = position_ids
+            if attn_metadata.padded_num_tokens is not None:
+                if input_ids is not None:
+                    # Slice along the first dimension
+                    mtp_input_ids = input_ids[:attn_metadata.num_tokens]
+                if position_ids is not None:
+                    # Slice along the last dimension
+                    mtp_position_ids = position_ids[:, :attn_metadata.
+                                                    num_tokens]
+
             # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=input_ids,
-                                    position_ids=position_ids,
+            return self.spec_worker(input_ids=mtp_input_ids,
+                                    position_ids=mtp_position_ids,
                                     hidden_states=hidden_states,
                                     logits=logits,
                                     attn_metadata=attn_metadata,

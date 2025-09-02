@@ -74,12 +74,24 @@ struct TmaWarpSpecializedGroupedGemmInput
     static_assert(std::is_same_v<cutlass::layout::RowMajor, TransposeLayoutTag<cutlass::layout::ColumnMajor>>);
     static_assert(std::is_same_v<cutlass::layout::ColumnMajor, TransposeLayoutTag<cutlass::layout::RowMajor>>);
 
-    // Layout for A and B is transposed and then swapped in the implementation
-    // This uses B^T * A^T = (A * B)^T to get a better layout for the GEMM
-    using LayoutA = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for A matrix operand
-    using LayoutB = TransposeLayoutTag<cutlass::layout::ColumnMajor>; // Layout type for B matrix operand
-    using LayoutC = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for C matrix operand
-    using LayoutD = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for D matrix operand
+    // These are always the layout of A & B matrices, activations and weights will be assigned to either A or B based on
+    // swap_ab
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+
+    // When using Swap A&B we need to transpose the output matrix
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+    using LayoutC_T = TransposeLayoutTag<LayoutC>;
+    using LayoutD_T = TransposeLayoutTag<LayoutD>;
+
+    using StrideA = std::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutA*>>;
+    using StrideB = std::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
+
+    using StrideC = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutC*>>;
+    using StrideD = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD*>>;
+    using StrideC_T = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutC_T*>>;
+    using StrideD_T = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD_T*>>;
 
     constexpr static int NVFP4BlockScaleVectorSize = 16;
     constexpr static int MXFPXBlockScaleVectorSize = 32;
@@ -110,13 +122,6 @@ struct TmaWarpSpecializedGroupedGemmInput
         return (dim + alignment - 1) / alignment * alignment;
     }
 
-    using StrideA
-        = std::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutA*>>; // Use B because they will be swapped
-    using StrideB
-        = std::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutB*>>; // Use A because they will be swapped
-    using StrideC = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutC*>>;
-    using StrideD = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD*>>;
-
 #ifdef ENABLE_FP8
     template <class T>
     constexpr static bool IsFP8_v = std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
@@ -131,26 +136,29 @@ struct TmaWarpSpecializedGroupedGemmInput
 
     using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int64_t, int64_t, int64_t>>;
 
+    bool swap_ab = false;
     ProblemShape shape_info{};
-    StrideA* stride_a = nullptr;
-    StrideB* stride_b = nullptr;
+    void* stride_act = nullptr;
+    void* stride_weight = nullptr;
 
-    void const** ptr_a = nullptr;
-    void const** ptr_b = nullptr;
+    void const** ptr_act = nullptr;
+    void const** ptr_weight = nullptr;
 
     // C is currently the same in both epilogues
-    StrideC* stride_c = nullptr;
+    void* stride_c = nullptr;
     void const** ptr_c = nullptr;
 
     // D is used in all cases except fused finalize
-    StrideD* stride_d = nullptr;
+    void* stride_d = nullptr;
     void** ptr_d = nullptr;
 
     struct FusedFinalizeEpilogue
     {
+        using StrideFinalOutput_T = cutlass::detail::TagToStrideC_t<LayoutD_T>;
         using StrideFinalOutput = cutlass::detail::TagToStrideC_t<LayoutD>;
 
         void* ptr_final_output = nullptr;
+        StrideFinalOutput_T stride_final_output_transposed{};
         StrideFinalOutput stride_final_output{};
 
         void const** ptr_bias = nullptr;
@@ -158,6 +166,7 @@ struct TmaWarpSpecializedGroupedGemmInput
 
         int const** ptr_source_token_index = nullptr;
         int num_rows_in_final_output = 0;
+        int shape_override = -1;
 
         bool use_reduction = true;
     };
@@ -178,11 +187,11 @@ struct TmaWarpSpecializedGroupedGemmInput
     using ElementSF = uint8_t;
     using MXFPXElementSF = ElementSF; // Just an alias for now
     using NVFP4ElementSF = ElementSF; // Just an alias for now
-    ElementSF const** fpX_block_scaling_factors_A = nullptr;
-    ElementSF const** fpX_block_scaling_factors_B = nullptr;
+    ElementSF const** fpX_block_scaling_factors_act = nullptr;
+    ElementSF const** fpX_block_scaling_factors_weight = nullptr;
 
-    void* fpX_block_scaling_factors_stride_A = nullptr;
-    void* fpX_block_scaling_factors_stride_B = nullptr;
+    void* fpX_block_scaling_factors_stride_act = nullptr;
+    void* fpX_block_scaling_factors_stride_weight = nullptr;
 
     enum class FpXBlockScalingType
     {
@@ -228,7 +237,7 @@ struct TmaWarpSpecializedGroupedGemmInput
 
     bool isValid() const
     {
-        return stride_a != nullptr && ptr_a != nullptr;
+        return stride_act != nullptr && ptr_act != nullptr;
     }
 
     void setFinalizeFusionParams(void* final_output, int hidden_size, int num_output_tokens, bool use_reduction);

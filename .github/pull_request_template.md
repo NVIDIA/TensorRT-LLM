@@ -40,6 +40,20 @@ Please explain the issue and the solution in short.
 Please list clearly what are the relevant test(s) that can safeguard the changes in the PR. This helps us to ensure we have sufficient test coverage for the PR.
 -->
 
+## PR Checklist
+
+Please review the following before submitting your PR:
+- PR description clearly explains what and why. If using CodeRabbit's summary, please make sure it makes sense.
+- PR Follows [TRT-LLM CODING GUIDELINES](https://github.com/NVIDIA/TensorRT-LLM/blob/main/CODING_GUIDELINES.md) to the best of your knowledge.
+- Test cases are provided for new code paths (see [test instructions](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tests#1-how-does-the-ci-work))
+- Any new dependencies have been scanned for license and vulnerabilities
+- [CODEOWNERS](https://github.com/NVIDIA/TensorRT-LLM/blob/main/.github/CODEOWNERS) updated if ownership changes
+- Documentation updated as needed
+- The reviewers assigned automatically/manually are appropriate for the PR.
+
+
+- [ ] Please check this after reviewing the above items as appropriate for this PR.
+
 ## GitHub Bot Help
 
 `/bot [-h] ['run', 'kill', 'skip', 'reuse-pipeline'] ...`
