@@ -367,7 +367,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     """
 
     # To reuse pytorch memory segments allocated during graph capture.
-    allocated_buffer_recorder: dict[str, list[torch.Tensor]] = {}
+    allocated_buffer_in_graph_pool: dict[str, list[torch.Tensor]] = {}
+    allocated_buffer_in_runtime: dict[str, torch.Tensor] = {}
 
     def __init__(
         self,
