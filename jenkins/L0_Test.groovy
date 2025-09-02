@@ -387,7 +387,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
                     "-v /tmp/ccache:${CCACHE_DIR}:rw " +
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
-                    "--cap-add SYSLOG"
+                    "--cap-add=SYSLOG"
 
                 echo "Final dockerArgs: ${dockerArgs}"
 
