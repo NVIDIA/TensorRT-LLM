@@ -27,14 +27,14 @@ build_sqsh:
 		--container-save "$(SQSH_PATH)" \
 		--container-mounts "$(SOURCE_DIR):/code/tensorrt_llm" --container-workdir /code/tensorrt_llm/docker/common \
 		--container-mount-home --container-remap-root \
-		--container-env TRT_VER=$(TRT_VERSION) \
-		--container-env CUDA_VER=$(CUDA_VERSION) \
-		--container-env CUDNN_VER=$(CUDNN_VERSION) \
-		--container-env NCCL_VER=$(NCCL_VERSION) \
-		--container-env CUBLAS_VER=$(CUBLAS_VERSION) \
-		--container-env PYTHON_VERSION \
-		--container-env GITHUB_MIRROR \
-		--container-env TORCH_INSTALL_TYPE \
+		$(if $(CUDA_VERSION), --container-env CUDA_VER="$(CUDA_VERSION)") \
+		$(if $(CUDNN_VERSION), --container-env CUDNN_VER="$(CUDNN_VERSION)") \
+		$(if $(NCCL_VERSION), --container-env NCCL_VER="$(NCCL_VERSION)") \
+		$(if $(CUBLAS_VERSION), --container-env CUBLAS_VER="$(CUBLAS_VERSION)") \
+		$(if $(TRT_VERSION), --container-env TRT_VER="$(TRT_VERSION)") \
+		$(if $(PYTHON_VERSION), --container-env PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(GITHUB_MIRROR), --container-env GITHUB_MIRROR="$(GITHUB_MIRROR)") \
+		$(if $(TORCH_INSTALL_TYPE), --container-env TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
 		./install.sh --all
 
 endif
