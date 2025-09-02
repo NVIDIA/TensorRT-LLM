@@ -97,6 +97,9 @@ install_rockylinux_requirements() {
         wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
+    # Remove old packages
+    dnf remove -y "libnccl*"
+
     # Install new packages
     dnf -y install \
         libnccl-${NCCL_VER}.${ARCH1}.rpm \
