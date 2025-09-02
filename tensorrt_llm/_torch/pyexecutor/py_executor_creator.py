@@ -217,14 +217,9 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     lora_config: Optional[LoraConfig] = None,
     kv_connector_config: Optional[KvCacheConnectorConfig] = None,
-    logits_post_processor_config: Optional[LogitsPostProcessorConfig] = None,
-    parallel_config: Optional[ParallelConfig] = None,
 ) -> PyExecutor:
 
     executor_config = llm_args.get_executor_config(checkpoint_dir, tokenizer)
-    executor_config.logits_post_processor_config = logits_post_processor_config
-    executor_config.parallel_config = parallel_config
-
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
 
     _mangle_executor_config(executor_config)
