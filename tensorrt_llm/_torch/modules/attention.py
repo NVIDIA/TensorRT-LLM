@@ -968,6 +968,14 @@ class MLA(nn.Module):
         if self.is_lite:
             compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
+            if os.getenv("TRTLLM_ENABLE_PREFETCH") == "1" and do_multi_stream():
+                if getattr(
+                        self,
+                        "kv_a_proj_with_mqa_weight_is_passed_to_previous_layer",
+                        False):
+                    if hidden_states.shape[0] in [64, 256]:
+                        self.prefetch_aux_stream.wait_stream(
+                            torch.cuda.current_stream())
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             q = hidden_states
         else:
