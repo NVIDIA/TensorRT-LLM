@@ -69,7 +69,7 @@ run_python_file() {
 
 # Function: run disagg serving test
 run_disagg_serving_test() {
-    local disagg_dir="disagg_serving_local"
+    local disagg_dir="disaggregated"
     local test_name="disagg_serving_test"
 
     # Store the original directory path for log files
@@ -81,7 +81,7 @@ run_disagg_serving_test() {
     echo "Log file: $log_file"
     echo "------------------------------------------"
 
-    # Check if disagg_serving_local directory exists
+    # Check if disaggregated directory exists
     if [ ! -d "$disagg_dir" ]; then
         echo "❌ $disagg_dir directory not found"
         TEST_RESULTS["$test_name"]="FAIL"
@@ -89,7 +89,7 @@ run_disagg_serving_test() {
         return 1
     fi
 
-    # Change to disagg_serving_local directory
+    # Change to disaggregated directory
     cd "$disagg_dir"
 
     # Start the serving in background

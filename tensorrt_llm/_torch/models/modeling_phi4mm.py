@@ -1,7 +1,7 @@
 # Plan for phi4-mm model support.
 # (done) step 1: support legacy inference pipeline for phi4-mm model.
 # (todo) step 2: refactor the inference pipeline to use AGGREGATE mode (https://github.com/NVIDIA/TensorRT-LLM/pull/5522).
-
+import copy
 from typing import List, Optional, Tuple
 
 import torch
@@ -166,7 +166,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
             return
 
         # We use Phi3ForCausalLM as the language model.
-        llm_model_config = model_config.clone()
+        llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config.architectures = ["Phi3ForCausalLM"]
         # Only build the language model architecture without loading weights.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)

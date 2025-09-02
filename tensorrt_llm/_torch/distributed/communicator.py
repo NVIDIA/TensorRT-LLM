@@ -188,8 +188,6 @@ class TorchDist(Distributed):
         pg_broker.init_pg(torch.distributed.group.WORLD, self.local_comm)
         pg_broker.init_store(self.default_store)
 
-        self.tp_group = self.mapping.tp_group
-
     def setup_local_comm(self):
         self._get_cluster_info()
 
