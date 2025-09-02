@@ -14,9 +14,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
-                                            ExecutorConfig)
+                                            ExecutorConfig,
+                                            LogitsPostProcessorConfig,
+                                            ParallelConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -209,12 +212,21 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
 
 
 def create_py_executor(
-        executor_config: ExecutorConfig,
-        checkpoint_dir: str = None,
-        lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: str = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    lora_config: Optional[LoraConfig] = None,
+    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+    logits_post_processor_config: Optional[LogitsPostProcessorConfig] = None,
+    parallel_config: Optional[ParallelConfig] = None,
 ) -> PyExecutor:
+
+    executor_config = llm_args.get_executor_config(checkpoint_dir, tokenizer)
+    executor_config.logits_post_processor_config = logits_post_processor_config
+    executor_config.parallel_config = parallel_config
+
+    garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
+
     _mangle_executor_config(executor_config)
     pytorch_backend_config = executor_config.pytorch_backend_config
 
@@ -260,12 +272,28 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-            draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
-            if spec_config.load_format == "dummy":
-                draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
             # The draft model won't have any draft tokens attached to
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
+
+            use_chain_drafter = (
+                executor_config.guided_decoding_config is None
+                and not pytorch_backend_config.enable_mixed_sampler
+                and pytorch_backend_config.attn_backend == "TRTLLM")
+
+            if use_chain_drafter:
+
+                def drafting_loop_wrapper(model):
+                    from tensorrt_llm._torch.speculative.drafting_loops import \
+                        ChainDrafter
+
+                    return ChainDrafter(spec_config.max_draft_len, model)
+            else:
+                drafting_loop_wrapper = None
+
+            draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
+            if spec_config.load_format == "dummy":
+                draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model_dir,
@@ -282,6 +310,7 @@ def create_py_executor(
                 spec_config=draft_spec_config,
                 checkpoint_loader=executor_config.checkpoint_loader,
                 is_draft_model=True,
+                drafting_loop_wrapper=drafting_loop_wrapper,
             )
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
@@ -484,6 +513,7 @@ def create_py_executor(
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
+            max_seq_len=executor_config.max_seq_len,
         )
 
     if estimating_kv_cache:
@@ -528,6 +558,7 @@ def create_py_executor(
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
+                max_seq_len=executor_config.max_seq_len,
             )
 
     _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)
