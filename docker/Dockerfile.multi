@@ -6,15 +6,6 @@ ARG TRITON_BASE_TAG=25.06-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
-COPY docker/common/install.sh install.sh
-COPY docker/common/install_base.sh install_base.sh
-COPY docker/common/install_cmake.sh install_cmake.sh
-COPY docker/common/install_ccache.sh install_ccache.sh
-COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
-COPY docker/common/install_tensorrt.sh install_tensorrt.sh
-COPY docker/common/install_polygraphy.sh install_polygraphy.sh
-COPY docker/common/install_mpi4py.sh install_mpi4py.sh
-COPY docker/common/install_pytorch.sh install_pytorch.sh
 
 # Add NVIDIA EULA and AI Terms labels
 LABEL com.nvidia.eula="https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/"
@@ -37,19 +28,38 @@ ARG NCCL_VER
 ARG CUBLAS_VER
 
 ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
+
+COPY docker/common/install.sh install.sh
+
+COPY docker/common/install_base.sh install_base.sh
 RUN bash ./install.sh --base
+
+COPY docker/common/install_cmake.sh install_cmake.sh
 RUN bash ./install.sh --cmake
+
+COPY docker/common/install_ccache.sh install_ccache.sh
 RUN bash ./install.sh --ccache
+
+COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
 RUN bash ./install.sh --cuda_toolkit
+
+COPY docker/common/install_tensorrt.sh install_tensorrt.sh
 RUN export TRT_VER=${TRT_VER} \
     && export CUDA_VER=${CUDA_VER} \
     && export CUDNN_VER=${CUDNN_VER} \
     && export NCCL_VER=${NCCL_VER} \
     && export CUBLAS_VER=${CUBLAS_VER} \
     && bash ./install.sh --tensorrt
+
+COPY docker/common/install_polygraphy.sh install_polygraphy.sh
 RUN bash ./install.sh --polygraphy
+
+COPY docker/common/install_mpi4py.sh install_mpi4py.sh
 RUN bash ./install.sh --mpi4py
+
+COPY docker/common/install_pytorch.sh install_pytorch.sh
 RUN bash ./install.sh --pytorch
+
 RUN bash ./install.sh --opencv
 RUN bash ./install.sh --protobuf
 
