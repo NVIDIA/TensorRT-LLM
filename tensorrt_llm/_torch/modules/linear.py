@@ -927,6 +927,9 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
         # amax_input / 448
         module.input_scale = Parameter(torch.empty([1], dtype=torch.float32),
                                        requires_grad=False)
+        module.inv_input_scale = Parameter(torch.tensor(1.,
+                                                        dtype=torch.float32),
+                                           requires_grad=False)
         # amax_weight / 448
         module.weight_scale_2 = Parameter(torch.empty([1], dtype=torch.float32),
                                           requires_grad=False)
@@ -1029,6 +1032,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                                      module.epilogue_tile_m,
                                                      module.scaling_vector_size)
         copy_weight(module.input_scale, input_scale)
+        copy_weight(module.inv_input_scale, 1.0 / input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.weight_scale_2, weight_scale_2)
         copy_weight(module.alpha, alpha)
@@ -1050,6 +1054,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                                      module.epilogue_tile_m,
                                                      module.scaling_vector_size)
         copy_weight(module.input_scale, input_scale)
+        copy_weight(module.inv_input_scale, 1.0 / input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.weight_scale_2, weight_scale_2)
         copy_weight(module.alpha, alpha)
@@ -1080,6 +1085,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                                                      module.epilogue_tile_m,
                                                      module.scaling_vector_size)
         copy_weight(module.input_scale, input_scale)
+        copy_weight(module.inv_input_scale, 1.0 / input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.weight_scale_2, weight_scale_2)
         copy_weight(module.alpha, alpha)
