@@ -1910,6 +1910,7 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
 @skip_pre_hopper
 @pytest.mark.parametrize("model_path", [
     pytest.param('DeepSeek-V3', marks=skip_post_blackwell),
+    pytest.param('DeepSeek-V3-0324', marks=skip_post_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
@@ -2149,6 +2150,10 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
     pytest.param('Nemotron-Ultra-253B',
                  'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
                  marks=(skip_pre_hopper, pytest.mark.timeout(12600))),
+    pytest.param('DeepSeek-V3-671B-FP8',
+                 'DeepSeek-V3-0324',
+                 marks=(skip_post_blackwell,
+                        pytest.mark.skip_less_device_memory(90000))),
 ])
 def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                        model_path):
@@ -2160,7 +2165,8 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
         "Llama3.1-70B-FP8": 14.9,
         "Llama3.1-405B-FP8": 63.2,
         "Mixtral-8x7B-NVFP4": 9.9,
-        "Nemotron-Ultra-253B": 72.3
+        "Nemotron-Ultra-253B": 72.3,
+        "DeepSeek-V3-671B-FP8": 83.8
     }
     with tempfile.NamedTemporaryFile(mode='w+t',
                                      suffix=f".{model_name}.log",
