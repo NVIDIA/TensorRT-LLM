@@ -2,13 +2,16 @@ BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' ../docker/Dockerfile.multi
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' ../docker/Dockerfile.multi | grep -o '=.*' | tr -d '="')
 SQSH_PATH          ?= tensorrt_llm.devel.sqsh
 SOURCE_DIR        ?= $(shell readlink -f ..)
+RUN_CMD            ?= "--pty bash"
 
 ifndef MAKEFILE_PYXIS_INCLUDED
 MAKEFILE_PYXIS_INCLUDED := 1
 
 
 build_sqsh:
-	@echo "Building trtllm sqsh image. Base image: $(BASE_IMAGE):$(BASE_TAG). Location: $(SQSH_PATH)"
+	@echo "Building trtllm sqsh image."
+	@echo "Base image: $(BASE_IMAGE):$(BASE_TAG)"
+	@echo "Location: $(SQSH_PATH)"
 
 	srun \
 		--container-image $(BASE_IMAGE):$(BASE_TAG) \
@@ -23,3 +26,15 @@ build_sqsh:
 		./install.sh --all
 
 endif
+
+run_sqsh:
+	@echo "Running srun job step with:"
+	@echo "    sqsh image: $(SQSH_PATH)"
+	@echo "    run command: $(RUN_CMD)"
+
+	srun \
+		--container-image $(SQSH_PATH) \
+		--container-mounts $(SOURCE_DIR):/code/tensorrt_llm --container-workdir /code/tensorrt_llm \
+		--container-mount-home --container-remap-root \
+		--container-env PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999" \
+		$(RUN_CMD)
