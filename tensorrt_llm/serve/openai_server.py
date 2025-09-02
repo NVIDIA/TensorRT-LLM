@@ -23,6 +23,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
+from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder
@@ -55,6 +56,42 @@ from .harmony_adapter import (HarmonyAdapter, handle_non_streaming_response,
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def tokenize_prompt_with_default_processor(prompt_data, input_processor, sampling_params):
+    """Tokenize a prompt using DefaultInputProcessor in a thread pool worker.
+
+    This function is designed to run in a ThreadPoolExecutor to avoid blocking
+    the main event loop during tokenization. It uses the existing input processor
+    and sampling params for efficient tokenization.
+
+    Args:
+        prompt_data (dict): Dictionary containing the prompt text
+        input_processor: The DefaultInputProcessor instance to use
+        sampling_params: The SamplingParams instance to use
+
+    Returns:
+        dict: Dictionary containing tokenized prompt and any extra processed inputs
+    """
+    try:
+        # Extract the prompt
+        prompt = prompt_data["prompt"]
+
+        # Create TextPrompt input
+        text_prompt = {"prompt": prompt}
+        if "query" in prompt_data:
+            text_prompt["query"] = prompt_data["query"]
+
+        # Tokenize using the input processor
+        token_ids, extra_processed_inputs = input_processor(text_prompt, sampling_params)
+
+        return {
+            "token_ids": token_ids,
+            "extra_processed_inputs": extra_processed_inputs or {}
+        }
+    except Exception as e:
+        logger.error(f"Error tokenizing prompt in thread: {e}")
+        raise
 
 
 class OpenAIServer:
@@ -623,7 +660,74 @@ class OpenAIServer:
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
-            for idx, prompt in enumerate(prompts):
+
+            # Tokenize prompts using asyncio.to_thread for truly non-blocking operation
+            tokenized_prompts = []
+
+            # Create input processor for tokenization
+            input_processor = DefaultInputProcessor(
+                model_path=self.llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path,
+                model_config=self.model_config,
+                tokenizer=self.tokenizer,
+                trust_remote_code=self.llm.args.trust_remote_code
+            )
+
+            # Prepare tokenization tasks
+            tokenization_tasks = []
+            for prompt in prompts:
+                if isinstance(prompt, str):
+                    # Only tokenize string prompts, skip already tokenized ones
+                    prompt_data = {
+                        "prompt": prompt
+                    }
+                    if hasattr(request, 'query') and request.query:
+                        prompt_data["query"] = request.query
+
+                    # Create async task using asyncio.to_thread
+                    task = asyncio.create_task(
+                        asyncio.to_thread(
+                            tokenize_prompt_with_default_processor,
+                            prompt_data,
+                            input_processor,
+                            sampling_params
+                        )
+                    )
+                    tokenization_tasks.append(task)
+                else:
+                    # Already tokenized, add None to maintain index alignment
+                    tokenization_tasks.append(None)
+
+            # Collect tokenization results concurrently
+            if any(task is not None for task in tokenization_tasks):
+                # Wait for all tokenization tasks to complete concurrently
+                results = await asyncio.gather(*[task for task in tokenization_tasks if task is not None])
+
+                # Process results
+                result_idx = 0
+                for i, task in enumerate(tokenization_tasks):
+                    if task is not None:
+                        try:
+                            result = results[result_idx]
+                            tokenized_prompt = {
+                                "prompt_token_ids": result["token_ids"]
+                            }
+                            # Add query_token_ids if present
+                            if result["extra_processed_inputs"] and "query_token_ids" in result["extra_processed_inputs"]:
+                                tokenized_prompt["query_token_ids"] = result["extra_processed_inputs"]["query_token_ids"]
+                            tokenized_prompts.append(tokenized_prompt)
+                            result_idx += 1
+                        except Exception as e:
+                            logger.error(f"Error tokenizing prompt {i}: {e}")
+                            raise
+                    else:
+                        # Already tokenized prompt - convert to proper format
+                        tokenized_prompts.append(prompt_inputs(prompts[i]))
+            else:
+                # No tokenization needed, just convert existing prompts
+                for prompt in prompts:
+                    tokenized_prompts.append(prompt_inputs(prompt))
+
+            for idx, (prompt, tokenized_prompt) in enumerate(zip(prompts, tokenized_prompts)):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx
                 if request.echo:
@@ -634,7 +738,7 @@ class OpenAIServer:
                     postproc_args=postproc_args,
                 )
                 promise = self.llm.generate_async(
-                    inputs=prompt,
+                    inputs=tokenized_prompt,
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
                     streaming=request.stream,
