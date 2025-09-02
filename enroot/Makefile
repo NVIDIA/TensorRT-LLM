@@ -2,7 +2,7 @@ BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' ../docker/Dockerfile.multi
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' ../docker/Dockerfile.multi | grep -o '=.*' | tr -d '="')
 SQSH_PATH          ?= tensorrt_llm.devel.sqsh
 SOURCE_DIR        ?= $(shell readlink -f ..)
-RUN_CMD            ?= "--pty bash"
+RUN_CMD            ?= --pty bash
 
 ifndef MAKEFILE_PYXIS_INCLUDED
 MAKEFILE_PYXIS_INCLUDED := 1
@@ -14,9 +14,9 @@ build_sqsh:
 	@echo "Location: $(SQSH_PATH)"
 
 	srun \
-		--container-image $(BASE_IMAGE):$(BASE_TAG) \
-		--container-save $(SQSH_PATH) \
-		--container-mounts $(SOURCE_DIR):/code/tensorrt_llm --container-workdir /code/tensorrt_llm/docker/common \
+		--container-image "$(BASE_IMAGE):$(BASE_TAG)" \
+		--container-save "$(SQSH_PATH)" \
+		--container-mounts "$(SOURCE_DIR):/code/tensorrt_llm" --container-workdir /code/tensorrt_llm/docker/common \
 		--container-mount-home --container-remap-root \
 		--container-env TRT_VER \
 		--container-env CUDA_VER \
@@ -33,8 +33,8 @@ run_sqsh:
 	@echo "    run command: $(RUN_CMD)"
 
 	srun \
-		--container-image $(SQSH_PATH) \
-		--container-mounts $(SOURCE_DIR):/code/tensorrt_llm --container-workdir /code/tensorrt_llm \
+		--container-image "$(SQSH_PATH)" \
+		--container-mounts "$(SOURCE_DIR):/code/tensorrt_llm" --container-workdir /code/tensorrt_llm \
 		--container-mount-home --container-remap-root \
 		--container-env PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999" \
 		$(RUN_CMD)
