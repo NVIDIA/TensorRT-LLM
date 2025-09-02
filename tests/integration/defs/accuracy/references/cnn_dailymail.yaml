@@ -1,5 +1,5 @@
 google/gemma-3-1b-it:
-  - accuracy: 22.988
+  - accuracy: 19.0
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 20.699
@@ -186,7 +186,8 @@ meta-llama/Llama-3.2-3B:
     kv_cache_quant_algo: FP8
     accuracy: 33.629
 meta-llama/Llama-3.3-70B-Instruct:
-  - spec_dec_algo: Eagle
+  - quant_algo: FP8
+    spec_dec_algo: Eagle
     accuracy: 33.244
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
@@ -216,6 +217,9 @@ mistralai/Mistral-7B-Instruct-v0.3:
     accuracy: 31.201
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 29.20
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.0
 mistralai/Mistral-Nemo-12b-Base:
   - accuracy: 28.906
   - quant_algo: FP8
