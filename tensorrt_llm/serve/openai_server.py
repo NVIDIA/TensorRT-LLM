@@ -351,15 +351,19 @@ class OpenAIServer:
 
         async def chat_stream_generator(
                 promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            if not self.postproc_worker_enabled:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-            async for res in promise:
-                pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                await self._extract_metrics(res)
-                for pp_res in pp_results:
-                    yield pp_res
-            yield "data: [DONE]\n\n"
-            nvtx_mark("generation ends")
+            try:
+                if not self.postproc_worker_enabled:
+                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                async for res in promise:
+                    pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                    await self._extract_metrics(res)
+                    for pp_res in pp_results:
+                        yield pp_res
+                yield "data: [DONE]\n\n"
+                nvtx_mark("generation ends")
+            except:
+                logger.error(traceback.format_exc())
+                raise
 
         async def create_chat_response(
                 promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
@@ -572,15 +576,20 @@ class OpenAIServer:
             return merged_rsp
 
         async def completion_generator(promise: RequestOutput, params: Optional[PostprocParams]):
-            async for output in promise:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = params.post_processor, params.postproc_args
-                    pp_result = post_processor(output, args)
-                else:
-                    pp_result = output.outputs[0]._postprocess_result
-                await self._extract_metrics(output)
-                for pp_res in pp_result:
-                    yield pp_res
+            try:
+                async for output in promise:
+                    if not self.postproc_worker_enabled:
+                        post_processor, args = params.post_processor, params.postproc_args
+                        pp_result = post_processor(output, args)
+                    else:
+                        pp_result = output.outputs[0]._postprocess_result
+                    await self._extract_metrics(output)
+                    for pp_res in pp_result:
+                        yield pp_res
+            except:
+                logger.error(traceback.format_exc())
+                raise
+
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
