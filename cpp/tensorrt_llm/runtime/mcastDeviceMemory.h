@@ -96,11 +96,11 @@ private:
     size_t mSignalPadOffset;
     size_t mAllocationSize;
 
-    tensorrt_llm::mpi::MpiComm mGroupComm; //!< The MPI communicator for the group
-
     CUdeviceptr mMcPtr;
     CUmemGenericAllocationHandle mMcHandle;
     std::vector<CUmemGenericAllocationHandle> mUcHandles;
+
+    tensorrt_llm::mpi::MpiComm mGroupComm; //!< The MPI communicator for the group
 
     // Host array of pointers
     std::vector<CUdeviceptr> mUcPtrs;
