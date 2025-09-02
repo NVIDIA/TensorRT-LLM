@@ -3822,7 +3822,8 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
         if alibi and enable_attn_logit_softcapping:
             continue
         # for normal attention, we do not need return softmax for ws fp8 kernels currently.
-        skip_combination = return_softmax
+        # also fp8 input and bf16 output is only needed for MLA kernel.
+        skip_combination = return_softmax or (output_dtype is not None)
         # for context mla, we need separate qkv as input layout when returning softmax.
         skip_mla_combination = return_softmax and input_layout != InputLayout.SEPARATE_Q_K_V
         if not skip_combination:
@@ -6215,6 +6216,10 @@ def enumerate_kernels():
     enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16')
     enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='bf16')
     enumerate_qgmma_flash_warpspec_kernels(specs, sm=90, dtype='e4m3')
+    enumerate_qgmma_flash_warpspec_kernels(specs,
+                                           sm=90,
+                                           dtype='e4m3',
+                                           output_dtype="bf16")
 
     # For now SageAttention only needs BF16
     # block_size_q should be divisible by 64
