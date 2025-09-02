@@ -1292,7 +1292,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
     // fail the stage immediately without attempting any reruns
-    rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
+    def rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
     if (fileExists(rerunTestList)) {
         sh "cat ${rerunTestList}"
         error "There are some failed tests that cannot be rerun, skip the rerun step."
@@ -1301,10 +1301,10 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     // If the stage has more than 5 failed tests, skip the rerun step
     def validLineCount = 0
     for (times in [1, 2]) {
-        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
-        if (fileExists(rerunTestList)) {
+        def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (fileExists(currentRerunTestList)) {
             count = sh(
-                script: "grep -v '^[[:space:]]*\$' ${rerunTestList} | wc -l",
+                script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
                 returnStdout: true
             ).trim().toInteger()
             echo "Found ${count} tests to rerun ${times} time(s)"
@@ -1318,23 +1318,23 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     }
 
     // Rerun tests
-    isRerunFailed = false
+    def isRerunFailed = false
     for (times in [1, 2]) {
-        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
-        if (!fileExists(rerunTestList)) {
+        def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (!fileExists(currentRerunTestList)) {
             echo "No failed tests need to be rerun ${times} time(s)"
             continue
         }
-        sh "cat ${rerunTestList}"
-        xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
+        sh "cat ${currentRerunTestList}"
+        def xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
-        noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
-        needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
-        testCmdLine = testCmdLine.findAll { cmd ->
+        def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
+        def needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
+        def newTestCmdLine = testCmdLine.findAll { cmd ->
             !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
         }
-        testCmdLine += [
-            "--test-list=${rerunTestList}",
+        newTestCmdLine += [
+            "--test-list=${currentRerunTestList}",
             "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
             "--junit-xml ${xmlFile}",
             "--reruns ${times - 1}"
@@ -1342,7 +1342,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         try {
             sh """
                 cd ${llmSrc}/tests/integration/defs && \
-                ${testCmdLine.join(" ")}
+                ${newTestCmdLine.join(" ")}
             """
         } catch(InterruptedException e) {
             throw e
@@ -1360,9 +1360,9 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
 
     // Generate rerun report
-    inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
-                  "${WORKSPACE}/${stageName}/rerun_results_1.xml",
-                  "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
+    def inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
+                      "${WORKSPACE}/${stageName}/rerun_results_1.xml",
+                      "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_report \
@@ -1643,7 +1643,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
-                    isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
+                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
                     if (isRerunFailed) {
                         error "The tests still failed after rerun attempt."
                     }
