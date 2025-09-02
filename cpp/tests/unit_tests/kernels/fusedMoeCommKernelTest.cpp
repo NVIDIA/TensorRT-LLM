@@ -65,6 +65,19 @@ protected:
         }
     }
 
+    cudaDataType_t getCudaDataType(int elementSize)
+    {
+        switch (elementSize)
+        {
+        case 1: return CUDA_R_8U;
+        case 2: return CUDA_R_16F;
+        case 4: return CUDA_R_32F;
+        case 8: return CUDA_R_64F;
+        case 16: return CUDA_C_64F;
+        default: TLLM_THROW("Unsupported element size: %d", elementSize);
+        };
+    }
+
     bool skipped = false;
     cudaStream_t stream = nullptr;
 
@@ -238,7 +251,8 @@ protected:
             deviceFieldPtrs[i] = deviceField;
 
             // Use the new fillFieldInfo helper function
-            sendFieldInfo.fieldsInfo[i].fillFieldInfo(deviceField, elementSize, vectorSize, vectorSize);
+            sendFieldInfo.fieldsInfo[i].fillFieldInfo(
+                deviceField, elementSize, vectorSize, vectorSize, getCudaDataType(elementSize));
         }
 
         // Fill field placement info
@@ -385,7 +399,8 @@ protected:
             deviceFieldPtrs[i] = deviceField;
 
             // Use the new fillFieldInfo helper function
-            recvFieldInfo.fieldsInfo[i].fillFieldInfo(deviceField, elementSize, vectorSize, vectorSize);
+            recvFieldInfo.fieldsInfo[i].fillFieldInfo(
+                deviceField, elementSize, vectorSize, vectorSize, getCudaDataType(elementSize));
         }
 
         // Fill field placement info
@@ -612,8 +627,10 @@ protected:
             deviceRecvFieldPtrs[i] = deviceRecvField;
 
             // Fill field info for both send and recv
-            sendFieldInfo.fieldsInfo[i].fillFieldInfo(deviceSendField, elementSize, vectorSize, vectorSize);
-            recvFieldInfo.fieldsInfo[i].fillFieldInfo(deviceRecvField, elementSize, vectorSize, vectorSize);
+            sendFieldInfo.fieldsInfo[i].fillFieldInfo(
+                deviceSendField, elementSize, vectorSize, vectorSize, getCudaDataType(elementSize));
+            recvFieldInfo.fieldsInfo[i].fillFieldInfo(
+                deviceRecvField, elementSize, vectorSize, vectorSize, getCudaDataType(elementSize));
         }
 
         // Fill field placement info
@@ -1067,8 +1084,10 @@ protected:
             deviceRecvFieldPtrs[i] = deviceRecvField;
 
             // Fill field info
-            sendFieldInfo.fieldsInfo[i].fillFieldInfo(deviceSendField, elementSize, vectorSize, vectorSize);
-            recvFieldInfo.fieldsInfo[i].fillFieldInfo(deviceRecvField, elementSize, vectorSize, vectorSize);
+            sendFieldInfo.fieldsInfo[i].fillFieldInfo(
+                deviceSendField, elementSize, vectorSize, vectorSize, getCudaDataType(elementSize));
+            recvFieldInfo.fieldsInfo[i].fillFieldInfo(
+                deviceRecvField, elementSize, vectorSize, vectorSize, getCudaDataType(elementSize));
         }
 
         // Fill field placement info

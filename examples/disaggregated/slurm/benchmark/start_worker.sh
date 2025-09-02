@@ -10,8 +10,9 @@ port=$4
 benchmark_mode=$5
 concurrency=$6
 enable_pdl=$7
-work_dir=$8
-nsys_folder=${9:-}
+numa_bind=$8
+work_dir=$9
+nsys_folder=${10:-}
 
 unset UCX_TLS
 echo "concurrency: ${concurrency}, enable_pdl: ${enable_pdl}, work_dir: ${work_dir}"
@@ -21,6 +22,14 @@ export TLLM_LOG_LEVEL=INFO
 
 if [ "${enable_pdl}" = "true" ]; then
     export TRTLLM_ENABLE_PDL=1
+fi
+
+if [ "${numa_bind}" = "true" ]; then
+    numa_bind_cmd="numactl -m 0,1"
+    echo "numactl -m 0,1 - Only allocate memory from nodes on GB200"
+else
+    numa_bind_cmd=""
+    echo "Not binding memory. If on GB200, use \"numactl -m 0,1\" to only allocate memory from nodes."
 fi
 
 if [ "${benchmark_mode}" = "gen_only" ]; then
@@ -50,20 +59,20 @@ fi
 #check if nsys_folder is provided
 if [ -z "${nsys_folder:-}" ]; then
     echo "nsys is not enabled, start normal flow"
-    trtllm-llmapi-launch trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file}
+    trtllm-llmapi-launch ${numa_bind_cmd} trtllm-serve ${model_path} --host $(hostname) --port ${port} --extra_llm_api_options ${config_file}
 else
     nsys_prefix=""
     nsys_file=${nsys_folder}/nsys_worker_proc_${instance_id}_${SLURM_PROCID}
     export TLLM_PROFILE_RECORD_GC=1
     export TLLM_NVTX_DEBUG=1
-    if [ "${role}" = "GEN" ]; then
+    if [ "${role}" = "GEN" ] && [ "$SLURM_PROCID" = "0" ]; then
         export TLLM_PROFILE_START_STOP=200-250
         nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
         echo "nsys_prefix: ${nsys_prefix}"
     elif [ "${role}" = "CTX" ]; then
         echo "nsys is not enabled on ctx_gpus"
     fi
-    trtllm-llmapi-launch ${nsys_prefix} \
+    ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
         trtllm-serve ${model_path} \
             --host $(hostname) --port ${port} \
             --extra_llm_api_options ${config_file}
