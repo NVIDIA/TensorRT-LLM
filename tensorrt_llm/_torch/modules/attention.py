@@ -1,4 +1,5 @@
 import math
+import os
 import weakref
 from typing import Optional, Union, cast
 
@@ -22,7 +23,7 @@ from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
-from .multi_stream_utils import maybe_execute_in_parallel
+from .multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
@@ -600,6 +601,7 @@ class MLA(nn.Module):
         max_position_embeddings: int,
         bias: bool,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        prefetch_aux_stream: Optional[torch.cuda.Stream] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
@@ -622,6 +624,7 @@ class MLA(nn.Module):
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
             aux_stream (Optional[torch.cuda.Stream]): The auxiliary CUDA stream for running operations in two parallel streams.
+            prefetch_aux_stream (Optional[torch.cuda.Stream]): The auxiliary CUDA stream for prefetch.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
@@ -829,6 +832,7 @@ class MLA(nn.Module):
         )
 
         self.aux_stream = aux_stream
+        self.prefetch_aux_stream = prefetch_aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.rope_fusion = self.mha.support_fused_rope()
@@ -971,7 +975,46 @@ class MLA(nn.Module):
                 hidden_states).split([
                     self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
                 ], -1)
+            if os.getenv("TRTLLM_ENABLE_PREFETCH") == "1" and do_multi_stream():
+                if getattr(
+                        self,
+                        "kv_a_proj_with_mqa_weight_is_passed_to_previous_layer",
+                        False):
+                    if hidden_states.shape[0] in [64, 256]:
+                        self.prefetch_aux_stream.wait_stream(
+                            torch.cuda.current_stream())
 
+            if os.getenv("TRTLLM_ENABLE_PREFETCH") == "1" and do_multi_stream():
+                if hidden_states.shape[0] == 64:
+                    self.prefetch_aux_stream.wait_stream(
+                        torch.cuda.current_stream())
+                    with torch.cuda.stream(self.prefetch_aux_stream):
+                        torch.ops.trtllm.cute_host_prefetch(
+                            self.q_b_proj.weight[:, :1408],
+                            delay_start=0,
+                            throttle_time=700,
+                            throttle_mode=2,
+                            pdl=True)
+                if hidden_states.shape[0] == 128:
+                    self.prefetch_aux_stream.wait_stream(
+                        torch.cuda.current_stream())
+                    with torch.cuda.stream(self.prefetch_aux_stream):
+                        torch.ops.trtllm.cute_host_prefetch(
+                            self.q_b_proj.weight[:, :1408],
+                            delay_start=0,
+                            throttle_time=700,
+                            throttle_mode=2,
+                            pdl=True)
+                if hidden_states.shape[0] == 256:
+                    self.prefetch_aux_stream.wait_stream(
+                        torch.cuda.current_stream())
+                    with torch.cuda.stream(self.prefetch_aux_stream):
+                        torch.ops.trtllm.cute_host_prefetch(
+                            self.q_b_proj.weight[:, :896],
+                            delay_start=0,
+                            throttle_time=700,
+                            throttle_mode=2,
+                            pdl=True)
             q, compressed_kv = maybe_execute_in_parallel(
                 lambda: self.q_a_layernorm(q),
                 lambda: self.kv_a_layernorm(compressed_kv),
@@ -987,6 +1030,11 @@ class MLA(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
+        if not self.is_lite:
+            if os.getenv("TRTLLM_ENABLE_PREFETCH") == "1" and do_multi_stream():
+                if hidden_states.shape[0] in [64, 128, 256]:
+                    torch.cuda.current_stream().wait_stream(
+                        self.prefetch_aux_stream)
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
@@ -1442,6 +1490,41 @@ class MLA(nn.Module):
                               hidden_states,
                               attn_metadata,
                               output=attn_output)
+        if os.getenv("TRTLLM_ENABLE_PREFETCH") == "1" and do_multi_stream():
+            if attn_output.shape[0] == 64:
+                self.prefetch_aux_stream.wait_stream(
+                    torch.cuda.current_stream())
+                with torch.cuda.stream(self.prefetch_aux_stream):
+                    torch.ops.trtllm.cute_host_prefetch(
+                        self.o_proj.weight[:, :7680],
+                        delay_start=0,
+                        throttle_time=700,
+                        throttle_mode=2,
+                        pdl=True)
+            if attn_output.shape[0] == 128:
+                self.prefetch_aux_stream.wait_stream(
+                    torch.cuda.current_stream())
+                with torch.cuda.stream(self.prefetch_aux_stream):
+                    torch.ops.trtllm.cute_host_prefetch(
+                        self.o_proj.weight[:, :8192],
+                        delay_start=0,
+                        throttle_time=700,
+                        throttle_mode=2,
+                        pdl=True)
+            if attn_output.shape[0] == 256:
+                self.prefetch_aux_stream.wait_stream(
+                    torch.cuda.current_stream())
+                with torch.cuda.stream(self.prefetch_aux_stream):
+                    torch.ops.trtllm.cute_host_prefetch(
+                        self.o_proj.weight[:, :7680],
+                        delay_start=0,
+                        throttle_time=700,
+                        throttle_mode=2,
+                        pdl=True)
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+        if os.getenv("TRTLLM_ENABLE_PREFETCH") == "1" and do_multi_stream():
+            if attn_output.shape[0] in [64, 128, 256]:
+                torch.cuda.current_stream().wait_stream(
+                    self.prefetch_aux_stream)
         return attn_output
