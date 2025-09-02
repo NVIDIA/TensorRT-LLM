@@ -119,7 +119,8 @@ void logitsBitmaskDispatchToBitsPerThread(
     T** logits, uint32_t const** bitmask, int32_t batchSize, int32_t vocabSizePadded, cudaStream_t stream)
 {
     int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
-    int32_t const numBlocksPerRow = ceilDiv(2048 / kThreadsPerBlock * 128, batchSize);
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const numBlocksPerRow = ceilDiv(2048 / kThreadsPerBlock * smCount, batchSize);
     int32_t const numBitsPerThread = ceilDiv(vocabSizePadded, kThreadsPerBlock * numBlocksPerRow);
     int32_t bitmaskSize = ceilDiv(vocabSizePadded, kBitsPerMaskElement);
 
@@ -258,7 +259,8 @@ void contiguousLogitsBitmaskDispatchToBitsPerThread(T* logits, uint32_t const* b
     int32_t const* d2t, int32_t batchSize, int32_t vocabSizePadded, int32_t bitmaskSize, cudaStream_t stream)
 {
     int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
-    int32_t const numBlocksPerRow = ceilDiv(2048 / kThreadsPerBlock * 128, batchSize);
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const numBlocksPerRow = ceilDiv(2048 / kThreadsPerBlock * smCount, batchSize);
     int32_t const numBitsPerThread = ceilDiv(vocabSizePadded, kThreadsPerBlock * numBlocksPerRow);
 
     dim3 const block(kThreadsPerBlock);
