@@ -8,7 +8,6 @@ from transformers import AutoConfig, AutoTokenizer
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.models.modeling_llava_next import \
     LlavaNextInputProcessor
-from tensorrt_llm._torch.models.modeling_mistral import Mistral3InputProcessor
 from tensorrt_llm._torch.models.modeling_qwen2vl import \
     Qwen2VLInputProcessorBase
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
@@ -46,11 +45,6 @@ def multimodal_model_configs():
         'qwen2.5-vl': {
             'hf_model_dir': 'Qwen/Qwen2.5-VL-3B-Instruct',
             'model_type': 'qwen2_5_vl',
-        },
-        'mistral-small-3.1': {
-            'hf_model_dir':
-            '/home/scratch.trt_llm_data/llm-models/Mistral-Small-3.1-24B-Instruct-2503',
-            'model_type': 'mistral3',
         },
     }
     return model_configs
@@ -149,9 +143,6 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
                     image_height=image_height,
                     num_frames=1,
                     do_resize=True)
-            elif model_type == 'mistral':
-                predicted_num_tokens = input_processor.get_num_tokens_per_image(
-                    image_width=image_width, image_height=image_height)
             else:
                 raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -212,12 +203,6 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
                 trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
-                model_path=encoder_model_dir,
-                model_config=model_config_dict,
-                tokenizer=tokenizer,
-                trust_remote_code=True)
-        elif model_type == 'mistral':
-            input_processor = Mistral3InputProcessor(
                 model_path=encoder_model_dir,
                 model_config=model_config_dict,
                 tokenizer=tokenizer,

@@ -154,7 +154,7 @@ def parse_arguments():
     parser = add_lora_args(parser)
     args = parser.parse_args()
 
-    args.disable_kv_cache_reuse = True  # kv cache reuse does not work for multimodal, force overwrite
+    args.disable_kv_cache_reuse = False  # kv cache reuse does not work for multimodal, force overwrite
     if args.kv_cache_fraction is None:
         args.kv_cache_fraction = 0.6  # lower the default kv cache fraction for multimodal
 
@@ -185,6 +185,19 @@ def main():
         lora_config.max_cpu_loras = 2
 
     llm, sampling_params = setup_llm(args, lora_config=lora_config)
+
+#    from tensorrt_llm import MultimodalEncoder, SamplingParams
+#    sampling_params = SamplingParams(max_tokens=args.max_tokens)
+#    llm = MultimodalEncoder(
+#        model=args.model_dir,
+#        backend='pytorch',
+#        disable_overlap_scheduler=args.disable_overlap_scheduler,
+#        max_seq_len=args.max_seq_len,
+#        max_batch_size=args.max_batch_size,
+#        max_num_tokens=args.max_num_tokens,
+#        trust_remote_code=args.trust_remote_code,
+#        )
+
 
     image_format = args.image_format
     if args.model_type is not None:
@@ -280,8 +293,8 @@ def main():
                                              model_dir=str(llm._hf_model_dir),
                                              model_type=model_type,
                                              modality=args.modality,
-                                             prompts=args.prompt,
-                                             media=args.media,
+                                             prompts=[args.prompt[0], args.prompt[0]],
+                                             media=[args.media[0], args.media[0]],
                                              image_data_format=image_format,
                                              num_frames=args.num_frames,
                                              device=args.device)
@@ -294,7 +307,6 @@ def main():
     outputs = llm.generate(
         inputs,
         sampling_params,
-        lora_request=lora_request,
     )
 
     for i, output in enumerate(outputs):

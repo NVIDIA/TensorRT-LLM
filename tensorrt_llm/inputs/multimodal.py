@@ -445,6 +445,8 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
             # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
             for frame in image:
                 hasher.update(b"<frame>")
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.detach().cpu().contiguous()
                 hasher.update(serialize_item(frame))
         else:
             hasher.update(serialize_item(image))

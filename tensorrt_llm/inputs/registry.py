@@ -50,6 +50,24 @@ class BaseMultimodalInputProcessor:
     models. Specific processors can override these methods if they need custom logic.
     """
 
+    @property
+    def get_num_multimodal_tokens(self):
+        """
+        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
+
+        """
+        if hasattr(self, 'processor') and hasattr(self.processor,
+                                                  '_get_num_multimodal_tokens'):
+            return self.processor._get_num_multimodal_tokens
+        elif hasattr(self, '_processor') and hasattr(
+                self._processor, '_get_num_multimodal_tokens'):
+            return self._processor._get_num_multimodal_tokens
+        else:
+            raise NotImplementedError(
+                f"get_num_multimodal_tokens not implemented for {self.__class__.__name__}. "
+                "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
+            )
+
     def get_num_tokens_per_image(
         self,
         *,
@@ -60,30 +78,14 @@ class BaseMultimodalInputProcessor:
         """
         Calculate the number of tokens generated for an image.
 
-        Default implementation assumes the processor has either:
-        1. A 'processor' attribute with _get_num_multimodal_tokens method
-        2. A '_processor' attribute with _get_num_multimodal_tokens method
+        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        Returns the token count for the given image.
 
-        Override this method for custom implementations.
+        Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
-        if hasattr(self, 'processor') and hasattr(self.processor,
-                                                  '_get_num_multimodal_tokens'):
-            image_size = (image_height, image_width)
-            num_image_tokens = self.processor._get_num_multimodal_tokens(
-                [image_size], **kwargs)["num_image_tokens"][0]
-            return num_image_tokens
-        # Check for _processor attribute (e.g., Mistral3)
-        elif hasattr(self, '_processor') and hasattr(
-                self._processor, '_get_num_multimodal_tokens'):
-            image_size = (image_height, image_width)
-            num_image_tokens = self._processor._get_num_multimodal_tokens(
-                [image_size], **kwargs)["num_image_tokens"][0]
-            return num_image_tokens
-        else:
-            raise NotImplementedError(
-                f"get_num_tokens_per_image not implemented for {self.__class__.__name__}. "
-                "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
-            )
+        image_size = (image_height, image_width)
+        return self.get_num_multimodal_tokens([image_size],
+                                              **kwargs)["num_image_tokens"][0]
 
     def get_num_tokens_per_video(
         self,
@@ -96,53 +98,23 @@ class BaseMultimodalInputProcessor:
         """
         Calculate the number of tokens generated for a video.
 
-        Default implementation assumes the processor has either:
-        1. A 'processor' attribute with _get_num_multimodal_tokens method
-        2. A '_processor' attribute with _get_num_multimodal_tokens method
+        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        Returns the token count for the given video.
 
-        Override this method for custom implementations.
+        Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
-        if hasattr(self, 'processor') and hasattr(self.processor,
-                                                  '_get_num_multimodal_tokens'):
-            video_size = (num_frames, video_height, video_width)
-            # Try to get video tokens directly
-            try:
-                num_video_tokens = self.processor._get_num_multimodal_tokens(
-                    video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
-                return num_video_tokens
-            except Exception:
-                # Fallback: treat video as sequence of frames
-                num_tokens_per_frame = self.get_num_tokens_per_image(
-                    image_width=video_width,
-                    image_height=video_height,
-                    **kwargs)
-                temporal_patch_size = self.temporal_patch_size if hasattr(
-                    self, 'temporal_patch_size') else 1
-                return num_tokens_per_frame * num_frames // temporal_patch_size
-        # Check for _processor attribute (e.g., Mistral3)
-        # TODO: unify the naming convention for the processor attribute
-        elif hasattr(self, '_processor') and hasattr(
-                self._processor, '_get_num_multimodal_tokens'):
-            video_size = (num_frames, video_height, video_width)
-            # Try to get video tokens directly
-            try:
-                num_video_tokens = self._processor._get_num_multimodal_tokens(
-                    video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
-                return num_video_tokens
-            except Exception:
-                # Fallback: treat video as sequence of frames
-                num_tokens_per_frame = self.get_num_tokens_per_image(
-                    image_width=video_width,
-                    image_height=video_height,
-                    **kwargs)
-                temporal_patch_size = self.temporal_patch_size if hasattr(
-                    self, 'temporal_patch_size') else 1
-                return num_tokens_per_frame * num_frames // temporal_patch_size
-        else:
-            raise NotImplementedError(
-                f"get_num_tokens_per_video not implemented for {self.__class__.__name__}. "
-                "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
-            )
+        video_size = (num_frames, video_height, video_width)
+        try:
+            num_video_tokens = self.get_num_multimodal_tokens(
+                video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
+            return num_video_tokens
+        except Exception:
+            # Fallback: treat video as sequence of frames
+            num_tokens_per_frame = self.get_num_tokens_per_image(
+                image_width=video_width, image_height=video_height, **kwargs)
+            temporal_patch_size = self.temporal_patch_size if hasattr(
+                self, 'temporal_patch_size') else 1
+            return num_tokens_per_frame * num_frames // temporal_patch_size
 
 
 class DefaultInputProcessor(InputProcessor):

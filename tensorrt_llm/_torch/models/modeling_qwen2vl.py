@@ -44,6 +44,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
             trust_remote_code=trust_remote_code)
 
         self.tllm_multimodal_token_id = self.model_config.vocab_size + 1
+        # temporal patch size for video frames
         self.temporal_patch_size = getattr(model_config.vision_config,
                                            'temporal_patch_size', 1)
 
