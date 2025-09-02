@@ -18,6 +18,7 @@
 
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "trtllmGen_bmm_export/BatchedGemmInterface.h"
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
@@ -247,7 +248,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     auto envVarVal = std::getenv("TLLM_BATCHED_GEMM_PRINT_NAME");
     if (envVarVal && std::atoi(envVarVal) == 1)
     {
-        TLLM_LOG_INFO("NumBatches %d, MaxNumCtasInBatchDim %d, ShapeMNK %d %d %d, Kernel %s", numBatches,
+        TLLM_CHECK_WITH_INFO(true, "NumBatches %d, MaxNumCtasInBatchDim %d, ShapeMNK %d %d %d, Kernel %s", numBatches,
             maxNumCtasInBatchDim, m, n, k, config.mFunctionName);
     }
     // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
@@ -367,7 +368,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
         return false;
     };
     // Tier 2+: When previous comparators are the same, and when number of estimated CTAs is on the larger side, prefer
-    // persistent tile scheduler. The threshold is hardcoded as >148 CTAs at the moment.
+    // persistent tile scheduler.
     auto cmpTier3 = [maxNumCtasInBatchDim, bmm, &configs, &gemmData](int64_t idx0, int64_t idx1)
     {
         auto const& optionsA = configs[idx0].mOptions;
@@ -379,7 +380,8 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
             // M/N in kernel options are stale values. Update the before sending them in for calculation.
             options.mM = gemmData.mProblemDimensions.mM;
             options.mN = gemmData.mProblemDimensions.mN;
-            if (bmm.getNumCtas(options, maxNumCtasInBatchDim) > 148)
+
+            if (bmm.getNumCtas(options, maxNumCtasInBatchDim) > tensorrt_llm::common::getMultiProcessorCount())
             {
                 return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
             }
