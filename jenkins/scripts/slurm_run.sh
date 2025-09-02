@@ -24,6 +24,9 @@ set_value_in_command() {
     echo "$result"
 }
 
+# save job ID in $jobWorkspace/id.txt for later job to retrieve
+echo $SLURM_JOB_ID > $jobWorkspace/slurm_job_id.txt
+
 resultsPath=$jobWorkspace/results
 mkdir -p $resultsPath
 if [ $SLURM_LOCALID -eq 0 ]; then

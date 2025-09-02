@@ -143,50 +143,44 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String jobUID){
             allowAnyHosts: true,
         ]
 
+        def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
         def slurmJobID = Utils.exec(
             pipeline,
+            // Try to grab the job id from ${jobWorkspace}/slurm_job_id.txt.
+            // The slurm_run.sh will add the slurm job id in that file.
             script: Utils.sshUserCmd(
                 remote,
-                "\"sed -n " +
-                "-e 's/.*Submitted batch job \\([0-9]\\+\\).*/\\1/p' " +
-                "-e 's/.*srun: job \\([0-9]\\+\\) queued.*/\\1/p' " +
-                "-e 's/.*srun: job \\([0-9]\\+\\) has been allocated.*/\\1/p' " +
-                "-e 's/.*SLURM_JOB_ID=\\([0-9]\\+\\).*/\\1/p' " +
-                "-e 's/.*SLURM_JOBID=\\([0-9]\\+\\).*/\\1/p' " +
-                "${slurmOutputFile} | tail -n1 || true\""
+                "'test -f ${jobWorkspace}/slurm_job_id.txt && cat ${jobWorkspace}/slurm_job_id.txt'"
             ),
             returnStdout: true
         ).trim()
-
-        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
-
-        Utils.exec(pipeline, script: "echo Sleeping to allow slurm job termination; sleep 30")
-
-        Utils.exec(
-            pipeline,
-            script: Utils.sshUserCmd(
-                remote,
-                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
-            )
-        )
-
-        Utils.exec(
-            pipeline,
-            script: Utils.sshUserCmd(
-                remote,
-                "\"rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID} || true\""
-            )
-        )
 
         if (!slurmJobID || !slurmJobID.isNumber()) {
             Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"cat ${slurmOutputFile} || true\""))
             echo "Slurm job did not submit successfully. No job ID found."
         } else {
-            // The original Slurm output file name is like "slurm-%j-*.out", we need to replace the %j with the real job ID.
-            def newSlurmOutputFile = slurmOutputFile.replace("%j", slurmJobID)
-            Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mv ${slurmOutputFile} ${newSlurmOutputFile} || true\""))
+            Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+
+            Utils.exec(pipeline, script: "echo Sleeping to allow slurm job termination; sleep 30")
+
+            Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
+                )
+            )
+
+            Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "\"rm -rf ${jobWorkspace} || true\""
+                )
+            )
         }
 
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
@@ -429,7 +423,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
                 try {
-                    cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID, slurmOutputFile)
+                    cleanUpNodeResources(pipeline, cluster, jobUID)
                 } catch (Exception e) {
                     error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
                 }
