@@ -1,29 +1,11 @@
-import json
-import os
-import signal
-import subprocess
-import sys
-import tempfile
-from typing import Callable
-import threading
-
-import os
-import signal
 import subprocess
 import time
 
-import pytest
 import requests
-import yaml
-from defs.conftest import get_sm_version, llm_models_root, skip_arm, skip_no_hopper
-from defs.trt_test_alternative import check_call, check_output, popen
-
-from tensorrt_llm.logger import logger
-
-import time
-import socket
-import requests
-from requests.exceptions import RequestException, JSONDecodeError
+from defs.conftest import llm_models_root
+from defs.trt_test_alternative import print_error, print_info, print_warning
+from openai import OpenAI
+from requests.exceptions import JSONDecodeError, RequestException
 
 
 def check_server_ready(http_port="8000", timeout_timer=300, sleep_interval=5):
@@ -50,9 +32,69 @@ def check_server_ready(http_port="8000", timeout_timer=300, sleep_interval=5):
             f"Error: Launch trtllm-serve timed out, timer is {timeout} seconds."
         )
 
-    logger.info(
+    print_info(
         f"trtllm-serve launched successfully! Cost {timer} seconds to launch server."
     )
+
+
+def test_openai_chat_completion(http_port="8000",
+                                model_name="TinyLlama-1.1B-Chat-v1.0"):
+    """
+    Test the launched trtllm-serve server using OpenAI client.
+
+    Args:
+        http_port: The port where the server is running
+        model_name: The model name to use for the chat completion
+    """
+    print_info("Testing trtllm-serve server with OpenAI chat completion...")
+
+    try:
+        # Create OpenAI client pointing to the local server
+        client = OpenAI(
+            base_url=f"http://localhost:{http_port}/v1",
+            api_key="tensorrt_llm",
+        )
+
+        # Make a chat completion request
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role": "system",
+                "content": "you are a helpful assistant"
+            }, {
+                "role": "user",
+                "content": "What is the capital of China?"
+            }],
+            max_tokens=50,
+        )
+
+        # Validate the response
+        assert response is not None, "Response should not be None"
+        assert hasattr(response,
+                       'choices'), "Response should have choices attribute"
+        assert len(
+            response.choices) > 0, "Response should have at least one choice"
+        assert hasattr(response.choices[0],
+                       'message'), "Choice should have message attribute"
+        assert hasattr(response.choices[0].message,
+                       'content'), "Message should have content attribute"
+
+        content = response.choices[0].message.content
+        assert content is not None, "Message content should not be None"
+        assert len(content.strip()) > 0, "Message content should not be empty"
+
+        print_info(f"Chat completion test successful!")
+        print_info(
+            f"Model: {response.model if hasattr(response, 'model') else 'Unknown'}"
+        )
+        print_info(f"Response: {content[:100]}..." if len(content) >
+                   100 else f"Response: {content}")
+
+        return response
+
+    except Exception as e:
+        print_error(f"Chat completion test failed: {str(e)}")
+        raise
 
 
 def test_torch_compile_enabled(serve_test_root):
@@ -74,22 +116,23 @@ def test_torch_compile_enabled(serve_test_root):
         config_file,
     ]
 
-    logger.info("Launching trtllm-serve...")
-    # 保存进程对象以便后续管理，所有输出直接显示到控制台
+    print_info("Launching trtllm-serve...")
+
     process = subprocess.Popen(cmd)
 
     try:
         check_server_ready()
-        logger.info(f"trtllm-serve is ready")
-        # 这里可以添加你的测试代码
+        # Test the server with OpenAI chat completion
+        # Extract model name from the model path for consistency
+        model_name = model_path.split('/')[-1]  # "Qwen3-30B-A3B-FP8"
+        test_openai_chat_completion(model_name=model_name)
 
     finally:
-        # 确保进程被正确清理
-        logger.info("Cleaning up server process...")
+        print_info("Cleaning up server process...")
         try:
             process.terminate()
-            process.wait(timeout=10)  # 等待最多10秒
+            process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            logger.warning("Process didn't terminate gracefully, killing it...")
+            print_warning("Process didn't terminate gracefully, killing it...")
             process.kill()
             process.wait()
