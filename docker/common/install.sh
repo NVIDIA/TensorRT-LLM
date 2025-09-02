@@ -1,5 +1,10 @@
 #!/bin/bash
 set -Eeuo pipefail
+shopt -s nullglob
+trap 'echo "[install.sh] Error on line $LINENO" >&2' ERR
+
+# Resolve script directory for robust relative pathing
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
 # Default values
 base=0
@@ -87,27 +92,27 @@ if [ $base -eq 1 ]; then
     PYTHON_VERSION="3.12.3"
     echo "Using Python version: $PYTHON_VERSION"
 
-    GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_base.sh $PYTHON_VERSION
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_base.sh $PYTHON_VERSION
 fi
 
 if [ $cmake -eq 1 ]; then
     echo "Installing CMake..."
-    GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_cmake.sh
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_cmake.sh
 fi
 
 if [ $ccache -eq 1 ]; then
     echo "Installing ccache..."
-    GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_ccache.sh
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_ccache.sh
 fi
 
 if [ $cuda_toolkit -eq 1 ]; then
     echo "Installing CUDA toolkit..."
-    GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_cuda_toolkit.sh
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_cuda_toolkit.sh
 fi
 
 if [ $tensorrt -eq 1 ]; then
     echo "Installing TensorRT..."
-    bash ./install_tensorrt.sh \
+    bash $SCRIPT_DIR/install_tensorrt.sh \
         --TRT_VER=${TRT_VER} \
         --CUDA_VER=${CUDA_VER} \
         --CUDNN_VER=${CUDNN_VER} \
@@ -117,17 +122,17 @@ fi
 
 if [ $polygraphy -eq 1 ]; then
     echo "Installing Polygraphy..."
-    bash ./install_polygraphy.sh
+    bash $SCRIPT_DIR/install_polygraphy.sh
 fi
 
 if [ $mpi4py -eq 1 ]; then
     echo "Installing mpi4py..."
-    GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_mpi4py.sh
+    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_mpi4py.sh
 fi
 
 if [ $pytorch -eq 1 ]; then
     echo "Installing PyTorch..."
-    bash ./install_pytorch.sh $TORCH_INSTALL_TYPE
+    bash $SCRIPT_DIR/install_pytorch.sh $TORCH_INSTALL_TYPE
 fi
 
 if [ $opencv -eq 1 ]; then
