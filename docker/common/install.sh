@@ -146,4 +146,3 @@ if [ $protobuf -eq 1 ]; then
     pip3 install --upgrade --no-cache-dir \
     "protobuf>=4.25.8"
 fi
-
