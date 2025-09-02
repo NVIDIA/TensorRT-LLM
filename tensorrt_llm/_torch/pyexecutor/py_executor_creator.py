@@ -502,7 +502,6 @@ def create_py_executor(
             resources=resources,
             mapping=mapping,
             pytorch_backend_config=pytorch_backend_config,
-            executor_config=executor_config,
             ctx_chunk_config=ctx_chunk_config,
             model_engine=model_engine,
             start_worker=False,
@@ -514,7 +513,16 @@ def create_py_executor(
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             max_seq_len=executor_config.max_seq_len,
+            max_batch_size=executor_config.max_batch_size,
+            max_beam_width=executor_config.max_beam_width,
+            max_num_tokens=executor_config.max_num_tokens,
+            peft_cache_config=executor_config.peft_cache_config,
+            scheduler_config=executor_config.scheduler_config,
+            cache_transceiver_config=executor_config.cache_transceiver_config,
         )
+        # Modify the executor_config.peft_cache_config which might be mutated
+        # inside create_py_executor_instance
+        executor_config.peft_cache_config = py_executor.peft_cache_config
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -547,7 +555,6 @@ def create_py_executor(
                 resources=resources,
                 mapping=mapping,
                 pytorch_backend_config=pytorch_backend_config,
-                executor_config=executor_config,
                 ctx_chunk_config=ctx_chunk_config,
                 model_engine=model_engine,
                 start_worker=False,
@@ -559,6 +566,13 @@ def create_py_executor(
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
                 max_seq_len=executor_config.max_seq_len,
+                max_batch_size=executor_config.max_batch_size,
+                max_beam_width=executor_config.max_beam_width,
+                max_num_tokens=executor_config.max_num_tokens,
+                peft_cache_config=executor_config.peft_cache_config,
+                scheduler_config=executor_config.scheduler_config,
+                cache_transceiver_config=executor_config.
+                cache_transceiver_config,
             )
 
     _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)

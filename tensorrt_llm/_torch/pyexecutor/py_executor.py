@@ -24,8 +24,9 @@ from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
-                                            IterationStats, KvCacheStats,
-                                            RequestStage, RequestStats,
+                                            IterationStats, KvCacheStats)
+from tensorrt_llm.bindings.executor import PeftCacheConfig as _PeftCacheConfig
+from tensorrt_llm.bindings.executor import (RequestStage, RequestStats,
                                             SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
@@ -157,10 +158,13 @@ class PyExecutor:
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True,
                  kv_connector_manager: Optional[KvCacheConnectorManager] = None,
-                 max_seq_len: Optional[int] = None):
+                 max_seq_len: Optional[int] = None,
+                 peft_cache_config: Optional[_PeftCacheConfig] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
+
+        self.peft_cache_config = peft_cache_config
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
