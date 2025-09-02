@@ -76,15 +76,15 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
     }
     catch (std::exception const& e)
     {
-        std::string error = "Error in UcxConnection constructor for rank "
-            + std::to_string(mpi::MpiComm::world().getRank()) + ": " + e.what();
+        std::string error = std::string("Error in UcxConnection constructor for rank ")
+            + std::to_string(mManager->getRank()) + ": " + e.what();
         TLLM_THROW(error);
     }
 
     mSendTagPrefix = mConnectionIdInPeer;
     mRecvTagPrefix = mConnectionId;
 
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mManager->getRank(),
         "UcxConnection::UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }
@@ -92,7 +92,7 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
 UcxConnection::~UcxConnection()
 {
 
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mManager->getRank(),
         "UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     // TODO: how to close the endpoint safely?
@@ -100,7 +100,7 @@ UcxConnection::~UcxConnection()
 
 void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, size_t size) const
 {
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mManager->getRank(),
         "start UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
 
@@ -121,7 +121,7 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "sendConnectionId should be completed");
     req->checkError();
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mManager->getRank(),
         "end UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
 }
@@ -133,7 +133,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
         sendConnectionId(ctx, data, size);
         return;
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mManager->getRank(),
         "start UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 
@@ -151,7 +151,8 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
     // throw if there is error
     req->checkError();
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+
+    TLLM_LOG_DEBUG(mManager->getRank(),
         "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }
@@ -159,7 +160,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
 void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
     // Guard to ensure CUDA context is initialized for UCX ops
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mManager->getRank(),
         "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
@@ -175,7 +176,8 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
     // throw if there is error
     req->checkError();
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+
+    TLLM_LOG_DEBUG(mManager->getRank(),
         "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }

@@ -111,3 +111,6 @@ if(NOT WIN32)
   target_link_libraries(runtime_src PUBLIC libnuma::libnuma)
   target_link_options(runtime_src PUBLIC ${CONAN_LIBNUMA_LINK_OPTIONS})
 endif()
+
+# Add utils subdirectory for pg_utils module
+add_subdirectory(utils)

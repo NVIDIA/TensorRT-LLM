@@ -1,4 +1,3 @@
-import copy
 import os
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -425,7 +424,7 @@ class LlavaNextModel(PreTrainedModel):
         if not DISAGG:
             self.mm_encoder = LlavaNextVisionModel(model_config)
 
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.clone()
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
 
         # TODO Remove these when MistralConfig is natively supported

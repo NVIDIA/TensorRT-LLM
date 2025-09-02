@@ -3,6 +3,7 @@ import datetime
 import functools
 import gc
 import os
+import pickle  # nosec B403
 import threading
 import time
 import traceback
@@ -17,11 +18,13 @@ try:
 except ImportError:
     from cuda import cudart
 
+import ray
+
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
-                                 is_trace_enabled, nvtx_range, trace_func)
+from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
+                                 mpi_disabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -160,7 +163,6 @@ class PyExecutor:
             kv_connector_manager: Optional[KvCacheConnectorManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
-        self.global_rank = global_mpi_rank()
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
@@ -200,6 +202,7 @@ class PyExecutor:
         self.response_lock = threading.Lock()
         self.response_cv = threading.Condition(self.response_lock)
         self.responses = {}
+        self.result_wait_queues = {}
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -216,6 +219,7 @@ class PyExecutor:
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
+        self._disable_mpi = mpi_disabled()
 
         # list of requests in each PP micro batch
         self.num_micro_batches = self.dist.pp_size
@@ -348,11 +352,18 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
-    def enqueue_requests(self, requests: List[ExecutorRequest]) -> List[int]:
+    def enqueue_requests(
+            self,
+            requests: List[ExecutorRequest],
+            result_wait_queue: Optional[ray.actor.ActorHandle] = None
+    ) -> List[int]:
         """
         Enqueue new requests
         """
         req_ids = self.executor_request_queue.enqueue_requests(requests)
+        if result_wait_queue is not None:
+            for req_id in req_ids:
+                self.result_wait_queues[req_id] = result_wait_queue
         return req_ids
 
     def await_responses(
@@ -377,6 +388,7 @@ class PyExecutor:
         for req_id in id:
             responses.append(
                 self._await_single_response(id=req_id, timeout=timeout))
+
         return responses
 
     def cancel_request(self, id: int):
@@ -434,14 +446,16 @@ class PyExecutor:
     def wait_shutdown(self):
         self.shutdown_event.wait()
 
-    def enqueue_request(self,
-                        request: ExecutorRequest,
-                        query: Optional[List] = None) -> int:
+    def enqueue_request(
+            self,
+            request: ExecutorRequest,
+            query: Optional[List] = None,
+            result_wait_queue: Optional[ray.actor.ActorHandle] = None) -> int:
         """
         Enqueue a new request, query is only used in `StarAttention`.
         """
         req_id = self.executor_request_queue.enqueue_request(request, query)
-
+        self.result_wait_queues[req_id] = result_wait_queue
         return req_id
 
     def set_gather_responses(self, gather_all_responses):
@@ -844,10 +858,12 @@ class PyExecutor:
                 if previous_batch is not None:
                     sample_state = previous_batch.sample_state
                     if not self.dist.is_last_pp_rank:
+                        recv_object_funct = self.dist.recv_object_from_isend if self._disable_mpi \
+                            else self.dist.recv_object
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        sample_state.host = self.dist.recv_object(
+                        sample_state.host = recv_object_funct(
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id,
                         )
@@ -859,7 +875,18 @@ class PyExecutor:
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
-                            self.send_handles[prev_microbatch_id].wait()
+                            # TODO: need clean up
+                            if self._disable_mpi:
+                                for work in self.send_handles[
+                                        prev_microbatch_id]:
+                                    try:
+                                        work.wait()
+                                    except Exception as e:
+                                        raise RuntimeError(
+                                            f"Asynchronous send operation failed: {e}"
+                                        ) from e
+                            else:
+                                self.send_handles[prev_microbatch_id].wait()
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
                                 sample_state.host,
@@ -1717,6 +1744,13 @@ class PyExecutor:
                         self.responses[req_id].append(resp)
                     else:
                         self.responses.update({req_id: [resp]})
+                    # (TODO: joyang) There are other types of responses, we need to sort out.
+                    if type(
+                            resp
+                    ) == LlmResponse and req_id in self.result_wait_queues and self.result_wait_queues[
+                            req_id] is not None:
+                        self.result_wait_queues[req_id].put_response.remote(
+                            resp.client_id, resp)
                 self.response_cv.notify_all()
 
     @nvtx_range("_handle_first_token_response")

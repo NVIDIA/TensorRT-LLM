@@ -21,13 +21,13 @@ class TestMapping(unittest.TestCase):
 
     def test_mapping(self):
         m = Mapping(world_size=8, rank=0, tp_size=8)
-        self.assertEqual(len(m.tp_groups), 1)
-        self.assertEqual(len(m.pp_groups), 8)
+        self.assertEqual(len(m._tp_groups), 1)
+        self.assertEqual(len(m._pp_groups), 8)
         self.assertEqual(m.tp_group, [0, 1, 2, 3, 4, 5, 6, 7])
 
         m = Mapping(world_size=8, rank=0, tp_size=4, pp_size=2)
-        self.assertEqual(len(m.tp_groups), 2)
-        self.assertEqual(len(m.pp_groups), 4)
+        self.assertEqual(len(m._tp_groups), 2)
+        self.assertEqual(len(m._pp_groups), 4)
         self.assertEqual(m.tp_group, [0, 1, 2, 3])
         self.assertEqual(m.pp_group, [0, 4])
         self.assertTrue(m.is_first_pp_rank())
@@ -36,8 +36,8 @@ class TestMapping(unittest.TestCase):
         self.assertEqual(m.next_pp_rank(), 4)
 
         m = Mapping(world_size=8, rank=6, tp_size=2, pp_size=4)
-        self.assertEqual(len(m.tp_groups), 4)
-        self.assertEqual(len(m.pp_groups), 2)
+        self.assertEqual(len(m._tp_groups), 4)
+        self.assertEqual(len(m._pp_groups), 2)
         self.assertEqual(m.tp_group, [6, 7])
         self.assertEqual(m.pp_group, [0, 2, 4, 6])
         self.assertFalse(m.is_first_pp_rank())

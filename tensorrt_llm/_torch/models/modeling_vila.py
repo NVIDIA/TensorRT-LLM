@@ -15,7 +15,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # This file is based on official VILA: https://github.com/NVlabs/VILA/
 
-import copy
 import dataclasses
 import math
 import os
@@ -637,7 +636,7 @@ def init_llm(
             scaling_factor = float(math.ceil(model_max_length / orig_ctx_len))
             llm_cfg.rope_scaling = {"type": "linear", "factor": scaling_factor}
 
-    llm_model_config = copy.deepcopy(model_config)
+    llm_model_config = model_config.clone()
     llm_model_config.pretrained_config = llm_cfg
     llm = AutoModelForCausalLM.from_config(llm_model_config)
     if llm_cfg.vocab_size != len(tokenizer):

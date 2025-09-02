@@ -19,6 +19,7 @@ import json
 import linecache
 import math
 import os
+import socket
 import struct
 import tempfile
 import trace
@@ -38,6 +39,7 @@ from packaging import version
 
 # isort: off
 import torch
+import torch.distributed as dist
 import tensorrt as trt
 # isort: on
 
@@ -461,6 +463,12 @@ def dim_resolve_negative(dim, ndim):
     return tuple(pos)
 
 
+def get_free_port():
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
@@ -483,11 +491,29 @@ def local_mpi_comm():
     return local_comm
 
 
+def mpi_disabled() -> bool:
+    """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
+    return os.environ.get("TLLM_DISABLE_MPI") == "1"
+
+
 def mpi_rank():
+    if mpi_disabled():
+        try:
+            return torch.distributed.get_rank()
+        except ValueError:
+            # TODO WAR for controller to work in slurm pmix env
+            return 0
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def global_mpi_rank():
+    # TODO WAR for controller to work in slurm pmix env
+    if mpi_disabled():
+        assert not (dist.is_available() and dist.is_initialized()), (
+            "Please deprceate all usages of global_mpi_rank() in Ray migration except in controller,"
+            "which will be cleaned up later.")
+        return 0
+
     return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
@@ -688,6 +714,9 @@ def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":
         return True
+    if value == "-1":
+        # early return w/o calling global_mpi_rank() for Ray path
+        return False
     try:
         return int(value) == global_mpi_rank()
     except ValueError:

@@ -103,7 +103,7 @@ else:
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
-        'libs/libtensorrt_llm_nixl_wrapper.so',
+        'libs/libtensorrt_llm_nixl_wrapper.so', 'libs/libpg_utils.so',
         'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
         'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
@@ -117,6 +117,7 @@ package_data += [
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
     "_torch/auto_deploy/config/*.yaml",
+    '_torch/distributed/pgBroker.cpp',
 ]
 
 

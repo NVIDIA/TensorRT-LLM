@@ -222,6 +222,7 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
 
 void MpiComm::barrier() const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Barrier(mComm));
 #else
@@ -267,6 +268,7 @@ size_t invokeChunked(TMpiFunc func, TBase* buffer, size_t size, MPI_Datatype dty
 
 std::unique_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const
 {
+    couldUseMPI();
     std::unique_ptr<MpiRequest> r = std::make_unique<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Ibcast, buffer, size, getMpiDtype(dtype), root, mComm, &r->mRequest);
@@ -278,11 +280,13 @@ std::unique_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiTy
 
 std::unique_ptr<MpiRequest> MpiComm::bcastAsync(runtime::IBuffer& buf, int root) const
 {
+    couldUseMPI();
     return bcastAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 
 void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Bcast, buffer, size, getMpiDtype(dtype), root, mComm);
 #else
@@ -292,12 +296,14 @@ void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
 
 void MpiComm::bcast(runtime::IBuffer& buf, int root) const
 {
+    couldUseMPI();
     bcast(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 
 std::unique_ptr<MpiRequest> MpiComm::sendAsync(
     void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
 {
+    couldUseMPI();
     TLLM_LOG_DEBUG("start MPI_Isend with dest %d, tag %d, size %d", dest, static_cast<int>(tag), size);
     std::unique_ptr<MpiRequest> r = std::make_unique<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
@@ -311,11 +317,13 @@ std::unique_ptr<MpiRequest> MpiComm::sendAsync(
 
 std::unique_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int dest, MpiTag tag) const
 {
+    couldUseMPI();
     return sendAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }
 
 void MpiComm::sendRawTag(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
+    couldUseMPI();
     TLLM_LOG_DEBUG("start MPI_Send with dest %d, tag %d, size %d", dest, tag, size);
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Send, buffer, size, getMpiDtype(dtype), dest, tag, mComm);
@@ -327,16 +335,19 @@ void MpiComm::sendRawTag(void const* buffer, size_t size, MpiType dtype, int des
 
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
 {
+    couldUseMPI();
     sendRawTag(buffer, size, dtype, dest, static_cast<int>(tag));
 }
 
 void MpiComm::send(runtime::IBuffer const& buf, int dest, MpiTag tag) const
 {
+    couldUseMPI();
     send(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }
 
 MPI_Status MpiComm::recvRawTag(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
+    couldUseMPI();
     TLLM_LOG_DEBUG("start MPI_Recv with source %d, tag %d, size %d", source, tag, size);
     MPI_Status status{};
 #if ENABLE_MULTI_DEVICE
@@ -350,11 +361,13 @@ MPI_Status MpiComm::recvRawTag(void* buffer, size_t size, MpiType dtype, int sou
 
 MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, MpiTag tag) const
 {
+    couldUseMPI();
     return recvRawTag(buffer, size, dtype, source, static_cast<int>(tag));
 }
 
 MPI_Status MpiComm::recv(runtime::IBuffer& buf, int source, MpiTag tag) const
 {
+    couldUseMPI();
     return recv(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, source, tag);
 }
 
@@ -382,6 +395,7 @@ MpiComm const& MpiComm::setRawSessionByFortran(int64_t fortranHandle)
 
 void MpiComm::allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Allreduce(sendbuf, recvbuf, count, getMpiDtype(dtype), getMpiOp(op), mComm));
 #else
@@ -391,6 +405,7 @@ void MpiComm::allreduce(void const* sendbuf, void* recvbuf, int count, MpiType d
 
 void MpiComm::allgather(void const* sendbuf, void* recvbuf, int count, MpiType dtype) const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), mComm));
 #else
@@ -401,6 +416,7 @@ void MpiComm::allgather(void const* sendbuf, void* recvbuf, int count, MpiType d
 void MpiComm::allgatherv(void const* sendbuf, int sendcount, MpiType sendtype, void* recvbuf,
     std::vector<int> const& recvcounts, std::vector<int> const& displs, MpiType recvtype) const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Allgatherv(sendbuf, sendcount, getMpiDtype(sendtype), recvbuf, recvcounts.data(), displs.data(),
         getMpiDtype(recvtype), mComm));
@@ -450,6 +466,7 @@ bool MpiComm::iprobe(int source, MpiTag tag, MPI_Status* status) const
 
 void MpiComm::recvPoll(int source, MpiTag tag, int periodMs) const
 {
+    couldUseMPI();
     MPI_Status status;
     while (!iprobe(source, tag, &status))
     {

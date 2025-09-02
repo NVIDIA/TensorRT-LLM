@@ -1,4 +1,3 @@
-import copy
 import dataclasses
 import os
 from typing import List, Optional, Tuple
@@ -165,7 +164,7 @@ class Gemma3VLM(PreTrainedModel):
                                             dtype=torch.int32,
                                             device=self._device)
 
-        model_config_cp = copy.deepcopy(model_config)
+        model_config_cp = model_config.clone()
         self.model_config = model_config_cp
 
         llm_model_config = self.get_sub_model_config(model_config_cp,

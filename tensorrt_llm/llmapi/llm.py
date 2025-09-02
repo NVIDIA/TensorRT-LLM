@@ -121,6 +121,7 @@ class BaseLLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        self._orchestrator_type = kwargs.pop("orchestrator_type", None)
         self._llm_id = None
 
         log_level = logger.level
@@ -131,6 +132,8 @@ class BaseLLM:
             if backend == "pytorch":
                 logger.info("Using LLM with PyTorch backend")
                 llm_args_cls = TorchLlmArgs
+                if self._orchestrator_type == "ray":
+                    os.environ["TLLM_DISABLE_MPI"] = "1"
             elif backend == '_autodeploy':
                 logger.info("Using LLM with AutoDeploy backend")
                 from .._torch.auto_deploy.llm_args import \
@@ -644,6 +647,22 @@ class BaseLLM:
                                              self.llm_build_stats))
         self._engine_dir, self._hf_model_dir = model_loader()
 
+    def update_weights_from_ipc_handles_async(self, handles: dict):
+        result = self._executor.async_update_weights_from_ipc_handles(handles)
+        return result
+
+    def update_weights_from_ipc_handles(self, handles: dict):
+        result = self._executor.update_weights_from_ipc_handles(handles)
+        return result
+
+    def update_weights(self, weights: dict):
+        result = self._executor.update_weights(weights)
+        return result
+
+    def update_weights_async(self, weights: dict):
+        result = self._executor.async_update_weights(weights)
+        return result
+
     @property
     def _on_trt_backend(self) -> bool:
         return isinstance(self.args, TrtLlmArgs)
@@ -950,6 +969,31 @@ class _TorchLLM(BaseLLM):
                          tokenizer_revision,
                          backend=backend,
                          **kwargs)
+
+    def collective_rpc(self,
+                       method: str,
+                       args: tuple = (),
+                       kwargs: Optional[dict] = None,
+                       non_block: bool = False,
+                       unique_reply_rank: Optional[int] = None) -> list[Any]:
+        """
+        Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
+
+        Args:
+            method: The name of the worker method to execute.
+            args: Positional arguments to pass to the worker method.
+            kwargs: Keyword arguments to pass to the worker method.
+            non_block: Whether to block until all workers have completed the RPC call.
+            unique_reply_rank: The rank of the worker that will be used to send the reply.
+
+        Returns:
+            A list of results from each worker.
+        """
+        if hasattr(self._executor, 'collective_rpc'):
+            return self._executor.collective_rpc(method, args, kwargs,
+                                                 non_block, unique_reply_rank)
+        else:
+            assert False, f"Executor type {type(self._executor)} does not support collective RPC."
 
     def _build_model(self):
         super()._build_model()

@@ -1,4 +1,3 @@
-import copy
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -476,7 +475,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         if hasattr(self, "llm"):
             return
 
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.clone()
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
         self.vocab_size = config.vocab_size
