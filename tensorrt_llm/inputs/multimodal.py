@@ -523,27 +523,33 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
     return num_mm_tokens  # flatten all mm instances to a single list
 
 
-def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
-                                             np.ndarray],
-                            num_mm_tokens: List[int],
-                            vocab_size: int,
-                            mm_token_ids: torch.Tensor = None) -> List[int]:
+def find_mm_token_positions(
+        input_ids: Union[torch.Tensor, List[int], np.ndarray],
+        num_mm_tokens: List[int],
+        vocab_size: Optional[int] = None,
+        mm_token_ids: Optional[torch.Tensor] = None) -> List[int]:
     """Get multimodal token positions using IDs > vocab_size and known lengths.
 
     This function finds multimodal tokens (with IDs > vocab_size) and uses the
     provided lengths in num_mm_tokens to identify where each chunk starts.
     This works even when there are no gaps between different image sequences
     (e.g., when all images use the same token IDs).
+    Note at least one of vocab_size or mm_token_ids must be provided. If mm_token_ids is provided, vocab_size is ignored.
 
     Args:
         input_ids: Token sequence (tensor, list, or numpy array)
         num_mm_tokens: List of lengths for each multimodal token chunk
         vocab_size: Size of the model's vocabulary
-        mm_token_ids (optional): possible token ids for multimodal tokens
+        mm_token_ids: possible token ids for multimodal tokens
 
     Returns:
         List of starting positions for each multimodal token chunk
     """
+    if mm_token_ids is None and vocab_size is None:
+        raise ValueError(
+            "Provide either mm_token_ids or vocab_size to find multimodal token positions"
+        )
+
     # Convert input_ids to tensor if needed
     if not isinstance(input_ids, torch.Tensor):
         if isinstance(input_ids, list):
@@ -555,6 +561,11 @@ def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
     if mm_token_ids is None:
         mm_mask = input_ids >= vocab_size
     else:
+        if not isinstance(mm_token_ids, torch.Tensor):
+            mm_token_ids = torch.tensor(mm_token_ids)
+        if mm_token_ids.ndim != 1:
+            raise ValueError("mm_token_ids must be a 1D tensor")
+        mm_token_ids = torch.unique(mm_token_ids)
         mm_mask = torch.isin(input_ids, mm_token_ids)
 
     # If no multimodal tokens found, return empty list

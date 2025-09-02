@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
                     TypeVar)
 
-from torch import nn
+from torch import Tensor, nn
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
@@ -49,6 +49,54 @@ class BaseMultimodalInputProcessor:
     This class provides default implementations that work with most AutoProcessor-based
     models. Specific processors can override these methods if they need custom logic.
     """
+
+    def get_vocab_size(self) -> Optional[int]:
+        """Return the tokenizer/model vocabulary size if available; otherwise None.
+
+        Resolution order:
+        1) self.model_config.vocab_size
+        2) self.tokenizer.vocab_size
+
+        Raises:
+            NotImplementedError: If the vocabulary size cannot be determined.
+        """
+        # 1) Model config
+        if hasattr(self, 'model_config') and getattr(
+                self.model_config, 'vocab_size', None) is not None:
+            return int(self.model_config.vocab_size)
+
+        # 2) Direct tokenizer on self
+        if hasattr(self, 'tokenizer') and getattr(self.tokenizer, 'vocab_size',
+                                                  None) is not None:
+            return int(self.tokenizer.vocab_size)
+
+        logger.warning(
+            f"Cannot determine vocab_size from {self.__class__.__name__}. "
+            "Please override this method to provide the vocabulary size. ")
+        return None
+
+    def get_mm_token_ids(self) -> Optional[Tensor]:
+        """Return multimodal token IDs if available; otherwise None.
+
+        Resolution order:
+        1) self.processor.mm_token_ids
+        2) self._processor.mm_token_ids
+        """
+        # Processor
+        if hasattr(self, 'processor') and getattr(
+                self.processor, 'mm_token_ids', None) is not None:
+            return self.processor.mm_token_ids
+
+        # _Processor
+        if hasattr(self, '_processor') and getattr(
+                self._processor, 'mm_token_ids', None) is not None:
+            return self._processor.mm_token_ids
+
+        logger.warning(
+            f"Cannot determine mm_token_ids from {self.__class__.__name__}. "
+            "If needed, please override this method to return multimodal token ids. "
+        )
+        return None
 
     @property
     def get_num_multimodal_tokens(self):
@@ -409,11 +457,18 @@ def create_input_processor_with_hash(
             mm_hashes = apply_mm_hashes(mm_data, hash_lib)
             prompt_token_ids, extra_processed_inputs = input_processor(
                 inputs, sampling_params)
+            vocab_size = input_processor.get_vocab_size()
+            mm_ids = input_processor.get_mm_token_ids()
+            if vocab_size is None and mm_ids is None:
+                raise ValueError(
+                    "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
+                )
             start_positions = find_mm_token_positions(
                 input_ids=prompt_token_ids,  # token sequence
                 num_mm_tokens=
                 num_mm_tokens,  # list of lengths of each chunk of visual tokens
-                vocab_size=input_processor.model_config.vocab_size,
+                vocab_size=vocab_size,
+                mm_token_ids=mm_ids,
             )
             # flatten the hashes from dict to a single list
             mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
