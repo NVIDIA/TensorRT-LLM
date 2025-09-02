@@ -348,7 +348,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                def dockerGpuOption = ""
+                def dockerGPUOption = ""
 
                 node(nodeName) {
                     sh """
@@ -367,6 +367,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                     // Dynamically set GPU arguments based on environment variables
                     // https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
+                    // It's intentional to check NV_GPU first.
                     dockerGPUOption = sh(script: """
                         if [ -n "\$NV_GPU" ]; then
                             echo "--gpus '\\"device=\$NV_GPU\\"'"
@@ -386,7 +387,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
                     "-v /tmp/ccache:${CCACHE_DIR}:rw " +
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
-                    "--cap-add syslog"
+                    "--cap-add SYSLOG"
 
                 echo "Final dockerArgs: ${dockerArgs}"
 
@@ -516,9 +517,9 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 ].join(" ")
 
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
-                scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
-                // TODO: check if the tee always returns 0
+                def scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
                 def scriptContent = """#!/bin/bash
+                    set -o pipefail
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
@@ -536,6 +537,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export NVIDIA_IMEX_CHANNELS=0
                     chmod +x ${scriptRunNode}
                     ${srunCmd} 2>&1 | tee ${slurmOutputFile}
+                    exit ${PIPESTATUS[0]}
                 """.stripIndent()
                 pipeline.writeFile(file: scriptLaunchDestPath, text: scriptContent)
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
