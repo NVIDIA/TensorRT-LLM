@@ -4,6 +4,15 @@ SQSH_PATH          ?= tensorrt_llm.devel.sqsh
 SOURCE_DIR        ?= $(shell readlink -f ..)
 RUN_CMD            ?= --pty bash
 
+PYTHON_VERSION ?= 3.12.3
+TORCH_INSTALL_TYPE ?= skip
+GITHUB_MIRROR ?=
+CUDA_VERSION ?=
+CUDNN_VERSION ?=
+NCCL_VERSION ?=
+CUBLAS_VERSION ?=
+TRT_VERSION ?=
+
 ifndef MAKEFILE_PYXIS_INCLUDED
 MAKEFILE_PYXIS_INCLUDED := 1
 
@@ -18,11 +27,14 @@ build_sqsh:
 		--container-save "$(SQSH_PATH)" \
 		--container-mounts "$(SOURCE_DIR):/code/tensorrt_llm" --container-workdir /code/tensorrt_llm/docker/common \
 		--container-mount-home --container-remap-root \
-		--container-env TRT_VER \
-		--container-env CUDA_VER \
-		--container-env CUDNN_VER \
-		--container-env NCCL_VER \
-		--container-env CUBLAS_VER \
+		--container-env TRT_VER=$(TRT_VERSION) \
+		--container-env CUDA_VER=$(CUDA_VERSION) \
+		--container-env CUDNN_VER=$(CUDNN_VERSION) \
+		--container-env NCCL_VER=$(NCCL_VERSION) \
+		--container-env CUBLAS_VER=$(CUBLAS_VERSION) \
+		--container-env PYTHON_VERSION \
+		--container-env GITHUB_MIRROR \
+		--container-env TORCH_INSTALL_TYPE \
 		./install.sh --all
 
 endif
@@ -36,5 +48,5 @@ run_sqsh:
 		--container-image "$(SQSH_PATH)" \
 		--container-mounts "$(SOURCE_DIR):/code/tensorrt_llm" --container-workdir /code/tensorrt_llm \
 		--container-mount-home --container-remap-root \
-		--container-env PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999" \
+		--container-env PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.99999 \
 		$(RUN_CMD)

@@ -80,18 +80,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-GITHUB_MIRROR=""
-TORCH_INSTALL_TYPE="skip"
-export PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
-
 if [ $base -eq 1 ]; then
     echo "Installing base dependencies..."
     # Clean up the pip constraint file from the base NGC PyTorch image.
     [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
 
-    PYTHON_VERSION="3.12.3"
     echo "Using Python version: $PYTHON_VERSION"
-
     GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_base.sh $PYTHON_VERSION
 fi
 
