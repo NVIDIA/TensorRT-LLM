@@ -160,6 +160,12 @@ Welcome to TensorRT-LLM's Documentation!
    blogs/XQA-kernel.md
    blogs/tech_blog/*
 
+.. toctree::
+   :maxdepth: 2
+   :caption: Use TensorRT Engine
+   :hidden:
+
+   legacy/tensorrt_quickstart.md
 
 Indices and tables
 ==================

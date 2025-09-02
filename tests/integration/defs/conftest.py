@@ -2388,7 +2388,7 @@ def timeout_manager(timeout_from_command_line, timeout_from_marker):
     return TimeoutManager(timeout_value)
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def torch_empty_cache() -> None:
     """
     Manually empty the torch CUDA cache before each test, to reduce risk of OOM errors.
