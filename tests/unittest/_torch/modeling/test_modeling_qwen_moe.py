@@ -320,6 +320,9 @@ class TestQwenMoe(unittest.TestCase):
             mock_engine = create_mock_engine(1)
             graph_runner = CUDAGraphRunner(mock_engine)
 
+        def postprocess_fn(inputs):
+            pass
+
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
             if not scenario.use_cuda_graph:
@@ -334,7 +337,7 @@ class TestQwenMoe(unittest.TestCase):
                 }
                 graph_runner.capture(1,
                                      lambda inputs: qwen_moe.forward(**inputs),
-                                     inputs)
+                                     postprocess_fn, inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
