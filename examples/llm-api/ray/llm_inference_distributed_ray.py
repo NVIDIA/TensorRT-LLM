@@ -6,7 +6,7 @@ def main():
     # model could accept HF model name or a path to local HF model.
     llm = LLM(
         model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        orchestrator_type="ray",
+        orchestrator_type="ray",  # Enable Ray orchestrator
         # Enable 2-way tensor parallelism
         tensor_parallel_size=2
         # Enable 2-way pipeline parallelism if needed
