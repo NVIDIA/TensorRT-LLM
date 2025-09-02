@@ -13,7 +13,7 @@ OLD_CUDA_VER=$(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1)
 echo "The version of pre-installed CUDA is ${OLD_CUDA_VER}."
 
 check_cuda_version() {
-    if [ -z "$CUDA_VERSION" ] && [ -z "$CUDA_DRIVER_VERSION" ]; then
+    if [ -n "$CUDA_VERSION" ] && [ -n "$CUDA_DRIVER_VERSION" ]; then
         CUDA_VERSION_SHORT=$(echo "$CUDA_VERSION" | cut -d'.' -f1-3)
         ENV_CUDA_VER="${CUDA_VERSION_SHORT}_${CUDA_DRIVER_VERSION}"
         if [ "$ENV_CUDA_VER" = "$CUDA_VER" ]; then
