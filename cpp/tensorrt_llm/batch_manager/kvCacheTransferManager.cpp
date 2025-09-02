@@ -42,6 +42,7 @@
 
 namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
+namespace kvc = tensorrt_llm::executor::kv_cache;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -86,11 +87,15 @@ static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string con
     return true;
 }
 
-KVCacheTransferManager::KVCacheTransferManager(tr::BufferManager const& bufferManager)
+KVCacheTransferManager::KVCacheTransferManager(
+    tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent)
     : mBufferManager{bufferManager}
     , mOnboardManager(std::make_shared<tr::CudaStream>())
     , mOffloadManager(std::make_shared<tr::CudaStream>())
+    , mLoopbackAgent{loopbackAgent}
 {
+    TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
+    TLLM_CHECK(mDeviceId != -1);
 }
 
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
@@ -159,114 +164,58 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         return;
     }
 
+    std::vector<kvc::FileDesc> fileBlobs;
+    std::vector<kvc::MemoryDesc> memoryBlobs;
+
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {
-        auto srcPtr = computeBlockPointer(src, pools, poolIdx);
-        auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
+        auto ptr = isOffload ? computeBlockPointer(src, pools, poolIdx) : computeBlockPointer(dst, pools, poolIdx);
+        auto block_id = src->getBlockId();
 
         TLLM_CHECK_WITH_INFO(
             !directory.empty(), "Expected a directory path for KVCache offload, but none was provided.");
 
-        int size = std::snprintf(
-            nullptr, 0, "%s/block_%d_pool_%zu.bin", directory.c_str(), src->getBlockId(), poolIdx);
-
-        std::string filename(size + 1, '\0');
-        std::snprintf(filename.data(), filename.size(), "%s/block_%d_pool_%zu.bin", directory.c_str(),
-            src->getBlockId(), poolIdx);
+        int size = std::snprintf(nullptr, 0, "%s/block_%d_pool_%zu.bin", directory.c_str(), block_id, poolIdx);
+        std::string filename;
+        filename.resize(size + 1);
+        std::snprintf(
+            filename.data(), filename.size(), "%s/block_%d_pool_%zu.bin", directory.c_str(), block_id, poolIdx);
 
         if (mode == executor::KvCacheTransferMode::POSIX_DEBUG_FALLBACK)
         {
             TLLM_LOG_INFO("Forcing POSIX fallback for file: %s", filename.c_str());
             if (isOffload)
             {
-                gpuToFilePosix(srcPtr, filename);
+                gpuToFilePosix(ptr, filename);
             }
             else
             {
-                fileToGpuPosix(dstPtr, filename);
+                fileToGpuPosix(ptr, filename);
             }
             continue;
         }
-
-        int openFlags = isOffload ? (O_CREAT | O_WRONLY) : O_RDONLY;
-        int fd = ::open(filename.c_str(), openFlags, 0664);
-        if (fd < 0)
+        else if (mode == executor::KvCacheTransferMode::GDS)
         {
-            TLLM_LOG_ERROR(
-                "Failed to open '%s' for %s; fallback POSIX", filename.c_str(), (isOffload ? "writing" : "reading"));
 
-            if (isOffload)
-            {
-                gpuToFilePosix(srcPtr, filename);
-            }
-            else
-            {
-                fileToGpuPosix(dstPtr, filename);
-            }
-            continue;
+            int openFlags = isOffload ? (O_CREAT | O_WRONLY) : O_RDONLY;
+            fileBlobs.emplace_back(filename, openFlags, 0664, ptr->getSizeInBytes());
+            memoryBlobs.emplace_back(ptr->data(), ptr->getSizeInBytes(), mDeviceId);
+        }
+    }
+
+    if (mode == executor::KvCacheTransferMode::GDS)
+    {
+        if (mLoopbackAgent == nullptr)
+        {
+            TLLM_LOG_DEBUG("KVCacheTransferManager: creating mLoopbackAgent lazily");
+            kvc::BaseAgentConfig config{std::string("GDSAgent"), true, true};
+            mLoopbackAgent = kvc::makeLoopbackAgent("nixl", &config);
         }
 
-#ifdef ENABLE_CUFILE
-        CUfileDescr_t cufileDesc = {};
-        cufileDesc.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-        cufileDesc.handle.fd = fd;
+        kvc::FileDescs fileDescs(std::move(fileBlobs));
+        kvc::MemoryDescs memoryDescs(kvc::MemoryType::kVRAM, memoryBlobs);
 
-        CUfileHandle_t cufileHandle;
-        CUfileError_t status = cuFileHandleRegister(&cufileHandle, &cufileDesc);
-        if (status.err != CU_FILE_SUCCESS)
-        {
-            // Fallback to POSIX
-            TLLM_LOG_WARN(
-                "cuFileHandleRegister failed (err=%d). Falling back to POSIX for '%s'", status.err, filename.c_str());
-            ::close(fd);
-            if (isOffload)
-                gpuToFilePosix(srcPtr, filename);
-            else
-                fileToGpuPosix(dstPtr, filename);
-            continue;
-        }
-
-        ssize_t numBytes = static_cast<ssize_t>(srcPtr->getSizeInBytes());
-        if (isOffload)
-        {
-            ssize_t written = cuFileWrite(cufileHandle, srcPtr->data(), numBytes, 0, 0);
-            if (written < 0)
-            {
-                TLLM_LOG_ERROR("cuFileWrite error=%zd. Fallback to POSIX", written);
-                cuFileHandleDeregister(cufileHandle);
-                ::close(fd);
-                gpuToFilePosix(srcPtr, filename);
-                continue;
-            }
-        }
-        else
-        {
-            ssize_t readCount = cuFileRead(cufileHandle, dstPtr->data(), numBytes, 0, 0);
-            if (readCount < 0)
-            {
-                TLLM_LOG_ERROR("cuFileRead error=%zd. Fallback to POSIX", readCount);
-                cuFileHandleDeregister(cufileHandle);
-                ::close(fd);
-                fileToGpuPosix(dstPtr, filename);
-                continue;
-            }
-        }
-
-        cuFileHandleDeregister(cufileHandle);
-        ::close(fd);
-#else
-        // If GDS isn't enabled, fallback to POSIX automatically
-        TLLM_LOG_DEBUG("ENABLE_CUFILE=OFF, so fallback to POSIX for %s", filename.c_str());
-        ::close(fd); // close the file opened for GDS
-        if (isOffload)
-        {
-            gpuToFilePosix(srcPtr, filename);
-        }
-        else
-        {
-            fileToGpuPosix(dstPtr, filename);
-        }
-#endif
+        mLoopbackAgent->executeLoopbackRequest(memoryDescs, fileDescs, isOffload);
     }
 }
 
