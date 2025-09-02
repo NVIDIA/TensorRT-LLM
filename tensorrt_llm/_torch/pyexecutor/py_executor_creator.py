@@ -14,9 +14,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
-                                            ExecutorConfig,
-                                            LogitsPostProcessorConfig,
-                                            ParallelConfig)
+                                            ExecutorConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
