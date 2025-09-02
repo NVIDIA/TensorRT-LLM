@@ -139,25 +139,25 @@ class BatchStatePP(BatchState):
 
 class PyExecutor:
 
-    def __init__(
-            self,
-            resource_manager,
-            scheduler: RequestScheduler,
-            model_engine: ModelEngine,
-            sampler: Sampler,
-            dist: Distributed,
-            max_num_sequences: int,
-            drafter: Optional[Drafter] = None,
-            disable_overlap_scheduler: bool = False,
-            max_input_len: int = 2048,
-            max_batch_size: int = 8,
-            max_beam_width: int = 1,
-            max_draft_len: int = 0,
-            kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-            guided_decoder: Optional[GuidedDecoder] = None,
-            garbage_collection_gen0_threshold: Optional[int] = None,
-            start_worker: bool = True,
-            kv_connector_manager: Optional[KvCacheConnectorManager] = None):
+    def __init__(self,
+                 resource_manager,
+                 scheduler: RequestScheduler,
+                 model_engine: ModelEngine,
+                 sampler: Sampler,
+                 dist: Distributed,
+                 max_num_sequences: int,
+                 drafter: Optional[Drafter] = None,
+                 disable_overlap_scheduler: bool = False,
+                 max_input_len: int = 2048,
+                 max_batch_size: int = 8,
+                 max_beam_width: int = 1,
+                 max_draft_len: int = 0,
+                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
+                 guided_decoder: Optional[GuidedDecoder] = None,
+                 garbage_collection_gen0_threshold: Optional[int] = None,
+                 start_worker: bool = True,
+                 kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+                 max_seq_len: Optional[int] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
@@ -271,6 +271,7 @@ class PyExecutor:
                 )
             self.draft_seq_slot_manager = SeqSlotManager(max_num_sequences)
         self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+        self.max_seq_len = max_seq_len
 
         self.worker_started = False
         self.worker_lock = threading.Lock()

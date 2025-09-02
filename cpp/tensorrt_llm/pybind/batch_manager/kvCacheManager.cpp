@@ -365,6 +365,18 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 }
                 return block_pool_pointers;
             })
+        .def("get_block_scale_pool_pointers",
+            [](tbk::BaseKVCacheManager& self)
+            {
+                std::optional<at::Tensor> block_scale_pool_pointers{std::nullopt};
+                auto tensor = self.getBlockScalePoolPointers();
+                if (tensor)
+                {
+                    std::shared_ptr<tensorrt_llm::runtime::ITensor> _tensor = std::move(tensor);
+                    block_scale_pool_pointers = tr::Torch::tensor(_tensor);
+                }
+                return block_scale_pool_pointers;
+            })
         .def("get_layer_to_pool_mapping",
             [](tbk::BaseKVCacheManager& self)
             {

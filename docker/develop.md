@@ -16,7 +16,10 @@ specifically designed to be used alongside the source code cloned from the offic
 Full instructions for cloning the TensorRT-LLM repository can be found in
 the [TensorRT-LLM Documentation](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html).
 
-### Running TensorRT-LLM Using Docker
+> **Note:**  
+> This container does not contain a pre-built binary release of `TensorRT-LLM` or tools like `trtllm-serve`.
+
+### Running the TensorRT-LLM Develop Container Using Docker
 
 With the top-level directory of the TensorRT-LLM repository cloned to your local machine, you can run the following
 command to start the development container:
