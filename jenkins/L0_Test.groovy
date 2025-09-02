@@ -641,6 +641,53 @@ def trimForStageList(stageNameList)
     return trimedList
 }
 
+def preprocessTestList(String testListFile)
+{
+    def regularTests = []
+    def isolateTests = []
+
+    // Read the test list file
+    def lines = new File(testListFile).readLines()
+
+    lines.each { line ->
+        def trimmedLine = line.trim()
+        if (trimmedLine && !trimmedLine.startsWith('#')) {
+            if (trimmedLine.contains(' ISOLATE')) {
+                // Remove ' ISOLATE' from the line and add to isolate list
+                def cleanedLine = trimmedLine.replaceAll(' ISOLATE', '').trim()
+                if (cleanedLine) {
+                    isolateTests.add(cleanedLine)
+                }
+            } else {
+                // Add to regular test list
+                regularTests.add(trimmedLine)
+            }
+        }
+    }
+
+    // Write the regular tests back to the original file
+    new File(testListFile).withWriter { writer ->
+        regularTests.each { test ->
+            writer.writeLine(test)
+        }
+    }
+
+    // Create a separate file for isolate tests
+    def isolateTestFile = testListFile.replaceAll('\\.txt$', '_isolate.txt')
+    new File(isolateTestFile).withWriter { writer ->
+        isolateTests.each { test ->
+            writer.writeLine(test)
+        }
+    }
+
+    return [
+        regular: testListFile,
+        isolate: isolateTestFile,
+        regularCount: regularTests.size(),
+        isolateCount: isolateTests.size()
+    ]
+}
+
 // Test filter flags
 @Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
@@ -1674,6 +1721,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
+
+        // Preprocess the testDBList to separate ISOLATE tests
+        def preprocessedLists = preprocessTestList(testDBList)
+        def regularTestList = preprocessedLists.regular
+        def isolateTestList = preprocessedLists.isolate
+
         testList = "${testList}_${splitId}"
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
@@ -1693,7 +1746,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "--splits ${splits}",
             "--group ${splitId}",
             "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
-            "--test-list=${testDBList}",
+            "--test-list=${regularTestList}",
             "--output-dir=${WORKSPACE}/${stageName}/",
             "--csv=${WORKSPACE}/${stageName}/report.csv",
             "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
@@ -1758,6 +1811,32 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         error "The tests still failed after rerun attempt."
                     }
                 }
+            }
+        }
+
+        // Run the isolated tests one by one to avoid any potential conflicts
+        for (int i = 0; i < isolateTestList.size(); i++) {
+            def isolateTest = isolateTestList[i]
+            def isolateTestCmdLine = testCmdLine.findAll { cmd ->
+                !cmd.contains("--test-list=") &&
+                !cmd.contains("--test-prefix=") &&
+                !cmd.contains("--csv=") &&
+                !cmd.contains("--junit-xml")
+            }
+            isolateTestCmdLine += ["--test-list=${isolateTest}"]
+            isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
+            isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
+            isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+            echo "Running isolated test: ${isolateTest}"
+            try {
+                sh """
+                    cd ${llmSrc}/tests/integration/defs && \
+                    ${isolateTestCmdLine.join(" ")}
+                """
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                error "The isolated test ${isolateTest} failed."
             }
         }
 
