@@ -538,18 +538,6 @@ class RayGPUWorker(GenerationExecutor):
         logger.debug(f'Worker {mpi_rank()} shutting down...')
 
         if self.engine is not None:
-            if self.engine.can_enqueue_requests():
-
-                if self.await_response_thread.is_alive():
-                    self.await_response_thread.stop()
-                    self.await_response_thread.join()
-                if self.dispatch_stats_thread.is_alive():
-                    self.dispatch_stats_thread.stop()
-                    self.dispatch_stats_thread.join()
-                if self.dispatch_kv_cache_events_thread.is_alive():
-                    self.dispatch_kv_cache_events_thread.stop()
-                    self.dispatch_kv_cache_events_thread.join()
-
             self.engine.shutdown()
             self.engine = None
 
