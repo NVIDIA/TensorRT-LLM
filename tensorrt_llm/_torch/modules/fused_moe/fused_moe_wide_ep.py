@@ -127,7 +127,7 @@ class WideEPMoE(MoE):
             self.layer_load_balancer.set_initial_weight_assignments(
                 self.initial_global_assignments)
             logger.info(
-                f"MoE load balancer enabled. num_experts = {num_experts}, num_slots = {self.num_slots}, ep_size = {self.ep_size}"
+                f"xxi test MoE load balancer enabled. num_experts = {num_experts}, num_slots = {self.num_slots}, ep_size = {self.ep_size}"
             )
             logger.info(
                 f"initial_global_assignments (layer {self.layer_idx}) = {self.initial_global_assignments}"
