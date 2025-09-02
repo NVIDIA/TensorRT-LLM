@@ -62,18 +62,18 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 {
 }
 
-RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, std::vector<BlockKey> allBlockKeys,
-    executor::DataTransceiverState transState, SizeType32 indexFromEnd)
+RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState,
+    SizeType32 indexFromEnd, BlockKey const& lastBlockKey)
     : mRequestId{requestId}
-    , mAllBlockKeys{std::move(allBlockKeys)}
     , mIndexFromEnd{indexFromEnd}
+    , mLastBlockKey{lastBlockKey}
     , mTransState{std::move(transState)}
 {
 }
 
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
-    return mRequestId == rhs.mRequestId && mAllBlockKeys == rhs.mAllBlockKeys && mIndexFromEnd == rhs.mIndexFromEnd
+    return mRequestId == rhs.mRequestId && mIndexFromEnd == rhs.mIndexFromEnd && mLastBlockKey == rhs.mLastBlockKey
         && mTransState == rhs.mTransState;
 }
 
@@ -91,8 +91,8 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
 {
     namespace su = executor::serialize_utils;
     su::serialize(requestInfo.mRequestId, os);
-    su::serialize(requestInfo.mAllBlockKeys, os);
     su::serialize(requestInfo.mIndexFromEnd, os);
+    su::serialize(requestInfo.mLastBlockKey, os);
     su::serialize(requestInfo.mTransState, os);
 }
 
@@ -100,10 +100,10 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
 {
     namespace su = executor::serialize_utils;
     auto requestId = su::deserialize<decltype(mRequestId)>(is);
-    auto allBlockKeys = su::deserialize<decltype(mAllBlockKeys)>(is);
     auto indexFromEnd = su::deserialize<decltype(mIndexFromEnd)>(is);
+    auto lastBlockKey = su::deserialize<decltype(mLastBlockKey)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    return RequestInfo{requestId, std::move(allBlockKeys), std::move(transState), indexFromEnd};
+    return RequestInfo{requestId, std::move(transState), indexFromEnd, lastBlockKey};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -111,8 +111,8 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     namespace su = executor::serialize_utils;
     std::size_t totalSize = 0;
     totalSize += su::serializedSize(requestInfo.mRequestId);
-    totalSize += su::serializedSize(requestInfo.mAllBlockKeys);
     totalSize += su::serializedSize(requestInfo.mIndexFromEnd);
+    totalSize += su::serializedSize(requestInfo.mLastBlockKey);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
 }
@@ -218,7 +218,7 @@ public:
             {
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
                     DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager,
-                    info.getAllBlockKeys(), info.getIndexFromEnd());
+                    info.getIndexFromEnd(), info.getLastBlockKey());
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
@@ -233,6 +233,11 @@ public:
         auto& session = it->second;
         session.setLlmRequest(llmRequest);
         mFormatter->format(session);
+        if (mFormatter->getCacheManager()->getBlockManager().getNumPools() == 1
+            && llmRequest.getLlmRequestType() == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY)
+        {
+            auto& blockKey = session.getLastBlockKey();
+        }
     }
 
     ~Impl()
@@ -490,22 +495,26 @@ public:
         {
             auto* cacheManager = mFormatter->getCacheManager();
             auto beam = 0;
-            auto allBlockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
             auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest);
 
             auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
-            auto blockedUniqueTokens = tensorrt_llm::batch_manager::kv_cache_manager::chopVectorIntoBlocks<UniqueToken>(
-                uniqueTokens, uniqueTokens.size() - 1, mFormatter->getCacheManager()->getTokensPerBlock(), true);
-            auto blockKeys
-                = tensorrt_llm::batch_manager::kv_cache_manager::buildBlockKeys(blockedUniqueTokens, llmRequest);
+            auto lastBlockKey
+                = BlockKey(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
+            if (llmRequest.getInputTokensExtraIds().has_value())
+            {
+                auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+                SizeType32 startTokenIdx
+                    = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
+                SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
+                auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
+                lastBlockKey.extraKeys = std::move(extraKeys);
+            }
             // Compute indexFromEnd from the number of requested blocks
-            size_t totalBlockSize = allBlockRange.getBlockIds().size();
             size_t requestedBlockSize = requestedBlockRange.getBlockIds().size();
-            std::cout << "requestedBlockSize: " << requestedBlockSize << std::endl;
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
             SizeType32 indexFromEnd = static_cast<SizeType32>(requestedBlockSize - 1);
 
-            requestInfo = RequestInfo(requestId, blockKeys, mSelfState, indexFromEnd);
+            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -550,7 +559,7 @@ public:
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
-            contextState, resource->mBufferManager, requestInfo.getAllBlockKeys(), requestInfo.getIndexFromEnd(),
+            contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(),
             &llmRequest);
     }
 

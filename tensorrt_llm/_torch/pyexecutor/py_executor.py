@@ -1775,8 +1775,9 @@ class PyExecutor:
 
             if request_done:
                 if request.is_disagg_context_transmission_state:
-                    if self.block_reuse_enabled:
+                    if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
                         requests_to_terminate.append(request)
+                        self.ctx_in_transmission_requests.append(request)
                     else:
                         self.ctx_in_transmission_requests.append(request)
                 else:
@@ -1794,7 +1795,8 @@ class PyExecutor:
     def _terminate_ctx_finished_requests(self):
         for request in self.ctx_in_transmission_requests[:]:
             if request.is_disagg_context_complete_state:
-                self._terminate_request(request)
+                if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
+                    self._terminate_request(request)
                 self.ctx_in_transmission_requests.remove(request)
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):

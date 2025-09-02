@@ -49,20 +49,13 @@ public:
     }
 
     static BlockRange fromReuseTree(
-        BaseKVCacheManager const& cacheManager, std::vector<BlockKey> const& allBlockKeys, SizeType32 indexFromEnd)
+        BaseKVCacheManager const& cacheManager, BlockKey const& lastBlockKey, SizeType32 indexFromEnd)
     {
         auto const windowSize = firstWindowSize(cacheManager);
         // Find the last block in the reuse tree for the provided full sequence of block keys
-        auto lastBlock = *cacheManager.findBlocksInReuseTreeByBlockKeys(allBlockKeys, windowSize);
+        auto lastBlock = *cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
         // TODO: handle the case where the last block is not found
         TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
-        // Validate indexFromEnd and determine how many trailing blocks to collect
-        auto const totalNumBlocks = static_cast<SizeType32>(allBlockKeys.size());
-        TLLM_CHECK_WITH_INFO(
-            indexFromEnd < totalNumBlocks, "indexFromEnd=%d is out of range (total=%d)", indexFromEnd, totalNumBlocks);
-
-        // Number of blocks to return equals suffix length starting at the block located indexFromEnd from the end
-        // Example: indexFromEnd=0 -> return last block only; indexFromEnd=2 -> return last 3 blocks
         SizeType32 const numBlocksToCollect = indexFromEnd + 1;
 
         std::vector<SizeType32> blockIds;

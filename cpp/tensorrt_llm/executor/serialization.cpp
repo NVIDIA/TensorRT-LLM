@@ -2450,7 +2450,6 @@ size_t Serialization::serializedSize(tensorrt_llm::batch_manager::kv_cache_manag
     totalSize += su::serializedSize(key.uniqueTokens);
     // std::vector<MmKey> where MmKey is pair<std::array<uint8_t,32>, SizeType32>
     totalSize += su::serializedSize(key.extraKeys);
-    totalSize += su::serializedSize(key.hash);
     return totalSize;
 }
 
@@ -2460,7 +2459,6 @@ void Serialization::serialize(tensorrt_llm::batch_manager::kv_cache_manager::Blo
     su::serialize(key.loraTaskId, os);
     su::serialize(key.uniqueTokens, os);
     su::serialize(key.extraKeys, os);
-    su::serialize(key.hash, os);
 }
 
 tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deserializeBlockKey(std::istream& is)
@@ -2469,13 +2467,11 @@ tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deseriali
     auto loraTaskId = su::deserialize<std::optional<tensorrt_llm::batch_manager::kv_cache_manager::LoraTaskIdType>>(is);
     auto uniqueTokens = su::deserialize<std::vector<tensorrt_llm::runtime::UniqueToken>>(is);
     auto extraKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
-    auto hash = su::deserialize<size_t>(is);
     tensorrt_llm::batch_manager::kv_cache_manager::BlockKey key;
     key.usesExtraIds = usesExtraIds;
     key.loraTaskId = std::move(loraTaskId);
     key.uniqueTokens = std::move(uniqueTokens);
     key.extraKeys = std::move(extraKeys);
-    key.hash = hash;
     return key;
 }
 

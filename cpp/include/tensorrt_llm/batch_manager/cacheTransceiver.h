@@ -119,7 +119,6 @@ private:
         mMpiGroupTPInDPComm;
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
-    // std::unique_ptr<CacheServer> mCacheServer;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
     std::unique_ptr<kv_cache_manager::CacheTransBufferManager> mCacheTransBufferManager;

@@ -132,6 +132,9 @@ struct WindowSizeMetadata
     }
 };
 
+std::vector<MmKey> generateBlockHashExtraKeys(
+    tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx);
+
 struct BlockKey
 {
     bool usesExtraIds = false;
@@ -141,8 +144,6 @@ struct BlockKey
     // Extra keys for multimodal data (similar to VLLM's approach)
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
     std::vector<MmKey> extraKeys;
-
-    size_t hash{0};
 
     BlockKey() = default;
 
@@ -154,11 +155,6 @@ struct BlockKey
         {
             uniqueTokens.push_back(UniqueToken{token, 0});
         }
-    }
-
-    explicit BlockKey(size_t hash)
-        : hash{hash}
-    {
     }
 
     explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
@@ -196,10 +192,6 @@ struct BlockKeyHasher
 
     std::size_t operator()(BlockKey const& blockKey, std::size_t parentHash = 0) const noexcept
     {
-        if (blockKey.hash != 0)
-        {
-            return blockKey.hash;
-        }
         return hash(blockKey, parentHash);
     }
 };
@@ -603,6 +595,7 @@ public:
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Pin blocks associated with a sequence to prevent eviction.
     void pinBlocks(GenerationRequest& sequence);
 
     //! \brief Release blocks of the sequence.
@@ -785,8 +778,11 @@ public:
         return 0;
     }
 
-    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKeys(
-        std::vector<BlockKey> const& blockKeys) const;
+    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey) const;
+
+    //! \brief Unpin blocks along the reuse path ending at last blockKey by decrementing their refcounts.
+    void unpinBlocks(BlockKey const& lastBlockKey);
 
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -942,7 +938,11 @@ public:
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
+    /// @brief Pin all blocks associated with a sequence across all window managers.
+    /// @param sequence The generation request whose blocks should be pinned.
     void pinBlocks(GenerationRequest& sequence);
+
+    void unpinBlocks(BlockKey const& blockKey);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1128,10 +1128,10 @@ public:
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
     }
 
-    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKeys(
-        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) const
+    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize) const
     {
-        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKeys(blockKeys);
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
     }
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
@@ -1277,6 +1277,8 @@ public:
     [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
         = 0;
 
+    /// @brief Pin blocks associated with a request to prevent eviction.
+    /// @param requestId The ID of the request whose blocks should be pinned.
     virtual void pinBlocks(LlmRequest::RequestIdType requestId) = 0;
 
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
@@ -1420,8 +1422,8 @@ public:
 
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
 
-    [[nodiscard]] virtual std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKeys(
-        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) const
+    [[nodiscard]] virtual std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize) const
         = 0;
 };
 
@@ -1677,7 +1679,9 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
-    void pinBlocks(LlmRequest::RequestIdType requestId);
+    void pinBlocks(LlmRequest::RequestIdType requestId) override;
+
+    void unpinBlocks(BlockKey const& blockKey);
 
     /// @brief Calculates the number of kv-cache blocks that a sequence will require, for a single beam.
     ///
@@ -1717,10 +1721,10 @@ public:
         mBlockManager.flushIterationEvents();
     }
 
-    std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKeys(
-        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) const override
+    std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize) const override
     {
-        return mBlockManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
+        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
     }
 
     /// @brief Finds the maximum attention window that can be used on a sequence, given some kv-cache block capacity.

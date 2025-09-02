@@ -69,8 +69,8 @@ public:
     /// @param transState The state of the data transceiver.
     RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState);
 
-    RequestInfo(LlmRequest::RequestIdType requestId, std::vector<BlockKey> allBlockKeys,
-        executor::DataTransceiverState transState, SizeType32 indexFromEnd);
+    RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState, SizeType32 indexFromEnd,
+        BlockKey const& lastBlockKey);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
@@ -81,11 +81,6 @@ public:
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
 
-    [[nodiscard]] std::vector<BlockKey> const& getAllBlockKeys() const noexcept
-    {
-        return mAllBlockKeys;
-    }
-
     [[nodiscard]] SizeType32 getIndexFromEnd() const noexcept
     {
         return mIndexFromEnd;
@@ -94,6 +89,11 @@ public:
     /// @brief Return the state of the data transceiver.
     /// @return The state of the data transceiver.
     [[nodiscard]] executor::DataTransceiverState const& getTransState() const noexcept;
+
+    [[nodiscard]] BlockKey const& getLastBlockKey() const noexcept
+    {
+        return mLastBlockKey;
+    }
 
     /// @brief Serialization.
     /// @param requestInfo Request information to be serialized.
@@ -112,12 +112,11 @@ public:
 private:
     // The ID used in the context phase of the current request.
     LlmRequest::RequestIdType mRequestId;
-
-    // The block hashes of the request.
-    std::vector<BlockKey> mAllBlockKeys;
-
     // Index from end indicating how many trailing blocks to transfer (index+1)
     SizeType32 mIndexFromEnd{0};
+
+    // Last block key, used to derive other block keys on receiver
+    BlockKey mLastBlockKey{};
 
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;

@@ -33,9 +33,8 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
-
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    std::vector<BlockKey> const& allBlockKeys, SizeType32 indexFromEnd);
+    BlockKey const& lastBlockKey, SizeType32 indexFromEnd);
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
 
@@ -130,15 +129,15 @@ public:
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, std::vector<BlockKey> allBlockKeys = {},
-        SizeType32 indexFromEnd = 0, LlmRequest const* llmRequest = nullptr)
+        runtime::BufferManager const& bufferManager, SizeType32 indexFromEnd = 0, BlockKey lastBlockKey = {},
+        LlmRequest const* llmRequest = nullptr)
         : mConnections(std::move(connections))
         , mDataContext(dataContext)
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
-        , mAllBlockKeys(std::move(allBlockKeys))
         , mIndexFromEnd(indexFromEnd)
+        , mLastBlockKey(std::move(lastBlockKey))
         , mRequest(llmRequest)
     {
         TLLM_CHECK(!mConnections.empty());
@@ -235,14 +234,14 @@ public:
         outFile << '\n' << std::flush;
     }
 
-    [[nodiscard]] std::vector<BlockKey> const& getAllBlockKeys() const
-    {
-        return mAllBlockKeys;
-    }
-
     [[nodiscard]] SizeType32 getIndexFromEnd() const
     {
         return mIndexFromEnd;
+    }
+
+    [[nodiscard]] BlockKey const& getLastBlockKey() const
+    {
+        return mLastBlockKey;
     }
 
 private:
@@ -253,8 +252,8 @@ private:
     runtime::BufferManager const* mBufferManager;
     std::vector<Measure> mMeasures;
     bool mRecordMeasure{false};
-    std::vector<BlockKey> mAllBlockKeys;
     SizeType32 mIndexFromEnd;
+    BlockKey mLastBlockKey;
     LlmRequest const* mRequest;
 };
 

@@ -106,7 +106,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     : mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
     , mCacheTransceiverConfig{cacheTransceiverConfig}
 {
-    // mCacheServer = std::make_unique<CacheServer>(CacheServerConfig{cacheManager});
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (worldConfig.isTensorParallel())
     {
@@ -298,7 +297,6 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     int localSize = static_cast<int>(requestIds.size());
     std::vector<int> sizes(mpiComm.getSize());
     mpiComm.allgather(&localSize, sizes.data(), 1, mpi::MpiType::kINT32);
-    // std::vector<LlmRequest::RequestIdType> all_data(total_size);
     std::vector<int> displs(mpiComm.getSize());
     int totalSize = 0;
     for (int i = 0; i < mpiComm.getSize(); i++)
