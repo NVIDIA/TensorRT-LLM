@@ -21,6 +21,7 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_radio import RADIOVisionModel
 from .modeling_utils import register_auto_model
 
 
@@ -66,19 +67,12 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         self.num_image_token = int((self.image_size // self.patch_size)**2 *
                                    (config.downsample_ratio**2))
         self.downsample_ratio = config.downsample_ratio
-        self.ps_version = config.ps_version
-        # self.image_tag_type = config.image_tag_type
-
-        logger.info(f'num_image_token: {self.num_image_token}')
-        logger.info(f'ps_version: {self.ps_version}')
-
-        # self.drop_vision_class_token = True
+        self.ps_version = config.ps_version  # Pixel shuffle version.
 
         # Construct the vision projection.
         self.vit_hidden_size = config.vit_hidden_size
         self.vision_projection_hidden_size = config.projector_hidden_size
         self.llm_hidden_size = config.llm_config.hidden_size
-
         self.mlp1 = nn.Sequential(
             RMSNorm(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
                     eps=1e-5),
@@ -90,37 +84,19 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
                       bias=False))
         self.mlp1 = self.mlp1.to(config.torch_dtype)
 
-        WITH_HF_CODES = False
-        if WITH_HF_CODES:
+        # Construct the vision encoder.
+        self.with_hf_codes = os.getenv("WITH_HF_CODES", "0") == "1"
+        if self.with_hf_codes:
             self.vision_model = transformers.AutoModel.from_config(
                 config.vision_config, trust_remote_code=True)
             # set input_condition as Identity module.
             self.vision_model.radio_model.make_preprocessor_external()
             self.vision_model.to(config.torch_dtype)
-
-            with open("hf_vision_encoder_arch.txt", "w") as f:
-                f.write(str(self.vision_model))
         else:
-            WITH_TRTLLM_CODES = True
-            if WITH_TRTLLM_CODES:
-                from .modeling_radio import RADIOVisionModel
-
-                vision_model_config = copy.deepcopy(model_config)
-                vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
-
-                self.vision_model = RADIOVisionModel(vision_model_config)
-                self.vision_model.to(config.torch_dtype)
-
-                with open("trtllm_vision_encoder_arch.txt", "w") as f:
-                    f.write(str(self.vision_model))
-            else:
-                # Update the vision model with customized one.
-                from .modeling_radio import RADIOModel
-                self.vision_model = RADIOModel(config.vision_config)
-                self.vision_model.to(config.torch_dtype)
-
-                with open("user_vision_encoder_arch.txt", "w") as f:
-                    f.write(str(self.vision_model))
+            vision_model_config = copy.deepcopy(model_config)
+            vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
+            self.vision_model = RADIOVisionModel(vision_model_config)
+            self.vision_model.to(config.torch_dtype)
 
     @torch.compile
     def pixel_shuffle(self, x, scale_factor=0.5):
@@ -141,8 +117,12 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         return x
 
     def extract_feature(self, pixel_values):
-        vit_embeds = self.vision_model(pixel_values).features
+        if self.with_hf_codes:
+            vit_embeds = self.vision_model(pixel_values).features
+        else:
+            vit_embeds = self.vision_model(pixel_values)
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        # Down-sampling and projection.
         h = w = int(vit_embeds.shape[1]**0.5)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
         vit_embeds = self.pixel_shuffle(vit_embeds,
@@ -163,12 +143,15 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
                 for multimodal_param in multimodal_params
             ],
                                              dim=0)
-            batched_num_patches = [
+            # -> [num_patches, channel, height, width]
+            batched_num_patches = torch.cat([
                 multimodal_param.multimodal_data["num_patches"]
                 for multimodal_param in multimodal_params
-            ]
-            # -> [num_patches, num_image_token, hidden_size]
+            ],
+                                            dim=0).tolist()
+            # -> list of[num_patches1, num_patches2, ...]
             batched_image_embeds = self.extract_feature(batched_pixel_values)
+            # -> [num_patches, num_image_token, hidden_size]
             mm_embedding = torch.split(batched_image_embeds,
                                        batched_num_patches,
                                        dim=0)
@@ -309,6 +292,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.is_loaded = True
 
     def load_weights(self, weights):
+        # TODO: move vision encoder weights loading to vision encoder class.
+
         # Load vision encoder weights for pytorch modules.
         filter_weights = {
             k: v
@@ -317,7 +302,11 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         }
         missing_keys, unexpected_keys = self.vision_encoder.load_state_dict(
             filter_weights, strict=False)
-        missing_keys.remove("vision_model.radio_model.summary_idxs")
+        try:
+            missing_keys.remove("vision_model.radio_model.summary_idxs")
+        except ValueError:
+            pass
+
         unexpected_keys.remove(
             "vision_model.radio_model.input_conditioner.norm_mean")
         unexpected_keys.remove(

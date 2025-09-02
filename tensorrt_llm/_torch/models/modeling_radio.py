@@ -1,28 +1,13 @@
 import math
 from collections import namedtuple
-from typing import (Dict, Iterable, List, NamedTuple, Optional, Tuple, Type,
-                    Union)
-
-import torch
-from torch import nn
-from transformers import PretrainedConfig, PreTrainedModel
-
-try:
-    from typing import Literal
-except ImportError:
-    from typing_extensions import Literal
-
-import math
-from typing import List, Optional, Tuple, Union
+from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
+                    Type, Union)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from timm.data.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
-from timm.layers import (Attention, LayerNorm, LayerType, Mlp, get_act_layer,
-                         get_norm_layer)
-from torch import nn
+from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import \
@@ -31,14 +16,9 @@ from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 
-norm_t = Union[Tuple[float, float, float], torch.Tensor]
 input_dim_t = Union[int, Tuple[int, int]]
 
 DEFAULT_VERSION = "radio_v2.5-h"
-
-
-def _to_tensor(v: norm_t):
-    return torch.as_tensor(v, dtype=torch.float32).view(-1, 1, 1)
 
 
 class Resolution(NamedTuple):
@@ -83,31 +63,6 @@ class RADIOConfig(PretrainedConfig):
         self.num_key_value_heads = 16  # Hardcoded for model weight loading
         self.num_attention_heads = 16  # Hardcoded for model weight loading
         super().__init__(**kwargs)
-
-
-# class InputConditioner(nn.Module):
-
-#     def __init__(
-#         self,
-#         input_scale: float,
-#         norm_mean: norm_t,
-#         norm_std: norm_t,
-#         dtype: torch.dtype = None,
-#     ):
-#         super().__init__()
-
-#         self.dtype = dtype
-
-#         self.register_buffer("norm_mean", _to_tensor(norm_mean) / input_scale)
-#         self.register_buffer("norm_std", _to_tensor(norm_std) / input_scale)
-
-#     def forward(self, x: torch.Tensor):
-#         y = (x - self.norm_mean) / self.norm_std
-#         if self.dtype is not None:
-#             y = y.to(self.dtype)
-#         return y
-
-InputConditioner = nn.Identity
 
 
 class ClsToken(nn.Module):
@@ -156,11 +111,6 @@ class ClsToken(nn.Module):
         ], dim=1)
 
         return x
-
-    def no_weight_decay(self):
-        return [
-            'token',
-        ]
 
 
 class ViTPatchGenerator(nn.Module):
@@ -245,16 +195,8 @@ class ViTPatchGenerator(nn.Module):
         return patches
 
     @property
-    def apply_cls_token(self):
-        return self.cls_token.enabled
-
-    @property
     def num_cls_tokens(self):
         return self.cls_token.num_tokens
-
-    @property
-    def num_cls_patches(self):
-        return self.cls_token.num_patches
 
     @property
     def num_registers(self):
@@ -263,52 +205,6 @@ class ViTPatchGenerator(nn.Module):
     @property
     def num_skip(self):
         return self.num_cls_tokens + self.num_registers
-
-    def no_weight_decay(self):
-        return [
-            'pos_embed',
-        ]
-
-    def _load_embed(self, src_embed: torch.Tensor, targ_embed: nn.Parameter):
-        if src_embed.shape != targ_embed.shape:
-            src_size = int(math.sqrt(src_embed.shape[1]))
-
-            assert src_size**2 == src_embed.shape[
-                1], 'Unable to interpolate non-square embedding'
-
-            src_embed = rearrange(src_embed,
-                                  'b (h w) c -> b c h w',
-                                  h=src_size,
-                                  w=src_size)
-            src_embed = F.interpolate(src_embed,
-                                      size=(self.num_rows, self.num_cols),
-                                      mode='bicubic',
-                                      align_corners=True,
-                                      antialias=False)
-            src_embed = rearrange(src_embed, 'b c h w -> b (h w) c')
-        targ_embed.data.copy_(src_embed)
-
-    def _load_projection(self, src_proj_weight: torch.Tensor,
-                         targ_proj_weight: torch.Tensor):
-        if src_proj_weight.shape != targ_proj_weight.shape:
-            src_patch_size = int(math.sqrt(src_proj_weight.shape[1] // 3))
-
-            assert (src_patch_size**2) * 3 == src_proj_weight.shape[
-                1], 'Unable to interpolate non-square patch size'
-
-            src_proj_weight = rearrange(src_proj_weight,
-                                        'b (c h w) -> b c h w',
-                                        c=3,
-                                        h=src_patch_size,
-                                        w=src_patch_size)
-            src_proj_weight = F.interpolate(src_proj_weight,
-                                            size=(self.patch_size,
-                                                  self.patch_size),
-                                            mode='bicubic',
-                                            align_corners=True,
-                                            antialias=False)
-            src_proj_weight = rearrange(src_proj_weight, 'b c h w -> b (c h w)')
-        targ_proj_weight.data.copy_(src_proj_weight)
 
     def embed_patches(self, x: torch.Tensor) -> torch.Tensor:
         patches = self.im_to_patches(x)
@@ -325,18 +221,7 @@ class ViTPatchGenerator(nn.Module):
             return patches
 
         pos_enc = self.get_pos_enc(patches.shape[0], patch_idxs, input_size)
-
-        if self.training and self.pos_dropout > 0:
-            keeps = torch.rand(patches.shape[0],
-                               1,
-                               1,
-                               dtype=pos_enc.dtype,
-                               device=pos_enc.device) > self.pos_dropout
-            pos_enc_drop = torch.where(keeps, pos_enc, 0)
-        else:
-            pos_enc_drop = pos_enc
-
-        return patches + pos_enc_drop, pos_enc
+        return patches + pos_enc, pos_enc
 
     def get_pos_enc(
         self,
@@ -377,62 +262,13 @@ class ViTPatchGenerator(nn.Module):
             return pos_embed
 
         if self.cpe_mode:
-            if self.training:
-                min_scale = math.sqrt(0.1)
-                scale = torch.rand(batch_size, 1, 1, device=pos_embed.device
-                                   ) * (1 - min_scale) + min_scale
-                aspect_min = math.log(3 / 4)
-                aspect_max = -aspect_min
-                aspect = torch.exp(
-                    torch.rand(batch_size, 1, 1, device=pos_embed.device) *
-                    (aspect_max - aspect_min) + aspect_min)
+            max_dim = max(input_dims)
+            pos_embed = F.interpolate(pos_embed.float(),
+                                      size=(max_dim, max_dim),
+                                      align_corners=True,
+                                      mode='bilinear').to(pos_embed.dtype)
 
-                scale_x = scale * aspect
-                scale_y = scale * (1 / aspect)
-                scale_xy = torch.stack([scale_x, scale_y], dim=-1).clamp_(0, 1)
-
-                pos_xy = torch.rand(
-                    batch_size, 1, 1, 2,
-                    device=pos_embed.device) * (1 - scale_xy)
-
-                lin_x = torch.linspace(
-                    0, 1, steps=input_dims[1],
-                    device=pos_embed.device)[None, None].expand(
-                        batch_size, input_dims[0], -1)
-                lin_y = torch.linspace(
-                    0, 1, steps=input_dims[0],
-                    device=pos_embed.device)[None, :, None].expand(
-                        batch_size, -1, input_dims[1])
-
-                lin_xy = torch.stack([lin_x, lin_y], dim=-1)
-
-                grid_xy = lin_xy * scale_xy + pos_xy
-
-                # Convert to [-1, 1] range
-                grid_xy.mul_(2).sub_(1)
-
-                pos_embed = F.grid_sample(
-                    pos_embed.float().expand(batch_size, -1, -1, -1),
-                    grid=grid_xy,
-                    mode='bilinear',
-                    padding_mode='zeros',
-                    align_corners=True,
-                ).to(pos_embed.dtype)
-            else:
-                # i_rows, i_cols = input_dims
-                # p_rows, p_cols = pos_embed.shape[2:]
-                # if i_rows <= p_rows and i_cols <= p_cols:
-                #     left = (p_cols - i_cols) // 2
-                #     top = (p_rows - i_rows) // 2
-                #     pos_embed = pos_embed[..., top:top+i_rows, left:left+i_cols]
-                # else:
-                max_dim = max(input_dims)
-                pos_embed = F.interpolate(pos_embed.float(),
-                                          size=(max_dim, max_dim),
-                                          align_corners=True,
-                                          mode='bilinear').to(pos_embed.dtype)
-
-                pos_embed = window_select(pos_embed)
+            pos_embed = window_select(pos_embed)
         else:
             pos_embed = window_select(pos_embed)
 
@@ -501,8 +337,7 @@ class Block(nn.Module):
         init_values: Optional[float] = None,
         drop_path: float = 0.,
         act_layer: Type[nn.Module] = nn.GELU,
-        norm_layer: Type[nn.Module] = LayerNorm,
-        mlp_layer: Type[nn.Module] = Mlp,
+        norm_layer: Type[nn.Module] = nn.LayerNorm,
         layer_idx: Optional[int] = None,
         model_config: model_config_lib.ModelConfig[RADIOConfig] = None,
     ) -> None:
@@ -521,92 +356,55 @@ class Block(nn.Module):
             drop_path: Stochastic depth rate.
             act_layer: Activation layer.
             norm_layer: Normalization layer.
-            mlp_layer: MLP layer.
         """
         super().__init__()
         self.model_config = model_config
-        if self.model_config is None:
-            self.norm1 = norm_layer(dim)
-            self.attn = Attention(
-                dim,
-                num_heads=num_heads,
-                qkv_bias=qkv_bias,
-                qk_norm=qk_norm,
-                scale_norm=scale_attn_norm,
-                proj_bias=proj_bias,
-                attn_drop=attn_drop,
-                proj_drop=proj_drop,
-                norm_layer=norm_layer,
-            )
-            if init_values:
-                raise IOError("Block does not support LayerScale for now.")
-            self.ls1 = nn.Identity()
-            if drop_path > 0.:
-                raise IOError("Block does not support DropPath for now.")
-            self.drop_path1 = nn.Identity()
+        self.norm1 = norm_layer(dim)
 
-            self.norm2 = norm_layer(dim)
-            self.mlp = mlp_layer(
-                in_features=dim,
-                hidden_features=int(dim * mlp_ratio),
-                act_layer=act_layer,
-                norm_layer=norm_layer if scale_mlp_norm else None,
-                bias=proj_bias,
-                drop=proj_drop,
-            )
-            if init_values:
-                raise IOError("Block does not support LayerScale for now.")
-            self.ls2 = nn.Identity()
-            if drop_path > 0.:
-                raise IOError("Block does not support DropPath for now.")
-            self.drop_path2 = nn.Identity()
-        else:
-            self.norm1 = norm_layer(dim)
+        if qk_norm:
+            raise IOError("Block does not support qk_norm for now.")
+        self.attn = trtllm_attention.Attention(
+            hidden_size=dim,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            bias=qkv_bias,
+            dense_bias=proj_bias,
+            dtype=self.model_config.torch_dtype,
+            layer_idx=layer_idx,
+            pos_embd_params=None,
+            rope_fusion=None,
+            q_scaling=1.0,
+            attention_chunk_size=None,
+            config=self.model_config,
+            max_position_embeddings=None,
+        )
+        if init_values:
+            raise IOError("Block does not support LayerScale for now.")
+        self.ls1 = nn.Identity()
+        if drop_path > 0.:
+            raise IOError("Block does not support DropPath for now.")
+        self.drop_path1 = nn.Identity()
 
-            if qk_norm:
-                raise IOError("Block does not support qk_norm for now.")
-            self.attn = trtllm_attention.Attention(
-                hidden_size=dim,
-                num_attention_heads=num_heads,
-                num_key_value_heads=num_heads,
-                bias=qkv_bias,
-                dense_bias=proj_bias,
-                dtype=self.model_config.torch_dtype,
-                layer_idx=layer_idx,
-                pos_embd_params=None,
-                rope_fusion=None,
-                q_scaling=1.0,
-                attention_chunk_size=None,
-                config=self.model_config,
-                max_position_embeddings=None,
-            )
-            if init_values:
-                raise IOError("Block does not support LayerScale for now.")
-            self.ls1 = nn.Identity()
-            if drop_path > 0.:
-                raise IOError("Block does not support DropPath for now.")
-            self.drop_path1 = nn.Identity()
-
-            self.norm2 = norm_layer(dim)
-            if scale_mlp_norm:
-                raise IOError("Block does not support scale_mlp_norm for now.")
-            if proj_drop > 0.:
-                raise IOError("Block does not support proj_drop for now.")
-            self.mlp = trtllm_mlp.MLP(
-                hidden_size=dim,
-                intermediate_size=int(dim * mlp_ratio),
-                bias=proj_bias,
-                activation=nn.GELU(),
-                dtype=self.model_config.torch_dtype,
-                config=self.model_config,
-                layer_idx=layer_idx,
-            )
-            if init_values:
-                raise IOError("Block does not support LayerScale for now.")
-            self.ls2 = nn.Identity()
-            if drop_path > 0.:
-                raise IOError("Block does not support DropPath for now.")
-            self.drop_path2 = nn.Identity()
+        self.norm2 = norm_layer(dim)
+        if scale_mlp_norm:
+            raise IOError("Block does not support scale_mlp_norm for now.")
+        if proj_drop > 0.:
+            raise IOError("Block does not support proj_drop for now.")
+        self.mlp = trtllm_mlp.MLP(
+            hidden_size=dim,
+            intermediate_size=int(dim * mlp_ratio),
+            bias=proj_bias,
+            activation=nn.GELU(),
+            dtype=self.model_config.torch_dtype,
+            config=self.model_config,
+            layer_idx=layer_idx,
+        )
+        if init_values:
+            raise IOError("Block does not support LayerScale for now.")
+        self.ls2 = nn.Identity()
+        if drop_path > 0.:
+            raise IOError("Block does not support DropPath for now.")
+        self.drop_path2 = nn.Identity()
 
     def forward(
         self,
@@ -614,40 +412,30 @@ class Block(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         attn_metadata: Optional[attention_interface.AttentionMetadata] = None
     ) -> torch.Tensor:
-        if self.model_config is None:
-            x = x + self.drop_path1(
-                self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask)))
-            x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-            return x
-        else:
-            residual = x
-            x = self.norm1(x)
-            x = self.attn(
-                position_ids=None,
-                hidden_states=x,
-                attn_metadata=attn_metadata,
-                attention_mask=attention_interface.PredefinedAttentionMask.
-                FULL  # Always FULL for Vision
-            )
-            x = self.ls1(x)
-            x = self.drop_path1(x)
-            x = residual + x
+        residual = x
+        x = self.norm1(x)
+        x = self.attn(
+            position_ids=None,
+            hidden_states=x,
+            attn_metadata=attn_metadata,
+            attention_mask=attention_interface.PredefinedAttentionMask.
+            FULL  # Always FULL for Vision
+        )
+        x = self.ls1(x)
+        x = self.drop_path1(x)
+        x = residual + x
 
-            residual = x
-            x = self.norm2(x)
-            x = self.mlp(x)
-            x = self.ls2(x)
-            x = self.drop_path2(x)
-            x = residual + x
-            return x
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = self.ls2(x)
+        x = self.drop_path2(x)
+        x = residual + x
+        return x
 
 
 class VisionTransformer(nn.Module):
-    """ Vision Transformer
-
-    A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
-        - https://arxiv.org/abs/2010.11929
-    """
+    """ Vision Transformer."""
 
     def __init__(
         self,
@@ -683,9 +471,8 @@ class VisionTransformer(nn.Module):
         drop_path_rate: float = 0.,
         weight_init: Literal['skip', 'jax', 'jax_nlhb', 'moco', ''] = '',
         fix_init: bool = False,
-        norm_layer: Optional[LayerType] = None,
-        act_layer: Optional[LayerType] = None,
-        mlp_layer: Type[nn.Module] = Mlp,
+        norm_layer: Optional[nn.Module] = None,
+        act_layer: Optional[nn.Module] = None,
         cpe_max_size: Optional[int] = None,
         special_args: Optional[dict] = None,
         model_config: model_config_lib.ModelConfig[RADIOConfig] = None,
@@ -726,8 +513,13 @@ class VisionTransformer(nn.Module):
         assert pos_embed in ('', 'none', 'learn')
         use_fc_norm = global_pool in ('avg', 'avgmax',
                                       'max') if fc_norm is None else fc_norm
-        norm_layer = get_norm_layer(norm_layer) or LayerNorm
-        act_layer = get_act_layer(act_layer) or nn.GELU
+
+        if norm_layer is not None or act_layer is not None:
+            raise ValueError(
+                f"We assume to use default norm_layer and act_layer, while getting {norm_layer=} {act_layer=}."
+            )
+        norm_layer = nn.LayerNorm
+        act_layer = nn.GELU
 
         self.model_config = model_config
         if self.model_config is not None:
@@ -765,7 +557,6 @@ class VisionTransformer(nn.Module):
                 drop_path=dpr[i],
                 norm_layer=norm_layer,
                 act_layer=act_layer,
-                mlp_layer=mlp_layer,
                 model_config=model_config,
                 layer_idx=i,
             ) for i in range(depth)
@@ -839,10 +630,7 @@ class VisionTransformer(nn.Module):
         attn_metadata.prepare()
         return attn_metadata
 
-    def forward_features(
-            self,
-            x: torch.Tensor,
-            attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
         x = self.patch_generator(x)
         batch_size, seq_len, hidden_size = x.shape
@@ -861,69 +649,25 @@ class VisionTransformer(nn.Module):
         return x
 
 
-def create_model_from_args(args) -> nn.Module:
-    in_chans = 3
-    if args.in_chans is not None:
-        in_chans = args.in_chans
-    elif args.input_size is not None:
-        in_chans = args.input_size[0]
-
-    model = VisionTransformer(
-        img_size=224,
-        patch_size=16,
-        embed_dim=1280,
-        depth=32,
-        num_heads=16,
-        in_chans=in_chans,
-        drop_rate=args.drop,
-        weight_init=args.model_kwargs.pop("weight_init", "skip"),
-        special_args=args,
-    )
-
-    if hasattr(model, 'norm') and not getattr(args, 'model_norm', False):
-        model.norm = nn.Identity()
-
-    model.head = nn.Identity()
-
-    return model
-
-
-class RadioOutput(NamedTuple):
-    summary: torch.Tensor
-    features: torch.Tensor
-
-    def to(self, *args, **kwargs):
-        return RadioOutput(
-            self.summary.to(*args, **kwargs)
-            if self.summary is not None else None,
-            self.features.to(*args, **kwargs)
-            if self.features is not None else None,
-        )
-
-
-class RADIOModelBase(nn.Module):
+class RADIOVisionModelBase(nn.Module):
 
     def __init__(
         self,
         model: nn.Module,
-        input_conditioner: InputConditioner,
+        input_conditioner: nn.Module,
         patch_size: int,
         max_resolution: int,
         preferred_resolution: Resolution,
-        summary_idxs: Optional[torch.Tensor] = None,
         window_size: int = None,
         adaptors: Optional[Dict[str, nn.Module]] = None,
         feature_normalizer: Optional[nn.Module] = None,
         inter_feature_normalizer: Optional[nn.Module] = None,
+        model_config: model_config_lib.ModelConfig[RADIOConfig] = None,
     ):
         super().__init__()
 
         self.model = model
         self.input_conditioner = input_conditioner
-        if summary_idxs is not None:
-            self.register_buffer('summary_idxs', summary_idxs)
-        else:
-            self.summary_idxs = None
 
         self._preferred_resolution = preferred_resolution
         self._patch_size = patch_size
@@ -937,6 +681,7 @@ class RADIOModelBase(nn.Module):
             feature_normalizer = nn.Identity()
         self.feature_normalizer = feature_normalizer
         self.inter_feature_normalizer = inter_feature_normalizer
+        self.model_config = model_config
 
     @property
     def num_summary_tokens(self) -> int:
@@ -1035,7 +780,6 @@ class RADIOModelBase(nn.Module):
                 '`self.get_nearest_supported_resolution(<height>, <width>) is provided as a convenience API. '
                 f'Input: {x.shape[-2:]}, Nearest: {self.get_nearest_supported_resolution(*x.shape[-2:])}'
             )
-
         x = self.input_conditioner(x)
         y = self.model.forward_features(x)
         ret = self._extract_final(x, y, feature_fmt=feature_fmt)
@@ -1049,19 +793,10 @@ class RADIOModelBase(nn.Module):
         if isinstance(self.model, VisionTransformer):
             patch_gen = getattr(self.model, "patch_generator", None)
             if patch_gen is not None:
-                all_summary = y[:, :patch_gen.num_cls_tokens]
-                if self.summary_idxs is not None:
-                    bb_summary = all_summary[:, self.summary_idxs]
-                else:
-                    bb_summary = all_summary
                 all_feat = y[:, patch_gen.num_skip:]
             elif self.model.global_pool == "avg":
-                all_summary = y[:, self.model.num_prefix_tokens:].mean(dim=1)
-                bb_summary = all_summary
                 all_feat = y
             else:
-                all_summary = y[:, 0]
-                bb_summary = all_summary
                 all_feat = y[:, 1:]
         else:
             raise ValueError(f'Unsupported model type: {type(self.model)}')
@@ -1080,98 +815,12 @@ class RADIOModelBase(nn.Module):
                 f'Unsupported feature_fmt: {feature_fmt}. Must be one of ["NLC", "NCHW"]'
             )
 
-        ret = RadioOutput(bb_summary.flatten(1), fmt_feat)
+        ret = fmt_feat
 
         if self.adaptors:
             raise ValueError("Adaptors are not supported for RADIO models.")
 
         return ret
-
-
-class RADIOModel(PreTrainedModel):
-    """Pretrained Hugging Face model for RADIO.
-
-    This class inherits from PreTrainedModel, which provides
-    HuggingFace's functionality for loading and saving models.
-    """
-
-    config_class = RADIOConfig
-
-    def __init__(self, config: RADIOConfig):
-        super().__init__(config)
-
-        RADIOArgs = namedtuple("RADIOArgs", config.args.keys())
-        args = RADIOArgs(**config.args)
-        self.config = config
-
-        model = create_model_from_args(args)
-        input_conditioner = InputConditioner(
-            input_scale=1.0,
-            norm_mean=OPENAI_CLIP_MEAN,
-            norm_std=OPENAI_CLIP_STD,
-        )
-
-        dtype = getattr(args, "dtype", torch.float32)
-        if isinstance(dtype, str):
-            # Convert the dtype's string representation back to a dtype.
-            dtype = getattr(torch, dtype)
-        model.to(dtype=dtype)
-        input_conditioner.dtype = dtype
-
-        summary_idxs = torch.tensor(
-            [
-                i for i, t in enumerate(args.teachers)
-                if t.get("use_summary", True)
-            ],
-            dtype=torch.int64,
-        )
-
-        config.adaptor_configs
-        adaptor_names = config.adaptor_names or []
-        if len(adaptor_names) > 0:
-            raise ValueError(
-                "Adaptor names are not supported for RADIO models.")
-        adaptors = dict()
-
-        feature_normalizer = None
-        if config.feature_normalizer_config is not None:
-            raise ValueError(
-                "Feature normalizer is not supported for RADIO models.")
-
-        inter_feature_normalizer = None
-        if config.inter_feature_normalizer_config is not None:
-            raise ValueError(
-                "Intermediate feature normalizer is not supported for RADIO models."
-            )
-
-        self.radio_model = RADIOModelBase(
-            model,
-            input_conditioner,
-            summary_idxs=summary_idxs,
-            patch_size=config.patch_size,
-            max_resolution=config.max_resolution,
-            window_size=config.vitdet_window_size,
-            preferred_resolution=config.preferred_resolution,
-            adaptors=adaptors,
-            feature_normalizer=feature_normalizer,
-            inter_feature_normalizer=inter_feature_normalizer,
-        )
-
-    def forward(self, x: torch.Tensor):
-        return self.radio_model.forward(x)
-
-
-############# TRTLLM code #############
-
-from typing import List
-
-import torch
-
-from tensorrt_llm._torch import model_config as model_config_lib
-from tensorrt_llm._torch.attention_backend import \
-    interface as attention_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
-from tensorrt_llm._torch.modules import attention as trtllm_attention
 
 
 class RADIOVisionModel(PreTrainedModel):
@@ -1208,22 +857,9 @@ class RADIOVisionModel(PreTrainedModel):
         model.head = nn.Identity()
         model.to(dtype=config.torch_dtype)
 
-        input_conditioner = InputConditioner(
-            input_scale=1.0,
-            norm_mean=OPENAI_CLIP_MEAN,
-            norm_std=OPENAI_CLIP_STD,
-        )
+        input_conditioner = nn.Identity()
         input_conditioner.dtype = config.torch_dtype
 
-        summary_idxs = torch.tensor(
-            [
-                i for i, t in enumerate(args.teachers)
-                if t.get("use_summary", True)
-            ],
-            dtype=torch.int64,
-        )
-
-        config.adaptor_configs
         adaptor_names = config.adaptor_names or []
         if len(adaptor_names) > 0:
             raise ValueError(
@@ -1244,7 +880,6 @@ class RADIOVisionModel(PreTrainedModel):
         self.radio_model = RADIOVisionModelBase(
             model,
             input_conditioner,
-            summary_idxs=summary_idxs,
             patch_size=config.patch_size,
             max_resolution=config.max_resolution,
             window_size=config.vitdet_window_size,
@@ -1257,191 +892,3 @@ class RADIOVisionModel(PreTrainedModel):
 
     def forward(self, x: torch.Tensor):
         return self.radio_model.forward(x)
-
-
-class RADIOVisionModelBase(nn.Module):
-
-    def __init__(
-        self,
-        model: nn.Module,
-        input_conditioner: InputConditioner,
-        patch_size: int,
-        max_resolution: int,
-        preferred_resolution: Resolution,
-        summary_idxs: Optional[torch.Tensor] = None,
-        window_size: int = None,
-        adaptors: Optional[Dict[str, nn.Module]] = None,
-        feature_normalizer: Optional[nn.Module] = None,
-        inter_feature_normalizer: Optional[nn.Module] = None,
-        model_config: model_config_lib.ModelConfig[RADIOConfig] = None,
-    ):
-        super().__init__()
-
-        self.model = model
-        self.input_conditioner = input_conditioner
-        if summary_idxs is not None:
-            self.register_buffer('summary_idxs', summary_idxs)
-        else:
-            self.summary_idxs = None
-
-        self._preferred_resolution = preferred_resolution
-        self._patch_size = patch_size
-        self._max_resolution = max_resolution
-        self._window_size = window_size
-
-        adaptors = adaptors or dict()
-        self.adaptors = nn.ModuleDict(adaptors)
-
-        if feature_normalizer is None:
-            feature_normalizer = nn.Identity()
-        self.feature_normalizer = feature_normalizer
-        self.inter_feature_normalizer = inter_feature_normalizer
-        self.model_config = model_config
-
-    @property
-    def num_summary_tokens(self) -> int:
-        if hasattr(self.model, 'num_summary_tokens'):
-            return self.model.num_summary_tokens
-
-        patch_gen = getattr(self.model, "patch_generator", None)
-        if patch_gen is not None:
-            return patch_gen.num_skip
-        elif getattr(self.model, 'global_pool', None) == 'avg':
-            return 0
-        return 1
-
-    @property
-    def num_cls_tokens(self) -> int:
-        if hasattr(self.model, 'num_cls_tokens'):
-            return self.model.num_cls_tokens
-
-        patch_gen = getattr(self.model, 'patch_generator', None)
-        if patch_gen is not None:
-            return patch_gen.num_cls_tokens
-        elif getattr(self.model, 'global_pool', None) == 'avg':
-            return 0
-        return 1
-
-    @property
-    def patch_size(self) -> int:
-        if self._patch_size is not None:
-            return self._patch_size
-        if hasattr(self.model, "patch_size"):
-            return self.model.patch_size
-        patch_gen = getattr(self.model, "patch_generator", None)
-        if patch_gen is not None:
-            return patch_gen.patch_size
-        return None
-
-    @property
-    def max_resolution(self) -> int:
-        return self._max_resolution
-
-    @property
-    def preferred_resolution(self) -> Resolution:
-        return self._preferred_resolution
-
-    @property
-    def window_size(self) -> int:
-        return self._window_size
-
-    @property
-    def min_resolution_step(self) -> int:
-        res = self.patch_size
-        if self.window_size is not None:
-            res *= self.window_size
-        return res
-
-    @property
-    def blocks(self) -> Iterable[nn.Module]:
-        blocks = getattr(self.model, 'blocks', None)
-        if blocks is not None:
-            return blocks
-        return None
-
-    @property
-    def embed_dim(self) -> int:
-        return self.model.embed_dim
-
-    def get_nearest_supported_resolution(self, height: int,
-                                         width: int) -> Resolution:
-        height = int(
-            round(height / self.min_resolution_step) * self.min_resolution_step)
-        width = int(
-            round(width / self.min_resolution_step) * self.min_resolution_step)
-
-        height = max(height, self.min_resolution_step)
-        width = max(width, self.min_resolution_step)
-
-        return Resolution(height=height, width=width)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        feature_fmt: str = 'NLC'
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        '''
-        Forward process for model.
-        Args:
-            x: Input tensor. Unless `make_preprocessor_external` has been called, then the dynamic range of `x` is expected to be `[0, 1]`,
-                             otherwise `x` is expected to be mean centered with unit standard deviation.
-            feature_format: ['NLC', 'NCHW'] - The output format for the features.
-        '''
-        res_step = self.min_resolution_step
-        if res_step is not None and (x.shape[-2] % res_step != 0
-                                     or x.shape[-1] % res_step != 0):
-            raise ValueError(
-                'The input resolution must be a multiple of `self.min_resolution_step`. '
-                '`self.get_nearest_supported_resolution(<height>, <width>) is provided as a convenience API. '
-                f'Input: {x.shape[-2:]}, Nearest: {self.get_nearest_supported_resolution(*x.shape[-2:])}'
-            )
-        x = self.input_conditioner(x)
-        y = self.model.forward_features(x)
-        ret = self._extract_final(x, y, feature_fmt=feature_fmt)
-        return ret
-
-    @torch.compile
-    def _extract_final(self,
-                       x: torch.Tensor,
-                       y: torch.Tensor,
-                       feature_fmt: str = 'NLC'):
-        if isinstance(self.model, VisionTransformer):
-            patch_gen = getattr(self.model, "patch_generator", None)
-            if patch_gen is not None:
-                all_summary = y[:, :patch_gen.num_cls_tokens]
-                if self.summary_idxs is not None:
-                    bb_summary = all_summary[:, self.summary_idxs]
-                else:
-                    bb_summary = all_summary
-                all_feat = y[:, patch_gen.num_skip:]
-            elif self.model.global_pool == "avg":
-                all_summary = y[:, self.model.num_prefix_tokens:].mean(dim=1)
-                bb_summary = all_summary
-                all_feat = y
-            else:
-                all_summary = y[:, 0]
-                bb_summary = all_summary
-                all_feat = y[:, 1:]
-        else:
-            raise ValueError(f'Unsupported model type: {type(self.model)}')
-
-        all_feat = self.feature_normalizer(all_feat)
-
-        if feature_fmt == 'NCHW':
-            fmt_feat = (all_feat.reshape(all_feat.shape[0],
-                                         x.shape[-2] // self.patch_size,
-                                         x.shape[-1] // self.patch_size,
-                                         all_feat.shape[2]).permute(0, 3, 1, 2))
-        elif feature_fmt == 'NLC':
-            fmt_feat = all_feat
-        else:
-            raise ValueError(
-                f'Unsupported feature_fmt: {feature_fmt}. Must be one of ["NLC", "NCHW"]'
-            )
-
-        ret = RadioOutput(bb_summary.flatten(1), fmt_feat)
-
-        if self.adaptors:
-            raise ValueError("Adaptors are not supported for RADIO models.")
-
-        return ret
