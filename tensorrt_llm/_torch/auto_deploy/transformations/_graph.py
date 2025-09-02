@@ -129,7 +129,7 @@ def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
         gm.recompile()
 
 
-def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule:
+def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> None:
     """Move the entire graph module and all sub-GraphModules to the specified device."""
     # get device
     device = torch.device(device)
@@ -154,7 +154,7 @@ def _is_impure_node(node: Node) -> bool:
             node.target._nondeterministic_seeded = True
 
 
-def _canonicalize_single_gm(gm: GraphModule) -> GraphModule:
+def _canonicalize_single_gm(gm: GraphModule) -> None:
     # clean up graph (needs to be done repeatedly until no more dead code)
     gm.graph.eliminate_dead_code(is_impure_node=_is_impure_node)
 
@@ -187,7 +187,7 @@ def canonicalize_graph(gm: GraphModule) -> None:
 def _run_shape_prop_single_gm(
     gm: GraphModule,
     args_static: Optional[Tuple[Any, ...]] = None,
-) -> bool:
+) -> None:
     fake_mode: Optional[FakeTensorMode] = _detect_fake_mode_from_gm(gm)
 
     # get fake tensors from placeholder nodes
