@@ -884,11 +884,12 @@ protected:
         // Blocks are distributed among CP ranks as evenly as possible.
         int numTotalBlocks = (llmRequest->getNumTokens(beamIdx) + tokensPerBlock - 1) / tokensPerBlock;
         int numBlocksCurrRank = numTotalBlocks / mCpSize;
-        // When the number of blocks is not divisible by mCpSize, the remainder will be distributed evenly among lowest-indexed CP ranks.
+        // When the number of blocks is not divisible by mCpSize, the remainder will be distributed evenly among lowest-indexed CP ranks (overflow ranks).
         if (numTotalBlocks % mCpSize > mCpRank)
         {
             numBlocksCurrRank++;
         }
+        // TODO: Last block on the last overflow rank may not be full.
         return numBlocksCurrRank * tokensPerBlock;
     }
 
@@ -1120,7 +1121,7 @@ protected:
                                 using ValueType = decltype(generateValue);
                                 auto* dataPtr = static_cast<ValueType*>(hostTensor->data(keyIndex));
                                 if (*dataPtr != static_cast<ValueType>(0)) {
-                                    // EXPECT_EQ(*dataPtr, generateValue);
+                                    EXPECT_EQ(*dataPtr, generateValue);
                                 } else {
                                     // // TODO: Remove this when over-allocation is fixed.
                                     // printf("[verifyBlockData::key] SKIPPING 0! \n");
@@ -1150,7 +1151,7 @@ protected:
                                     using ValueType = decltype(generateValue);
                                     auto* dataPtr = static_cast<ValueType*>(hostTensor->data(valueIndex));
                                     if (*dataPtr != static_cast<ValueType>(0)) {
-                                        // EXPECT_EQ(*dataPtr, generateValue);
+                                        EXPECT_EQ(*dataPtr, generateValue);
                                     } else {
                                         // // TODO: Remove this when over-allocation is fixed.
                                         // printf("[verifyBlockData::value] SKIPPING 0! \n");
