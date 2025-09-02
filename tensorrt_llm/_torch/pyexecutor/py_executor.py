@@ -1726,7 +1726,11 @@ class PyExecutor:
                 self.pending_termination[req_key] = state
             if self.dist.rank not in state['ready_to_terminate']:
                 state['ready_to_terminate'].add(self.dist.rank)
-        elif self.kv_connector_manager is not None:
+        else:
+            self._do_terminate_request(request)
+
+    def _do_terminate_request(self, request: LlmRequest):
+        if self.kv_connector_manager is not None:
             # Only call request_finished on the connector if the request has already been added to the kv cache manager.
             try:
                 cache_block_ids = self.kv_cache_manager.get_cache_indices(
@@ -1925,7 +1929,7 @@ class PyExecutor:
             if len(ready) >= self.dist.pp_size and self.dist.rank not in done:
                 local_req = self.local_termination.get(req_id)
                 if local_req is not None:
-                    self.resource_manager.free_resources(local_req)
+                    self._do_terminate_request(local_req)
                 done.add(self.dist.rank)
             if len(done) >= self.dist.pp_size:
                 to_delete.append(req_id)
