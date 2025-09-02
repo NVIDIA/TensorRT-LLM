@@ -154,6 +154,8 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
                 "-e 's/.*Submitted batch job \\([0-9]\\+\\).*/\\1/p' " +
                 "-e 's/.*srun: job \\([0-9]\\+\\) queued.*/\\1/p' " +
                 "-e 's/.*srun: job \\([0-9]\\+\\) has been allocated.*/\\1/p' " +
+                "-e 's/.*SLURM_JOB_ID=\\([0-9]\\+\\).*/\\1/p' " +
+                "-e 's/.*SLURM_JOBID=\\([0-9]\\+\\).*/\\1/p' " +
                 "${slurmOutputFile} | tail -n1 || true\""
             ),
             returnStdout: true
@@ -183,6 +185,7 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
             Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"cat ${slurmOutputFile} || true\""))
             echo "Slurm job did not submit successfully. No job ID found."
         } else {
+            // The original Slurm output file name is like "slurm-%j-*.out", we need to replace the %j with the real job ID.
             def newSlurmOutputFile = slurmOutputFile.replace("%j", slurmJobID)
             Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mv ${slurmOutputFile} ${newSlurmOutputFile} || true\""))
         }
@@ -317,6 +320,10 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                         if (m1) ids << m1[0][1]  // Extract the first captured group
                         def m2 = (line =~ /srun: job (\d+) (queued|has been allocated)/)
                         if (m2) ids << m2[0][1]  // Extract the first captured group
+                        def m3 = (line =~ /SLURM_JOB_ID=(\d+)/)
+                        if (m3) ids << m3[0][1]  // Extract the first captured group
+                        def m4 = (line =~ /SLURM_JOBID=(\d+)/)
+                        if (m4) ids << m4[0][1]  // Extract the first captured group
                         return ids
                     }
 
@@ -341,6 +348,8 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
+                def dockerGpuOption = ""
+
                 node(nodeName) {
                     sh """
                         env | sort
@@ -348,9 +357,28 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                         ls -alh ${env.WORKSPACE}
                         ls -alh ${env.WORKSPACE_TMP}
                     """
+
+                    sh "nproc && free -g && hostname"
+                    echoNodeAndGpuInfo(pipeline, stageName)
+                    sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
+                    // Use single quotes to avoid Jenkins variable expansion
+                    sh 'echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"'
+                    sh 'echo "NV_GPU: $NV_GPU"'
+
+                    // Dynamically set GPU arguments based on environment variables
+                    // https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
+                    dockerGPUOption = sh(script: """
+                        if [ -n "\$NV_GPU" ]; then
+                            echo "--gpus '\\"device=\$NV_GPU\\"'"
+                        elif [ -n "\$CUDA_VISIBLE_DEVICES" ]; then
+                            echo "--gpus '\\"device=\$CUDA_VISIBLE_DEVICES\\"'"
+                        else
+                            echo "--gpus ${gpuCount}"
+                        fi
+                    """, returnStdout: true).trim()
                 }
 
-                def dockerArgs = "--gpus ${gpuCount} " +
+                def dockerArgs = "${dockerGPUOption} " +
                     "--cap-add=SYS_ADMIN " +
                     "--ipc=host " +
                     "--security-opt seccomp=unconfined " +
@@ -359,6 +387,8 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     "-v /tmp/ccache:${CCACHE_DIR}:rw " +
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add syslog"
+
+                echo "Final dockerArgs: ${dockerArgs}"
 
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
@@ -369,12 +399,6 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             } else {
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
             }
-        }
-    } catch (Exception e) {
-        if (e.getMessage()?.contains("Failed to kill container")) {
-            echo "Known benign error ignored: ${e.getMessage()}"
-        } else {
-            throw e // Re-throw if it's a different IOException
         }
     } finally {
         stage("Clean up SLURM Resources") {
@@ -939,7 +963,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
 def echoNodeAndGpuInfo(pipeline, stageName)
 {
-    String hostNodeName = sh(script: 'echo $HOST_NODE_NAME', returnStdout: true)
+    String hostNodeName = sh(script: '''
+        if [ -n "$HOST_NODE_NAME" ]; then
+            echo "$HOST_NODE_NAME"
+        else
+            hostname -f || hostname
+        fi
+    ''', returnStdout: true).trim()
+
     String gpuUuids = pipeline.sh(script: "nvidia-smi -q | grep \"GPU UUID\" | awk '{print \$4}' | tr '\n' ',' || true", returnStdout: true)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
@@ -1013,7 +1044,7 @@ def launchTestListCheck(pipeline)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
             libffi-dev \
             -y""")
-            sh "nvidia-smi -q"
+            sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
             // download TRT-LLM tarfile
             def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
@@ -1421,8 +1452,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "nproc && free -g && hostname"
         echoNodeAndGpuInfo(pipeline, stageName)
         sh "cat ${MODEL_CACHE_DIR}/README"
-        sh "nvidia-smi -q"
-        sh "nvidia-smi topo -m"
+        sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
         sh "df -h"
 
         // setup HF_HOME to cache model and datasets
@@ -1798,7 +1828,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     sh "nproc && free -g && hostname"
     sh "bash -c 'pip3 show tensorrt || true'"
     sh "cat ${MODEL_CACHE_DIR}/README"
-    sh "nvidia-smi -q"
+    sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
 
     sh "pwd && ls -alh"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
@@ -1849,32 +1879,25 @@ def checkStageName(stageNames) {
     }
 }
 
-// TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
 def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
 {
     return {
         runner -> node(label) {
-            if (needToDeleteDir) {
-                deleteDir()
-            }
-            stage('Pull Docker Image') {
-                docker.image(image).pull()
-            }
-            docker.image(image).inside(dockerArgs) {
-                runner()
-            }
-        }
-    }
-}
-
-def runInDockerOnNode(image, label, dockerArgs)
-{
-    return {
-        stageName, runner -> stage(stageName) {
-            node(label) {
-                deleteDir()
+            try {
+                if (needToDeleteDir) {
+                    deleteDir()
+                }
+                stage('Pull Docker Image') {
+                    docker.image(image).pull()
+                }
                 docker.image(image).inside(dockerArgs) {
                     runner()
+                }
+            } catch (Exception e) {
+                if (e.getMessage()?.contains("Failed to kill container")) {
+                    echo "Known benign error ignored: ${e.getMessage()}"
+                } else {
+                    throw e // Re-throw if it's a different IOException
                 }
             }
         }
@@ -1893,10 +1916,8 @@ def runInKubernetes(pipeline, podSpec, containerName)
     }
 }
 
-def launchTestJobs(pipeline, testFilter, dockerNode=null)
+def launchTestJobs(pipeline, testFilter)
 {
-    def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
-
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
@@ -2198,12 +2219,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             def buildRunner = runInKubernetes(pipeline, buildSpec, "trt-llm")
             def sanityRunner = null
 
-            if (dockerNode) {
-                sanityRunner = runInDockerOnNode(values[0], dockerNode, dockerArgs)
-            } else {
-                def sanitySpec = createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
-                sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
-            }
+
+            def sanitySpec = createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
+            sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
 
             def wheelPath = "${values[4]}"
             def wheelName = ""
@@ -2447,17 +2465,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 stage("Skip - reused") {
                     echo "Skip - Passed in the last pipeline."
                 }
-            } else if (values instanceof List && dockerNode == null) {
+            } else if (values instanceof List) {
                 trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
                     values[1]()
                 })
-            } else if (values instanceof List && dockerNode != null) {
-                node(dockerNode) {
-                    deleteDir()
-                    docker.image(LLM_DOCKER_IMAGE).inside(dockerArgs) {
-                        values[1]()
-                    }
-                }
             } else {
                 values()
             }
