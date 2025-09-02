@@ -443,8 +443,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager = resource_manager.get_resource_manager(
                 self.kv_cache_manager_key)
             if kv_cache_manager is not None:
-                for layer_idx in kv_cache_manager.layer_offsets.keys():
-                    kv_cache_manager.get_buffers(layer_idx).zero_()
+                buffer = kv_cache_manager.get_unique_primary_pool()
+                buffer.zero_()
             return result
 
         return wrapper
