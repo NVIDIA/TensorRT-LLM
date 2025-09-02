@@ -87,6 +87,33 @@ Follow the linked catalog entry to enter a new container based on the pre-built 
     make -C docker run LOCAL_USER=1
     ```
 
+If you wish to use enroot instead of docker, then you can build a sqsh file that has the identical environment as the development image `tensorrt_llm/devel:latest` as follows.
+
+1. Allocate compute nodes:
+    ```bash
+    salloc --nodes=1
+    ```
+
+2. Create a sqsh file with essential TRTLLM dependancies installed
+    ```bash
+    # Using default sqsh filename (enroot/tensorrt_llm.devel.sqsh)
+    make -C enroot build_sqsh
+
+    # Or specify a custom path (optional)
+    make -C enroot build_sqsh SQSH_PATH=/path/to/dev_trtllm_image.sqsh
+    ```
+
+3. Once this squash file is ready, the steps under [Build TensorRT-LLM](#build-tensorrt-llm) may be followed from within an enroot sandbox started from `dev_trtllm_image.sqsh`. To do this:
+    ```bash
+    export SQSH_PATH=/path/to/dev_trtllm_image.sqsh
+
+    # Start a pseudo terminal for interactive session
+    make -C enroot run_sqsh
+
+    # Or, you could run commands directly
+    make -C enroot run_sqsh RUN_CMD="python3 scripts/build_wheel.py"
+    ```
+
 **On systems without GNU `make`**
 
 1. Create a Docker image for development.
