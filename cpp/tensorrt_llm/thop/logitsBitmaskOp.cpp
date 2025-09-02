@@ -21,8 +21,6 @@
 namespace torch_ext
 {
 
-int32_t constexpr kBitsPerMaskElement = 32;
-
 void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
     at::optional<torch::Tensor> const& tokenMask = at::nullopt, at::optional<torch::Tensor> const& d2t = at::nullopt)
 {
