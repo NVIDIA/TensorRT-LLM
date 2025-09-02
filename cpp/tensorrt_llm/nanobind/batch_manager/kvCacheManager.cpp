@@ -39,6 +39,7 @@
 #include <torch/extension.h>
 
 namespace tb = tensorrt_llm::batch_manager;
+namespace tbc = tensorrt_llm::batch_manager::kv_connector;
 namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tr = tensorrt_llm::runtime;
 namespace nb = nanobind;
@@ -362,6 +363,18 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 }
                 return block_pool_pointers;
             })
+        .def("get_block_scale_pool_pointers",
+            [](tbk::BaseKVCacheManager& self)
+            {
+                std::optional<at::Tensor> block_scale_pool_pointers{std::nullopt};
+                auto tensor = self.getBlockScalePoolPointers();
+                if (tensor)
+                {
+                    std::shared_ptr<tensorrt_llm::runtime::ITensor> _tensor = std::move(tensor);
+                    block_scale_pool_pointers = tr::Torch::tensor(_tensor);
+                }
+                return block_scale_pool_pointers;
+            })
         .def("get_layer_to_pool_mapping",
             [](tbk::BaseKVCacheManager& self)
             {
@@ -381,6 +394,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             })
+        .def("get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); })
         .def("get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)
@@ -446,12 +460,13 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .value("SELFKONLY", tbk::CacheType::kSELFKONLY);
 
     nb::class_<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
-        .def(nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
-                 std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
-                 std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
-                 nvinfer1::DataType, SizeType32, int64_t, std::optional<runtime::SizeType32>, bool, bool,
-                 tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
-                 std::shared_ptr<tbk::KVCacheEventManager>, bool, bool>(),
+        .def(
+            nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
+                std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
+                std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
+                nvinfer1::DataType, SizeType32, int64_t, std::optional<runtime::SizeType32>, bool, bool, tbk::CacheType,
+                std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
+                bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
@@ -459,7 +474,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("enable_block_reuse") = false, nb::arg("onboard_blocks") = true,
             nb::arg("cache_type") = tbk::CacheType::kSELF, nb::arg("secondary_offload_min_priority") = std::nullopt,
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
-            nb::arg("copy_on_partial_reuse") = true);
+            nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr);
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

@@ -14,9 +14,10 @@ from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
+from ..._utils import binding_to_str_dtype, get_size_in_bytes, nvtx_range
 from ...logger import logger
 from ...mapping import CpType, Mapping
+from .kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -161,6 +162,7 @@ class KVCacheManager(BaseResourceManager):
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
         is_draft: bool = False,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -177,6 +179,8 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        self.kv_connector_manager = kv_connector_manager
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -329,6 +333,7 @@ class KVCacheManager(BaseResourceManager):
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
+            'kv_connector_manager': self.kv_connector_manager,
         }
         if self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
@@ -347,6 +352,14 @@ class KVCacheManager(BaseResourceManager):
 
         self.impl.allocate_pools(False)
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
+        kv_cache_block_scale_pool_pointers = self.impl.get_block_scale_pool_pointers(
+        )
+        if kv_cache_block_scale_pool_pointers.numel() > 0:
+            self.kv_cache_pool_pointers = torch.stack([
+                self.kv_cache_pool_pointers, kv_cache_block_scale_pool_pointers
+            ],
+                                                      dim=-1)
+
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
@@ -413,7 +426,8 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
-                    if req.is_first_context_chunk:
+                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
+                            req):
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
                                                req)
@@ -422,10 +436,23 @@ class KVCacheManager(BaseResourceManager):
                         for _ in range(get_draft_token_length(req)):
                             self.impl.add_token(req.py_request_id)
 
+                        if self.kv_connector_manager is not None:
+                            block_ids = self.get_cache_indices(req)
+                            self.kv_connector_manager.update_state_after_alloc(
+                                req, block_ids)
+
             for req in generation_batch:
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
+
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self)
+
+    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
+        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
+            request)
 
     def add_dummy_requests(
         self,
@@ -442,6 +469,11 @@ class KVCacheManager(BaseResourceManager):
         max_num_draft_tokens: int = 0,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        # For capturable drafting loops. During normal inference, the draft model always
+        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
+        # we need to make the KV cache manager aware that multiple autoregressive steps will
+        # occur.
+        num_extra_decoding_steps: int = 0,
     ):
         beam_width = max_beam_width
         requests = []
@@ -475,6 +507,10 @@ class KVCacheManager(BaseResourceManager):
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
                 for _ in range(self.num_extra_kv_tokens):
                     self.impl.add_token(req_id)
+
+                for _ in range(num_extra_decoding_steps):
+                    self.impl.add_token(req_id)
+
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
@@ -483,6 +519,7 @@ class KVCacheManager(BaseResourceManager):
                 if prepare_resource:
                     for _ in range(max_num_draft_tokens):
                         self.impl.add_token(req_id)
+
             requests.append(req)
         return requests
 
@@ -500,6 +537,14 @@ class KVCacheManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
 
+    @staticmethod
+    def calculate_scaling_factor_size_bytes(
+            cache_size: int, quant_vector_size: int,
+            scaling_factor_dtype: DataType) -> int:
+        assert cache_size % quant_vector_size == 0, "NVFP4 cache size must be divisible by quant vector size"
+        return get_size_in_bytes(cache_size // quant_vector_size,
+                                 scaling_factor_dtype)
+
     def calculate_max_num_blocks(self,
                                  kv_cache_config: KvCacheConfigCpp,
                                  head_dim: int,
@@ -515,11 +560,17 @@ class KVCacheManager(BaseResourceManager):
             self.num_kv_heads_per_layer) * head_dim
 
         if dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                         DataType.FLOAT):
+                         DataType.FLOAT, DataType.NVFP4):
             raise ValueError(f'Cannot support {dtype} KV cache.')
-        kv_cache_dtype_bytes = binding_dtype_size(dtype)
 
-        cache_size_bytes_per_token = cache_size_per_token * kv_cache_dtype_bytes
+        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
+                                                       dtype)
+        if dtype == DataType.NVFP4:
+            cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
+                cache_size_per_token,
+                quant_vector_size=16,
+                scaling_factor_dtype=DataType.FP8)
+
         free_mem, total_mem = torch.cuda.mem_get_info()
 
         assert free_mem_fraction < 1.0, f"Invalid freeMemFraction, freeMemFraction {free_mem_fraction} must be smaller than 1.0"
@@ -626,6 +677,9 @@ class KVCacheManager(BaseResourceManager):
             self.head_dim,
         )
 
+    def get_unique_primary_pool(self) -> torch.Tensor:
+        return self.impl.get_unique_primary_pool()
+
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         block_ids_per_seq_tensors = [
@@ -710,8 +764,13 @@ class KVCacheManager(BaseResourceManager):
         for window_size in sorted(window_size_to_layers):
             layers = window_size_to_layers[window_size]
             cache_size_per_token = calculate_cache_size_per_token(layers)
-            cache_size_bytes_per_token = cache_size_per_token * binding_dtype_size(
-                dtype)
+            cache_size_bytes_per_token = get_size_in_bytes(
+                cache_size_per_token, dtype)
+            if dtype == DataType.NVFP4:
+                cache_size_bytes_per_token += KVCacheManager.calculate_scaling_factor_size_bytes(
+                    cache_size_per_token,
+                    quant_vector_size=16,
+                    scaling_factor_dtype=DataType.FP8)
             required_mem_bytes_per_seq += window_size * cache_size_bytes_per_token
         logger.debug(
             f'Required memory per sequence: {required_mem_bytes_per_seq} bytes')
@@ -741,8 +800,13 @@ class KVCacheManager(BaseResourceManager):
                 # Calculate cache size per token for remaining layers only
                 cache_size_per_token = calculate_cache_size_per_token(
                     remaining_layers)
-                cache_size_bytes_per_token = cache_size_per_token * binding_dtype_size(
-                    dtype)
+                cache_size_bytes_per_token = get_size_in_bytes(
+                    cache_size_per_token, dtype)
+                if dtype == DataType.NVFP4:
+                    cache_size_bytes_per_token += KVCacheManager.calculate_scaling_factor_size_bytes(
+                        cache_size_per_token,
+                        quant_vector_size=16,
+                        scaling_factor_dtype=DataType.FP8)
                 logger.debug(
                     f'Cache size per token for {len(remaining_layers)} layers: '
                     f'{cache_size_bytes_per_token} bytes')
