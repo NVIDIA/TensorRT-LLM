@@ -144,8 +144,10 @@ struct BuildDecoderInfoParams
 
     // Scales for fmha only.
     // The scale to dequant Q/Kv input.
-    float const* dequantScaleQ;
-    float const* dequantScaleKv;
+    float const* dequantScaleQkv;
+    // Whether to use separate scales for Q/K/V.
+    bool separateQkvScales;
+
     // The scale to quant O output.
     float const* quantScaleO;
     // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
