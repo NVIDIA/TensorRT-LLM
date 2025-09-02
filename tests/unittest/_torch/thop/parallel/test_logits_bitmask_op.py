@@ -60,7 +60,7 @@ def test_logits_bitmask_with_d2t(batch_size: int, vocab_size: int, stride: int,
                                   device="cuda") % stride == 0
         token_mask = token_mask.to(torch.int32)
     d2t = torch.randint(0, 3, size=(vocab_size // 4, ),
-                        device="cuda").cumsum(dim=0).to(dtype=torch.int32)
+                        device="cuda").cumsum(dim=0, dtype=torch.int32)
 
     # Compute reference logits
     logits_reference = logits.clone()

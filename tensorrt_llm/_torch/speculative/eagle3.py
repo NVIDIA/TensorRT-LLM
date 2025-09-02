@@ -302,12 +302,9 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Prepare inputs for the 1st draft model forward
         position_ids = position_ids.squeeze(0)
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
             position_ids=position_ids,
-            last_tokens_idx=last_tokens_idx,
             hidden_states=hidden_states,
             accepted_tokens=accepted_tokens,
             attn_metadata=attn_metadata,
@@ -324,7 +321,8 @@ class Eagle3OneModelWorker(nn.Module):
                                   num_accepted_tokens[num_contexts:] - 1 +
                                   attn_metadata.num_ctx_tokens)
                 gather_ids = torch.concat(
-                    [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
+                    [spec_metadata.gather_ids[:num_contexts], gather_ids_gen],
+                    dim=0)
             else:
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
@@ -482,7 +480,6 @@ class Eagle3OneModelWorker(nn.Module):
         self,
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor,
-        last_tokens_idx: torch.LongTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -506,7 +503,8 @@ class Eagle3OneModelWorker(nn.Module):
                                          device="cuda")
         input_ids_ctx[:-1].copy_(input_ctx_ids[1:])
         input_ids_ctx[
-            last_tokens_idx[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+            spec_metadata.
+            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
