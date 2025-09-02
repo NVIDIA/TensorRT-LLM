@@ -1,262 +1,119 @@
-# Tree-Based Inference Time Compute Methods
+# Tree-Based Inference Methods (MCTS and TOT)
 
-This document describes the implementation of tree-based inference time compute methods for the TensorRT-LLM Scaffolding framework, including Monte Carlo Tree Search (MCTS) and Tree of Thoughts (TOT).
+This document describes the tree-based inference time methods implemented in the TensorRT-LLM Scaffolding framework and how to run the provided examples. The two supported methods are Monte Carlo Tree Search (MCTS) and Tree of Thoughts (TOT).
 
 ## Overview
 
-Tree-based inference methods enable LLMs to explore multiple reasoning paths and make more deliberate decisions, similar to human System-2 thinking. These methods can significantly improve performance on complex reasoning tasks that require strategic planning and multi-step problem solving.
+Tree-based inference enables LLMs to explore multiple reasoning paths before committing to a final answer. At a high level:
+- **MCTS** balances exploration and exploitation with UCB1 and backpropagates rewards to guide search.
+- **TOT** generates multiple candidate “thoughts” per step, evaluates them, and expands the most promising paths.
 
-## Implemented Methods
+These approaches are particularly useful for multi-step reasoning, math word problems, planning, and tasks with verifiable answers.
 
-### 1. Monte Carlo Tree Search (MCTS)
+## Core Classes
 
-MCTS is a tree search algorithm that balances exploration and exploitation using the UCB1 (Upper Confidence Bound) formula. It's particularly effective for tasks where the solution space can be explored systematically.
+Defined in `tensorrt_llm/scaffolding/tree_controllers.py`:
 
-**Key Features:**
-- UCB1-based node selection for optimal exploration/exploitation balance
-- Configurable exploration constant
-- Support for reward models or heuristic evaluation
-- Backpropagation of rewards through the tree
-- Early termination for high-quality solutions
+- **`TreeNode`**: Base node with parent/children, visits, value, depth, terminal flag, and helpers.
+- **`MCTSNode`**: Extends `TreeNode` with reward and UCB1-based child selection.
+- **`TOTNode`**: Extends `TreeNode` with thought text, confidence, reasoning, and evaluation score.
+- **`MCTSController`**: Orchestrates selection → expansion → simulation → backpropagation; produces a final answer after following the best path.
+- **`TOTController`**: Breadth-first expansion of thoughts with self-evaluation and selection; produces a final answer based on the best thought trajectory.
 
-**Best Use Cases:**
-- Mathematical problem solving
-- Game playing (e.g., Game of 24)
-- Strategic planning tasks
-- Problems with verifiable solutions
+Both controllers integrate with the scaffolding stack via `GenerationTask` and can optionally use a reward controller (e.g., a reward model) for scoring.
 
-### 2. Tree of Thoughts (TOT)
+## Key Parameters
 
-TOT enables deliberate problem solving by maintaining a tree of coherent language sequences (thoughts) and using search algorithms to find the best reasoning path.
+### MCTSController
+- **`max_depth`**: Maximum depth of the search tree.
+- **`max_iterations`**: Total MCTS iterations.
+- **`exploration_constant`**: UCB1 exploration parameter (higher → more exploration).
+- **`num_thoughts_per_step`**: Number of candidate next steps generated per expansion.
 
-**Key Features:**
-- Multiple thought generation at each step
-- Self-evaluation of thought quality
-- Flexible selection strategies (best, vote, random)
-- Breadth-first exploration
-- Confidence scoring for thoughts
+Internally, the controller:
+- Builds a tree rooted at the original problem.
+- Selects leaves by UCB1, expands via the generation controller, and simulates with either a reward controller or a heuristic.
+- Backpropagates rewards and finally generates a succinct answer conditioned on the best path.
 
-**Best Use Cases:**
-- Creative writing
-- Complex reasoning problems
-- Multi-step planning
-- Tasks requiring consideration of multiple approaches
+### TOTController
+- **`max_depth`**: Reasoning depth (number of steps/levels).
+- **`max_iterations`**: Upper bound on traversal work (used as a guard; breadth-first expansion is primary).
+- **`num_thoughts_per_step`**: Number of approaches generated per node.
+- **`selection_strategy`**: Selection policy for next-level thoughts: `"best"`, `"vote"`, or `"random"`.
 
-## Architecture
+Internally, the controller:
+- Generates multiple approaches (“thoughts”), evaluates them, and selects the most promising to expand.
+- At the end, chooses the best leaf by evaluation score and generates a concise answer from the reasoning path.
 
-### Core Classes
+## Example Scripts
 
-#### TreeNode
-Base class for all tree nodes with common functionality:
-- Parent-child relationships
-- Path tracking
-- Depth management
-- Terminal state handling
+Two runnable examples live under `examples/scaffolding/` and use a JSONL dataset for prompts and (optional) reference answers:
+- `run_mcts_example.py`
+- `run_tot_example.py`
 
-#### MCTSNode
-Specialized node for MCTS with:
-- UCB1 score calculation
-- Visit counts and values
-- Reward tracking
-- Child selection logic
+Both scripts accept a `--jsonl_file` (default: `./test.jsonl`) and read each line as a JSON object with the following schema:
+- `problem` or `question`: The prompt to solve.
+- `answer` (optional): Reference answer, printed for comparison.
 
-#### TOTNode
-Specialized node for TOT with:
-- Thought representation
-- Confidence scoring
-- Evaluation metrics
-- Reasoning storage
+An example dataset is provided at `examples/scaffolding/test.jsonl` with AIME-style questions.
 
-#### TreeSearchController
-Abstract base class providing:
-- Common tree search interface
-- Task creation utilities
-- Worker tag management
-- Search orchestration
+## How to Run
 
-## Usage Examples
-
-### Basic MCTS Usage
-
-```python
-from tensorrt_llm.scaffolding import (
-    MCTSController, NativeGenerationController, 
-    ScaffoldingLlm, TRTLLMWorker
-)
-
-# Create controllers
-generation_controller = NativeGenerationController(sampling_params={
-    "temperature": 0.7,
-    "max_tokens": 200,
-})
-
-mcts_controller = MCTSController(
-    generation_controller=generation_controller,
-    reward_controller=None,  # Optional reward model
-    max_depth=4,
-    max_iterations=50,
-    exploration_constant=1.414,
-    num_thoughts_per_step=3
-)
-
-# Set up worker mapping
-worker_mapping = {
-    MCTSController.WorkerTag.GENERATION: llm_worker,
-}
-
-# Create scaffolding LLM
-llm = ScaffoldingLlm(mcts_controller, worker_mapping)
-
-# Solve a problem
-results = llm.generate(
-    ["Solve for x: 2x + 5 = 13"], 
-    goal="Solve the mathematical problem step by step"
-)
-```
-
-### Basic TOT Usage
-
-```python
-from tensorrt_llm.scaffolding import (
-    TOTController, NativeGenerationController,
-    ScaffoldingLlm, TRTLLMWorker
-)
-
-# Create controllers
-generation_controller = NativeGenerationController(sampling_params={
-    "temperature": 0.6,
-    "max_tokens": 250,
-})
-
-tot_controller = TOTController(
-    generation_controller=generation_controller,
-    max_depth=4,
-    max_iterations=40,
-    num_thoughts_per_step=3,
-    selection_strategy="best"
-)
-
-# Set up worker mapping
-worker_mapping = {
-    TOTController.WorkerTag.GENERATION: llm_worker,
-}
-
-# Create scaffolding LLM
-llm = ScaffoldingLlm(tot_controller, worker_mapping)
-
-# Solve a complex reasoning problem
-results = llm.generate([
-    "A farmer has chickens and rabbits. He counts 35 heads and 94 legs. "
-    "How many of each animal does he have?"
-], goal="Solve this step-by-step with clear reasoning")
-```
-
-## Configuration Parameters
-
-### MCTS Parameters
-
-- `max_depth`: Maximum tree depth (default: 5)
-- `max_iterations`: Maximum search iterations (default: 100)
-- `exploration_constant`: UCB1 exploration parameter (default: 1.414)
-- `num_thoughts_per_step`: Thoughts generated per expansion (default: 3)
-
-### TOT Parameters
-
-- `max_depth`: Maximum reasoning steps (default: 4)
-- `max_iterations`: Maximum search iterations (default: 50)
-- `num_thoughts_per_step`: Thoughts per step (default: 3)
-- `selection_strategy`: Strategy for thought selection ("best", "vote", "random")
-
-## Performance Characteristics
+Prerequisites:
+- A compatible generation model path for `--model_dir` (PyTorch backend in the examples)
+- Optional reward model path for `--reward_model_dir` (MCTS only in the examples)
+- The JSONL dataset file (default provided)
 
 ### MCTS
-- **Strengths**: Systematic exploration, proven convergence properties, good for games
-- **Computational Cost**: O(iterations × depth × thoughts_per_step)
-- **Memory Usage**: Grows with tree size, manageable with pruning
+```bash
+python TensorRT-LLM/examples/scaffolding/run_mcts_example.py \
+  --model_dir <path_to_generation_model> \
+  --reward_model_dir <path_to_reward_model> \
+  --jsonl_file TensorRT-LLM/examples/scaffolding/test.jsonl \
+  --max_depth 4 \
+  --max_iterations 20 \
+  --exploration_constant 1.414 \
+  --num_thoughts_per_step 3
+```
+Notes:
+- `--reward_model_dir` is optional. If omitted, a heuristic simulation reward is used.
+- The script prints the problem, the reference answer (if present), then the MCTS solution.
 
 ### TOT
-- **Strengths**: Natural language reasoning, flexible evaluation, interpretable
-- **Computational Cost**: O(depth × thoughts_per_step × evaluations)
-- **Memory Usage**: Linear with depth and branching factor
-
-## Integration with Scaffolding Framework
-
-Both controllers integrate seamlessly with the existing scaffolding framework:
-
-1. **Task Compatibility**: Work with `GenerationTask` and `RewardTask`
-2. **Worker Integration**: Support all existing worker types
-3. **Concurrent Execution**: Leverage scaffolding's concurrency features
-4. **Modular Design**: Can be combined with other controllers
-
-## Running Examples
-
-### MCTS Example
 ```bash
-python examples/scaffolding/run_mcts_example.py --model_dir /path/to/model
+python TensorRT-LLM/examples/scaffolding/run_tot_example.py \
+  --model_dir <path_to_generation_model> \
+  --jsonl_file TensorRT-LLM/examples/scaffolding/test.jsonl \
+  --max_depth 3 \
+  --max_iterations 15 \
+  --num_thoughts_per_step 3 \
+  --selection_strategy best
 ```
+Notes:
+- `--reward_model_dir` is supported but optional.
+- The script prints the problem, the reference answer (if present), then the TOT solution.
 
-### TOT Example  
-```bash
-python examples/scaffolding/run_tot_example.py --model_dir /path/to/model
+## JSONL Format Details
+
+Each line should be a valid JSON object. Supported keys:
+```json
+{"problem": "...", "answer": "..."}
+{"question": "...", "answer": "..."}
 ```
+If both `problem` and `question` are present, the scripts use the first non-empty one. `answer` is optional and is only printed for reference.
 
-### With Reward Model
-```bash
-python examples/scaffolding/run_mcts_example.py \
-    --model_dir /path/to/generation/model \
-    --reward_model_dir /path/to/reward/model
-```
-
-## Benchmarking Results
-
-Based on research literature, these methods show significant improvements:
-
-### Game of 24
-- **Standard prompting**: ~4% success rate
-- **Chain-of-Thought**: ~4% success rate  
-- **TOT**: ~74% success rate
-- **MCTS**: Expected ~60-70% success rate
-
-### Complex Reasoning
-- **Standard**: Variable performance
-- **Tree methods**: 20-50% improvement on multi-step problems
-
-## Future Enhancements
-
-1. **Hybrid Methods**: Combine MCTS and TOT for different problem phases
-2. **Adaptive Parameters**: Dynamic adjustment based on problem complexity
-3. **Parallel Search**: Distributed tree exploration
-4. **Memory Optimization**: Tree pruning and state compression
-5. **Domain-Specific Adaptations**: Specialized versions for different domains
-
-## Contributing
-
-When contributing to tree-based methods:
-
-1. Maintain compatibility with the scaffolding framework
-2. Add comprehensive tests for new features
-3. Document performance characteristics
-4. Provide usage examples
-5. Consider computational efficiency
-
-## References
-
-1. "Tree of Thoughts: Deliberate Problem Solving with Large Language Models" (Yao et al., 2023)
-2. "Monte Carlo Tree Search: A Review of Recent Modifications and Applications" (Browne et al., 2012)
-3. "Mastering the Game of Go with Deep Neural Networks and Tree Search" (Silver et al., 2016)
+## Tuning Tips
+- Increase `num_thoughts_per_step` for broader exploration at each step (higher cost).
+- Increase `max_depth` for deeper reasoning (be mindful of latency).
+- For MCTS, raise `max_iterations` for more exhaustive search; tune `exploration_constant` for your task.
+- Provide a reward model for MCTS when verifiable scoring is available.
 
 ## Troubleshooting
+- Reduce `max_depth`/`max_iterations`/`num_thoughts_per_step` if inference is slow or memory-heavy.
+- Ensure model paths are valid and the backend (`backend="pytorch"` in the examples) is supported.
+- Verify your JSONL file has one JSON object per line with `problem` or `question` keys.
 
-### Common Issues
-
-1. **High Memory Usage**: Reduce `max_depth` or `num_thoughts_per_step`
-2. **Slow Performance**: Lower `max_iterations` or use simpler evaluation
-3. **Poor Quality**: Increase `num_thoughts_per_step` or improve prompts
-4. **Worker Errors**: Ensure proper worker initialization and mapping
-
-### Performance Tuning
-
-1. **For Speed**: Reduce iterations and depth, use heuristic evaluation
-2. **For Quality**: Increase thoughts per step, use reward models
-3. **For Memory**: Implement tree pruning, reduce branching factor
-4. **For Accuracy**: Improve prompt engineering, add verification steps 
+## References
+- Yao et al., "Tree of Thoughts: Deliberate Problem Solving with Large Language Models" (2023)
+- Browne et al., "A Survey of Monte Carlo Tree Search Methods" (2012)
+- Silver et al., "Mastering the Game of Go with Deep Neural Networks and Tree Search" (2016) 

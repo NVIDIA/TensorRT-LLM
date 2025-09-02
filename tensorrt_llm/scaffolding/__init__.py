@@ -20,7 +20,7 @@ __all__ = [
     "MajorityVoteController",
     "BestOfNController",
     "MCTSController",
-    "TOTController", 
+    "TOTController",
     "Task",
     "GenerationTask",
     "RewardTask",

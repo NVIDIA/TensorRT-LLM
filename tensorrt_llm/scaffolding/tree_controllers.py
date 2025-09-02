@@ -1,17 +1,12 @@
-import copy
 import math
 import random
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 
-import torch
-
-from tensorrt_llm.logger import logger
-from tensorrt_llm.scaffolding.controller import Controller
-from tensorrt_llm.scaffolding.task import GenerationTask, RewardTask, Task
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
+from tensorrt_llm.scaffolding.controller import Controller
+from tensorrt_llm.scaffolding.task import GenerationTask, Task
 
 
 @dataclass
@@ -24,22 +19,21 @@ class TreeNode:
     value: float = 0.0
     is_terminal: bool = False
     depth: int = 0
-    
+
     def is_leaf(self) -> bool:
-        """Check if this node is a leaf (has no children)."""
+        """node has no children"""
         return len(self.children) == 0
-    
+
     def is_root(self) -> bool:
-        """Check if this node is the root (has no parent)."""
+        """node has no parent?"""
         return self.parent is None
-    
+
     def add_child(self, child: 'TreeNode') -> 'TreeNode':
-        """Add a child node and return it."""
         child.parent = self
         child.depth = self.depth + 1
         self.children.append(child)
         return child
-    
+
     def get_path_to_root(self) -> List['TreeNode']:
         """Get the path from this node to the root."""
         path = []
@@ -55,24 +49,27 @@ class MCTSNode(TreeNode):
     """Node for Monte Carlo Tree Search."""
     reward: float = 0.0
     untried_actions: List[str] = field(default_factory=list)
-    
+
     def ucb1_score(self, exploration_constant: float = 1.414) -> float:
         """Calculate UCB1 score for this node."""
         if self.visits == 0:
             return float('inf')
-        
+
         if self.parent is None or self.parent.visits == 0:
             return float('inf')
-        
+
         exploitation = self.value / self.visits
-        exploration = exploration_constant * math.sqrt(math.log(self.parent.visits) / self.visits)
+        exploration = exploration_constant * math.sqrt(
+            math.log(self.parent.visits) / self.visits)
         return exploitation + exploration
-    
-    def select_best_child(self, exploration_constant: float = 1.414) -> 'MCTSNode':
+
+    def select_best_child(self,
+                          exploration_constant: float = 1.414) -> 'MCTSNode':
         """Select the child with the highest UCB1 score."""
         if not self.children:
             return self
-        return max(self.children, key=lambda child: child.ucb1_score(exploration_constant))
+        return max(self.children,
+                   key=lambda child: child.ucb1_score(exploration_constant))
 
 
 @dataclass
@@ -82,7 +79,7 @@ class TOTNode(TreeNode):
     confidence: float = 0.0
     reasoning: str = ""
     evaluation_score: float = 0.0
-    
+
     def __post_init__(self):
         if not self.thought and self.state:
             self.thought = self.state
@@ -90,11 +87,11 @@ class TOTNode(TreeNode):
 
 class MCTSController(Controller):
     """Monte Carlo Tree Search Controller for scaffolding framework."""
-    
+
     class WorkerTag(Enum):
         GENERATION = "generation"
         REWARD = "reward"
-    
+
     def __init__(self,
                  generation_controller: Controller,
                  reward_controller: Optional[Controller] = None,
@@ -109,10 +106,11 @@ class MCTSController(Controller):
         self.max_iterations = max_iterations
         self.exploration_constant = exploration_constant
         self.num_thoughts_per_step = num_thoughts_per_step
-    
+
     def process(self, tasks: List[Task], **kwargs) -> Any:
         """Process tasks using MCTS with yield-based orchestration."""
-        assert len(tasks) == 1, "MCTS Controller only supports single task processing"
+        assert len(
+            tasks) == 1, "MCTS Controller only supports single task processing"
         task = tasks[0]
         goal = kwargs.get('goal', 'Solve the problem step by step')
         initial_state = getattr(task, 'input_str', str(task)) or ""
@@ -132,11 +130,11 @@ class MCTSController(Controller):
                 gen_task = GenerationTask.create_from_prompt(prompt)
                 gen_task.max_tokens = 200
                 gen_task.temperature = 0.7
-                
+
                 # Delegate to generation controller
                 yield from self.generation_controller.process([gen_task])
                 thoughts = self._parse_thoughts(gen_task.output_str or "")
-                for thought in thoughts[: self.num_thoughts_per_step]:
+                for thought in thoughts[:self.num_thoughts_per_step]:
                     child_state = f"{node.state}\n{thought}".strip()
                     node.add_child(MCTSNode(state=child_state, reward=0.0))
                 if node.children:
@@ -148,7 +146,7 @@ class MCTSController(Controller):
                 # input_str should be the original problem, output_str should be the response to evaluate
                 reward_task = GenerationTask()
                 reward_task.input_str = initial_state
-                
+
                 # Create a proper result with CompletionOutput before setting output_str
                 completion_output = CompletionOutput(index=0, text=node.state)
                 # Create a mock GenerationResult - we need sampling_params for the constructor
@@ -160,7 +158,8 @@ class MCTSController(Controller):
                 reward_task.result = reward_result
                 yield from self.reward_controller.process([reward_task])
                 # Get reward from the reward controller
-                if hasattr(self.reward_controller, 'scores') and self.reward_controller.scores:
+                if hasattr(self.reward_controller,
+                           'scores') and self.reward_controller.scores:
                     reward = float(self.reward_controller.scores[0])
                 else:
                     reward = 0.5  # Default reward
@@ -178,8 +177,7 @@ class MCTSController(Controller):
         reasoning = "\n".join([n.state for n in path])
         final_prompt = (
             f"{goal}\n\nHere is a coherent reasoning trajectory.\n"
-            f"{reasoning}\n\nNow provide the final answer succinctly."
-        )
+            f"{reasoning}\n\nNow provide the final answer succinctly.")
         final_task = GenerationTask.create_from_prompt(final_prompt)
         final_task.max_tokens = 256
         final_task.temperature = 0.2
@@ -187,7 +185,7 @@ class MCTSController(Controller):
 
         # Assign the result to the original task
         tasks[0].result = final_task.result
-    
+
     def _create_expansion_prompt(self, node: MCTSNode, goal: str) -> str:
         """Create a prompt for expanding a node."""
         return f"""Goal: {goal}
@@ -195,13 +193,13 @@ class MCTSController(Controller):
 Current state:
 {node.state}
 
-Generate {self.num_thoughts_per_step} possible next steps or thoughts to progress toward the goal. 
+Generate {self.num_thoughts_per_step} possible next steps or thoughts to progress toward the goal.
 Each thought should be a coherent reasoning step or action.
 Format your response as:
 1. [First thought]
-2. [Second thought] 
+2. [Second thought]
 3. [Third thought]"""
-    
+
     def _parse_thoughts(self, text: str) -> List[str]:
         """Parse generated thoughts from text."""
         thoughts = []
@@ -217,7 +215,7 @@ Format your response as:
             elif line.startswith(('-', '*')):
                 thoughts.append(line[1:].strip())
         return thoughts
-    
+
     def _backpropagate(self, node: MCTSNode, reward: float):
         """Backpropagate the reward up the tree."""
         current = node
@@ -225,11 +223,12 @@ Format your response as:
             current.visits += 1
             current.value += reward
             current = current.parent
-    
+
     def _select_best_leaf(self, root: MCTSNode) -> MCTSNode:
         """Select the best leaf node from the tree."""
         best_leaf = root
         best_score = -float('inf')
+
         def traverse(node: MCTSNode):
             nonlocal best_leaf, best_score
             if node.is_leaf() and node.visits > 0:
@@ -238,18 +237,19 @@ Format your response as:
                     best_score = avg_value
                     best_leaf = node
             for child in node.children:
-                traverse(child) 
+                traverse(child)
+
         traverse(root)
         return best_leaf
 
 
 class TOTController(Controller):
     """Tree of Thoughts Controller for scaffolding framework."""
-    
+
     class WorkerTag(Enum):
         GENERATION = "generation"
         REWARD = "reward"
-    
+
     def __init__(self,
                  generation_controller: Controller,
                  reward_controller: Optional[Controller] = None,
@@ -264,10 +264,11 @@ class TOTController(Controller):
         self.max_iterations = max_iterations
         self.num_thoughts_per_step = num_thoughts_per_step
         self.selection_strategy = selection_strategy  # "best", "vote", "random"
-    
+
     def process(self, tasks: List[Task], **kwargs) -> Any:
         """Process tasks using Tree of Thoughts with yield-based orchestration."""
-        assert len(tasks) == 1, "TOT Controller only supports single task processing"
+        assert len(
+            tasks) == 1, "TOT Controller only supports single task processing"
         task = tasks[0]
         goal = kwargs.get('goal', 'Solve the problem step by step')
         root_state = getattr(task, 'input_str', str(task)) or ""
@@ -290,30 +291,35 @@ class TOTController(Controller):
 
                 # Evaluate each thought
                 evaluated_thoughts: List[Dict[str, Any]] = []
-                for thought in thoughts[: self.num_thoughts_per_step]:
-                    eval_prompt = self._evaluation_prompt(thought, goal, node.state)
+                for thought in thoughts[:self.num_thoughts_per_step]:
+                    eval_prompt = self._evaluation_prompt(
+                        thought, goal, node.state)
                     eval_task = GenerationTask.create_from_prompt(eval_prompt)
                     eval_task.max_tokens = 150
                     eval_task.temperature = 0.3
                     yield from self.generation_controller.process([eval_task])
-                    evaluation = self._parse_evaluation(eval_task.output_str or "")
+                    evaluation = self._parse_evaluation(eval_task.output_str
+                                                        or "")
                     evaluated_thoughts.append({
-                        'thought': thought,
-                        'score': evaluation['score'],
-                        'confidence': evaluation['confidence'],
-                        'reasoning': evaluation['reasoning']
+                        'thought':
+                        thought,
+                        'score':
+                        evaluation['score'],
+                        'confidence':
+                        evaluation['confidence'],
+                        'reasoning':
+                        evaluation['reasoning']
                     })
 
                 # Select top thoughts and create children
                 for thought_data in self._select_thoughts(evaluated_thoughts):
-                    child_state = self._combine_state_and_thought(node.state, thought_data['thought'])
-                    child = TOTNode(
-                        state=child_state,
-                        thought=thought_data['thought'],
-                        confidence=thought_data['confidence'],
-                        reasoning=thought_data['reasoning'],
-                        evaluation_score=thought_data['score']
-                    )
+                    child_state = self._combine_state_and_thought(
+                        node.state, thought_data['thought'])
+                    child = TOTNode(state=child_state,
+                                    thought=thought_data['thought'],
+                                    confidence=thought_data['confidence'],
+                                    reasoning=thought_data['reasoning'],
+                                    evaluation_score=thought_data['score'])
                     node.add_child(child)
                     next_level.append(child)
 
@@ -335,8 +341,7 @@ class TOTController(Controller):
         # Generate final solution based on selected thoughts
         final_prompt = (
             f"{goal}\n\nYou have the following proposed steps. Use them to produce the final answer.\n"
-            f"{reasoning}\n\nProvide the final answer succinctly."
-        )
+            f"{reasoning}\n\nProvide the final answer succinctly.")
         final_task = GenerationTask.create_from_prompt(final_prompt)
         final_task.max_tokens = 256
         final_task.temperature = 0.2
@@ -376,7 +381,8 @@ Approach 3: [detailed approach]"""
             approaches.append(current.strip())
         return approaches
 
-    def _evaluation_prompt(self, thought: str, goal: str, current_state: str) -> str:
+    def _evaluation_prompt(self, thought: str, goal: str,
+                           current_state: str) -> str:
         return f"""Goal: {goal}
 
 Current state:
@@ -411,38 +417,49 @@ Reasoning: [brief explanation]"""
                 confidence = line.split(':', 1)[1].strip()
             elif line.startswith('Reasoning:'):
                 reasoning = line.split(':', 1)[1].strip()
-        return {'score': score, 'confidence': confidence, 'reasoning': reasoning}
+        return {
+            'score': score,
+            'confidence': confidence,
+            'reasoning': reasoning
+        }
 
-    def _select_thoughts(self, evaluated_thoughts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _select_thoughts(
+            self, evaluated_thoughts: List[Dict[str,
+                                                Any]]) -> List[Dict[str, Any]]:
         if not evaluated_thoughts:
             return []
         if self.selection_strategy == "best":
-            return sorted(evaluated_thoughts, key=lambda x: x['score'], reverse=True)[: min(2, len(evaluated_thoughts))]
+            return sorted(evaluated_thoughts,
+                          key=lambda x: x['score'],
+                          reverse=True)[:min(2, len(evaluated_thoughts))]
         if self.selection_strategy == "vote":
             return evaluated_thoughts[:2]
-        return random.sample(evaluated_thoughts, min(2, len(evaluated_thoughts)))
-    
-    def _combine_state_and_thought(self, current_state: str, thought: str) -> str:
+        return random.sample(evaluated_thoughts, min(2,
+                                                     len(evaluated_thoughts)))
+
+    def _combine_state_and_thought(self, current_state: str,
+                                   thought: str) -> str:
         """Combine current state with new thought."""
         if not current_state.strip():
             return thought
         return f"{current_state}\n\nNext step: {thought}"
-    
+
     def _select_best_solution(self, root: TOTNode) -> TOTNode:
         """Select the best solution from all leaf nodes."""
         best_node = root
         best_score = -float('inf')
-        
+
         def traverse(node: TOTNode):
             nonlocal best_node, best_score
             if node.is_leaf():
                 # For leaf nodes, use evaluation score if available, otherwise use depth as heuristic
-                score = node.evaluation_score if hasattr(node, 'evaluation_score') else node.depth
+                score = node.evaluation_score if hasattr(
+                    node, 'evaluation_score') else node.depth
                 if score > best_score:
                     best_score = score
                     best_node = node
             for child in node.children:
                 traverse(child)
-        
+
         traverse(root)
-        return best_node 
+        return best_node

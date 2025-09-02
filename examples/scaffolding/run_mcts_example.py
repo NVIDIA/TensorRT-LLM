@@ -1,22 +1,26 @@
 import argparse
+import json
 
-from tensorrt_llm.scaffolding import (MCTSController, NativeGenerationController,
+from tensorrt_llm.scaffolding import (MCTSController,
+                                      NativeGenerationController,
                                       NativeRewardController, ScaffoldingLlm,
                                       TRTLLMWorker)
 
 
+def load_test_file(jsonl_file: str):
+    data = []
+    with open(jsonl_file, "r", encoding="utf-8") as file:
+        for line in file:
+            if line.strip():
+                data.append(json.loads(line))
+    return data
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--model_dir',
-        type=str,
-        default="HuggingFaceTB/SmolLM-1.7B-Instruct",  # Much smaller default model
-        help="Path to the directory containing the generation model")
-    parser.add_argument(
-        '--reward_model_dir',
-        type=str,
-        default="HuggingFaceTB/SmolLM-360M-Instruct",  # Smaller reward model
-        help="Path to the directory containing the reward model (optional)")
+    parser.add_argument('--model_dir', type=str, required=True)
+    parser.add_argument('--reward_model_dir', type=str, required=True)
+    parser.add_argument('--jsonl_file', type=str, default='./test.jsonl')
     parser.add_argument('--max_depth', type=int, default=4)
     parser.add_argument('--max_iterations', type=int, default=20)
     parser.add_argument('--exploration_constant', type=float, default=1.414)
@@ -52,7 +56,7 @@ def main():
 
     # Create generation controller
     generation_controller = NativeGenerationController(sampling_params={
-        "max_tokens": 300,
+        "max_tokens": 4096,
         "temperature": 0.7,
         "top_p": 0.9,
     })
@@ -64,40 +68,38 @@ def main():
         max_depth=args.max_depth,
         max_iterations=args.max_iterations,
         exploration_constant=args.exploration_constant,
-        num_thoughts_per_step=args.num_thoughts_per_step
-    )
+        num_thoughts_per_step=args.num_thoughts_per_step)
 
     llm = ScaffoldingLlm(controller, workers=workers)
+    # Load problems from JSONL
+    test_dataset = load_test_file(args.jsonl_file)
+    prompts = []
+    ref_answers = []
+    for case in test_dataset:
+        prompt = case.get("problem") or case.get("question")
+        if prompt is None:
+            continue
+        prompts.append(prompt)
+        ref_answers.append(case.get("answer"))
 
-    # Test problems - mathematical reasoning tasks
-    test_problems = [
-        "Solve for x: 3x + 7 = 22. Show your work step by step.",
-        "A rectangle has a perimeter of 24 cm and a length that is 2 cm more than its width. Find the dimensions.",
-        "If a train travels 180 km in 2.5 hours, what is its average speed in km/h?",
-    ]
-
-    print("🔄 Testing MCTS Controller on Mathematical Problems")
-    print("=" * 60)
-
-    for i, problem in enumerate(test_problems):
-        print(f"\n📝 Problem {i+1}: {problem}")
-        print("-" * 40)
-
+    for i, problem in enumerate(prompts):
+        print(f"\nProblem {i+1}: {problem}")
+        if i < len(ref_answers) and ref_answers[i] is not None:
+            print(f"Reference Answer: {ref_answers[i]}")
         try:
             results = llm.generate([problem])
-            
-            for result in results:
-                print(f"🎯 MCTS Solution:")
-                print(result.outputs[0].text)
-                print(f"📊 Tokens generated: {len(result.outputs[0].token_ids)}")
-                
-        except Exception as e:
-            print(f"❌ Error solving problem {i+1}: {e}")
 
-    print(f'\n🔄 Shutting down...')
+            for result in results:
+                print(f"MCTS Solution:")
+                print(result.outputs[0].text)
+                print(f"Tokens generated: {len(result.outputs[0].token_ids)}")
+
+        except Exception as e:
+            print(e)
+
     llm.shutdown(shutdown_workers=True)
-    print(f'✅ Shutdown complete')
+    print(f'main shut down done')
 
 
 if __name__ == "__main__":
-    main() 
+    main()
