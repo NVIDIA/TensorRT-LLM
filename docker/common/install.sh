@@ -1,5 +1,5 @@
 #!/bin/bash
-set -Eeuo pipefail
+set -Eeo pipefail
 shopt -s nullglob
 trap 'echo "[install.sh] Error on line $LINENO" >&2' ERR
 
