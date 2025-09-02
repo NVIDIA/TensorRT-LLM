@@ -2230,9 +2230,8 @@ class PyTorchModelEngine(ModelEngine):
                         self._postprocess_inputs(inputs)
 
                     self.cuda_graph_runner.capture(batch_size,
-                                                   capture_forward_fn,
-                                                   capture_postprocess_fn,
-                                                   inputs)
+                                                   capture_forward_fn, inputs,
+                                                   capture_postprocess_fn)
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
