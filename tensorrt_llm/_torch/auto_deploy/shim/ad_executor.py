@@ -9,7 +9,6 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 
 from ...._utils import mpi_rank, mpi_world_size
-from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import MPIDist
@@ -259,7 +258,7 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
-def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: str = None):
+def create_autodeploy_executor(ad_config: LlmArgs):
     """Create an AutoDeploy executor from the given configuration and checkpoint directory.
 
     This is the entrypoint API to the _autodeploy backend.
@@ -276,8 +275,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
 
     # some config
     msg = "pytorch_backend_config must be an AD LlmArgs object"
-    assert isinstance(executor_config.pytorch_backend_config, LlmArgs), msg
-    ad_config: LlmArgs = executor_config.pytorch_backend_config
+    assert isinstance(ad_config, LlmArgs), msg
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
     max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size

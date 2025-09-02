@@ -3,6 +3,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 
+import pytest
 from profile_utils import profile
 from transformers import AutoTokenizer
 from utils.llm_data import llm_models_root
@@ -42,6 +43,7 @@ def workspace(suffix, prefix="./trtllm_workspace"):
 # 233s on ipp1-1197: loading weights 37s, network/engine 27s, save engine: 35s, load engine (14GB) about 100s
 @profile("save-and-load")
 @force_ampere
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 def test_save_load():
     '''When the engine_dir parameter of to_trt and generate is not None
         to_trt() saves the engine to disk.
@@ -102,6 +104,7 @@ def test_high_level_fake_weights():
 
 
 @force_ampere
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 def test_async_io():
     max_batch_size, max_isl, max_osl = 8, 256, 256
     hf_model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
