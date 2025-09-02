@@ -1925,7 +1925,7 @@ class PyExecutor:
             if len(ready) >= self.dist.pp_size and self.dist.rank not in done:
                 local_req = self.local_termination.get(req_id)
                 if local_req is not None:
-                    self._free_resources_for_request(local_req)
+                    self.resource_manager.free_resources(local_req)
                 done.add(self.dist.rank)
             if len(done) >= self.dist.pp_size:
                 to_delete.append(req_id)
