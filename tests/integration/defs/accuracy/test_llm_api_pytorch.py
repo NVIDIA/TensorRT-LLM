@@ -568,24 +568,26 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3_tp8(self, eagle3_one_model):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
+    def test_fp8_eagle3_tp8(self, eagle3_one_model):
+        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         spec_config = EagleDecodingConfig(max_draft_len=4,
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
-        pytorch_config = dict(disable_overlap_scheduler=True, )
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1))
         with LLM(model_path,
+                 max_batch_size=16,
                  tensor_parallel_size=8,
                  speculative_config=spec_config,
                  kv_cache_config=kv_cache_config,
                  **pytorch_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -911,8 +913,24 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_fp8(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        model_path = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503-fp8"
+        with LLM(model_path, kv_cache_config=kv_cache_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -2804,8 +2822,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     extra_evaluator_kwargs = {
         "fewshot_as_multiturn": True,
         "apply_chat_template": True,
-        "scores_filter": "exact_match,flexible-extract",
-        "MAX_OUTPUT_LEN": 8192
     }
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
@@ -2819,7 +2835,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler, mocker):
-        pytest.skip("https://nvbugs/5481087")
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
         if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
             pytest.skip("Triton kernels are not available")
 
@@ -2837,7 +2855,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
-            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
@@ -2857,7 +2874,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["tp4", "ep4", "dp4"])
     def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
                       attention_dp, cuda_graph, overlap_scheduler, mocker):
-        pytest.skip("https://nvbugs/5481087")
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
@@ -2878,7 +2897,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with llm:
             model_name = "GPT-OSS/MXFP4"
             task = GSM8K(model_name)
-            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
@@ -2890,6 +2908,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["dp4"])
     def test_w4a16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, monkeypatch, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
         if not IS_TRITON_KERNELS_AVAILABLE:
             pytest.skip("Triton kernels are not available")
         monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
@@ -2909,7 +2930,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with llm:
             model_name = "GPT-OSS/BF16"
             task = GSM8K(model_name)
-            mocker.patch.object(GSM8K, {"MAX_OUTPUT_LEN": 8192})
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 

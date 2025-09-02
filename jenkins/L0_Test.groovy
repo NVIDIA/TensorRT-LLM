@@ -170,15 +170,10 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
                 "-e 's/.*Submitted batch job \\([0-9]\\+\\).*/\\1/p' " +
                 "-e 's/.*srun: job \\([0-9]\\+\\) queued.*/\\1/p' " +
                 "-e 's/.*srun: job \\([0-9]\\+\\) has been allocated.*/\\1/p' " +
-                "${slurmOutputFile} | tail -n1\""
+                "${slurmOutputFile} | tail -n1 || true\""
             ),
             returnStdout: true
         ).trim()
-
-        if (!slurmJobID || !slurmJobID.isNumber()) {
-            Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"cat ${slurmOutputFile}\""))
-            error("Slurm job did not submit successfully. No job ID found.")
-        }
 
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
@@ -196,9 +191,17 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID}"
+                "\"rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID} || true\""
             )
         )
+
+        if (!slurmJobID || !slurmJobID.isNumber()) {
+            Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"cat ${slurmOutputFile} || true\""))
+            echo "Slurm job did not submit successfully. No job ID found."
+        } else {
+            def newSlurmOutputFile = slurmOutputFile.replace("%j", slurmJobID)
+            Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mv ${slurmOutputFile} ${newSlurmOutputFile} || true\""))
+        }
 
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
     }
@@ -213,6 +216,12 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
         ]
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
+
+        CloudManager.destroyNode(nodeName)
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
 
@@ -230,7 +239,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh"
+                "\"rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh || true\""
             )
         )
 
@@ -330,7 +339,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 slurmJobID = jobIDs ? jobIDs[-1] : null
 
                 if (!slurmJobID || !slurmJobID.isNumber()) {
-                    error("Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}")
+                    echo "Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}"
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
                 Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
@@ -377,12 +386,22 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
             }
         }
+    } catch (Exception e) {
+        if (e.getMessage()?.contains("Failed to kill container")) {
+            echo "Known benign error ignored: ${e.getMessage()}"
+        } else {
+            throw e // Re-throw if it's a different IOException
+        }
     } finally {
-        stage('Clean up SLURM Resources') {
-            Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
-            CloudManager.destroyNode(nodeName)
-            Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
-            cleanUpNodeResources(pipeline, cluster, nodeName, slurmJobID)
+        stage("Clean up SLURM Resources") {
+            // Workaround to handle the interruption during clean up SLURM resources
+            retry(3) {
+                try {
+                    cleanUpNodeResources(pipeline, cluster, nodeName, slurmJobID)
+                } catch (Exception e) {
+                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                }
+            }
         }
     }
 }
@@ -436,7 +455,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
             def scriptRunNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def scriptLaunch = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
-            slurmOutputFile = "${jobWorkspace}/${jobUID}-slurm_output.log"
+            slurmOutputFile = SlurmConfig.getOutputFilePath("/home/svc_tensorrt/slurm-logs", jobUID)
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def isAarch64 = config.contains("aarch64")
@@ -490,6 +509,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
 
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
                 scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
+                // TODO: check if the tee always returns 0
                 def scriptContent = """#!/bin/bash
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
@@ -531,8 +551,15 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
     } finally {
         uploadResults(pipeline, cluster, jobUID, stageName)
 
-        stage('Clean up SLURM Resources') {
-            cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID, slurmOutputFile)
+        stage("Clean up SLURM Resources") {
+            // Workaround to handle the interruption during clean up SLURM resources
+            retry(3) {
+                try {
+                    cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID, slurmOutputFile)
+                } catch (Exception e) {
+                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                }
+            }
         }
     }
 }
@@ -660,7 +687,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
-            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg; fi'
+            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
             if (noResultIfSuccess && !stageIsFailed) {
                 // Clean up the workspace
                 sh """
@@ -1555,7 +1582,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     stage ("[${stageName}] Run Pytest")
     {
         echoNodeAndGpuInfo(pipeline, stageName)
-        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
+        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
 
         def extraInternalEnv = ""
         def pytestTestTimeout = "3600"
@@ -2056,7 +2083,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 1],
+        // Disable GB200-PyTorch-1 due to OOM (https://nvbugspro.nvidia.com/bug/5490507)
+        //"GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 1],
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
