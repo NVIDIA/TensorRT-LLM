@@ -684,7 +684,7 @@ pipeline {
                         }
                         cmd += imageKeyToTag.values().join(" ")
                         withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
-                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 3, shortCommondRunTimeMax: 7200))
+                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 3, shortCommondRunTimeMax: 7200)
                         }
                     }
                 }
