@@ -26,14 +26,7 @@ build_sqsh:
 		--container-save "$(SQSH_PATH)" \
 		--container-mounts "$(SOURCE_DIR):/code/tensorrt_llm" --container-workdir /code/tensorrt_llm/docker/common \
 		--container-mount-home --container-remap-root \
-		$(if $(CUDA_VERSION), --export CUDA_VER="$(CUDA_VERSION)") \
-		$(if $(CUDNN_VERSION), --export CUDNN_VER="$(CUDNN_VERSION)") \
-		$(if $(NCCL_VERSION), --export NCCL_VER="$(NCCL_VERSION)") \
-		$(if $(CUBLAS_VERSION), --export CUBLAS_VER="$(CUBLAS_VERSION)") \
-		$(if $(TRT_VERSION), --export TRT_VER="$(TRT_VERSION)") \
-		$(if $(PYTHON_VERSION), --export PYTHON_VERSION="$(PYTHON_VERSION)") \
-		$(if $(GITHUB_MIRROR), --export GITHUB_MIRROR="$(GITHUB_MIRROR)") \
-		$(if $(TORCH_INSTALL_TYPE), --export TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
+		--export PYTHON_VERSION=$(PYTHON_VERSION),GITHUB_MIRROR=$(GITHUB_MIRROR),TORCH_INSTALL_TYPE=$(TORCH_INSTALL_TYPE),CUDA_VER=$(CUDA_VERSION),CUDNN_VER=$(CUDNN_VERSION),NCCL_VER=$(NCCL_VERSION),CUBLAS_VER=$(CUBLAS_VERSION),TRT_VER=$(TRT_VERSION) \
 		./install.sh --all
 
 run_sqsh:
@@ -45,7 +38,7 @@ run_sqsh:
 		--container-image "$(SQSH_PATH)" \
 		--container-mounts "$(SOURCE_DIR):/code/tensorrt_llm" --container-workdir /code/tensorrt_llm \
 		--container-mount-home --container-remap-root \
-		--container-env PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.99999 \
+		--export PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.99999 \
 		$(RUN_CMD)
 
 endif
