@@ -16,6 +16,7 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.speculative.drafting_loops import ChainDrafter
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  str_dtype_to_torch, torch_dtype_to_str,
                                  trace_func)
@@ -50,7 +51,6 @@ from ..modules.fused_moe.moe_load_balancer import (
 from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
-from tensorrt_llm._torch.speculative.drafting_loops import ChainDrafter
 from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,

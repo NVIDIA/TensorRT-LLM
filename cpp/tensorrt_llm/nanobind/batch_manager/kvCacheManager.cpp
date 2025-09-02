@@ -367,8 +367,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                     block_pool_pointers = tr::Torch::tensor(_tensor);
                 }
                 return block_pool_pointers;
-            })
-        .def("get_block_scale_pool_pointers",
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_block_scale_pool_pointers",
             [](tbk::BaseKVCacheManager& self)
             {
                 std::optional<at::Tensor> block_scale_pool_pointers{std::nullopt};
