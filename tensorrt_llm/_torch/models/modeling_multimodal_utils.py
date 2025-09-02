@@ -110,12 +110,25 @@ def filter_mm_token_from_input_ids(
     vocab_size: int,
     mm_token_ids: Optional[torch.IntTensor] = None,
 ) -> Tuple[torch.IntTensor, torch.IntTensor]:
+    """
+    Filter multimodal tokens from input_ids.
+    Args:
+        input_ids: shape [text_total_length + mm_total_length].
+        vocab_size: size of the model's vocabulary
+        mm_token_ids: possible token ids for multimodal tokens, if known. If not known and set to None, it is assumed that the multimodal tokens are out-of-vocabulary tokens i.e. the `input_ids` contains tokens >= vocab_size that represent the multimodal tokens.
+    Note:
+        This function involves host device sync due to the use of torch.where() (= torch.nonzero) which requires allocation on host.
+        The output indices reside on the same device as input_ids.
+    Returns:
+        text_token_indices: indices of text tokens in the input_ids
+        mm_token_indices: indices of multimodal tokens in the input_ids
+    """
     if mm_token_ids is None:
         # NOTE:
         # If mm_token_ids is None, it is assumed that the multimodal
         # tokens are out-of-vocab tokens i.e. the `input_ids` contains
         # tokens >= vocab_size that represent the multimodal tokens.
-        # Since mm_token_ids is be unbounded in this case,
+        # Since mm_token_ids can be unbounded in this case,
         # using torch.isin() may not be performant.
         # This provides a more performant alternative while keeping
         # the flexibility of still specifying all possible mm_token_ids,
@@ -168,8 +181,7 @@ def fuse_input_embeds_cuda(
                                device=text_embed.device,
                                dtype=text_embed.dtype)
 
-    input_embeds[text_token_indices, :] = text_embed.to(
-        dtype=input_embeds.dtype, device=input_embeds.device)
+    input_embeds[text_token_indices, :] = text_embed
     input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
                                                     device=input_embeds.device)
 
@@ -183,59 +195,26 @@ def fuse_input_embeds(
     mm_token_ids: Optional[torch.IntTensor] = None,
 ) -> Tuple[Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
     """
-    Fuse text and multimodal embeddings. input_ids is [text_total_length + mm_total_length] and mm_embed is [mm_total_length, hidden_dim]. We just need to fuse them into [text_total_length + mm_total_length, hidden_dim] by slice-and-assign to the corresponding entries.
-
+    Filter multimodal tokens from input_ids and fuse text and multimodal embeddings.
     Args:
-        input_ids: shape [text_total_length + mm_total_length], flattened from List[(text_length1 + mm_total_length1), ..., (text_lengthi + mm_total_lengthi)]. For LLM model, the requests are inflight batched together, but the input_ids are flattened with padding removed. By the slice condition < vocab_size, we can easily separate text / multimodal tokens and naturally batched the LLM embedding lookup
-        mm_embed: List[(mm_total_length1, hidden_dim), ..., (mm_total_lengthi, hidden_dim)].
-        mm_token_ids: possible token ids for multimodal tokens, if known. If not known and set to None, it is assumed that the multimodal tokens are out-of-vocabulary tokens i.e. the `input_ids` contains tokens >= vocab_size that represent the multimodal tokens.
+        embedding_layer: embedding layer of the model.
+        input_ids: shape [text_total_length + mm_total_length].
+        mm_embeds: list of multimodal embeddings.
+        mm_token_ids: possible token ids for multimodal tokens, if known. If not known and set to None, it is assumed that the multimodal tokens are out-of-vocabulary tokens.
     Returns:
         - If (1) JIT test run, (2) non-multimodal run, i.e. all text-only requests, either context or generation phase (3) multimodal run, all requests in generation phase --> there is no multimodal data, return only the input_ids
         - If (4) multimodal run, mixed batch of context and generation requests, each context request has a multimodal feature --> return only the fused input_embeds of shape [total length, hidden_dim]. For text tokens, LLM embedding layer has already run.
+    Note:
+        This function involves host device sync due to the use of torch.where() from filter_mm_token_from_input_ids.
     """
-    if len(mm_embeds) == 0:
-        return input_ids, None
-
-    mm_embed = torch.cat(mm_embeds, dim=0)
-
-    if mm_token_ids is None:
-        # NOTE:
-        # If mm_token_ids is None, it is assumed that the multimodal
-        # tokens are out-of-vocab tokens i.e. the `input_ids` contains
-        # tokens >= vocab_size that represent the multimodal tokens.
-        # Since mm_token_ids is be unbounded in this case,
-        # using torch.isin() may not be performant.
-        # This provides a more performant alternative while keeping
-        # the flexibility of still specifying all possible mm_token_ids,
-        # if the user wants to.
-        vocab_size = embedding_layer.num_embeddings
-        mm_token_mask = input_ids >= vocab_size
-        text_token_mask = input_ids < vocab_size
-    else:
-        mm_token_ids = mm_token_ids.to(input_ids.device)
-        mm_token_mask = torch.isin(input_ids, mm_token_ids)
-        text_token_mask = ~mm_token_mask
-    text_token_indices = torch.where(text_token_mask)[0]
-    mm_token_indices = torch.where(mm_token_mask)[0]
-    if len(mm_token_indices) != mm_embed.shape[0]:
-        raise ValueError(
-            f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
-            f"but received {mm_embed.shape[0]} image embeddings. "
-            "This is likely due to KV cache reuse, chunk prefill, or other optimizations that "
-            "cause token count mismatches within the inference batch.")
-
-    text_embed = embedding_layer(input_ids[text_token_indices])
-    input_embeds = torch.empty(input_ids.shape[0],
-                               mm_embed.shape[-1],
-                               device=text_embed.device,
-                               dtype=text_embed.dtype)
-
-    input_embeds[text_token_indices, :] = text_embed.to(
-        dtype=input_embeds.dtype, device=input_embeds.device)
-    input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
-                                                    device=input_embeds.device)
-
-    return None, input_embeds
+    text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+        input_ids,
+        vocab_size=embedding_layer.num_embeddings,
+        mm_token_ids=mm_token_ids)
+    # text_token_indices, mm_token_indices resides on the same device as input_ids
+    return fuse_input_embeds_cuda(embedding_layer, input_ids,
+                                  text_token_indices, mm_token_indices,
+                                  mm_embeds)
 
 
 #region VILA utils
