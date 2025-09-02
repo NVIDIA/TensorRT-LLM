@@ -122,11 +122,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.local_num_experts, self.routed_scaling_factor,
             self.routing_method_type, self.do_finalize, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = FP4BlockScaleMoEInputs(*inputs)
 
@@ -409,11 +406,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = FP8BlockScaleMoEInputs(*inputs)
 
@@ -670,11 +664,8 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = MxE4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
@@ -907,11 +898,8 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = E4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
@@ -1123,11 +1111,8 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_num_experts, self.routed_scaling_factor,
             self.routing_method_type, tactic)
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         args = Bf16MxE2m1BlockScaleMoEInputs(*inputs)
 

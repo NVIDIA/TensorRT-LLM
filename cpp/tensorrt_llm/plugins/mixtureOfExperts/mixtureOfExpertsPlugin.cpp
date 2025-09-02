@@ -946,8 +946,8 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> gemm2;
     if (common::getEnvForceDeterministicMOE())
     {
-        gemm1 = mMOERunner->getTactics()[0];
-        gemm2 = mMOERunner->getTactics()[0];
+        gemm1 = mMOERunner->getTactics(MoeGemmId::GEMM_1)[0];
+        gemm2 = mMOERunner->getTactics(MoeGemmId::GEMM_2)[0];
     }
     else
     {
@@ -964,6 +964,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
         ActivationParams(mActivationType), inputs[getExpertWeights2Index()],
         hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens, mExpertHiddenSize,
+        mExpertHiddenSize /*TRT does not support padding, safe to assume padded/unpadded hidden sizes are the same*/,
         mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig,
@@ -1278,7 +1279,7 @@ void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, MixtureOfExper
 auto MixtureOfExpertsGemmProfiler::getTactics(int m, int n, int k) const -> std::vector<Config>
 {
     assert(mRunner);
-    return mRunner->mMOERunner->getTactics();
+    return mRunner->mMOERunner->getTactics(backend.mGemmToProfile);
 }
 
 void MixtureOfExpertsGemmProfiler::initTmpData(
@@ -1299,7 +1300,8 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     auto& plugin = *mRunner;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
-        plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
+        plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize,
+        plugin.mExpertHiddenSize /*TRT backend does not support unpadded hidden size*/, plugin.mExpertInterSize,
         plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*min_latency_mode=*/false,
         /*need_weights=*/true, plugin.getParallelismConfig(), /*enable_alltoall=*/false);
 #else

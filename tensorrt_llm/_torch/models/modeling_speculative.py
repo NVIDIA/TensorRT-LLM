@@ -1,4 +1,4 @@
-from typing import Any, Dict, Generic, Optional, Tuple
+from typing import Dict, Generic, Optional, Tuple
 
 import torch
 from torch import nn
@@ -14,6 +14,7 @@ from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
@@ -155,10 +156,12 @@ class Eagle3DraftModel(DecoderModel):
         else:
             self.hidden_size_in = config.hidden_size
 
-        self.fc = Linear(self.hidden_size_in * 3,
-                         config.hidden_size,
-                         bias=getattr(config, "bias", False),
-                         dtype=config.torch_dtype)
+        if self.spec_config.num_capture_layers > 1:
+            self.fc = Linear(self.hidden_size_in *
+                             self.spec_config.num_capture_layers,
+                             config.hidden_size,
+                             bias=getattr(config, "bias", False),
+                             dtype=config.torch_dtype)
 
         self.midlayer = Eagle3DecoderLayer(model_config, start_layer_idx)
 
@@ -290,18 +293,6 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         if self.load_lm_head_from_target:
             self.lm_head = target_model.lm_head
 
-    # TODO: should input/position IDs be included in this? Keeping it implicit
-    # for now since the shapes/dtypes are the same across all models we have.
-    def get_warmup_extra_inputs(self, batch_size: int,
-                                num_tokens: int) -> Dict[str, Any]:
-
-        hidden_states = torch.empty(batch_size * num_tokens,
-                                    self.model.hidden_size,
-                                    dtype=self.model.dtype,
-                                    device='cuda')
-
-        return {'hidden_states': hidden_states}
-
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Hack for eagle3. We might need to run a matmul to reduce
@@ -337,6 +328,9 @@ class MTPForCausalLM(nn.Module):
         assert spec_dec_mode.is_mtp()
         mtp_num_layers = 1 if spec_dec_mode.is_mtp_eagle(
         ) else model_config.spec_config.num_nextn_predict_layers
+
+        moe_load_balancer_set_repeated_for_next_layer(
+            model_config.spec_config.num_nextn_predict_layers // mtp_num_layers)
 
         self.mtp_layers = nn.ModuleList([
             DeepseekV3MTP(model_config, layer_idx + start_layer_idx,
@@ -419,6 +413,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             **kwargs,
         )
 
+        if attn_metadata.padded_num_tokens is not None:
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+
         if self.draft_model is not None:
             # get logits
             logits = self.logits_processor.forward(
@@ -427,9 +424,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 attn_metadata,
                 True,
             )
+            mtp_input_ids = input_ids
+            mtp_position_ids = position_ids
+            if attn_metadata.padded_num_tokens is not None:
+                if input_ids is not None:
+                    # Slice along the first dimension
+                    mtp_input_ids = input_ids[:attn_metadata.num_tokens]
+                if position_ids is not None:
+                    # Slice along the last dimension
+                    mtp_position_ids = position_ids[:, :attn_metadata.
+                                                    num_tokens]
+
             # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=input_ids,
-                                    position_ids=position_ids,
+            return self.spec_worker(input_ids=mtp_input_ids,
+                                    position_ids=mtp_position_ids,
                                     hidden_states=hidden_states,
                                     logits=logits,
                                     attn_metadata=attn_metadata,

@@ -26,8 +26,7 @@ def test_dynamic_spec_decode():
 
     max_batch_size = 1
     max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True,
-                                    free_gpu_memory_fraction=0.5)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(batch_sizes=[1])
 
     llm_common_config = dict(

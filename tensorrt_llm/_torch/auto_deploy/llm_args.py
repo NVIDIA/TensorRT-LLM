@@ -159,6 +159,17 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
     )
 
+    use_sharding_from_factory: bool = Field(
+        default=False,
+        description="If True, use sharding from the model factory. If False, use sharding from the "
+        "AutoDeployConfig.",
+    )
+
+    sharding_dims: List[str] = Field(
+        default=["tp", "ep", "dp"],
+        description="The sharding methods to apply by the heuristic sharding stage.",
+    )
+
     compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
         Field(
             default="torch-compile",
@@ -274,6 +285,16 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         self._quant_config = value
 
     ### VALIDATION #################################################################################
+    @field_validator("max_seq_len", mode="before")
+    @classmethod
+    def ensure_max_seq_len(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None:
+            # Fallback to the AutoDeployConfig default when not provided
+            return AutoDeployConfig.model_fields["max_seq_len"].get_default(
+                call_default_factory=True
+            )
+        return value
+
     @field_validator("build_config", mode="before")
     @classmethod
     def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:

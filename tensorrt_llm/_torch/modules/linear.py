@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -12,7 +13,6 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -327,7 +327,12 @@ class FP8QDQLinearMethod(LinearMethodBase):
         module.inv_input_scale = Parameter(torch.tensor(1.,
                                                         dtype=torch.float32),
                                            requires_grad=False)
-
+        # K, V scales for NVFP4 KV cache
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        # K, V scales for NVFP4 KV cache
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -375,6 +380,15 @@ class FP8QDQLinearMethod(LinearMethodBase):
             output = output + bias
         return output
 
+    def load_kv_scales(self, weights: List[Dict]):
+        k_scale, v_scale = [], []
+        for w in weights:
+            if "k_scale" in w:
+                k_scale.append(w["k_scale"][...].reshape([]))
+            if "v_scale" in w:
+                v_scale.append(w["v_scale"][...].reshape([]))
+        return k_scale, v_scale
+
     def load_weight_scales(self, weights: List[Dict]):
         input_scale, weight_scale = [], []
         for w in weights:
@@ -409,6 +423,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
         else:
             # Dynamic quantization
             module.input_scale = None
+
         copy_weight(module.weight_scale, max(weight_scale))
 
         q_weight = q_weight.to(module.dtype) * weight_scale[0]
@@ -422,6 +437,22 @@ class FP8QDQLinearMethod(LinearMethodBase):
         fused_weight = (fused_weight / module.weight_scale).to(
             torch.float8_e4m3fn)
         copy_weight(module.weight, fused_weight)
+
+        # Load k and v scales, used for NVFP4 KV cache
+        k_scale, v_scale = self.load_kv_scales(weights)
+        # NOTE: Currently the calibrated kv scales may cause overflow for certain input, disabling by default.
+        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "0") == "1":
+            if len(k_scale) != 0:
+                assert len(v_scale) != 0
+                # The calibrated KV scales are amax / (6 * 448), but the requested KV scales are amax / 448,
+                # to avoid overflow when dequantizing NVFP4 in attention kernels.
+                copy_weight(
+                    module.kv_scales,
+                    torch.tensor(
+                        [1.0, max(k_scale) * 6.0,
+                         max(v_scale) * 6.0],
+                        dtype=torch.float32))
+                module.inv_kv_scales.data = 1.0 / module.kv_scales
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]) -> None:
@@ -591,15 +622,12 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
             else:
-                from tensorrt_llm import deep_gemm
-                a, a_sf = fp8_utils.per_token_quant_and_transform(input)
-                output = torch.empty((input.shape[0], module.weight.shape[0]),
-                                     device=input.device,
-                                     dtype=torch.bfloat16)
-                deep_gemm.fp8_gemm_nt((a, a_sf),
-                                      (module.weight, module.weight_scale),
-                                      output,
-                                      disable_ue8m0_cast=True)
+                output = torch.ops.trtllm.fp8_swap_ab_gemm(
+                    input,
+                    module.weight,
+                    module.weight_scale,
+                    disable_ue8m0_cast=True,
+                )
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
@@ -622,9 +650,12 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         load_weights_vanilla_helper(module, weights)
 
         scale_name = self._get_scale_name(weights)
-        weight_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
-                                         module.tp_rank,
-                                         module.tp_mode).squeeze()
+        full_weight_scale = weights[0][scale_name]
+        # modelopt fp8_pb_wo can have 2 extra singleton dimensions
+        if full_weight_scale.dim() == 4:
+            full_weight_scale = full_weight_scale.squeeze(1).squeeze(-1)
+        weight_scale = load_weight_shard(full_weight_scale, module.tp_size,
+                                         module.tp_rank, module.tp_mode)
         copy_weight(module.weight_scale, weight_scale)
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
@@ -637,13 +668,23 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
 
         scale_name = self._get_scale_name(weights)
-        q_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
+        full_q_scale = weights[0][scale_name]
+        full_k_scale = weights[1][scale_name]
+        full_v_scale = weights[2][scale_name]
+        # modelopt fp8_pb_wo can have 2 extra singleton dimensions
+        if full_q_scale.dim() == 4:
+            full_q_scale = full_q_scale.squeeze(1).squeeze(-1)
+        if full_k_scale.dim() == 4:
+            full_k_scale = full_k_scale.squeeze(1).squeeze(-1)
+        if full_v_scale.dim() == 4:
+            full_v_scale = full_v_scale.squeeze(1).squeeze(-1)
+        q_scale = load_weight_shard(full_q_scale, module.tp_size,
                                     module.tp_rank, module.tp_mode)
-        k_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
+        k_scale = load_weight_shard(full_k_scale, module.tp_size,
                                     module.tp_rank, module.tp_mode)
-        v_scale = load_weight_shard(weights[2][scale_name], module.tp_size,
+        v_scale = load_weight_shard(full_v_scale, module.tp_size,
                                     module.tp_rank, module.tp_mode)
-        fused_fp8_block_scale = torch.cat((q_scale, k_scale, v_scale)).squeeze()
+        fused_fp8_block_scale = torch.cat((q_scale, k_scale, v_scale))
 
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_fp8_block_scale)
@@ -655,11 +696,18 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         fused_weight = torch.cat((gate_weight, up_weight))
 
         scale_name = self._get_scale_name(weights)
-        left_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
+        full_left_scale = weights[0][scale_name]
+        full_right_scale = weights[1][scale_name]
+        # modelopt fp8_pb_wo can have 2 extra singleton dimensions
+        if full_left_scale.dim() == 4:
+            full_left_scale = full_left_scale.squeeze(1).squeeze(-1)
+        if full_right_scale.dim() == 4:
+            full_right_scale = full_right_scale.squeeze(1).squeeze(-1)
+        left_scale = load_weight_shard(full_left_scale, module.tp_size,
                                        module.tp_rank, module.tp_mode)
-        right_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
+        right_scale = load_weight_shard(full_right_scale, module.tp_size,
                                         module.tp_rank, module.tp_mode)
-        fused_scale = torch.cat([left_scale, right_scale], dim=0).squeeze()
+        fused_scale = torch.cat([left_scale, right_scale], dim=0)
         copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
 
@@ -695,6 +743,13 @@ class NVFP4LinearMethod(LinearMethodBase):
         module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                  requires_grad=False)
 
+        # K, V scales for NVFP4 KV cache
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        # K, V scales for NVFP4 KV cache
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -726,6 +781,15 @@ class NVFP4LinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def load_kv_scales(self, weights: List[Dict]):
+        k_scale, v_scale = [], []
+        for w in weights:
+            if "k_scale" in w:
+                k_scale.append(w["k_scale"][...].reshape([]))
+            if "v_scale" in w:
+                v_scale.append(w["v_scale"][...].reshape([]))
+        return k_scale, v_scale
 
     def load_weight_scales(self,
                            weights: List[Dict],
@@ -810,6 +874,22 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
         copy_weight(module.weight, fused_weight)
+
+        # Load k and v scales, used for NVFP4 KV cache
+        k_scale, v_scale = self.load_kv_scales(weights)
+        # NOTE: Currently the calibrated kv scales may cause overflow for certain input, disabling by default.
+        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "0") == "1":
+            if len(k_scale) != 0:
+                assert len(v_scale) != 0
+                # The calibrated KV scales are amax / (6 * 448), but the requested KV scales are amax / 448,
+                # to avoid overflow when dequantizing NVFP4 in attention kernels using FP8 math.
+                copy_weight(
+                    module.kv_scales,
+                    torch.tensor(
+                        [1.0, max(k_scale) * 6.0,
+                         max(v_scale) * 6.0],
+                        dtype=torch.float32))
+                module.inv_kv_scales.data = 1.0 / module.kv_scales
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]) -> None:
