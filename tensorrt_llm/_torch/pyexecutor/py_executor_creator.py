@@ -37,7 +37,7 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
-from .config import PyTorchConfig, _construct_checkpoint_loader
+from .config import LoadFormat, PyTorchConfig, _construct_checkpoint_loader
 from .config_utils import is_mla
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -353,7 +353,6 @@ def create_py_executor(
             pytorch_backend_config.disable_overlap_scheduler = True
 
     if mm_encoder_only:
-        from tensorrt_llm.llmapi.llm_args import LoadFormat
         pytorch_backend_config.mm_encoder_only = True
         pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
         # Disable overlap scheduler for multimodal encoder-only mode
