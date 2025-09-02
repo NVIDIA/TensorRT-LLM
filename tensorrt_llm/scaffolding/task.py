@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.executor.result import GenerationResult, TokenLogprobs
 
 
 @dataclass
@@ -64,6 +64,7 @@ class GenerationTask(Task):
     # result field
     # link to TRTLLM's GenerationResult, for async update in streaming mode
     _result: Optional[GenerationResult] = None
+    costimized_result_fields: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def result(self) -> GenerationResult:
@@ -96,7 +97,7 @@ class GenerationTask(Task):
             0].cumulative_logprob if self._result else None
 
     @property
-    def logprobs(self) -> Optional[List[float]]:
+    def logprobs(self) -> Optional[TokenLogprobs]:
         return self._result.outputs[0].logprobs if self._result else None
 
     @property
