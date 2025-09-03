@@ -1,9 +1,10 @@
 # Multi-node inference with Ray orchestrator
-TensorRT-LLM supports [Ray](https://docs.ray.io/en/latest/index.html) as an orchestrator with [PyTorch Distributed](https://docs.pytorch.org/tutorials/beginner/dist_overview.html) as an alternative to MPI. This feature is currently experimental and under active development. 
+TensorRT-LLM supports an experimental [Ray orchestrator](../README.md) as an alternative to MPI. The following example shows how to start a Ray cluster for multi-node inference.
 
-**Prerequisite:** a container image with TensorRT-LLM preinstalled (or suitable for installing it). The examples use Slurm and [Enroot](https://github.com/NVIDIA/enroot); if you use a different setup, adapt the container options and launch commands to your multi-node environment.
 
-## Run multi-node inference with Ray 
+## Quick Start
+
+**Prerequisite:** a container image with TensorRT-LLM preinstalled (or suitable for installing it). The examples use Slurm and [Enroot](https://github.com/NVIDIA/enroot). if you use a different setup, adapt the following scrips and commands to your multi-node environment.
 
 1. Allocate nodes and open a shell on the head node:
 
@@ -32,5 +33,9 @@ TensorRT-LLM supports [Ray](https://docs.ray.io/en/latest/index.html) as an orch
 
     # Under your work directory:
     >> pip install -e . # if needed
+    # You can change this script to a model and parallel settings effective for multi-node inference (e.g., TP8 or TP4PP4)
     >> python examples/ray/llm_inference_async_ray.py
     ```
+
+## Disclaimer
+The code is experimental and subject to change. Currently, there are no guarantees regarding functionality, performance, or stability.
