@@ -229,6 +229,10 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             tokenizer=None if self.tokenizer is None else str(self.tokenizer),
             tokenizer_kwargs=self.tokenizer_kwargs,
             skip_loading_weights=self.skip_loading_weights,
+            simple_shard_only=self.simple_shard_only,
+            use_sharding_from_factory=self.use_sharding_from_factory,
+            support_partial_config=self.support_partial_config,
+            sharding_dims=self.sharding_dims,
             max_seq_len=self.max_seq_len,
         )
 
