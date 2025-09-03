@@ -30,6 +30,3 @@ l0_gh200:
   - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_py_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1] TIMEOUT (90)
   - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1]
   - unittest/trt/model/eagle
-  - unittest/trt/model_api/test_model_level_api.py
-  - unittest/trt/model_api/test_model_quantization.py
-  - unittest/trt/model_api/test_model_api_multi_gpu.py
