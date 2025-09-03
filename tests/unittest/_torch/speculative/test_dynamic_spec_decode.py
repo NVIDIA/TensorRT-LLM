@@ -30,12 +30,12 @@ def test_dynamic_spec_decode(enforce_single_worker,
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
-
     models_path = llm_models_root()
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
-    max_batch_size = 1
+    # Allow with 3 concurrent requests
+    max_batch_size = 3
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(batch_sizes=[1])
@@ -47,11 +47,7 @@ def test_dynamic_spec_decode(enforce_single_worker,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        # This max_seq_len is larger than the one specified
-        # in the llama 3 8B eagle's config. We want to make sure
-        # that the draft model won't go above its max in warmup
-        # in this test.
-        max_seq_len=8192,
+        max_seq_len=4096,
     )
 
     spec_config = EagleDecodingConfig(

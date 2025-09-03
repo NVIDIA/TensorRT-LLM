@@ -1130,7 +1130,7 @@ class PyExecutor:
                     req.py_draft_tokens = [0] * max_draft_len
                     req.py_draft_pages_allocated = max_draft_len
                 else:
-                    req.py_draft_tokens = None
+                    req.py_draft_tokens = []
                     req.py_draft_pages_allocated = 0
 
         except Exception as e:
