@@ -163,7 +163,7 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
 
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
-        Utils.exec(pipeline, script: "echo Sleeping to allow slurm job termination; sleep 30")
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
         Utils.exec(
             pipeline,
@@ -172,6 +172,8 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
                 "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
         )
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         Utils.exec(
             pipeline,
@@ -221,6 +223,8 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
                 "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
         )
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         Utils.exec(
             pipeline,
@@ -537,7 +541,6 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export NVIDIA_IMEX_CHANNELS=0
                     chmod +x ${scriptRunNode}
                     ${srunCmd} 2>&1 | tee ${slurmOutputFile}
-                    exit ${PIPESTATUS[0]}
                 """.stripIndent()
                 pipeline.writeFile(file: scriptLaunchDestPath, text: scriptContent)
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
