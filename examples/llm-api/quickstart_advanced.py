@@ -177,7 +177,8 @@ def setup_llm(args, **kwargs):
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
-            mtp_eagle_one_model=args.use_one_model)
+            mtp_eagle_one_model=args.use_one_model,
+            speculative_model_dir=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,

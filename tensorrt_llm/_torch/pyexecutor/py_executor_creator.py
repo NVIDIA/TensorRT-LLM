@@ -268,12 +268,6 @@ def create_py_executor(
             # The draft model won't have any draft tokens attached to
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
-            is_deepseek_model = model_engine.model.model_config.pretrained_config.architectures[
-                0] == "DeepseekV3ForCausalLM"
-            if is_deepseek_model:
-                draft_model_path = checkpoint_dir
-            else:
-                draft_model_path = spec_config.speculative_model_dir
 
             use_chain_drafter = (
                 executor_config.guided_decoding_config is None
@@ -295,7 +289,7 @@ def create_py_executor(
                 draft_pytorch_backend_config.load_format = LoadFormat.DUMMY
 
             draft_model_engine = PyTorchModelEngine(
-                model_path=draft_model_path,
+                model_path=spec_config.speculative_model_dir,
                 pytorch_backend_config=draft_pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_beam_width=executor_config.max_beam_width,
@@ -311,7 +305,9 @@ def create_py_executor(
                 is_draft_model=True,
                 drafting_loop_wrapper=drafting_loop_wrapper,
             )
-            if is_deepseek_model:
+            # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
+            if model_engine.model.model_config.pretrained_config.architectures[
+                    0] == "DeepseekV3ForCausalLM" and spec_config.speculative_model_dir == checkpoint_dir._str:
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
