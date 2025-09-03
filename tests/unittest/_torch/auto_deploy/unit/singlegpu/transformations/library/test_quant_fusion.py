@@ -24,10 +24,10 @@ def _has_fused_linear_fp8(gm):
 
 def _has_fused_linear_fp4(gm):
     found_fused = any(
-        is_op(n, torch.ops.auto_deploy.torch_quant_fp4_linear) for n in gm.graph.nodes
+        is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes
     )
     found_ref = any(
-        is_op(n, torch.ops.auto_deploy.torch_fake_quant_fp4_linear) for n in gm.graph.nodes
+        is_op(n, torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear) for n in gm.graph.nodes
     )
     return found_fused and not found_ref
 
@@ -74,24 +74,26 @@ class TinyFP8Ref(nn.Module):
 class TinyFP4Ref(nn.Module):
     """
     A tiny module whose forward uses the reference NVFP4 op:
-      torch_fake_quant_fp4_linear(x, w_fp4, bias, [s_in2], [cutlass_vec, alpha], [], [])
+      torch_fake_quant_nvfp4_linear(x, w_fp4, bias, [s_in2], [cutlass_vec, alpha], [], [])
     """
 
     def __init__(self, in_features=64, out_features=32, use_bias=True):
         super().__init__()
         assert in_features % 16 == 0, "NVFP4 requires K % 16 == 0 for CUTLASS scaling."
+        device = torch.device("cuda")
+
         self.use_bias = use_bias
-        self.weight = nn.Parameter(torch.rand(out_features, in_features, dtype=torch.half))
+        self.weight = nn.Parameter(
+            torch.rand(out_features, in_features, dtype=torch.half, device=device)
+        )
         if use_bias:
-            self.bias = nn.Parameter(torch.rand(out_features, dtype=torch.half))
+            self.bias = nn.Parameter(torch.rand(out_features, dtype=torch.half, device=device))
         else:
             self.register_parameter("bias", None)
 
-        # Build inputs required by reference FP4 op:
         with torch.no_grad():
-            s_in2 = fp4_global_scale(torch.rand(1, in_features, dtype=torch.half))
+            s_in2 = fp4_global_scale(torch.rand(1, in_features, dtype=torch.half, device=device))
             s_w2 = fp4_global_scale(self.weight)
-            # Quantize weight to NVFP4 (packed uint8) + CUTLASS uint8 per-16 scaling vector
             w_fp4, cutlass_vec = torch.ops.trtllm.fp4_quantize(self.weight, s_w2, 16, False)
             alpha = (1.0 / (s_in2 * s_w2)).to(torch.float32)
 
@@ -102,7 +104,7 @@ class TinyFP4Ref(nn.Module):
 
     def forward(self, x):
         bias = self.bias if self.use_bias else None
-        return torch.ops.auto_deploy.torch_fake_quant_fp4_linear(
+        return torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
             x,
             self.weight_fp4,
             bias,
@@ -171,7 +173,7 @@ def test_fuse_quant_rewrites_fp4_linear(use_bias):
         model,
         x,
         gm_transformed,
-        _has_fused_linear_fp8,
+        _has_fused_linear_fp4,
         lambda n: n,
         0.1,  # atol
         0.05,  # rtol

@@ -8,7 +8,6 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
-from ...utils.quantization_utils import get_scales_and_type_from_node
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -136,20 +135,25 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
 
     For a torch.ops.auto_deploy.torch_quant_fp8_linear op:
       - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8")
-       For a torch.ops.auto_deploy.torch_quant_fp4_linear op:
+       For a torch.ops.auto_deploy.torch_quant_nvfp4_linear op:
       - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale, "alpha": alpha}, "fp4")
     """
     input_node = linear_node.args[0]
+    weight = linear_node.args[1]
     if is_op(linear_node, torch.ops.auto_deploy.torch_linear_simple):
-        weight = linear_node.args[1]
         return input_node, weight, None, ""
-    elif {
-        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp4_linear)
-        or is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear),
-    }:
-        weight = linear_node.args[1]
-        scales, quant_type = get_scales_and_type_from_node(linear_node)
-        return input_node, weight, scales or {}, quant_type
+    elif is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear):
+        scales = {}
+        scales["input_scale"] = linear_node.args[3]
+        scales["weight_scale"] = linear_node.args[4]
+        quant_type = "fp8"
+    elif is_op(linear_node, torch.ops.auto_deploy.torch_quant_nvfp4_linear):
+        scales = {}
+        scales["input_scale"] = linear_node.args[3]
+        scales["weight_scale"] = linear_node.args[4]
+        scales["alpha"] = linear_node.args[5]
+        quant_type = "fp4"
+    return input_node, weight, scales or {}, quant_type
 
 
 def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
@@ -166,7 +170,7 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
     This function supports both:
       - torch.ops.auto_deploy.torch_linear_simple.default ops, and
       - torch.ops.auto_deploy.torch_quant_fp8_linear ops (also extracts quantization scales).
-      - torch.ops.auto_deploy.torch_quant_fp4_linear ops (also extracts quantization scales).
+      - torch.ops.auto_deploy.torch_quant_nvfp4_linear ops (also extracts quantization scales).
 
     Returns:
         A tuple:

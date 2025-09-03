@@ -322,10 +322,10 @@ def _run_pattern_detection_job(
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
                     # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
                     if "linear1" in node.args[1].name:
-                        dim = SplitDimension.ROW
+                        dim = SplitDimension.COLUMN
                         dist_op = None
                     else:
-                        dim = SplitDimension.COLUMN
+                        dim = SplitDimension.ROW
                         dist_op = "all_reduce"
                     expected_transformations.append(
                         FP8TPShardingInfo(
@@ -390,10 +390,10 @@ def test_sharding(
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
-        # (MLP, "torch_dist_all_reduce"),
+        (MLP, "torch_dist_all_reduce"),
         (FP8MLP, "torch_dist_all_reduce"),
-        # (nn.Linear, "torch_dist_all_gather"),
-        # (GQA_Block, "torch_dist_all_reduce"),
+        (nn.Linear, "torch_dist_all_gather"),
+        (GQA_Block, "torch_dist_all_reduce"),
     ),
 )
 def test_sharding_pattern_detection(
