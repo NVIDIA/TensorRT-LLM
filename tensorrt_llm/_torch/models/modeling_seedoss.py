@@ -1,3 +1,4 @@
+# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from typing import Optional, Tuple
 
 import torch
@@ -27,7 +28,8 @@ class SeedOssAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if config.rope_scaling["rope_type"] == "default":
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict) and rope_scaling.get("rope_type") == "default":
             # map transformers 'default' type to trtllm 'none' type
             config.rope_scaling["rope_type"] = "none"
         super().__init__(
@@ -68,6 +70,7 @@ class SeedOssDecoderLayer(DecoderLayer):
             bias=config.mlp_bias if hasattr(config, "mlp_bias") else False,
             dtype=config.torch_dtype,
             config=model_config,
+            layer_idx=layer_idx,
         )
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
