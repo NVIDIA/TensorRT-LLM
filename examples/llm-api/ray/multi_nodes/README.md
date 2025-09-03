@@ -4,7 +4,7 @@ TensorRT-LLM supports an experimental [Ray orchestrator](../README.md) as an alt
 
 ## Quick Start
 
-**Prerequisite:** a container image with TensorRT-LLM preinstalled (or suitable for installing it). The examples use Slurm and [Enroot](https://github.com/NVIDIA/enroot). if you use a different setup, adapt the following scrips and commands to your multi-node environment.
+**Prerequisite:** a container image with TensorRT-LLM preinstalled (or suitable for installing it). The examples use Slurm and [Enroot](https://github.com/NVIDIA/enroot). if you use a different setup, adapt the following scripts and commands to your multi-node environment.
 
 1. Allocate nodes and open a shell on the head node:
 
