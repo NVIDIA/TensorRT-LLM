@@ -1348,6 +1348,7 @@ class PyTorchModelEngine(ModelEngine):
             request.py_batch_idx = request.py_seq_slot
 
         if len(multimodal_params_list) > 0:
+            # discard the text token indices as it only includes context tokens at this moment
             _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
         else:
             mm_token_indices = None
@@ -1727,7 +1728,6 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_requests'] = num_ctx_requests
         self.iter_states['num_ctx_tokens'] = num_ctx_tokens
         self.iter_states['num_generation_tokens'] = num_generation_tokens
-
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
 

@@ -207,10 +207,14 @@ class Embedding(LMHead):
     def forward(self, input):
         # Run the ops before all_reduce/all_gather.
         # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
-        embedding_ops_func = torch.compile(
-            pre_comm_embedding_ops,
-            options={"max-autotune": True},
-            disable=not self.enable_torch_compile_for_embedding)
+        if self.tp_size > 1:
+            embedding_ops_func = torch.compile(
+                pre_comm_embedding_ops,
+                options={"max-autotune": True},
+                disable=not self.enable_torch_compile_for_embedding)
+        else:
+            # Skip torch.compile when TP size is 1 to avoid unnecessary host overhead
+            embedding_ops_func = pre_comm_embedding_ops
         output = embedding_ops_func(input, self.weight, self.tp_size,
                                     self.tp_rank, self.tp_mode,
                                     self.vocab_start_index,

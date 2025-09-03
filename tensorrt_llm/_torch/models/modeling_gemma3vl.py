@@ -263,7 +263,9 @@ class Gemma3VLM(PreTrainedModel):
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
             mm_embeds=mm_embeds,
-            mm_token_ids=self.image_token_ids)
+            mm_token_ids=self.image_token_ids,
+            **kwargs,
+        )
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,

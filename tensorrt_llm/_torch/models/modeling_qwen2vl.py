@@ -642,7 +642,8 @@ class Qwen2VLModelBase(PreTrainedModel):
                 'mrope_position_deltas']
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
-                                                    input_ids, mm_embeds)
+                                                    input_ids, mm_embeds,
+                                                    **kwargs)
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
