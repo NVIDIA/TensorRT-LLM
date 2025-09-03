@@ -89,8 +89,8 @@ class ModelFactory(ABC):
             position_ids.shape == (batch_size, seq_len)
             logits.shape == (batch_size, seq_len, vocab_size)
 
-        Additionally, we allow for additional arguments to be passed to the model's forward function
-        as defined by the factory.
+        We allow for additional arguments to be passed to the model's forward function as defined by
+        the factory.
         """
         # make sure model architecture is pre-fetched (no weights needed at this point)
         skip_loading_weights = self.skip_loading_weights

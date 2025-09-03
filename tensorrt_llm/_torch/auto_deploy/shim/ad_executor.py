@@ -107,7 +107,6 @@ class ADEngine(ModelEngine):
             max_num_tokens=max_num_tokens,
         )
 
-        # get factory
         factory = ad_config.create_factory()
 
         # pass in extra arguments defined by the model factory
