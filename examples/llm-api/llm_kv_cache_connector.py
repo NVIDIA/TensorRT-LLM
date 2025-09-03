@@ -33,8 +33,8 @@ class PersistentKvCacheConnectorMetadata:
 
 class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
-    def __init__(self, llm_args: TorchLlmArgs):
-        super().__init__(llm_args)
+    def __init__(self, llm_args: TorchLlmArgs, tokens_per_block: int):
+        super().__init__(llm_args, tokens_per_block)
 
         self.kv_cache_tensor = None
 
