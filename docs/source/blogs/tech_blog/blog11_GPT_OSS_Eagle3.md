@@ -105,7 +105,7 @@ Notes:
 Run the following command inside the container to start the endpoint:
 
 ```bash
-TRTLLM_ENABLE_PDL=1 trtllm-serve /config/models/gpt-oss-120b --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 10  --tp_size 8 --ep_size 4 --trust_remote_code --extra_llm_api_options /config/models/eagle/eagle.yaml --max_num_tokens 131072 --max_seq_len 131072
+TRTLLM_ENABLE_PDL=1 trtllm-serve /config/models/gpt-oss-120b --host 0.0.0.0 --port 8000 --max_batch_size 10  --tp_size 8 --ep_size 4 --trust_remote_code --extra_llm_api_options /config/models/eagle/eagle.yaml --max_num_tokens 131072 --max_seq_len 131072
 ```
 
 The server initializes, loads, and optimizes the models. After it is ready, it listens on port 8000.
