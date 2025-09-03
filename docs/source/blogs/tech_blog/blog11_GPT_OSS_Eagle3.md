@@ -1,4 +1,4 @@
-## Running gpt-oss-120b with Eagle3 Speculative Decoding on GB200/B200 (TensorRT-LLM)
+## Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT-LLM)
 
 This guide sets up a production endpoint that uses Eagle3 speculative decoding on NVIDIA GB200 or B200 GPUs only. It replaces the low‑latency flow from the previous guide and intentionally omits max‑throughput, Hopper, and benchmarking content.
 
@@ -17,9 +17,9 @@ Expected directory layout on the host (example):
   └─ eagle/         # Eagle3 speculative decoding assets
 ```
 
-### Get the TensorRT-LLM container (1.1.0rc0)
+### Get the TensorRT-LLM Container (1.1.0rc0)
 
-If required by your environment, log in to NGC and pull the image:
+If required by your environment, log into NGC and pull the image:
 
 ```bash
 # Create an API key at https://ngc.nvidia.com (if you don't have one)
@@ -30,7 +30,7 @@ docker login nvcr.io
 docker pull nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc0
 ```
 
-### Start the TensorRT-LLM container
+### Start the TensorRT-LLM Container
 
 Run the container and bind-mount your models directory to `/config/models` inside the container:
 
@@ -47,7 +47,7 @@ docker run --rm --ipc=host -it \
 
 Replace `/path/to/models` with the absolute path on your host.
 
-### Download the models (base + Eagle3)
+### Download the models (Base + Eagle3)
 
 Inside the container, download the base model and the Eagle3 speculative model to the expected directories under `/config/models/`:
 
@@ -70,9 +70,9 @@ huggingface-cli download nvidia/gpt-oss-120b-Eagle3 \
   --repo-type model
 ```
 
-References: `https://huggingface.co/openai/gpt-oss-120b`, `https://huggingface.co/nvidia/gpt-oss-120b-Eagle3`
+References: `https://huggingface.co/openai/gpt-oss-120b` and `https://huggingface.co/nvidia/gpt-oss-120b-Eagle3`
 
-### Create the Eagle3 configuration
+### Create the Eagle3 Configuration
 
 Inside the container, create the YAML file at `/config/models/eagle/eagle.yaml` with the following content:
 
@@ -100,7 +100,7 @@ Notes:
 - Ensure your Eagle3 assets are present under `/config/models/eagle/`.
 - If you are running on Top of Tree, replace `use_torch_sampler: true` with `sampler_type: TorchSampler`.
 
-### Launch the server (Eagle3 speculative decoding)
+### Launch the Server (Eagle3 Speculative Decoding)
 
 Run the following command inside the container to start the endpoint:
 
@@ -108,11 +108,11 @@ Run the following command inside the container to start the endpoint:
 TRTLLM_ENABLE_PDL=1 trtllm-serve /config/models/gpt-oss-120b --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 10  --tp_size 8 --ep_size 4 --trust_remote_code --extra_llm_api_options /config/models/eagle/eagle.yaml --max_num_tokens 131072 --max_seq_len 131072
 ```
 
-The server will initialize, load, and optimize the models. Once ready, it will listen on port 8000.
+The server initializes, loads, and optimizes the models. After it is ready, it listens on port 8000.
 
-### Quick health check
+### Quick Health Check
 
-From another terminal on the host, verify the server is healthy:
+From another terminal on the host, verify that the server is healthy:
 
 ```bash
 curl -s -o /dev/null -w "Status: %{http_code}\n" "http://localhost:8000/health"
@@ -120,11 +120,11 @@ curl -s -o /dev/null -w "Status: %{http_code}\n" "http://localhost:8000/health"
 
 When `Status: 200` is returned, the endpoint is ready to serve requests.
 
-### Sample Chat Completions request
+### Sample Chat Completions Request
 
-Note: This Eagle3 + TensorRT-LLM endpoint currently supports only greedy sampling. The following Chat Completions parameters are ignored (no-ops): temperature, top_p, top_k, seed.
+Note: This Eagle3 + TensorRT-LLM endpoint currently supports only greedy sampling. The following Chat Completions parameters are ignored (no-ops): `temperature`, `top_p`, `top_k`, and `seed`.
 
-Send a simple OpenAI-compatible Chat Completions request against the running server:
+Send a simple OpenAI-compatible Chat Completions request to the running server:
 
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
