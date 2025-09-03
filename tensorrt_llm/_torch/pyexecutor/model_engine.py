@@ -1265,7 +1265,7 @@ class PyTorchModelEngine(ModelEngine):
         input_ids = torch.tensor(input_ids, dtype=torch.int, device="cpu")
         vocab_size = self.model.config.vocab_size
         # TODO: unify naming of mm_token_ids across models
-        mm_token_ids = getattr(self.model, "_image_token_ids", None)
+        mm_token_ids = getattr(self.model, "mm_token_ids", None)
 
         text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
             input_ids, vocab_size=vocab_size, mm_token_ids=mm_token_ids)
@@ -1349,6 +1349,9 @@ class PyTorchModelEngine(ModelEngine):
 
         if len(multimodal_params_list) > 0:
             # discard the text token indices as it only includes context tokens at this moment
+            print(
+                f"len multimodal_params_list: {len(multimodal_params_list)} from model_engine"
+            )
             _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
         else:
             mm_token_indices = None

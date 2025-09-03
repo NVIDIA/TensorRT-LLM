@@ -502,6 +502,10 @@ class Mistral3VLM(PreTrainedModel):
         ]
         return torch.cat(pixel_values), batched_image_sizes
 
+    @property
+    def mm_token_ids(self):
+        return self._image_token_ids
+
 
 # Original implementation:
 # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/mistral3/modeling_mistral3.py#L66
