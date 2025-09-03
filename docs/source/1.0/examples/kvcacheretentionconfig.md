@@ -1,8 +1,8 @@
-# How To Change Block Priorities
+# How to Change Block Priorities
 
-Block priority can be changed by providing the optional argument ```kv_cache_retention_config``` when a request is submitted to LLM engine. Consider the quickstart example (found in examples/pytorch/quickstart.py):
+You can change block priority by providing the optional ```kv_cache_retention_config``` argument when you submit a request to the LLM engine. Consider the quick start example found in ```examples/pytorch/quickstart.py```:
 
-```
+```python
 from tensorrt_llm import LLM, SamplingParams
 
 
@@ -28,9 +28,9 @@ if __name__ == '__main__':
     main()
 ```
 
-The blocks from the prompts will be stored for reuse with the default priotity of 35 (on a scale from 1 to 100 where 100 is highest and 1 is lowest priority). Assume you know that the first four tokens of each prompt is a system prompt that should be stored with high priority (100). You do this by providing a kv cache retention config object when you submit the prompts for generation:
+The blocks from the prompts are stored for reuse with the default priority of 35 on a scale from one to 100, where 100 is highest priority and one is lowest priority. Assume you know that the first four tokens of each prompt represent a system prompt that should be stored with high priority (100). You can achieve this by providing a KV cache retention config object when you submit the prompts for generation:
 
-```
+```python
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheRetentionConfig
 
@@ -65,4 +65,5 @@ if __name__ == '__main__':
     main()
 ```
 
-Here we used a single kv_cache_retention_config object for all the prompts. Alternatively, you can also provide a list, the list must have the same length as the list of prompts.
+This example uses a single ```kv_cache_retention_config``` object for all the prompts. You can also provide a list that must have the same length as the list of prompts.
+

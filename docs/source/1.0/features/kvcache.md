@@ -22,15 +22,15 @@ One caveat in the current code is that only leaf blocks can be evicted (leaves a
 
 ### Retention Policy
 
-Blocks are assigned priority in line with the [retention policy](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [TokenRangeRetentionConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig) objects, each specifying priority for a given range of tokens, such as "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect, priority will revert to the default after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect, after which priority will revert to the default. Default priority is 35. Any property that expects a duration can be set to None, which indicates retention policy never expires.
+Blocks are assigned priority in line with the [retention policy](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. The retention policy is a list of [TokenRangeRetentionConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig) objects, each specifying priority for a given range of tokens, such as "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect. Priority reverts to the default of 35 after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect. Priority reverts to the default after expiration. Any property that expects a duration can be set to None. This indicates that particular part of the retention policy never expires.
 
 Not in use: ```transfer_mode``` is a debug option and should not be used.
 
-See [this example](../examples/kvcacheretentionconfig.md) of how to change block priorities of specific requests by altering their retention policy.
+See [this example](../examples/kvcacheretentionconfig.md) for an example of how to change block priorities of specific requests by altering their retention policy.
 
 ### Speculative Decoding
 
-Reuse across requests is only supported for one model MTP, all other [speculative decoding](speculative-decoding.md) algorithms must disable block reuse.
+Reuse across requests is only supported for one model MTP. All other [speculative decoding](speculative-decoding.md) algorithms must disable block reuse.
 
 ## Limited Attention Window Size
 
@@ -42,9 +42,9 @@ TensorRT-LLM takes advantage of grouped query attention in order to save memory.
 
 ## Controlling KV Cache Behavior
 
-Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of KV cache system.
+Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of the KV cache system.
 
-See [this example](../examples/kvcacheconfig.md) of how to use KvCacheConfig to control KV cache behavior.
+See [this example](../examples/kvcacheconfig.md) for an example of how to use KvCacheConfig to control KV cache behavior.
 
 ### Datatype
 
