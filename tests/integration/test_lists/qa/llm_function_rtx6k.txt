@@ -41,3 +41,7 @@ test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Llama3.1-70B-BF16-llama-3.
 test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Nemotron-Super-49B-v1-BF16-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1]
 test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Mixtral-8x7B-BF16-Mixtral-8x7B-Instruct-v0.1]
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-0528-FP4-DeepSeek-R1/DeepSeek-R1-0528-FP4]
+
+
+perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float16-kv_frac:0.85-input_output_len:1000,2000-reqs:3000-ep:8-tp:4-gpus:8]
+perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float16-kv_frac:0.85-input_output_len:4000,1000-reqs:1024-ep:8-tp:8-gpus:8]
