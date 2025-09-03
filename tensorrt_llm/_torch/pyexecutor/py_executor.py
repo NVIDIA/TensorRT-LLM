@@ -268,7 +268,7 @@ class PyExecutor:
         self._disagg_pp_termination_handler = None
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
-                self.num_micro_batches, self.dist, self.resource_manager)
+                self.num_micro_batches, self.dist)
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -1954,42 +1954,23 @@ class PyExecutor:
 
 
 class DisaggPPTerminationHandler:
-    """Handles termination synchronization across pipeline parallel ranks for disaggregated serving.
+    """Handles termination synchronization across pipeline parallel ranks under disaggregated serving.
 
-    This class manages the complex synchronization required when terminating requests
-    in a pipeline parallel setup with KV cache reuse enabled. It ensures all PP ranks
-    reach consensus before freeing resources to avoid NCCL hangs.
+    We require synchronization when terminating requests in disaggregated PP when
+    KV cache reuse is enabled. All PP ranks need to reach consensus before freeing
+    resources to avoid a NCCL hang.
     """
 
-    def __init__(self, num_micro_batches: int, dist, resource_manager):
-        """Initialize the termination handler.
-
-        Args:
-            num_micro_batches: Number of micro batches in the pipeline
-            dist: Distributed communication object
-            resource_manager: Resource manager for freeing resources
-        """
-        self.num_micro_batches = num_micro_batches
+    def __init__(self, num_micro_batches: int, dist):
         self.dist = dist
-        self.resource_manager = resource_manager
-
         # Request termination synchronization across PP ranks
         # {request_id: {'ready_to_terminate': set{ranks}, 'terminated': {ranks}}}
         self.pending_termination = {}
-        self.termination_handles = [None] * self.num_micro_batches
-
+        self.termination_handles = [None] * num_micro_batches
         # Local map from request_id -> local LlmRequest awaiting consensus termination
         self.local_termination = {}
 
     def terminate(self, request: LlmRequest) -> bool:
-        """Mark a request for termination and check if it should be terminated immediately.
-
-        Args:
-            request: The request to terminate
-
-        Returns:
-            True if the request was terminated immediately, False if pending consensus
-        """
         req_key = request.py_request_id
         self.local_termination[req_key] = request
         state = self.pending_termination.get(req_key, None)
@@ -2006,12 +1987,6 @@ class DisaggPPTerminationHandler:
         Each rank sends its current pending_termination snapshot to the next PP rank
         and receives the previous rank's snapshot. After merging, apply any terminations
         that have reached consensus (i.e., all PP ranks are ready).
-
-        Args:
-            microbatch_id: The microbatch ID for the current batch
-
-        Returns:
-            List of requests that should be terminated
         """
         snapshot = {
             req_id: {
@@ -2074,7 +2049,6 @@ class DisaggPPTerminationHandler:
         return requests_to_terminate
 
     def cleanup(self):
-        """Wait for all pending termination handles to complete."""
         for h in self.termination_handles:
             if h is not None:
                 h.wait()
