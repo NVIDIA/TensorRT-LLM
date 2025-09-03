@@ -21,7 +21,7 @@ from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.llm_args import TorchLlmArgs
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
@@ -356,9 +356,10 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
-        llm_args: Optional[TorchLlmArgs] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -405,7 +406,8 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                kv_connector_config=kv_connector_config)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -415,8 +417,10 @@ class GenerationExecutor(ABC):
             logger.warning(
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
-            return GenerationExecutorWorker(**worker_kwargs,
-                                            is_llm_executor=is_llm_executor)
+            return GenerationExecutorWorker(
+                **worker_kwargs,
+                is_llm_executor=is_llm_executor,
+                kv_connector_config=kv_connector_config)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
@@ -428,7 +432,8 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                kv_connector_config=kv_connector_config)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -439,7 +444,8 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor)
+                is_llm_executor=is_llm_executor,
+                kv_connector_config=kv_connector_config)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

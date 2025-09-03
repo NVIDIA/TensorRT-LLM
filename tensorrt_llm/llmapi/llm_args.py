@@ -404,6 +404,21 @@ class DecodingBaseConfig(StrictBaseModel):
             self.decoding_type.upper())
 
 
+class KvCacheConnectorConfig(StrictBaseModel):
+    """
+    Configuration for the KV Cache Connector.
+    """
+    connector_module: str = Field(
+        ...,
+        description=
+        "The import path to the connector module. It will be imported with `importlib.import_module`."
+    )
+    connector_scheduler_class: str = Field(
+        ..., description="The class name of the scheduler within the module.")
+    connector_worker_class: str = Field(
+        ..., description="The class name of the worker within the module.")
+
+
 class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
@@ -2300,6 +2315,11 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description="The format of the provided checkpoint.",
         status="prototype",
+    )
+
+    kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
+        default=None,
+        description="The config for KV cache connector.",
     )
 
     mm_encoder_only: bool = Field(

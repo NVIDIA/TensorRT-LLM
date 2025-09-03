@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -69,13 +70,20 @@ def calculate_robust_stats(values: List[float]) -> Tuple[float, float, int]:
     return mean(filtered_values), median(filtered_values), len(filtered_values)
 
 
+def tiny_llama_details():
+    model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    model_path_or_name = _hf_model_dir_or_hub_id(model_path, model_name)
+    return model_path_or_name, model_name, model_path
+
+
 def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
     """Parse KV cache metrics from the benchmark log output."""
     metrics = {}
 
     # Simple patterns based on actual log format
     patterns = {
-        "current_cache_size": r"Current cache size:\s*(\d+)",
+        "current_cache_size": r"Current cache size \(MB\):\s*(\d+)",
         "free_mem_pre_mb": r"Free memory before forward pass \(MB\):\s*(\d+)",
         "free_mem_post_mb": r"Free memory after forward pass \(MB\):\s*(\d+)",
     }
@@ -89,6 +97,11 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
             print(f"  ✅ Found {metric_name}: {value}")
         else:
             print(f"  ❌ Could not find {metric_name}")
+
+    try:
+        metrics["current_cache_size"] = metrics["current_cache_size"] * 1024 * 1024
+    except KeyError:
+        print("  ❌ Could not find current_cache_size")
 
     # Calculate new_cache_size using the same formula as in resize_kv_cache
     # new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
@@ -108,6 +121,7 @@ def parse_kv_cache_metrics(log_output: str, free_mem_ratio: float = 0.8):
 
 def run_benchmark(
     model_name: str,
+    model_path: str,
     dataset_path: str,
     temp_dir: str,
     backend: str = "_autodeploy",
@@ -122,22 +136,23 @@ def run_benchmark(
     config_path = f"{temp_dir}/extra_llm_api_options.yaml"
 
     # Build the command to run the benchmark
-    cmd = [
-        "python",
-        "-m",
-        "tensorrt_llm.commands.bench",
-        "--model",
-        model_name,
-        "throughput",
-        "--backend",
-        backend,
-        "--dataset",
-        str(dataset_path),
-        "--max_batch_size",
-        str(max_batch_size),
-        # "--warmup",
-        # "10",
-    ]
+    cmd = ["python", "-m", "tensorrt_llm.commands.bench", "--model", model_name]
+
+    # If the model exists locally, then using the local copy will make the test robust to CI network issues
+    if os.path.isdir(model_path):
+        cmd.extend(["--model_path", model_path])
+
+    cmd.extend(
+        [
+            "throughput",
+            "--backend",
+            backend,
+            "--dataset",
+            str(dataset_path),
+            "--max_batch_size",
+            str(max_batch_size),
+        ]
+    )
 
     # Add report_json argument if path is provided
     if report_json_path:
@@ -148,8 +163,6 @@ def run_benchmark(
         cmd.extend(["--extra_llm_api_options", config_path])
 
     # Run benchmark as subprocess to capture ALL output
-    import os
-
     env = os.environ.copy()
     if backend == "pytorch":
         env["TLLM_OVERRIDE_LAYER_NUM"] = str(num_hidden_layers)
@@ -288,7 +301,7 @@ def assert_performance_within_tolerance(
     )
 
 
-def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
+def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
     _DATASET_NAME = "synthetic_128_128.txt"
     dataset_path = Path(temp_dir, _DATASET_NAME)
     dataset_tool = Path(root_dir, "benchmarks", "cpp", "prepare_dataset.py")
@@ -300,7 +313,7 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
         f"{dataset_tool}",
         "--stdout",
         "--tokenizer",
-        model_name,
+        model_path_or_name,
         "token-norm-dist",
         "--input-mean",
         "128",
@@ -511,6 +524,7 @@ def print_kv_cache_metrics(kv_cache_metrics):
 
 def run_multiple_benchmarks_with_outlier_removal(
     model_name: str,
+    model_path: str,
     dataset_path: str,
     temp_dir: str,
     backend: str,
@@ -541,6 +555,7 @@ def run_multiple_benchmarks_with_outlier_removal(
             print(f"🔄 Iteration {i + 1}/{num_iterations}")
             report_data = run_benchmark(
                 model_name,
+                model_path,
                 dataset_path,
                 temp_dir,
                 backend,
@@ -654,9 +669,7 @@ def trtllm_bench_unified_comparison(
         golden_absolute_tolerance: Absolute tolerance for golden comparison
         num_iterations: Number of benchmark iterations to run (default 10)
     """
-    model_name = _hf_model_dir_or_hub_id(
-        f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    )
+    model_path_or_name, model_name, model_path = tiny_llama_details()
 
     with tempfile.TemporaryDirectory() as temp_dir:
         with open(f"{temp_dir}/extra_llm_api_options.yaml", "w") as f:
@@ -671,12 +684,13 @@ def trtllm_bench_unified_comparison(
                 f,
             )
 
-        dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
+        dataset_path = prepare_dataset(llm_root, temp_dir, model_path_or_name)
 
         # Always run autodeploy backend with multiple iterations
         autodeploy_report_path = f"{temp_dir}/autodeploy_report.json"
         autodeploy_report = run_multiple_benchmarks_with_outlier_removal(
             model_name,
+            model_path,
             dataset_path,
             temp_dir,
             "_autodeploy",
@@ -700,6 +714,7 @@ def trtllm_bench_unified_comparison(
             pytorch_report_path = f"{temp_dir}/pytorch_report.json"
             pytorch_report = run_multiple_benchmarks_with_outlier_removal(
                 model_name,
+                model_path,
                 dataset_path,
                 temp_dir,
                 "pytorch",
@@ -785,9 +800,7 @@ def trtllm_bench_unified_comparison(
 
 
 def test_trtllm_bench(llm_root):  # noqa: F811
-    model_name = _hf_model_dir_or_hub_id(
-        f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    )
+    model_path_or_name, model_name, model_path = tiny_llama_details()
 
     with tempfile.TemporaryDirectory() as temp_dir:
         with open(f"{temp_dir}/extra_llm_api_options.yaml", "w") as f:
@@ -799,11 +812,12 @@ def test_trtllm_bench(llm_root):  # noqa: F811
                 f,
             )
 
-        dataset_path = prepare_dataset(llm_root, temp_dir, model_name)
-        run_benchmark(model_name, dataset_path, temp_dir)
+        dataset_path = prepare_dataset(llm_root, temp_dir, model_path_or_name)
+        run_benchmark(model_name, model_path, dataset_path, temp_dir)
 
 
 @pytest.mark.no_xdist
+@pytest.mark.skip(reason="https://nvbugs/5458798")
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
     """Test that compares autodeploy backend performance against pytorch backend
     with given relative and absolute thresholds.

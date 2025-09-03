@@ -28,6 +28,7 @@
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
 #include "tensorrt_llm/pybind/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/pybind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
@@ -158,6 +159,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("FP8", nvinfer1::DataType::kFP8)
         .value("BF16", nvinfer1::DataType::kBF16)
         .value("INT64", nvinfer1::DataType::kINT64)
+        .value("NVFP4", nvinfer1::DataType::kFP4)
         .export_values();
 
     py::enum_<tr::ModelConfig::ModelVariant>(m, "GptModelVariant")
@@ -236,6 +238,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("has_per_group_scaling", &tc::QuantMode::hasPerGroupScaling)
         .def_property_readonly("has_static_activation_scaling", &tc::QuantMode::hasStaticActivationScaling)
         .def_property_readonly("has_int8_kv_cache", &tc::QuantMode::hasInt8KvCache)
+        .def_property_readonly("has_fp4_kv_cache", &tc::QuantMode::hasFp4KvCache)
         .def_property_readonly("has_fp8_kv_cache", &tc::QuantMode::hasFp8KvCache)
         .def_property_readonly("has_fp8_qdq", &tc::QuantMode::hasFp8Qdq)
         .def_property_readonly("has_nvfp4", &tc::QuantMode::hasNvfp4)
@@ -468,6 +471,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tensorrt_llm::pybind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::pybind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);
+    tb::kv_cache_manager::KVCacheManagerConnectorBindings::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
