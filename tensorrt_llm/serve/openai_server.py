@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import asyncio
+import gc
 import os
 import re
 import signal
@@ -750,6 +751,7 @@ class OpenAIServer:
 
     async def __call__(self, host, port):
         # Store the binding address for server registration
+        gc.disable()
         self.binding_addr = f"http://{host}:{port}"
         config = uvicorn.Config(self.app,
                                 host=host,
