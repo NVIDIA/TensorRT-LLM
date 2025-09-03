@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 from .benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from .controller import (BestOfNController, Controller, MajorityVoteController,
                          NativeGenerationController, NativeRewardController,
@@ -8,7 +10,7 @@ from .scaffolding_llm import ScaffoldingLlm
 from .task import GenerationTask, RewardTask, Task, TaskStatus
 from .task_collection import (GenerationTokenCounter, TaskCollection,
                               with_task_collection)
-from .tree_controllers import MCTSController, TOTController
+from .contrib.TreeInference.tree_controllers import MCTSController, TOTController
 from .worker import OpenaiWorker, TRTLLMWorker, TRTOpenaiWorker, Worker
 
 __all__ = [

@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 import math
 import random
 from dataclasses import dataclass, field
@@ -5,9 +7,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
-from tensorrt_llm.scaffolding.controller import Controller
+from tensorrt_llm.scaffolding.controller import Controller, ParallelProcess
 from tensorrt_llm.scaffolding.task import GenerationTask, Task
-
 
 @dataclass
 class TreeNode:
@@ -76,7 +77,7 @@ class MCTSNode(TreeNode):
 class TOTNode(TreeNode):
     """Node for Tree of Thoughts."""
     thought: str = ""
-    confidence: float = 0.0
+    confidence: str = "Medium"
     reasoning: str = ""
     evaluation_score: float = 0.0
 
@@ -98,7 +99,8 @@ class MCTSController(Controller):
                  max_depth: int = 5,
                  max_iterations: int = 100,
                  exploration_constant: float = 1.414,
-                 num_thoughts_per_step: int = 3):
+                 num_thoughts_per_step: int = 3,
+                 expansion_parallel_samples: int = 1):
         super().__init__()
         self.generation_controller = generation_controller
         self.reward_controller = reward_controller
@@ -106,6 +108,7 @@ class MCTSController(Controller):
         self.max_iterations = max_iterations
         self.exploration_constant = exploration_constant
         self.num_thoughts_per_step = num_thoughts_per_step
+        self.expansion_parallel_samples = max(1, expansion_parallel_samples)
 
     def process(self, tasks: List[Task], **kwargs) -> Any:
         """Process tasks using MCTS with yield-based orchestration."""
@@ -114,9 +117,9 @@ class MCTSController(Controller):
         task = tasks[0]
         goal = kwargs.get('goal', 'Solve the problem step by step')
         initial_state = getattr(task, 'input_str', str(task)) or ""
-
-        # Build tree
         root = MCTSNode(state=initial_state)
+
+        
 
         for iteration in range(self.max_iterations):
             # Selection
@@ -127,35 +130,52 @@ class MCTSController(Controller):
             # Expansion
             if not node.is_terminal and node.depth < self.max_depth:
                 prompt = self._create_expansion_prompt(node, goal)
-                gen_task = GenerationTask.create_from_prompt(prompt)
-                gen_task.max_tokens = 200
-                gen_task.temperature = 0.7
 
-                # Delegate to generation controller
-                yield from self.generation_controller.process([gen_task])
-                thoughts = self._parse_thoughts(gen_task.output_str or "")
-                for thought in thoughts[:self.num_thoughts_per_step]:
+                # Parallelize expansion sampling if requested
+                gen_controllers: List[Controller] = []
+                gen_tasks_wrapped: List[List[GenerationTask]] = []
+                gen_kwargs_list: List[Dict[str, Any]] = []
+
+                for _ in range(self.expansion_parallel_samples):
+                    gen_task = GenerationTask.create_from_prompt(prompt)
+                    gen_task.max_tokens = 200
+                    gen_task.temperature = 0.7
+                    gen_controllers.append(self.generation_controller.clone())
+                    gen_tasks_wrapped.append([gen_task])
+                    gen_kwargs_list.append({})
+
+                if gen_controllers:
+                    yield ParallelProcess(gen_controllers, gen_tasks_wrapped,
+                                          gen_kwargs_list)
+
+                # Collect and merge thoughts from all parallel samples
+                merged_thoughts: List[str] = []
+                seen = set()
+                for [gen_task] in gen_tasks_wrapped:
+                    for t in self._parse_thoughts(gen_task.output_str or ""):
+                        if t not in seen:
+                            merged_thoughts.append(t)
+                            seen.add(t)
+
+                for thought in merged_thoughts[:self.num_thoughts_per_step]:
                     child_state = f"{node.state}\n{thought}".strip()
                     node.add_child(MCTSNode(state=child_state, reward=0.0))
                 if node.children:
                     node = random.choice(node.children)
 
-            # Simulation (evaluate node)
+            # Evaluate node
             if self.reward_controller is not None:
-                # Create a proper task for reward evaluation
-                # input_str should be the original problem, output_str should be the response to evaluate
                 reward_task = GenerationTask()
                 reward_task.input_str = initial_state
-
-                # Create a proper result with CompletionOutput before setting output_str
                 completion_output = CompletionOutput(index=0, text=node.state)
-                # Create a mock GenerationResult - we need sampling_params for the constructor
+
                 from tensorrt_llm.sampling_params import SamplingParams
                 mock_sampling_params = SamplingParams()
                 reward_result = GenerationResult.__new__(GenerationResult)
                 reward_result._outputs = [completion_output]
                 reward_result.sampling_params = mock_sampling_params
                 reward_task.result = reward_result
+                
                 yield from self.reward_controller.process([reward_task])
                 # Get reward from the reward controller
                 if hasattr(self.reward_controller,
@@ -205,7 +225,9 @@ Each thought should be a coherent reasoning step or action.
 Format your response as:
 1. [First thought]
 2. [Second thought]
-3. [Third thought]"""
+3. [Third thought]
+...
+"""
 
     def _parse_thoughts(self, text: str) -> List[str]:
         """Parse generated thoughts from text."""
@@ -281,76 +303,96 @@ class TOTController(Controller):
         task = tasks[0]
         goal = kwargs.get('goal', 'Solve the problem step by step')
         root_state = getattr(task, 'input_str', str(task)) or ""
-
+        
         root = TOTNode(state=root_state, thought="Initial problem")
         current_level: List[TOTNode] = [root]
-
+        iterations = 0
+        stop = False
+        
         for depth in range(self.max_depth):
+            if stop:
+                break
+
             next_level: List[TOTNode] = []
+
+            # 1) Parallel generation for all nodes in the current level
+            gen_controllers: List[Controller] = []
+            gen_tasks_wrapped: List[List[GenerationTask]] = []
+            gen_kwargs_list: List[Dict[str, Any]] = []
+            node_order: List[TOTNode] = []
+
             for node in current_level:
+                if stop:
+                    break
+
                 if node.is_terminal:
                     continue
-                # Generate thoughts for this node
                 gen_prompt = self._generate_prompt(node, goal)
                 gen_task = GenerationTask.create_from_prompt(gen_prompt)
                 gen_task.max_tokens = 512
                 gen_task.temperature = 0.8
-                yield from self.generation_controller.process([gen_task])
+
+                gen_controllers.append(self.generation_controller.clone())
+                gen_tasks_wrapped.append([gen_task])
+                gen_kwargs_list.append({})
+                node_order.append(node)
+                iterations+=1
+                if(iterations>=self.max_iterations):
+                    stop=True
+                    break
+
+            if gen_controllers:
+                yield ParallelProcess(gen_controllers, gen_tasks_wrapped,
+                                      gen_kwargs_list)
+
+            # 2) Parse thoughts per node, then (optionally) reward scoring per node
+            evaluated_by_node: Dict[int, List[Dict[str, Any]]] = {}
+
+            # Prepare a single batched reward request across all nodes (leverages worker concurrency)
+            all_reward_tasks: List[GenerationTask] = []
+            node_to_task_indices: Dict[int, List[int]] = {}
+
+            for idx, (node, [gen_task]) in enumerate(zip(node_order, gen_tasks_wrapped)):
                 thoughts = self._parse_approaches(gen_task.output_str or "")
 
-                # Evaluate each thought
                 evaluated_thoughts: List[Dict[str, Any]] = []
                 if not thoughts:
-                    # Nothing to evaluate for this node
+                    evaluated_by_node[idx] = evaluated_thoughts
                     continue
-                if self.reward_controller is not None and thoughts:
-                    # Use reward controller (e.g., PRM) to score thoughts
-                    reward_tasks: List[GenerationTask] = []
-                    # Import locally to avoid circular imports
+
+                if self.reward_controller is not None:
+                    # Build reward tasks for this node
+                    reward_indices_for_node: List[int] = []
                     from tensorrt_llm.sampling_params import SamplingParams
                     for thought in thoughts[:self.num_thoughts_per_step]:
                         reward_task = GenerationTask()
-                        # original problem as input
                         reward_task.input_str = root_state
 
-                        # Construct the assistant "response" to evaluate: current state + next thought
                         candidate_content = self._combine_state_and_thought(
                             node.state, thought)
 
-                        # Build a minimal GenerationResult carrying the text for PRMController to read
-                        completion_output = CompletionOutput(
-                            index=0, text=candidate_content)
+                        completion_output = CompletionOutput(index=0, text=candidate_content)
                         mock_sampling_params = SamplingParams()
-                        reward_result = GenerationResult.__new__(
-                            GenerationResult)
+                        reward_result = GenerationResult.__new__(GenerationResult)
                         reward_result._outputs = [completion_output]
                         reward_result.sampling_params = mock_sampling_params
                         reward_task.result = reward_result
-                        reward_tasks.append(reward_task)
 
-                    # Delegate scoring to reward controller
-                    yield from self.reward_controller.process(reward_tasks)
+                        reward_indices_for_node.append(len(all_reward_tasks))
+                        all_reward_tasks.append(reward_task)
 
-                    # Collect scores and build evaluated_thoughts
-                    scores = getattr(self.reward_controller, 'scores',
-                                     None) or []
-                    for thought, score in zip(
-                            thoughts[:self.num_thoughts_per_step], scores):
-                        # Normalize score to 1-10 scale if PRM returns 0-1
-                        normalized_score = float(score)
-                        if 0.0 <= normalized_score <= 1.0:
-                            normalized_score *= 10.0
-                        confidence = (
-                            'High' if normalized_score >= 8.0 else
-                            'Medium' if normalized_score >= 5.0 else 'Low')
-                        evaluated_thoughts.append({
-                            'thought': thought,
-                            'score': normalized_score,
-                            'confidence': confidence,
+                    node_to_task_indices[idx] = reward_indices_for_node
+
+                    evaluated_by_node[idx] = [
+                        {
+                            'thought': t,
+                            'score': 0.0,
+                            'confidence': 'Medium',
                             'reasoning': 'PRM score'
-                        })
+                        } for t in thoughts[:self.num_thoughts_per_step]
+                    ]
                 else:
-                    # Fallback: use LLM-generated evaluation and parse text
+                    # Fallback: sequential lightweight LLM self-eval for this node
                     for thought in thoughts[:self.num_thoughts_per_step]:
                         eval_prompt = self._evaluation_prompt(
                             thought, goal, node.state)
@@ -358,22 +400,40 @@ class TOTController(Controller):
                             eval_prompt)
                         eval_task.max_tokens = 256
                         eval_task.temperature = 0.3
-                        yield from self.generation_controller.process(
-                            [eval_task])
-                        evaluation = self._parse_evaluation(eval_task.output_str
-                                                            or "")
-                        evaluated_thoughts.append({
-                            'thought':
-                            thought,
-                            'score':
-                            evaluation['score'],
-                            'confidence':
-                            evaluation['confidence'],
-                            'reasoning':
-                            evaluation['reasoning']
-                        })
 
-                # Select top thoughts and create children
+                        yield from self.generation_controller.process([eval_task])
+                        evaluation = self._parse_evaluation(
+                            eval_task.output_str or "")
+                        evaluated_thoughts.append({
+                            'thought': thought,
+                            'score': evaluation['score'],
+                            'confidence': evaluation['confidence'],
+                            'reasoning': evaluation['reasoning']
+                        })
+                    evaluated_by_node[idx] = evaluated_thoughts
+
+            # Run all reward evaluations in a single batch
+            if self.reward_controller is not None and all_reward_tasks:
+                yield from self.reward_controller.process(all_reward_tasks)
+                scores = getattr(self.reward_controller, 'scores', None) or []
+
+                for node_idx, indices in node_to_task_indices.items():
+                    thoughts_for_node = evaluated_by_node[node_idx]
+                    for local_j, task_index in enumerate(indices):
+                        if task_index < len(scores):
+                            normalized_score = float(scores[task_index])
+                            if 0.0 <= normalized_score <= 1.0:
+                                normalized_score *= 10.0
+                            thoughts_for_node[local_j]['score'] = normalized_score
+                            thoughts_for_node[local_j]['confidence'] = (
+                                'High' if normalized_score >= 8.0 else
+                                'Medium' if normalized_score >= 5.0 else 'Low')
+
+            # 3) Selection and child creation
+            for idx, node in enumerate(node_order):
+                evaluated_thoughts = evaluated_by_node.get(idx, [])
+                if not evaluated_thoughts:
+                    continue
                 selected_thoughts = self._select_thoughts(evaluated_thoughts)
                 if not selected_thoughts:
                     continue
@@ -388,7 +448,7 @@ class TOTController(Controller):
                     node.add_child(child)
                     next_level.append(child)
 
-            if not next_level:
+            if stop or not next_level:
                 break
             current_level = next_level
 

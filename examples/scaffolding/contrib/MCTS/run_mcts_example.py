@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 import argparse
 
 from tensorrt_llm.scaffolding import (MCTSController,
@@ -20,6 +23,18 @@ def parse_arguments():
     parser.add_argument('--max_iterations', type=int, default=20)
     parser.add_argument('--exploration_constant', type=float, default=1.414)
     parser.add_argument('--num_thoughts_per_step', type=int, default=3)
+
+    # New tuning flags
+    parser.add_argument('--gen_kv_cache_free_gpu_memory_fraction',
+                        type=float,
+                        default=0.1)
+    parser.add_argument('--reward_kv_cache_free_gpu_memory_fraction',
+                        type=float,
+                        default=0.2)
+    parser.add_argument('--reward_overlap_scheduler',
+                        action='store_true',
+                        help='Enable overlap scheduler for reward worker (disabled by default)')
+
     args = parser.parse_args()
     return args
 
@@ -32,7 +47,7 @@ def main():
         backend="pytorch",
         max_batch_size=4,
         max_num_tokens=8192,
-        kv_cache_free_gpu_memory_fraction=0.1)
+        kv_cache_free_gpu_memory_fraction=args.gen_kv_cache_free_gpu_memory_fraction)
     workers[NativeGenerationController.WorkerTag.GENERATION] = gen_worker
 
     # Initialize reward worker if provided
@@ -42,8 +57,8 @@ def main():
         backend="pytorch",
         max_batch_size=4,
         max_num_tokens=8192,
-        kv_cache_free_gpu_memory_fraction=0.2,
-        disable_overlap_scheduler=True)
+        kv_cache_free_gpu_memory_fraction=args.reward_kv_cache_free_gpu_memory_fraction,
+        disable_overlap_scheduler=not args.reward_overlap_scheduler)
     workers[PRMController.WorkerTag.REWARD] = reward_worker
 
     # Create generation controller
