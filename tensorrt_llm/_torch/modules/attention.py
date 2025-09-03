@@ -951,7 +951,7 @@ class MLA(nn.Module):
 
         hidden_states = hidden_states[:num_tokens, ...]
         if position_ids is not None:
-            position_ids = position_ids[:num_tokens, ...]
+            position_ids = position_ids[:, :num_tokens]
 
         if self.is_lite:
             compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
