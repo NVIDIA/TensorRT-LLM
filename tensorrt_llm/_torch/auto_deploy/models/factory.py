@@ -35,10 +35,6 @@ class ModelFactory(ABC):
         tokenizer: Optional[str] = None,
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         skip_loading_weights: bool = False,
-        simple_shard_only: bool = False,
-        use_sharding_from_factory: bool = False,
-        support_partial_config: bool = False,
-        sharding_dims: list[str] = ["tp", "ep", "bmm"],
         max_seq_len: int = 512,
         **kwargs,
     ):
@@ -47,10 +43,6 @@ class ModelFactory(ABC):
         self._tokenizer = tokenizer
         self.tokenizer_kwargs = copy.deepcopy(tokenizer_kwargs or {})
         self.skip_loading_weights = skip_loading_weights
-        self.simple_shard_only = simple_shard_only
-        self.use_sharding_from_factory = use_sharding_from_factory
-        self.support_partial_config = support_partial_config
-        self.sharding_dims = sharding_dims
         self.max_seq_len = max_seq_len
         self._prefetched_model_path: Optional[str] = None
         self._prefetched_tokenizer_path: Optional[str] = None

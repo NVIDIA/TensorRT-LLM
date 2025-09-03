@@ -184,11 +184,13 @@ class Sharding(BaseTransform):
             if factory
             else ShardingConfigSource.UNKNOWN
         )
-        shared_config.sharding_config.simple_shard_only = factory.simple_shard_only
-        shared_config.sharding_config.support_partial_config = factory.support_partial_config
-        shared_config.sharding_config.sharding_dims = factory.sharding_dims
+        shared_config.sharding_config.simple_shard_only = self.config.simple_shard_only
+        shared_config.sharding_config.support_partial_config = self.config.support_partial_config
+        shared_config.sharding_config.sharding_dims = self.config.sharding_dims
 
-        shared_config.sharding_config.use_sharding_from_factory = factory.use_sharding_from_factory
+        shared_config.sharding_config.use_sharding_from_factory = (
+            self.config.use_sharding_from_factory
+        )
 
         sharding_config = shared_config.sharding_config
         sharding_config.validate_config()
