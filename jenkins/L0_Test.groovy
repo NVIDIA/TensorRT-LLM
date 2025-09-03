@@ -1443,6 +1443,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
     }
 
+    stage("Test machine") {
+        try {
+            sh "python3 ${llmSrc}/jenkins/scripts/gemm_test.py"
+            echo "GEMM test completed successfully. The machine is healthy."
+        } catch (Exception e) {
+            echo "GEMM test failed: ${e.getMessage()}"
+            error("Machine Error: GEMM test failed, please check CUDA and GPU environment.")
+        }
+    }
+
     // Step 2: run tests
     stage ("Setup environment")
     {
