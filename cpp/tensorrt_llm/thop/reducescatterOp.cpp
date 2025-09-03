@@ -180,13 +180,20 @@ public:
     {
         std::vector<torch::Tensor> output_list;
         output_list.reserve(input_list.size());
-        // mProcessGroup->startCoalescing(c10::DeviceType::CUDA);
+        bool const isCapturing = c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None;
+        if (!isCapturing)
+        {
+            mProcessGroup->startCoalescing(c10::DeviceType::CUDA);
+        }
         for (auto const& input : input_list)
         {
             auto output = run(input, sizes);
             output_list.push_back(output);
         }
-        // mProcessGroup->endCoalescing(c10::DeviceType::CUDA)->wait();
+        if (!isCapturing)
+        {
+            mProcessGroup->endCoalescing(c10::DeviceType::CUDA)->wait();
+        }
         return output_list;
     }
 
