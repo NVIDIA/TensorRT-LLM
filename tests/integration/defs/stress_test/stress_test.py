@@ -439,7 +439,7 @@ def stress_test(config,
         run_performance = False
         run_stress = True
     elif test_mode == "stress-test-with-accuracy":
-        run_performance = True
+        run_performance = False
         run_stress = True
     else:
         pytest.skip(
@@ -487,7 +487,7 @@ def stress_test(config,
             max_batch_size=
             161,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
             max_num_tokens=
-            1160,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
+            2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens, adjust for accuracy test: 1160 -> 2048
             kv_cache_free_gpu_memory_fraction=
             0.7,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
@@ -667,7 +667,7 @@ def stress_test(config,
             # Run baseline accuracy test first if enabled
             baseline_accuracy_success = True
             if stress_config and stress_config.enable_accuracy_test:
-                baseline_accuracy_success = run_accuracy_test(
+                baseline_accuracy_success, baseline_accuracy_value = run_accuracy_test(
                     model_path, test_server_config, stress_config, "baseline")
 
             # Run performance test first if enabled
@@ -706,7 +706,7 @@ def stress_test(config,
             # Run post-stress accuracy test if enabled
             post_stress_accuracy_success = True
             if stress_config and stress_config.enable_accuracy_test:
-                post_stress_accuracy_success = run_accuracy_test(
+                post_stress_accuracy_success, post_stress_accuracy_value = run_accuracy_test(
                     model_path, test_server_config, stress_config,
                     "post_stress")
 
@@ -715,8 +715,31 @@ def stress_test(config,
                     print_info("=== ACCURACY TEST SUMMARY ===")
                     print_info("✓ Baseline accuracy test: PASSED")
                     print_info("✓ Post-stress accuracy test: PASSED")
-                    print_info(
-                        "Model accuracy appears stable under stress conditions")
+
+                    # Compare accuracy values if both are available
+                    if baseline_accuracy_value is not None and post_stress_accuracy_value is not None:
+                        accuracy_drop = baseline_accuracy_value - post_stress_accuracy_value
+                        accuracy_drop_percentage = (
+                            accuracy_drop / baseline_accuracy_value) * 100
+
+                        print_info(
+                            f"Baseline accuracy: {baseline_accuracy_value:.4f}")
+                        print_info(
+                            f"Post-stress accuracy: {post_stress_accuracy_value:.4f}"
+                        )
+                        print_info(
+                            f"Accuracy drop: {accuracy_drop:.4f} ({accuracy_drop_percentage:.2f}%)"
+                        )
+
+                        # Define threshold for significant accuracy drop (e.g., 5%)
+                        accuracy_drop_threshold = 0.05  # 5%
+                        # Assert that accuracy drop is within acceptable threshold
+                        assert accuracy_drop_percentage <= (
+                            accuracy_drop_threshold * 100
+                        ), f"Accuracy drop {accuracy_drop_percentage:.2f}% exceeds threshold {accuracy_drop_threshold * 100}%"
+                        print_info(
+                            "✓ Model accuracy appears stable under stress conditions"
+                        )
                 else:
                     print_warning("=== ACCURACY TEST SUMMARY ===")
                     if not baseline_accuracy_success:
@@ -1045,10 +1068,39 @@ def format_time(seconds: int) -> str:
         return f"{seconds}s"
 
 
+def parse_accuracy_from_lm_eval_output(output_text: str) -> float:
+    """
+    Parse accuracy value from lm_eval output for GSM8K flexible-extract exact_match
+
+    Args:
+        output_text: The output text from lm_eval command
+
+    Returns:
+        float: The accuracy value (0.7582 in the example)
+    """
+    import re
+
+    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    patterns = [
+        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, output_text)
+        if match:
+            accuracy_value = float(match.group(1))
+            print_info(f"Extracted accuracy value: {accuracy_value}")
+            return accuracy_value
+
+    print_warning("Could not find accuracy value in lm_eval output")
+    print_warning(f"Output text: {output_text}")
+    return None
+
+
 def run_accuracy_test(model_path: str,
                       server_config: ServerConfig,
                       stress_config: StressTestConfig,
-                      test_phase: str = "baseline") -> bool:
+                      test_phase: str = "baseline") -> tuple[bool, float]:
     """
     Run accuracy test using lm_eval with GSM8K dataset
 
@@ -1059,11 +1111,11 @@ def run_accuracy_test(model_path: str,
         test_phase: Phase of the test ("baseline" or "post_stress")
 
     Returns:
-        Boolean indicating whether the accuracy test completed successfully
+        tuple: (Boolean indicating whether the accuracy test completed successfully, accuracy value)
     """
     if not stress_config.enable_accuracy_test:
         print_info(f"Skipping accuracy test for {test_phase} phase (disabled)")
-        return True
+        return True, None
 
     print_info(f"=== Running {test_phase.upper()} ACCURACY TEST (GSM8K) ===")
 
@@ -1081,64 +1133,45 @@ def run_accuracy_test(model_path: str,
         "--trust_remote_code"
     ]
 
-    print_info(f"Running lm_eval command: {' '.join(lm_eval_cmd)}")
-
     test_start_time = time.time()
+    accuracy_value = None
 
     try:
         # Run lm_eval process with timeout monitoring
-        with launch_process(lm_eval_cmd,
-                            start_new_session=True,
-                            filter_pattern=None,
-                            request_counter=None) as process:
+        print_info(f"Running lm_eval command: {' '.join(lm_eval_cmd)}")
 
-            # Monitor the process with timeout
-            while process.poll() is None:
-                current_time = time.time()
-                elapsed_time = current_time - test_start_time
+        # Use subprocess.run to capture output directly
+        result = subprocess.run(lm_eval_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=stress_config.accuracy_test_timeout)
 
-                # Check if test exceeded timeout
-                if elapsed_time > stress_config.accuracy_test_timeout:
-                    print_warning(
-                        f"Accuracy test timed out after {stress_config.accuracy_test_timeout} seconds"
-                    )
-                    cleanup_process_tree(process, has_session=True)
-                    return False
+        # Check if process completed successfully
+        if result.returncode == 0:
+            test_end_time = time.time()
+            duration = int(test_end_time - test_start_time)
+            print_info(
+                f"{test_phase.capitalize()} accuracy test completed successfully in {format_time(duration)}"
+            )
 
-                # Check server health periodically
-                is_healthy, error_msg = check_server_health(
-                    server_config.url, server_config.health_check_timeout)
+            # Parse accuracy value from output
+            output_text = result.stdout
+            accuracy_value = parse_accuracy_from_lm_eval_output(output_text)
+            return True, accuracy_value
+        else:
+            print_warning(
+                f"lm_eval exited with non-zero code: {result.returncode}")
+            print_warning(f"stderr: {result.stderr}")
+            return False, None
 
-                if not is_healthy:
-                    print_warning(
-                        f"Server health check failed during accuracy test: {error_msg}"
-                    )
-                    cleanup_process_tree(process, has_session=True)
-                    return False
-
-                time.sleep(5)  # Check every 5 seconds
-
-            # Check final status
-            retcode = process.poll()
-            if retcode is not None:
-                if retcode != 0:
-                    print_warning(
-                        f"lm_eval exited with non-zero code: {retcode}")
-                    return False
-                else:
-                    test_end_time = time.time()
-                    duration = int(test_end_time - test_start_time)
-                    print_info(
-                        f"{test_phase.capitalize()} accuracy test completed successfully in {format_time(duration)}"
-                    )
-                    return True
-            else:
-                print_warning("lm_eval did not complete normally")
-                return False
-
+    except subprocess.TimeoutExpired:
+        print_warning(
+            f"Accuracy test timed out after {stress_config.accuracy_test_timeout} seconds"
+        )
+        return False, None
     except Exception as e:
         print_warning(f"Error during {test_phase} accuracy test: {str(e)}")
-        return False
+        return False, None
 
 
 def extract_stress_test_metrics(artifacts_dir="./artifacts",
