@@ -67,7 +67,6 @@ __all__ = [
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
     "GptOssForCausalLM",
-    "SeedOssForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":
