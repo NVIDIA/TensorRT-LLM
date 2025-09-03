@@ -22,6 +22,7 @@ import sys
 from typing import Dict, List, NamedTuple
 
 import pytest
+import yaml
 from defs.common import convert_weights, get_cpp_benchmark, quantize_data
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
@@ -269,6 +270,12 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.KV_CACHE_SIZE:
     re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
 }
+DISAGG_SERVER_METRICS_LOG_QUERIES = {
+    PerfMetricType.DISAGG_SERVER_E2EL:
+    re.compile(r"Median E2EL \(ms\):\s*(\d+\.?\d*)"),
+    PerfMetricType.DISAGG_SERVER_TTFT:
+    re.compile(r"Median TTFT \(ms\):\s*(\d+\.?\d*)"),
+}
 # (Relative threshold, Absolute threshold) for all metric types
 PERF_METRIC_THRESHOLD = {
     PerfMetricType.BUILD_TIME: (0.1, 30),  # Ignore build time regression < 30ms
@@ -296,6 +303,8 @@ PERF_METRIC_THRESHOLD = {
     PerfMetricType.CONTEXT_GPU_MEMORY:
     (0.1, 50),  # Ignore context GPU memory < 50MiB
     PerfMetricType.KV_CACHE_SIZE: (-0.1, 50),  # Ignore value < 50MiB
+    PerfMetricType.DISAGG_SERVER_E2EL: (0.1, 50),  # Ignore E2EL < 50ms?
+    PerfMetricType.DISAGG_SERVER_TTFT: (0.1, 50),  # Ignore TTFT < 50ms?
 }
 
 BUILDER_METRICS = [
@@ -328,6 +337,11 @@ BENCH_INFERENCE_METRICS = [
     PerfMetricType.TOKEN_THROUGHPUT,
     PerfMetricType.SEQ_THROUGHPUT,
     PerfMetricType.KV_CACHE_SIZE,
+]
+
+DISAGG_SERVER_METRICS = [
+    PerfMetricType.DISAGG_SERVER_E2EL,
+    PerfMetricType.DISAGG_SERVER_TTFT,
 ]
 
 
@@ -441,6 +455,11 @@ class PerfTestConfig:
         self.num_gpus = num_gpus
         # Just build engines
         self.build_only = False
+
+        # Whether to run disaggregated server perf test.
+        self.is_disagg_server = False
+        self.ctx_server_workers = 0
+        self.gen_server_workers = 0
 
     def to_string(self,
                   custom_bs: int = None,
@@ -557,6 +576,8 @@ class PerfTestConfig:
         # Add number of GPUs.
         if self.num_gpus > 1:
             entries.append(f"gpus:{self.num_gpus}")
+        if self.is_disagg_server:
+            entries.append(f"disagg_server")
 
         # Concatenate labels with "-".
         return "-".join(entries)
@@ -573,101 +594,112 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         self.model_name = labels.pop(0)
-        assert labels[0] in ["cpp", "cppmanager", "bench"], \
-            f"Invalid runtime {labels[0]}!"
-        self.runtime = labels.pop(0)
-        self.api = labels.pop(0) if labels[0] == "exe" else ""
-        self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
-        self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
-        self.static_batching = labels.pop(
-            0) if labels[0] == "static_batching" else ""
-        if self.runtime != "bench":
-            self.mode = labels.pop(0)
-        self.data_type = labels.pop(0)
-        if labels[0].startswith("gwp"):
-            self.gpu_weights_percent = float(labels.pop(0).replace("gwp:", ""))
+        # assert labels[0] in ["cpp", "cppmanager", "bench"], \
+        #     f"Invalid runtime {labels[0]}!"
+        # self.runtime = labels.pop(0)
+        # self.api = labels.pop(0) if labels[0] == "exe" else ""
+        # self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
+        # self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
+        # self.static_batching = labels.pop(
+        #     0) if labels[0] == "static_batching" else ""
+        # if self.runtime != "bench":
+        #     self.mode = labels.pop(0)
+        # self.data_type = labels.pop(0)
+        # if labels[0].startswith("gwp"):
+        #     self.gpu_weights_percent = float(labels.pop(0).replace("gwp:", ""))
 
-        if labels[0] == "mp":
-            self.multiple_profiles = True
+        # if labels[0] == "mp":
+        #     self.multiple_profiles = True
+        #     labels.pop(0)
+
+        # if labels[0].startswith("maxbs"):
+        #     self.max_batch_size = int(labels.pop(0).replace("maxbs:", ""))
+
+        # if labels[0].startswith("maxnt"):
+        #     self.max_num_tokens = int(labels.pop(0).replace("maxnt:", ""))
+
+        # if labels[0].startswith("kv_frac"):
+        #     self.kv_cache_free_gpu_mem_fraction = float(
+        #         labels.pop(0).replace("kv_frac:", ""))
+
+        # if labels[0] == "build_only":
+        #     self.build_only = True
+        #     labels.pop(0)
+
+        # if not self.build_only:
+        #     if labels[0].startswith("bs:"):
+        #         self.batch_sizes = [
+        #             int(x) for x in labels.pop(0).replace("bs:", "").split("+")
+        #         ]
+        #     else:
+        #         self.batch_sizes = [0]
+
+        #     if labels[0].startswith("input_output_len"):
+        #         io_lens = labels.pop(0).replace("input_output_len:",
+        #                                         "").split("+")
+        #         self.input_lens = [int(x.split(",")[0]) for x in io_lens]
+        #         self.output_lens = [int(x.split(",")[1]) for x in io_lens]
+        #     elif labels[0].startswith("input_len"):
+        #         self.input_lens = [
+        #             int(x)
+        #             for x in labels.pop(0).replace("input_len:", "").split("+")
+        #         ]
+        #         self.output_lens = []
+        #     else:
+        #         raise RuntimeError(
+        #             f"Unexpected test name label for seq lens: {labels[0]}!")
+
+        # if len(labels) > 0:
+        #     self.num_beams = 1 if not labels[0].startswith("beams:") else int(
+        #         labels.pop(0).replace("beams:", ""))
+
+        # if len(labels) > 0:
+        #     self.num_loras = 0 if not labels[0].startswith("loras:") else int(
+        #         labels.pop(0).replace("loras:", ""))
+
+        # if len(labels) > 0:
+        #     self.quantization = "" if not labels[0].startswith(
+        #         "quant:") else labels.pop(0).replace("quant:", "")
+
+        # if len(labels) > 0:
+        #     self.kv_cache_dtype = "auto" if not labels[0].startswith(
+        #         "kv_cache_dtype:") else labels.pop(0).replace(
+        #             "kv_cache_dtype:", "")
+
+        # if len(labels) > 0:
+        #     self.num_reqs = 512 if not labels[0].startswith("reqs:") else int(
+        #         labels.pop(0).replace("reqs:", ""))
+
+        # if len(labels) > 0:
+        #     self.concurrency = -1 if not labels[0].startswith("con:") else int(
+        #         labels.pop(0).replace("con:", ""))
+
+        # if len(labels) > 0:
+        #     self.ep_size = None if not labels[0].startswith("ep:") else int(
+        #         labels.pop(0).replace("ep:", ""))
+
+        # if len(labels) > 0:
+        #     self.tp_size = 1 if not labels[0].startswith("tp:") else int(
+        #         labels.pop(0).replace("tp:", ""))
+
+        # if len(labels) > 0:
+        #     self.pp_size = 1 if not labels[0].startswith("pp:") else int(
+        #         labels.pop(0).replace("pp:", ""))
+
+        # if len(labels) > 0:
+        #     self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
+        #         labels.pop(0).replace("gpus:", ""))
+
+        if len(labels) > 0:
+            self.is_disagg_server = True if labels[0].startswith(
+                "disagg_server") else False
             labels.pop(0)
-
-        if labels[0].startswith("maxbs"):
-            self.max_batch_size = int(labels.pop(0).replace("maxbs:", ""))
-
-        if labels[0].startswith("maxnt"):
-            self.max_num_tokens = int(labels.pop(0).replace("maxnt:", ""))
-
-        if labels[0].startswith("kv_frac"):
-            self.kv_cache_free_gpu_mem_fraction = float(
-                labels.pop(0).replace("kv_frac:", ""))
-
-        if labels[0] == "build_only":
-            self.build_only = True
-            labels.pop(0)
-
-        if not self.build_only:
-            if labels[0].startswith("bs:"):
-                self.batch_sizes = [
-                    int(x) for x in labels.pop(0).replace("bs:", "").split("+")
-                ]
-            else:
-                self.batch_sizes = [0]
-
-            if labels[0].startswith("input_output_len"):
-                io_lens = labels.pop(0).replace("input_output_len:",
-                                                "").split("+")
-                self.input_lens = [int(x.split(",")[0]) for x in io_lens]
-                self.output_lens = [int(x.split(",")[1]) for x in io_lens]
-            elif labels[0].startswith("input_len"):
-                self.input_lens = [
-                    int(x)
-                    for x in labels.pop(0).replace("input_len:", "").split("+")
-                ]
-                self.output_lens = []
-            else:
-                raise RuntimeError(
-                    f"Unexpected test name label for seq lens: {labels[0]}!")
-
         if len(labels) > 0:
-            self.num_beams = 1 if not labels[0].startswith("beams:") else int(
-                labels.pop(0).replace("beams:", ""))
-
+            self.ctx_server_workers = 0 if not labels[0].startswith(
+                "ctx:") else int(labels.pop(0).replace("ctx:", ""))
         if len(labels) > 0:
-            self.num_loras = 0 if not labels[0].startswith("loras:") else int(
-                labels.pop(0).replace("loras:", ""))
-
-        if len(labels) > 0:
-            self.quantization = "" if not labels[0].startswith(
-                "quant:") else labels.pop(0).replace("quant:", "")
-
-        if len(labels) > 0:
-            self.kv_cache_dtype = "auto" if not labels[0].startswith(
-                "kv_cache_dtype:") else labels.pop(0).replace(
-                    "kv_cache_dtype:", "")
-
-        if len(labels) > 0:
-            self.num_reqs = 512 if not labels[0].startswith("reqs:") else int(
-                labels.pop(0).replace("reqs:", ""))
-
-        if len(labels) > 0:
-            self.concurrency = -1 if not labels[0].startswith("con:") else int(
-                labels.pop(0).replace("con:", ""))
-
-        if len(labels) > 0:
-            self.ep_size = None if not labels[0].startswith("ep:") else int(
-                labels.pop(0).replace("ep:", ""))
-
-        if len(labels) > 0:
-            self.tp_size = 1 if not labels[0].startswith("tp:") else int(
-                labels.pop(0).replace("tp:", ""))
-
-        if len(labels) > 0:
-            self.pp_size = 1 if not labels[0].startswith("pp:") else int(
-                labels.pop(0).replace("pp:", ""))
-
-        if len(labels) > 0:
-            self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
-                labels.pop(0).replace("gpus:", ""))
+            self.gen_server_workers = 0 if not labels[0].startswith(
+                "gen:") else int(labels.pop(0).replace("gen:", ""))
 
         assert len(
             labels
@@ -680,7 +712,8 @@ class PerfTestConfig:
         """
         Validate if the config makes sense.
         """
-
+        if self.is_disagg_server:
+            return
         # Validate model name.
         assert len(self.model_name) > 0, "model_name must not be empty!"
         assert "-" not in self.model_name, "model_name must not contain '-' character!"
@@ -1787,6 +1820,293 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         return PERF_METRIC_THRESHOLD[metric_type][1]
 
 
+class DisaggregatedServerPerfTest(AbstractPerfScriptTestClass):
+
+    def __init__(self, full_test_name: str):
+        # full_test_name is the full test name appearing in test output.
+        self._full_test_name = full_test_name
+        # test_domain_name is the part before "::".
+        self._test_domain_name = "::".join(full_test_name.split("::")[:-1])
+        # short_test_name is the part after "::".
+        self._short_test_name = full_test_name.split("::")[-1]
+        # short_test_name_body is the part before "[" in short_test_name.
+        self._short_test_name_body = self._short_test_name.split("[")[0]
+        # test_param_labels is the part inside "[...]".
+        self._test_param_labels = full_test_name.split("[")[-1][:-1]
+        self._config = PerfTestConfig()
+        self._config.load_from_str(self._test_param_labels)
+        self._current_metric = None
+
+    def set_runtime_configs(self, llm_root, working_dir,
+                            perf_cache_fpath) -> None:
+        self._llm_root = llm_root
+        self._working_dir = working_dir
+        self._perf_cache_fpath = perf_cache_fpath
+
+    def get_test_name(self) -> str:
+        return str(self._config)
+
+    def gen_worker_config(self):
+        ctx_config = {
+            # 'max_batch_size': ctx_batch_size,
+            # 'max_num_tokens': ctx_max_num_tokens,
+            # 'max_seq_len': ctx_max_seq_len,
+            # 'tensor_parallel_size': ctx_tp_size,
+            # 'moe_expert_parallel_size': ctx_tp_size,
+            # 'enable_attention_dp': True if ctx_enable_attention_dp else False,
+            # 'pipeline_parallel_size': ctx_pp_size,
+            # 'print_iter_log': True,
+            # 'disable_overlap_scheduler': True,
+            # 'kv_cache_config': {
+            #     'enable_block_reuse': False,
+            #     # 'free_gpu_memory_fraction': ctx_free_gpu_memory_fraction,
+            #     'free_gpu_memory_fraction': 0.5,
+            #     'dtype': 'fp8',
+            # },
+            'disable_overlap_scheduler': True,
+            'cache_transceiver_config': {
+                # 'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
+                'max_tokens_in_buffer': 2048,
+                'backend': 'DEFAULT',
+            },
+        }
+
+        gen_config = {
+            # 'tensor_parallel_size': gen_tp_size,
+            # 'moe_expert_parallel_size': gen_tp_size,
+            # 'enable_attention_dp': True if gen_enable_attention_dp else False,
+            # 'pipeline_parallel_size': gen_pp_size,
+            # 'max_batch_size': gen_batch_size,
+            # 'max_num_tokens': gen_max_num_tokens,
+            # 'max_seq_len': gen_max_seq_len,
+            # 'cuda_graph_config': {
+            #     'enable_padding': True,
+            #     'batch_sizes': gen_cuda_graph_batch_sizes,
+            # },
+            # 'print_iter_log': True,
+            # 'kv_cache_config': {
+            #     'enable_block_reuse': False,
+            #     'free_gpu_memory_fraction': gen_gpu_memory_fraction,
+            #     'dtype': 'fp8',
+            # },
+            # 'moe_config': {
+            #     'backend': gen_moe_backend,
+            # },
+            'cache_transceiver_config': {
+                'max_tokens_in_buffer': 2048,
+                'backend': 'DEFAULT',
+            },
+            # 'stream_interval': 20,
+        }
+        return ctx_config, gen_config
+
+    def gen_server_config(self):
+        server_config = {
+            'hostname': 'localhost',
+            'port': 8000,
+            'backend': 'pytorch',
+            'context_servers': {
+                'num_instances': 1,
+                'urls': ['localhost:8001']
+            },
+            'generation_servers': {
+                'num_instances': 1,
+                'urls': ['localhost:8002']
+            }
+        }
+        return server_config
+
+    def get_worker_deploy_command(self):
+        ctx_config, gen_config = self.gen_worker_config()
+        ctx_config_path = os.path.join(self._working_dir, "ctx_config.yaml")
+        gen_config_path = os.path.join(self._working_dir, "gen_config.yaml")
+        with open(ctx_config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(ctx_config, f)
+        with open(gen_config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(gen_config, f)
+
+        model_path = MODEL_PATH_DICT[self._config.model_name]
+        model_dir = os.path.join(llm_models_root(), model_path)
+
+        ctx_gpu_list = ",".join(
+            [str(i) for i in range(self._config.ctx_server_workers)])
+
+        gen_gpu_list = ",".join([
+            str(i) for i in range(
+                self._config.ctx_server_workers,
+                self._config.ctx_server_workers +
+                self._config.gen_server_workers)
+        ])
+
+        ctx_cmd = f'CUDA_VISIBLE_DEVICES={ctx_gpu_list} trtllm-serve {model_dir} --host localhost --port 8001 --extra_llm_api_options {ctx_config_path}'
+        gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} trtllm-serve {model_dir} --host localhost --port 8002 --extra_llm_api_options {gen_config_path}'
+        return ctx_cmd, gen_cmd
+
+    def get_server_deploy_command(self):
+        server_config = self.gen_server_config()
+        server_config_path = os.path.join(self._working_dir,
+                                          "server_config.yaml")
+        with open(server_config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(server_config, f)
+        return f'trtllm-serve disaggregated -c {server_config_path} -t 3600 -r 3600'
+
+    def get_benchmark_command(self):
+        benchmark_script = os.path.join(self._llm_root, "tensorrt_llm", "serve",
+                                        "scripts", "benchmark_serving.py")
+        model_path = MODEL_PATH_DICT[self._config.model_name]
+        model_dir = os.path.join(llm_models_root(), model_path)
+        shared_gpt_path = os.path.join(
+            llm_models_root(), "datasets",
+            "ShareGPT_V3_unfiltered_cleaned_split.json")
+        benchmark_cmd = [
+            'python3',
+            benchmark_script,
+            '--model',
+            model_dir,
+            '--tokenizer',
+            model_dir,
+            '--dataset-name',
+            'random',
+            '--dataset-path',
+            shared_gpt_path,
+            '--random-input-len',
+            '256',
+            '--random-output-len',
+            '64',
+            '--random-prefix-len',
+            '0',
+            '--num-prompts',
+            '320',
+            '--max-concurrency',
+            '32',
+            '--host',
+            'localhost',
+            '--port',
+            '8000',
+            '--ignore-eos',
+            '--no-test-input',
+            '--percentile-metrics',
+            'e2el,ttft',
+        ]
+        return benchmark_cmd
+
+    def get_commands(self):
+        ctx_cmd, gen_cmd = self.get_worker_deploy_command()
+        server_cmd = self.get_server_deploy_command()
+        benchmark_cmd = self.get_benchmark_command()
+        return ctx_cmd, gen_cmd, server_cmd, benchmark_cmd
+
+    def _get_metrics(self) -> List[PerfTestMetric]:
+        metrics = []
+        for metric_type in DISAGG_SERVER_METRICS:
+            metrics.append(
+                PerfTestMetric(
+                    original_test_name=self._full_test_name,
+                    metric_name=self._get_metric_name(metric_type),
+                    metric_type=metric_type,
+                    metric_regex=self._get_metric_regex(metric_type),
+                    metric_threshold=self._get_metric_threshold(metric_type),
+                    metric_abs_threshold=self._get_metric_abs_threshold(
+                        metric_type),
+                    cmd_idx=0,
+                ))
+        return metrics
+
+    def _get_metric_name(self, metric_type: PerfMetricType) -> str:
+        metric_name = f"test_perf_metric_{metric_type.lower()}"
+        return self._test_domain_name + "::" + metric_name
+
+    def _get_metric_regex(self, metric_type: PerfMetricType) -> re.Pattern:
+        if metric_type not in DISAGG_SERVER_METRICS_LOG_QUERIES:
+            raise ValueError(f"Unexpected metric_type: {metric_type}")
+        return DISAGG_SERVER_METRICS_LOG_QUERIES[metric_type]
+
+    def _get_metric_threshold(self, metric_type: PerfMetricType) -> float:
+        if metric_type not in PERF_METRIC_THRESHOLD:
+            raise ValueError(f"Unexpected metric_type: {metric_type}")
+        return PERF_METRIC_THRESHOLD[metric_type][0]
+
+    def _get_metric_abs_threshold(self, metric_type: PerfMetricType) -> float:
+        if metric_type not in PERF_METRIC_THRESHOLD:
+            raise ValueError(f"Unexpected metric_type: {metric_type}")
+        return PERF_METRIC_THRESHOLD[metric_type][1]
+
+    def run_metrics(self, llm_venv, gpu_clock_lock, session_data_writer,
+                    output_dir):
+        """
+        Run through the commands and parse multiple perf metrics from the logs.
+        """
+        #print info to separate cases
+        print_info(f"Running perf test for case: {self._short_test_name}")
+        metrics = self._get_metrics()
+        outputs = {}
+        result_states = {}
+        errors = []
+        print_info(f"Running command for disaggregated server perf test")
+        try:
+            for metric in metrics:
+                self._current_metric = metric
+                self._current_cmd_idx = metric.cmd_idx
+                outputs = self.run_disagg_server(
+                    self._full_test_name,
+                    llm_venv,
+                    gpu_clock_lock,
+                    session_data_writer,
+                    output_dir,
+                    outputs,
+                    original_test_name=self._full_test_name,
+                    cmd_idx=0)
+                result_state = self.get_result_state()
+                result_states[self._current_cmd_idx] = result_state
+        finally:
+            # Clean up engine dir after use.
+            print("clean what?")
+
+        # Check if any commands failed.
+        if not all([result_states[idx] == "valid" for idx in result_states]):
+            # If there is only one error, throw it directly.
+            if len(errors) == 1:
+                raise errors[0]
+
+            # Otherwise, combine all the error messages and re-raise a generic RuntimeError.
+            msg = "Multiple Errors happened:\n"
+            for error_idx, e in enumerate(errors):
+                msg += f"> Error {error_idx+1}/{len(errors)}: {type(e).__name__}: {e}\n"
+
+            raise RuntimeError(msg)
+
+    def set_runtime_configs(self, llm_root, working_dir,
+                            perf_cache_fpath) -> None:
+        self._working_dir = working_dir
+        self._perf_cache_fpath = perf_cache_fpath
+        self._llm_root = llm_root
+
+    def get_perf_result(self, outputs: Dict[int, str]) -> float:
+
+        metric = self._current_metric
+        metric_name = metric.metric_name
+
+        regex_matches = [
+            metric.metric_regex.search(line) for line in outputs[0].split("\n")
+        ]
+        metric_values = [
+            float(match.group(1)) for match in regex_matches if match
+        ]
+        metric_value = metric_values[0]
+        print_info(f"Use value {metric_value} for perf metric {metric_name}.")
+
+        return metric_value
+
+    def get_threshold(self) -> float:
+        return self._current_metric.metric_threshold
+
+    def get_absolute_threshold(self) -> float:
+        return self._current_metric.metric_abs_threshold
+
+    def get_metric_type(self) -> PerfMetricType:
+        return self._current_metric.metric_type
+
+
 def run_perf_test(perf_case_name, trt_performance_cache_fpath,
                   trt_gpu_clock_lock, llm_session_data_writer, output_dir,
                   llm_venv, llm_root):
@@ -1794,7 +2114,7 @@ def run_perf_test(perf_case_name, trt_performance_cache_fpath,
     The actual test definition for TensorRT LLM perf test.
     """
     working_dir = llm_venv.get_working_directory()
-    test_runner = MultiMetricPerfTest(perf_case_name)
+    test_runner = DisaggregatedServerPerfTest(perf_case_name)
     test_runner.set_runtime_configs(llm_root, working_dir,
                                     trt_performance_cache_fpath)
     test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,

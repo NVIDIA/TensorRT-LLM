@@ -26,7 +26,8 @@ from typing import Dict, List, NamedTuple, Optional
 
 from _pytest.nodes import Item
 from _pytest.python import Function
-from defs.trt_test_alternative import check_output, print_error, print_info
+from defs.trt_test_alternative import (check_output, popen, print_error,
+                                       print_info)
 
 from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
 from ..local_venv import PythonVenvRunnerImpl
@@ -99,6 +100,8 @@ class PerfMetricType(str, Enum):
     SEQ_THROUGHPUT = "SEQ_THROUGHPUT"
     SEQ_LATENCY = "SEQ_LATENCY"
     KV_CACHE_SIZE = "KV_CACHE_SIZE"
+    DISAGG_SERVER_E2EL = "DISAGG_SERVER_E2EL"
+    DISAGG_SERVER_TTFT = "DISAGG_SERVER_TTFT"
 
 
 class PerfScriptTestCmds(NamedTuple):
@@ -381,6 +384,119 @@ class AbstractPerfScriptTestClass(abc.ABC):
         """
         return self._error
 
+    def run_disagg_server(self,
+                          full_test_name: str,
+                          venv: Optional[PythonVenvRunnerImpl],
+                          gpu_clock_lock: GPUClockLock,
+                          session_data_writer: SessionDataWriter,
+                          output_dir: str,
+                          outputs: Dict[int, str] = {},
+                          original_test_name: str = None,
+                          cmd_idx: int = 0,
+                          **kwargs) -> List[str]:
+        """
+        Run the disaggregated server and write the results to the output csv and/or yaml files.
+        """
+        # ctx_cmds, gen_cmds, server_cmd, benchmark_cmd
+        ctx_cmd, gen_cmd, server_cmd, benchmark_cmd = self.get_commands()
+        outputs = outputs.copy()
+
+        # Initialize result status.
+        self._perf_result = None
+        self._result_state = "valid"
+        self._error = None
+        self._gpu_clock_lock = gpu_clock_lock
+        tmpDir = temp_wd(self.get_working_dir())
+        client_dir = os.path.join(self._llm_root,
+                                  "examples/disaggregated/clients")
+        client_cmd = [
+            'python3', f'{client_dir}/disagg_client.py', '-c',
+            f'{self._working_dir}/server_config.yaml', '-p',
+            f'{client_dir}/prompts.json', '--ignore-eos',
+            '--server-start-timeout',
+            str(1800)
+        ]
+        # Start the timer.
+        self._start_timestamp = datetime.utcnow()
+        if cmd_idx not in outputs:
+            try:
+                with (  # Start ctx workers
+                        open('output_ctx.log', 'w') as output_ctx,
+                        popen(ctx_cmd,
+                              stdout=output_ctx,
+                              stderr=output_ctx,
+                              env=venv._new_env,
+                              shell=True,
+                              cwd=self.get_working_dir()) as ctx_workers_proc,
+                        # Start gen workers
+                        open('output_gen.log', 'w') as output_gen,
+                        popen(gen_cmd,
+                              stdout=output_gen,
+                              stderr=subprocess.STDOUT,
+                              env=venv._new_env,
+                              shell=True,
+                              cwd=self.get_working_dir()) as gen_workers_proc,
+                        # Start server
+                        open('output_server.log', 'w') as output_server,
+                        popen(server_cmd,
+                              stdout=output_server,
+                              stderr=subprocess.STDOUT,
+                              env=venv._new_env,
+                              shell=True,
+                              cwd=self.get_working_dir()) as server_proc):
+                    check_output(client_cmd, env=venv._new_env)
+                    outputs[0] = check_output(benchmark_cmd, env=venv._new_env)
+
+            except InvalidGPUMonitoringResultError as e:
+                # Mark result state as invalid when GPU monitoring result is invalid.
+                self._result_state = "invalid"
+                self._error = e
+                print_error(
+                    f"Test result is invalid due to GPU monitoring issue. Error: {e}"
+                )
+
+            except Exception as e:
+                # Mark result state as failed if anything else went wrong.
+                self._result_state = "failed"
+                self._error = e
+                print_error(f"Test command failed. Error: {e}")
+                if isinstance(e, subprocess.CalledProcessError):
+                    print_error("--- stdout ---")
+                    if e.stdout:
+                        print_error(clean_myelin_time(e.stdout.decode()))
+                    else:
+                        print_error("<empty>")
+                    print_error("--------------")
+                    print_error("--- stderr ---")
+                    print_error(e.stderr.decode() if e.stderr else "<empty>")
+                    print_error("--------------")
+            finally:
+                server_proc.terminate()
+                ctx_workers_proc.terminate()
+                gen_workers_proc.terminate()
+                server_proc.wait()
+                ctx_workers_proc.wait()
+                gen_workers_proc.wait()
+        else:
+            print_info(
+                f"Reusing cached logs for disaggregated server perf test.")
+
+        if self._result_state == "valid":
+            # Parse the perf result from the test outputs.
+            self._perf_result = self.get_perf_result(outputs)
+
+            # Stop the timer
+            self._end_timestamp = datetime.utcnow()
+
+            # Write results to output csv and/or yaml files.
+            self._write_result(full_test_name,
+                               session_data_writer,
+                               output_dir,
+                               outputs,
+                               original_test_name,
+                               cmd_idx=0)
+        return outputs
+
     def run_ex(self,
                full_test_name: str,
                venv: Optional[PythonVenvRunnerImpl],
@@ -518,8 +634,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
         }
 
         # Serialize the commands.
-        serialized_cmd = self.get_commands().get_cmd_str(cmd_idx)
-
+        # serialized_cmd = self.get_commands().get_cmd_str(cmd_idx)
+        serialized_cmd = "placeholder for disaggregated server"
         # Save engine building log + benchmarking log in the csv file.
         raw_result = ""
         if 0 in outputs:
