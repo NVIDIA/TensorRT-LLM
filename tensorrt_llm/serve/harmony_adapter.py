@@ -1485,11 +1485,15 @@ class HarmonyAdapter:
         return True
 
 
-serve_harmony_adapter = HarmonyAdapter()
+_SERVE_HARMONY_ADAPTER: HarmonyAdapter = None
 
 
 def get_harmony_adapter():
-    return serve_harmony_adapter
+    global _SERVE_HARMONY_ADAPTER
+    if _SERVE_HARMONY_ADAPTER is None:
+        _SERVE_HARMONY_ADAPTER = HarmonyAdapter()
+
+    return _SERVE_HARMONY_ADAPTER
 
 
 def handle_streaming_response(tools: List[ChatCompletionToolsParam],
