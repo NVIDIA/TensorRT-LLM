@@ -328,8 +328,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
+    @parametrize_with_ids("eagle3_one_model", [True, False])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding_with_eagle3(self, backend: str, mocker):
+    def test_guided_decoding_with_eagle3(self, backend: str,
+                                         eagle3_one_model: bool, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
@@ -337,14 +339,16 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             max_draft_len=3,
             speculative_model_dir=
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            eagle3_one_model=False)
-        llm = LLM(self.MODEL_PATH,
-                  guided_decoding_backend=backend,
-                  kv_cache_config=kv_cache_config,
-                  cuda_graph_config=cuda_graph_config,
-                  enable_chunked_prefill=True,
-                  speculative_config=spec_config,
-                  disable_overlap_scheduler=True)
+            eagle3_one_model=eagle3_one_model)
+        llm = LLM(
+            self.MODEL_PATH,
+            guided_decoding_backend=backend,
+            kv_cache_config=kv_cache_config,
+            cuda_graph_config=cuda_graph_config,
+            enable_chunked_prefill=True,
+            speculative_config=spec_config,
+            # Two-model eagle3 does not support overlap scheduler
+            disable_overlap_scheduler=not eagle3_one_model)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
@@ -1749,6 +1753,50 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  speculative_config=mtp_config)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding_4gpus(self, backend: str, mtp_nextn: int, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=4,
+                  moe_expert_parallel_size=4,
+                  enable_attention_dp=True,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  speculative_config=mtp_config)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
 

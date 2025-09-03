@@ -337,14 +337,6 @@ class ModelDrafter(Drafter):
 
         return new_requests
 
-    def _execute_guided_decoder(self,
-                                scheduled_batch: ScheduledRequests,
-                                logits: torch.Tensor,
-                                d2t: Optional[torch.Tensor] = None):
-        if self.guided_decoder is not None:
-            self.guided_decoder.build(scheduled_batch)
-            self.guided_decoder.execute(scheduled_batch, logits, d2t=d2t)
-
     @nvtx_range("prepare_draft_tokens")
     def prepare_draft_tokens(
         self,
@@ -400,9 +392,10 @@ class ModelDrafter(Drafter):
 
                 return
 
-            self._execute_guided_decoder(draft_batch,
-                                         outputs['logits'],
-                                         d2t=outputs.get('d2t'))
+            if self.guided_decoder is not None:
+                self.guided_decoder.add_batch(draft_batch)
+                self.guided_decoder.execute(outputs['logits'],
+                                            d2t=outputs.get('d2t'))
             sample_state = self._sample_async(draft_batch, outputs)
             previous_batch = sample_state
 
@@ -422,9 +415,10 @@ class ModelDrafter(Drafter):
                                                     previous_batch)
                 if previous_batch is not None:
                     self._update_requests(previous_batch)
-                self._execute_guided_decoder(draft_batch,
-                                             outputs['logits'],
-                                             d2t=outputs.get('d2t'))
+                if self.guided_decoder is not None:
+                    self.guided_decoder.add_batch(draft_batch)
+                    self.guided_decoder.execute(outputs['logits'],
+                                                d2t=outputs.get('d2t'))
                 sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
                 if previous_batch is not None:
@@ -441,9 +435,6 @@ class ModelDrafter(Drafter):
                 self._update_requests(previous_batch)
                 self._process_decoded_tokens(previous_batch.scheduled_requests,
                                              req_id_to_old_request)
-
-            if self.guided_decoder is not None:
-                self.guided_decoder.rollback_draft_tokens(scheduled_requests)
 
         except Exception as e:
             traceback.print_exc()
