@@ -296,9 +296,7 @@ class Eagle3OneModelWorker(nn.Module):
             logits, attn_metadata, spec_metadata)
 
         # Save the old attn_metadata and spec_metadata
-        if attn_metadata.is_cuda_graph:
-            seq_len = attn_metadata._seq_lens[:batch_size].clone()
-            seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
         # Prepare inputs for the 1st draft model forward
         position_ids = position_ids.squeeze(0)
@@ -386,10 +384,8 @@ class Eagle3OneModelWorker(nn.Module):
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn_metadata to support cuda graph
-        if attn_metadata.is_cuda_graph:
-            attn_metadata._seq_lens[:batch_size].copy_(seq_len)
-            attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
-            attn_metadata.on_update()
+        attn_metadata.restore_from_spec_dec()
+        attn_metadata.on_update()
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
