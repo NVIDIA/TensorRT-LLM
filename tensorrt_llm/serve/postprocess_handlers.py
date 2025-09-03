@@ -8,6 +8,9 @@ from ..executor.postproc_worker import PostprocArgs
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
                                        ReasoningParserFactory)
 from ..llmapi.tokenizer import TransformersTokenizer
+# yapf: enale
+from .harmony_adapter import (handle_non_streaming_response,
+                              handle_streaming_response)
 # yapf: disable
 from .openai_protocol import (ChatCompletionLogProbs,
                               ChatCompletionLogProbsContent,
@@ -24,7 +27,6 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               FunctionCall, StreamOptions, ToolCall, UsageInfo,
                               to_disaggregated_params)
 
-# yapf: enale
 
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
@@ -350,4 +352,44 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
                     completion_tokens=completion_tokens,
                     total_tokens=completion_tokens + prompt_tokens)
     response = CompletionResponse(choices=choices, model=args.model, usage=usage)
+    return response
+
+@dataclass(kw_only=True)
+class ChatCompletionPostprocArgs(PostprocArgs):
+    model: str
+    tools: Optional[List[ChatCompletionToolsParam]]
+    tool_choice: Optional[Union[Literal["none", "auto"],
+                                ChatCompletionNamedToolChoiceParam]]
+    request_id: Optional[int] = None
+
+    @classmethod
+    def from_request(cls, request: ChatCompletionRequest):
+        return cls(
+            model=request.model,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+        )
+
+@nvtx_range_debug("chat_harmony_post_processor")
+def chat_harmony_post_processor(rsp: GenerationResult, args: ChatCompletionPostprocArgs) -> ChatCompletionResponse:
+    response = handle_non_streaming_response(
+        tools=args.tools,
+        tool_choice=args.tool_choice,
+        outputs=rsp.outputs,
+        model=args.model,
+        num_prompt_tokens=args.num_prompt_tokens,
+    )
+    return response
+
+@nvtx_range_debug("chat_harmony_streaming_post_processor")
+def chat_harmony_streaming_post_processor(rsp: GenerationResult, args: ChatCompletionPostprocArgs) -> List[str]:
+    response = handle_streaming_response(
+        tools=args.tools,
+        tool_choice=args.tool_choice,
+        outputs=rsp.outputs,
+        model=args.model,
+        request_id=args.request_id,
+        done=rsp._done,
+        num_prompt_tokens=args.num_prompt_tokens,
+    )
     return response
