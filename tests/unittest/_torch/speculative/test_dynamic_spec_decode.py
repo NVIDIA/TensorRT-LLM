@@ -52,9 +52,7 @@ def test_dynamic_spec_decode():
         max_concurrency=2,
     )
 
-    print("Before LLM(...)")
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-    print("After LLM(...)")
     # Output tests
     prompts = [
         "The capital of France is",
