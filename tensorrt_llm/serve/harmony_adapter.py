@@ -6,7 +6,7 @@ import re
 import time
 import traceback
 import uuid
-from typing import Any, Literal
+from typing import Any, List, Literal
 
 from openai_harmony import (Author, Conversation, DeveloperContent,
                             HarmonyEncodingName, HarmonyError, Message,
@@ -21,7 +21,8 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               ChatCompletionResponse,
                               ChatCompletionResponseChoice,
                               ChatCompletionResponseStreamChoice,
-                              ChatCompletionStreamResponse, ChatMessage,
+                              ChatCompletionStreamResponse,
+                              ChatCompletionToolsParam, ChatMessage,
                               DeltaFunctionCall, DeltaMessage, DeltaToolCall,
                               UsageInfo)
 
@@ -1491,8 +1492,10 @@ def get_harmony_adapter():
     return serve_harmony_adapter
 
 
-def handle_streaming_response(tools, tool_choice, outputs, model, request_id,
-                              done, num_prompt_tokens):
+def handle_streaming_response(tools: List[ChatCompletionToolsParam],
+                              tool_choice: str, outputs: List, model: str,
+                              request_id: str, done: bool,
+                              num_prompt_tokens: int):
     first_iteration = True
     output = outputs[0]
 
@@ -1574,8 +1577,9 @@ def handle_streaming_response(tools, tool_choice, outputs, model, request_id,
         raise e
 
 
-def handle_non_streaming_response(tools, tool_choice, outputs, model,
-                                  num_prompt_tokens):
+def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
+                                  tool_choice: str, outputs: List, model: str,
+                                  num_prompt_tokens: int):
     """Handle non-streaming response with harmony format."""
     # Parse harmony output to OpenAI format
     # Convert tools to dictionary format for harmony adapter (standard pattern)
