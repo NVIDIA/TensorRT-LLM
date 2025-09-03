@@ -429,7 +429,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         def get_empty(tensor_shape: list[int], dtype: torch.dtype,
                       cache_name: str) -> torch.Tensor:
-            captuer_graph = torch.cuda.is_current_stream_capturing()
+            capture_graph = torch.cuda.is_current_stream_capturing()
             if DeepGemmFusedMoE.allocated_buffer_in_graph_pool is not None:
                 numel_like = math.prod(tensor_shape)
                 runtime_buffer = None
@@ -450,13 +450,13 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                         graph_buffer = buffer
                         break
 
-                if captuer_graph and graph_buffer is not None:
+                if capture_graph and graph_buffer is not None:
                     return graph_buffer[0:numel_like].view(tensor_shape)
                 else:
                     buffer, use_graph = select_buffer_with_more_elements(
                         graph_buffer, runtime_buffer)
                     if buffer is not None:
-                        if not use_graph and captuer_graph:
+                        if not use_graph and capture_graph:
                             # move the buffer into graph buffers since it's running in graph capturing mode.
                             DeepGemmFusedMoE.allocated_buffer_in_graph_pool.setdefault(
                                 cache_name, []).append(buffer)
@@ -472,7 +472,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             # If we get here, no suitable buffer was found in the cache. Create a new one.
             new_buffer = torch.zeros(tensor_shape, device='cuda', dtype=dtype)
             if DeepGemmFusedMoE.allocated_buffer_in_graph_pool is not None:
-                if captuer_graph:
+                if capture_graph:
                     DeepGemmFusedMoE.allocated_buffer_in_graph_pool.setdefault(
                         cache_name, []).append(new_buffer)
                 else:
