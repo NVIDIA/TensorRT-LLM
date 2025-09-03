@@ -1027,6 +1027,9 @@ class PyTorchModelEngine(ModelEngine):
 
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)
+                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                ):
+                    model.draft_model.load_weights_from_target_model(model)
 
             elif load_format == LoadFormat.VISION_ONLY:
                 # Vision weights are already loaded within the model.

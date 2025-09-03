@@ -305,6 +305,7 @@ def test_multi_eagle3(use_one_model: bool):
             max_batch_size=max_batch_size,
             kv_cache_config=kv_cache_config,
             enable_chunked_prefill=enable_chunked_prefill,
+            load_format="dummy",
         )
 
         spec_config = EagleDecodingConfig(
