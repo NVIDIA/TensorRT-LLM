@@ -16,8 +16,8 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
-from .moe_backend import MoEBackend, MoEBackendSelection
 from .moe_load_balancer import get_moe_load_balancer
+from .ops import MoEOp, MoEOpSelector
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
@@ -233,8 +233,8 @@ class WideEPMoE(MoE):
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
 
-        # MoE backend will be lazily initialized when first accessed (see moe_backend property)
-        self._moe_backend_impl = None
+        # MoE op will be lazily initialized when first accessed (see moe_op_impl property)
+        self._moe_op_impl = None
 
     def _check_configs(self):
         assert self._weights_created
@@ -352,17 +352,17 @@ class WideEPMoE(MoE):
         self._check_configs()
 
     @property
-    def moe_backend_impl(self) -> MoEBackend:
+    def moe_op_impl(self) -> MoEOp:
         """
-        Lazily initialize and return the MoE backend.
+        Lazily initialize and return the MoE op.
 
-        The backend is selected based on hardware capabilities and quantization
+        The op is selected based on hardware capabilities and quantization
         configuration, which are only available after weights are created.
         """
-        if self._moe_backend_impl is None:
-            assert self._weights_created, "Weights must be created before accessing moe_backend"
-            self._moe_backend_impl = MoEBackendSelection.select_backend(self)
-        return self._moe_backend_impl
+        if self._moe_op_impl is None:
+            assert self._weights_created, "Weights must be created before accessing moe_op"
+            self._moe_op_impl = MoEOpSelector.select_op(self)
+        return self._moe_op_impl
 
     def dummy_allreduce(self):
         """
@@ -414,8 +414,8 @@ class WideEPMoE(MoE):
         if self.layer_load_balancer and is_first_call:
             self.layer_load_balancer.start_wait_gpu_stage()
 
-        use_deepseek_fp8_block_scale = False
-        use_w4_group_scaling = False
+        if not use_all_to_all or self.alltoall_method_type != AlltoallMethodType.MNNVL:
+            pass
 
         weight_dtype = self.w3_w1_weight.dtype
 
@@ -661,7 +661,7 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        final_hidden_states = self.moe_backend_impl.run_moe(
+        final_hidden_states = self.moe_op_impl.run_moe(
             self,
             x,
             token_selected_slots,
