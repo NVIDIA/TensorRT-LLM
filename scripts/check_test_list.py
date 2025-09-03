@@ -17,6 +17,9 @@ import argparse
 import os
 import subprocess
 
+# The markers in our test lists, need to be preprocess before checking
+MARKER_LIST_IN_TEST = [" TIMEOUT", " ISOLATE"]
+
 
 def install_python_dependencies(llm_src):
     subprocess.run(
@@ -51,9 +54,14 @@ def verify_l0_test_lists(llm_src):
         lines = f.readlines()
 
     for line in lines:
-        # Remove 'TIMEOUT (number)' and strip spaces
-        cleaned_line = line.split(" TIMEOUT ", 1)[0].strip()
-        cleaned_lines.add(cleaned_line)
+        # Remove markers and rest of the line if present
+        cleaned_line = line.strip()
+        for marker in MARKER_LIST_IN_TEST:
+            if marker in cleaned_line:
+                cleaned_line = cleaned_line.split(marker, 1)[0].strip()
+                break
+        if cleaned_line:
+            cleaned_lines.add(cleaned_line)
 
     with open(test_list, "w") as f:
         f.writelines(f"{line}\n" for line in sorted(cleaned_lines))
