@@ -54,7 +54,7 @@ def _nvfp4_get_weights_scaling_factor(
     assert block_size != 0, "Block size is zero. Cannot return per_block amax for given input."
 
     assert k % block_size == 0, (
-        "Weight shape is not divisible for block size for block quantiation."
+        "Weight shape is not divisible for block size for block quantization."
     )
 
     input = input.reshape((*tuple(input.shape[:-2]), n, k // block_size, block_size))
@@ -205,8 +205,8 @@ def torch_fake_quant_fp8_linear(
     return torch.ops.aten.linear(input, w, bias)
 
 
-@torch.library.custom_op("auto_deploy::torch_fake_quant_fp4_linear", mutates_args=())
-def torch_fake_quant_fp4_linear(
+@torch.library.custom_op("auto_deploy::torch_fake_quant_nvfp4_linear", mutates_args=())
+def torch_fake_quant_nvfp4_linear(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
     bias: torch.Tensor,
@@ -267,8 +267,8 @@ def torch_fake_quant_fp4_linear(
     return out_2d.reshape(*input_shape[:-1], N)
 
 
-@torch_fake_quant_fp4_linear.register_fake
-def torch_fake_quant_fp4_linear(
+@torch_fake_quant_nvfp4_linear.register_fake
+def torch_fake_quant_nvfp4_linear(
     input: torch.Tensor,
     weight_quantized: torch.Tensor,
     bias: torch.Tensor,
@@ -282,7 +282,7 @@ def torch_fake_quant_fp4_linear(
 
 CUSTOM_QUANT_LINEAR_OPS = [
     torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
-    torch.ops.auto_deploy.torch_fake_quant_fp4_linear,
+    torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
 ]
 QUANT_LINEAR_OPS.extend(CUSTOM_QUANT_LINEAR_OPS)
 QUANT_OPS.extend(CUSTOM_QUANT_LINEAR_OPS)

@@ -85,7 +85,7 @@ def _fp4_ref_pattern_1(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
 ):
-    return torch.ops.auto_deploy.torch_fake_quant_fp4_linear(
+    return torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
         x,
         w_fp4,
         None,
@@ -103,7 +103,7 @@ def _fp4_ref_repl_1(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
 ):
-    return torch.ops.auto_deploy.torch_quant_fp4_linear(
+    return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
         x,
         w_fp4,
         bias=None,
@@ -122,7 +122,7 @@ def _fp4_ref_pattern_2(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
 ):
-    return torch.ops.auto_deploy.torch_fake_quant_fp4_linear(
+    return torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
         x,
         w_fp4,
         bias,
@@ -141,7 +141,7 @@ def _fp4_ref_repl_2(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
 ):
-    return torch.ops.auto_deploy.torch_quant_fp4_linear(
+    return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
         x,
         w_fp4,
         bias=bias,
@@ -151,22 +151,31 @@ def _fp4_ref_repl_2(
     )
 
 
-def _register_quant_linear_patterns(patterns: ADPatternMatcherPass) -> None:
+def _register_quant_fp8_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     """
-    Register the FP8 and FP4 patterns with robust dummy args and minimal ignores.
+    Register FP8 linear patterns with robust dummy args and minimal ignores.
     """
+    # FP8 dummy tensors
     x_fp8 = torch.randn(3, 16, device="meta", dtype=torch.float16)
     w_fp8 = torch.randn(32, 16, device="meta", dtype=torch.float16)
     bias32 = torch.randn(32, device="meta", dtype=torch.float32)
     one = torch.tensor(1.0, device="meta", dtype=torch.float32)
 
+    # no-bias variant
     dummy_args_fp8 = [
         x_fp8,
         w_fp8,
         one,
         torch.tensor(0.5, device="meta", dtype=torch.float32),
     ]
+    register_ad_pattern(
+        search_fn=_fp8_ref_pattern_1,
+        replace_fn=_fp8_ref_repl_1,
+        patterns=patterns,
+        dummy_args=dummy_args_fp8,
+    )
 
+    # bias variant
     dummy_args_fp8_2 = [
         x_fp8,
         w_fp8,
@@ -174,13 +183,6 @@ def _register_quant_linear_patterns(patterns: ADPatternMatcherPass) -> None:
         one,
         torch.tensor(0.5, device="meta", dtype=torch.float32),
     ]
-
-    register_ad_pattern(
-        search_fn=_fp8_ref_pattern_1,
-        replace_fn=_fp8_ref_repl_1,
-        patterns=patterns,
-        dummy_args=dummy_args_fp8,
-    )
     register_ad_pattern(
         search_fn=_fp8_ref_pattern_2,
         replace_fn=_fp8_ref_repl_2,
@@ -188,11 +190,17 @@ def _register_quant_linear_patterns(patterns: ADPatternMatcherPass) -> None:
         dummy_args=dummy_args_fp8_2,
     )
 
-    # FP4 dummy args
+
+def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
+    """
+    Register FP4 linear patterns with robust dummy args and minimal ignores.
+    """
+    # FP4 shape params
     N = 32
     K_packed = 32  # weight is packed by 2 FP4 per byte
     K_eff = 2 * K_packed
 
+    # FP4 dummy tensors
     x_fp4 = torch.randn(3, K_eff, device="meta", dtype=torch.float16)
     w_fp4 = torch.randint(0, 255, (N, K_packed), device="meta", dtype=torch.uint8)
 
@@ -202,6 +210,7 @@ def _register_quant_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     cutlass_len = N * (K_eff // 16)  # 32 * (64/16) = 128
     cutlass_vec = torch.randint(0, 255, (cutlass_len,), device="meta", dtype=torch.uint8)
 
+    # no-bias variant
     dummy_args_fp4_1 = [
         x_fp4,
         w_fp4,
@@ -209,7 +218,14 @@ def _register_quant_linear_patterns(patterns: ADPatternMatcherPass) -> None:
         cutlass_vec,
         alpha,
     ]
+    register_ad_pattern(
+        search_fn=_fp4_ref_pattern_1,
+        replace_fn=_fp4_ref_repl_1,
+        patterns=patterns,
+        dummy_args=dummy_args_fp4_1,
+    )
 
+    # bias variant
     dummy_args_fp4_2 = [
         x_fp4,
         w_fp4,
@@ -218,14 +234,6 @@ def _register_quant_linear_patterns(patterns: ADPatternMatcherPass) -> None:
         cutlass_vec,
         alpha,
     ]
-
-    register_ad_pattern(
-        search_fn=_fp4_ref_pattern_1,
-        replace_fn=_fp4_ref_repl_1,
-        patterns=patterns,
-        dummy_args=dummy_args_fp4_1,
-    )
-
     register_ad_pattern(
         search_fn=_fp4_ref_pattern_2,
         replace_fn=_fp4_ref_repl_2,
@@ -244,8 +252,8 @@ class FuseQuant(BaseTransform):
         -> torch_quant_fp8_linear(x, w_fp8, bias=bias, input_scale=in_s, weight_scale=w_s)
 
       FP4 (NVFP4):
-        torch_fake_quant_fp4_linear(x, w_fp4, bias, [s_in2], [cutlass_vec, alpha], [], [])
-        -> torch_quant_fp4_linear(x, w_fp4, bias=bias, input_scale=s_in2,
+        torch_fake_quant_nvfp4_linear(x, w_fp4, bias, [s_in2], [cutlass_vec, alpha], [], [])
+        -> torch_quant_nvfp4_linear(x, w_fp4, bias=bias, input_scale=s_in2,
                                   weight_scale=cutlass_vec, alpha=alpha)
     """
 
@@ -257,7 +265,8 @@ class FuseQuant(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         patterns = ADPatternMatcherPass()
-        _register_quant_linear_patterns(patterns)
+        _register_quant_fp8_linear_patterns(patterns)
+        _register_quant_fp4_linear_patterns(patterns)
         num_matches = patterns.apply(gm.graph)
 
         info = TransformInfo(

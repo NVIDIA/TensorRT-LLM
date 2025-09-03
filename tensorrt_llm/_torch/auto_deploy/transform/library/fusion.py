@@ -1,4 +1,5 @@
 import operator
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from functools import partial
 from itertools import chain
@@ -96,7 +97,7 @@ def check_same_children(parent_node: Node, is_desired_child: Callable[[Node], bo
     return all(is_desired_child(u) for u in users)
 
 
-class QuantizationFusionMixin:
+class QuantizationFusionMixin(ABC):
     """
     Mixin that factors out the shared logic for fusing quantized GEMMs
     that share the same input activation (parent node).
@@ -118,11 +119,13 @@ class QuantizationFusionMixin:
     target_op: Callable
     scale_groups: List[List[str]]
 
+    @abstractmethod
     def fuse_rule(
         self, weights: List[torch.Tensor], **scales
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         raise NotImplementedError
 
+    @abstractmethod
     def build_custom_args_for_linear(self, scale_getattrs: Dict[str, Node]) -> Tuple[object, ...]:
         """Return the *positional* tail after bias for the fused call."""
         raise NotImplementedError
@@ -310,7 +313,7 @@ class FuseFP8Gemms(QuantizationFusionMixin, BaseTransform):
 
 @TransformRegistry.register("fuse_fp4_gemms")
 class FuseFP4Gemms(QuantizationFusionMixin, BaseTransform):
-    target_op = torch.ops.auto_deploy.torch_fake_quant_fp4_linear
+    target_op = torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear
     scale_groups = [["input_scale"], ["weight_scale", "alpha"]]
 
     def fuse_rule(

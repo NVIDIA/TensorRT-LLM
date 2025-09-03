@@ -273,7 +273,7 @@ def torch_quant_fp4_moe(
         def mlp(inp):
             if inp.shape[0] == 0:
                 return torch.zeros_like(inp)
-            gate_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+            gate_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                 inp,
                 w1_weight[i],
                 bias=None,
@@ -281,7 +281,7 @@ def torch_quant_fp4_moe(
                 weight_scale=w1_weight_scale[i],
                 alpha=w1_alpha[i],
             )
-            up_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+            up_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                 inp,
                 w3_weight[i],
                 bias=None,
@@ -290,7 +290,7 @@ def torch_quant_fp4_moe(
                 alpha=w3_alpha[i],
             )
             prod = F.silu(gate_out) * up_out
-            return torch.ops.auto_deploy.torch_quant_fp4_linear(
+            return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                 prod,
                 w2_weight[i],
                 bias=None,

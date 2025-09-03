@@ -50,7 +50,7 @@ def test_fp4_linear():
         weight, weight_scale_2, SCALING_VECTOR_SIZE, False
     )
 
-    output_fp4_gemm = torch.ops.auto_deploy.torch_quant_fp4_linear(
+    output_fp4_gemm = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
         input,
         weight_fp4,
         bias=None,
@@ -170,7 +170,7 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
     if bias is not None and bias.dtype != x.dtype:
         bias = bias.to(x.dtype)
 
-    out_fused = torch.ops.auto_deploy.torch_quant_fp4_linear(
+    out_fused = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
         x,
         weight_fp4,
         bias=bias,
@@ -179,7 +179,7 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
         alpha=alpha_fused,
     )
 
-    out_unified = torch.ops.auto_deploy.torch_fake_quant_fp4_linear(
+    out_unified = torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
         x,
         weight_fp4,
         bias,

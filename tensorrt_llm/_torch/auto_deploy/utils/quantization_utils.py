@@ -197,7 +197,7 @@ class FP8QuantizationImpl(QuantizationImpl):
 class FP4QuantizationImpl(QuantizationImpl):
     @staticmethod
     def target_op():
-        return torch.ops.auto_deploy.torch_fake_quant_fp4_linear.default
+        return torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear.default
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
@@ -433,13 +433,3 @@ def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Op
             scales[name] = args[3 + i]
 
     return scales
-
-
-def get_scales_and_type_from_node(node: Node) -> Tuple[Dict[str, Node], str]:
-    """Returns a dict of scale args and quantization type string ('fp4', 'fp8', etc)."""
-    for qtype in [FP4QuantizationImpl, FP8QuantizationImpl]:
-        if is_op(node, qtype.target_op()):
-            return extract_scales_from_node(
-                node, qtype.scale_names()
-            ), qtype.__name__.lower().replace("quantizationimpl", "")
-    return None, "simple"
