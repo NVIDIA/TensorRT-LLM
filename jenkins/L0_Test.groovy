@@ -647,7 +647,7 @@ def preprocessTestList(String testListFile)
     def isolateTests = []
 
     // Read the test list file
-    def lines = new File(testListFile).readLines()
+    def lines = readFile(file: testListFile).readLines()
 
     lines.each { line ->
         def trimmedLine = line.trim()
@@ -666,19 +666,13 @@ def preprocessTestList(String testListFile)
     }
 
     // Write the regular tests back to the original file
-    new File(testListFile).withWriter { writer ->
-        regularTests.each { test ->
-            writer.writeLine(test)
-        }
-    }
+    def regularTestContent = regularTests.join('\n') + (regularTests.size() > 0 ? '\n' : '')
+    writeFile(file: testListFile, text: regularTestContent)
 
     // Create a separate file for isolate tests
     def isolateTestFile = testListFile.replaceAll('\\.txt$', '_isolate.txt')
-    new File(isolateTestFile).withWriter { writer ->
-        isolateTests.each { test ->
-            writer.writeLine(test)
-        }
-    }
+    def isolateTestContent = isolateTests.join('\n') + (isolateTests.size() > 0 ? '\n' : '')
+    writeFile(file: isolateTestFile, text: isolateTestContent)
 
     return [
         regular: testListFile,
