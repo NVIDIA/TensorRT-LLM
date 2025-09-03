@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
@@ -55,6 +54,7 @@ static constexpr SizeType32 kPrimaryLevel = 0;
 static constexpr SizeType32 kSecondaryLevel = 1;
 
 class KVCacheBlock;
+class KVCachePromptLookupNode;
 class BlockManager;
 class KVCacheManager;
 class KVCacheTransferManager;
@@ -95,6 +95,7 @@ struct WindowSizeMetadata
     SizeType32 temporaryAttentionWindow; // Temporary kv cache length per sequence.
                                          // Only needed when chunked context + sliding window attention are used
                                          // together. And it should only be considered when allocating blocks.
+
 
     std::string toString()
     {
@@ -189,12 +190,72 @@ struct KvCacheStats
     SizeType32 reusedBlocks;
     // Number of blocks that were not matched and not reused.
     SizeType32 missedBlocks;
-    // Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
     // Number of free blocks for every configured attention-window size.
     std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
     // GPU bytes allocated for KV-cache
     std::size_t allocatedBytes{};
+};
+
+
+class KVCachePromptLookupNode
+{
+public:
+    explicit KVCachePromptLookupNode(BlockKey const& blockKey);
+
+    [[nodiscard]] NextNodeMap getNextNodes() const;
+
+    void setBlockKey(BlockKey const& blockKey, bool isFull);
+
+    BlockKey getBlockKey();
+
+    [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
+
+    NodePtr const& getPrevNode() const;
+
+    void setPrevNode(NodePtr prevNode);
+
+    void addNextNode(BlockKey const& blockKey, NodePtr block);
+
+    void removeNextNode(BlockKey const& blockKey);
+
+    //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
+    //! blockKey.
+    //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
+    //! matched.
+    [[nodiscard]] std::tuple<bool, SizeType32, NodePtr> findMatchingNode(
+        BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const;
+
+    void setBlock(SizeType32 windowSize, BlockPtr block);
+
+    [[nodiscard]] getBlock(SizeType32 windowSize) const;
+
+private:
+    // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
+    BlockKey mBlockKey;
+
+    // Flag indicating if block is full
+    bool mIsFull;
+
+    // Previous block in reuse tree, or nullptr if not reusing
+    BlockPtr mPrevBlock;
+
+    // Next node(s) in sequence(s)
+    NextNodeMap mNextNodes;
+
+    // Pointers to blocks holding KV state for this prompt prefix
+    std::unordered_map<SizeType32, BlockPtr> mBlocks;
+};
+
+class KVCachePromptLookup
+{
+public:
+    explicit KVCachePromptLookup();
+
+    
+
+private:
+    LookupNodePtr mRoot;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -213,8 +274,6 @@ public:
 
     [[nodiscard]] IdType getBlockId() const;
 
-    [[nodiscard]] NextBlockMap getNextBlocks() const;
-
     [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
 
     [[nodiscard]] bool isPrimary() const;
@@ -231,39 +290,19 @@ public:
 
     [[nodiscard]] bool hasSchedulingRefs() const;
 
+    // Thor J: This info is duplicated in KVCacheBlock and KVCachePromptLookupNode
+    // because it is needed by the former when KVCacheBlock might not be stored
+    // in lookup structure and therefore cannot get this value from there
     void setBlockKey(BlockKey const& blockKey, bool isFull);
-
     BlockKey getBlockKey();
-
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
-    BlockPtr const& getPrevBlock() const;
-
-    void setPrevBlock(BlockPtr prevBlock);
-
     BlockPtr const& getPrevBlockInSeq() const;
-
     void setPrevBlockInSeq(BlockPtr prevBlock);
-
-    void addNextBlock(BlockKey const& blockKey, BlockPtr block);
-
-    void removeNextBlock(BlockKey const& blockKey);
-
-    //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
-    //! blockKey.
-    //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
-    //! matched.
-    [[nodiscard]] std::tuple<bool, SizeType32, BlockPtr> findMatchingBlock(
-        BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const;
-
-    //! \brief Free block from previous block if present.
-    void freeLeafBlock();
 
     [[nodiscard]] bool isFull() const;
 
     [[nodiscard]] bool isShared() const;
-
-    [[nodiscard]] bool isLeaf() const;
 
     void setPriority(executor::RetentionPriority priority);
 
@@ -301,14 +340,8 @@ private:
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
     BlockKey mBlockKey;
 
-    // Previous block in reuse tree, or nullptr if not reusing
-    BlockPtr mPrevBlock;
-
     // Previous block in sequence, == nullptr for first block, == mPrevBlock if reusing and not first
     BlockPtr mPrevBlockInSeq;
-
-    // Next block(s) in sequence(s)
-    NextBlockMap mNextBlocks;
 
     // Iterator pointing to this block in mFreeBlocks.
     std::optional<FreeBlocksQueue::iterator> mFreeBlockIterator;
@@ -1673,25 +1706,6 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
-private:
-    // Maximum number of sequences
-    SizeType32 mMaxNumSequences;
-    // Maximum beam width
-    SizeType32 mMaxBeamWidth;
-    nvinfer1::DataType mDataType;
-    // Maximum kv cache length per sequence
-    SizeType32 mMaxAttentionWindow;
-    // Number of tokens per block
-    SizeType32 mTokensPerBlock;
-    // Number of tokens to fill up the sink tokens to a full block size
-    SizeType32 mSinkBubbleLength;
-    // Number of tokens in the sink blocks
-    SizeType32 mSinkBlockTokenLength;
-    // Block manager
-    BlockManager mBlockManager;
-    // Map of all sequences
-    std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
-    // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
     // Mutex to protect access to mSequences
     mutable std::mutex mSequencesMtx;
