@@ -47,6 +47,7 @@ from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.internal.batch_manager import \
     KvCacheConnectorManager as KvCacheConnectorManagerCpp
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from .scheduler import ScheduledRequests
 
@@ -80,7 +81,8 @@ class SchedulerOutput:
 
 class KvCacheConnectorWorker(ABC):
 
-    def __init__(self):
+    def __init__(self, llm_args: TorchLlmArgs):
+        self._llm_args = llm_args
         self._metadata = None
         super().__init__()
 
@@ -160,7 +162,9 @@ class KvCacheConnectorWorker(ABC):
 
 class KvCacheConnectorScheduler(ABC):
 
-    def __init__(self):
+    def __init__(self, llm_args: TorchLlmArgs, tokens_per_block: int):
+        self._llm_args = llm_args
+        self._tokens_per_block = tokens_per_block
         super().__init__()
 
     @abstractmethod
