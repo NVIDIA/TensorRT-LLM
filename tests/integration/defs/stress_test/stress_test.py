@@ -668,7 +668,7 @@ def stress_test(config,
             baseline_accuracy_success = True
             if stress_config and stress_config.enable_accuracy_test:
                 baseline_accuracy_success = run_accuracy_test(
-                    model_name, test_server_config, stress_config, "baseline")
+                    model_path, test_server_config, stress_config, "baseline")
 
             # Run performance test first if enabled
             stage2_output = None  # Initialize stage2_output to None
@@ -707,7 +707,7 @@ def stress_test(config,
             post_stress_accuracy_success = True
             if stress_config and stress_config.enable_accuracy_test:
                 post_stress_accuracy_success = run_accuracy_test(
-                    model_name, test_server_config, stress_config,
+                    model_path, test_server_config, stress_config,
                     "post_stress")
 
                 # Report accuracy test results
@@ -1045,7 +1045,7 @@ def format_time(seconds: int) -> str:
         return f"{seconds}s"
 
 
-def run_accuracy_test(model_name: str,
+def run_accuracy_test(model_path: str,
                       server_config: ServerConfig,
                       stress_config: StressTestConfig,
                       test_phase: str = "baseline") -> bool:
@@ -1053,7 +1053,7 @@ def run_accuracy_test(model_name: str,
     Run accuracy test using lm_eval with GSM8K dataset
 
     Args:
-        model_name: Name of the model being tested
+        model_path: Path of the model being tested
         server_config: Server configuration containing URL and port
         stress_config: Stress test configuration containing accuracy test parameters
         test_phase: Phase of the test ("baseline" or "post_stress")
@@ -1071,7 +1071,7 @@ def run_accuracy_test(model_name: str,
     lm_eval_cmd = [
         "lm_eval", "--model", "local-completions", "--tasks", "gsm8k",
         "--model_args",
-        f"model={model_name},base_url={server_config.url}/v1/completions,"
+        f"model={model_path},base_url={server_config.url}/v1/completions,"
         f"num_concurrent={stress_config.accuracy_test_concurrency},"
         f"max_retries={stress_config.accuracy_test_max_retries},"
         f"tokenized_requests=False,"
