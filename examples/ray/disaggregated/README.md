@@ -1,11 +1,11 @@
 # Disaggregated Serving with Ray orchestrator
 TensorRT-LLM supports an experimental [Ray orchestrator](../README.md) as an alternative to MPI.
 
-Running disaggregated serving with Ray follows [the same workflow as in MPI](/examples/disaggregated/README.md), except that `orchestrator_type="ray"` must be set on the `LLM` class, and `CUDA_VISIBLE_DEVICES` can be omitted since Ray handles GPU placement. 
+Running disaggregated serving with Ray follows [the same workflow as in MPI](/examples/disaggregated/README.md), except that `orchestrator_type="ray"` must be set on the `LLM` class, and `CUDA_VISIBLE_DEVICES` can be omitted since Ray handles GPU placement.
 
 
 ## Quick Start
-This script is a shorthand to launch a single-GPU context and generation server, as well as the disaggregated server within a single Ray cluster. Please see [this page]((/examples/disaggregated/README.md)) for details on adjusting parallel settings.
+This script is a shorthand to launch a single-GPU context and generation server, as well as the disaggregated server within a single Ray cluster. Please see [this documentation](/examples/disaggregated/README.md) for details on adjusting parallel settings.
 
 ```bash
 # requires a total of two GPUs

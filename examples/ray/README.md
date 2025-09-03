@@ -14,7 +14,7 @@ This feature is a prototype and under active development. MPI remains the defaul
 Run a simple `TP=2` example with a Hugging Face model:
 
 ```shell
-cd examples/llm-api/ray
+cd examples/ray
 python llm_inference_distributed_ray.py
 ```
 

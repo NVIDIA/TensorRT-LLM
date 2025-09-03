@@ -66,6 +66,35 @@ disable_overlap_scheduler: true
 EOF
 fi
 
+# Generate disaggregated server config
+echo "Generating disagg_config_local.yaml"
+cat > disagg_config_local.yaml << EOF
+hostname: localhost
+port: 8000
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+free_gpu_memory_fraction: 0.25
+backend: "pytorch"
+disable_overlap_scheduler: True
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.2
+  cache_transceiver_config:
+    backend: "ucx"
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: "ucx"
+  urls:
+      - "localhost:8002"
+EOF
+
 # Conditionally start ray head if using ray backend and not in attach mode
 RAY_STARTED=false
 if [[ "$BACKEND" == "ray" && "$ATTACH_MODE" != "true" ]]; then

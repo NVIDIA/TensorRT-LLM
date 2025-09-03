@@ -69,7 +69,7 @@ run_python_file() {
 
 # Function: run disagg serving test
 run_disagg_serving_test() {
-    local disagg_dir="disaggregated"
+    local disagg_dir="../disaggregated"
     local test_name="disagg_serving_test"
 
     # Store the original directory path for log files
@@ -135,7 +135,7 @@ run_disagg_serving_test() {
     echo "----------------------------------------"
 
     # Run the test and capture output
-    python disagg_serving_test.py 2>&1 | tee "$test_log_file"
+    python ../to_delete/disagg_serving_test.py 2>&1 | tee "$test_log_file"
     local test_result=$?
 
     echo "----------------------------------------"
@@ -229,12 +229,12 @@ if [ -f "rlhf/rlhf_colocate.py" ]; then
 fi
 
 # 3. llm_inference_async_ray.py
-if [ -f "llm_inference_async_ray.py" ]; then
-    run_python_file "llm_inference_async_ray.py"
+if [ -f "../llm_inference_async_ray.py" ]; then
+    run_python_file "../llm_inference_async_ray.py"
 fi
 
 # Run MPI guarding tests
-run_python_file "../llm_inference.py"
+run_python_file "../../llm-api/llm_inference.py"
 
 # Run disagg_serving_local test
 echo "Running disagg_serving_local test:"
