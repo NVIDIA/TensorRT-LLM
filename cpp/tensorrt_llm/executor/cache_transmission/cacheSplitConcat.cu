@@ -57,9 +57,12 @@ TargetRanksInfo TargetRanksInfoForDP(
     auto const selfPPNum = selfParConfig.mPipelineParallelism;
     auto const peerTPNum = peerParConfig.mTensorParallelism;
     auto const selfTPNum = selfParConfig.mTensorParallelism;
+    auto const peerCPNum = peerParConfig.mContextParallelism;
+    auto const selfCPNum = selfParConfig.mContextParallelism;
 
-    auto const selfTPRank = selfRank % selfParConfig.mTensorParallelism;
-    auto const selfPPRank = selfRank / selfParConfig.mTensorParallelism;
+    auto const selfTPRank = selfRank % selfTPNum;
+    auto const selfPPRank = selfRank / (selfTPNum * selfCPNum);
+    auto const selfCPRank = (selfRank % (selfTPNum * selfCPNum)) / selfTPNum;
 
     int peerPPRankStart = 0;
     int mDomainPPSize = 1;
@@ -108,13 +111,35 @@ TargetRanksInfo TargetRanksInfoForDP(
         peerTPRankEnd = peerTPRankStart + mDomainTPSize;
     }
 
+    int mDomainCPSize = 1;
+    int peerCPRankStart = 0;
+    int peerCPRankEnd = 0;
+    for (auto val : {peerCPNum, selfCPNum})
+    {
+        TLLM_CHECK(isPowerOfTwo(val));
+    }
+    if (selfCPNum <= peerCPNum)
+    {
+        mDomainCPSize = peerCPNum / selfCPNum;
+        peerCPRankStart = selfCPRank * mDomainCPSize;
+        peerCPRankEnd = (selfCPRank + 1) * mDomainCPSize;
+    }
+    else
+    {
+        peerCPRankStart = selfCPRank / (selfCPNum / peerCPNum);
+        peerCPRankEnd = peerCPRankStart + mDomainCPSize;
+    }
+
     std::vector<int> retRanks;
     for (int i = peerTPRankStart; i < peerTPRankEnd; i++)
     {
-        for (int j = peerPPRankStart; j < peerPPRankEnd; j++)
+        for (int j = peerCPRankStart; j < peerCPRankEnd; j++)
         {
-            int irank = j * peerTPNum + i;
-            retRanks.push_back(irank);
+            for (int k = peerPPRankStart; k < peerPPRankEnd; k++)
+            {
+                int irank = (k * peerTPNum * peerCPNum) + (j * peerTPNum) + i;
+                retRanks.push_back(irank);
+            }
         }
     }
 
@@ -131,7 +156,7 @@ TargetRanksInfo TargetRanksInfoForDP(
             = (peerNbHeadsPerLayer * peerTPSizePerDPGroup) / (selfNbHeadsPerLayer * selfTPSizePerDPGroup);
     }
 
-    return {mDomainPPSize, mDomainTPSize, std::move(retRanks), mDupHeadFactor, mPeerDupHeadFactor};
+    return {mDomainPPSize, mDomainTPSize, mDomainCPSize, std::move(retRanks), mDupHeadFactor, mPeerDupHeadFactor};
 }
 
 TargetRanksInfo targetIRanks(
