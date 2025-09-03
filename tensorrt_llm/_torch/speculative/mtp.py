@@ -85,7 +85,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
             self.slot_manager.add_slot(rid)
 
     def shutdown(self):
-        pass
+        self.slot_manager.shutdown()
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
