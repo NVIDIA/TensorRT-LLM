@@ -18,6 +18,8 @@ from torch._ops import OpOverloadPacket
 from torch.export import Dim
 from torch.fx import Node
 
+from ...._utils import nvtx_range
+
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 DynamicShapeCallback = Callable[[], DynamicShape]
 
@@ -530,19 +532,35 @@ class SequenceInfo:
             tnsr_like: List of values to store.
             reset: Whether to reset the full tensor on the device to 0 before writing to it.
         """
-        tnsr_device = self._args_device[name]
+        with nvtx_range(f"ad_store_seq_info_arg_{name}"):
+            tnsr_device = self._args_device[name]
 
-        # store list object on the host
-        self._args_host[name] = tnsr_like.copy()
+            # store list object on the host
+            self._args_host[name] = tnsr_like.copy()
 
-        # pin the memory on the host
-        tnsr_host = torch.tensor(tnsr_like, dtype=tnsr_device.dtype, pin_memory=True)
+            # pin the memory on the host
+            tnsr_host = torch.tensor(tnsr_like, dtype=tnsr_device.dtype, pin_memory=True)
 
-        # reset/copy to the device in a non-blocking fashion
-        if reset:
-            tnsr_device.zero_()
-        tnsr_device[: len(tnsr_like)].copy_(tnsr_host, non_blocking=True)
+            # reset/copy to the device in a non-blocking fashion
+            if reset:
+                tnsr_device.zero_()
+            tnsr_device[: len(tnsr_like)].copy_(tnsr_host, non_blocking=True)
 
+    def _store_extra_arg(
+        self, name: str, tnsr_like: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]]
+    ) -> None:
+        with nvtx_range(f"ad_store_extra_arg_{name}"):
+            if tnsr_like is not None:
+                if not isinstance(tnsr_like, torch.Tensor):
+                    if len(tnsr_like) > 1:
+                        tnsr_like = torch.cat(tnsr_like)
+                    else:
+                        tnsr_like = tnsr_like[0]
+                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
+            else:
+                self._extra_args[name] = self._extra_none_inputs[name]
+
+    @nvtx_range("ad_nest_sequences")
     def nest_sequences(
         self,
         input_ids: Sequence[Sequence[int]],
@@ -598,20 +616,11 @@ class SequenceInfo:
 
         ### UPDATE EXTRA INPUTS ####################################################################
         # go through all extra tensor arguments and update them
-        for name, none_input in self._extra_none_inputs.items():
-            if name in extra_args:
-                arg = extra_args.pop(name)
-                if not isinstance(arg, torch.Tensor):
-                    if len(arg) > 1:
-                        arg = torch.cat(arg)
-                    else:
-                        arg = arg[0]
-                self._extra_args[name] = arg.to(self.device, non_blocking=True)
-            else:
-                self._extra_args[name] = none_input
-
+        for name in self._extra_none_inputs.keys():
+            self._store_extra_arg(name, extra_args.pop(name, None))
         assert not extra_args, f"Extra arguments {extra_args.keys()} not found"
 
+    @nvtx_range("ad_rescatter_input_ids")
     def rescatter_input_ids(
         self, ungathered_input_ids: torch.Tensor, gather_idx: List[int], scatter_ref: int
     ):
@@ -638,6 +647,7 @@ class SequenceInfo:
         input_ids_device = self._args_device["input_ids"]
         input_ids_device.masked_scatter_(input_ids_device == scatter_ref, packed_input_ids)
 
+    @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.seq_len))
