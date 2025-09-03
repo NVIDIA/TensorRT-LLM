@@ -133,6 +133,8 @@ accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
 accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp8
+accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestPhi4::test_fp8
 accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[latency]

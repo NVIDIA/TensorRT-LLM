@@ -566,6 +566,16 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
                 config.epilogue_fusion_type = cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                 return config;
             });
+
+        // Finalize fusion is only supported for TMA epilogue schedule
+        tma_ws_configs.erase(std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
+                                 [](auto& config)
+                                 {
+                                     return config.epilogue_fusion_type
+                                         == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
+                                         && config.epilogue_schedule != cutlass_extensions::EpilogueScheduleType::TMA;
+                                 }),
+            tma_ws_configs.end());
     }
 
     auto swap_ab_configs = tma_ws_configs;

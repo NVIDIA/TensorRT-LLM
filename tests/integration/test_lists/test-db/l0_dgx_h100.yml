@@ -77,7 +77,8 @@ l0_dgx_h100:
       backend: pytorch
       auto_trigger: deepseek
   tests:
-  - unittest/_torch/multi_gpu_modeling -k "deepseek"
+  - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp1-bf16-trtllm-deepseekv3_lite]
+  - unittest/_torch/multi_gpu_modeling/test_deepseek.py::test_deepseek_streaming[tp4-bf16-trtllm-deepseekv3_lite]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEP]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEPLowLatency]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4afp8[MoEWeightLoadingMode.VANILLA-dtype0]

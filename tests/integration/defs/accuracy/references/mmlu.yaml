@@ -293,6 +293,11 @@ microsoft/Phi-4-multimodal-instruct:
   - accuracy: 69.69
 microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 65.98
+microsoft/phi-4:
+  - accuracy: 79.73
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 79.36
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 78.52
 GPT-OSS/BF16:

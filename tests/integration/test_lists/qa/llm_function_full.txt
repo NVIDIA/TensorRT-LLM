@@ -603,6 +603,8 @@ accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype_long_rope
 accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestPhi4::test_fp8
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend

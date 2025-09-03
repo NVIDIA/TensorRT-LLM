@@ -677,6 +677,7 @@ python3 ../../../summarize.py --test_trt_llm \
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rouge2: 4.331099231480823
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rougeL: 15.26751867562475
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rougeLsum: 20.14696930976001
+```
 
 #### Disaggregated Serving
 
