@@ -174,7 +174,14 @@ class MCTSController(Controller):
         path = best_leaf.get_path_to_root()
 
         # Final answer generation based on the best path
-        reasoning = "\n".join([n.state for n in path])
+        steps_desc = []
+        if path:
+            steps_desc.append(f"Problem: {path[0].state}")
+        for i in range(1, len(path)):
+            # Each child state's last line is the appended thought
+            last_line = (path[i].state.split('\n')[-1]).strip()
+            steps_desc.append(f"Step {i}: {last_line}")
+        reasoning = "\n".join(steps_desc)
         final_prompt = (
             f"{goal}\n\nHere is a coherent reasoning trajectory.\n"
             f"{reasoning}\n\nNow provide the final answer succinctly.")
@@ -256,7 +263,8 @@ class TOTController(Controller):
                  max_depth: int = 4,
                  max_iterations: int = 50,
                  num_thoughts_per_step: int = 3,
-                 selection_strategy: str = "best"):
+                 selection_strategy: str = "best",
+                 branch_factor: int = 2):
         super().__init__()
         self.generation_controller = generation_controller
         self.reward_controller = reward_controller
@@ -264,6 +272,7 @@ class TOTController(Controller):
         self.max_iterations = max_iterations
         self.num_thoughts_per_step = num_thoughts_per_step
         self.selection_strategy = selection_strategy  # "best", "vote", "random"
+        self.branch_factor = max(1, branch_factor)
 
     def process(self, tasks: List[Task], **kwargs) -> Any:
         """Process tasks using Tree of Thoughts with yield-based orchestration."""
@@ -284,35 +293,91 @@ class TOTController(Controller):
                 # Generate thoughts for this node
                 gen_prompt = self._generate_prompt(node, goal)
                 gen_task = GenerationTask.create_from_prompt(gen_prompt)
-                gen_task.max_tokens = 300
+                gen_task.max_tokens = 512
                 gen_task.temperature = 0.8
                 yield from self.generation_controller.process([gen_task])
                 thoughts = self._parse_approaches(gen_task.output_str or "")
 
                 # Evaluate each thought
                 evaluated_thoughts: List[Dict[str, Any]] = []
-                for thought in thoughts[:self.num_thoughts_per_step]:
-                    eval_prompt = self._evaluation_prompt(
-                        thought, goal, node.state)
-                    eval_task = GenerationTask.create_from_prompt(eval_prompt)
-                    eval_task.max_tokens = 150
-                    eval_task.temperature = 0.3
-                    yield from self.generation_controller.process([eval_task])
-                    evaluation = self._parse_evaluation(eval_task.output_str
-                                                        or "")
-                    evaluated_thoughts.append({
-                        'thought':
-                        thought,
-                        'score':
-                        evaluation['score'],
-                        'confidence':
-                        evaluation['confidence'],
-                        'reasoning':
-                        evaluation['reasoning']
-                    })
+                if not thoughts:
+                    # Nothing to evaluate for this node
+                    continue
+                if self.reward_controller is not None and thoughts:
+                    # Use reward controller (e.g., PRM) to score thoughts
+                    reward_tasks: List[GenerationTask] = []
+                    # Import locally to avoid circular imports
+                    from tensorrt_llm.sampling_params import SamplingParams
+                    for thought in thoughts[:self.num_thoughts_per_step]:
+                        reward_task = GenerationTask()
+                        # original problem as input
+                        reward_task.input_str = root_state
+
+                        # Construct the assistant "response" to evaluate: current state + next thought
+                        candidate_content = self._combine_state_and_thought(
+                            node.state, thought)
+
+                        # Build a minimal GenerationResult carrying the text for PRMController to read
+                        completion_output = CompletionOutput(
+                            index=0, text=candidate_content)
+                        mock_sampling_params = SamplingParams()
+                        reward_result = GenerationResult.__new__(
+                            GenerationResult)
+                        reward_result._outputs = [completion_output]
+                        reward_result.sampling_params = mock_sampling_params
+                        reward_task.result = reward_result
+                        reward_tasks.append(reward_task)
+
+                    # Delegate scoring to reward controller
+                    yield from self.reward_controller.process(reward_tasks)
+
+                    # Collect scores and build evaluated_thoughts
+                    scores = getattr(self.reward_controller, 'scores',
+                                     None) or []
+                    for thought, score in zip(
+                            thoughts[:self.num_thoughts_per_step], scores):
+                        # Normalize score to 1-10 scale if PRM returns 0-1
+                        normalized_score = float(score)
+                        if 0.0 <= normalized_score <= 1.0:
+                            normalized_score *= 10.0
+                        confidence = (
+                            'High' if normalized_score >= 8.0 else
+                            'Medium' if normalized_score >= 5.0 else 'Low')
+                        evaluated_thoughts.append({
+                            'thought': thought,
+                            'score': normalized_score,
+                            'confidence': confidence,
+                            'reasoning': 'PRM score'
+                        })
+                else:
+                    # Fallback: use LLM-generated evaluation and parse text
+                    for thought in thoughts[:self.num_thoughts_per_step]:
+                        eval_prompt = self._evaluation_prompt(
+                            thought, goal, node.state)
+                        eval_task = GenerationTask.create_from_prompt(
+                            eval_prompt)
+                        eval_task.max_tokens = 256
+                        eval_task.temperature = 0.3
+                        yield from self.generation_controller.process(
+                            [eval_task])
+                        evaluation = self._parse_evaluation(eval_task.output_str
+                                                            or "")
+                        evaluated_thoughts.append({
+                            'thought':
+                            thought,
+                            'score':
+                            evaluation['score'],
+                            'confidence':
+                            evaluation['confidence'],
+                            'reasoning':
+                            evaluation['reasoning']
+                        })
 
                 # Select top thoughts and create children
-                for thought_data in self._select_thoughts(evaluated_thoughts):
+                selected_thoughts = self._select_thoughts(evaluated_thoughts)
+                if not selected_thoughts:
+                    continue
+                for thought_data in selected_thoughts:
                     child_state = self._combine_state_and_thought(
                         node.state, thought_data['thought'])
                     child = TOTNode(state=child_state,
@@ -343,8 +408,19 @@ class TOTController(Controller):
             f"{goal}\n\nYou have the following proposed steps. Use them to produce the final answer.\n"
             f"{reasoning}\n\nProvide the final answer succinctly.")
         final_task = GenerationTask.create_from_prompt(final_prompt)
-        final_task.max_tokens = 256
+        final_task.max_tokens = 1024
         final_task.temperature = 0.2
+        # If the model uses R1-style <think> blocks, stop at the closing tag to avoid extra content
+        try:
+            if isinstance(final_task.stop, list):
+                if '</think>' not in final_task.stop:
+                    final_task.stop.append('</think>')
+            elif isinstance(final_task.stop, str) and final_task.stop:
+                final_task.stop = [final_task.stop, '</think>']
+            else:
+                final_task.stop = ['</think>']
+        except Exception:
+            final_task.stop = ['</think>']
         yield from self.generation_controller.process([final_task])
 
         tasks[0].result = final_task.result
@@ -366,20 +442,81 @@ Approach 3: [detailed approach]"""
     def _parse_approaches(self, text: str) -> List[str]:
         approaches: List[str] = []
         lines = (text or "").strip().split('\n')
-        current = ""
-        for line in lines:
-            line = line.strip()
+        current: List[str] = []
+
+        import re
+
+        def is_new_item(line: str) -> Optional[str]:
+            """Return the content of a new item header if the line starts a new approach/step item.
+            Supports:
+            - 'Approach N: ...' or 'Step N: ...'
+            - 'N. ...'
+            - '- ...' or '* ...'
+            """
+            line_stripped = line.strip()
+            if not line_stripped:
+                return None
+
+            # Approach/Step N: ...
+            m = re.match(r'^(?:approach|step)\s*\d+\s*[:\-\.]\s*(.*)$',
+                         line_stripped,
+                         flags=re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+            # Numbered list: '1. ...'
+            m = re.match(r'^\d+\.\s*(.*)$', line_stripped)
+            if m:
+                return m.group(1).strip()
+
+            # Bulleted list: '- ...' or '* ...'
+            m = re.match(r'^[\-\*]\s*(.*)$', line_stripped)
+            if m:
+                return m.group(1).strip()
+
+            return None
+
+        def flush_current():
+            nonlocal current
+            if current:
+                content = ' '.join(s for s in current).strip()
+                if content:
+                    approaches.append(content)
+                current = []
+
+        for raw_line in lines:
+            line = raw_line.strip()
             if not line:
                 continue
-            if (line.lower().startswith('approach') and ':' in line):
-                if current:
-                    approaches.append(current.strip())
-                current = line.split(':', 1)[1].strip()
-            elif current:
-                current += " " + line
-        if current:
-            approaches.append(current.strip())
-        return approaches
+            header_content = is_new_item(line)
+            if header_content is not None:
+                # Start of a new item
+                flush_current()
+                if header_content:
+                    current = [header_content]
+                else:
+                    current = []
+            else:
+                # Continuation of the current item
+                current.append(line)
+
+        flush_current()
+
+        # Fallbacks if nothing was parsed
+        if approaches:
+            return approaches
+        if not approaches:
+            # Try splitting by blank lines
+            paragraphs = [
+                p.strip() for p in re.split(r'\n\s*\n', text or '')
+                if p.strip()
+            ]
+            if paragraphs:
+                return paragraphs
+            # Final fallback to the whole text
+            if (text or '').strip():
+                return [(text or '').strip()]
+            return []
 
     def _evaluation_prompt(self, thought: str, goal: str,
                            current_state: str) -> str:
@@ -405,18 +542,48 @@ Reasoning: [brief explanation]"""
         lines = (text or "").strip().split('\n')
         score = 5.0
         confidence = 'Medium'
-        reasoning = 'No reasoning provided'
-        for line in lines:
-            line = line.strip()
-            if line.startswith('Score:'):
-                try:
-                    score = float(line.split(':', 1)[1].strip())
-                except Exception:
-                    pass
-            elif line.startswith('Confidence:'):
-                confidence = line.split(':', 1)[1].strip()
-            elif line.startswith('Reasoning:'):
-                reasoning = line.split(':', 1)[1].strip()
+        reasoning_lines: List[str] = []
+
+        import re
+
+        reasoning_started = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            if 'score' in lower:
+                # Extract the first number (handles '8', '8.5', '8/10')
+                nums = re.findall(r'(\d+(?:\.\d+)?)', line)
+                if nums:
+                    try:
+                        parsed = float(nums[0])
+                        # Normalize if it's like '0.8' (unlikely) or clamp
+                        if parsed <= 1.0 and '/10' in lower:
+                            parsed *= 10.0
+                        score = max(0.0, min(10.0, parsed))
+                    except Exception:
+                        pass
+            elif 'confidence' in lower:
+                # Normalize to High/Medium/Low if possible
+                val = line.split(':', 1)[1].strip() if ':' in line else line
+                v = val.lower()
+                if 'high' in v or 'strong' in v:
+                    confidence = 'High'
+                elif 'low' in v or 'weak' in v:
+                    confidence = 'Low'
+                else:
+                    confidence = 'Medium'
+            elif 'reason' in lower:
+                reasoning_started = True
+                val = line.split(':', 1)[1].strip() if ':' in line else line
+                if val:
+                    reasoning_lines.append(val)
+            else:
+                if reasoning_started:
+                    reasoning_lines.append(line)
+
+        reasoning = ' '.join(reasoning_lines).strip() or 'No reasoning provided'
         return {
             'score': score,
             'confidence': confidence,
@@ -429,13 +596,26 @@ Reasoning: [brief explanation]"""
         if not evaluated_thoughts:
             return []
         if self.selection_strategy == "best":
-            return sorted(evaluated_thoughts,
-                          key=lambda x: x['score'],
-                          reverse=True)[:min(2, len(evaluated_thoughts))]
+            return sorted(
+                evaluated_thoughts, key=lambda x: x['score'],
+                reverse=True)[:min(self.branch_factor, len(evaluated_thoughts))]
         if self.selection_strategy == "vote":
-            return evaluated_thoughts[:2]
-        return random.sample(evaluated_thoughts, min(2,
-                                                     len(evaluated_thoughts)))
+            # Confidence-aware selection: prioritize High > Medium > Low confidence, then score
+            def confidence_weight(conf: str) -> int:
+                c = (conf or '').lower()
+                if 'high' in c:
+                    return 2
+                if 'low' in c:
+                    return 0
+                return 1
+
+            return sorted(
+                evaluated_thoughts,
+                key=lambda x: (confidence_weight(x.get('confidence', 'Medium')),
+                               x.get('score', 0.0)),
+                reverse=True)[:min(self.branch_factor, len(evaluated_thoughts))]
+        return random.sample(evaluated_thoughts,
+                             min(self.branch_factor, len(evaluated_thoughts)))
 
     def _combine_state_and_thought(self, current_state: str,
                                    thought: str) -> str:

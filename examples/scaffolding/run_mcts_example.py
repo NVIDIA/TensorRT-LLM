@@ -1,25 +1,20 @@
 import argparse
-import json
 
 from tensorrt_llm.scaffolding import (MCTSController,
-                                      NativeGenerationController,
-                                      NativeRewardController, ScaffoldingLlm,
-                                      TRTLLMWorker)
-
-
-def load_test_file(jsonl_file: str):
-    data = []
-    with open(jsonl_file, "r", encoding="utf-8") as file:
-        for line in file:
-            if line.strip():
-                data.append(json.loads(line))
-    return data
+                                      NativeGenerationController, PRMController)
+from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
+from tensorrt_llm.scaffolding.worker import TRTLLMWorker
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', type=str, required=True)
-    parser.add_argument('--reward_model_dir', type=str, required=True)
+
+    parser.add_argument('--model_dir',
+                        type=str,
+                        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
+    parser.add_argument('--reward_model_dir',
+                        type=str,
+                        default="Qwen/Qwen2.5-Math-PRM-7B")
     parser.add_argument('--jsonl_file', type=str, default='./test.jsonl')
     parser.add_argument('--max_depth', type=int, default=4)
     parser.add_argument('--max_iterations', type=int, default=20)
@@ -32,34 +27,31 @@ def parse_arguments():
 def main():
     args = parse_arguments()
     workers = {}
-
-    # Initialize generation worker
     gen_worker = TRTLLMWorker.init_with_new_llm(
         args.model_dir,
         backend="pytorch",
-        max_batch_size=16,
-        max_num_tokens=4096,
-        kv_cache_free_gpu_memory_fraction=0.4)
+        max_batch_size=4,
+        max_num_tokens=8192,
+        kv_cache_free_gpu_memory_fraction=0.1)
     workers[NativeGenerationController.WorkerTag.GENERATION] = gen_worker
 
     # Initialize reward worker if provided
     reward_controller = None
-    if args.reward_model_dir:
-        reward_worker = TRTLLMWorker.init_with_new_llm(
-            args.reward_model_dir,
-            backend="pytorch",
-            max_batch_size=8,
-            max_num_tokens=2048,
-            kv_cache_free_gpu_memory_fraction=0.2)
-        workers[NativeRewardController.WorkerTag.REWARD] = reward_worker
-        reward_controller = NativeRewardController()
+    reward_worker = TRTLLMWorker.init_with_new_llm(
+        args.reward_model_dir,
+        backend="pytorch",
+        max_batch_size=4,
+        max_num_tokens=8192,
+        kv_cache_free_gpu_memory_fraction=0.2,
+        disable_overlap_scheduler=True)
+    workers[PRMController.WorkerTag.REWARD] = reward_worker
 
     # Create generation controller
     generation_controller = NativeGenerationController(sampling_params={
         "max_tokens": 4096,
-        "temperature": 0.7,
-        "top_p": 0.9,
+        "temperature": 0.8,
     })
+    reward_controller = PRMController(tokenizer=reward_worker.tokenizer)
 
     # Create MCTS controller
     controller = MCTSController(
@@ -71,32 +63,12 @@ def main():
         num_thoughts_per_step=args.num_thoughts_per_step)
 
     llm = ScaffoldingLlm(controller, workers=workers)
-    # Load problems from JSONL
-    test_dataset = load_test_file(args.jsonl_file)
-    prompts = []
-    ref_answers = []
-    for case in test_dataset:
-        prompt = case.get("problem") or case.get("question")
-        if prompt is None:
-            continue
-        prompts.append(prompt)
-        ref_answers.append(case.get("answer"))
 
-    for i, problem in enumerate(prompts):
-        print(f"\nProblem {i+1}: {problem}")
-        if i < len(ref_answers) and ref_answers[i] is not None:
-            print(f"Reference Answer: {ref_answers[i]}")
-        try:
-            results = llm.generate([problem])
+    query = "Sue lives in a fun neighborhood.  One weekend, the neighbors decided to play a prank on Sue.  On Friday morning, the neighbors placed 18 pink plastic flamingos out on Sue's front yard.  On Saturday morning, the neighbors took back one third of the flamingos, painted them white, and put these newly painted white flamingos back out on Sue's front yard.  Then, on Sunday morning, they added another 18 pink plastic flamingos to the collection. At noon on Sunday, how many more pink plastic flamingos were out than white plastic flamingos?"
+    prompts = [query]
 
-            for result in results:
-                print(f"MCTS Solution:")
-                print(result.outputs[0].text)
-                print(f"Tokens generated: {len(result.outputs[0].token_ids)}")
-
-        except Exception as e:
-            print(e)
-
+    results = llm.generate(prompts)
+    print(results[0].outputs[0].text)
     llm.shutdown(shutdown_workers=True)
     print(f'main shut down done')
 
