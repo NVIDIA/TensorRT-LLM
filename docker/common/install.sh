@@ -101,7 +101,7 @@ fi
 
 if [ $cuda_toolkit -eq 1 ]; then
     echo "Installing CUDA toolkit..."
-    GITHUB_MIRROR=$GITHUB_MIRROR bash $SCRIPT_DIR/install_cuda_toolkit.sh
+    bash $SCRIPT_DIR/install_cuda_toolkit.sh
 fi
 
 if [ $tensorrt -eq 1 ]; then
