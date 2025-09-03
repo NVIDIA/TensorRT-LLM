@@ -4,6 +4,7 @@
 # Please take a look at the existing test_llm_api_pytorch.py file for reference.
 import concurrent
 import contextlib
+import itertools
 import json
 import os
 import tempfile
@@ -47,6 +48,9 @@ class Result(GenerationResultBase):
 
 DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
+DEFAULT_TEST_TIMEOUT = 1800
+DEFAULT_SERVER_WAITING_TIMEOUT = 1200
+
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
 
@@ -67,13 +71,15 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 
 
 @contextlib.contextmanager
-def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
-                             ctx_server_config: Dict[str, Any],
-                             gen_server_config: Dict[str, Any],
-                             model_name: str,
-                             tensor_parallel_size: int = 1,
-                             ctx_model: str = None,
-                             gen_model: str = None):
+def launch_disaggregated_llm(
+        disaggregated_server_config: Dict[str, Any],
+        ctx_server_config: Dict[str, Any],
+        gen_server_config: Dict[str, Any],
+        model_name: str,
+        tensor_parallel_size: int = 1,
+        ctx_model: str = None,
+        gen_model: str = None,
+        server_waiting_timeout: int = DEFAULT_SERVER_WAITING_TIMEOUT):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -197,16 +203,22 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             )
             raise
 
+    server_cmd = [
+        trtllm_serve_path, "disaggregated", "-c",
+        disaggregated_serving_config_path, "--server_start_timeout",
+        str(server_waiting_timeout)
+    ]
     with (MyThreadPoolExecutor(max_workers=16) as
-          thread_pool, temp_dir, multi_popen(ctx_servers + gen_servers),
-          popen([
-              trtllm_serve_path, "disaggregated", "-c",
-              disaggregated_serving_config_path, "--server_start_timeout",
-              "3600"
-          ])):
+          thread_pool, temp_dir, multi_popen(ctx_servers + gen_servers) as
+          worker_processes, popen(server_cmd) as server_process):
         start_time = time.time()
-        while time.time() - start_time < 3600:
-            time.sleep(1)
+        while time.time() - start_time < server_waiting_timeout:
+            time.sleep(5)
+            for process in itertools.chain(worker_processes, [server_process]):
+                if process.poll() is not None:
+                    raise Exception(
+                        f"process {process.pid} exited with code {process.returncode}"
+                    )
             try:
                 print("Checking health endpoint")
                 response = requests.get("http://localhost:8000/health")
@@ -339,7 +351,7 @@ def run_parallel_test(model_name: str,
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -522,15 +534,17 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(32000)
+    @parametrize_with_ids("eagle3_one_model", [True, False])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding_with_eagle3(self, backend: str, mocker):
+    def test_guided_decoding_with_eagle3(self, backend: str,
+                                         eagle3_one_model: bool, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 3,
             "speculative_model_dir":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": False
+            "eagle3_one_model": eagle3_one_model
         }
 
         ctx_server_config = {
@@ -545,7 +559,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         gen_server_config = {
-            "disable_overlap_scheduler": True,
+            # Two-model eagle3 does not support overlap scheduler
+            "disable_overlap_scheduler": not eagle3_one_model,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.8,
@@ -639,7 +654,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
@@ -723,8 +738,61 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+            "guided_decoding_backend": backend,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+            "guided_decoding_backend": backend,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            }
+        }
+        if mtp_nextn > 0:
+            ctx_server_config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "num_nextn_predict_layers": mtp_nextn
+            }
+            gen_server_config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "num_nextn_predict_layers": mtp_nextn
+            }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
 
-@pytest.mark.timeout(3600)
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
@@ -780,7 +848,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8"
@@ -897,7 +965,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
 
 @skip_pre_blackwell
-@pytest.mark.timeout(3600)
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     FP4_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf"
     FP8_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf"
