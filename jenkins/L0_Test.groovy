@@ -1160,11 +1160,11 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // At this point, only tests with backend=triton or unspecified backend will be run
         makoArgs += ["backend=triton"]
     } else if (stageName.contains("-FMHA-")) {
-        // If stageName contains "-FMHA-", add "backend=FMHA" to makoArgs
-        // At this point, only tests with backend=FMHA or unspecified backend will be run
-        makoArgs += ["backend=FMHA"]
+        // If stageName contains "-FMHA-", add "backend=fmha" to makoArgs
+        // At this point, only tests with backend=fmha or unspecified backend will be run
+        makoArgs += ["backend=fmha"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", or "-Triton-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", or "-FMHA-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
