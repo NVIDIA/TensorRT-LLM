@@ -36,6 +36,7 @@ if __name__ == "__main__":
         '--calib_dataset',
         type=str,
         default='cnn_dailymail',
+        choices=['cnn_dailymail', 'peoples_speech'],
         help=
         "The huggingface dataset name or the local directory of the dataset for calibration."
     )
