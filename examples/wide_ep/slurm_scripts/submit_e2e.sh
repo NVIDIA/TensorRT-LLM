@@ -30,8 +30,8 @@ for b in 1 64 1024; do
         ntasks=$((total_node_num * ntasks_per_node))
 
         args=(
-            ${ctx_num} 4 4 4480 true "0.85"   # Context servers arguments
-            1 16 1024 1024 true "0.7"       # Generation servers arguments
+            ${ctx_num} 4 1 4 4480 true "0.85"   # Context servers arguments
+            1 16 1 1024 1024 true "0.7"       # Generation servers arguments
             $eplb_num_slots $mtp_size  # Other arguments
             $concurrency               # Benchmarking arguments
             $isl
@@ -68,8 +68,8 @@ for b in 512; do
     eplb_num_slots=288
 
     args=(
-        ${ctx_num} 4 4 4480 true "0.85"   # Context servers arguments
-        1 32 1024 1024 true "0.7"  # Generation servers arguments
+        ${ctx_num} 4 1 4 4480 true "0.85"   # Context servers arguments
+        1 32 1 1024 1024 true "0.7"  # Generation servers arguments
         $eplb_num_slots $mtp_size  # Other arguments
         $concurrency               # Benchmarking arguments
         $isl

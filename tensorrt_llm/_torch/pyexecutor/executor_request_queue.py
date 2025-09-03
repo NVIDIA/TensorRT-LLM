@@ -16,7 +16,6 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
-from .sampler import Sampler, TorchSampler
 
 SHUTDOWN_REQUEST_ID = -1
 
@@ -303,12 +302,13 @@ class ExecutorRequestQueue:
         return new_requests
 
     @nvtx_range("_fetch_new_requests")
-    def fetch_new_requests(self, num_active_requests: int) -> List[LlmRequest]:
+    def fetch_new_requests(
+            self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
 
         if self.enable_attention_dp:
-            return self._fetch_new_requests_attention_dp(num_active_requests)
+            return self._fetch_new_requests_attention_dp(activate_requests)
         else:
-            return self._fetch_new_requests_attention_tp(num_active_requests)
+            return self._fetch_new_requests_attention_tp(len(activate_requests))
 
     def _fetch_new_requests_attention_tp(
             self, num_active_requests: int) -> List[LlmRequest]:
@@ -327,13 +327,18 @@ class ExecutorRequestQueue:
         return merged_requests
 
     def _fetch_new_requests_attention_dp(
-            self, num_active_requests: int) -> List[LlmRequest]:
+            self, activate_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
         # Get active request counts across all ranks
         all_ranks_num_active_requests = []
-        responses_list = self.dist.tp_allgather(num_active_requests)
-        for num_active_requests in responses_list:
+        all_ranks_num_active_tokens = []
+        num_active_tokens = sum(
+            [req.py_orig_prompt_len for req in activate_requests])
+        responses_list = self.dist.tp_allgather(
+            [len(activate_requests), num_active_tokens])
+        for num_active_requests, num_active_tokens in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
+            all_ranks_num_active_tokens.append(num_active_tokens)
 
         total_num_active_requests = sum(all_ranks_num_active_requests)
         total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
@@ -347,7 +352,8 @@ class ExecutorRequestQueue:
 
         # Schedule attention dp requests
         all_ranks_new_requests = self._schedule_attention_dp_requests(
-            new_requests, all_ranks_num_active_requests)
+            new_requests, all_ranks_num_active_requests,
+            all_ranks_num_active_tokens)
         new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
         # Update performance metrics
@@ -365,7 +371,8 @@ class ExecutorRequestQueue:
 
     def _schedule_attention_dp_requests(
             self, new_requests: List[RequestQueueItem],
-            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
+            all_ranks_num_active_requests: List[int],
+            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
         """Schedule attention dp requests."""
 
         # Map from ranks to new requests
@@ -412,7 +419,7 @@ class ExecutorRequestQueue:
 
         all_ranks_new_requests = self._balance_requests_across_ranks(
             remaining_unscheduled, all_ranks_new_requests,
-            all_ranks_num_active_requests)
+            all_ranks_num_active_requests, all_ranks_num_active_tokens)
 
         return all_ranks_new_requests
 
@@ -470,7 +477,8 @@ class ExecutorRequestQueue:
     def _balance_requests_across_ranks(
             self, new_requests: List[RequestQueueItem],
             all_ranks_new_requests: Dict[int, List[RequestQueueItem]],
-            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
+            all_ranks_num_active_requests: List[int],
+            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
         """Balance requests across ranks for attention DP."""
         if new_requests:
             # Balance context tokens across ranks using heap
@@ -479,7 +487,7 @@ class ExecutorRequestQueue:
                 ['num_tokens', 'num_requests', 'rank', 'request_list'])
 
             all_ranks_new_requests_heap = [
-                HeapVal(0, val, tp_rank, [])
+                HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
                 for tp_rank, val in enumerate(all_ranks_num_active_requests)
             ]
 
@@ -504,6 +512,7 @@ class ExecutorRequestQueue:
 
             # Distribute requests across ranks
             for req_item in new_requests:
+
                 val = heapq.heappop(all_ranks_new_requests_heap)
                 token_count = len(
                     getattr(req_item.request, 'input_token_ids',
@@ -707,21 +716,19 @@ class ExecutorRequestQueue:
 
     def set_exclude_last_generation_logits(self,
                                            disable_overlap_scheduler: bool,
-                                           sampler: Sampler) -> None:
+                                           pp_size: int) -> None:
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # sample_async is called twice before the first call to update_requests:
         # - 1st time as a context request that handles on the 1st generated token
         # - 2nd time as a generation request that handles on the 2nd generated token.
         # and only after these two calls the sampler's update_request method is called.
         # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async (TorchSampler is an anomaly that instead does that on
-        # update_requests), every update_request doesn't handle the newest token, but one
+        # sample_async, every update_request doesn't handle the newest token, but one
         # before it. Since all these calls work on the same request object, then its
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
-        # getter is required, when not using TorchSampler.
-        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and not isinstance(
-            sampler, TorchSampler)
+        # getter is required.
+        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and pp_size == 1
 
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits

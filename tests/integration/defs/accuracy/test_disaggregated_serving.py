@@ -23,7 +23,7 @@ from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_pre_blackwell, skip_pre_hopper)
+                        skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, JsonModeEval,
                             LlmapiAccuracyTestHarness, get_accuracy_task)
@@ -129,37 +129,81 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
     ctx_total_gpus = ctx_tp * ctx_pp
     gen_total_gpus = gen_tp * gen_pp
 
-    env_ctx = os.environ.copy()
-    env_ctx["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env_ctx["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(ctx_total_gpus)))
+    ctx_urls = disaggregated_server_config["context_servers"]["urls"]
+    gen_urls = disaggregated_server_config["generation_servers"]["urls"]
 
-    env_gen = os.environ.copy()
-    env_gen["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(
-        map(str, range(ctx_total_gpus, ctx_total_gpus + gen_total_gpus)))
-    ctx_server_args = ctx_args + [
-        "--port", "8001", "--extra_llm_api_options", ctx_server_config_path,
-        f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}"
-    ]
-    gen_server_args = gen_args + [
-        "--port", "8002", "--extra_llm_api_options", gen_server_config_path,
-        f"--tp_size={gen_tp}", f"--pp_size={gen_pp}"
-    ]
-    if "max_num_tokens" in ctx_server_config:
-        ctx_server_args.append(
-            f"--max_num_tokens={ctx_server_config['max_num_tokens']}")
-    if "max_num_tokens" in gen_server_config:
-        gen_server_args.append(
-            f"--max_num_tokens={gen_server_config['max_num_tokens']}")
+    ctx_ports = [int(url.split(":")[1]) for url in ctx_urls]
+    gen_ports = [int(url.split(":")[1]) for url in gen_urls]
+
+    ctx_servers = []
+    current_gpu_offset = 0
+
+    for i, port in enumerate(ctx_ports):
+        env_ctx = os.environ.copy()
+        env_ctx["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        gpu_range = range(current_gpu_offset,
+                          current_gpu_offset + ctx_total_gpus)
+        env_ctx["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        current_gpu_offset += ctx_total_gpus
+
+        ctx_server_args = ctx_args + [
+            "--port",
+            str(port), "--extra_llm_api_options", ctx_server_config_path,
+            f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}"
+        ]
+        if "max_num_tokens" in ctx_server_config:
+            ctx_server_args.append(
+                f"--max_num_tokens={ctx_server_config['max_num_tokens']}")
+
+        ctx_servers.append((env_ctx, ctx_server_args))
+
+    gen_servers = []
+
+    for i, port in enumerate(gen_ports):
+        env_gen = os.environ.copy()
+        env_gen["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        gpu_range = range(current_gpu_offset,
+                          current_gpu_offset + gen_total_gpus)
+        env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        current_gpu_offset += gen_total_gpus
+
+        gen_server_args = gen_args + [
+            "--port",
+            str(port), "--extra_llm_api_options", gen_server_config_path,
+            f"--tp_size={gen_tp}", f"--pp_size={gen_pp}"
+        ]
+        if "max_num_tokens" in gen_server_config:
+            gen_server_args.append(
+                f"--max_num_tokens={gen_server_config['max_num_tokens']}")
+
+        gen_servers.append((env_gen, gen_server_args))
+
+    @contextlib.contextmanager
+    def multi_popen(server_configs):
+        processes = []
+        try:
+            for env, args in server_configs:
+                proc = popen(args, env=env)
+                processes.append(proc)
+
+            with contextlib.ExitStack() as stack:
+                opened_processes = [
+                    stack.enter_context(proc) for proc in processes
+                ]
+                yield opened_processes
+        except Exception as e:
+            print(
+                f"Failed to start disaggregated server processes in multi_popen: {e}"
+            )
+            raise
 
     with (MyThreadPoolExecutor(max_workers=16) as
-          thread_pool, temp_dir, popen(ctx_server_args, env=env_ctx) as
-          ctx_server, popen(gen_server_args, env=env_gen) as gen_server,
+          thread_pool, temp_dir, multi_popen(ctx_servers + gen_servers),
           popen([
               trtllm_serve_path, "disaggregated", "-c",
               disaggregated_serving_config_path, "--server_start_timeout",
               "3600"
-          ]) as disaggregated_server):
+          ])):
         start_time = time.time()
         while time.time() - start_time < 3600:
             time.sleep(1)
@@ -225,17 +269,7 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             return future
 
         tokenizer = load_hf_tokenizer(model_name)
-
-        try:
-            yield DuckLLM(args, tokenizer, generate_async)
-        finally:
-            ctx_server.terminate()
-            gen_server.terminate()
-            disaggregated_server.terminate()
-
-            ctx_server.wait()
-            gen_server.wait()
-            disaggregated_server.wait()
+        yield DuckLLM(args, tokenizer, generate_async)
 
 
 def run_parallel_test(model_name: str,
@@ -244,13 +278,18 @@ def run_parallel_test(model_name: str,
                       ctx_tp: int,
                       gen_pp: int,
                       gen_tp: int,
+                      ctx_instances: int,
+                      gen_instances: int,
                       test_sets: List[LlmapiAccuracyTestHarness],
                       ctx_model: str = None,
                       gen_model: str = None):
-    if ctx_tp * ctx_pp + gen_tp * gen_pp > get_device_count():
-        pytest.fail(
-            f"Not enough devices for ctx_pp={ctx_pp}+ctx_tp={ctx_tp} and gen_pp={gen_pp}+gen_tp={gen_tp} test"
+    total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
+    total_gen_gpus = gen_tp * gen_pp * gen_instances
+    if total_ctx_gpus + total_gen_gpus > get_device_count():
+        pytest.skip(
+            f"Not enough devices for {ctx_instances} ctx instances (ctx_pp={ctx_pp}*ctx_tp={ctx_tp}) + {gen_instances} gen instances (gen_pp={gen_pp}*gen_tp={gen_tp}), total: {total_ctx_gpus + total_gen_gpus}"
         )
+
     kv_cache_config = {
         "free_gpu_memory_fraction": 0.5,
     }
@@ -272,17 +311,21 @@ def run_parallel_test(model_name: str,
             "backend": "DEFAULT"
         }
     }
+
+    ctx_urls = [f"localhost:{8001 + i * 2}" for i in range(ctx_instances)]
+    gen_urls = [f"localhost:{8002 + i * 2}" for i in range(gen_instances)]
+
     disaggregated_server_config = {
         "hostname": "localhost",
         "port": 8000,
         "backend": "pytorch",
         "context_servers": {
-            "num_instances": 1,
-            "urls": ["localhost:8001"]
+            "num_instances": ctx_instances,
+            "urls": ctx_urls
         },
         "generation_servers": {
-            "num_instances": 1,
-            "urls": ["localhost:8002"]
+            "num_instances": gen_instances,
+            "urls": gen_urls
         }
     }
     with launch_disaggregated_llm(disaggregated_server_config,
@@ -301,6 +344,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
     def test_auto_dtype(self, disable_overlap_scheduler):
@@ -331,6 +375,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(2)
+    @skip_pre_hopper
     def test_ngram(self):
         speculative_decoding_config = {
             "decoding_type": "NGram",
@@ -378,6 +424,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(2)
+    @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("eagle3_one_model", [True, False])
     def test_eagle3(self, overlap_scheduler, eagle3_one_model):
@@ -436,6 +484,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mocker):
@@ -532,7 +581,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if tp * pp * 2 > get_device_count():
             pytest.skip(f"Not enough devices for tp={tp}*pp={pp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
-                                 tp, [get_accuracy_task(testset)])
+                                 tp, 1, 1, [get_accuracy_task(testset)])
 
     @parametrize_with_ids("ctx_pp", [2, 4])
     @parametrize_with_ids("gen_tp", [1, 2])
@@ -542,15 +591,20 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip(
                 f"Not enough devices for ctx_pp={ctx_pp}*gen_tp={gen_tp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
-                                 gen_tp, [get_accuracy_task(testset)])
+                                 gen_tp, 1, 1, [get_accuracy_task(testset)])
+
+    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
+    def test_multi_instance(self, testset):
+        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, 1, 1, 1, 1,
+                                 2, 2, [get_accuracy_task(testset)])
 
 
-@pytest.mark.skip_less_device_memory(140000)
-@pytest.mark.timeout(3600)
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
+    @pytest.mark.skip_less_device_memory(140000)
+    @pytest.mark.timeout(3600)
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
@@ -590,6 +644,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(60000)
+    @skip_no_hopper
     def test_nixl_backend(self):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -628,6 +685,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.skip_less_device(8)
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
@@ -671,6 +729,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         pytest.skip(
@@ -726,6 +785,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8"
 
+    @pytest.mark.skip_less_device(2)
+    @skip_no_hopper
     def test_nixl_backend(self):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -755,11 +816,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {
@@ -771,6 +832,43 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         }
         gen_server_config = {
             "disable_overlap_scheduler": overlap_scheduler,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_chunked_prefill(self):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            },
+            "enable_chunked_prefill": True,
+            "max_num_tokens": 256,
+        }
+        gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"

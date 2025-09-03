@@ -9,8 +9,8 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.guided_decoder import GuidedDecoder
-from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
-                                      get_draft_token_length)
+from ..pyexecutor.handle_logits import HandleLogits
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState, TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -70,6 +70,12 @@ class ModelDrafter(Drafter):
         if isinstance(sampler, TorchSampler):
             self._request_draft_logits = sampler.enable_mixed_sampler
         self.guided_decoder = guided_decoder
+
+        self.use_static_draft_loop = draft_model_engine.model_is_wrapped
+        if self.use_static_draft_loop:
+            # TODO: enable sampling/guided decoding on static draft loop
+            assert guided_decoder is None
+            assert not sampler.enable_mixed_sampler
 
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
@@ -236,6 +242,8 @@ class ModelDrafter(Drafter):
         """Check if CUDA graph should be disabled for the current forward pass."""
         if previous_batch is not None:
             return False
+        if self.use_static_draft_loop:
+            return False
         return self.spec_config.spec_dec_mode.needs_kv_cache_recompute()
 
     def _forward_draft_model(
@@ -255,8 +263,10 @@ class ModelDrafter(Drafter):
                 resource_manager,
                 new_tensors_device=new_tensors_device)
 
-        # Handle d2t data if available
-        if hasattr(self.draft_model_engine.model.model, 'd2t'):
+        # Handle d2t data if available. Static drafting loops should incorporate d2t
+        # in their implementations.
+        if not self.use_static_draft_loop and hasattr(
+                self.draft_model_engine.model.model, 'd2t'):
             outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
         return outputs
@@ -266,7 +276,21 @@ class ModelDrafter(Drafter):
         """Sample tokens from draft model outputs."""
         try:
             if self.sampler is not None:
-                return self.sampler.sample_async(draft_batch, outputs)
+                num_context_logits_prefix_sum = [0]
+                prefix_sum = 0
+                for request in draft_batch.context_requests:
+                    prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
+                    num_context_logits_prefix_sum.append(prefix_sum)
+
+                HandleLogits()(
+                    draft_batch.context_requests,
+                    draft_batch.generation_requests, outputs["logits"],
+                    self.sampler.beam_width(draft_batch.all_requests()),
+                    num_context_logits_prefix_sum,
+                    self.sampler.is_generation_model())
+
+                return self.sampler.sample_async(draft_batch, outputs,
+                                                 num_context_logits_prefix_sum)
             return None
         except Exception as e:
             logger.error(f"Error in sampling: {str(e)}")
@@ -311,15 +335,6 @@ class ModelDrafter(Drafter):
 
         return new_requests
 
-    def _pad_to_max_draft_tokens(self,
-                                 scheduled_requests: ScheduledRequests) -> None:
-        """Pad draft tokens to maximum length for all generation requests."""
-        for req in scheduled_requests.generation_requests:
-            max_draft_tokens = self.max_draft_tokens
-            num_draft_tokens = get_draft_token_length(req)
-            req.py_draft_tokens.extend(
-                0 for _ in range(max_draft_tokens - num_draft_tokens))
-
     def _execute_guided_decoder(self,
                                 scheduled_batch: ScheduledRequests,
                                 logits: torch.Tensor,
@@ -360,8 +375,29 @@ class ModelDrafter(Drafter):
                 for req in scheduled_requests.all_requests()
             }
 
-            # Initial forward pass
+            # Initial forward pass. May do the complete drafting loop
+            # if use_static_draft_loop is set.
             outputs = self._forward_draft_model(draft_batch, resource_manager)
+
+            if self.use_static_draft_loop:
+                outputs_host = outputs.cpu()
+                for token_idx in range(self.max_draft_tokens):
+                    for req_idx, req in enumerate(draft_batch.all_requests()):
+                        target_model_req = req_id_to_old_request[
+                            req.py_request_id]
+                        if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                            # Chunked prefill request in progress; no need to append draft tokens
+                            continue
+
+                        target_req = req_id_to_old_request[req.py_request_id]
+                        target_req.py_draft_tokens.append(
+                            outputs_host[token_idx][req_idx])
+
+                for req in draft_batch.all_requests():
+                    self.draft_seq_slot_manager.free_resources(req)
+
+                return
+
             self._execute_guided_decoder(draft_batch,
                                          outputs['logits'],
                                          d2t=outputs.get('d2t'))
@@ -403,7 +439,6 @@ class ModelDrafter(Drafter):
                 self._update_requests(previous_batch)
                 self._process_decoded_tokens(previous_batch.scheduled_requests,
                                              req_id_to_old_request)
-            self._pad_to_max_draft_tokens(scheduled_requests)
 
             if self.guided_decoder is not None:
                 self.guided_decoder.rollback_draft_tokens(scheduled_requests)

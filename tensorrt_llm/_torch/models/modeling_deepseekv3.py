@@ -58,14 +58,13 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
                                  MoEWeightLoadingMode, TRTLLMGenFusedMoE,
-                                 create_moe,
-                                 moe_load_balancer_set_repeated_for_next_layer)
+                                 create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
-from ..speculative import MTPSpecMetadata, SpecMetadata
+from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
@@ -127,6 +126,12 @@ def weight_dequant(x: torch.Tensor,
                          triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
+
+@torch.compile(dynamic=True)
+def moe_reduce_add_shared_output(routed_output, shared_output):
+    routed_output = torch.sum(routed_output, dim=1, keepdim=False)
+    return shared_output + routed_output
 
 
 class DeepseekV3MTPHead(nn.Module):
@@ -230,7 +235,7 @@ class DeepseekV3Attention(MLA):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-        predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
+        predicted_tokens_per_seq = model_config.spec_config.max_draft_len + 1 if model_config.spec_config is not None else 1
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
                          num_key_value_heads=config.num_key_value_heads,
@@ -280,10 +285,16 @@ class Deepseekv3RoutingImpl():
         self.routed_scaling_factor = routed_scaling_factor
         self.is_fused = is_fused
 
-    def noaux_tc(self, logits, e_score_correction_bias):
-        n_group = self.n_group
+    @torch.compile(options={"max-autotune": True})
+    def get_scores(self, logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias
+        return scores, scores_with_bias
+
+    def noaux_tc(self, logits, e_score_correction_bias):
+        n_group = self.n_group
+        scores, scores_with_bias = self.get_scores(logits,
+                                                   e_score_correction_bias)
         scores_shape = list(scores_with_bias.shape)
 
         if enable_llm_debug():
@@ -580,6 +591,8 @@ class Deepseekv3MoE(nn.Module):
                                                        do_finalize)
             return routed_output
 
+        # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
+
         routed_output, shared_output = maybe_execute_in_parallel(
             _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
@@ -588,9 +601,17 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
-            assert shared_output.size() == routed_output.size(
-            ), f'unmatched tensor shape'
-            final_hidden_states = shared_output + routed_output
+            if routed_output.dim() == 3:
+                assert shared_output.numel(
+                ) * self.top_k == routed_output.numel(
+                ), 'unmatched tensor shape'
+                final_hidden_states = moe_reduce_add_shared_output(
+                    routed_output, shared_output)
+            else:
+                assert shared_output.size() == routed_output.size(
+                ), 'unmatched tensor shape'
+                final_hidden_states = shared_output + routed_output
+
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
                     final_hidden_states,
@@ -606,7 +627,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                        torch.cuda.Stream]):
         super().__init__()
         self.model_config = model_config
-        config = model_config.pretrained_config
+        self.config = model_config.pretrained_config
+        config = self.config
 
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -637,6 +659,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
         has_tp = mapping.has_tp()
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
+        self.moe_allreduce = MoEAllReduce(self.mapping)
 
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
@@ -689,10 +715,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy,
-                                   dtype=config.torch_dtype)
-        self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
@@ -738,10 +760,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 intermediate_size // block_size,
                 self.mapping.tp_size,
             )
-            mlp_tp_size = math.gcd(
-                tp,
-                self.mapping.gpus_per_node,
-            ) if tp > self.mapping.gpus_per_node else tp  # Avoid costly inter-node TP
+
+            if tp > self.mapping.gpus_per_node and not self.allreduce.is_mnnvl(
+            ):
+                mlp_tp_size = math.gcd(
+                    tp,
+                    self.mapping.gpus_per_node,
+                )  # Avoid costly inter-node TP when MNNVL is not supported
+            else:
+                mlp_tp_size = tp
         return mlp_tp_size
 
     def forward(
@@ -750,6 +777,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -765,16 +793,24 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             **kwargs,
         )
         if isinstance(self.mlp, Deepseekv3MoE):
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                self.fusion_config.POST_MOE_FUSION = False
             return self.forward_MoE(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
         else:
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                self.fusion_config.POST_MLP_FUSION = False
             assert isinstance(self.mlp, GatedMLP)
             return self.forward_mlp(
                 hidden_states=hidden_states,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
 
     def forward_MoE(
@@ -782,6 +818,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
+        spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
@@ -856,6 +893,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params)
         else:
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
@@ -866,6 +907,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
@@ -903,6 +945,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 ),
             )
         else:
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
@@ -1105,6 +1151,7 @@ class DeepseekV3Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
 
         return hidden_states
@@ -1132,13 +1179,14 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                          model_config=model_config)
 
         self.model_nextn = 0
-        if model_config.spec_config is not None:
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp(
+        ):
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
-                moe_load_balancer_set_repeated_for_next_layer(model_nextn)
+                pass
             else:
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
@@ -1167,11 +1215,10 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         input_ids: torch.IntTensor = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[MTPSpecMetadata] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        attn_metadata.num_generations_per_batch = self.model_nextn + 1
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,
@@ -1313,7 +1360,9 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
-            if len(module._parameters) > 0:
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            else:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
                 if "model.layers" in name and int(
