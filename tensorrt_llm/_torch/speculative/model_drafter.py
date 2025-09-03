@@ -151,8 +151,10 @@ class ModelDrafter(Drafter):
             assert num_draft_tokens == 0
             return self._create_context_request(request, input_tokens)
 
-        # No tokens accepted - generation request
-        elif num_accepted_tokens == 0:
+        # No tokens accepted - generation request. This only applies to speculation algorithms
+        # that need to recompute KV cache for accepted tokens like eagle3.
+        elif num_accepted_tokens == 0 or not self.spec_config.spec_dec_mode.needs_kv_cache_recompute(
+        ):
             return self._create_generation_request(request, input_tokens)
 
         # Tokens accepted - chunked context request
