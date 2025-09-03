@@ -113,6 +113,7 @@ class GenerationExecutorWorker(GenerationExecutor):
             assert hasattr(
                 self.llm_args, "backend"
             ), "llm_args should be with backend in _create_py_executor"
+            _ = _get_comm_ranks_device_id()
             if self.llm_args.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
