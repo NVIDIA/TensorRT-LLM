@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import Llama4ForConditionalGeneration
-from transformers.models.llama4.modeling_llama4 import Llama4CausalLMOutputWithPast
+from transformers.models.llama4.modeling_llama4 import Llama4CausalLMOutputWithPast, Llama4TextMoe
 
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
@@ -191,3 +191,41 @@ class Llama4VisionPatch(BaseExportPatch):
         Llama4ForConditionalGeneration.forward = self.original_values[
             "Llama4ForConditionalGeneration.forward"
         ]
+
+
+def _moe_forward_with_transpose(self, hidden_states):
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    router_scores, router_logits = self.router(hidden_states)
+    routed_in = hidden_states.repeat(router_scores.shape[1], 1)
+
+    # BUG IN ORIGINAL CODE
+    # routed_in = routed_in * router_scores.reshape(-1, 1)
+    # END OF BUG IN ORIGINAL CODE
+
+    # PATCH STARTED
+    routed_in = routed_in * router_scores.transpose(0, 1).reshape(-1, 1)
+    # PATCH ENDED
+
+    routed_out = self.experts(routed_in)
+    out = self.shared_expert(hidden_states)
+    out.add_(routed_out.reshape(router_scores.shape[1], -1, routed_out.shape[-1]).sum(dim=0))
+    return out, router_logits
+
+
+# TODO: remove this patch once https://github.com/huggingface/transformers/pull/40609 is merged,
+# gets released, and TRT-LLM updates to the relevant transformers version
+@ExportPatchRegistry.register("hf_llama4_moe")
+class Llama4MoEPatch(BaseExportPatch):
+    """Patch for Llama4 MoE routing to fix its current accuracy issue."""
+
+    def _apply_patch(self):
+        """Apply the Llama4 MoE routing patch."""
+        # Store original forward method
+        self.original_values["Llama4TextMoe.forward"] = Llama4TextMoe.forward
+
+        # Apply patch by replacing the forward method
+        Llama4TextMoe.forward = _moe_forward_with_transpose
+
+    def _revert_patch(self):
+        """Revert the Llama4 MoE routing patch."""
+        Llama4TextMoe.forward = self.original_values["Llama4TextMoe.forward"]
