@@ -58,7 +58,7 @@ from ..utils import (get_model_extra_attrs,
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner
-from .guided_decoder import GuidedWorker
+from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -413,7 +413,7 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = False
             self.max_draft_len = 0
 
-        self.guided_worker: Optional[GuidedWorker] = None
+        self.guided_decoder: Optional[CapturableGuidedDecoder] = None
 
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:
@@ -484,11 +484,12 @@ class PyTorchModelEngine(ModelEngine):
             dtype=torch_dtype_to_str(self.model.config.torch_dtype),
             swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
 
-    def set_guided_worker(self, guided_worker: GuidedWorker) -> bool:
-        if hasattr(self.model, "set_guided_worker"):
-            success = self.model.set_guided_worker(guided_worker)
+    def set_guided_decoder(self,
+                           guided_decoder: CapturableGuidedDecoder) -> bool:
+        if hasattr(self.model, "set_guided_decoder"):
+            success = self.model.set_guided_decoder(guided_decoder)
             if success:
-                self.guided_worker = guided_worker
+                self.guided_decoder = guided_decoder
             return success
         return False
 
@@ -1181,8 +1182,8 @@ class PyTorchModelEngine(ModelEngine):
                     num_ctx_requests:num_seqs] += (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
 
-        if self.guided_worker is not None:
-            self.guided_worker.token_event.record()
+        if self.guided_decoder is not None:
+            self.guided_decoder.token_event.record()
 
         return inputs
 
@@ -1271,9 +1272,9 @@ class PyTorchModelEngine(ModelEngine):
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
         # Must be before the update of py_batch_idx
-        if self.guided_worker is not None:
-            self.guided_worker.add_batch(scheduled_requests,
-                                         new_tokens=new_tokens_device)
+        if self.guided_decoder is not None:
+            self.guided_decoder.add_batch(scheduled_requests,
+                                          new_tokens=new_tokens_device)
 
         # if new_tensors_device exist, input_ids will only contain new context tokens
         input_ids = []  # per sequence

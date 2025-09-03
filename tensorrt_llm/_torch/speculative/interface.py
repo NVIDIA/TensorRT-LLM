@@ -60,9 +60,9 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3_one_model()
 
     def support_guided_decoder(self):
-        return self.has_spec_drafter()
+        return self.is_none() or self.has_spec_drafter()
 
-    def support_guided_worker(self):
+    def support_capturable_guided_decoder(self):
         return self.is_mtp() or self.is_eagle3_one_model()
 
     def has_draft_model(self):

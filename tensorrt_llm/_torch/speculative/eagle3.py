@@ -7,7 +7,7 @@ from torch import nn
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.guided_decoder import GuidedWorker
+from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -276,7 +276,7 @@ class Eagle3OneModelWorker(nn.Module):
         self.spec_config = spec_config
         self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
-        self.guided_worker: Optional[GuidedWorker] = None
+        self.guided_decoder: Optional[CapturableGuidedDecoder] = None
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -288,8 +288,8 @@ class Eagle3OneModelWorker(nn.Module):
 
         raw_logits = logits
 
-        if self.guided_worker is not None:
-            self.guided_worker.execute(logits)
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
 
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -329,11 +329,11 @@ class Eagle3OneModelWorker(nn.Module):
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
-            if self.guided_worker is not None:
+            if self.guided_decoder is not None:
                 new_tokens = inputs["input_ids"][gather_ids]
-                self.guided_worker.add_draft_batch(new_tokens,
-                                                   num_accepted_tokens,
-                                                   is_first_step=(i == 0))
+                self.guided_decoder.add_draft_batch(new_tokens,
+                                                    num_accepted_tokens,
+                                                    is_first_step=(i == 0))
 
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
@@ -347,9 +347,9 @@ class Eagle3OneModelWorker(nn.Module):
             logits = draft_model.logits_processor(hidden_states[gather_ids],
                                                   draft_model.lm_head,
                                                   attn_metadata, True)
-            if self.guided_worker is not None:
+            if self.guided_decoder is not None:
                 d2t = getattr(draft_model.model, "d2t", None)
-                self.guided_worker.execute_draft_batch(
+                self.guided_decoder.execute_draft_batch(
                     logits,
                     d2t,
                     is_first_step=(i == 0),
@@ -524,6 +524,7 @@ class Eagle3OneModelWorker(nn.Module):
             "spec_metadata": spec_metadata,
         }
 
-    def set_guided_worker(self, guided_worker: GuidedWorker) -> bool:
-        self.guided_worker = guided_worker
+    def set_guided_decoder(self,
+                           guided_decoder: CapturableGuidedDecoder) -> bool:
+        self.guided_decoder = guided_decoder
         return True

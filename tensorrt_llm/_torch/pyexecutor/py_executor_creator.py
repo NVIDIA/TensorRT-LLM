@@ -33,7 +33,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
-from .guided_decoder import GuidedDecoder, GuidedWorker
+from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -402,15 +402,19 @@ def create_py_executor(
                 }
                 if spec_config is not None:
                     kwargs["max_num_draft_tokens"] = spec_config.max_draft_len
+
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):
+                    # GuidedDecoder is applicable to non-speculative decoding and two-model speculative decoding.
                     guided_decoder = GuidedDecoder(**kwargs)
-                elif spec_config.spec_dec_mode.support_guided_worker():
-                    success = model_engine.set_guided_worker(
-                        GuidedWorker(**kwargs))
+                elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
+                ):
+                    # CapturableGuidedDecoder is applicable to one-model speculative decoding.
+                    success = model_engine.set_guided_decoder(
+                        CapturableGuidedDecoder(**kwargs))
                     if not success:
                         raise ValueError(
-                            f"Failed to set guided worker for speculative decoding mode: {spec_config.spec_dec_mode.name}."
+                            f"Failed to set guided decoder for speculative decoding mode: {spec_config.spec_dec_mode.name}."
                         )
                 else:
                     raise ValueError(

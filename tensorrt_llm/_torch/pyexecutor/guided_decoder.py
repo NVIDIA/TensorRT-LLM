@@ -392,7 +392,7 @@ class GuidedDecoder:
         self._init_disagg_gen_requests(self.requests)
 
 
-class GuidedWorker(GuidedDecoder):
+class CapturableGuidedDecoder(GuidedDecoder):
 
     def __init__(self,
                  guided_decoding_config: GuidedDecodingConfig,
@@ -401,6 +401,8 @@ class GuidedWorker(GuidedDecoder):
                  max_num_draft_tokens: int = 0):
         super().__init__(guided_decoding_config, max_num_sequences,
                          vocab_size_padded, max_num_draft_tokens)
+        # self.requests should be accessed by normal host code;
+        # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
         self.requests_hostfunc: Optional[GuidedRequests] = None
         self.queue = Queue()
 

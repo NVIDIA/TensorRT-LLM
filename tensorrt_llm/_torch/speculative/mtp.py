@@ -7,7 +7,7 @@ from torch import nn
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
-from ..pyexecutor.guided_decoder import GuidedWorker
+from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
@@ -327,7 +327,7 @@ class MTPWorker(nn.Module):
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
-        self.guided_worker: Optional[GuidedWorker] = None
+        self.guided_decoder: Optional[CapturableGuidedDecoder] = None
 
     def forward(
         self,
@@ -443,8 +443,8 @@ class MTPWorker(nn.Module):
 
         raw_logits = logits
 
-        if self.guided_worker is not None:
-            self.guided_worker.execute(logits)
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
 
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -478,18 +478,18 @@ class MTPWorker(nn.Module):
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         for i, mtp_layer in enumerate(draft_model.mtp_layers):
-            if self.guided_worker is not None:
+            if self.guided_decoder is not None:
                 new_tokens = draft_inputs['input_ids'][last_tokens_idx]
-                self.guided_worker.add_draft_batch(new_tokens,
-                                                   num_accepted_tokens,
-                                                   is_first_step=(i == 0))
+                self.guided_decoder.add_draft_batch(new_tokens,
+                                                    num_accepted_tokens,
+                                                    is_first_step=(i == 0))
 
             hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                       **draft_inputs)
             logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
                                            attn_metadata).float()
-            if self.guided_worker is not None:
-                self.guided_worker.execute_draft_batch(
+            if self.guided_decoder is not None:
+                self.guided_decoder.execute_draft_batch(
                     logits,
                     is_first_step=(i == 0),
                     is_last_step=(i == len(draft_model.mtp_layers) - 1))
@@ -1125,8 +1125,9 @@ class MTPWorker(nn.Module):
 
         return draft_tokens
 
-    def set_guided_worker(self, guided_worker: GuidedWorker) -> bool:
-        self.guided_worker = guided_worker
+    def set_guided_decoder(self,
+                           guided_decoder: CapturableGuidedDecoder) -> bool:
+        self.guided_decoder = guided_decoder
         return True
 
 
@@ -1164,8 +1165,8 @@ class MTPEagleWorker(MTPWorker):
 
         raw_logits = logits
 
-        if self.guided_worker is not None:
-            self.guided_worker.execute(logits)
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
 
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -1227,17 +1228,17 @@ class MTPEagleWorker(MTPWorker):
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
-            if self.guided_worker is not None:
+            if self.guided_decoder is not None:
                 new_tokens = inputs["input_ids"][gather_ids]
-                self.guided_worker.add_draft_batch(new_tokens,
-                                                   num_accepted_tokens,
-                                                   is_first_step=(i == 0))
+                self.guided_decoder.add_draft_batch(new_tokens,
+                                                    num_accepted_tokens,
+                                                    is_first_step=(i == 0))
 
             logits = draft_model.mtp_layers[0].shared_head(
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata,
                 True)
-            if self.guided_worker is not None:
-                self.guided_worker.execute_draft_batch(
+            if self.guided_decoder is not None:
+                self.guided_decoder.execute_draft_batch(
                     logits,
                     is_first_step=(i == 0),
                     is_last_step=(i == self.mtp_num_modules - 1))
