@@ -72,7 +72,8 @@ controller = MCTSController(
 # 3) Run
 llm = ScaffoldingLlm(controller, workers=workers)
 prompts = [
-    "Sue lives in a fun neighborhood ... how many more pink plastic flamingos were out than white?",
+    "Question 1",
+    "Question 2"
 ]
 results = llm.generate(prompts)
 print(results[0].outputs[0].text)
@@ -129,7 +130,8 @@ controller = TOTController(
 # 3) Run
 llm = ScaffoldingLlm(controller, workers=workers)
 prompts = [
-    "Sue lives in a fun neighborhood ... how many more pink plastic flamingos were out than white?",
+    "Question 1",
+    "Question 2"
 ]
 results = llm.generate(prompts)
 print(results[0].outputs[0].text)

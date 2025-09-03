@@ -10,6 +10,7 @@ from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 from tensorrt_llm.scaffolding.controller import Controller, ParallelProcess
 from tensorrt_llm.scaffolding.task import GenerationTask, Task
 
+
 @dataclass
 class TreeNode:
     """Base class for tree nodes in tree-based inference methods."""
@@ -119,8 +120,6 @@ class MCTSController(Controller):
         initial_state = getattr(task, 'input_str', str(task)) or ""
         root = MCTSNode(state=initial_state)
 
-        
-
         for iteration in range(self.max_iterations):
             # Selection
             node = root
@@ -175,7 +174,7 @@ class MCTSController(Controller):
                 reward_result._outputs = [completion_output]
                 reward_result.sampling_params = mock_sampling_params
                 reward_task.result = reward_result
-                
+
                 yield from self.reward_controller.process([reward_task])
                 # Get reward from the reward controller
                 if hasattr(self.reward_controller,
@@ -303,12 +302,12 @@ class TOTController(Controller):
         task = tasks[0]
         goal = kwargs.get('goal', 'Solve the problem step by step')
         root_state = getattr(task, 'input_str', str(task)) or ""
-        
+
         root = TOTNode(state=root_state, thought="Initial problem")
         current_level: List[TOTNode] = [root]
         iterations = 0
         stop = False
-        
+
         for depth in range(self.max_depth):
             if stop:
                 break
@@ -336,9 +335,9 @@ class TOTController(Controller):
                 gen_tasks_wrapped.append([gen_task])
                 gen_kwargs_list.append({})
                 node_order.append(node)
-                iterations+=1
-                if(iterations>=self.max_iterations):
-                    stop=True
+                iterations += 1
+                if (iterations >= self.max_iterations):
+                    stop = True
                     break
 
             if gen_controllers:
@@ -352,7 +351,9 @@ class TOTController(Controller):
             all_reward_tasks: List[GenerationTask] = []
             node_to_task_indices: Dict[int, List[int]] = {}
 
-            for idx, (node, [gen_task]) in enumerate(zip(node_order, gen_tasks_wrapped)):
+            for idx, (node, [gen_task
+                             ]) in enumerate(zip(node_order,
+                                                 gen_tasks_wrapped)):
                 thoughts = self._parse_approaches(gen_task.output_str or "")
 
                 evaluated_thoughts: List[Dict[str, Any]] = []
@@ -371,9 +372,11 @@ class TOTController(Controller):
                         candidate_content = self._combine_state_and_thought(
                             node.state, thought)
 
-                        completion_output = CompletionOutput(index=0, text=candidate_content)
+                        completion_output = CompletionOutput(
+                            index=0, text=candidate_content)
                         mock_sampling_params = SamplingParams()
-                        reward_result = GenerationResult.__new__(GenerationResult)
+                        reward_result = GenerationResult.__new__(
+                            GenerationResult)
                         reward_result._outputs = [completion_output]
                         reward_result.sampling_params = mock_sampling_params
                         reward_task.result = reward_result
@@ -383,14 +386,12 @@ class TOTController(Controller):
 
                     node_to_task_indices[idx] = reward_indices_for_node
 
-                    evaluated_by_node[idx] = [
-                        {
-                            'thought': t,
-                            'score': 0.0,
-                            'confidence': 'Medium',
-                            'reasoning': 'PRM score'
-                        } for t in thoughts[:self.num_thoughts_per_step]
-                    ]
+                    evaluated_by_node[idx] = [{
+                        'thought': t,
+                        'score': 0.0,
+                        'confidence': 'Medium',
+                        'reasoning': 'PRM score'
+                    } for t in thoughts[:self.num_thoughts_per_step]]
                 else:
                     # Fallback: sequential lightweight LLM self-eval for this node
                     for thought in thoughts[:self.num_thoughts_per_step]:
@@ -401,14 +402,19 @@ class TOTController(Controller):
                         eval_task.max_tokens = 256
                         eval_task.temperature = 0.3
 
-                        yield from self.generation_controller.process([eval_task])
-                        evaluation = self._parse_evaluation(
-                            eval_task.output_str or "")
+                        yield from self.generation_controller.process(
+                            [eval_task])
+                        evaluation = self._parse_evaluation(eval_task.output_str
+                                                            or "")
                         evaluated_thoughts.append({
-                            'thought': thought,
-                            'score': evaluation['score'],
-                            'confidence': evaluation['confidence'],
-                            'reasoning': evaluation['reasoning']
+                            'thought':
+                            thought,
+                            'score':
+                            evaluation['score'],
+                            'confidence':
+                            evaluation['confidence'],
+                            'reasoning':
+                            evaluation['reasoning']
                         })
                     evaluated_by_node[idx] = evaluated_thoughts
 
@@ -424,7 +430,8 @@ class TOTController(Controller):
                             normalized_score = float(scores[task_index])
                             if 0.0 <= normalized_score <= 1.0:
                                 normalized_score *= 10.0
-                            thoughts_for_node[local_j]['score'] = normalized_score
+                            thoughts_for_node[local_j][
+                                'score'] = normalized_score
                             thoughts_for_node[local_j]['confidence'] = (
                                 'High' if normalized_score >= 8.0 else
                                 'Medium' if normalized_score >= 5.0 else 'Low')
