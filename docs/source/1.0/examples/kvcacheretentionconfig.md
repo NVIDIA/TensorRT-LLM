@@ -66,4 +66,3 @@ if __name__ == '__main__':
 ```
 
 This example uses a single ```kv_cache_retention_config``` object for all the prompts. You can also provide a list that must have the same length as the list of prompts.
-
