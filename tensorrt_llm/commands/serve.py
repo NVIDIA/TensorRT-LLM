@@ -3,7 +3,7 @@ import os
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import click
 import torch
@@ -14,13 +14,13 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
-                                              MetadataServerConfig, ServerRole,
+from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig, ServerRole,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
@@ -82,7 +82,6 @@ def get_llm_args(model: str,
                  moe_expert_parallel_size: Optional[int] = None,
                  gpus_per_node: Optional[int] = None,
                  free_gpu_memory_fraction: Optional[float] = None,
-                 mamba_ssm_cache_dtype: str = "auto",
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
@@ -98,8 +97,7 @@ def get_llm_args(model: str,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction,
-        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
+        free_gpu_memory_fraction=free_gpu_memory_fraction, )
 
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
@@ -109,7 +107,7 @@ def get_llm_args(model: str,
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
-
+    backend = backend if backend in ["pytorch", "_autodeploy"] else None
     llm_args = {
         "model":
         model,
@@ -140,7 +138,7 @@ def get_llm_args(model: str,
         "kv_cache_config":
         kv_cache_config,
         "backend":
-        backend if backend == "pytorch" else None,
+        backend,
         "num_postprocess_workers":
         num_postprocess_workers,
         "postprocess_tokenizer_dir":
@@ -162,9 +160,15 @@ def launch_server(host: str,
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
+    elif backend == '_autodeploy':
+        # AutoDeploy does not support build_config
+        llm_args.pop("build_config", None)
+        # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/7142):
+        # AutoDeploy does not support cache reuse yet.
+        llm_args["kv_cache_config"].enable_block_reuse = False
+        llm = AutoDeployLLM(**llm_args)
     else:
         llm = LLM(**llm_args)
 
@@ -204,10 +208,13 @@ def launch_mm_encoder_server(
               default="localhost",
               help="Hostname of the server.")
 @click.option("--port", type=int, default=8000, help="Port of the server.")
-@click.option("--backend",
-              type=click.Choice(["pytorch", "trt"]),
-              default="pytorch",
-              help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+@click.option(
+    "--backend",
+    type=click.Choice(["pytorch", "trt", "_autodeploy"]),
+    default="pytorch",
+    help=
+    "Set to 'pytorch' for pytorch path and '_autodeploy' for autodeploy path. Default is pytorch path."
+)
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
@@ -257,12 +264,6 @@ def launch_mm_encoder_server(
               help="Free GPU memory fraction reserved for KV Cache, "
               "after allocating model weights and buffers.")
 @click.option(
-    "--mamba_ssm_cache_dtype",
-    type=click.Choice(["auto", "float16", "bfloat16", "float32"]),
-    default="auto",
-    help="Data type for Mamba SSM cache. If 'auto', inferred from model config."
-)
-@click.option(
     "--num_postprocess_workers",
     type=int,
     default=0,
@@ -302,17 +303,16 @@ def launch_mm_encoder_server(
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
-def serve(model: str, tokenizer: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
-          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-          tp_size: int, pp_size: int, ep_size: Optional[int],
-          cluster_size: Optional[int], gpus_per_node: Optional[int],
-          kv_cache_free_gpu_memory_fraction: float, mamba_ssm_cache_dtype: str,
-          num_postprocess_workers: int, trust_remote_code: bool,
-          extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-          metadata_server_config_file: Optional[str],
-          server_role: Optional[str],
-          fail_fast_on_attention_window_too_large: bool):
+def serve(
+        model: str, tokenizer: Optional[str], host: str, port: int,
+        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
+        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
+        ep_size: Optional[int], cluster_size: Optional[int],
+        gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
+        num_postprocess_workers: int, trust_remote_code: bool,
+        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+        metadata_server_config_file: Optional[str], server_role: Optional[str],
+        fail_fast_on_attention_window_too_large: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -333,7 +333,6 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         moe_cluster_parallel_size=cluster_size,
         gpus_per_node=gpus_per_node,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
-        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
@@ -432,19 +431,6 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
 
 
-def get_ctx_gen_server_urls(
-        server_configs: List[CtxGenServerConfig]) -> List[str]:
-    ctx_server_urls = []
-    gen_server_urls = []
-    for cfg in server_configs:
-        if cfg.type == "ctx":
-            ctx_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
-        else:
-            gen_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
-
-    return ctx_server_urls, gen_server_urls
-
-
 @click.command("disaggregated")
 @click.option("-c",
               "--config_file",
@@ -471,32 +457,31 @@ def get_ctx_gen_server_urls(
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
+@click.option(
+    "--metrics-log-interval",
+    type=int,
+    default=0,
+    help=
+    "The interval of logging metrics in seconds. Set to 0 to disable metrics logging."
+)
 def disaggregated(config_file: Optional[str],
                   metadata_server_config_file: Optional[str],
                   server_start_timeout: int, request_timeout: int,
-                  log_level: str):
+                  log_level: str, metrics_log_interval: int):
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
-    ctx_server_urls, gen_server_urls = get_ctx_gen_server_urls(
-        disagg_cfg.server_configs)
-
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    server = OpenAIDisaggServer(
-        ctx_servers=ctx_server_urls,
-        gen_servers=gen_server_urls,
-        req_timeout_secs=request_timeout,
-        server_start_timeout_secs=server_start_timeout,
-        max_retries=disagg_cfg.max_retries,
-        ctx_router_config=disagg_cfg.ctx_router_config,
-        gen_router_config=disagg_cfg.gen_router_config,
-        conditional_disagg_config=disagg_cfg.conditional_disagg_config,
-        metadata_server_cfg=metadata_server_cfg)
+    server = OpenAIDisaggServer(config=disagg_cfg,
+                                req_timeout_secs=request_timeout,
+                                server_start_timeout_secs=server_start_timeout,
+                                metadata_server_cfg=metadata_server_cfg,
+                                metrics_interval_secs=metrics_log_interval)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 

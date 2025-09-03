@@ -54,6 +54,7 @@ class SharedConfig(BaseModel):
     sharding_config: ShardingConfig = Field(default_factory=ShardingConfig)
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
+    attn_backend: str = Field(default="flashinfer", description="The attention backend to use.")
 
 
 class TransformConfig(BaseModel):
@@ -285,7 +286,10 @@ class BaseTransform(ABC):
         # update + store new meta data
         history[t_name] = info
         autodeploy_meta[self._history_key] = history
-        self._set_autodeploy_meta(gm, autodeploy_meta)
+
+        if isinstance(gm, GraphModule):
+            # After compilation, gm becomes type CapturedGraph with no meta data.
+            self._set_autodeploy_meta(gm, autodeploy_meta)
 
         # return the graph module
         return gm
@@ -322,6 +326,7 @@ class BaseTransform(ABC):
 
         # check if run cleanup depending on the config and info
         if self.config.requires_shape_prop and not has_valid_shapes:
+            canonicalize_graph(gm)
             with lift_to_meta(gm):
                 canonicalize_graph(gm, shape_prop=True)
             is_clean = True
@@ -347,6 +352,7 @@ class BaseTransform(ABC):
 
         # check if run cleanup depending on the config and info
         if self.config.run_shape_prop and not (info.is_clean and info.has_valid_shapes):
+            canonicalize_graph(gm)
             with lift_to_meta(gm):
                 canonicalize_graph(gm, shape_prop=True)
         elif self.config.run_graph_cleanup and not info.is_clean:

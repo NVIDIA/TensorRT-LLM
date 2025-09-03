@@ -183,17 +183,27 @@ class BaseMoeRoutingMethod(nn.Module):
 
 class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
 
-    def __init__(self, top_k: int):
+    def __init__(self, top_k: int, force_enable_pytorch_op: bool = False):
         super().__init__()
         self.top_k = top_k
+        self.force_enable_pytorch_op = force_enable_pytorch_op
 
-    def apply(self,
-              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    def apply_pytorch(
+            self, router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         topk_values, topk_indices = torch.topk(torch.nn.functional.softmax(
             router_logits.float(), dim=-1),
                                                k=self.top_k,
                                                dim=-1)
         return topk_indices.to(torch.int32), topk_values
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        num_experts = router_logits.shape[-1]
+        if self.force_enable_pytorch_op or num_experts > 128 or self.top_k > 8:
+            return self.apply_pytorch(router_logits)
+        else:
+            return torch.ops.trtllm.default_moe_routing_op(
+                router_logits, self.top_k)
 
     @property
     def routing_method_type(self):

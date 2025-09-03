@@ -194,11 +194,16 @@ class Gemma3VLM(PreTrainedModel):
             "text_config", "vision_config"
         ], f"Expected subconfig name to be either 'text_config' or 'vision_config'. Got {name} instead."
         pretrained_config = getattr(model_config.pretrained_config, name)
+        # ModelOpt currently doesn't quantize the vision part. Without setting quant config to None,
+        # weight loading fails for vision.
+        quant_config = model_config.quant_config if name == "text_config" else None
+        # FlashInfer backend supports custom mask which is needed for bidirectional mask in decoder.
         preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
         sub_model_config: ModelConfig[Gemma3Config] = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
-            attn_backend=preferred_backend)
+            attn_backend=preferred_backend,
+            quant_config=quant_config)
         # Make sure some fields that are not explicitly included in the sub config, but present
         # in the top-level config, are replicated.
         if (hasattr(sub_model_config.pretrained_config, "torch_dtype")
@@ -279,17 +284,3 @@ class Gemma3VLM(PreTrainedModel):
                                                attn_metadata=attn_metadata)[-1]
             image_features = self.mm_projector(image_features)
         return image_features
-
-
-def _load_weights_into_hf_module(
-    model: torch.nn.Module,
-    weights: dict,
-    prefix: str,
-    model_name: str,
-) -> None:
-    filtered_weights = filter_weights(prefix, weights)
-    missing_keys, _ = model.load_state_dict(filtered_weights)
-    if len(missing_keys) > 0:
-        raise KeyError(
-            f"Missing the following keys for the {model_name} in the checkpoint: "
-            f"[{', '.join(missing_keys)}].")

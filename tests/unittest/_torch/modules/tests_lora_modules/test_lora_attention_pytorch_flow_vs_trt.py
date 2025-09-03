@@ -419,31 +419,23 @@ class TestLoraAttentionPytorchFlowVsTRT(unittest.TestCase):
                     lora_params['lora_ranks'],
                     'weight_pointers':
                     lora_params['lora_weights_pointers'],
-                    'is_dora':
-                    False,
                 },
                 LoraModuleType.ATTENTION_K: {
                     'adapter_size':
                     lora_params['lora_ranks'],
                     'weight_pointers': lora_params['lora_weights_pointers'],
-                    'is_dora':
-                    False,
                 },
                 LoraModuleType.ATTENTION_V: {
                     'adapter_size':
                     lora_params['lora_ranks'],
                     'weight_pointers':
                      lora_params['lora_weights_pointers'],
-                    'is_dora':
-                    False,
                 },
                 LoraModuleType.ATTENTION_DENSE: {
                     'adapter_size':
                     lora_params['lora_ranks'],
                     'weight_pointers':
                     lora_params['lora_weights_pointers'],
-                    'is_dora':
-                    False,
                 }
             }
         }
