@@ -118,7 +118,7 @@ class InsertCachedAttention(BaseTransform):
 
         # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
         inputs_from_info = [input_nodes_mapping[k] for k in cm.info.named_standard_args.keys()]
-        constants_from_info = cm.info.extra_args_for_prepare_metadata
+        constants_from_info = cm.info.const_args_for_prepare_metadata
 
         # insert metadata computation and extract each argument as a node
         get_metadata, num_metadata = attn_descriptor.get_prepare_metadata_op()

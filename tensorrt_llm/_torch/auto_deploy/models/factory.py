@@ -25,7 +25,8 @@ class ModelFactory(ABC):
 
     NOTE: we make the assumption that the model can be prompted with a set of input_ids and
     position_ids of shape (batch_size, seq_len) and will return a tensor of shape
-    (batch_size, seq_len, embedding_size).
+    (batch_size, seq_len, embedding_size) by default. Individual factories have the ability to
+    define additional optional inputs and their (dynamic) shapes.
     """
 
     def __init__(
@@ -74,7 +75,7 @@ class ModelFactory(ABC):
         .. code-block:: python
 
             def forward(
-                self, input_ids: torch.Tensor, position_ids: torch.Tensor
+                self, input_ids: torch.Tensor, position_ids: torch.Tensor, *extra_args: torch.Tensor
             ) -> Sequence[torch.Tensor]: ...
 
         ``logits`` are assumed to be the first output of the model, i.e.,
@@ -87,6 +88,9 @@ class ModelFactory(ABC):
             input_ids.shape == (batch_size, seq_len)
             position_ids.shape == (batch_size, seq_len)
             logits.shape == (batch_size, seq_len, vocab_size)
+
+        Additionally, we allow for additional arguments to be passed to the model's forward function
+        as defined by the factory.
         """
         # make sure model architecture is pre-fetched (no weights needed at this point)
         skip_loading_weights = self.skip_loading_weights
@@ -241,8 +245,8 @@ class ModelFactory(ABC):
         """
         return {}
 
-    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
-        """Return a dictionary of extra inputs for the model.
+    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
+        """Return a dictionary of extra model inputs that behave like optional forward arguments.
 
         Returns:
             A dictionary of extra inputs for the model where the key corresponds to the argument
@@ -250,9 +254,11 @@ class ModelFactory(ABC):
                 - `none_input`: The none input value of the extra input indicating the tensor
                    value corresponding to the equivalent of the None input. `None` is not supported
                    as we require the input to be a tensor. Hence, this none_input acts as a
-                   placeholder for the None input.
+                   placeholder for the None input. We assume that the "optional" behavior of these
+                   arguments can be represented via a placeholder tensor and and an appropriate
+                   check within the forward function using ``torch.cond``.
                 - `dynamic_shape_callback`: A function that returns the dynamic shape of the extra
-                  input.
+                  input. Simply set to `None` if the extra input is not dynamic.
         """
         return {}
 

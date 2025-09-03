@@ -216,12 +216,26 @@ class SequenceInfo:
 
     @property
     def named_args(self) -> Dict[str, torch.Tensor]:
-        """Return a dictionary of named arguments."""
+        """Return a dictionary of named arguments.
+
+        These arguments contain all arguments that are managed by this interface and are required
+        to run a model's forward pass including all extra arguments.
+
+        Cached arguments are only included if the attention mode is cached to reflect that after
+        switching to cached attention, the cached arguments are required for a forward pass.
+        """
         return self._named_args(include_extra_args=True, include_cached_args=self._is_cached_attn)
 
     @property
     def named_standard_args(self) -> Dict[str, torch.Tensor]:
-        """Return a dictionary of named standard arguments."""
+        """Return a dictionary of named standard arguments.
+
+        We define standard arguments as the arguments that are part of the model's forward function
+        by default (i.e., without the extra arguments).
+
+        Just liked ``named_args``, this property includes cached attention arguments if the
+        attention mode is cached.
+        """
         return self._named_args(include_extra_args=False, include_cached_args=self._is_cached_attn)
 
     @property
@@ -230,8 +244,19 @@ class SequenceInfo:
         return tuple(self.named_args.values())
 
     @property
-    def extra_args_for_prepare_metadata(self) -> Tuple:
-        """Return a tuple of extra (const, non-tensor) arguments for the prepare_metadata op."""
+    def const_args_for_prepare_metadata(self) -> Tuple:
+        """Return a tuple of extra (const, non-tensor) arguments for the prepare_metadata op.
+
+        The ``prepare_metadata`` interface expects the following arguments:
+
+        1. ``named_standard_args`` as nodes,i.e., as input-dependent tensors.
+        2. ``const_args_for_prepare_metadata`` as constants that can directly by passed in as args
+           to the corresponding ``prepare_metadata`` node/op.
+
+        This interface handles the constant arguments part and can be used by compiler passes like
+        ``insert_cached_attention`` to extract the constant arguments and add them to the
+        ``prepare_metadata`` node/op.
+        """
         return (self.page_size,)
 
     @property
@@ -314,7 +339,7 @@ class SequenceInfo:
     def _get_page_assignments(
         cache_locations: List[int], pages_per_sequence: List[int]
     ) -> List[List[int]]:
-        """Get page assignments.
+        """Get nested page assignments from cache locations and pages per sequence as list of lists.
 
         Args:
             cache_locations: A flat list of cache locations for each sequence ordered by sequence.
@@ -336,7 +361,7 @@ class SequenceInfo:
     def _get_cache_locations_and_pages_per_sequence(
         page_assignments: List[List[int]],
     ) -> Tuple[List[int], List[int]]:
-        """Get cache locations and pages per sequence from page assignments.
+        """Get cache locations and pages per sequence from nested page assignments (lists of lists).
 
         Args:
             page_assignments: A list of page assignments for each sequence ordered by sequence.

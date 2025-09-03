@@ -20,7 +20,7 @@ class ADInputProcessor(DefaultInputProcessor):
     """
 
     def __init__(self, tokenizer: Optional[TokenizerBase], processor: Optional[Any] = None):
-        super().__init__(None, None, tokenizer)
+        super().__init__(model_path=None, model_config=None, tokenizer=tokenizer)
         # NOTE: HF's tokenizer/processor that has the apply_chat_template method
         self.processor = processor or getattr(tokenizer, "tokenizer", None)
 

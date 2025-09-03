@@ -112,7 +112,9 @@ class AutoModelForCausalLMFactory(ModelFactory):
     def _simple_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
         """A simple forward pass for the model to functionalize the args.
 
-        This follows the standard function signature as expected by factory.py.
+        This follows the standard function signature as expected by factory.py. We do _not_ use the
+        model.forward method directly to create the patch. Instead we use the type of the model to
+        get the forward method to keep the patch composable with other forward patches.
         """
         return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
 
@@ -398,7 +400,9 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     ):
         """A simple forward pass for the model to functionalize the args.
 
-        This follows the standard function signature as expected by factory.py.
+        This follows the standard function signature as expected by factory.py. We do _not_ use the
+        model.forward method directly to create the patch. Instead we use the type of the model to
+        get the forward method to keep the patch composable with other forward patches.
         """
         return type(model).forward(
             model,
@@ -452,14 +456,14 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             "pixel_values": inputs["pixel_values"],
         }
 
-    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, DynamicShapeCallback]]:
+    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
         """Return a dictionary of extra inputs for the model.
 
         Returns:
             A dictionary of extra inputs for the model where the key corresponds to the argument
             name and the value corresponds to a tuple of (example_input, dynamic_shape_callback).
             The dynamic shape callback is a function that returns the dynamic shape of the extra
-            input.
+            input. Simply set to `None` if the extra input is not dynamic.
         """
 
         def _get_dynamic_shape():
