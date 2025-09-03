@@ -333,7 +333,7 @@ class Eagle3OneModelWorker(nn.Module):
                 new_tokens = inputs["input_ids"][gather_ids]
                 self.guided_decoder.add_draft_batch(new_tokens,
                                                     num_accepted_tokens,
-                                                    is_first_step=(i == 0))
+                                                    draft_step=i)
 
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
@@ -349,11 +349,9 @@ class Eagle3OneModelWorker(nn.Module):
                                                   attn_metadata, True)
             if self.guided_decoder is not None:
                 d2t = getattr(draft_model.model, "d2t", None)
-                self.guided_decoder.execute_draft_batch(
-                    logits,
-                    d2t,
-                    is_first_step=(i == 0),
-                    is_last_step=(i == self.max_draft_len - 1))
+                self.guided_decoder.execute_draft_batch(logits,
+                                                        d2t,
+                                                        draft_step=i)
 
             new_draft_token = self.draft_decoder(logits, draft_model)
             next_draft_tokens.append(new_draft_token)

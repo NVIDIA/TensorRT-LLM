@@ -482,17 +482,14 @@ class MTPWorker(nn.Module):
                 new_tokens = draft_inputs['input_ids'][last_tokens_idx]
                 self.guided_decoder.add_draft_batch(new_tokens,
                                                     num_accepted_tokens,
-                                                    is_first_step=(i == 0))
+                                                    draft_step=i)
 
             hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                       **draft_inputs)
             logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
                                            attn_metadata).float()
             if self.guided_decoder is not None:
-                self.guided_decoder.execute_draft_batch(
-                    logits,
-                    is_first_step=(i == 0),
-                    is_last_step=(i == len(draft_model.mtp_layers) - 1))
+                self.guided_decoder.execute_draft_batch(logits, draft_step=i)
 
             new_draft_token = self.draft_sampler(logits)
             next_draft_tokens.append(new_draft_token)
@@ -1232,16 +1229,13 @@ class MTPEagleWorker(MTPWorker):
                 new_tokens = inputs["input_ids"][gather_ids]
                 self.guided_decoder.add_draft_batch(new_tokens,
                                                     num_accepted_tokens,
-                                                    is_first_step=(i == 0))
+                                                    draft_step=i)
 
             logits = draft_model.mtp_layers[0].shared_head(
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata,
                 True)
             if self.guided_decoder is not None:
-                self.guided_decoder.execute_draft_batch(
-                    logits,
-                    is_first_step=(i == 0),
-                    is_last_step=(i == self.mtp_num_modules - 1))
+                self.guided_decoder.execute_draft_batch(logits, draft_step=i)
 
             new_draft_token = self.draft_sampler(logits)
 

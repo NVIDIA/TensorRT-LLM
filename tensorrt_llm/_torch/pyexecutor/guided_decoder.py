@@ -203,7 +203,7 @@ class GuidedDecoder:
         - call the grammar matcher to fill the bitmask on CPU;
         - asynchronously copy the bitmask to GPU.
         """
-        # Fix it.
+        # TODO: Fuse token-level mask to logits_bitmask.
         self.bitmask_host[:requests.num_bitmask_tokens].fill_(-1)
 
         for req, offset in requests.valid_requests_with_offsets():
@@ -476,21 +476,21 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def add_draft_batch(self,
                         new_tokens: torch.Tensor,
                         num_accepted_tokens: torch.Tensor,
-                        is_first_step: bool = False) -> None:
+                        draft_step: int = 0) -> None:
         batch_size = len(self.requests)
         assert new_tokens.size(0) == batch_size
         self.new_tokens[0, :batch_size].copy_(new_tokens, non_blocking=True)
-        if is_first_step:
+        if draft_step == 0:
             assert num_accepted_tokens.size(0) == batch_size
             self.num_accepted_tokens[:batch_size].copy_(num_accepted_tokens,
                                                         non_blocking=True)
         self.token_event.record()
 
     @hostfunc
-    def fetch_draft_batch(self, is_first_step: bool = False) -> None:
+    def fetch_draft_batch(self, draft_step: int = 0) -> None:
         batch_size = len(self.requests_hostfunc)
         new_tokens_list = self.new_tokens[0, :batch_size].tolist()
-        if is_first_step:
+        if draft_step == 0:
             num_accepted_tokens_list = self.num_accepted_tokens[:
                                                                 batch_size].tolist(
                                                                 )
@@ -499,7 +499,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
                                                       req.seq_slot) is None:
                 continue
             req.new_token = new_tokens_list[i]
-            if is_first_step:
+            if draft_step == 0:
                 # When overlap scheduler is enabled, it is possible that
                 # - The EOS token is in the draft tokens, and
                 # - Some draft tokens after the EOS token are accepted by the target model.
@@ -515,15 +515,14 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def execute_draft_batch(self,
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
-                            is_first_step: bool = False,
-                            is_last_step: bool = False) -> None:
+                            draft_step: int = 0) -> None:
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
-            self.fetch_draft_batch(is_first_step=is_first_step)
-            if is_first_step:
+            self.fetch_draft_batch(draft_step=draft_step)
+            if draft_step == 0:
                 self.rollback_rejected_tokens()
             self.build()
-            if is_last_step:
+            if draft_step == self.max_num_draft_tokens - 1:
                 self.rollback_draft_tokens()
             self.copy_bitmask()
             self.bitmask_event.record()
