@@ -24,7 +24,6 @@ set(SRCS
     createNewDecoderRequests.cpp
     contextProgress.cpp
     dataTransceiver.cpp
-    dataTransceiverImpl.cpp
     decoderBuffers.cpp
     encoderBuffers.cpp
     guidedDecoder.cpp

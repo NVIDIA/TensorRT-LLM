@@ -318,12 +318,6 @@ bool getEnvDisaggLayerwise()
     return disaggLayerwise;
 }
 
-bool getEnvDisableSelectiveCacheTransfer()
-{
-    static bool const disableSelectiveCacheTransfer = getBoolEnv("TRTLLM_DISABLE_SELECTIVE_CACHE_TRANSFER");
-    return disableSelectiveCacheTransfer;
-}
-
 bool getEnvParallelCacheSend()
 {
     static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");

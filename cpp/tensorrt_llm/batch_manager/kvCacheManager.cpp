@@ -50,37 +50,15 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
-//! \brief Split vector into list of blocks of given size.
-//! \param vec vector to split
-//! \param usableSize part of the vector that is processed
-//! \param elementsPerBlock desired size of blocks
-//! \param allowPartial whether to append a block smaller than `elementsPerBlock` at the end
-//! \return list of blocks
-template <typename T>
-std::list<std::vector<T>> chopVectorIntoBlocks(
-    std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
-{
-    TLLM_CHECK_WITH_INFO(
-        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
-    std::list<std::vector<T>> blockedVectors;
-    auto const vecEnd = vec.begin() + usableSize;
-    for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
-    {
-        auto blockSize = std::min(elementsPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
-        auto end = begin + blockSize;
-        if (blockSize == elementsPerBlock || allowPartial)
-        {
-            blockedVectors.emplace_back(begin, end);
-        }
-    }
-    return blockedVectors;
-}
-
 inline uint8_t getNthByte(SizeType32 hashPart, uint8_t byteIdx) noexcept
 {
     return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
 }
 
+} // namespace
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
 std::vector<MmKey> generateBlockHashExtraKeys(
     tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx)
 {
@@ -156,10 +134,12 @@ std::vector<BlockKey> buildBlockKeys(
     return blockKeys;
 }
 
-} // namespace
-
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+bool BlockKey::operator==(BlockKey const& other) const noexcept
 {
+    return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens
+        && extraKeys == other.extraKeys);
+}
+
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
 {
     // Hashing algorithm adapted from StackOverflow:
@@ -1020,6 +1000,33 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
+std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReuseTreeByBlockKey(
+    BlockKey const& blockKey) const
+{
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
+    std::vector<BlockKey> blockKeys;
+    for (auto const& blockedUniqueTokens : blockedUniqueTokens)
+    {
+        blockKeys.push_back(blockKey);
+        blockKeys.back().uniqueTokens = blockedUniqueTokens;
+    }
+    auto searchRoot = mCachedBlocksRoot;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, true, true)
+            : std::make_tuple(false, 0, nullptr);
+        if (matchingBlock == nullptr)
+        {
+            return std::nullopt;
+        }
+
+        searchRoot = std::move(matchingBlock);
+    }
+    return searchRoot;
+}
+
 SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
     GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions)
 {
@@ -1493,6 +1500,51 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
             manager.storeBlocksForReuse(sequence, llmRequest);
         }
         manager.releaseBlocks(sequence);
+    }
+}
+
+void BlockManager::pinBlocks(GenerationRequest& sequence)
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.pinBlocks(sequence);
+    }
+}
+
+void BlockManager::unpinBlocks(BlockKey const& blockKey)
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.unpinBlocks(blockKey);
+    }
+}
+
+void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
+{
+    auto const requestId = sequence.getRequestId();
+    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    for (auto& block : allocatedBlocks)
+    {
+        block->incRefCount();
+    }
+}
+
+void WindowBlockManager::unpinBlocks(BlockKey const& lastBlockKey)
+{
+    auto lastBlockOpt = findBlocksInReuseTreeByBlockKey(lastBlockKey);
+    if (!lastBlockOpt.has_value())
+    {
+        return;
+    }
+    auto block = *lastBlockOpt;
+    while (block)
+    {
+        block->decRefCount();
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(block);
+        }
+        block = block->getPrevBlock();
     }
 }
 
@@ -2057,6 +2109,11 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
 void KVCacheManager::removeSequence(RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest)
 {
     TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
+    if (mBlockManager.getNumPools() == 1
+        && llmRequest->getLlmRequestType() == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY && mEnableBlockReuse)
+    {
+        pinBlocks(requestId);
+    }
     auto sequenceNode = [this, requestId]
     {
         std::scoped_lock lock(mSequencesMtx);
@@ -2081,6 +2138,17 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
 {
     // Mimic Free all blocks for this sequence
     mBlockManager.schedulingReleaseBlocks(requestId);
+}
+
+void KVCacheManager::pinBlocks(RequestIdType requestId)
+{
+    auto& sequence = getSequence(requestId);
+    mBlockManager.pinBlocks(sequence);
+}
+
+void KVCacheManager::unpinBlocks(BlockKey const& blockKey)
+{
+    mBlockManager.unpinBlocks(blockKey);
 }
 
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
