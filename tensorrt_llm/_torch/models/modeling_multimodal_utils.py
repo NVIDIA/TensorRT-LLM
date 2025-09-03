@@ -136,7 +136,7 @@ def filter_mm_token_from_input_ids(
         mm_token_mask = input_ids >= vocab_size
         text_token_mask = input_ids < vocab_size
     else:
-        mm_token_ids = mm_token_ids.to(input_ids.device)
+        mm_token_ids = mm_token_ids.to(input_ids.device, dtype=input_ids.dtype)
         mm_token_mask = torch.isin(input_ids, mm_token_ids)
         text_token_mask = ~mm_token_mask
     # NOTE: torch.where() enforces a host sync
@@ -150,6 +150,8 @@ def fuse_input_embeds(
     input_ids: torch.IntTensor,
     mm_embeds: List[torch.Tensor],
     mm_token_ids: Optional[torch.IntTensor] = None,
+    text_token_indices: Optional[torch.IntTensor] = None,
+    mm_token_indices: Optional[torch.IntTensor] = None,
     **kwargs,
 ) -> Tuple[Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
     """
@@ -164,18 +166,16 @@ def fuse_input_embeds(
         - If (1) JIT test run, (2) non-multimodal run, i.e. all text-only requests, either context or generation phase (3) multimodal run, all requests in generation phase --> there is no multimodal data, return only the input_ids
         - If (4) multimodal run, mixed batch of context and generation requests, each context request has a multimodal feature --> return only the fused input_embeds of shape [total length, hidden_dim]. For text tokens, LLM embedding layer has already run.
     Note:
-        This function may involve host-device synchronization if text_token_indices (cuda tensor) and mm_token_indices (cuda tensor) are not provided from kwargs. See filter_mm_token_from_input_ids for more details.
+        - Precedence: If kwargs provide indices (text_token_indices and mm_token_indices), those are used. If any one of them is not provided, fallback to filtering method. Sentinel-/OOV-based filtering (e.g., tokens >= vocab_size) is used only when neither index tensor and mm_token_ids is provided.
+        - This function may involve host-device synchronization if indices are not provided and filtering is performed. See filter_mm_token_from_input_ids for details.
     """
     if len(mm_embeds) == 0:
         return input_ids, None
 
     mm_embed = torch.cat(mm_embeds, dim=0)
 
-    if kwargs.get("text_token_indices", None) is not None and kwargs.get(
-            "mm_token_indices", None) is not None:
-        text_token_indices = kwargs["text_token_indices"]
-        mm_token_indices = kwargs["mm_token_indices"]
-    else:
+    # TODO: support the case where only one index tensor is provided, the other is derived as the complement (try to avoid implicit host-device synchronization)
+    if text_token_indices is None or mm_token_indices is None:
         # NOTE: This function involves host-device synchronization due to torch.where() used in filter_mm_token_from_input_ids.
         text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
             input_ids,
