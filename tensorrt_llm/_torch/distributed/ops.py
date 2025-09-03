@@ -641,3 +641,20 @@ class MoEAllReduce(nn.Module):
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
             )
+
+
+def moe_a2a_dispatch(token_selected_experts, input_payloads, workspace,
+                     max_tokens_per_rank, ep_rank, ep_size, top_k):
+    """Wrapper for torch.ops.trtllm.moe_a2a_dispatch to avoid pickle issues in multi-GPU tests"""
+    return torch.ops.trtllm.moe_a2a_dispatch(token_selected_experts,
+                                             input_payloads, workspace,
+                                             max_tokens_per_rank, ep_rank,
+                                             ep_size, top_k)
+
+
+def moe_a2a_combine(send_indices, payload, workspace, max_tokens_per_rank,
+                    ep_rank, ep_size, top_k):
+    """Wrapper for torch.ops.trtllm.moe_a2a_combine to avoid pickle issues in multi-GPU tests"""
+    return torch.ops.trtllm.moe_a2a_combine(send_indices, payload, workspace,
+                                            max_tokens_per_rank, ep_rank,
+                                            ep_size, top_k)
