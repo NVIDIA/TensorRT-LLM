@@ -7,7 +7,11 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.distributed as dist
-from mpi4py import MPI
+
+try:
+    from mpi4py import MPI
+except Exception:
+    MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_isend, mpi_isend_object, mpi_recv,
@@ -114,7 +118,11 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     """
     if not ENABLE_MULTI_DEVICE:
         return obj
-
+    if ENABLE_MULTI_DEVICE and MPI is None:
+        raise RuntimeError(
+            "mpi4py is required when ENABLE_MULTI_DEVICE is True")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
     rank = comm.Get_rank()
 
     # ---- Serialization phase (root only) ----
@@ -214,6 +222,11 @@ def safe_gather(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     """
     if not ENABLE_MULTI_DEVICE:
         return [obj]
+    if ENABLE_MULTI_DEVICE and MPI is None:
+        raise RuntimeError(
+            "mpi4py is required when ENABLE_MULTI_DEVICE is True")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
 
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -226,14 +239,15 @@ def safe_gather(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         my_n = np.int64(len(payload))
     except Exception as e:
         # Keep collectives aligned: every rank must call Allgather exactly once
-        _ = comm.allgather((False, ))
+        _ = comm.allgather(int(-1))
         raise RuntimeError(f"Rank {rank} serialization failed: {e}") from e
 
     # -- Allgather lengths so all ranks know sizes and can compute displacements --
     # We allgather just the int64 length to minimize traffic.
     lengths = np.array(comm.allgather(int(my_n)),
                        dtype=np.int64)  # shape (size,)
-    # Optional sanity: if someone signaled failure above, handle here (not used).
+    if (lengths < 0).any():
+        raise RuntimeError(f"Serialization failed on at least one rank")
     # Every rank computes displacements & total locally and identically:
     displs = np.zeros(size, dtype=np.int64)
     if size > 1:
@@ -299,7 +313,7 @@ def safe_gather(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
             start = int(displs[i])
             blob = recvbuf[start:start + sz].tobytes()
             try:
-                out.append(pickle.loads(blob))
+                out.append(pickle.loads(blob))  # nosec B301
             except Exception as e:
                 raise RuntimeError(
                     f"Deserialization failed for rank {i}: {e}") from e
