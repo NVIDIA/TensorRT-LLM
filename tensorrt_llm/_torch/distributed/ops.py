@@ -645,7 +645,44 @@ class MoEAllReduce(nn.Module):
 
 def moe_a2a_dispatch(token_selected_experts, input_payloads, workspace,
                      max_tokens_per_rank, ep_rank, ep_size, top_k):
-    """Wrapper for torch.ops.trtllm.moe_a2a_dispatch to avoid pickle issues in multi-GPU tests"""
+    """
+    MoE All-to-All Dispatch Operation.
+    
+    This operation dispatches tokens and their associated payloads to different expert ranks
+    based on the expert assignment. Each token can be sent to multiple ranks if it needs
+    to be processed by experts on different ranks.
+    
+    Args:
+        token_selected_experts: [local_num_tokens, top_k] tensor of expert indices (int32).
+                               Each row contains the global expert IDs selected for that token.
+        input_payloads: List of tensors with shape [local_num_tokens, ...] containing data to dispatch.
+                       These are the payloads that will be sent along with tokens to expert ranks.
+        workspace: [ep_size, size_per_rank] unified virtual memory workspace (uint8). This should be provided by MNNVLMemory.
+                  Used for inter-rank communication and synchronization.
+                  size_per_rank should be large enough to accomodate all recv_buffers (see the doc for return "recv_buffers") plus ep_size * 4 (for completion flags)
+        max_tokens_per_rank: Maximum number of tokens that can be received per rank.
+                           Used to allocate fixed-size receive buffers.
+        ep_rank: Current expert parallel rank (0 to ep_size-1).
+        ep_size: Total expert parallel size.
+        top_k: Number of experts selected per token.
+    
+    Returns:
+        tuple: (recv_buffers, send_counters, send_indices)
+            - recv_buffers: List of receive buffers, one for each payload.
+                          Each buffer has shape [ep_size, max_tokens_per_rank, payload_elements].
+                          Contains data received from all ranks.
+                          Note: recv_buffers are created using torch::from_blob from the workspace
+            - send_counters: [ep_size] tensor tracking number of tokens sent to each rank (int32).
+            - send_indices: [local_num_tokens, ep_size] tensor where send_indices[i, j] is the
+                          position where token i was placed in rank j's receive buffer,
+                          or -1 if token i was not sent to rank j.
+    
+    Note:
+        - token_selected_experts is used for routing but is NOT automatically included as a payload.
+          If you need to dispatch expert assignments, include them explicitly in input_payloads.
+        - The workspace must be MNNVL memory (unified virtual memory) accessible by all ranks.
+        - Each rank processes this operation independently but coordinates through the workspace.
+    """
     return torch.ops.trtllm.moe_a2a_dispatch(token_selected_experts,
                                              input_payloads, workspace,
                                              max_tokens_per_rank, ep_rank,
@@ -654,7 +691,37 @@ def moe_a2a_dispatch(token_selected_experts, input_payloads, workspace,
 
 def moe_a2a_combine(send_indices, payload, workspace, max_tokens_per_rank,
                     ep_rank, ep_size, top_k):
-    """Wrapper for torch.ops.trtllm.moe_a2a_combine to avoid pickle issues in multi-GPU tests"""
+    """
+    MoE All-to-All Combine Operation.
+    
+    This operation combines (sums) the MoE-processed results for tokens that were originally
+    from this rank but were processed by experts on different ranks. It effectively reverses
+    the dispatch operation by gathering and summing the expert outputs.
+    
+    Args:
+        send_indices: [local_num_tokens, ep_size] tensor from dispatch operation (int32).
+                     send_indices[i, j] indicates where token i was placed in rank j's buffer,
+                     or -1 if token i was not sent to rank j. See the return `send_indices` in `moe_a2a_dispatch`.
+        payload: [ep_size, max_tokens_per_rank, elements_per_token] tensor containing MoE-processed results.
+                This is the output from expert processing that needs to be combined.
+                Note: This tensor is NOT on the workspace.
+        workspace: [ep_size, size_per_rank] unified virtual memory workspace (uint8).
+                  Used for inter-rank communication and synchronization.
+        max_tokens_per_rank: Maximum number of tokens that can be received per rank.
+                           Must match the value used in dispatch.
+        ep_rank: Current expert parallel rank (0 to ep_size-1).
+        ep_size: Total expert parallel size (number of ranks in expert parallel group).
+        top_k: Number of experts selected per token. Must match the value used in dispatch.
+    
+    Returns:
+        torch.Tensor: [local_num_tokens, elements_per_token] tensor containing the combined results.
+                     For each token, this is the sum of all expert outputs that processed it.
+    
+    Note:
+        - Unlike dispatch, combine needs to sum up the data from ranks where as dispatch only does copying.
+        - Currently `payload` could only be bfloat16, float16 or float32. Multiple payloads are not supported.
+        - The workspace must be MNNVL memory (unified virtual memory) accessible by all ranks.
+    """
     return torch.ops.trtllm.moe_a2a_combine(send_indices, payload, workspace,
                                             max_tokens_per_rank, ep_rank,
                                             ep_size, top_k)
