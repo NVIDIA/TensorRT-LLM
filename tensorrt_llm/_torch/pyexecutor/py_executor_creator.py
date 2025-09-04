@@ -306,8 +306,7 @@ def create_py_executor(
                 drafting_loop_wrapper=drafting_loop_wrapper,
             )
             # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
-            if model_engine.model.model_config.pretrained_config.architectures[
-                    0] == "DeepseekV3ForCausalLM" and spec_config.speculative_model_dir == checkpoint_dir._str:
+            if spec_config.spec_dec_mode.is_mtp_eagle():
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
