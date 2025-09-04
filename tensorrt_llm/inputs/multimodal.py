@@ -9,6 +9,8 @@ import torch
 from blake3 import blake3
 from torchvision.transforms import ToPILImage
 
+from tensorrt_llm.logger import logger
+
 # Default hasher
 default_hasher = blake3
 
@@ -551,6 +553,10 @@ def find_mm_token_positions(
     if mm_token_ids is None and vocab_size is None:
         raise ValueError(
             "Provide either mm_token_ids or vocab_size to find multimodal token positions"
+        )
+    if mm_token_ids is not None and vocab_size is not None:
+        logger.warning(
+            "Both mm_token_ids and vocab_size are provided, using mm_token_ids and ignoring vocab_size"
         )
 
     # Convert input_ids to tensor if needed
