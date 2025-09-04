@@ -77,7 +77,6 @@ class HunYuanTRTRotaryEmbedding(RotaryEmbedding):
     def __init__(self,
                  config: HunYuanPretrainedConfig,
                  device: Optional[torch.device] = None):
-        "default" if config.rope_scaling is None else 'hunyuan'
         super().__init__(
             config,
             head_dim=config.hidden_size // config.num_attention_heads,
@@ -189,7 +188,7 @@ class HunYuanAttention(Attention):
 
 class HunYuanMLP(GatedMLP):
     """
-    继承自 GatedMLP 的 HunYuanMLP 实现, 兼容混合专家和tp
+    HunYuanMLP implementation inherited from GatedMLP, compatible with mixed experts and tp
     """
 
     def __init__(self,
@@ -227,9 +226,6 @@ class HunYuanMLP(GatedMLP):
                          config=model_config,
                          overridden_tp_size=1,
                          is_expert=is_moe)
-
-    def forward(self, x):
-        return super().forward(x)
 
 
 class HunYuanDecoderLayer(DecoderLayer):
@@ -291,7 +287,7 @@ class HunYuanDecoderLayer(DecoderLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, is_hunyuan=True)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -435,164 +431,12 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        ###### DEBUG #####
-        dump_decode_step = int(os.environ.get("DUMP_DECODE_STEP", "-1"))
-        if dump_decode_step > 0:
-            import json
-            import time
-
-            def _initialize_dump_trackers(self):
-                # called once per session
-                self.dump_modules_file = os.path.join(
-                    os.environ.get(
-                        "TRT_MODEL_DUMP_DIR",
-                        "/apdcephfs_jn/share_302216743/jiarunliu/trt_model_dumps"
-                    ),
-                    f"trt_modules_{time.strftime('%Y%m%d_%H%M%S')}_{id(self):x}.jsonl"
-                )
-                os.makedirs(os.path.dirname(self.dump_modules_file),
-                            exist_ok=True)
-                open(self.dump_modules_file, 'w').close()
-                self.hooks = []
-
-            if not hasattr(self, 'dump_modules_file'):
-                _initialize_dump_trackers(self)
-
-            self.decode_step = getattr(self, "decode_step", 0) + 1
-            exec_list = []
-
-            if self.decode_step == dump_decode_step + 2:
-                for name, module in self.named_modules():
-                    if not list(module.children()):
-
-                        def make_hook(mod_name):
-
-                            def hook(mod, inp, out):
-                                cls_name = mod.__class__.__name__
-
-                                input_shape = None
-                                input_values = None
-                                input_mid_values = None
-                                input_back_values = None
-                                input_mean = None
-                                input_var = None
-                                dump_module_input = os.environ.get(
-                                    "DUMP_MODULE_INPUT", "o_proj")
-                                if dump_module_input in mod_name:
-                                    input_shape = list(inp[0].shape)
-                                    input_values, input_mid_values, input_back_values, input_mean, input_var = _get_tensor_stats(
-                                        inp[0])
-
-                                if isinstance(out, torch.Tensor):
-                                    shape = list(out.shape)
-                                    output_values, output_mid_values, output_back_values, output_mean, output_var = _get_tensor_stats(
-                                        out)
-                                elif isinstance(
-                                        out,
-                                    (tuple,
-                                     list)) and len(out) > 0 and isinstance(
-                                         out[0], torch.Tensor):
-                                    shape = list(out[0].shape)
-                                    output_values, output_mid_values, output_back_values, output_mean, output_var = _get_tensor_stats(
-                                        out)
-                                else:
-                                    shape = None
-                                    output_values = None
-                                    output_mean = None
-                                    output_var = None
-
-                                weights = {}
-                                weight_output_mean = 0.0
-                                weight_output_var = 0.0
-                                for param_name, param in mod.named_parameters(
-                                        recurse=False):
-                                    weights[
-                                        param_name], weight_output_mid_values, weight_output_back_values, weight_output_mean, weight_output_var = _get_tensor_stats(
-                                            param)
-
-                                if input_shape is None:
-                                    exec_list.append({
-                                        "name": mod_name,
-                                        "shape": shape,
-                                        "cls_name": cls_name,
-                                        "output_values": output_values,
-                                        "output_middle_values":
-                                        output_mid_values,
-                                        "output_last_values":
-                                        output_back_values,
-                                        "output_stats": {
-                                            "mean": output_mean,
-                                            "var": output_var
-                                        },
-                                        "weights": weights,
-                                        "weights_stats": {
-                                            "mean": weight_output_mean,
-                                            "var": weight_output_var
-                                        },
-                                    })
-                                else:
-                                    exec_list.append({
-                                        "name": mod_name,
-                                        "shape": shape,
-                                        "cls_name": cls_name,
-                                        "input_shape": input_shape,
-                                        "input_values": input_values,
-                                        "input_middle_values": input_mid_values,
-                                        "input_last_values": input_back_values,
-                                        "input_stats": {
-                                            "mean": input_mean,
-                                            "var": input_var
-                                        },
-                                        "output_values": output_values,
-                                        "output_middle_values":
-                                        output_mid_values,
-                                        "output_last_values":
-                                        output_back_values,
-                                        "output_stats": {
-                                            "mean": output_mean,
-                                            "var": output_var
-                                        },
-                                        "weights": weights,
-                                        "weights_stats": {
-                                            "mean": weight_output_mean,
-                                            "var": weight_output_var
-                                        },
-                                    })
-
-                            return hook
-
-                        self.hooks.append(
-                            module.register_forward_hook(make_hook(name)))
-
-            elif self.decode_step == dump_decode_step + 3:
-                if hasattr(self, 'hooks'):
-                    for hook in self.hooks:
-                        hook.remove()
-                    self.hooks = []
-                    print(f"已完成第{self.decode_step - 3}次decode的数据收集，hook已移除")
-        ###############
         output = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
         )
-
-        #### Save Debug Info ####
-        if dump_decode_step > 0:
-            if self.decode_step == dump_decode_step + 2:
-                record = {
-                    "timestamp": time.strftime("%Y%m%d_%H%M%S.%f")[:-3],
-                    "decode_step": self.decode_step - 2,
-                    "modules": exec_list
-                }
-                with open(self.dump_modules_file, "a") as f:
-                    f.write(json.dumps(record, ensure_ascii=False, indent=2))
-                    f.write("\n")
-                print(
-                    f"第{self.decode_step - 2}次decode的模块信息已dump到: {self.dump_modules_file}"
-                )
-        #### Save Debug Info ####
 
         return self.logits_processor.forward(
             output,

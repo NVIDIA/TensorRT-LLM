@@ -338,22 +338,6 @@ class HunYuanPretrainedConfig(PretrainedConfig):
         if self.rope_scaling is None:
             return
 
-        # TODO:?
-        # if 'rope_alpha' in model_config:
-        #     rope_alpha = model_config['rope_alpha']
-        # if 'rope_theta' in model_config:
-        #     rope_theta = model_config['rope_theta']
-        # if 'rope_scaling' in model_config and model_config['rope_scaling']:
-        #     rope_scaling = model_config['rope_scaling']
-        #     scaling_type = rope_scaling['type'] if 'type' in rope_scaling else 'dynamic'
-        #     assert scaling_type == 'dynamic', f"Now only support dynamic rope scaling, but got {scaling_type}"
-        #     if 'alpha' in rope_scaling and rope_scaling['alpha']:
-        #         scaling_alpha = rope_scaling['alpha']
-        #     else:
-        #         scaling_alpha = 1.0
-
-        #     rope_base = rope_theta * scaling_alpha ** (size_per_head / (size_per_head - 2))
-
         if not isinstance(self.rope_scaling, dict) or len(
                 self.rope_scaling) != 2:
             raise ValueError(
