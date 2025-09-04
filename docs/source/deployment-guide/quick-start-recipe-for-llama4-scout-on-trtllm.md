@@ -175,7 +175,7 @@ These options provide finer control over performance and are set within a YAML f
 
 * **Default**: `TRTLLM`
 
-See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `extra_llm_api_options`.
+See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) class for the full list of options which can be used in the `extra_llm_api_options`.
 
 ## Testing API Endpoint
 
@@ -225,7 +225,7 @@ To run the evaluation harness exec into the running TensorRT-LLM container and i
 ```shell
 docker exec -it tensorrt_llm /bin/bash
 
-pip install lm_eval
+pip install -U lm-eval
 ```
 
 FP8 command for GSM8K
