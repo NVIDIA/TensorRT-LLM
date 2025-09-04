@@ -275,7 +275,7 @@ To run the evaluation harness exec into the running TensorRT-LLM container and i
 ```shell
 docker exec -it tensorrt_llm /bin/bash
 
-pip install lm_eval
+pip install -U lm-eval
 ```
 
 FP8 command for GSM8K:
