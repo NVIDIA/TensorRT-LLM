@@ -9,7 +9,8 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from ..attention_backend.trtllm import TrtllmAttention
-from ..pyexecutor.guided_decoder import GuidedDecoder
+from ..pyexecutor.guided_decoder import (TRTLLM_DISABLE_DRAFT_GUIDED_DECODING,
+                                         GuidedDecoder)
 from ..pyexecutor.handle_logits import HandleLogits
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import (BaseResourceManager, ResourceManager,
@@ -70,7 +71,10 @@ class ModelDrafter(Drafter):
         self.max_draft_tokens = max_draft_tokens
         # Sampling
         self.sampler = sampler
-        self.guided_decoder = guided_decoder
+        if TRTLLM_DISABLE_DRAFT_GUIDED_DECODING:
+            self.guided_decoder = None
+        else:
+            self.guided_decoder = guided_decoder
 
         self.use_static_draft_loop = draft_model_engine.model_is_wrapped
         if self.use_static_draft_loop:
