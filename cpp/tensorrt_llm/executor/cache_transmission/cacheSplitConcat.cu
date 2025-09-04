@@ -695,6 +695,7 @@ __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T**
                 T* outputCachePtr = outputCaches[outputCacheIdx];
 
                 int const headIdInDomainTP = headId;
+                
 
                 T* kOutputPtr = outputCachePtr
                     + blockIdInDomainCP

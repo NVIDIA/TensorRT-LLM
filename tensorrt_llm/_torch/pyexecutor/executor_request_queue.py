@@ -14,6 +14,7 @@ from tensorrt_llm._utils import mpi_disabled, nvtx_range
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
+from ..utils import use_torch_printoptions
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
 
@@ -313,11 +314,12 @@ class ExecutorRequestQueue:
         new_requests = self._handle_special_queue_items(new_requests)
 
         # Attach Python objects to requests
-        if py_request_objects and (self.dist.tp_size > 1
-                                   or self.dist.has_pp) and self.dist.rank > 0:
+        # @B: What's the significance of this condition?
+        if py_request_objects and (self.dist.tp_size > 1 or self.dist.has_pp
+                                   or self.dist.cp_size
+                                   > 1) and self.dist.rank > 0:
             self._attach_py_objects_to_requests(new_requests,
                                                 py_request_objects)
-
         self.waiting_queue.extend(new_requests)
 
         new_requests = self._get_from_waiting_queue(
@@ -684,6 +686,17 @@ class ExecutorRequestQueue:
                 input_ids_this_rank = input_ids_this_rank[:-padding_len]
                 position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
+            with use_torch_printoptions(sci_mode=False,
+                                        threshold=16,
+                                        edgeitems=2,
+                                        linewidth=120):
+                print(
+                    f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: input_ids_this_rank: {torch.tensor(input_ids_this_rank)}"
+                )
+                print(
+                    f"[ExecutorRequestQueue::_merge_helix_requests][{curr_cp_rank}]: position_ids_this_rank: {torch.tensor(position_ids_this_rank)}"
+                )
+            # TODO: Figure how to pass down position_ids_this_rank to LLMRequest.
             req = executor_request_to_llm_request(
                 req_id=req_item.id,
                 executor_request=req_item.request,
@@ -693,6 +706,7 @@ class ExecutorRequestQueue:
                 input_token_ids=input_ids_this_rank,
                 position_ids=position_ids_this_rank,
             )
+            req.total_input_len_cp = input_len
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
@@ -707,7 +721,6 @@ class ExecutorRequestQueue:
             if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
             elif cp_type == CpType.HELIX:
-                # Take the usual route below.
                 return self._merge_helix_requests(
                     new_requests,
                     tokens_per_block=cp_config['tokens_per_block'])

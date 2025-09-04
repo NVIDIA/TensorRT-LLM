@@ -31,7 +31,9 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
+#include <vector>
 
 using namespace tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
@@ -1019,6 +1021,7 @@ int AttentionOp::mlaGeneration(
 
     if (mUseTllmGen)
     {
+        // std::cerr << "[AttentionOp::mlaGeneration] useTllmGen is true." << std::endl;
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
@@ -1074,10 +1077,25 @@ int AttentionOp::mlaGeneration(
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
+        // std::cerr << "[AttentionOp::mlaGeneration] mMaxSeqLenQ: " << tllmRunnerParams.mMaxSeqLenQ
+        //           << " mMaxSeqLenKv: " << tllmRunnerParams.mMaxSeqLenKv
+        //           << " mSumOfSeqLensQ: " << tllmRunnerParams.mSumOfSeqLensQ
+        //           << " mSumOfSeqLensKv: " << tllmRunnerParams.mSumOfSeqLensKv
+        //           << " mBatchSize: " << tllmRunnerParams.mBatchSize
+        //           << " mNumHeadsQ: " << tllmRunnerParams.mNumHeadsQ
+        //           << " mNumHeadsKv: " << tllmRunnerParams.mNumHeadsKv
+        //           << " mNumHeadsQPerKv: " << tllmRunnerParams.mNumHeadsQPerKv
+        //           << " mMaxSeqLenCacheKv: " << tllmRunnerParams.mMaxSeqLenCacheKv
+        //           << std::endl;
+
         // The attention window size.
         tllmRunnerParams.mAttentionWindowSize = generation_params.cyclic_attention_window_size;
         // The chunked attention size.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+
+        // std::cerr << "[AttentionOp::mlaGeneration] mAttentionWindowSize: " << tllmRunnerParams.mAttentionWindowSize
+        //           << " mChunkedAttentionSize: " << tllmRunnerParams.mChunkedAttentionSize
+        //           << std::endl;
 
         // The scaleQ that will be applied to the BMM1 output.
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
@@ -1110,6 +1128,64 @@ int AttentionOp::mlaGeneration(
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
         sync_check_cuda_error(stream);
+
+        // // Copy tllmRunnerParams oPtr to CPU and print them to terminal.
+        // std::cerr << "[AttentionOp::mlaGeneration] Copying oPtr to CPU." << std::endl;
+        // if (tllmRunnerParams.oPtr != nullptr) {
+        //     // Calculate the size of the output buffer
+        //     size_t output_size = tllmRunnerParams.mBatchSize * tllmRunnerParams.mNumHeadsQ *
+        //                         tllmRunnerParams.mMaxSeqLenQ * tllmRunnerParams.mHeadDimV;
+
+        //     // Determine the element size based on the data type (assuming FP16 for now).
+        //     size_t element_size = sizeof(half);  // Adjust based on actual data type.
+        //     size_t total_bytes = output_size * element_size;
+
+        //     std::cerr << "[AttentionOp::mlaGeneration] Copying oPtr to CPU..." << std::endl;
+        //     std::cerr << "  Output buffer size: " << output_size << " elements" << std::endl;
+        //     std::cerr << "  Total bytes: " << total_bytes << " bytes" << std::endl;
+
+        //     // Allocate CPU memory
+        //     std::vector<half> cpu_output(output_size);
+
+        //     // Copy from GPU to CPU
+        //     cudaError_t cuda_result = cudaMemcpy(cpu_output.data(), tllmRunnerParams.oPtr,
+        //                                        total_bytes, cudaMemcpyDeviceToHost);
+
+        //     if (cuda_result == cudaSuccess) {
+        //         std::cerr << "[AttentionOp::mlaGeneration] Successfully copied oPtr to CPU" << std::endl;
+
+        //         // Print the first few elements and some statistics
+        //         std::cerr << "First 10 elements of oPtr:" << std::endl;
+        //         for (int i = 0; i < std::min(10, (int)output_size); ++i) {
+        //             std::cerr << "  [" << i << "] = " << (float)cpu_output[i] << std::endl;
+        //         }
+
+        //         // Print some statistics
+        //         float sum = 0.0f;
+        //         float min_val = std::numeric_limits<float>::max();
+        //         float max_val = std::numeric_limits<float>::lowest();
+
+        //         for (const auto& val : cpu_output) {
+        //             float f_val = (float)val;
+        //             sum += f_val;
+        //             min_val = std::min(min_val, f_val);
+        //             max_val = std::max(max_val, f_val);
+        //         }
+
+        //         float mean = sum / output_size;
+        //         std::cerr << "oPtr Statistics:" << std::endl;
+        //         std::cerr << "  Min: " << min_val << std::endl;
+        //         std::cerr << "  Max: " << max_val << std::endl;
+        //         std::cerr << "  Mean: " << mean << std::endl;
+        //         std::cerr << "  Sum: " << sum << std::endl;
+
+        //     } else {
+        //         std::cerr << "[AttentionOp::mlaGeneration] Failed to copy oPtr to CPU: "
+        //                  << cudaGetErrorString(cuda_result) << std::endl;
+        //     }
+        // } else {
+        //     std::cerr << "[AttentionOp::mlaGeneration] oPtr is nullptr, cannot copy to CPU" << std::endl;
+        // }
     }
     else if (mUseGenFlashMLA)
     {

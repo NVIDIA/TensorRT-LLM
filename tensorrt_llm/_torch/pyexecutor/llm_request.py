@@ -275,6 +275,20 @@ class PyResult:
             self, exclude_last_generation_logits: bool):
         self._exclude_last_generation_logits = exclude_last_generation_logits
 
+    def __str__(self):
+        properties = []
+        context_str = str(self._context_logits)
+        context_str = context_str.replace("\n", "\n\t")
+        properties.append(f"_streaming: {self._streaming}")
+        properties.append(f"_context_logits: {context_str}")
+        generation_str = str(self._generation_logits)
+        generation_str = generation_str.replace("\n", "\n\t")
+        properties.append(f"_generation_logits: {generation_str}")
+        log_probs_str = str(self._log_probs)
+        log_probs_str = log_probs_str.replace("\n", "\n\t")
+        properties.append(f"_log_probs: {log_probs_str}")
+        return "PyResult:\n" + "\n".join(properties)
+
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
             self._context_logits.append(context_logits)
@@ -488,6 +502,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_orig_prompt_len = self.orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens
         self.py_min_length = self.sampling_config.min_length
+        self.py_helix_is_inactive_rank = False
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0

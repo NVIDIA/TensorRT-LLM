@@ -1,0 +1,14 @@
+{
+  "request_id": 2048,
+  "layer_idx": 21,
+  "block_id": 257,
+  "block_index": 0,
+  "block_shape": [
+    1,
+    32,
+    1,
+    576
+  ],
+  "tokens_per_block": 32,
+  "rank": 0
+}

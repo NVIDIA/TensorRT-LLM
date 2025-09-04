@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import os
+import gc
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
@@ -32,6 +33,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
@@ -90,6 +92,8 @@ def get_llm_args(
         max_seq_len: int = BuildConfig.model_fields["max_seq_len"].default,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
+        context_parallel_size: int = 1,
+        cp_config: Optional[dict] = None,
         moe_expert_parallel_size: Optional[int] = None,
         gpus_per_node: Optional[int] = None,
         free_gpu_memory_fraction: float = 0.9,
@@ -120,12 +124,21 @@ def get_llm_args(
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
+    if cp_config is not None and "cp_type" in cp_config:
+        cp_config = cp_config.copy()
+        try:
+            cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
+        except KeyError:
+            raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
+                             f"Must be one of: {', '.join([t.name for t in CpType])}")
     llm_args = {
         "model": model,
         "scheduler_config": scheduler_config,
         "tokenizer": tokenizer,
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
+        "context_parallel_size": context_parallel_size,
+        "cp_config": cp_config,
         "moe_expert_parallel_size": moe_expert_parallel_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
@@ -187,6 +200,12 @@ def launch_server(
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
         gc.disable()
+
+    # Optionally disable GC (default: not disabled)
+    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+        gc.disable()
+    else:
+        assert False, "TRTLLM_SERVER_DISABLE_GC must be set to 1."
 
     asyncio.run(server(host, port))
 
@@ -286,6 +305,10 @@ class ChoiceWithAlias(click.Choice):
               type=int,
               default=1,
               help='Pipeline parallelism size.')
+@click.option("--cp_size",
+              type=int,
+              default=1,
+              help='Context parallelism size.')
 @click.option("--ep_size",
               type=int,
               default=None,
@@ -369,7 +392,7 @@ class ChoiceWithAlias(click.Choice):
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
+        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int, cp_size: int,
         ep_size: Optional[int], cluster_size: Optional[int],
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
         num_postprocess_workers: int, trust_remote_code: bool,
@@ -404,6 +427,7 @@ def serve(
         max_seq_len=max_seq_len,
         tensor_parallel_size=tp_size,
         pipeline_parallel_size=pp_size,
+        context_parallel_size=cp_size,
         moe_expert_parallel_size=ep_size,
         moe_cluster_parallel_size=cluster_size,
         gpus_per_node=gpus_per_node,

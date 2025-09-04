@@ -469,6 +469,11 @@ class Mapping(MappingBase):
             attn_cp_size=-1,
             enable_attention_dp=False,
             enable_lm_head_tp_in_adp=False):
+        #################################################################
+        # TODO: Remove this hardcoding and obtain cp_config from llm_args.
+        if cp_size > 1:
+            cp_config = {"cp_type": CpType.HELIX}
+        #################################################################
         super().__init__(world_size=world_size,
                          rank=rank,
                          gpus_per_node=gpus_per_node,

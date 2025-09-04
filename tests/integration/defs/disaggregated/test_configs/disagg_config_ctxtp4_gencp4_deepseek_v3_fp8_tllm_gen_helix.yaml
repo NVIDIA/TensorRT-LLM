@@ -1,0 +1,36 @@
+hostname: localhost
+port: 8000
+model: DeepSeek-V3
+free_gpu_memory_fraction: 0.25
+backend: "pytorch"
+disable_overlap_scheduler: True
+cuda_graph_config: null
+context_servers:
+  num_instances: 1
+  enable_chunked_prefill: False
+  max_batch_size: 1
+  max_num_tokens: 132000
+  kv_cache_config:
+    enable_block_reuse: False
+    enable_partial_reuse: False
+  tensor_parallel_size: 4
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: "UCX"
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  context_parallel_size: 4
+  enable_chunked_prefill: False
+  max_batch_size: 1
+  max_num_tokens: 36000   # This is per CP rank.
+  kv_cache_config:
+    enable_block_reuse: False
+    enable_partial_reuse: False
+  cache_transceiver_config:
+    backend: "UCX"
+  urls:
+      - "localhost:8002"

@@ -68,7 +68,7 @@ void initBindings(pybind11::module_& m)
         py::arg("sparse_mla_topk") = std::nullopt, py::arg("cu_q_seqlens") = std::nullopt,
         py::arg("cu_kv_seqlens") = std::nullopt, py::arg("fmha_scheduler_counter") = std::nullopt,
         py::arg("mla_bmm1_scale") = std::nullopt, py::arg("mla_bmm2_scale") = std::nullopt,
-        py::arg("quant_q_buffer") = std::nullopt, "Multi-head attention operation",
+        py::arg("quant_q_buffer") = std::nullopt, py::arg("helix_tensor_params"), "Multi-head attention operation",
         py::call_guard<py::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::pybind::thop
