@@ -983,4 +983,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                  gen_tp=gen_tp,
                                  test_sets=[GSM8K, MMLU],
                                  ctx_model=ctx_model,
-                                 gen_model=gen_model)
+                                 gen_model=gen_model,
+                                 ctx_instances=1,
+                                 gen_instances=1)
