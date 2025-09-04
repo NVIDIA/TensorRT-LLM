@@ -1927,7 +1927,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size):
         if get_sm_version() == 100:
-            moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
+            moe_config = MoeConfig(backend="TRTLLM", max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
             moe_config = MoeConfig()
