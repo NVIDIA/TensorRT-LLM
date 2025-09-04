@@ -5,7 +5,6 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.node_utils import get_op_overload_packet, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
@@ -15,68 +14,6 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 # * version above with fused GEMMs (i.e. with a split node)
 # * all_reduce(pointwise_op(linear(x)))
 # * ...
-
-
-@TransformRegistry.register("fuse_collectives")
-class FuseCollectives(BaseTransform):
-    """
-    Fuses all_reduce ops with preceding (quantized) linear ops into a single fused node for improved performance.
-    """
-
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        num_gemm_collective_fusions = 0
-
-        # lookup for fused ops
-        # TODO: avoid this hardcoded lookup, e.g., by generating fused ops on the fly.
-        lookup = {
-            torch.ops.auto_deploy.torch_linear_simple: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
-            torch.ops.aten.linear: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
-            torch.ops.auto_deploy.torch_quant_fp8_linear: torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce,
-        }
-
-        # go through all nodes and find all_reduce nodes
-        for node in gm.graph.nodes:
-            if not is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
-                continue
-
-            # check if args are as expected
-            assert len(node.args) == 1 and not len(node.kwargs), (
-                "Unexpected args/kwargs for all_reduce"
-            )
-
-            # retrieve parent and check a few conditions on the parent node
-            parent_node = node.args[0]
-            if not is_op(parent_node, lookup.keys()):
-                continue
-            if len(parent_node.users) > 1:
-                continue
-
-            with gm.graph.inserting_before(node):
-                # insert fused node
-                fused_linear_collective_node = gm.graph.call_function(
-                    lookup[get_op_overload_packet(parent_node.target)],
-                    args=parent_node.args,
-                    kwargs=parent_node.kwargs,
-                )
-            node.replace_all_uses_with(fused_linear_collective_node)
-            gm.graph.erase_node(node)
-            gm.graph.erase_node(parent_node)
-            num_gemm_collective_fusions += 1
-
-        info = TransformInfo(
-            skipped=False,
-            num_matches=num_gemm_collective_fusions,
-            is_clean=False,
-            has_valid_shapes=False,
-        )
-
-        return gm, info
 
 
 def _allreduce_residual_rmsnorm_pattern(
