@@ -29,9 +29,7 @@ The two model implementation supports the following speculative decoding algorit
 
 For all speculation algorithms, when speculation is enabled, a single sequence of draft tokens with length `max_draft_len` is created for every request. There is currently no way to dynamically disable speculation, thus speed ups are only observable at low batch sizes.
 
-All two-model based speculation implementations have the following additional constraints:
-* KV cache reuse must be disabled (this occurs implicitly).
-* Overlap scheduling must be disabled.
+Two-model based speculation implementations do not support overlap scheduler. It will be disabled automatically. 
 
 ### Draft/Target
 
@@ -99,7 +97,7 @@ MTP is currently only supported by Deepseek. MTP can be tuned with the following
 * `relaxed_topk`: The top K tokens are sampled from the target model's logits to create the initial candidate set for relaxed decoding.
 * `relaxed_delta`: Used to further filter the top K candidate set for relaxed decoding. We remove tokens `t` for which `log(P(top 1 token)) - log(P(t)) > relaxed_delta`.
 
-Unlike the other speculation algorithms, MTP supports the overlap scheduler and KV cache reuse.
+Unlike the other speculation algorithms, MTP supports the overlap scheduler.
 
 ```python
 from tensorrt_llm.llm_api import MTPDecodingConfig
@@ -191,7 +189,6 @@ draft tokens to be attached to the `py_draft_tokens` field of request that specu
 ## Two Model Speculative Decoding Architecture
 
 Note that there are currently a few limitations on the two model implementation:
-* KV cache reuse must be disabled.
 * Overlap scheduling must be disabled.
 
 In this approach, there are two new steps to the `PyExecutor`'s `_executor_loop`.
