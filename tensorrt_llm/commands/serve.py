@@ -152,30 +152,63 @@ def get_llm_args(model: str,
     return llm_args, llm_args_extra_dict
 
 
+# The global LLM instance for shutdown callback.
+_global_llm: Optional[LLM] = None
+
+
 def launch_server(host: str,
                   port: int,
                   llm_args: dict,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
                   server_role: Optional[ServerRole] = None):
 
+    global _global_llm
+
     backend = llm_args["backend"]
     model = llm_args["model"]
     if backend == 'pytorch':
-        llm = PyTorchLLM(**llm_args)
+        _global_llm = PyTorchLLM(**llm_args)
     elif backend == '_autodeploy':
         # AutoDeploy does not support build_config
         llm_args.pop("build_config", None)
         # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/7142):
         # AutoDeploy does not support cache reuse yet.
         llm_args["kv_cache_config"].enable_block_reuse = False
-        llm = AutoDeployLLM(**llm_args)
+        _global_llm = AutoDeployLLM(**llm_args)
     else:
-        llm = LLM(**llm_args)
+        _global_llm = LLM(**llm_args)
 
-    server = OpenAIServer(llm=llm,
+    server = OpenAIServer(llm=_global_llm,
                           model=model,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
+
+    def signal_handler(signum=None, frame=None):
+        """Signal handler that also performs server shutdown."""
+        if signum is not None:
+            logger.warning(
+                f"Received signal {signal.Signals(signum).name} (signum={signum}). Shutting down server..."
+            )
+        else:
+            logger.warning(
+                "Signal kill received, shutting down server via llm.shutdown()")
+        global _global_llm
+        if _global_llm is not None:
+            _global_llm.shutdown()
+            _global_llm = None
+
+    server.app.add_event_handler("shutdown", signal_handler)
+
+    # get the original signal handlers and print debug info for them
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    original_sigint_handler = signal.getsignal(signal.SIGINT)
+    logger.debug(
+        f"Original signal handler for SIGTERM: {original_sigterm_handler}")
+    logger.debug(
+        f"Original signal handler for SIGINT: {original_sigint_handler}")
+    # add kill signal handler
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
 
     asyncio.run(server(host, port))
 
