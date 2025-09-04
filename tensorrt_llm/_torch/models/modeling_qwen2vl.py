@@ -232,14 +232,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         merge_size = self.model_config.vision_config.spatial_merge_size
         temporal_patch_size = self.model_config.vision_config.temporal_patch_size
         if do_resize:
-            resized_height, resized_width = smart_resize(
-                height=image_height,
-                width=image_width,
-                factor=patch_size * merge_size,
-                min_pixels=self.processor.image_processor.min_pixels,
-                max_pixels=self.processor.image_processor.max_pixels,
-            )
-            image_width, image_height = resized_width, resized_height
+            image_width, image_height = self.resize_image(width=image_width,
+                                                          height=image_height)
 
         padded_num_frames = num_frames + num_frames % temporal_patch_size
 
@@ -251,6 +245,31 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         num_vision_tokens = num_patches // (merge_size**2)
 
         return num_vision_tokens
+
+    def resize_image(self, width, height):
+        resized_height, resized_width = smart_resize(
+            height=height,
+            width=width,
+            factor=self.model_config.vision_config.patch_size *
+            self.model_config.vision_config.spatial_merge_size,
+            min_pixels=self.processor.image_processor.min_pixels,
+            max_pixels=self.processor.image_processor.max_pixels,
+        )
+        return resized_width, resized_height
+
+    def get_prompt_for_profiling(self):
+        "Send prompt with largest image resolution for profiling the worst case"
+        max_width = 9999999
+        max_height = 9999999
+        img_width, img_height = self.resize_image(width=max_width,
+                                                  height=max_height)
+        img_tensor = torch.rand([3, img_width, img_height], device="cpu")
+        mm_data = {"image": [img_tensor]}
+
+        text_prompt = TextPrompt(
+            prompt="<|vision_start|><|image_pad|><|vision_end|>",
+            multi_modal_data=mm_data)
+        return text_prompt
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
@@ -672,6 +691,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
+        self.is_multimodal = True  # variable used during profiling
         super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
@@ -693,6 +713,7 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
+        self.is_multimodal = True  # variable used during profiling
         super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
