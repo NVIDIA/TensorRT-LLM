@@ -672,11 +672,6 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow, failFastOnAttentionWindowTooLarge);
     }
 
-    kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
-    tempAttentionWindowInputs.pagedContextFMHA = mModelConfig.getPagedContextFMHA();
-    tempAttentionWindowInputs.maxInputLen = getMaxInputLen();
-    tempAttentionWindowInputs.maxNumTokens = getMaxNumTokens().value();
-
     if (kvCacheType == KvCacheType::kCROSS && kvCacheConfig.getEnableBlockReuse())
     {
         TLLM_LOG_INFO(
@@ -687,8 +682,8 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const sizePerHead = mModelConfig.getSizePerHead();
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
-        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
+        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, kvDtype, getSinkTokenLen(),
+        mRuntime->getStreamPtr(), getMaxInputLen(), getMaxNumTokens().value(), enableBlockReuse,
         kvCacheConfig.getOnboardBlocks(), kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())

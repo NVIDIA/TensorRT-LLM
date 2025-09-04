@@ -38,7 +38,6 @@ RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
 WorldConfig = tensorrt_llm.bindings.WorldConfig
-TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
 BlocksPerWindow = Dict[int, Tuple[
     int,
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
@@ -232,7 +231,6 @@ class KVCacheManager(BaseResourceManager):
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
-        self.max_num_tokens = max_num_tokens
 
         # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
@@ -309,9 +307,6 @@ class KVCacheManager(BaseResourceManager):
                 f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
             )
 
-        # Set up temp_attention_window_inputs
-        temp_attention_window_inputs = self._set_temp_attention_window_inputs()
-
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
         self._stream = torch.cuda.Stream()
@@ -323,11 +318,11 @@ class KVCacheManager(BaseResourceManager):
             'max_num_sequences': max_batch_size,
             'max_beam_width': max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
-            'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,
             'max_sequence_length': max_seq_len,
+            'chunk_size': max_num_tokens,
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'onboard_blocks': kv_cache_config.onboard_blocks,
             'cache_type': kv_cache_type,
@@ -993,22 +988,6 @@ class KVCacheManager(BaseResourceManager):
             return adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_window_vec
         else:
             return blocks_per_window, max_seq_len, max_attention_window_vec
-
-    def _set_temp_attention_window_inputs(
-            self) -> Optional[TempAttentionWindowInputs]:
-        """
-        Set up temp_attention_window_inputs for sliding window.
-        """
-        is_sliding_window = min(
-            self.max_attention_window_vec) < self.max_seq_len
-        if is_sliding_window:
-            temp_attention_window_inputs = TempAttentionWindowInputs()
-            temp_attention_window_inputs.paged_context_fmha = True
-            temp_attention_window_inputs.max_input_len = self.max_seq_len - 1
-            temp_attention_window_inputs.max_num_tokens = self.max_num_tokens
-            return temp_attention_window_inputs
-        else:
-            return None
 
 
 class SlotManager:
