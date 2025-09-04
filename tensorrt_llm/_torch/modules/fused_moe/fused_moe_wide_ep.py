@@ -250,6 +250,7 @@ class WideEPMoE(MoE):
     def select_alltoall_method_type(mapping: Mapping, top_k: int,
                                     dtype: torch.dtype,
                                     use_cuda_graph: bool) -> AlltoallMethodType:
+
         def is_deepep_feasible(num_ranks: int) -> bool:
             num_rdma_ranks = num_ranks // 8  # 8 is the number of NVL peers
             return num_ranks in [2, 4, 8] or num_rdma_ranks in [2, 4, 8, 16]
