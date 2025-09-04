@@ -1,8 +1,12 @@
 # Adapt from
 # https://github.com/vllm-project/vllm/blob/2e33fe419186c65a18da6668972d61d7bbc31564/vllm/inputs/data.py
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from typing_extensions import NotRequired, TypedDict
+
+from tensorrt_llm.sampling_params import SamplingParams
+
+from .multimodal import MultimodalParams
 
 
 class TextPrompt(TypedDict):
@@ -47,6 +51,14 @@ class TokensPrompt(TypedDict):
 
     query_token_ids: NotRequired[List[int]]
     """The query input token IDs for star attention."""
+
+
+class PreprocessedInputs(TypedDict):
+    prompt_token_ids: List[int]
+    prompt: str
+    query_token_ids: List[int]
+    sampling_params: SamplingParams
+    multimodal_params: Optional[MultimodalParams]
 
 
 PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]

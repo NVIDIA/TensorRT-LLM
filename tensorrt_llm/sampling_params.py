@@ -339,7 +339,7 @@ class SamplingParams:
     def _need_return_generation_logits(self) -> bool:
         return self.return_generation_logits and not self._generation_logits_auto_enabled
 
-    def _setup(self, tokenizer, add_special_tokens: bool = False) -> "SamplingParams":
+    def maybe_setup(self, tokenizer, add_special_tokens: bool = False) -> "SamplingParams":
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id

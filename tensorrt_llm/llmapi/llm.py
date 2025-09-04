@@ -12,7 +12,7 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from tensorrt_llm.inputs.data import TextPrompt
+from tensorrt_llm.inputs.data import PreprocessedInputs, TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
@@ -313,50 +313,12 @@ class BaseLLM:
 
         return futures
 
-    @nvtx_range_debug("LLM.generate_async", color="green", category="LLM")
-    def generate_async(
-        self,
-        inputs: PromptInputs,
-        sampling_params: Optional[SamplingParams] = None,
-        lora_request: Optional[LoRARequest] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        streaming: bool = False,
-        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
-        disaggregated_params: Optional[DisaggregatedParams] = None,
-        _postproc_params: Optional[PostprocParams] = None,
-        scheduling_params: Optional[SchedulingParams] = None,
-    ) -> RequestOutput:
-        """Generate output for the given prompt in the asynchronous mode.
-        Asynchronous generation accepts single prompt only.
-
-        Args:
-            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.
-            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
-                A default one will be used if not provided.
-            lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
-            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
-            streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
-            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
-            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
-            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
-
-        Returns:
-            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
-        """
-
-        # Check if the worker is shutting down
-        if self._executor is None or self._executor.is_shutdown():
-            raise RuntimeError("LLM is shutting down")
-
+    def preprocess_inputs(
+            self,
+            inputs: PromptInputs,
+            sampling_params: Optional[SamplingParams] = None
+    ) -> PreprocessedInputs:
         sampling_params = self._prepare_sampling_params(sampling_params)
-
-        # With pytorch backend, py_executor has logic to handle max_tokens of 1,
-        # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
-        # TODO: Also support for trt backend
-        is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
-        is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
-        if is_ctx_only and not self._on_trt_backend:
-            sampling_params.max_tokens = 1
 
         inputs = prompt_inputs(inputs)
 
@@ -423,6 +385,65 @@ class BaseLLM:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
+        return PreprocessedInputs(prompt_token_ids=prompt_token_ids,
+                                  prompt=prompt,
+                                  query_token_ids=query_token_ids,
+                                  sampling_params=sampling_params,
+                                  multimodal_params=multimodal_params)
+
+    @nvtx_range_debug("LLM.generate_async", color="green", category="LLM")
+    def generate_async(
+        self,
+        inputs: PromptInputs,
+        sampling_params: Optional[SamplingParams] = None,
+        lora_request: Optional[LoRARequest] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        streaming: bool = False,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+        _postproc_params: Optional[PostprocParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
+        preprocessed_inputs: Optional[PreprocessedInputs] = None,
+    ) -> RequestOutput:
+        """Generate output for the given prompt in the asynchronous mode.
+        Asynchronous generation accepts single prompt only.
+
+        Args:
+            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.
+            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
+                A default one will be used if not provided.
+            lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
+            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
+            streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
+            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
+            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
+
+        Returns:
+            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
+        """
+
+        # Check if the worker is shutting down
+        if self._executor is None or self._executor.is_shutdown():
+            raise RuntimeError("LLM is shutting down")
+
+        if preprocessed_inputs is None:
+            preprocessed_inputs = self.preprocess_inputs(
+                inputs, sampling_params)
+
+        prompt_token_ids = preprocessed_inputs['prompt_token_ids']
+        query_token_ids = preprocessed_inputs['query_token_ids']
+        multimodal_params = preprocessed_inputs['multimodal_params']
+        prompt = preprocessed_inputs['prompt']
+        sampling_params = preprocessed_inputs['sampling_params']
+
+        # With pytorch backend, py_executor has logic to handle max_tokens of 1,
+        # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
+        # TODO: Also support for trt backend
+        is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
+        is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
+        if is_ctx_only and not self._on_trt_backend:
+            sampling_params.max_tokens = 1
 
         self._check_arguments(
             len(prompt_token_ids),
@@ -539,7 +560,7 @@ class BaseLLM:
                     raise ValueError(
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
-                sampling_params._setup(self.tokenizer)
+                sampling_params.maybe_setup(self.tokenizer)
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
