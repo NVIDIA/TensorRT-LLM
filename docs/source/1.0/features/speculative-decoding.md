@@ -186,7 +186,7 @@ draft tokens to be attached to the `py_draft_tokens` field of request that specu
 
 ## Two Model Speculative Decoding Architecture
 
-Two-model based speculation implementations do not support overlap scheduler. It will be disabled automatically. 
+Two-model based speculation implementations do not support overlap scheduler. It will be disabled automatically.
 
 In this approach, there are two new steps to the `PyExecutor`'s `_executor_loop`.
 * `_prepare_draft_requests`
