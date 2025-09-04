@@ -2363,7 +2363,7 @@ class TorchLlmArgs(BaseLlmArgs):
             load_format = v.upper()
             if load_format not in LoadFormat.__members__:
                 raise ValueError(f"Invalid LoadFormat: {v}")
-        return LoadFormat(load_format)
+        return LoadFormat[load_format]
 
     # Extra resource managers to use in addition to the KV cache manager.
     # Each manager's prepare_resources method is called before the forward pass,
