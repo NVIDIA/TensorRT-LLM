@@ -20,7 +20,6 @@
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime_api.h>
@@ -131,6 +130,7 @@ McastDeviceMemory::~McastDeviceMemory()
 
 void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 {
+
     CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
     CUmemAllocationProp prop = {};
     prop.requestedHandleTypes = handle_type;
