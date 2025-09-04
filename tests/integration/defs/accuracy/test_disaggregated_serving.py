@@ -534,15 +534,17 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(32000)
+    @parametrize_with_ids("eagle3_one_model", [True, False])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding_with_eagle3(self, backend: str, mocker):
+    def test_guided_decoding_with_eagle3(self, backend: str,
+                                         eagle3_one_model: bool, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 3,
             "speculative_model_dir":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": False
+            "eagle3_one_model": eagle3_one_model
         }
 
         ctx_server_config = {
@@ -557,7 +559,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         gen_server_config = {
-            "disable_overlap_scheduler": True,
+            # Two-model eagle3 does not support overlap scheduler
+            "disable_overlap_scheduler": not eagle3_one_model,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.8,
@@ -733,6 +736,59 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+            "guided_decoding_backend": backend,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+            "guided_decoding_backend": backend,
+            "cache_transceiver_config": {
+                "backend": "DEFAULT"
+            }
+        }
+        if mtp_nextn > 0:
+            ctx_server_config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "num_nextn_predict_layers": mtp_nextn
+            }
+            gen_server_config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "num_nextn_predict_layers": mtp_nextn
+            }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -927,4 +983,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                  gen_tp=gen_tp,
                                  test_sets=[GSM8K, MMLU],
                                  ctx_model=ctx_model,
-                                 gen_model=gen_model)
+                                 gen_model=gen_model,
+                                 ctx_instances=1,
+                                 gen_instances=1)
