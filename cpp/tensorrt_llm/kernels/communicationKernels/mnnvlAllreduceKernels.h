@@ -21,43 +21,40 @@
 #include <cstdint>
 
 namespace tensorrt_llm::kernels::mnnvl
+
 {
-struct AllReduceParams
+
+enum MNNVLTwoShotStage : uint8_t
 {
+    SCATTER = 0,
+    BROADCAST = 1,
+    NUM_STAGES = 2,
+};
+
+struct AllReduceFusionParams
+{
+    // Environmental/Aux data
     int nranks;
     int rank;
     nvinfer1::DataType dtype;
-    int buffer_M;
     int num_tokens;
     int token_dim;
-    uint32_t buffer_size;
     void** buffer_ptrs_dev;
     void* multicast_ptr;
-    void* buffer_flags;
-    bool wait_for_results;
+    uint32_t* buffer_flags;
+    bool rmsnorm_fusion;
 
-    void* input;
-    void* output;
-    cudaStream_t stream;
-};
-
-void twoshot_allreduce_op(AllReduceParams const& params);
-
-struct RMSNormParams
-{
-    void* residual_output;
-    void* output;
+    // Input and output data
     void const* input;
+    void const* residual_in;
     void const* gamma;
     double epsilon;
-    void* residual;
-    uint32_t buffer_size;
-    uint32_t* buffer_flags;
-    int batch;
-    int hidden_dim;
+
+    void* residual_out;
+    void* output;
     cudaStream_t stream;
-    nvinfer1::DataType dtype;
 };
 
-void twoshot_rmsnorm_op(RMSNormParams const& params);
+void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params);
+void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params);
 } // namespace tensorrt_llm::kernels::mnnvl

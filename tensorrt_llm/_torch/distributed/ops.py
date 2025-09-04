@@ -49,10 +49,13 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
-def get_allreduce_mnnvl_workspace(
-    mapping: Mapping, dtype: torch.dtype
+def get_or_scale_allreduce_mnnvl_workspace(
+    mapping: Mapping,
+    dtype: torch.dtype,
+    buffer_size_bytes: Optional[int] = None
 ) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
 
+    NUM_LAMPORT_BUFFERS = 3
     if not hasattr(_thread_local,
                    f"allreduce_mnnvl_workspaces_{mapping.pp_rank}"):
         setattr(_thread_local, f"allreduce_mnnvl_workspaces_{mapping.pp_rank}",
@@ -65,25 +68,45 @@ def get_allreduce_mnnvl_workspace(
 
     allreduce_mnnvl_workspaces = getattr(
         _thread_local, f"allreduce_mnnvl_workspaces_{mapping.pp_rank}")
-    if mapping not in allreduce_mnnvl_workspaces:
+    if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
+            mapping]["buffer_size_bytes"] < NUM_LAMPORT_BUFFERS * (
+                buffer_size_bytes or 0):
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = 1024 * 8192 * dtype.itemsize
         # Lamport requires 3 buffers
-        init_workspace_size = 3 * init_buffer_size_bytes
+        init_workspace_size = NUM_LAMPORT_BUFFERS * init_buffer_size_bytes
 
-        mcast_buffer = McastGPUBuffer(
-            init_workspace_size,
+        # If not scaling, use the initial buffer size
+        if buffer_size_bytes is None:
+            buffer_size_bytes = init_workspace_size
+            if mapping.tp_rank == 0:
+                logger.debug(
+                    f"[MNNVL] Creating workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} with {buffer_size_bytes} bytes"
+                )
+        # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
+        else:
+            req_buffer_size_bytes = buffer_size_bytes
+            buffer_size_bytes = math.ceil(buffer_size_bytes /
+                                          (8 * 1024 * 1024)) * (8 * 1024 * 1024)
+            if mapping.tp_rank == 0:
+                logger.debug(
+                    f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
+                )
+
+        mcast_buf_handle = McastGPUBuffer(
+            buffer_size_bytes,
             mapping.tp_size,
             mapping.tp_rank,
-            # Split the communicator according to the topology
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.local_rank,
             True,  # mnNvlink
         )
 
-        buffer = mcast_buffer.get_uc_buffer(mapping.tp_rank,
-                                            (3, 2, max_num_elements), dtype, 0)
-        # Only initialize the buffer when we need to resize it
+        # We use per FP32 element in the buffer for lamport sync, thus the buffer is only
+        buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
+                                                (init_buffer_size_bytes //
+                                                 (torch.float32.itemsize), ),
+                                                torch.float32, 0)
         buffer.fill_(-0.0)
         # CPU barrier since we assume this should not be called in cuda graph
         torch.cuda.synchronize()
@@ -91,14 +114,18 @@ def get_allreduce_mnnvl_workspace(
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
-        # [Buffer_ptr, Clear_ptr, num_tokens_to_clear,atomic access counter]
-        buffer_flags = torch.tensor([0, 2, 0, 0],
+        # The flag should be binded to each buffer allocation
+        # [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
+        buffer_flags = torch.tensor([0, 2, buffer_size_bytes, 0, 0, 0, 0, 0, 0],
                                     dtype=torch.uint32,
-                                    device=torch.device("cuda",
-                                                        mapping.local_rank))
+                                    device=mapping.local_device)
 
-        allreduce_mnnvl_workspaces[mapping] = (mcast_buffer, buffer,
-                                               buffer_flags, max_num_elements)
+        allreduce_mnnvl_workspaces[mapping] = {
+            "handle": mcast_buf_handle,
+            "uc_buffer": buffer,
+            "buffer_flags": buffer_flags,
+            "buffer_size_bytes": buffer_size_bytes,
+        }
     return allreduce_mnnvl_workspaces[mapping]
 
 
@@ -294,18 +321,19 @@ class MNNVLAllReduce(nn.Module):
     for certain operations when using NVLink for multi-node communication.
     """
 
-    SUPPORTED_FUSION_HIDDEN_DIMS = [2048, 2880, 4096, 5120, 7168, 8192]
-
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
-        assert dtype in MNNVLAllReduce.get_supported_dtypes() and (
-            not mapping.has_cp()
-        ), "MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
+        if dtype not in MNNVLAllReduce.get_supported_dtypes() or (
+                mapping.has_cp()):
+            # This is safe as we always capture the exception when create this object
+            raise ValueError(
+                f"MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
+            )
 
-        self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = (
-            get_allreduce_mnnvl_workspace(self.mapping, dtype))
+        # Initialize the workspace
+        _ = get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
 
     @staticmethod
     def get_supported_dtypes():
@@ -342,55 +370,37 @@ class MNNVLAllReduce(nn.Module):
         input = input.view(-1, shape[-1])
         (num_tokens, hidden_dim) = input.shape
 
-        # Slice the buffer according to the hidden size, need to pass this numel as the new buffer size
-        max_num_tokens = self.max_num_elements_mnnvl // hidden_dim
-        num_elements_in_use = max_num_tokens * hidden_dim
-        if num_tokens > max_num_tokens:
-            logger.debug(
-                f"MNNVL AllReduce can't be enabled due to {num_tokens=} larger than {max_num_tokens=}."
-            )
-            return None
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping,
+            self.dtype,
+            buffer_size_bytes=num_tokens * hidden_dim * self.dtype.itemsize)
 
-        # This should not happen but leave this check for future code changes
-        if num_elements_in_use > self.max_num_elements_mnnvl:
-            logger.debug(
-                f"MNNVL AllReduce can't be enabled due to {num_elements_in_use=} larger than {self.max_num_elements_mnnvl=}."
-            )
-            return None
-
-        output = torch.empty_like(input)
-        buffer_mnnvl = self.buffer_mnnvl.view(-1)[:(3 * 2 *
-                                                    num_elements_in_use)].view(
-                                                        3, 2, -1, hidden_dim)
+        # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
+        buffer_base = workspace["uc_buffer"].view(3, -1)
+        # The buffer flags is tied to the buffer and used to save the state of the buffer
+        buffer_flags = workspace["buffer_flags"]
 
         if fusion_op == AllReduceFusionOp.NONE:
-            output = torch.ops.trtllm.mnnvl_twoshot_allreduce(
+            output, _ = torch.ops.trtllm.mnnvl_fusion_allreduce(
                 input,
-                buffer_mnnvl,
-                self.buffer_flags_mnnvl,
-                num_elements_in_use,
-                True,
+                None,  # residual
+                None,  # gamma
+                1e-6,  # epsilon
+                buffer_base,  # comm_buffer
+                buffer_flags,  # buffer_flags
+                False,  # rmsnorm_fusion
             )
             return output.view(shape)
         # Fallback to use other allreduce if hidden_size is not supported
-        elif (fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
-              and hidden_dim in MNNVLAllReduce.SUPPORTED_FUSION_HIDDEN_DIMS):
-            torch.ops.trtllm.mnnvl_twoshot_allreduce(
+        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            output, residual_out = torch.ops.trtllm.mnnvl_fusion_allreduce(
                 input,
-                buffer_mnnvl,
-                self.buffer_flags_mnnvl,
-                num_elements_in_use,
-                False,
-            )
-            residual_in = all_reduce_params.residual
-
-            output, residual_out = torch.ops.trtllm.mnnvl_twoshot_rmsnorm(
-                buffer_mnnvl,
-                all_reduce_params.norm_weight,
-                all_reduce_params.eps,
-                residual_in,
-                self.buffer_flags_mnnvl,
-                num_elements_in_use,
+                all_reduce_params.residual,  # residual
+                all_reduce_params.norm_weight,  # gamma
+                all_reduce_params.eps,  # epsilon
+                buffer_base,  # comm_buffer
+                buffer_flags,  # buffer_flags
+                True,  # rmsnorm_fusion
             )
             return output.view(shape), residual_out.view(shape)
         return None
@@ -460,13 +470,10 @@ class AllReduce(nn.Module):
             if self.strategy in (AllReduceStrategy.AUTO,
                                  AllReduceStrategy.MNNVL):
                 if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
+                    # ALWAYS capture the exception when creating this instance
                     try:
                         self.mnnvl_allreduce = MNNVLAllReduce(
                             self.mapping, dtype) if dtype else None
-                        if self.mnnvl_allreduce:
-                            logger.debug(f"MNNVLAllReduce is enabled")
-                        else:
-                            logger.debug(f"MNNVLAllReduce is disabled")
                     except Exception as e:
                         logger.debug(
                             f"MNNVL AllReduce can't be enabled due to {e}.")
@@ -476,9 +483,6 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
-
-    def is_mnnvl(self) -> bool:
-        return self.mnnvl_allreduce is not None
 
     def forward(
         self,
