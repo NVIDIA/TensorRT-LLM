@@ -19,7 +19,8 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -678,16 +679,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError("suffix is not supported")
         return data
 
-    @model_validator(mode="before")
+    @field_validator("cache_salt")
     @classmethod
-    def check_cache_salt_support(cls, data):
-        if data.get("cache_salt") is not None:
-            if not isinstance(data["cache_salt"],
-                              str) or not data["cache_salt"]:
+    def check_cache_salt_support(cls, v):
+        if v is not None:
+            if not isinstance(v, str) or not v.strip():
                 raise ValueError(
                     "Parameter 'cache_salt' must be a non-empty string if provided."
                 )
-        return data
+        return v
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
