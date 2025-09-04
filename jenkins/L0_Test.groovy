@@ -667,12 +667,12 @@ def preprocessTestList(String testListFile)
 
     // Write the regular tests back to the original file
     def regularTestContent = regularTests.join('\n') + (regularTests.size() > 0 ? '\n' : '')
-    writeFile(file: testListFile, text: regularTestContent)
+    sh "echo '${regularTestContent.replace("'", "'\\''")}' > ${testListFile}"
 
     // Create a separate file for isolate tests
     def isolateTestFile = testListFile.replaceAll('\\.txt$', '_isolate.txt')
     def isolateTestContent = isolateTests.join('\n') + (isolateTests.size() > 0 ? '\n' : '')
-    writeFile(file: isolateTestFile, text: isolateTestContent)
+    sh "echo '${isolateTestContent.replace("'", "'\\''")}' > ${isolateTestFile}"
 
     return [
         regular: testListFile,
