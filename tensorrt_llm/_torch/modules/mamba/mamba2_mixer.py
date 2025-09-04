@@ -96,7 +96,6 @@ class Mamba2Mixer(nn.Module):
                               mapping=self.mapping,
                               tensor_parallel_mode=TensorParallelMode.COLUMN,
                               quant_config=config.get_quant_config(),
-                              skip_create_weights_in_init=config.skip_create_weights_in_init,
                               allreduce_strategy=config.allreduce_strategy)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
@@ -146,12 +145,7 @@ class Mamba2Mixer(nn.Module):
                                mapping=self.mapping,
                                tensor_parallel_mode=TensorParallelMode.ROW,
                                quant_config=config.get_quant_config(),
-                               skip_create_weights_in_init=config.skip_create_weights_in_init,
                                allreduce_strategy=config.allreduce_strategy)
-
-        print(f"######################################### {self.layer_idx} Mamba2 conv1d linear quant method: {self.conv1d.get_quant_method(self.conv1d.quant_config)}", flush=True)
-        print(f"######################################### {self.layer_idx} Mamba2 in_proj linear quant method: {self.in_proj.get_quant_method(self.in_proj.quant_config)}", flush=True)
-        print(f"######################################### {self.layer_idx} Mamba2 out_proj linear quant method: {self.out_proj.get_quant_method(self.out_proj.quant_config)}", flush=True)
 
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
 
@@ -161,9 +155,6 @@ class Mamba2Mixer(nn.Module):
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
     ) -> torch.Tensor:
-        print(f"######################################### {self.layer_idx} Mamba2 conv1d linear quant method: {self.conv1d.quant_method}", flush=True)
-        print(f"######################################### {self.layer_idx} Mamba2 in_proj linear quant method: {self.in_proj.quant_method}", flush=True)
-        print(f"######################################### {self.layer_idx} Mamba2 out_proj linear quant method: {self.out_proj.quant_method}", flush=True)
 
         # calculate split size
         num_prefills = attn_metadata.num_contexts

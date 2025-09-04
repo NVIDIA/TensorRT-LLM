@@ -482,22 +482,8 @@ class DecoderModelForCausalLM(nn.Module,
         if quant_config is not None:
             if quant_config.exclude_modules is not None:
                 for name, module in self.named_modules():
-                    if isinstance(module, Linear):
-                        weight_mode = module.weights_loading_config.weight_mode
-                        if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
-                            # gate_proj and up_proj share the same exclusion rule
-                            is_excluded = quant_config.is_module_excluded_from_quantization(name.replace('gate_up_proj', 'gate_proj'))
-                        elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
-                            # q_proj, k_proj and v_proj share the same exclusion rule
-                            is_excluded = quant_config.is_module_excluded_from_quantization(name.replace('qkv', 'q'))
-                        else:
-                            is_excluded = quant_config.is_module_excluded_from_quantization(name)
-                    # TODO: Do this in a more general way, with WeightMode.FUSED_QKV_LINEAR and WeightMode.FUSED_GATE_UP_LINEAR
-                    # if 'qkv' in name:
-                    #     is_excluded = quant_config.is_module_excluded_from_quantization(name.replace('qkv', 'q'))
-                    else:
-                        is_excluded = quant_config.is_module_excluded_from_quantization(
-                            name)
+                    is_excluded = quant_config.is_module_excluded_from_quantization(
+                        name)
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
@@ -950,7 +936,6 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                         module, module_name, module_weights)
 
                 elif hasattr(module, 'load_weights'):
-                    print(f"######################################### {name} {module_weights.keys()=}", flush=True)
                     module.load_weights(weights=[module_weights])
                 else:
                     for n, p in module._parameters.items():

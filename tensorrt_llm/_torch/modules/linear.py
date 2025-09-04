@@ -409,7 +409,6 @@ class FP8QDQLinearMethod(LinearMethodBase):
             # Dynamic quantization
             module.input_scale = None
             module.inv_input_scale = None
-        print(f"######################################### {module.weight_scale=}, {weight_scale=}", flush=True)
         copy_weight(module.weight_scale, weight_scale[0])
 
     def load_weights_fused_qkv_linear(self, module: Linear,
