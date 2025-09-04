@@ -617,7 +617,7 @@ __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T
         }
 
         // Now we view it as the value for reduction
-        PackedVec<PackedType, T>* values = reinterpret_cast<PackedVec<PackedType, T>*>(values_lamport);
+        auto values = reinterpret_cast<PackedVec<PackedType, T>*>(values_lamport);
 #pragma unroll
         for (int r = 0; r < WORLD_SIZE; r++)
         {

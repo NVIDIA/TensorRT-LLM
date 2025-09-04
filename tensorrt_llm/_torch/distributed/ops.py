@@ -73,10 +73,10 @@ def get_or_scale_allreduce_mnnvl_workspace(
     allreduce_mnnvl_workspaces = getattr(
         _thread_local, f"allreduce_mnnvl_workspaces_{mapping.pp_rank}")
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
-            mapping]["buffer_size_bytes"] < NUM_LAMPORT_BUFFERS * (
-                buffer_size_bytes or 0):
+            mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
-        init_buffer_size_bytes = 1024 * 8192 * dtype.itemsize
+        init_buffer_size_bytes = max(1024 * 8192 * dtype.itemsize,
+                                     buffer_size_bytes or 0)
         # If not scaling, use the initial buffer size
         if buffer_size_bytes is None:
             buffer_size_bytes = init_buffer_size_bytes
@@ -119,8 +119,9 @@ def get_or_scale_allreduce_mnnvl_workspace(
         # Should have the same lifetime with self._buffer
         # The flag should be binded to each buffer allocation
         # [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
+        num_bytes_to_clear = [0] * 4
         buffer_flags = torch.tensor(
-            [0, 2, buffer_size_bytes, 0, 0, 0, 0, 0, 0],
+            [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
             dtype=torch.uint32,
             device=torch.device("cuda", mapping.local_rank),
         )
@@ -362,14 +363,15 @@ class MNNVLAllReduce(nn.Module):
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
         # This should match the heuristic in allreduceOp.cpp
-        is_one_shot = num_tokens * hidden_dim * group_size * dtype.itemsize <= 128 * 1024 * 8
-        if is_one_shot:
-            # For one-shot, each rank needs to store num_tokens * group_size tokens
-            return num_tokens * hidden_dim * group_size * dtype.itemsize
-        else:
-            # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest group_size.
-            return math.ceil(
-                num_tokens / group_size) * hidden_dim * dtype.itemsize
+        # is_one_shot = num_tokens * hidden_dim * group_size * dtype.itemsize <= 128 * 1024 * 8
+        # if is_one_shot:
+        #     # For one-shot, each rank needs to store num_tokens * group_size tokens
+        #     return num_tokens * hidden_dim * group_size * dtype.itemsize
+        # else:
+        # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest group_size.
+        # 2 Stage is required for the two-shot allreduce.
+        return 2 * math.ceil(
+            num_tokens / group_size) * group_size * hidden_dim * dtype.itemsize
 
     def forward(
         self,
