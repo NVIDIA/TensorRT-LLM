@@ -1,0 +1,1370 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>trtllm-bench &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'commands/trtllm-bench';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc3';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="trtllm-build" href="trtllm-build.html" />
+    <link rel="prev" title="Runtime" href="../_cpp_gen/runtime.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.1.0rc3" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/dev-containers.html">Using Dev Containers</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT-LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT‑LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">trtllm-bench</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="trtllm-bench">
+<h1>trtllm-bench<a class="headerlink" href="#trtllm-bench" title="Link to this heading">#</a></h1>
+<p>trtllm-bench is a comprehensive benchmarking tool for TensorRT-LLM engines. It provides three main subcommands for different benchmarking scenarios:</p>
+<p><strong>Common Options for All Commands:</strong></p>
+<p><strong>Usage:</strong></p>
+<section id="trtllm-bench">
+<h2>trtllm-bench<a class="headerlink" href="#trtllm-bench" title="Link to this heading">#</a></h2>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>COMMAND<span class="w"> </span><span class="o">[</span>ARGS<span class="o">]</span>...
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-m">
+<span id="cmdoption-trtllm-bench-model"></span><span class="sig-name descname"><span class="pre">-m</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--model</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;model&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-m" title="Link to this definition">#</a></dt>
+<dd><p><strong>Required</strong> The Huggingface name of the model to benchmark.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-model_path">
+<span class="sig-name descname"><span class="pre">--model_path</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;model_path&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-model_path" title="Link to this definition">#</a></dt>
+<dd><p>Path to a Huggingface checkpoint directory for loading model components.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-w">
+<span id="cmdoption-trtllm-bench-workspace"></span><span class="sig-name descname"><span class="pre">-w</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--workspace</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;workspace&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-w" title="Link to this definition">#</a></dt>
+<dd><p>The directory to store benchmarking intermediate files.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-log_level">
+<span class="sig-name descname"><span class="pre">--log_level</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;log_level&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-log_level" title="Link to this definition">#</a></dt>
+<dd><p>The logging level.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>internal_error | error | warning | info | verbose | debug | trace</p>
+</dd>
+</dl>
+</dd></dl>
+
+<section id="trtllm-bench-throughput">
+<h3>throughput<a class="headerlink" href="#trtllm-bench-throughput" title="Link to this heading">#</a></h3>
+<p>Run a throughput test on a TRT-LLM engine.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>throughput<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-engine_dir">
+<span class="sig-name descname"><span class="pre">--engine_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;engine_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-engine_dir" title="Link to this definition">#</a></dt>
+<dd><p>Path to a serialized TRT-LLM engine.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-backend">
+<span class="sig-name descname"><span class="pre">--backend</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;backend&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-backend" title="Link to this definition">#</a></dt>
+<dd><p>The backend to use when running benchmarking.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>pytorch | _autodeploy | tensorrt</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-custom_module_dirs">
+<span class="sig-name descname"><span class="pre">--custom_module_dirs</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;custom_module_dirs&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-custom_module_dirs" title="Link to this definition">#</a></dt>
+<dd><p>Paths to custom module directories to import.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-extra_llm_api_options">
+<span class="sig-name descname"><span class="pre">--extra_llm_api_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;extra_llm_api_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-extra_llm_api_options" title="Link to this definition">#</a></dt>
+<dd><p>Path to a YAML file that overwrites the parameters specified by trtllm-bench.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-sampler_options">
+<span class="sig-name descname"><span class="pre">--sampler_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;sampler_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-sampler_options" title="Link to this definition">#</a></dt>
+<dd><p>Path to a YAML file that sets sampler options.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-max_batch_size">
+<span class="sig-name descname"><span class="pre">--max_batch_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_batch_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-max_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>Maximum runtime batch size to run the engine with.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-max_num_tokens">
+<span class="sig-name descname"><span class="pre">--max_num_tokens</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_num_tokens&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-max_num_tokens" title="Link to this definition">#</a></dt>
+<dd><p>Maximum runtime tokens that an engine can accept.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-max_seq_len">
+<span class="sig-name descname"><span class="pre">--max_seq_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_seq_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-max_seq_len" title="Link to this definition">#</a></dt>
+<dd><p>Maximum sequence length.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-beam_width">
+<span class="sig-name descname"><span class="pre">--beam_width</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;beam_width&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-beam_width" title="Link to this definition">#</a></dt>
+<dd><p>Number of search beams.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-kv_cache_free_gpu_mem_fraction">
+<span class="sig-name descname"><span class="pre">--kv_cache_free_gpu_mem_fraction</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;kv_cache_free_gpu_mem_fraction&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-kv_cache_free_gpu_mem_fraction" title="Link to this definition">#</a></dt>
+<dd><p>The percentage of memory to use for KV Cache after model load.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-dataset">
+<span class="sig-name descname"><span class="pre">--dataset</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;dataset&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-dataset" title="Link to this definition">#</a></dt>
+<dd><p>Pass in a dataset file for parsing instead of stdin.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-no_skip_tokenizer_init">
+<span class="sig-name descname"><span class="pre">--no_skip_tokenizer_init</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-no_skip_tokenizer_init" title="Link to this definition">#</a></dt>
+<dd><p>Do not skip tokenizer initialization when loading the model.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-eos_id">
+<span class="sig-name descname"><span class="pre">--eos_id</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;eos_id&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-eos_id" title="Link to this definition">#</a></dt>
+<dd><p>Set the end-of-sequence token for the benchmark. Set to -1 to disable EOS.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-modality">
+<span class="sig-name descname"><span class="pre">--modality</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;modality&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-modality" title="Link to this definition">#</a></dt>
+<dd><p>Modality of the multimodal requests.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>image | video</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-image_data_format">
+<span class="sig-name descname"><span class="pre">--image_data_format</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;image_data_format&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-image_data_format" title="Link to this definition">#</a></dt>
+<dd><p>Format of the image data for multimodal models.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>pt | pil</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-data_device">
+<span class="sig-name descname"><span class="pre">--data_device</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;data_device&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-data_device" title="Link to this definition">#</a></dt>
+<dd><p>Device to load the multimodal data on.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>cuda | cpu</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-max_input_len">
+<span class="sig-name descname"><span class="pre">--max_input_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_input_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-max_input_len" title="Link to this definition">#</a></dt>
+<dd><p>Maximum input sequence length to use for multimodal models. This is used only when –modality is specified since the actual number of vision tokens is unknown before the model is run.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-num_requests">
+<span class="sig-name descname"><span class="pre">--num_requests</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_requests&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-num_requests" title="Link to this definition">#</a></dt>
+<dd><p>Number of requests to cap benchmark run at. If not specified or set to 0, it will be the length of dataset.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-warmup">
+<span class="sig-name descname"><span class="pre">--warmup</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;warmup&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-warmup" title="Link to this definition">#</a></dt>
+<dd><p>Number of requests warm up benchmark.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-target_input_len">
+<span class="sig-name descname"><span class="pre">--target_input_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;target_input_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-target_input_len" title="Link to this definition">#</a></dt>
+<dd><p>Target (average) input length for tuning heuristics.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-target_output_len">
+<span class="sig-name descname"><span class="pre">--target_output_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;target_output_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-target_output_len" title="Link to this definition">#</a></dt>
+<dd><p>Target (average) sequence length for tuning heuristics.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-tp">
+<span class="sig-name descname"><span class="pre">--tp</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tp&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-tp" title="Link to this definition">#</a></dt>
+<dd><p>tensor parallelism size</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-pp">
+<span class="sig-name descname"><span class="pre">--pp</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pp&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-pp" title="Link to this definition">#</a></dt>
+<dd><p>pipeline parallelism size</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-ep">
+<span class="sig-name descname"><span class="pre">--ep</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;ep&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-ep" title="Link to this definition">#</a></dt>
+<dd><p>expert parallelism size</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-cluster_size">
+<span class="sig-name descname"><span class="pre">--cluster_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;cluster_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-cluster_size" title="Link to this definition">#</a></dt>
+<dd><p>expert cluster parallelism size</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-concurrency">
+<span class="sig-name descname"><span class="pre">--concurrency</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;concurrency&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-concurrency" title="Link to this definition">#</a></dt>
+<dd><p>Desired concurrency rate (number of requests processing at the same time), &lt;=0 for no concurrency limit.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-streaming">
+<span class="sig-name descname"><span class="pre">--streaming</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-streaming" title="Link to this definition">#</a></dt>
+<dd><p>Enable streaming mode for requests.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-report_json">
+<span class="sig-name descname"><span class="pre">--report_json</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;report_json&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-report_json" title="Link to this definition">#</a></dt>
+<dd><p>Path where report is written to.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-iteration_log">
+<span class="sig-name descname"><span class="pre">--iteration_log</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;iteration_log&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-iteration_log" title="Link to this definition">#</a></dt>
+<dd><p>Path where iteration logging is written to.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-output_json">
+<span class="sig-name descname"><span class="pre">--output_json</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;output_json&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-output_json" title="Link to this definition">#</a></dt>
+<dd><p>Path where output should be written to.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-request_json">
+<span class="sig-name descname"><span class="pre">--request_json</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;request_json&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-request_json" title="Link to this definition">#</a></dt>
+<dd><p>Path where per request information is written to.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-enable_chunked_context">
+<span id="cmdoption-trtllm-bench-throughput-disable_chunked_context"></span><span class="sig-name descname"><span class="pre">--enable_chunked_context</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--disable_chunked_context</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-enable_chunked_context" title="Link to this definition">#</a></dt>
+<dd><p>Enable/disable chunking in prefill stage for enhanced throughput benchmark.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-throughput-scheduler_policy">
+<span class="sig-name descname"><span class="pre">--scheduler_policy</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;scheduler_policy&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-throughput-scheduler_policy" title="Link to this definition">#</a></dt>
+<dd><p>KV cache scheduler policy: guaranteed_no_evict prevents request eviction, max_utilization optimizes for throughput.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>guaranteed_no_evict | max_utilization</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="trtllm-bench-latency">
+<h3>latency<a class="headerlink" href="#trtllm-bench-latency" title="Link to this heading">#</a></h3>
+<p>Run a latency test on a TRT-LLM engine.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>latency<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-engine_dir">
+<span class="sig-name descname"><span class="pre">--engine_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;engine_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-engine_dir" title="Link to this definition">#</a></dt>
+<dd><p>Path to a serialized TRT-LLM engine.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-extra_llm_api_options">
+<span class="sig-name descname"><span class="pre">--extra_llm_api_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;extra_llm_api_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-extra_llm_api_options" title="Link to this definition">#</a></dt>
+<dd><p>Path to a YAML file that overwrites the parameters specified by trtllm-bench.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-backend">
+<span class="sig-name descname"><span class="pre">--backend</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;backend&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-backend" title="Link to this definition">#</a></dt>
+<dd><p>The backend to use when running benchmarking.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>pytorch | _autodeploy | tensorrt</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-kv_cache_free_gpu_mem_fraction">
+<span class="sig-name descname"><span class="pre">--kv_cache_free_gpu_mem_fraction</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;kv_cache_free_gpu_mem_fraction&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-kv_cache_free_gpu_mem_fraction" title="Link to this definition">#</a></dt>
+<dd><p>The percentage of memory to use for KV Cache after model load.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-max_seq_len">
+<span class="sig-name descname"><span class="pre">--max_seq_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_seq_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-max_seq_len" title="Link to this definition">#</a></dt>
+<dd><p>Maximum sequence length.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-dataset">
+<span class="sig-name descname"><span class="pre">--dataset</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;dataset&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-dataset" title="Link to this definition">#</a></dt>
+<dd><p>Pass in a dataset file for parsing instead of stdin.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-modality">
+<span class="sig-name descname"><span class="pre">--modality</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;modality&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-modality" title="Link to this definition">#</a></dt>
+<dd><p>Modality of the multimodal requests.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>image | video</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-max_input_len">
+<span class="sig-name descname"><span class="pre">--max_input_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_input_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-max_input_len" title="Link to this definition">#</a></dt>
+<dd><p>Maximum input sequence length to use for multimodal models. This is used only when –modality is specified since the actual number of vision tokens is unknown before the model is run.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-num_requests">
+<span class="sig-name descname"><span class="pre">--num_requests</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_requests&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-num_requests" title="Link to this definition">#</a></dt>
+<dd><p>Number of requests to cap benchmark run at. Minimum between value andlength of dataset.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-warmup">
+<span class="sig-name descname"><span class="pre">--warmup</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;warmup&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-warmup" title="Link to this definition">#</a></dt>
+<dd><p>Number of requests warm up benchmark.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-tp">
+<span class="sig-name descname"><span class="pre">--tp</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tp&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-tp" title="Link to this definition">#</a></dt>
+<dd><p>tensor parallelism size</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-pp">
+<span class="sig-name descname"><span class="pre">--pp</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pp&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-pp" title="Link to this definition">#</a></dt>
+<dd><p>pipeline parallelism size</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-ep">
+<span class="sig-name descname"><span class="pre">--ep</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;ep&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-ep" title="Link to this definition">#</a></dt>
+<dd><p>expert parallelism size</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-beam_width">
+<span class="sig-name descname"><span class="pre">--beam_width</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;beam_width&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-beam_width" title="Link to this definition">#</a></dt>
+<dd><p>Number of search beams.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-sampler_options">
+<span class="sig-name descname"><span class="pre">--sampler_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;sampler_options&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-sampler_options" title="Link to this definition">#</a></dt>
+<dd><p>Path to a YAML file that sets sampler options.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-concurrency">
+<span class="sig-name descname"><span class="pre">--concurrency</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;concurrency&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-concurrency" title="Link to this definition">#</a></dt>
+<dd><p>Desired concurrency rate (number of requests processing at the same time), &lt;=0 for no concurrency limit.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-medusa_choices">
+<span class="sig-name descname"><span class="pre">--medusa_choices</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;medusa_choices&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-medusa_choices" title="Link to this definition">#</a></dt>
+<dd><p>Path to a YAML file that defines the Medusa tree.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-report_json">
+<span class="sig-name descname"><span class="pre">--report_json</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;report_json&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-report_json" title="Link to this definition">#</a></dt>
+<dd><p>Path where report should be written to.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-latency-iteration_log">
+<span class="sig-name descname"><span class="pre">--iteration_log</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;iteration_log&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-latency-iteration_log" title="Link to this definition">#</a></dt>
+<dd><p>Path where iteration logging is written to.</p>
+</dd></dl>
+
+</section>
+<section id="trtllm-bench-build">
+<h3>build<a class="headerlink" href="#trtllm-bench-build" title="Link to this heading">#</a></h3>
+<p>Build engines for benchmarking.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>build<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-tp">
+<span id="cmdoption-trtllm-bench-build-tp_size"></span><span class="sig-name descname"><span class="pre">-tp</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--tp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tp_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-tp" title="Link to this definition">#</a></dt>
+<dd><p>Number of tensor parallel shards to run the benchmark with.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-pp">
+<span id="cmdoption-trtllm-bench-build-pp_size"></span><span class="sig-name descname"><span class="pre">-pp</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--pp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pp_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-pp" title="Link to this definition">#</a></dt>
+<dd><p>Number of pipeline parallel shards to run the benchmark with.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-q">
+<span id="cmdoption-trtllm-bench-build-quantization"></span><span class="sig-name descname"><span class="pre">-q</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--quantization</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;quantization&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-q" title="Link to this definition">#</a></dt>
+<dd><p>The quantization algorithm to be used when benchmarking. See the documentations for more information.
+- <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/precision.html">https://nvidia.github.io/TensorRT-LLM/precision.html</a>  - <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/quantization-in-TRT-LLM.md">NVIDIA/TensorRT-LLM</a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>W8A16 | W4A16 | W4A16_AWQ | W4A8_AWQ | W4A16_GPTQ | FP8 | INT8 | NVFP4</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-max_seq_len">
+<span class="sig-name descname"><span class="pre">--max_seq_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_seq_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-max_seq_len" title="Link to this definition">#</a></dt>
+<dd><p>Maximum total length of one request, including prompt and outputs.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-no_weights_loading">
+<span class="sig-name descname"><span class="pre">--no_weights_loading</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;no_weights_loading&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-no_weights_loading" title="Link to this definition">#</a></dt>
+<dd><p>Do not load the weights from the checkpoint. Use dummy weights instead.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-trust_remote_code">
+<span class="sig-name descname"><span class="pre">--trust_remote_code</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;trust_remote_code&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-trust_remote_code" title="Link to this definition">#</a></dt>
+<dd><p>Trust remote code for the HF models that are not natively implemented in the transformers library. This is needed when using LLM API when loading the HF config to build the engine.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-dataset">
+<span class="sig-name descname"><span class="pre">--dataset</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;dataset&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-dataset" title="Link to this definition">#</a></dt>
+<dd><p>Dataset file to extract the sequence statistics for engine build.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-max_batch_size">
+<span class="sig-name descname"><span class="pre">--max_batch_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_batch_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-max_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>Maximum number of requests that the engine can schedule.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-max_num_tokens">
+<span class="sig-name descname"><span class="pre">--max_num_tokens</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_num_tokens&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-max_num_tokens" title="Link to this definition">#</a></dt>
+<dd><p>Maximum number of batched tokens the engine can schedule.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-target_input_len">
+<span class="sig-name descname"><span class="pre">--target_input_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;target_input_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-target_input_len" title="Link to this definition">#</a></dt>
+<dd><p>Target (average) input length for tuning heuristics.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-bench-build-target_output_len">
+<span class="sig-name descname"><span class="pre">--target_output_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;target_output_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-bench-build-target_output_len" title="Link to this definition">#</a></dt>
+<dd><p>Target (average) sequence length for tuning heuristics.</p>
+</dd></dl>
+
+</section>
+</section>
+</section>
+<section id="prepare-dataset-py">
+<h1>prepare_dataset.py<a class="headerlink" href="#prepare-dataset-py" title="Link to this heading">#</a></h1>
+<p>trtllm-bench is designed to work with the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/prepare_dataset.py">prepare_dataset.py</a> script, which generates benchmark datasets in the required format. The prepare_dataset script supports:</p>
+<p><strong>Dataset Types:</strong></p>
+<ul class="simple">
+<li><p>Real datasets from various sources</p></li>
+<li><p>Synthetic datasets with normal or uniform token distributions</p></li>
+<li><p>LoRA task-specific datasets</p></li>
+</ul>
+<p><strong>Key Features:</strong></p>
+<ul class="simple">
+<li><p>Tokenizer integration for proper text preprocessing</p></li>
+<li><p>Configurable random seeds for reproducible results</p></li>
+<li><p>Support for LoRA adapters and task IDs</p></li>
+<li><p>Output in JSON format compatible with trtllm-bench</p></li>
+</ul>
+<div class="admonition important">
+<p class="admonition-title">Important</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">--stdout</span></code> flag is <strong>required</strong> when using prepare_dataset.py with trtllm-bench to ensure proper data streaming format.</p>
+</div>
+<p><strong>Usage:</strong></p>
+<section id="prepare-dataset">
+<h2>prepare_dataset<a class="headerlink" href="#prepare-dataset" title="Link to this heading">#</a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>prepare_dataset.py<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p><strong>Options</strong></p>
+<hr class="docutils" />
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 20.0%" />
+<col style="width: 80.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Option</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tokenizer</span></code></p></td>
+<td><p>Tokenizer directory or HuggingFace model name (required)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--output</span></code></p></td>
+<td><p>Output JSON filename (default: preprocessed_dataset.json)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--stdout</span></code></p></td>
+<td><p>Print output to stdout with JSON dataset entry on each line (<strong>required for trtllm-bench</strong>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--random-seed</span></code></p></td>
+<td><p>Random seed for token generation (default: 420)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--task-id</span></code></p></td>
+<td><p>LoRA task ID (default: -1)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--rand-task-id</span></code></p></td>
+<td><p>Random LoRA task range (two integers)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lora-dir</span></code></p></td>
+<td><p>Directory containing LoRA adapters</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
+<td><p>Logging level: info or debug (default: info)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="dataset">
+<h2>dataset<a class="headerlink" href="#dataset" title="Link to this heading">#</a></h2>
+<p>Process real datasets from various sources.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>prepare_dataset.py<span class="w"> </span>dataset<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p><strong>Options</strong></p>
+<hr class="docutils" />
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 20.0%" />
+<col style="width: 80.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Option</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--input</span></code></p></td>
+<td><p>Input dataset file or directory (required)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--max-input-length</span></code></p></td>
+<td><p>Maximum input sequence length (default: 2048)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--max-output-length</span></code></p></td>
+<td><p>Maximum output sequence length (default: 512)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--num-samples</span></code></p></td>
+<td><p>Number of samples to process (default: all)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--format</span></code></p></td>
+<td><p>Input format: json, jsonl, csv, or txt (default: auto-detect)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="token-norm-dist">
+<h2>token_norm_dist<a class="headerlink" href="#token-norm-dist" title="Link to this heading">#</a></h2>
+<p>Generate synthetic datasets with normal token distribution.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>prepare_dataset.py<span class="w"> </span>token_norm_dist<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p><strong>Options</strong></p>
+<hr class="docutils" />
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 20.0%" />
+<col style="width: 80.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Option</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--num-requests</span></code></p></td>
+<td><p>Number of requests to be generated (required)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--input-mean</span></code></p></td>
+<td><p>Normal distribution mean for input tokens (required)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--input-stdev</span></code></p></td>
+<td><p>Normal distribution standard deviation for input tokens (required)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--output-mean</span></code></p></td>
+<td><p>Normal distribution mean for output tokens (required)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--output-stdev</span></code></p></td>
+<td><p>Normal distribution standard deviation for output tokens (required)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="token-unif-dist">
+<h2>token_unif_dist<a class="headerlink" href="#token-unif-dist" title="Link to this heading">#</a></h2>
+<p>Generate synthetic datasets with uniform token distribution</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>prepare_dataset.py<span class="w"> </span>token_unif_dist<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p><strong>Options</strong></p>
+<hr class="docutils" />
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 20.0%" />
+<col style="width: 80.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Option</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--num-requests</span></code></p></td>
+<td><p>Number of requests to be generated (required)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--input-min</span></code></p></td>
+<td><p>Uniform distribution minimum for input tokens (required)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--input-max</span></code></p></td>
+<td><p>Uniform distribution maximum for input tokens (required)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--output-min</span></code></p></td>
+<td><p>Uniform distribution minimum for output tokens (required)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--output-max</span></code></p></td>
+<td><p>Uniform distribution maximum for output tokens (required)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../_cpp_gen/runtime.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Runtime</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="trtllm-build.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">trtllm-build</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">trtllm-bench</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-bench">trtllm-bench</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-bench-throughput">throughput</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-bench-latency">latency</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-bench-build">build</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-dataset-py">prepare_dataset.py</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-dataset">prepare_dataset</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dataset">dataset</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#token-norm-dist">token_norm_dist</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#token-unif-dist">token_unif_dist</a></li>
+</ul>
+</li>
+</ul>
+
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 02, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e81c50d">e81c50d</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
