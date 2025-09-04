@@ -50,6 +50,8 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
+# WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
+# Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
 def get_or_scale_allreduce_mnnvl_workspace(
     mapping: Mapping,
     dtype: torch.dtype,
@@ -62,6 +64,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
         setattr(_thread_local, f"allreduce_mnnvl_workspaces_{mapping.pp_rank}",
                 {})
     # Support topology split
+    # FIXME: Reuse the communicator after split for each mapping
     comm = mpi_comm().Split(
         int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
         mapping.tp_rank)
@@ -74,30 +77,27 @@ def get_or_scale_allreduce_mnnvl_workspace(
                 buffer_size_bytes or 0):
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = 1024 * 8192 * dtype.itemsize
-        # Lamport requires 3 buffers
-        init_workspace_size = NUM_LAMPORT_BUFFERS * init_buffer_size_bytes
-
         # If not scaling, use the initial buffer size
         if buffer_size_bytes is None:
-            buffer_size_bytes = init_workspace_size
+            buffer_size_bytes = init_buffer_size_bytes
             if mapping.tp_rank == 0:
                 logger.debug(
                     f"[MNNVL] Creating workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} with {buffer_size_bytes} bytes"
                 )
-        # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
+
         else:
             req_buffer_size_bytes = buffer_size_bytes
-            buffer_size_bytes = (NUM_LAMPORT_BUFFERS *
-                                 math.ceil(buffer_size_bytes /
-                                           (8 * 1024 * 1024)) *
-                                 (8 * 1024 * 1024))
+            # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
+            buffer_size_bytes = math.ceil(buffer_size_bytes /
+                                          (8 * 1024 * 1024)) * (8 * 1024 * 1024)
             if mapping.tp_rank == 0:
                 logger.debug(
                     f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
                 )
-
+        # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
+        workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
         mcast_buf_handle = McastGPUBuffer(
-            buffer_size_bytes,
+            workspace_size_bytes,
             mapping.tp_size,
             mapping.tp_rank,
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
@@ -106,9 +106,10 @@ def get_or_scale_allreduce_mnnvl_workspace(
         )
 
         # We use per FP32 element in the buffer for lamport sync
-        buffer = mcast_buf_handle.get_uc_buffer(
-            mapping.tp_rank, (buffer_size_bytes // (torch.float32.itemsize), ),
-            torch.float32, 0)
+        buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
+                                                (workspace_size_bytes //
+                                                 (torch.float32.itemsize), ),
+                                                torch.float32, 0)
         buffer.fill_(-0.0)
         # Wait until the initialization is done
         torch.cuda.synchronize()
@@ -357,6 +358,19 @@ class MNNVLAllReduce(nn.Module):
                               and MnnvlMemory.supports_mnnvl()
                               and is_on_aarch64)
 
+    @staticmethod
+    def get_required_workspace_size(num_tokens: int, hidden_dim: int,
+                                    group_size: int, dtype: torch.dtype) -> int:
+        # This should match the heuristic in allreduceOp.cpp
+        is_one_shot = num_tokens * hidden_dim * group_size * dtype.itemsize <= 128 * 1024 * 8
+        if is_one_shot:
+            # For one-shot, each rank needs to store num_tokens * group_size tokens
+            return num_tokens * hidden_dim * group_size * dtype.itemsize
+        else:
+            # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest group_size.
+            return math.ceil(
+                num_tokens / group_size) * hidden_dim * dtype.itemsize
+
     def forward(
         self,
         input: torch.Tensor,
@@ -380,7 +394,9 @@ class MNNVLAllReduce(nn.Module):
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping,
             self.dtype,
-            buffer_size_bytes=num_tokens * hidden_dim * self.dtype.itemsize)
+            buffer_size_bytes=self.get_required_workspace_size(
+                num_tokens, hidden_dim, self.mapping.tp_size, self.dtype),
+        )
 
         # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
         buffer_base = workspace["uc_buffer"].view(self.dtype).view(3, -1)

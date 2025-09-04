@@ -341,7 +341,7 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
 
     auto values = reinterpret_cast<PackedVec<PackedType, T>*>(values_lamport);
     // ======================= Reduction =============================
-    std::array<float, ELTS_PER_THREAD> accum;
+    float accum[ELTS_PER_THREAD];
     PackedVec<PackedType, T> packed_accum;
     PackedVec<PackedType, T> residual_in;
     // Move the residual loading up to here
@@ -895,6 +895,9 @@ void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
         .numAttrs = 1,
     };
 
+    TLLM_LOG_DEBUG("[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128", num_tokens,
+        ar_num_blocks_per_token);
+
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                         \
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&ar_config, &twoshot_allreduce_kernel<WORLD_SIZE, T>, output, input, uc_ptrs,   \
         mcast_ptr, num_tokens, token_dim, params.rank, params.buffer_flags, (!params.rmsnorm_fusion)));
@@ -964,6 +967,13 @@ void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
         int const iters = dim_padded / rn_num_threads;
         assert(rn_loads_per_thread == iters / num_elts_per_thread);
         size_t const shmem_size = 3 * rn_block_size * iters * getDTypeSize(params.dtype);
+
+        TLLM_LOG_DEBUG(
+            "[MNNVL AllReduceTwoShotRMSNorm] Dispatch: grid size: (%d, %d, 1), block_size: %d, cluster_size: %d, "
+            "loads_per_thread: %d, "
+            "threads_needed: %d",
+            num_tokens, rn_cluster_size, rn_block_size, rn_cluster_size, rn_loads_per_thread,
+            divUp(token_dim, num_elts_per_thread));
 
 #define RUN_RMSNORM_KERNEL(T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD)                                                     \
     TLLM_CUDA_CHECK(cudaFuncSetAttribute(&rmsnorm_lamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,                     \
