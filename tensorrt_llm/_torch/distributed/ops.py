@@ -644,7 +644,7 @@ class MoEAllReduce(nn.Module):
 
 
 def moe_a2a_dispatch(token_selected_experts, input_payloads, workspace,
-                     max_tokens_per_rank, ep_rank, ep_size, top_k):
+                     max_tokens_per_rank, ep_rank, ep_size, top_k, num_experts):
     """
     MoE All-to-All Dispatch Operation.
     
@@ -665,6 +665,7 @@ def moe_a2a_dispatch(token_selected_experts, input_payloads, workspace,
         ep_rank: Current expert parallel rank (0 to ep_size-1).
         ep_size: Total expert parallel size.
         top_k: Number of experts selected per token.
+        num_experts: Total number of experts (must be divisible by ep_size).
     
     Returns:
         tuple: (recv_buffers, send_counters, send_indices)
@@ -686,7 +687,7 @@ def moe_a2a_dispatch(token_selected_experts, input_payloads, workspace,
     return torch.ops.trtllm.moe_a2a_dispatch(token_selected_experts,
                                              input_payloads, workspace,
                                              max_tokens_per_rank, ep_rank,
-                                             ep_size, top_k)
+                                             ep_size, top_k, num_experts)
 
 
 def moe_a2a_combine(send_indices, payload, workspace, max_tokens_per_rank,
