@@ -346,3 +346,8 @@ stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-str
 test_e2e.py::test_trtllm_bench_iteration_log[TRT-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B] SKIP (https://nvbugs/5448523)
 cpp/test_unit_tests.py::test_unit_tests[kernels-80] SKIP (https://nvbugs/5504078)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=vanilla-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (https://nvbugs/5504086)
+test_e2e.py::test_llmapi_lora[llama-3.1-model/Llama-3.1-8B-Instruct-lora/evian2-8b-instruct_vhf-lora-v1_jetart-tp1-torch] SKIP (https://nvbugs/5484088)
+test_e2e.py::test_llmapi_lora[llama-3.3-models/Llama-3.3-70B-Instruct-lora/llama-3.3-70b-instruct_vhf-squad-lora-031925331-v2-tp8-torch] SKIP (https://nvbugs/5484088)
+test_e2e.py::test_llmapi_lora[Mixtral-8x7B-v0.1-lora/mixtral-8x7b-instruct-v0-1_vhf-lora-v1-tp8-torch] SKIP (https://nvbugs/5484088)
+test_e2e.py::test_llmapi_lora[Mistral-7B-Instruct-v0.3-lora/mistral-7b-instruct-v0-3_vhf_lora_squad-tp1-torch] SKIP (https://nvbugs/5484088)
+test_e2e.py::test_llmapi_lora[starcoder2-7b-lora/starcoder2-7b_vhf-lora-squad-030325211133-tp1-torch] SKIP (https://nvbugs/5484088)
