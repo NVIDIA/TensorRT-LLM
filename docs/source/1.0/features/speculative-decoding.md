@@ -95,8 +95,6 @@ MTP is currently only supported by Deepseek. MTP can be tuned with the following
 * `relaxed_topk`: The top K tokens are sampled from the target model's logits to create the initial candidate set for relaxed decoding.
 * `relaxed_delta`: Used to further filter the top K candidate set for relaxed decoding. We remove tokens `t` for which `log(P(top 1 token)) - log(P(t)) > relaxed_delta`.
 
-Unlike the other speculation algorithms, MTP supports the overlap scheduler.
-
 ```python
 from tensorrt_llm.llm_api import MTPDecodingConfig
 
