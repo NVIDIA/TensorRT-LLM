@@ -760,8 +760,7 @@ class PyExecutor:
                         logger.warning(
                             "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                         )
-                        self.kv_cache_transceiver.check_context_transfer_status(
-                            1)
+                        self._check_disagg_ctx_cache_transfer_status(1)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -954,7 +953,7 @@ class PyExecutor:
                 logger.warning(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
-                self.kv_cache_transceiver.check_context_transfer_status(1)
+                self._check_disagg_ctx_cache_transfer_status(1)
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -1379,7 +1378,7 @@ class PyExecutor:
 
         if need_check:
             at_least_num = 1 if need_check_one else 0
-            self.kv_cache_transceiver.check_gen_transfer_status(at_least_num)
+            self._check_disagg_gen_cache_transfer_status(at_least_num)
 
         return
 
@@ -1484,8 +1483,7 @@ class PyExecutor:
             req.is_disagg_generation_transmission_in_progress
             for req in self.active_requests
         ])
-        self.kv_cache_transceiver.check_gen_transfer_status(
-            1 if block_transfer else 0)
+        self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
 
         return
 
@@ -1505,7 +1503,7 @@ class PyExecutor:
                         self.resource_manager.resource_managers[
                             resource_mgr_type].free_resources(req)
 
-        self.kv_cache_transceiver.check_context_transfer_status(0)
+        self._check_disagg_ctx_cache_transfer_status(0)
 
         # Keep track of ctx requests that are in transmission
         ctx_transmission_reqs = [
@@ -1514,6 +1512,36 @@ class PyExecutor:
         ]
 
         return ctx_transmission_reqs
+
+    def _check_request_error_state(self):
+        error_requests = []
+        for req in self.active_requests:
+            if req.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                error_requests.append(req)
+
+        return error_requests
+
+    @nvtx_range("_check_disagg_ctx_cache_transfer_status")
+    def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
+        self.kv_cache_transceiver.check_context_transfer_status(atLeastNum)
+
+        # Check if any request is in error state
+        error_requests = self._check_request_error_state()
+        if len(error_requests) > 0:
+            self._handle_errors(
+                f"Error in kv cache transfer for context requests",
+                requests=error_requests)
+
+    @nvtx_range("_check_disagg_gen_cache_transfer_status")
+    def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+        self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+
+        # Check if any request is in error state
+        error_requests = self._check_request_error_state()
+        if len(error_requests) > 0:
+            self._handle_errors(
+                f"Error in kv cache transfer for generation requests",
+                requests=error_requests)
 
     def _forward_step(self,
                       scheduled_requests,
