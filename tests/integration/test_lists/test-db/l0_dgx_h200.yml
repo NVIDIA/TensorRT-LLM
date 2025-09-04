@@ -16,6 +16,7 @@ l0_dgx_h200:
   tests:
   # ------------- PyTorch tests ---------------
   # - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput] # OOM
+  - examples/test_llama.py::test_llama_3_x_with_bf16_lora_torch_8_gpus[llama-3.3-70b-instruct]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[latency] # 1h
   - accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[True]
   - accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[False]
