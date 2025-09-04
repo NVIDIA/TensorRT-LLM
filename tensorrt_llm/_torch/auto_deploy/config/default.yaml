@@ -111,8 +111,8 @@ transforms:
     enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
-  fuse_collectives:
-    stage: post_load_fusion
+  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+  # check if we can fuse rmsnorm
   fuse_rmsnorm:
     # TODO (lucaslie): add backend selection as part of configurable inference optimizers
     # check if we can fuse rmsnorm
