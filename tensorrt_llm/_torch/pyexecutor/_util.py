@@ -9,11 +9,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-from tensorrt_llm.bindings.executor import \
-    CacheTransceiverConfig as _CacheTransceiverConfig
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
-from tensorrt_llm.bindings.executor import PeftCacheConfig as _PeftCacheConfig
-from tensorrt_llm.bindings.executor import SchedulerConfig as _SchedulerConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, SamplerType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -521,9 +517,9 @@ def create_py_executor_instance(
     max_batch_size: Optional[int] = None,
     max_beam_width: Optional[int] = None,
     max_num_tokens: Optional[int] = None,
-    peft_cache_config: Optional[_PeftCacheConfig] = None,
-    scheduler_config: Optional[_SchedulerConfig] = None,
-    cache_transceiver_config: Optional[_CacheTransceiverConfig] = None,
+    peft_cache_config: Optional[trtllm.PeftCacheConfig] = None,
+    scheduler_config: Optional[trtllm.SchedulerConfig] = None,
+    cache_transceiver_config: Optional[trtllm.CacheTransceiverConfig] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -649,7 +645,6 @@ def create_py_executor_instance(
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
-    cache_transceiver_config = cache_transceiver_config
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
     return PyExecutor(

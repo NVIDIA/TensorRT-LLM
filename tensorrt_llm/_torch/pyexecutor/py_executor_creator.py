@@ -226,7 +226,7 @@ def create_py_executor(
     mapping = _get_mapping(executor_config)
 
     dist = MPIDist(mapping=mapping)
-
+    cache_transceiver_config = executor_config.cache_transceiver_config
     spec_config = executor_config.speculative_config
     has_draft_model_engine = False
     has_spec_drafter = False
@@ -524,7 +524,7 @@ def create_py_executor(
             max_num_tokens=executor_config.max_num_tokens,
             peft_cache_config=executor_config.peft_cache_config,
             scheduler_config=executor_config.scheduler_config,
-            cache_transceiver_config=executor_config.cache_transceiver_config,
+            cache_transceiver_config=cache_transceiver_config,
         )
         # Modify the executor_config.peft_cache_config which might be mutated
         # inside create_py_executor_instance
@@ -577,8 +577,7 @@ def create_py_executor(
                 max_num_tokens=executor_config.max_num_tokens,
                 peft_cache_config=executor_config.peft_cache_config,
                 scheduler_config=executor_config.scheduler_config,
-                cache_transceiver_config=executor_config.
-                cache_transceiver_config,
+                cache_transceiver_config=cache_transceiver_config,
             )
 
     _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)
