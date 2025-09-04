@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc2" />
+  <meta name="docsearch:version" content="1.1.0rc3" />
 
 
   </head>
@@ -467,6 +467,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
 </div>
 </nav></div>
     </div>
@@ -551,72 +555,71 @@
 <span class="linenos">26</span>        <span class="n">cuda_graph_config</span><span class="o">=</span><span class="n">cuda_graph_config</span><span class="p">,</span>  <span class="c1"># Enable CUDA graphs</span>
 <span class="linenos">27</span>        <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
 <span class="linenos">28</span>        <span class="n">max_seq_len</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
-<span class="linenos">29</span>        <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
-<span class="linenos">30</span>                                      <span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
-<span class="linenos">31</span>
-<span class="linenos">32</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">33</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos">34</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">35</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos">36</span>    <span class="p">]</span>
-<span class="linenos">37</span>
-<span class="linenos">38</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
-<span class="linenos">39</span>
-<span class="linenos">40</span>    <span class="c1"># This should benefit from CUDA graphs</span>
-<span class="linenos">41</span>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-<span class="linenos">42</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
-<span class="linenos">43</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">44</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">45</span>        <span class="nb">print</span><span class="p">()</span>
+<span class="linenos">29</span>        <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">))</span>
+<span class="linenos">30</span>
+<span class="linenos">31</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">32</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos">33</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">34</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">35</span>    <span class="p">]</span>
+<span class="linenos">36</span>
+<span class="linenos">37</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">38</span>
+<span class="linenos">39</span>    <span class="c1"># This should benefit from CUDA graphs</span>
+<span class="linenos">40</span>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">41</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+<span class="linenos">42</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">43</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">44</span>        <span class="nb">print</span><span class="p">()</span>
+<span class="linenos">45</span>
 <span class="linenos">46</span>
-<span class="linenos">47</span>
-<span class="linenos">48</span><span class="k">def</span><span class="w"> </span><span class="nf">example_kv_cache_config</span><span class="p">():</span>
-<span class="linenos">49</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">=== KV Cache Configuration Example ===&quot;</span><span class="p">)</span>
-<span class="linenos">50</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">1. KV Cache Configuration:&quot;</span><span class="p">)</span>
-<span class="linenos">51</span>
-<span class="linenos">52</span>    <span class="n">llm_advanced</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
-<span class="linenos">53</span>                       <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
-<span class="linenos">54</span>                       <span class="n">max_seq_len</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
-<span class="linenos">55</span>                       <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
-<span class="linenos">56</span>                           <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.85</span><span class="p">,</span>
-<span class="linenos">57</span>                           <span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
-<span class="linenos">58</span>
-<span class="linenos">59</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">60</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos">61</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">62</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos">63</span>    <span class="p">]</span>
-<span class="linenos">64</span>
-<span class="linenos">65</span>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm_advanced</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">)</span>
-<span class="linenos">66</span>    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">output</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">outputs</span><span class="p">):</span>
-<span class="linenos">67</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Query </span><span class="si">{</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">68</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Answer: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">[:</span><span class="mi">100</span><span class="p">]</span><span class="si">}</span><span class="s2">...&quot;</span><span class="p">)</span>
-<span class="linenos">69</span>        <span class="nb">print</span><span class="p">()</span>
+<span class="linenos">47</span><span class="k">def</span><span class="w"> </span><span class="nf">example_kv_cache_config</span><span class="p">():</span>
+<span class="linenos">48</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">=== KV Cache Configuration Example ===&quot;</span><span class="p">)</span>
+<span class="linenos">49</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">1. KV Cache Configuration:&quot;</span><span class="p">)</span>
+<span class="linenos">50</span>
+<span class="linenos">51</span>    <span class="n">llm_advanced</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">52</span>                       <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos">53</span>                       <span class="n">max_seq_len</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos">54</span>                       <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
+<span class="linenos">55</span>                           <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+<span class="linenos">56</span>                           <span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos">57</span>
+<span class="linenos">58</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">59</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos">60</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">61</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">62</span>    <span class="p">]</span>
+<span class="linenos">63</span>
+<span class="linenos">64</span>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm_advanced</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">)</span>
+<span class="linenos">65</span>    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">output</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">outputs</span><span class="p">):</span>
+<span class="linenos">66</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Query </span><span class="si">{</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">67</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Answer: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">[:</span><span class="mi">100</span><span class="p">]</span><span class="si">}</span><span class="s2">...&quot;</span><span class="p">)</span>
+<span class="linenos">68</span>        <span class="nb">print</span><span class="p">()</span>
+<span class="linenos">69</span>
 <span class="linenos">70</span>
-<span class="linenos">71</span>
-<span class="linenos">72</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos">73</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="linenos">74</span><span class="sd">    Main function to run all runtime configuration examples.</span>
-<span class="linenos">75</span><span class="sd">    &quot;&quot;&quot;</span>
-<span class="linenos">76</span>    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">(</span>
-<span class="linenos">77</span>        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Runtime Configuration Examples&quot;</span><span class="p">)</span>
-<span class="linenos">78</span>    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--example&quot;</span><span class="p">,</span>
-<span class="linenos">79</span>                        <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
-<span class="linenos">80</span>                        <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;kv_cache&quot;</span><span class="p">,</span> <span class="s2">&quot;cuda_graph&quot;</span><span class="p">,</span> <span class="s2">&quot;all&quot;</span><span class="p">],</span>
-<span class="linenos">81</span>                        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;all&quot;</span><span class="p">,</span>
-<span class="linenos">82</span>                        <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Which example to run&quot;</span><span class="p">)</span>
-<span class="linenos">83</span>
-<span class="linenos">84</span>    <span class="n">args</span> <span class="o">=</span> <span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
-<span class="linenos">85</span>
-<span class="linenos">86</span>    <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">example</span> <span class="o">==</span> <span class="s2">&quot;kv_cache&quot;</span> <span class="ow">or</span> <span class="n">args</span><span class="o">.</span><span class="n">example</span> <span class="o">==</span> <span class="s2">&quot;all&quot;</span><span class="p">:</span>
-<span class="linenos">87</span>        <span class="n">example_kv_cache_config</span><span class="p">()</span>
-<span class="linenos">88</span>
-<span class="linenos">89</span>    <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">example</span> <span class="o">==</span> <span class="s2">&quot;cuda_graph&quot;</span> <span class="ow">or</span> <span class="n">args</span><span class="o">.</span><span class="n">example</span> <span class="o">==</span> <span class="s2">&quot;all&quot;</span><span class="p">:</span>
-<span class="linenos">90</span>        <span class="n">example_cuda_graph_config</span><span class="p">()</span>
+<span class="linenos">71</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos">72</span><span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="linenos">73</span><span class="sd">    Main function to run all runtime configuration examples.</span>
+<span class="linenos">74</span><span class="sd">    &quot;&quot;&quot;</span>
+<span class="linenos">75</span>    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">(</span>
+<span class="linenos">76</span>        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Runtime Configuration Examples&quot;</span><span class="p">)</span>
+<span class="linenos">77</span>    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--example&quot;</span><span class="p">,</span>
+<span class="linenos">78</span>                        <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
+<span class="linenos">79</span>                        <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;kv_cache&quot;</span><span class="p">,</span> <span class="s2">&quot;cuda_graph&quot;</span><span class="p">,</span> <span class="s2">&quot;all&quot;</span><span class="p">],</span>
+<span class="linenos">80</span>                        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;all&quot;</span><span class="p">,</span>
+<span class="linenos">81</span>                        <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Which example to run&quot;</span><span class="p">)</span>
+<span class="linenos">82</span>
+<span class="linenos">83</span>    <span class="n">args</span> <span class="o">=</span> <span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos">84</span>
+<span class="linenos">85</span>    <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">example</span> <span class="o">==</span> <span class="s2">&quot;kv_cache&quot;</span> <span class="ow">or</span> <span class="n">args</span><span class="o">.</span><span class="n">example</span> <span class="o">==</span> <span class="s2">&quot;all&quot;</span><span class="p">:</span>
+<span class="linenos">86</span>        <span class="n">example_kv_cache_config</span><span class="p">()</span>
+<span class="linenos">87</span>
+<span class="linenos">88</span>    <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">example</span> <span class="o">==</span> <span class="s2">&quot;cuda_graph&quot;</span> <span class="ow">or</span> <span class="n">args</span><span class="o">.</span><span class="n">example</span> <span class="o">==</span> <span class="s2">&quot;all&quot;</span><span class="p">:</span>
+<span class="linenos">89</span>        <span class="n">example_cuda_graph_config</span><span class="p">()</span>
+<span class="linenos">90</span>
 <span class="linenos">91</span>
-<span class="linenos">92</span>
-<span class="linenos">93</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
-<span class="linenos">94</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">92</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+<span class="linenos">93</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -749,9 +752,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 29, 2025.</p>
+  <p>Last updated on September 02, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15ec2b8">15ec2b8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e81c50d">e81c50d</a>.</p>
   
 </div></div>
       

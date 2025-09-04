@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc3';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc2" />
+  <meta name="docsearch:version" content="1.1.0rc3" />
 
 
   </head>
@@ -467,6 +467,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
 </div>
 </nav></div>
     </div>
@@ -520,39 +524,45 @@
   <section id="llm-examples-introduction">
 <h1>LLM Examples Introduction<a class="headerlink" href="#llm-examples-introduction" title="Link to this heading">#</a></h1>
 <p>Here is a simple example to show how to use the LLM with TinyLlama.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 2</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildConfig</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 2</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._tensorrt_engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>  <span class="c1"># NOTE the change</span>
 <span class="linenos"> 3</span>
-<span class="linenos"> 4</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos"> 5</span>
-<span class="linenos"> 6</span>    <span class="c1"># Model could accept HF model name, a path to local HF model,</span>
-<span class="linenos"> 7</span>    <span class="c1"># or TensorRT Model Optimizer&#39;s quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.</span>
-<span class="linenos"> 8</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
-<span class="linenos"> 9</span>
-<span class="linenos">10</span>    <span class="c1"># Sample prompts.</span>
-<span class="linenos">11</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">12</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos">13</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">14</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos">15</span>    <span class="p">]</span>
-<span class="linenos">16</span>
-<span class="linenos">17</span>    <span class="c1"># Create a sampling params.</span>
-<span class="linenos">18</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
-<span class="linenos">19</span>
-<span class="linenos">20</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">):</span>
-<span class="linenos">21</span>        <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">22</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
-<span class="linenos">23</span>        <span class="p">)</span>
-<span class="linenos">24</span>
-<span class="linenos">25</span>    <span class="c1"># Got output like</span>
-<span class="linenos">26</span>    <span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming&#39;</span>
-<span class="linenos">27</span>    <span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the&#39;</span>
-<span class="linenos">28</span>    <span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;Paris.&#39;</span>
-<span class="linenos">29</span>    <span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are&#39;</span>
+<span class="linenos"> 4</span>
+<span class="linenos"> 5</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 6</span>
+<span class="linenos"> 7</span>    <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
+<span class="linenos"> 8</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="mi">256</span>
+<span class="linenos"> 9</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="o">=</span> <span class="mi">1024</span>
+<span class="linenos">10</span>
+<span class="linenos">11</span>    <span class="c1"># Model could accept HF model name, a path to local HF model,</span>
+<span class="linenos">12</span>    <span class="c1"># or TensorRT Model Optimizer&#39;s quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.</span>
+<span class="linenos">13</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">14</span>              <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span><span class="p">)</span>
+<span class="linenos">15</span>
+<span class="linenos">16</span>    <span class="c1"># Sample prompts.</span>
+<span class="linenos">17</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">18</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos">19</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">20</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">21</span>    <span class="p">]</span>
+<span class="linenos">22</span>
+<span class="linenos">23</span>    <span class="c1"># Create a sampling params.</span>
+<span class="linenos">24</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">25</span>
+<span class="linenos">26</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">):</span>
+<span class="linenos">27</span>        <span class="nb">print</span><span class="p">(</span>
+<span class="linenos">28</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">29</span>        <span class="p">)</span>
 <span class="linenos">30</span>
-<span class="linenos">31</span>
-<span class="linenos">32</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">31</span>    <span class="c1"># Got output like</span>
+<span class="linenos">32</span>    <span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming&#39;</span>
+<span class="linenos">33</span>    <span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the&#39;</span>
+<span class="linenos">34</span>    <span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;Paris.&#39;</span>
+<span class="linenos">35</span>    <span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are&#39;</span>
+<span class="linenos">36</span>
+<span class="linenos">37</span>
+<span class="linenos">38</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">39</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 <p>The LLM API can be used for both offline or online usage. See more examples of the LLM API here:</p>
@@ -693,9 +703,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 29, 2025.</p>
+  <p>Last updated on September 02, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15ec2b8">15ec2b8</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e81c50d">e81c50d</a>.</p>
   
 </div></div>
       

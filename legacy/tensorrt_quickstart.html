@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Genai Perf Client For Multimodal &#8212; TensorRT-LLM</title>
+    <title>LLM API with TensorRT Engine &#8212; TensorRT-LLM</title>
   
   
   
@@ -55,7 +55,7 @@
     <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'examples/genai_perf_client_for_multimodal';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'legacy/tensorrt_quickstart';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
@@ -66,8 +66,7 @@
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="OpenAI Chat Client" href="openai_chat_client.html" />
-    <link rel="prev" title="Genai Perf Client" href="genai_perf_client.html" />
+    <link rel="prev" title="Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -339,40 +338,40 @@
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
-<ul class="current nav bd-sidenav">
-<li class="toctree-l1 has-children"><a class="reference internal" href="index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="customization.html">LLM Common Customizations</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate text asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate text in streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_speculative_decoding.html">Speculative Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_kv_cache_connector.html">KV Cache Connector</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_runtime.html">Runtime Configuration Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_sampling.html">Sampling Techniques Showcase</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1 current active has-children"><a class="reference internal" href="trtllm_serve_examples.html">Online Serving Examples</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="curl_chat_client.html">Curl Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
-<li class="toctree-l2"><a class="reference internal" href="curl_completion_client.html">Curl Completion Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Genai Perf Client For Multimodal</a></li>
-<li class="toctree-l2"><a class="reference internal" href="openai_chat_client.html">OpenAI Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
-<li class="toctree-l2"><a class="reference internal" href="openai_completion_client.html">OpenAI Completion Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
-<li class="toctree-l2"><a class="reference internal" href="openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -468,8 +467,8 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">LLM API with TensorRT Engine</a></li>
 </ul>
 </div>
 </nav></div>
@@ -504,10 +503,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    
-    <li class="breadcrumb-item"><a href="trtllm_serve_examples.html" class="nav-link">Online Serving Examples</a></li>
-    
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Genai Perf Client For Multimodal</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">LLM API with TensorRT Engine</span></li>
   </ul>
 </nav>
 </div>
@@ -524,31 +520,10 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="genai-perf-client-for-multimodal">
-<h1>Genai Perf Client For Multimodal<a class="headerlink" href="#genai-perf-client-for-multimodal" title="Link to this heading">#</a></h1>
-<p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html">trtllm-serve documentation</a> for starting a server.</p>
-<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/genai_perf_client_for_multimodal.sh">NVIDIA/TensorRT-LLM</a>.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
-<span class="linenos"> 2</span>
-<span class="linenos"> 3</span>genai-perf<span class="w"> </span>profile<span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 4</span><span class="w">    </span>-m<span class="w"> </span>Qwen2.5-VL-3B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 5</span><span class="w">    </span>--tokenizer<span class="w"> </span>Qwen/Qwen2.5-VL-3B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 6</span><span class="w">    </span>--endpoint-type<span class="w"> </span>multimodal<span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 7</span><span class="w">    </span>--random-seed<span class="w"> </span><span class="m">123</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 8</span><span class="w">    </span>--image-width-mean<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos"> 9</span><span class="w">    </span>--image-height-mean<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">10</span><span class="w">    </span>--image-format<span class="w"> </span>png<span class="w"> </span><span class="se">\</span>
-<span class="linenos">11</span><span class="w">    </span>--synthetic-input-tokens-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">12</span><span class="w">    </span>--synthetic-input-tokens-stddev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">13</span><span class="w">    </span>--output-tokens-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">14</span><span class="w">    </span>--output-tokens-stddev<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">15</span><span class="w">    </span>--request-count<span class="w"> </span><span class="m">5</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">16</span><span class="w">    </span>--request-rate<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="linenos">17</span><span class="w">    </span>--profile-export-file<span class="w"> </span>my_profile_export.json<span class="w"> </span><span class="se">\</span>
-<span class="linenos">18</span><span class="w">    </span>--url<span class="w"> </span>localhost:8000<span class="w"> </span><span class="se">\</span>
-<span class="linenos">19</span><span class="w">    </span>--streaming
-</pre></div>
-</div>
+  <section id="llm-api-with-tensorrt-engine">
+<h1>LLM API with TensorRT Engine<a class="headerlink" href="#llm-api-with-tensorrt-engine" title="Link to this heading">#</a></h1>
+<p>A simple inference example with TinyLlama using the LLM API:</p>
+<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <span class="xref myst">README</span>.</p>
 </section>
 
 
@@ -562,22 +537,13 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="genai_perf_client.html"
+       href="../blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Genai Perf Client</p>
+        <p class="prev-next-title">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</p>
       </div>
-    </a>
-    <a class="right-next"
-       href="openai_chat_client.html"
-       title="next page">
-      <div class="prev-next-info">
-        <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">OpenAI Chat Client</p>
-      </div>
-      <i class="fa-solid fa-angle-right"></i>
     </a>
 </div>
                 </footer>
