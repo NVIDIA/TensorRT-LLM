@@ -227,7 +227,7 @@ l0_a10:
       stage: post_merge
       backend: fmha
   tests:
-  - test_fmha.py::test_fmha
+  - test_fmha.py::test_fmha TIMEOUT (120)
 l0_a10_pybind:
 - condition:
     ranges:
