@@ -518,9 +518,7 @@ class Eagle3OneModelWorker(nn.Module):
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
-        # print(f"DBG : logits.shape: {logits.shape} {logits.dtype} {logits.device} logits stride: {logits.stride()}")
         draft_tokens = torch.argmax(logits, dim=-1) # [num_tokens]
-        # print(f"DBG : draft_tokens.shape: {draft_tokens.shape} {draft_tokens.dtype} {draft_tokens.device} draft_tokens stride: {draft_tokens.stride()}")
 
         # Apply d2t (offsets between draft model dictionary and main model dictionary).
         if (d2t := getattr(draft_model.model, "d2t", None)) is not None:
