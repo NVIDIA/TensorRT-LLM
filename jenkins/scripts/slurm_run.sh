@@ -22,7 +22,7 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     which python3
     python3 --version
     apt-get install -y libffi-dev
-    nvidia-smi
+    nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
     cd $llmSrcNode && pip3 install --retries 1 -r requirements-dev.txt
     cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
     git config --global --add safe.directory "*"

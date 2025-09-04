@@ -7,6 +7,7 @@ set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
     batch_manager/cacheTransceiver.cpp
+    batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
     executor/bindings.cpp
@@ -14,8 +15,9 @@ set(SRCS
     executor/executorConfig.cpp
     executor/request.cpp
     runtime/bindings.cpp
-    testing/modelSpecBinding.cpp
+    runtime/hostfunc.cpp
     runtime/moeBindings.cpp
+    testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
     ../runtime/ipcNvlsMemory.cu

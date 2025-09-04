@@ -220,30 +220,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           extra_acc_spec="temperature=0.8,top_p=0.95")
 
     @skip_pre_hopper
-    def test_fp8_beam_search(self):
-        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-        pytorch_config = dict(disable_overlap_scheduler=True)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-        max_beam_width = 4
-        sampling_params = SamplingParams(n=max_beam_width,
-                                         best_of=max_beam_width,
-                                         use_beam_search=True)
-
-        llm = LLM(model=model_path,
-                  **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  max_beam_width=max_beam_width,
-                  max_batch_size=16,
-                  max_seq_len=1024,
-                  build_config=None)
-
-        with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_acc_spec="beam_width=4")
-
-    @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("eagle3_one_model", [True, False])
     def test_eagle3(self, overlap_scheduler, eagle3_one_model):
@@ -306,6 +282,31 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids("attn_backend", ["TRTLLM"])
+    def test_nvfp4_kv(self, attn_backend, torch_compile):
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
+        pytorch_config = dict(
+            torch_compile_config=torch_compile_config,
+            cuda_graph_config=CudaGraphConfig(enable_padding=torch_compile,
+                                              batch_sizes=[4]),
+            attn_backend=attn_backend,
+            disable_overlap_scheduler=torch_compile,
+        )
+        pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="nvfp4")
+        with LLM(f"{llm_models_root()}/Llama-3_1-8B-Instruct_nvfp4_fp8_hf",
+                 **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
@@ -327,8 +328,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
+    @parametrize_with_ids("eagle3_one_model", [True, False])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding_with_eagle3(self, backend: str, mocker):
+    def test_guided_decoding_with_eagle3(self, backend: str,
+                                         eagle3_one_model: bool, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
@@ -336,14 +339,16 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             max_draft_len=3,
             speculative_model_dir=
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            eagle3_one_model=False)
-        llm = LLM(self.MODEL_PATH,
-                  guided_decoding_backend=backend,
-                  kv_cache_config=kv_cache_config,
-                  cuda_graph_config=cuda_graph_config,
-                  enable_chunked_prefill=True,
-                  speculative_config=spec_config,
-                  disable_overlap_scheduler=True)
+            eagle3_one_model=eagle3_one_model)
+        llm = LLM(
+            self.MODEL_PATH,
+            guided_decoding_backend=backend,
+            kv_cache_config=kv_cache_config,
+            cuda_graph_config=cuda_graph_config,
+            enable_chunked_prefill=True,
+            speculative_config=spec_config,
+            # Two-model eagle3 does not support overlap scheduler
+            disable_overlap_scheduler=not eagle3_one_model)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
@@ -383,6 +388,93 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  max_batch_size=64) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @parametrize_with_ids("disable_overlap_scheduler", [False, True])
+    @parametrize_with_ids(
+        "enable_cuda_graph,enable_padding",
+        [
+            (False, False),  # No CUDA Graph (padding irrelevant)
+            (True, False),  # CUDA Graph without padding
+            (True, True),  # CUDA Graph with padding
+        ])
+    def test_auto_dtype_beam_search(self, enable_cuda_graph, enable_padding,
+                                    disable_overlap_scheduler):
+        max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
+
+        if enable_cuda_graph:
+            # enable_padding only matters when CUDA Graph is enabled
+            if enable_padding:
+                batch_sizes = [
+                    1, 8
+                ]  # Need batch_size != max_batch_size to enable padding
+            else:
+                batch_sizes = [1, 2, 4, 8]
+            cuda_graph_config = CudaGraphConfig(batch_sizes=batch_sizes,
+                                                enable_padding=enable_padding)
+        else:
+            cuda_graph_config = None
+
+        with LLM(
+                model=self.MODEL_PATH,
+                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
+                max_batch_size=max_beam_width,
+                max_seq_len=2048,
+                max_beam_width=max_beam_width,
+                disable_overlap_scheduler=disable_overlap_scheduler,
+                cuda_graph_config=cuda_graph_config,
+        ) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="beam_width=2")
+
+    @skip_pre_hopper
+    @parametrize_with_ids("disable_overlap_scheduler", [False, True])
+    @parametrize_with_ids(
+        "enable_cuda_graph,enable_padding",
+        [
+            (False, False),  # No CUDA Graph (padding irrelevant)
+            (True, False),  # CUDA Graph without padding
+            (True, True),  # CUDA Graph with padding
+        ])
+    def test_fp8_beam_search(self, enable_cuda_graph, enable_padding,
+                             disable_overlap_scheduler):
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
+        if enable_cuda_graph:
+            # enable_padding only matters when CUDA Graph is enabled
+            if enable_padding:
+                batch_sizes = [
+                    1, 8
+                ]  # Need batch_size != max_batch_size to enable padding
+            else:
+                batch_sizes = [1, 2, 4, 8]
+            cuda_graph_config = CudaGraphConfig(batch_sizes=batch_sizes,
+                                                enable_padding=enable_padding)
+        else:
+            cuda_graph_config = None
+
+        llm = LLM(
+            model=model_path,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5),
+            max_batch_size=max_beam_width,
+            max_seq_len=2048,
+            max_beam_width=max_beam_width,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            cuda_graph_config=cuda_graph_config,
+        )
+
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="beam_width=2")
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
@@ -480,24 +572,26 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3_tp8(self, eagle3_one_model):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
+    def test_fp8_eagle3_tp8(self, eagle3_one_model):
+        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         spec_config = EagleDecodingConfig(max_draft_len=4,
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
-        pytorch_config = dict(disable_overlap_scheduler=True, )
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1))
         with LLM(model_path,
+                 max_batch_size=16,
                  tensor_parallel_size=8,
                  speculative_config=spec_config,
                  kv_cache_config=kv_cache_config,
                  **pytorch_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -823,8 +917,24 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_fp8(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        model_path = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503-fp8"
+        with LLM(model_path, kv_cache_config=kv_cache_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -1645,6 +1755,50 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  speculative_config=mtp_config)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding_4gpus(self, backend: str, mtp_nextn: int, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=4,
+                  moe_expert_parallel_size=4,
+                  enable_attention_dp=True,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  speculative_config=mtp_config)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 @pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
@@ -1712,10 +1866,21 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          16,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         True,
+                         True,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
         ],
         ids=[
             "latency", "latency_trtllmgen", "throughput", "throughput_tp8",
-            "throughput_tp4"
+            "throughput_tp4", "throughput_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
@@ -1759,8 +1924,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
         [(8, 1, 4, 3, False, False, True, True, 1),
-         (8, 1, 8, 0, True, True, True, True, 24)],
-        ids=["latency", "throughput"])
+         (8, 1, 8, 0, True, True, True, True, 24),
+         (8, 1, 8, 1, True, True, True, True, 24)],
+        ids=["latency", "throughput", "throughput_mtp"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size):
@@ -2673,6 +2839,25 @@ class TestBielik11BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestPhi4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "microsoft/phi-4"
+
+    def test_auto_dtype(self):
+        with LLM(f"{llm_models_root()}/Phi-4") as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        with LLM(f"{llm_models_root()}/Phi-4-FP8") as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestPhi4MM(LlmapiAccuracyTestHarness):
     # phi4-mm can also support text input.
     MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
@@ -2704,8 +2889,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     extra_evaluator_kwargs = {
         "fewshot_as_multiturn": True,
         "apply_chat_template": True,
-        "scores_filter": "exact_match,flexible-extract",
-        "MAX_OUTPUT_LEN": 8192
     }
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
@@ -2719,7 +2902,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler, mocker):
-        pytest.skip("https://nvbugs/5481087")
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
         if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
             pytest.skip("Triton kernels are not available")
 
@@ -2737,7 +2922,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
-            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
@@ -2757,7 +2941,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["tp4", "ep4", "dp4"])
     def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
                       attention_dp, cuda_graph, overlap_scheduler, mocker):
-        pytest.skip("https://nvbugs/5481087")
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
@@ -2778,7 +2964,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with llm:
             model_name = "GPT-OSS/MXFP4"
             task = GSM8K(model_name)
-            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
@@ -2790,6 +2975,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["dp4"])
     def test_w4a16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, monkeypatch, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
         if not IS_TRITON_KERNELS_AVAILABLE:
             pytest.skip("Triton kernels are not available")
         monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
@@ -2809,7 +2997,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with llm:
             model_name = "GPT-OSS/BF16"
             task = GSM8K(model_name)
-            mocker.patch.object(GSM8K, {"MAX_OUTPUT_LEN": 8192})
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
@@ -2847,3 +3034,23 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
                  kv_cache_config=self.kv_cache_config) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestQwQ_32B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/QwQ-32B"
+    MODEL_PATH = f"{llm_models_root()}/QwQ-32B"
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_tp4(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=16384,
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=4,
+                 max_batch_size=8) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
