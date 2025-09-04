@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -320,8 +321,11 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
     // The payload layout matches exactly what was received: [ep_size, max_tokens_per_rank, elements_per_token]
     // We simply copy it to our workspace section.
 
+    // TODO: Copy and sync here should be removed.
     // Copy the entire payload to workspace using PyTorch tensor operations
     recvBuffer.copy_(payload, /*non_blocking=*/true);
+    cudaDeviceSynchronize();
+    tensorrt_llm::mpi::MpiComm::world().barrier();
 
     torch::Tensor localTokenCounter = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32));
 
