@@ -56,6 +56,7 @@ add_library(
   fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
+  fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
