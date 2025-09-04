@@ -57,7 +57,8 @@ class HarmonyStreamState:
             # Normal case: filter based on available tools
             self.should_filter_tools = True
             self.available_tools = {
-                tool.get("function", {}).get("name", "")
+                tool.get("function", {}).get("name", "") if tool.get(
+                    "name", None) is None else tool.get("name")
                 for tool in available_tools
             }
             self.available_tools.discard("")
@@ -77,6 +78,9 @@ class HarmonyStreamState:
         self.sent_tool_arguments = {}  # tool_call_id -> sent_arguments_length
 
         logger.debug("Created HarmonyStreamState for request %s", request_id)
+
+    def get_parser(self) -> StreamableParser:
+        return self.parser
 
     def process_token_batch(self, tokens: list[int]) -> list[dict[str, Any]]:
         """
@@ -124,6 +128,42 @@ class HarmonyStreamState:
                     deltas.append(delta)
 
         return deltas
+
+    def process_token_batch_to_messages(self,
+                                        tokens: list[int]) -> list[Message]:
+        """
+        Process a batch of tokens while maintaining parsing state.
+        Returns OpenAI Messages for Responses API
+        """
+        self.tokens_processed += len(tokens)
+
+        for token in tokens:
+            # Store previous state for transition detection
+            prev_channel = self.parser.current_channel
+            prev_recipient = self.parser.current_recipient
+
+            # Process the token
+            self.parser.process(token)
+
+            # Detect channel/recipient transitions AFTER processing each token
+            channel_changed = prev_channel != self.parser.current_channel
+            recipient_changed = prev_recipient != self.parser.current_recipient
+
+            if channel_changed or recipient_changed:
+                # Mark any active tool calls as completed if we're leaving a tool call
+                if prev_channel == "commentary" and prev_recipient and "functions." in str(
+                        prev_recipient):
+                    func_name = str(prev_recipient).split("functions.")[-1]
+                    for tool_id, tool_info in self.tool_calls.items():
+                        if tool_info["name"] == func_name and tool_info.get(
+                                "active", True):
+                            tool_info["active"] = False
+
+                # Reset channel state for new channel
+                self.channel_started = False
+                self.current_channel_state = None
+
+        return self.parser.messages
 
     def _create_closing_token_delta(self) -> dict[str, Any] | None:
         """Create closing token delta for channel transition."""
@@ -316,6 +356,9 @@ class HarmonyAdapter:
             "<|refusal|>": 200013,
             "<|constrain|>": 200009,
         }
+
+    def get_stream_state(self, request_id: str) -> HarmonyStreamState | None:
+        return self._stream_states.get(request_id, None)
 
     def get_stop_tokens(self) -> list[int]:
         """
@@ -1212,6 +1255,42 @@ class HarmonyAdapter:
             logger.debug("Problematic streaming tokens: %s", tokens)
 
             # Return empty deltas to continue processing
+            return []
+
+    def stateful_stream_harmony_tokens_to_openai_messages(
+            self,
+            request_id: str,
+            tokens: list[int],
+            available_tools: list[dict[str, Any]] | None = None,
+            tool_choice: str | None = None) -> list[Message]:
+        """
+        Process tokens using stateful parsing.
+
+        This method maintains persistent state across multiple calls for the same request,
+        ensuring proper channel transitions and tool call handling.
+
+        Args:
+            request_id: Request ID to maintain state per request
+            tokens: New tokens from this iteration
+            available_tools: Available tools for filtering
+
+        Returns:
+            List of OpenAI Messages
+        """
+        stream_state = self._stream_states.get(request_id, None)
+        if stream_state is None:
+            stream_state = self.create_stream_state(request_id, available_tools,
+                                                    tool_choice)
+
+        try:
+            messages = stream_state.process_token_batch_to_messages(tokens)
+            return messages
+        except (HarmonyError, UnicodeDecodeError, ValueError):
+            logger.error(
+                f"Streaming: Failed to process token batch of {len(tokens)} tokens for request {request_id}",
+            )
+            logger.debug(f"Problematic streaming tokens: {tokens}")
+
             return []
 
     def create_openai_streaming_response(
