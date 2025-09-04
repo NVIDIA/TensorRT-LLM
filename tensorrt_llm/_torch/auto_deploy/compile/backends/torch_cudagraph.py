@@ -163,15 +163,22 @@ class TorchCudagraphCompiler(BackendCompiler):
         super().__init__(*args, **kwargs)
         requested = self.compiler_kwargs.get("cuda_graph_batch_sizes")
         if not requested:
-            requested = self._get_graph_batch_sizes(self.max_batch_size)
-        # clamp, dedupe, sort desc, ensure at least {1, max_bs}
-        effective = {min(max(1, int(b)), int(self.max_batch_size)) for b in requested}
-        effective.update({int(self.max_batch_size)})
-        self.cuda_graph_batch_sizes = sorted(effective, reverse=True)
-        ad_logger.info(
-            f"Configured cuda_graph_batch_sizes requested={requested} -> effective={self.cuda_graph_batch_sizes} "
-            f"(max_batch_size={self.max_batch_size})"
-        )
+            # Use heuristic which includes commonly-used sizes like 1 and max_bs
+            self.cuda_graph_batch_sizes = self._get_graph_batch_sizes(self.max_batch_size)
+            ad_logger.info(f"Using heuristic cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}")
+        else:
+            # Sanitize user-provided sizes: clamp to [1, max_batch_size], dedupe, sort desc
+            effective = {
+                min(max(1, int(b)), int(self.max_batch_size))
+                for b in requested
+                if isinstance(b, (int, float)) and b > 0
+            }
+            self.cuda_graph_batch_sizes = sorted(effective, reverse=True)
+            ad_logger.info(
+                f"Using explicit cuda_graph_batch_sizes: requested={requested}"
+                f" -> effective={self.cuda_graph_batch_sizes}"
+                f" (clamped to [1, {self.max_batch_size}])"
+            )
 
     def _init_captured_graph(
         self, gm: nn.Module, in_spec: TreeSpec, out_spec: TreeSpec
