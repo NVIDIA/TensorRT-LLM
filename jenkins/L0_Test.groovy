@@ -1200,6 +1200,9 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     } else {
         makoArgs += ["auto_trigger=others"]
     }
+    if (stageName.contains("-Ray-")) {
+        makoArgs += ["orchestrator=ray"]
+    }
 
     if (parseSysinfo) {
         def taskConfig = parseMultiNodeTaskConfigFromStageName(stageName)
@@ -1961,6 +1964,7 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
+        "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
