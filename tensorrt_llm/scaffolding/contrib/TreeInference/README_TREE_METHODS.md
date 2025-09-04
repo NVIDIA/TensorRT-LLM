@@ -149,19 +149,19 @@ llm.shutdown(shutdown_workers=True)
 
 ## Examples
 
-- `TensorRT-LLM/tensorrt_llm/scaffolding/contrib/TreeInference/run_mcts_example.py`
-- `TensorRT-LLM/tensorrt_llm/scaffolding/contrib/TreeInference/run_tot_example.py`
+- `TensorRT-LLM/examples/scaffolding/contrib/TreeInference/run_mcts_example.py`
+- `TensorRT-LLM/examples/scaffolding/contrib/TreeInference/run_tot_example.py`
 
 Basic usage (PyTorch backend):
 ```bash
-python TensorRT-LLM/tensorrt_llm/scaffolding/contrib/TreeInference/run_mcts_example.py \
+python TensorRT-LLM/examples/scaffolding/contrib/TreeInference/run_mcts_example.py \
   --model_dir <generation_model> \
   --reward_model_dir <reward_model> \
   [--gen_kv_cache_free_gpu_memory_fraction 0.1] \
   [--reward_kv_cache_free_gpu_memory_fraction 0.2] \
   [--reward_overlap_scheduler]
 
-python TensorRT-LLM/tensorrt_llm/scaffolding/contrib/TreeInference/run_tot_example.py \
+python TensorRT-LLM/examples/scaffolding/contrib/TreeInference/run_tot_example.py \
   --model_dir <generation_model> \
   [--gen_kv_cache_free_gpu_memory_fraction 0.1] \
   [--reward_kv_cache_free_gpu_memory_fraction 0.2] \
