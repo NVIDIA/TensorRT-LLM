@@ -373,6 +373,20 @@ class TorchStore:
         """Shape: See cpp DecoderState.getAllNewTokens()"""
         self.finish_reasons = int_tensor(self.new_tokens.shape)
 
+        # Helper tensors for finish_reasons:
+        self._finish_reasons_nonzero_static_buffer = torch.empty(
+            (self.max_tokens * max_num_sequences, 2),
+            device='cuda',
+            dtype=torch.int64)
+        """Preallocate buffer needed for torch.nonzero_static(..., out=finish_reasons_nonzero_static_buffer), see `def _write_reason`"""
+        self._reason_tensors = {
+            reason:
+            torch.tensor(reason.value,
+                         dtype=self.finish_reasons.dtype,
+                         device="cuda")
+            for reason in FinishReason
+        }
+
 
 @dataclass(kw_only=True)
 class SampleStateTensorsHostTorch(SampleStateTensors):
@@ -692,12 +706,35 @@ class TorchSampler(Sampler):
                                     and len(r.py_stop_words_list[0]) > 0)
         ]
 
-    @staticmethod
-    def _write_reason(finish_reasons: torch.Tensor, reason: FinishReason, *,
-                      where: torch.Tensor, seq_slots: torch.Tensor) -> None:
-        assert all([seq_slots.is_cuda, where.is_cuda])
-        r, c = torch.nonzero(where, as_tuple=True)
-        finish_reasons[r, seq_slots[c], BEAM_0] = reason.value
+    def _write_reason(self, finish_reasons: torch.Tensor, reason: FinishReason,
+                      *, where: torch.Tensor, seq_slots: torch.Tensor) -> None:
+        """Avoid GPU<->CPU syncs via:
+        ### `nonzero_static` [REF-A], see: https://ianbarber.blog/2024/12/18/nonzero_static-in-pytorch/.
+        - `nonzero` syncs (frontend needs result size).
+        - `nonzero_static` pads with dummy entries (`fill_value`), written into a prealloc buffer (max_num_sequences, 2).
+        - Need to drop padding, but `buffer[buffer!=fill_value]`, `buffer[:count_nonzero]`, `buffer[:sum]` all sync.
+
+        ### Hack:
+        1. Use `fill_value=0`, so padding is `[..., [0,0], [0,0]]`.
+        2. Write blindly to `finish_reasons` [REF-B]. Only `[seq_slot[0],0]` might have wrong values written to it, because of the padding entries.
+        3. Save `[seq_slot[0],0]` in `before_write` [REF-C], restore if `where[0][0]` is `False` [REF-D].
+        """
+        assert seq_slots.is_cuda and where.is_cuda
+        assert seq_slots.shape[0] == where.shape[1]
+        first_slot = seq_slots[0].unsqueeze(0)
+        before_write = finish_reasons[0][:].index_select(
+            0, first_slot).squeeze()  # REF-C
+        reason_tensor = self.store._reason_tensors[reason]
+        buffer = self.store._finish_reasons_nonzero_static_buffer
+        size = buffer.shape[0]
+        torch.nonzero_static(where, size=size, fill_value=0,
+                             out=buffer)  # REF-A
+        r, c = buffer[:, 0], buffer[:, 1]
+        finish_reasons[r, seq_slots[c], BEAM_0] = reason_tensor  # REF-B
+
+        correct = torch.where(~where[0, 0], before_write, reason_tensor).view(1)
+        assert correct.is_cuda
+        finish_reasons[0, first_slot, BEAM_0] = correct  # REF-D
 
     def _write_finish_reasons(self, requests: list[LlmRequest], *,
                               finish_reasons: torch.Tensor,
