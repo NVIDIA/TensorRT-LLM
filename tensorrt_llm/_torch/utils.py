@@ -80,7 +80,8 @@ def make_weak_ref(x):
 
     if isinstance(x, torch.Tensor):
         return convert_to_torch_tensor(
-            TensorWrapper(x.data_ptr(), x.dtype, x.shape)) if x.is_cuda else x
+            TensorWrapper(x.data_ptr(), x.dtype, x.shape,
+                          x.stride())) if x.is_cuda else x
     elif isinstance(x, tuple):
         return tuple(make_weak_ref(i) for i in x)
     elif isinstance(x, list):

@@ -1,4 +1,5 @@
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_multi_nodes[DeepSeek-V3]
+test_e2e.py::test_ptp_quickstart_advanced_deepseek_multi_nodes[DeepSeek-V3-0324]
 test_e2e.py::test_openai_multinodes_chat_tp16pp1
 test_e2e.py::test_multi_nodes_eval[llama-3.3-models/Llama-3.3-70B-Instruct-tp16-mmlu]
 test_e2e.py::test_multi_nodes_eval[llama4-models/Llama-4-Maverick-17B-128E-Instruct-tp8pp2-mmlu]
