@@ -12,6 +12,7 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
@@ -132,8 +133,12 @@ class BaseLLM:
             if backend == "pytorch":
                 logger.info("Using LLM with PyTorch backend")
                 llm_args_cls = TorchLlmArgs
-                if self._orchestrator_type == "ray":
+                if self._orchestrator_type == "ray" or mpi_disabled():
+                    self._orchestrator_type = "ray"
                     os.environ["TLLM_DISABLE_MPI"] = "1"
+                    # Propagate to args construction
+                    kwargs["orchestrator_type"] = "ray"
+
             elif backend == '_autodeploy':
                 logger.info("Using LLM with AutoDeploy backend")
                 from .._torch.auto_deploy.llm_args import \
