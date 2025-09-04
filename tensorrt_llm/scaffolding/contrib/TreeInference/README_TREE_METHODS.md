@@ -9,6 +9,15 @@ Tree-based methods explore multiple reasoning paths before producing a final ans
 
 Both integrate with Scaffolding `Controller`/`Worker` and optionally use a reward model (PRM).
 
+## Attribution and design notes
+
+- The `TOTController` is inspired by Tree-of-Thoughts (Yao et al., 2023). It follows the core idea (multi-thought expansion, scoring via value/PRM or self-eval, and tree-based selection).
+- Key implementation differences:
+  - Uses a configurable `branch_factor` per level rather than a single global beam width.
+  - Supports an optional reward controller (PRM) for scoring; can be disabled to use simpler heuristics.
+  - Provides multiple selection strategies (`best`, `vote`, `random`) with a simple best-path finalization by default, instead of strictly enforcing the paper’s BFS/DFS + majority vote variants.
+  - Other engineering choices reflect integration with this repository’s `Controller`/`Worker` scaffolding.
+
 ## Controllers
 
 - `MCTSController`
@@ -140,19 +149,19 @@ llm.shutdown(shutdown_workers=True)
 
 ## Examples
 
-- `examples/scaffolding/run_mcts_example.py`
-- `examples/scaffolding/run_tot_example.py`
+- `TensorRT-LLM/tensorrt_llm/scaffolding/contrib/TreeInference/run_mcts_example.py`
+- `TensorRT-LLM/tensorrt_llm/scaffolding/contrib/TreeInference/run_tot_example.py`
 
 Basic usage (PyTorch backend):
 ```bash
-python examples/scaffolding/run_mcts_example.py \
+python TensorRT-LLM/tensorrt_llm/scaffolding/contrib/TreeInference/run_mcts_example.py \
   --model_dir <generation_model> \
   --reward_model_dir <reward_model> \
   [--gen_kv_cache_free_gpu_memory_fraction 0.1] \
   [--reward_kv_cache_free_gpu_memory_fraction 0.2] \
   [--reward_overlap_scheduler]
 
-python examples/scaffolding/run_tot_example.py \
+python TensorRT-LLM/tensorrt_llm/scaffolding/contrib/TreeInference/run_tot_example.py \
   --model_dir <generation_model> \
   [--gen_kv_cache_free_gpu_memory_fraction 0.1] \
   [--reward_kv_cache_free_gpu_memory_fraction 0.2] \
@@ -171,4 +180,3 @@ Notes:
 
 - Yao et al., Tree of Thoughts (2023)
 - Browne et al., Survey of MCTS (2012)
-- Silver et al., AlphaGo (2016) 
