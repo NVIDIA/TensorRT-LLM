@@ -50,7 +50,11 @@ class PyTorchConfig:
     attention_dp_time_out_iters: int = 50
     attention_dp_batching_wait_iters: int = 10
 
+    max_num_tokens: int = 8192
+
     batch_wait_timeout_ms: float = 0
+    batch_wait_timeout_iters: int = 0
+    batch_wait_max_tokens_ratio: float = 0
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'

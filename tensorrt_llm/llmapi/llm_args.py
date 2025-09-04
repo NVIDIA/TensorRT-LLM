@@ -2255,6 +2255,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs.",
         status="prototype")
 
+    batch_wait_timeout_iters: int = Field(
+        default=0,
+        description=
+        "Maximum number of iterations the scheduler will wait to accumulate new coming requests for improved GPU utilization efficiency. If greater than 0, the scheduler will delay batch processing to gather more requests up to the specified iteration limit. If 0, disables timeout-iters-based batching delays.",
+        status="prototype")
+
+    batch_wait_max_tokens_ratio: float = Field(
+        default=0,
+        description=
+        "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes.If 0 disables token-based batching delays.",
+        status="prototype")
+
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
 
@@ -2528,6 +2540,22 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError("batch_wait_timeout_ms must be greater than 0")
         return self
 
+    @model_validator(mode='after')
+    def validate_batch_wait_timeout_iters(self) -> 'TorchLlmArgs':
+        if self.batch_wait_timeout_iters < 0:
+            raise ValueError(
+                f"batch_wait_timeout_iters must be >= 0, got {self.batch_wait_timeout_iters}"
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_batch_wait_max_tokens_ratio(self) -> 'TorchLlmArgs':
+        if self.batch_wait_max_tokens_ratio < 0 or self.batch_wait_max_tokens_ratio > 1:
+            raise ValueError(
+                f"batch_wait_max_tokens_ratio must be in range [0, 1], got {self.batch_wait_max_tokens_ratio}"
+            )
+        return self
+
     def get_executor_config(
         self,
         _hf_model_dir: Optional[Path] = None,
@@ -2603,7 +2631,10 @@ class TorchLlmArgs(BaseLlmArgs):
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
             AttentionDpConfig.model_fields['batching_wait_iters'].default,
-            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            batch_wait_timeout_iters=self.batch_wait_timeout_iters,
+            batch_wait_max_tokens_ratio=self.batch_wait_max_tokens_ratio,
+        )
 
 
 def update_llm_args_with_extra_dict(
