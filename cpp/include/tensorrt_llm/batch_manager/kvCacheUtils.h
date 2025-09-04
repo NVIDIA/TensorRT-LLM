@@ -49,7 +49,7 @@ public:
     }
 
     static BlockRange fromReuseTree(
-        BaseKVCacheManager const& cacheManager, BlockKey const& lastBlockKey, SizeType32 indexFromEnd)
+        BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, SizeType32 indexFromEnd)
     {
         auto const windowSize = firstWindowSize(cacheManager);
         // Find the last block in the reuse tree for the provided full sequence of block keys
@@ -62,7 +62,7 @@ public:
         blockIds.reserve(numBlocksToCollect);
         for (SizeType32 i = 0; i < numBlocksToCollect; ++i)
         {
-            blockIds.emplace_back(lastBlock->getBlockId());
+            blockIds.push_back(lastBlock->getBlockId());
             if (i + 1 < numBlocksToCollect)
             {
                 lastBlock = lastBlock->getPrevBlock();
@@ -102,19 +102,6 @@ public:
     void setBlockIds(std::vector<SizeType32> blockIds)
     {
         mBlockIds = std::move(blockIds);
-    }
-
-    [[nodiscard]] std::vector<size_t> getBlockHashes() const
-    {
-        TLLM_CHECK(mManager);
-        std::vector<size_t> blockHashes;
-        blockHashes.reserve(mBlockIds.size());
-        auto& blockManager = mManager->getBlockManager();
-        for (auto id : mBlockIds)
-        {
-            blockHashes.emplace_back(blockManager.getBlockById(id, mWindowSize)->getHash());
-        }
-        return blockHashes;
     }
 
     void updatePoolIdx(SizeType32 poolIdx)

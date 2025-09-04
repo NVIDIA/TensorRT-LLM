@@ -233,11 +233,6 @@ public:
         auto& session = it->second;
         session.setLlmRequest(llmRequest);
         mFormatter->format(session);
-        if (mFormatter->getCacheManager()->getBlockManager().getNumPools() == 1
-            && llmRequest.getLlmRequestType() == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY)
-        {
-            auto& blockKey = session.getLastBlockKey();
-        }
     }
 
     ~Impl()
@@ -256,7 +251,6 @@ private:
             std::unique_lock lkResp(mSenderMutex);
             auto requestIt = mReadyRequests.find(id);
             auto promiseIt = mReadyPromises.find(id);
-
             if (requestIt != mReadyRequests.end() && promiseIt != mReadyPromises.end())
             {
                 request = requestIt->second;
@@ -280,7 +274,9 @@ private:
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
+            auto stackTrace = getCurrentStackTrace();
+            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s\nStack trace:\n%s request id: %ld", e.what(),
+                stackTrace.c_str(), id);
             promise.set_exception(std::current_exception());
         }
     }

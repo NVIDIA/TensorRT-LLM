@@ -1777,27 +1777,34 @@ class PyExecutor:
                 if request.is_disagg_context_transmission_state:
                     if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
                         requests_to_terminate.append(request)
-                        self.ctx_in_transmission_requests.append(request)
-                    else:
-                        self.ctx_in_transmission_requests.append(request)
+                    self.ctx_in_transmission_requests.append(
+                        (request,
+                         self.kv_cache_manager.get_last_block_id(
+                             request.py_request_id)))
                 else:
                     requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
-        self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
+        self._enqueue_responses(new_responses)
         return requests_to_terminate
 
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
-        for request in self.ctx_in_transmission_requests[:]:
+        for request, block_id in self.ctx_in_transmission_requests[:]:
             if request.is_disagg_context_complete_state:
                 if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
                     self._terminate_request(request)
-                self.ctx_in_transmission_requests.remove(request)
+                else:
+                    print("Unpinning blocks for request ",
+                          request.py_request_id,
+                          block_id,
+                          flush=True)
+                    self.kv_cache_manager.unpin_blocks_by_id(block_id)
+                self.ctx_in_transmission_requests.remove((request, block_id))
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.

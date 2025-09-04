@@ -116,7 +116,10 @@ void MLACacheFormatter::format(TransferSession& session)
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
     for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
-        blockRange.updatePoolIdx(poolIdx);
+        if (numPools > 1)
+        {
+            blockRange.updatePoolIdx(poolIdx);
+        }
         for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
         {
             blockNum++;

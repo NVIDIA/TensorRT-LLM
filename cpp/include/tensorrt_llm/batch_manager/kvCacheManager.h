@@ -779,10 +779,10 @@ public:
     }
 
     [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey) const;
+        BlockKey const& blockKey);
 
-    //! \brief Unpin blocks along the reuse path ending at last blockKey by decrementing their refcounts.
-    void unpinBlocks(BlockKey const& lastBlockKey);
+    //! \brief Unpin blocks by starting from a block id and walking prev pointers.
+    void unpinBlocksById(KVCacheBlock::IdType blockId);
 
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -882,6 +882,9 @@ private:
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
+
+    // Mutex for the cached blocks root
+    std::mutex mCachedBlocksRootMutex;
 };
 
 class BlockManager
@@ -942,7 +945,7 @@ public:
     /// @param sequence The generation request whose blocks should be pinned.
     void pinBlocks(GenerationRequest& sequence);
 
-    void unpinBlocks(BlockKey const& blockKey);
+    void unpinBlocksById(KVCacheBlock::IdType blockId);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -996,6 +999,15 @@ public:
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumAllocTotalBlocks(); });
+    }
+
+    [[nodiscard]] SizeType32 getFirstWindowSize() const
+    {
+        if (mWindowBlockManagers.empty())
+        {
+            return 0;
+        }
+        return mWindowBlockManagers.begin()->first;
     }
 
     [[nodiscard]] SizeType32 getNumAllocNewBlocks() const
@@ -1129,7 +1141,7 @@ public:
     }
 
     [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize) const
+        BlockKey const& blockKey, SizeType32 windowSize)
     {
         return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
     }
@@ -1353,6 +1365,10 @@ public:
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
         = 0;
 
+    /// @brief Get the last block id (beam 0) for a given sequence and window size
+    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const
+        = 0;
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
@@ -1423,8 +1439,10 @@ public:
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
 
     [[nodiscard]] virtual std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize) const
+        BlockKey const& blockKey, SizeType32 windowSize)
         = 0;
+
+    virtual void unpinBlocksById(KVCacheBlock::IdType blockId) = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -1681,7 +1699,9 @@ public:
 
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
-    void unpinBlocks(BlockKey const& blockKey);
+    void unpinBlocksById(KVCacheBlock::IdType blockId) override;
+
+    std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 
     /// @brief Calculates the number of kv-cache blocks that a sequence will require, for a single beam.
     ///
@@ -1722,7 +1742,7 @@ public:
     }
 
     std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize) const override
+        BlockKey const& blockKey, SizeType32 windowSize) override
     {
         return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
     }
