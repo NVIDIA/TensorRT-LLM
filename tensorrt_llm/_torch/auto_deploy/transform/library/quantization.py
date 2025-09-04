@@ -195,7 +195,7 @@ class LinearQuantizationFromConfig(BaseTransform):
         impl = QuantizationImpl.create(quant_algo, is_bmm=False)
 
         for n in gm.graph.nodes:
-            if not is_linear_op(n, include_quantization=False):
+            if not is_linear_op(n):
                 continue
             if should_skip_quantization(n, excluded):
                 continue
@@ -275,7 +275,7 @@ class QuantizationFromGraph(BaseTransform):
         num_matches = 0
         for n in gm.graph.nodes:
             # Process linear operations
-            if is_linear_op(n, include_quantization=False):
+            if is_linear_op(n):
                 # get per-layer quantization format from the node
                 quant_algo_n: str = get_quantization_from_linear_node(n)
                 if not quant_algo_n:

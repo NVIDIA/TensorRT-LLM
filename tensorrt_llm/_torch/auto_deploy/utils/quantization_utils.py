@@ -296,7 +296,7 @@ class FP4QuantizationImpl(QuantizationImpl):
 def is_quantized_graph(gm: GraphModule):
     """Check if the graph is quantized by modelopt."""
     for n in gm.graph.nodes:
-        if is_linear_op(n, include_quantization=False):
+        if is_linear_op(n):
             input_params, weight_params, output_params = get_quantization_params_from_linear_node(n)
             if input_params or weight_params or output_params:
                 return True
@@ -317,7 +317,7 @@ def is_quantized_op(node: Node):
 def remove_output_quantizers(gm: GraphModule):
     """Remove output quatnizer if any from the graph."""
     for n in gm.graph.nodes:
-        if is_linear_op(n, include_quantization=False) and len(n.users) == 1:
+        if is_linear_op(n) and len(n.users) == 1:
             user = list(n.users.keys())[0]
             if is_quantized_op(user):
                 # skip the output quantizer
@@ -408,7 +408,7 @@ def should_skip_quantization(
     if isinstance(node_or_name, str):
         modname, _, _ = node_or_name.rpartition(".")
     else:
-        if not (is_linear_op(node_or_name, include_quantization=False) or is_bmm_op(node_or_name)):
+        if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
             return True
         param_name, _ = extract_param_names_from_lin_node(node_or_name)
         modname, _, _ = param_name.rpartition(".")

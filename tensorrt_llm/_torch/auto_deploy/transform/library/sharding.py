@@ -31,6 +31,7 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     filtered_nodes,
     identify_regions_between_residuals,
+    is_fake_quantized_linear_op,
     is_linear_op,
     is_op,
 )
@@ -455,7 +456,7 @@ def detect_column_row_shard(
         unaccounted_nodes: Set[Node] = set()
         current_node = n_start
         while current_node != n_end:
-            if is_linear_op(current_node, include_quantization=True):
+            if is_linear_op(current_node) or is_fake_quantized_linear_op(current_node):
                 nodes_linear[current_node.args[0]].append(current_node)
             elif is_op(current_node, shardable_attention_nodes):
                 attention_nodes.add(current_node)

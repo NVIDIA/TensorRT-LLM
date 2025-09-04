@@ -18,7 +18,11 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     TPShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
+    is_fake_quantized_linear_op,
+    is_linear_op,
+    is_op,
+)
 from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo
 
 base_model_tp_plan = {
@@ -260,7 +264,7 @@ def _run_pattern_detection_job(
         if model_cls == GQA_Block:
             min_local_shape = num_features // num_heads
             for node in gm.graph.nodes:
-                if is_linear_op(node, include_quantization=True):
+                if is_linear_op(node):
                     # for Q, K, V layers, we expect:
                     # dim = 0, add_dist = False
                     # for O layer, we expect:
@@ -283,7 +287,7 @@ def _run_pattern_detection_job(
                     )
         elif model_cls == MLP:
             for node in gm.graph.nodes:
-                if is_linear_op(node, include_quantization=True):
+                if is_linear_op(node):
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
                     # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
                     if "linear1" in node.args[1].name:
@@ -305,7 +309,7 @@ def _run_pattern_detection_job(
         elif model_cls == nn.Linear:
             # expect simple shard only (dim=0, add_dist=True, min_local_shape=1)
             for node in gm.graph.nodes:
-                if is_linear_op(node, include_quantization=True):
+                if is_linear_op(node):
                     expected_transformations.append(
                         TPShardingInfo(
                             target_node=node.name,
@@ -318,7 +322,7 @@ def _run_pattern_detection_job(
                     )
         elif model_cls == FP8MLP:
             for node in gm.graph.nodes:
-                if is_linear_op(node, include_quantization=True):
+                if is_fake_quantized_linear_op(node):
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
                     # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
                     if "linear1" in node.args[1].name:

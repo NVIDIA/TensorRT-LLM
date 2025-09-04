@@ -7,7 +7,13 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
-from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
+from ...utils.node_utils import (
+    bfs,
+    identify_regions_between_residuals,
+    is_linear_op,
+    is_op,
+    is_quantized_linear_op,
+)
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -193,7 +199,7 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
 
     for node in region_nodes:
         # Accept both simple and quantized linear ops.
-        if not is_linear_op(node, include_quantization=True):
+        if not (is_linear_op(node) or is_quantized_linear_op(node)):
             continue
 
         final_linear = node
@@ -215,13 +221,16 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
         if silu_node is None:
             continue
 
-        if not (silu_node.args and is_linear_op(silu_node.args[0], include_quantization=True)):
+        if not (
+            silu_node.args
+            and (is_linear_op(silu_node.args[0]) or is_quantized_linear_op(silu_node.args[0]))
+        ):
             continue
         linear_w1_node = silu_node.args[0]
 
         # The other branch should be a linear op (w3 branch).
         linear_w3_node = arg_b if arg_a is silu_node else arg_a
-        if not is_linear_op(linear_w3_node, include_quantization=True):
+        if not (is_linear_op(linear_w3_node) or is_quantized_linear_op(linear_w3_node)):
             continue
         if not (linear_w1_node.args and linear_w3_node.args):
             continue

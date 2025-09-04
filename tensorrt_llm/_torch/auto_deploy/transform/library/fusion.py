@@ -237,7 +237,7 @@ class FuseGemms(BaseTransform):
         linear_nodes = defaultdict(list)
         for node in gm.graph.nodes:
             # TODO: we don't handle bias for now...
-            if is_linear_op(node, include_quantization=False) and node.args[2] is None:
+            if is_linear_op(node) and node.args[2] is None:
                 linear_nodes[node.args[0]].append(node)
 
         # fuse linear nodes
@@ -247,9 +247,7 @@ class FuseGemms(BaseTransform):
             for parent_node, lin_children in linear_nodes.items():
                 if len(lin_children) < 2:
                     continue
-                if not check_same_children(
-                    parent_node, partial(is_linear_op, include_quantization=False)
-                ):
+                if not check_same_children(parent_node, is_linear_op):
                     # Mixed children (e.g., quantized or non-linear) — skip fusion
                     continue
                 # linear nodes to fuse
