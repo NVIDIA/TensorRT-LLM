@@ -231,21 +231,54 @@ private:
         {
             mRemainSendCount.erase(reqId);
 
-            // TODO(zhengd): pass the hashes directly instead of update llmRequest
-            auto llmRequest = it->second.mRequest;
-            llmRequest->setRequestedBlockHashes(std::move(blockHashes));
-
-            if (common::getEnvParallelCacheSend())
+            // Check if the request is cancelled
+            bool isReady = true;
             {
-                // TODO: Use a thread pool and check for thread safety.
-                std::thread(&DataResponder::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second))
-                    .detach();
+                std::unique_lock lk(mResponderMutex);
+                if (mCancelledRequests.find(reqId) != mCancelledRequests.end())
+                {
+                    isReady = false;
+                }
+            }
+            mSender->sendReadySignal(reqId, isReady);
+
+            if (isReady)
+            {
+                // TODO(zhengd): pass the hashes directly instead of update llmRequest
+                auto llmRequest = it->second.mRequest;
+                llmRequest->setRequestedBlockHashes(std::move(blockHashes));
+
+                if (common::getEnvParallelCacheSend())
+                {
+                    // TODO: Use a thread pool and check for thread safety.
+                    std::thread(&DataResponder::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second))
+                        .detach();
+                }
+                else
+                {
+                    DataResponder::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
+                }
+                removeResponse(it);
             }
             else
             {
-                DataResponder::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
+                // TODO: if the generation does not require the kv cache, the request will
+                // not be removed from mCancelledRequests.
+                auto it = mReadyResponses.find(mCurrentRequest.value());
+                {
+                    std::unique_lock lkResp(mResponderMutex);
+                    mReadyResponses.erase(it);
+                    mCancelledRequests.erase(mCurrentRequest.value());
+                    mRemainSendCount.erase(mCurrentRequest.value());
+                }
+                mCurrentRequest = std::nullopt;
+
+                if (mReadyResponses.empty())
+                {
+                    std::unique_lock lk(mCondMutex);
+                    mAnyReady = false;
+                }
             }
-            removeResponse(it);
         }
         mCurrentRequest = std::nullopt;
     }
@@ -274,16 +307,10 @@ private:
                     auto reqId = requestInfo.getRequestId();
                     blockHashes = requestInfo.getBlockHashes();
 
-                    bool isReady = true;
                     {
                         std::unique_lock lk(mResponderMutex);
                         mCurrentRequest = reqId;
-                        if (mCancelledRequests.find(reqId) != mCancelledRequests.end())
-                        {
-                            isReady = false;
-                        }
                     }
-                    mSender->sendReadySignal(reqId, isReady);
 
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
                     {
@@ -291,8 +318,7 @@ private:
                     }
                 }
                 auto it = getCurrentResponse();
-                bool isReady = !isCancelled(mCurrentRequest.value());
-                if (it != mReadyResponses.end() && isReady)
+                if (it != mReadyResponses.end())
                 {
                     sendResponse(blockHashes, it);
                 }
@@ -486,7 +512,9 @@ private:
         bool isReady = mReceiver->receiveReadySignal(session);
         if (!isReady)
         {
-            // TODO: set the error state for the request
+            // Reuse the error state for the cancelled request.
+            llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+            llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
             return;
         }
         mReceiver->receiveSync(session);
