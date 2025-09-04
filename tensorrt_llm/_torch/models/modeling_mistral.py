@@ -401,7 +401,7 @@ class Mistral3VLM(PreTrainedModel):
                 self._get_image_features(pixel_values=batched_pixel_values,
                                          image_sizes=batched_image_sizes)
             ]
-        
+
         with nvtx_range("[mistral] Fuse input embeds"):
             input_ids, inputs_embeds = fuse_input_embeds(
                 embedding_layer=self.llm.model.embed_tokens,

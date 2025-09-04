@@ -286,3 +286,7 @@ class Gemma3VLM(PreTrainedModel):
                                                attn_metadata=attn_metadata)[-1]
             image_features = self.mm_projector(image_features)
         return image_features
+
+    @property
+    def mm_token_ids(self):
+        return self.image_token_ids
