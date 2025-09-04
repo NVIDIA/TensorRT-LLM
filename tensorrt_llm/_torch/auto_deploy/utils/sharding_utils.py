@@ -184,7 +184,7 @@ def _insert_sharded_matmul(
     # figure out the right dist op
     dist_lookup = {
         0: (torch.ops.auto_deploy.torch_dist_all_gather, -1),
-        1: (torch.ops.auto_deploy.torch_dist_all_reduce,),
+        1: (torch.ops.auto_deploy.torch_dist_all_reduce.default,),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
