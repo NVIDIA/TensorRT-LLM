@@ -85,41 +85,64 @@ static std::string getLocalIp()
         perror("getifaddrs");
         return ip;
     }
-
+    bool getIp = false;
     // Loop through the linked list of interfaces
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
+    for (int ipVIndex = 0; ipVIndex < 2; ipVIndex++)
     {
-        // Check if the interface is an IP interface
-        if (ifa->ifa_addr == nullptr)
-            continue;
-
-        std::string ucxInterface = common::getEnvUCXInterface();
-        if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
+        for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
         {
-            continue;
+            // Check if the interface is an IP interface
+            if (ifa->ifa_addr == nullptr)
+                continue;
+
+            std::string ucxInterface = common::getEnvUCXInterface();
+            if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
+            {
+                continue;
+            }
+
+            // Skip the loopback interface
+            if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+            {
+                continue;
+            }
+
+            // Check if the address family is AF_INET (IPv4)
+            int addressFamily = (ipVIndex == 0) ? AF_INET : AF_INET6;
+
+            if (ifa->ifa_addr->sa_family == addressFamily)
+            {
+                if (ipVIndex == 0) // IPv4
+                {
+                    addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
+                    char address_buffer[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
+
+                    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s",
+                        ifa->ifa_name, address_buffer);
+                    ip = address_buffer;
+                }
+                else // IPv6
+                {
+                    addr_ptr = &((struct sockaddr_in6*) ifa->ifa_addr)->sin6_addr;
+                    char address_buffer[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, addr_ptr, address_buffer, sizeof(address_buffer));
+
+                    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s",
+                        ifa->ifa_name, address_buffer);
+                    ip = address_buffer;
+                }
+
+                getIp = true;
+                break;
+            }
         }
-
-        // Skip the loopback interface
-        if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+        if (getIp)
         {
-            continue;
-        }
-
-        // Check if the address family is AF_INET (IPv4)
-        // TODO: USER CAN SPECIFY THE IP ADDRESS
-        if (ifa->ifa_addr->sa_family == AF_INET)
-        {
-            addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
-            char address_buffer[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
-
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
-                address_buffer);
-            ip = address_buffer;
             break;
         }
     }
-    if (ifa == nullptr)
+    if (!getIp)
     {
         TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
             "UCX   No valid IP address found please set correct UCX interface with env variable TRTLLM_UCX_INTERFACE");
