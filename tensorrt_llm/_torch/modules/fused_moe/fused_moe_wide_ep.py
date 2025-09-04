@@ -250,6 +250,10 @@ class WideEPMoE(MoE):
     def select_alltoall_method_type(mapping: Mapping, top_k: int,
                                     dtype: torch.dtype,
                                     use_cuda_graph: bool) -> AlltoallMethodType:
+        def is_deepep_feasible(num_ranks: int) -> bool:
+            num_rdma_ranks = num_ranks // 8  # 8 is the number of NVL peers
+            return num_ranks in [2, 4, 8] or num_rdma_ranks in [2, 4, 8, 16]
+
         all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
         if all2all_method_type is not None:
             return AlltoallMethodType[all2all_method_type]
@@ -272,8 +276,7 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
                 # choose DeepEP by default if feasible
-                num_rdma_ranks = mapping.world_size // 8  # 8 is the number of NVL peers
-                if mapping.world_size in [2, 4, 8] or num_rdma_ranks in [2, 4, 8, 16]:
+                if is_deepep_feasible(mapping.world_size):
                     return AlltoallMethodType.DeepEP
                 return AlltoallMethodType.DeepEPLowLatency
 
