@@ -303,7 +303,7 @@ void CacheFormatter::format(TransferSession& session)
         auto getBufferSizeForTarget = [&]()
         {
             std::vector<size_t> bufferSizeForTarget(targetNum, 0);
-            std::vector<SizeType32> LayerNumbufferTargetNum(bufferTargetNum, 0);
+            std::vector<SizeType32> layerNumbufferTargetNum(bufferTargetNum, 0);
             //             // only first bufferTargetNum is used.
             if (inputKvCacheBlocks.size() > 1)
             {
@@ -312,7 +312,7 @@ void CacheFormatter::format(TransferSession& session)
                 {
                     bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetNum;
                 }
-                return std::make_pair(bufferSizeForTarget, LayerNumbufferTargetNum);
+                return std::make_pair(bufferSizeForTarget, layerNumbufferTargetNum);
             }
 
             for (size_t i = 0; i < targetNum; i++)
@@ -322,12 +322,12 @@ void CacheFormatter::format(TransferSession& session)
             }
             for (size_t i = 0; i < bufferTargetNum; i++)
             {
-                LayerNumbufferTargetNum[i] = targetInfo.getPeerPPDomainLayerNum(i);
+                layerNumbufferTargetNum[i] = targetInfo.getPeerPPDomainLayerNum(i);
             }
 
-            return std::make_pair(bufferSizeForTarget, LayerNumbufferTargetNum);
+            return std::make_pair(bufferSizeForTarget, layerNumbufferTargetNum);
         };
-        auto [bufferEleSizes, LayerNumbufferTargetNum] = getBufferSizeForTarget();
+        auto [bufferEleSizes, layerNumbufferTargetNum] = getBufferSizeForTarget();
         auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(bufferTargetNum), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -661,17 +661,17 @@ void CacheFormatter::unformat(TransferSession& session)
                 size_t baseEleSize = cacheBlockSizeSum / (validTpSize * selfAttentionLayerNum);
 
                 std::vector<size_t> bufferEleSizes(targetNum, 0);
-                std::vector<SizeType32> LayerNumbufferTargetNum(targetNum, 0);
+                std::vector<SizeType32> layerNumbufferTargetNum(targetNum, 0);
 
                 for (size_t i = 0; i < targetNum; i++)
                 {
-                    LayerNumbufferTargetNum[i]
+                    layerNumbufferTargetNum[i]
                         = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
-                    bufferEleSizes[i] = baseEleSize * LayerNumbufferTargetNum[i];
+                    bufferEleSizes[i] = baseEleSize * layerNumbufferTargetNum[i];
                 }
-                return std::make_pair(bufferEleSizes, LayerNumbufferTargetNum);
+                return std::make_pair(bufferEleSizes, layerNumbufferTargetNum);
             };
-            auto [bufferEleSizes, LayerNumbufferTargetNum] = getTargetBufferEleSize();
+            auto [bufferEleSizes, layerNumbufferTargetNum] = getTargetBufferEleSize();
 
             size_t remainNoCoverTargetNum = 0;
             size_t bufferCoverTargetNum = 0;

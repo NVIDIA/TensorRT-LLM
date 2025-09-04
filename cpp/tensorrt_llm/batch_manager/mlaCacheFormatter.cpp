@@ -160,16 +160,16 @@ void MLACacheFormatter::format(TransferSession& session)
     auto getBufferSizeForTarget = [&]()
     {
         std::vector<size_t> bufferSizeForTarget(pPDomainSize, 0);
-        std::vector<SizeType32> LayerNumbufferTargetNum(pPDomainSize, 0);
+        std::vector<SizeType32> layerNumBufferTargetNum(pPDomainSize, 0);
         size_t baseEleSize = cacheBlockSize * blockNum / selfAttentionLayerNum;
         for (size_t i = 0; i < pPDomainSize; i++)
         {
-            LayerNumbufferTargetNum[i] = targetInfo.getPeerPPDomainLayerNum(i);
-            bufferSizeForTarget[i] = baseEleSize * LayerNumbufferTargetNum[i];
+            layerNumBufferTargetNum[i] = targetInfo.getPeerPPDomainLayerNum(i);
+            bufferSizeForTarget[i] = baseEleSize * layerNumBufferTargetNum[i];
         }
-        return std::make_pair(bufferSizeForTarget, LayerNumbufferTargetNum);
+        return std::make_pair(bufferSizeForTarget, layerNumBufferTargetNum);
     };
-    auto [bufferEleSizes, LayerNumbufferTargetNum] = getBufferSizeForTarget();
+    auto [bufferEleSizes, layerNumbufferTargetNum] = getBufferSizeForTarget();
     auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, static_cast<int>(pPDomainSize), bufferEleSizes, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);
@@ -374,17 +374,17 @@ void MLACacheFormatter::unformat(TransferSession& session)
         auto getBufferSizeForTarget = [&]()
         {
             std::vector<size_t> bufferEleSizes(targetNum, 0);
-            std::vector<SizeType32> LayerNumbufferTargetNum(targetNum, 0);
+            std::vector<SizeType32> layerNumbufferTargetNum(targetNum, 0);
             auto baseEleSize = cacheBlockSize * blockNum / selfAttentionLayerNum;
             for (size_t i = 0; i < targetNum; i++)
             {
-                LayerNumbufferTargetNum[i]
+                layerNumbufferTargetNum[i]
                     = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
-                bufferEleSizes[i] = baseEleSize * LayerNumbufferTargetNum[i];
+                bufferEleSizes[i] = baseEleSize * layerNumbufferTargetNum[i];
             }
-            return std::make_pair(bufferEleSizes, LayerNumbufferTargetNum);
+            return std::make_pair(bufferEleSizes, layerNumbufferTargetNum);
         };
-        auto [bufferEleSizes, LayerNumbufferTargetNum] = getBufferSizeForTarget();
+        auto [bufferEleSizes, layerNumbufferTargetNum] = getBufferSizeForTarget();
 
         auto result = mCacheTransBufferManager->getOrAllocateRecvBuffers(
             cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
