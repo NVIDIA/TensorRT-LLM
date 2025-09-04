@@ -259,7 +259,6 @@ class Qwen2VLInputProcessorBase(InputProcessor):
 
     def get_prompt_for_profiling(self):
         "Send prompt with largest image resolution for profiling the worst case"
-        "during profiling"
         max_width = 9999999
         max_height = 9999999
         img_width, img_height = self.resize_image(width=max_width,
