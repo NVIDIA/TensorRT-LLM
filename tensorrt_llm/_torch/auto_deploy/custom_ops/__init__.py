@@ -6,12 +6,14 @@ from .flashinfer_attention import *
 from .flashinfer_rope import *
 from .linear import *
 from .mla import *
+from .mxfp4 import *
 from .quant import *
 from .rms_norm import *
 from .torch_attention import *
 from .torch_backend_attention import *
 from .torch_moe import *
 from .torch_rope import *
+from .torch_router import *
 from .triton_attention import *
 from .triton_rope import *
 from .trtllm_moe import *
