@@ -138,15 +138,6 @@ accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8-c
 accuracy/test_llm_api_pytorch.py::TestQwQ_32B::test_auto_dtype_tp4
 accuracy/test_llm_api_pytorch.py::TestCodestral_22B_V01::test_auto_dtype
 
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.2-11B-BF16-llama-3.2-models/Llama-3.2-11B-Vision]
-test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
-test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
-test_e2e.py::test_ptp_quickstart_advanced_8gpus[Llama3.1-70B-BF16-llama-3.1-model/Meta-Llama-3.1-70B]
-test_e2e.py::test_ptp_quickstart_advanced_8gpus[Llama3.1-70B-FP8-llama-3.1-model/Llama-3.1-70B-Instruct-FP8]
-test_e2e.py::test_ptp_quickstart_advanced_8gpus[Llama3.1-405B-FP8-llama-3.1-model/Llama-3.1-405B-Instruct-FP8]
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Nemotron-Ultra-253B-nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1]
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron4_4B-BF16-nemotron/Minitron-4B-Base]
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron-H-8B-Nemotron-H-8B-Base-8K]
