@@ -1247,7 +1247,7 @@ class MLA(nn.Module):
                 attention_mask=PredefinedAttentionMask.FULL,
                 softmax_stats_tensor=self.temp_softmax_stats_tensor,
                 chunked_prefill_buffer_batch_size=attn_metadata.
-                runtime_features.chunk_buffer_batch_size,
+                runtime_features.chunked_prefill_buffer_batch_size,
                 output=temp_attn_output,
             )
             # merge attn result
@@ -1299,7 +1299,7 @@ class MLA(nn.Module):
             out_scale=out_scale,
             softmax_stats_tensor=self.temp_softmax_stats_tensor,
             chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.
-            chunk_buffer_batch_size,
+            chunked_prefill_buffer_batch_size,
             output=temp_attn_output,
         )
         temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]

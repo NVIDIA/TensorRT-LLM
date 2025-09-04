@@ -67,7 +67,7 @@ class TrtllmAttentionWrapper:
     qk_rope_head_dim: Optional[int]
     qk_nope_head_dim: Optional[int]
     v_head_dim: Optional[int]
-    chunk_prefill_buffer_batch_size: Optional[int]
+    chunked_prefill_buffer_batch_size: Optional[int]
     attention_chunk_size: Optional[int]
     softmax_stats_tensor: Optional[torch.Tensor]
     use_spec_decoding: bool
@@ -188,7 +188,7 @@ class TrtllmAttentionWrapper:
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
-        chunk_prefill_buffer_batch_size: int = 1,
+        chunked_prefill_buffer_batch_size: int = 1,
         **kwargs,
     ):
         """
@@ -273,7 +273,7 @@ class TrtllmAttentionWrapper:
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
-        self.chunk_prefill_buffer_batch_size = chunk_prefill_buffer_batch_size
+        self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
         self.kwargs.update(kwargs)
 
     def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
@@ -473,7 +473,7 @@ class TrtllmAttentionWrapper:
             self.use_paged_context_fmha,
             self.attention_input_type,
             self.is_mla_enable,
-            self.chunk_prefill_buffer_batch_size,
+            self.chunked_prefill_buffer_batch_size,
             self.q_lora_rank,
             self.kv_lora_rank,
             self.qk_nope_head_dim,
@@ -875,7 +875,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         num_contexts = self.num_contexts
         chunk_size = self.runtime_features.chunk_size
-        chunk_batch_size = self.runtime_features.chunk_buffer_batch_size
+        chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
         total_chunk_size = chunk_size * chunk_batch_size
         cached_kv_lens = torch.tensor(
             self.kv_cache_params.num_cached_tokens_per_seq,
@@ -948,7 +948,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # currently we assume that the chunk size is the same as the max_num_tokens
             if self.runtime_features.chunked_prefill:
                 chunk_size = self.runtime_features.chunk_size
-                chunk_batch_size = self.runtime_features.chunk_buffer_batch_size
+                chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
                 total_chunk_size = chunk_size * chunk_batch_size
                 self.chunked_loop_num = (self.num_ctx_cached_tokens +
                                          total_chunk_size -
@@ -1295,7 +1295,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_generation_lengths=metadata.
             spec_decoding_generation_lengths,
             attention_sinks=attention_sinks,
-            chunk_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
+            chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
         )
         out_dtype = None
         if out_scale is not None:
