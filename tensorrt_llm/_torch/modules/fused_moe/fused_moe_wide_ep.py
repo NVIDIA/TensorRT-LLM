@@ -273,7 +273,7 @@ class WideEPMoE(MoE):
             if deep_ep_installed and dtype == torch.bfloat16:
                 # choose DeepEP by default if feasible
                 num_rdma_ranks = mapping.world_size // 8  # 8 is the number of NVL peers
-                if num_rdma_ranks in [2, 4, 8, 16]:
+                if mapping.world_size in [2, 4, 8] or num_rdma_ranks in [2, 4, 8, 16]:
                     return AlltoallMethodType.DeepEP
                 return AlltoallMethodType.DeepEPLowLatency
 
