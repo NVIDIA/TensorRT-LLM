@@ -86,6 +86,7 @@ def test_llm_capture_request_error():
 
 
 @force_ampere
+@pytest.mark.mpi_ray_parity
 @pytest.mark.parametrize(
     "sampling_params",
     [

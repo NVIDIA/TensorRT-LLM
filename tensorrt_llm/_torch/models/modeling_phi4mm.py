@@ -1,7 +1,6 @@
 # Plan for phi4-mm model support.
 # (done) step 1: support legacy inference pipeline for phi4-mm model.
 # (todo) step 2: refactor the inference pipeline to use AGGREGATE mode (https://github.com/NVIDIA/TensorRT-LLM/pull/5522).
-
 import copy
 from typing import List, Optional, Tuple
 

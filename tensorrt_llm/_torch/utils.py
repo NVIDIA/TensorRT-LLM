@@ -284,3 +284,11 @@ def set_per_request_piecewise_cuda_graph_flag(enable: bool):
 
 def get_per_request_piecewise_cuda_graph_flag() -> bool:
     return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
+
+
+def get_device_uuid(device_idx: int) -> str:
+    """Get the UUID of a CUDA device using torch cuda api"""
+
+    property = torch.cuda.get_device_properties(device_idx)
+    uuid = "GPU-" + str(property.uuid)
+    return uuid
