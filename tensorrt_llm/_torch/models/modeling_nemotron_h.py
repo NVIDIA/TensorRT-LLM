@@ -78,6 +78,8 @@ class MLPLayer(MLP):
                          dtype=config.torch_dtype,
                          config=model_config)
         self.layer_idx = layer_idx
+        # print(f"######################################### {self.layer_idx} MLP up_proj linear quant method: {self.up_proj.get_quant_method(self.up_proj.quant_config)}", flush=True)
+        # print(f"######################################### {self.layer_idx} MLP down_proj linear quant method: {self.down_proj.get_quant_method(self.down_proj.quant_config)}", flush=True)
 
     def forward(
         self,
@@ -85,6 +87,8 @@ class MLPLayer(MLP):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
+        print(f"######################################### {self.layer_idx} MLP up_proj linear quant method: {self.up_proj.quant_method}", flush=True)
+        print(f"######################################### {self.layer_idx} MLP down_proj linear quant method: {self.down_proj.quant_method}", flush=True)
         return super().forward(hidden_states)
 
 
@@ -107,6 +111,8 @@ class TransformerLayer(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
+        # print(f"######################################### {self.layer_idx} Attention qkv_proj linear quant method: {self.qkv_proj.get_quant_method(self.qkv_proj.quant_config)}", flush=True)
+        # print(f"######################################### {self.layer_idx} Attention o_proj linear quant method: {self.o_proj.get_quant_method(self.o_proj.quant_config)}", flush=True)
 
     def forward(
         self,
@@ -114,6 +120,8 @@ class TransformerLayer(Attention):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
+        print(f"######################################### {self.layer_idx} Attention qkv_proj linear quant method: {self.qkv_proj.quant_method}", flush=True)
+        print(f"######################################### {self.layer_idx} Attention o_proj linear quant method: {self.o_proj.quant_method}", flush=True)
         return super().forward(position_ids=None,
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata)
@@ -255,9 +263,10 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
 
         if model_config.quant_config.exclude_modules is not None:
             model_config.quant_config.exclude_modules = [
-                k.replace('model.layers.backbone', 'model')
+                k.replace('model.layers.backbone', 'model').replace('backbone', 'model')
                 for k in model_config.quant_config.exclude_modules
             ]
+            print(f"######################################### Quant config exclude modules: {model_config.quant_config.exclude_modules}", flush=True)
 
         super().__init__(
             NemotronHModel(model_config),

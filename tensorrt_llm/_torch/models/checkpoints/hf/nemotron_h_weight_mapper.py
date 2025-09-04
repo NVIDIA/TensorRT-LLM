@@ -34,7 +34,9 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             if "A_log" in key:
                 key = key.replace("A_log", "A")
 
-            if "_scale" in key and weights[name].dim() == 0:
+            # TODO: make sure I understand why this is needed
+            # if "_scale" in key and weights[name].dim() == 0:
+            if "_scale" in key:
                 new_weights[key] = weights[name]
             elif "A" in key:
                 w = split(weights[name], tp_size, tp_rank)
@@ -51,6 +53,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 new_weights[key] = w
             elif "mixer.in_proj" in key:
                 w = weights[name]
+                # print(f"######################################### {key} {w.shape=}", flush=True)
                 in_proj_z, in_proj_x, in_proj_b, in_proj_c, in_proj_dt = torch.split(
                     w, [
                         d_inner, d_inner, n_groups * d_state,
