@@ -644,6 +644,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
+        self.is_multimodal = True  # variable used during profiling
         super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
@@ -665,6 +666,7 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
+        self.is_multimodal = True  # variable used during profiling
         super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
