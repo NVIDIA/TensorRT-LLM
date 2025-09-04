@@ -660,6 +660,10 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
 ]
 
+class GlobalState {
+    static def uploadResultStageNames = []
+}
+
 String getShortenedJobName(String path)
 {
     static final nameMapping = [
@@ -703,6 +707,15 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         stageIsInterrupted = true
         throw e
     } finally {
+        if(!GlobalState.uploadResultStageNames.contains(stageName)) {
+            GlobalState.uploadResultStageNames.add(stageName)
+        } else {
+            stage('Upload Test Results') {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    error "Upload test results for ${stageName} failed because it has already been uploaded."
+                }
+            }
+        }
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
@@ -2323,7 +2336,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key) + "-subJob-runTest", 1, 1, true, null)
                         }
                     })
                 }
@@ -2554,7 +2567,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name + "-subJob-testImage", 1, 1, true, null)
                 })
             }
         } else {
