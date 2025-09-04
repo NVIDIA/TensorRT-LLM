@@ -36,13 +36,20 @@ def update_confidence_info(confidence_info: ConfidenceInfo, token_dict: Mapping[
 
 class DeepConfOfflineController(NativeGenerationController):
 
-    def __init__(self, conf_group_size: int, conf_threshold: float, sampling_params: dict = None, streaming: bool = False):
+    def __init__(self, 
+                 conf_group_size: int, 
+                 conf_threshold: float, 
+                 logprobs_topk:int = 20,
+                 sampling_params: dict = None, 
+                 streaming: bool = False):
         super().__init__(sampling_params, streaming)
+        self.logprobs_topk = logprobs_topk
         self.confidence_info = ConfidenceInfo(conf_grouped=0.0, conf_list=[], conf_group_list=deque([]), conf_group_size=conf_group_size, conf_threshold=conf_threshold)
 
     def process(self, tasks: List[Task], **kwargs):
-        yield from super().process(tasks, **kwargs)
         assert (len(tasks) == 1, "DeepConfOfflineController only supports one task")
+        tasks[0].num_logprobs = self.logprobs_topk
+        yield from super().process(tasks, **kwargs)
         for logprobs_dict, token_id in zip(tasks[0].logprobs, tasks[0].output_tokens):
             update_confidence_info(self.confidence_info, logprobs_dict, token_id)
         tasks[0].costimized_result_fields['confidence_info'] = self.confidence_info
@@ -62,7 +69,7 @@ class DeepConfOnlineController(Controller):
         self.confidence_info = ConfidenceInfo(conf_grouped=0.0, conf_list=[], conf_group_list=deque([]), conf_group_size=conf_group_size, conf_threshold=conf_threshold)
 
     def clone(self):
-        return DeepThinkOnlineController(self.conf_group_size, self.conf_threshold)
+        return DeepConfOnlineController(self.conf_group_size, self.conf_threshold)
     
     def process(self, tasks: List[Task], **kwargs):
         assert (len(tasks) == 1, "DeepThinkOnlineController only supports one task")
