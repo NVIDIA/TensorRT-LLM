@@ -552,6 +552,9 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                         "\"bash ${scriptLaunch}\""
                     )
                 )
+                // echo the slurm output
+                def slurmOutput = pipeline.readFile(file: slurmOutputFile)
+                echo "slurmOutput: ${slurmOutput}"
             }
 
             echo "Finished test stage execution."
