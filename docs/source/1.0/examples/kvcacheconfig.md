@@ -28,7 +28,7 @@ if __name__ == '__main__':
     main()
 ```
 
-This example runs with default KV cache properties. The default value for ```python free_gpu_memory_fraction``` is 0.9, which means TensorRT-LLM tries to allocate 90% of free GPU memory for KV cache. Depending on your system, this allocation can be too aggressive. You can reduce this value to 0.7 by adding the following lines to the quickstart example:
+This example runs with default KV cache properties. The default value for ```python free_gpu_memory_fraction``` is 0.9, which means TensorRT-LLM tries to allocate 90% of free GPU memory (after loading weights) for KV cache. Depending on your use case, this allocation can be too aggressive. You can reduce this value to 0.7 by adding the following lines to the quickstart example:
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig
