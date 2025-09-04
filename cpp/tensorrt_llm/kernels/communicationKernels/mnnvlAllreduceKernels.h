@@ -40,6 +40,7 @@ struct AllReduceFusionParams
     int num_tokens;
     int token_dim;
     void** buffer_ptrs_dev;
+    void* buffer_ptr_local;
     void* multicast_ptr;
     uint32_t* buffer_flags;
     bool rmsnorm_fusion;

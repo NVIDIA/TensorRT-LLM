@@ -13,8 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#include "mnnvlTwoShotAllreduceKernels.h"
+#include "mnnvlAllreduceKernels.h"
 #include <array>
 #include <cooperative_groups.h>
 #include <cstddef>
@@ -24,15 +23,25 @@
 #include <cuda_pipeline.h>
 #include <nvml.h>
 #include <tuple>
+#include <type_traits>
 
+#include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/lamportUtils.cuh"
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::kernels::mnnvl
 {
-// Guard the helper function used for this kernl.
+
+using tensorrt_llm::common::isNegZero;
+using tensorrt_llm::common::LamportFlags;
+using tensorrt_llm::common::cuda_cast;
+using tensorrt_llm::common::getMultiProcessorCount;
+using tensorrt_llm::common::getDTypeSize;
+
+// Guard the helper function used for this kernel.
 namespace detail
 {
 template <typename PackedType, typename T>
@@ -100,7 +109,16 @@ inline __device__ float2 loadPackedVolatile<float2>(void const* ptr)
     return return_value;
 }
 
-constexpr uint32_t WARP_SIZE = 32;
+template <typename T_IN>
+inline __device__ void copy_f4(T_IN* dst, T_IN const* src)
+{
+    float4* dst4 = reinterpret_cast<float4*>(dst);
+    float4 const* src4 = reinterpret_cast<float4 const*>(src);
+    __pipeline_memcpy_async(dst4, src4, sizeof(float4));
+}
+
+// global constexpr is not recognized in device code, so we have to use a macro here
+#define WARP_SIZE 32U
 
 // These two warpreduce functions are slightly different with the version in reduceKernelUtils as we dynamically extract
 // the mask to support different warp sizes
@@ -116,7 +134,7 @@ inline __device__ T warpReduceSum(T val)
     {
         if (offset < warp_size)
         {
-            val = add<T>(val, __shfl_xor_sync(mask, val, offset, WARP_SIZE));
+            val = tensorrt_llm::common::add(val, __shfl_xor_sync(mask, val, offset, WARP_SIZE));
         }
     }
     return val;
@@ -140,6 +158,16 @@ inline __device__ T blockReduceSum(T val)
     val = warpReduceSum(val);
 
     return val;
+}
+
+#undef WARP_SIZE
+
+// We have to define this again since the one in mathUtils.h is shadowed by the one from cudaUtils.h, which is a
+// host-only function!
+template <typename T>
+inline __device__ __host__ T divUp(T m, T n)
+{
+    return (m + n - 1) / n;
 }
 
 // A helper function to tune the grid configuration for fused oneshot and rmsnorm kernels
@@ -223,16 +251,15 @@ using detail::loadPacked;
 using detail::loadPackedVolatile;
 using detail::warpReduceSum;
 using detail::blockReduceSum;
-using tensorrt_llm::common::isNegZero;
-using tensorrt_llm::common::LamportFlags;
-using tensorrt_llm::common::cuda_cast;
+using detail::divUp;
+using detail::copy_f4;
 
 // Use another macro to enhance readability
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 #define SUPPORT_CGA
 #endif
 
-template <int WORLD_SIZE, typename T, bool RESNORM_FUSION = false, typename PackedType = float4>
+template <uint8_t WORLD_SIZE, typename T, bool RESNORM_FUSION = false, typename PackedType = float4>
 __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* output_ptr, T* prenormed_ptr,
     T const* shard_ptr, T const* residual_in_ptr, T const* gamma_ptr, T** input_ptrs, T* mcast_ptr,
     int const num_tokens, int const token_dim, float epsilon, int const rank, uint32_t* buffer_flags)
@@ -360,10 +387,11 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
         for (int i = 0; i < ELTS_PER_THREAD; i++)
         {
             // FIXME: Use float square if accuracy issue
-            thread_sum += toFloat<T>(packed_accum.elements[i] * packed_accum.elements[i]);
+            thread_sum += cuda_cast<float, T>(packed_accum.elements[i] * packed_accum.elements[i]);
         }
         float token_sum = blockReduceSum(thread_sum);
 #ifdef SUPPORT_CGA
+        namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)
         {
@@ -397,7 +425,7 @@ __global__ void __launch_bounds__(1024) oneshot_allreduce_fusion_kernel(T* outpu
         }
     }
     reinterpret_cast<PackedType*>(&output_ptr[thread_offset])[0] = packed_accum.packed;
-    flag.wait_and_update({num_tokens * token_dim * WORLD_SIZE * ELT_SIZE, 0, 0, 0});
+    flag.wait_and_update({static_cast<uint32_t>(num_tokens * token_dim * WORLD_SIZE * ELT_SIZE), 0, 0, 0});
 }
 
 using detail::adjust_grid_config;
@@ -406,7 +434,7 @@ void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
 {
     int const num_tokens = params.num_tokens;
     int const token_dim = params.token_dim;
-    int const elts_per_thread = sizeof(float4) / tensorrt_llm::common::getDTypeSize(params.dtype);
+    int const elts_per_thread = sizeof(float4) / getDTypeSize(params.dtype);
 
 #ifdef SUPPORT_CGA
     auto [block_size, cluster_size, loads_per_thread]
@@ -417,12 +445,12 @@ void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
 #endif
     dim3 grid(num_tokens, cluster_size, 1);
 
-    TLLM_CHECK_WITH_INFO(block_size <= 1024 && loads_per_thread == 1, "Hidden Dimension ", token_dim,
-        " exceeds the maximum supported hidden dimension", " (",
+    TLLM_CHECK_WITH_INFO(block_size <= 1024 && loads_per_thread == 1,
+        "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", token_dim,
 #ifdef SUPPORT_CGA
-        1024 * 8 * elts_per_thread, ")");
+        1024 * 8 * elts_per_thread);
 #else
-        1024 * elts_per_thread, ")");
+        1024 * elts_per_thread);
 #endif
 
     TLLM_LOG_DEBUG(
@@ -454,11 +482,19 @@ void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
 #endif
     };
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                         \
-    cudaLaunchKernelEx(&config, &oneshot_allreduce_kernel<WORLD_SIZE, T>, output, residual_out, input, residual_in,    \
-        gamma, uc_ptrs, mc_ptr, num_tokens, token_dim, static_cast<float>(params.epsilon), params.rank,                \
-        params.buffer_flags);
-
+#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, RMSNORM)                                                                \
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &oneshot_allreduce_fusion_kernel<WORLD_SIZE, T, RMSNORM>, output,      \
+        residual_out, input, residual_in, gamma, uc_ptrs, mc_ptr, num_tokens, token_dim,                               \
+        static_cast<float>(params.epsilon), params.rank, params.buffer_flags));
+#define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                       \
+    if (params.rmsnorm_fusion)                                                                                         \
+    {                                                                                                                  \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, true);                                                                  \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, false);                                                                 \
+    }
     // C++17 compatible alternative using a template function
     auto dispatch_impl = [&](auto* type_ptr) -> bool
     {
@@ -474,16 +510,17 @@ void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
         switch (params.nranks)
         {
             // FIXME: Do we need other world sizes?
-        case 2: LAUNCH_ALLREDUCE_KERNEL(2, T); return true;
-        case 4: LAUNCH_ALLREDUCE_KERNEL(4, T); return true;
-        case 8: LAUNCH_ALLREDUCE_KERNEL(8, T); return true;
-        case 16: LAUNCH_ALLREDUCE_KERNEL(16, T); return true;
-        case 32: LAUNCH_ALLREDUCE_KERNEL(32, T); return true;
-        case 64: LAUNCH_ALLREDUCE_KERNEL(64, T); return true;
+        case 2: DISPATCH_ALLREDUCE_KERNEL(2, T); return true;
+        case 4: DISPATCH_ALLREDUCE_KERNEL(4, T); return true;
+        case 8: DISPATCH_ALLREDUCE_KERNEL(8, T); return true;
+        case 16: DISPATCH_ALLREDUCE_KERNEL(16, T); return true;
+        case 32: DISPATCH_ALLREDUCE_KERNEL(32, T); return true;
+        case 64: DISPATCH_ALLREDUCE_KERNEL(64, T); return true;
         }
         return false;
     };
 #undef LAUNCH_ALLREDUCE_KERNEL
+#undef DISPATCH_ALLREDUCE_KERNEL
     bool launched = (params.dtype == nvinfer1::DataType::kBF16 && dispatch_impl((__nv_bfloat16*) nullptr))
         || (params.dtype == nvinfer1::DataType::kFLOAT && dispatch_impl((float*) nullptr))
         || (params.dtype == nvinfer1::DataType::kHALF && dispatch_impl((__nv_half*) nullptr));
@@ -493,7 +530,7 @@ void oneshot_allreduce_fusion_op(AllReduceFusionParams const& params)
     }
 }
 
-template <int WORLD_SIZE, typename T, typename PackedType = float4>
+template <uint8_t WORLD_SIZE, typename T, typename PackedType = float4>
 __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T const* shard_ptr, T** input_ptrs,
     T* mcast_ptr, uint32_t const num_tokens, uint32_t const token_dim, uint32_t const rank, uint32_t* buffer_flags,
     bool const wait_for_results)
@@ -552,8 +589,7 @@ __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T
     if ((token % WORLD_SIZE) == rank)
     {
         int local_token = token / WORLD_SIZE;
-        std::array<float, ELTS_PER_THREAD> accum;
-        accum.fill(0.F);
+        float accum[ELTS_PER_THREAD] = {0.F};
 
         // Use float as we only check each float value for validity
         PackedVec<PackedType, float> values_lamport[WORLD_SIZE];
@@ -623,9 +659,9 @@ __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T
         }
 
         // Update the buffer flags
-        flag.wait_and_update({divUp<uint32_t>(num_tokens, WORLD_SIZE) * WORLD_SIZE * token_dim
-                * ELT_SIZE,                    // Clear Size for scatter stage
-            num_tokens * token_dim * ELT_SIZE, // Clear Size for broadcast stage
+        flag.wait_and_update({static_cast<uint32_t>(divUp<uint32_t>(num_tokens, WORLD_SIZE) * WORLD_SIZE * token_dim
+                                  * ELT_SIZE),                        // Clear Size for scatter stage
+            static_cast<uint32_t>(num_tokens * token_dim * ELT_SIZE), // Clear Size for broadcast stage
             0, 0});
         // If not wait for results, we will rely on the following kernel to update the buffer
     }
@@ -639,7 +675,7 @@ __global__ __launch_bounds__(128) void twoshot_allreduce_kernel(T* output_ptr, T
 //      shared memory size and register count.
 template <typename T_IN, typename T_OUT, bool USE_CGA = false, int LOADS_PER_THREAD = 1>
 __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residual, T_OUT* output_norm,
-    T_IN* buffer_input, const T_IN* gamma, float epsilon, const T_IN* residual, uint32_t num_tokens, uint32_t dim,
+    T_IN* buffer_input, T_IN const* gamma, float epsilon, T_IN const* residual, uint32_t num_tokens, uint32_t dim,
     uint32_t world_size, uint32_t* buffer_flags)
 {
     // FIXME: Support different types if we'd like to fuse quantization in the future
@@ -655,6 +691,7 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
     uint32_t block_offset = 0;
     if constexpr (USE_CGA)
     {
+        namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
         num_threads = cluster.num_threads();
         cluster_size = cluster.num_blocks();
@@ -727,8 +764,8 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
             if (block_offset * block_chunk_size + thread_load_offset < dim)
             {
 
-                float4* dst4 = (float4*) &sh_input[thread_load_offset];
-                float4* src4 = (float4*) &input[offsets[i]];
+                float4* dst4 = reinterpret_cast<float4*>(&sh_input[thread_load_offset]);
+                float4 const* src4 = reinterpret_cast<float4 const*>(&input[offsets[i]]);
 
                 float4 value = loadPackedVolatile<float4>(src4);
                 // Assume that the 16B were written atomically, so we only need to check one value
@@ -755,8 +792,8 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
 #pragma unroll
             for (int j = 0; j < ELTS_PER_LOAD; j++)
             {
-                r_input[i * ELTS_PER_LOAD + j] = toFloat(inp_plus_res.elements[j]);
-                thread_sum += toFloat(inp_plus_res.elements[j] * inp_plus_res.elements[j]);
+                r_input[i * ELTS_PER_LOAD + j] = cuda_cast<float, T_IN>(inp_plus_res.elements[j]);
+                thread_sum += cuda_cast<float, T_IN>(inp_plus_res.elements[j] * inp_plus_res.elements[j]);
             }
 
             *reinterpret_cast<float4*>(&input_plus_residual[block_load_offset + thread_load_offset])
@@ -772,6 +809,7 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
     __shared__ float shared_val;
     if constexpr (USE_CGA)
     {
+        namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
         if (cluster.num_blocks() > 1)
         {
@@ -815,7 +853,8 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
 #pragma unroll
             for (uint32_t j = 0; j < ELTS_PER_LOAD; j++)
             {
-                r_out.elements[j] = fromFloat<T_OUT>(toFloat(gamma.elements[j]) * r_input[j] * rcp_rms);
+                r_out.elements[j]
+                    = cuda_cast<T_OUT, float>(cuda_cast<float, T_IN>(gamma.elements[j]) * r_input[j] * rcp_rms);
             }
 
             *reinterpret_cast<float4*>(&output_norm[block_load_offset + thread_load_offset]) = r_out.packed;
@@ -826,40 +865,42 @@ __global__ __launch_bounds__(1024) void rmsnorm_lamport(T_IN* input_plus_residua
     // Update the buffer pointers
     // FIXME: We round num_tokens to 64 to avoid passing in the world size into this kernel; Check this when we need
     // world size >64
-    flag.wait_and_update(
-        {divUp(num_tokens, world_size) * world_size * dim * ELTS_SIZE, num_tokens * dim * ELTS_SIZE, 0, 0});
+    flag.wait_and_update({static_cast<uint32_t>(divUp<uint32_t>(num_tokens, world_size) * world_size * dim * ELTS_SIZE),
+        static_cast<uint32_t>(num_tokens * dim * ELTS_SIZE), 0, 0});
 }
 
 void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
 {
     int const num_tokens = params.num_tokens;
     int const token_dim = params.token_dim;
-    int const num_elts_per_thread = sizeof(float4) / tensorrt_llm::common::getDTypeSize(params.dtype);
+    int const num_elts_per_thread = sizeof(float4) / getDTypeSize(params.dtype);
     TLLM_CHECK_WITH_INFO(token_dim % num_elts_per_thread == 0,
-        "[MNNVL AllReduceTwoShot] token_dim must be divisible by ", num_elts_per_thread);
+        "[MNNVL AllReduceTwoShot] token_dim must be divisible by %d", num_elts_per_thread);
 
     int const ar_num_threads = divUp(token_dim, num_elts_per_thread);
     int const ar_num_blocks_per_token = divUp(ar_num_threads, 128);
 
     dim3 ar_grid(num_tokens, ar_num_blocks_per_token);
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+
+    cudaLaunchAttribute ar_attrs[1];
+    ar_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    ar_attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 
     cudaLaunchConfig_t ar_config{
         .gridDim = ar_grid,
         .blockDim = 128,
         .dynamicSmemBytes = 0,
         .stream = params.stream,
-        .attrs = attrs,
+        .attrs = ar_attrs,
         .numAttrs = 1,
     };
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                         \
-    cudaLaunchKernelEx(&ar_config, &twoshot_allreduce_kernel<WORLD_SIZE, T>, output, input, uc_ptrs, mcast_ptr,        \
-        num_tokens, token_dim, params.rank, params.buffer_flags, (!params.rmsnorm_fusion));
-    auto dispatch_ar = [&]<typename T>(T*)
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&ar_config, &twoshot_allreduce_kernel<WORLD_SIZE, T>, output, input, uc_ptrs,   \
+        mcast_ptr, num_tokens, token_dim, params.rank, params.buffer_flags, (!params.rmsnorm_fusion)));
+    auto dispatch_ar = [&](auto* type_ptr) -> bool
     {
+        using T = std::remove_pointer_t<decltype(type_ptr)>;
         T** uc_ptrs = reinterpret_cast<T**>(params.buffer_ptrs_dev);
         T* mcast_ptr = reinterpret_cast<T*>(params.multicast_ptr);
         T* output = reinterpret_cast<T*>(params.output);
@@ -889,30 +930,32 @@ void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
     if (params.rmsnorm_fusion)
     {
 #ifdef SUPPORT_CGA
-        auto [rn_block_size, rn_cluster_size, rn_loads_per_thread]
-            = adjust_grid_config<true>(num_tokens, token_dim, num_elts_per_thread);
+        auto grid_config = adjust_grid_config<true>(num_tokens, token_dim, num_elts_per_thread);
 #else
-        auto [rn_block_size, rn_cluster_size, rn_loads_per_thread]
-            = adjust_grid_config<false>(num_tokens, token_dim, num_elts_per_thread);
+        auto grid_config = adjust_grid_config<false>(num_tokens, token_dim, num_elts_per_thread);
 #endif
+        int rn_block_size = std::get<0>(grid_config);
+        int rn_cluster_size = std::get<1>(grid_config);
+        int rn_loads_per_thread = std::get<2>(grid_config);
+
         int rn_num_threads = rn_cluster_size * rn_block_size;
         dim3 rn_grid(num_tokens, rn_cluster_size, 1);
         cudaLaunchConfig_t rn_config;
-        cudaLaunchAttribute attrs[2];
-        config.stream = params.stream;
-        config.gridDim = rn_grid;
-        config.blockDim = rn_block_size;
-        config.attrs = attrs;
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+        cudaLaunchAttribute rn_attrs[2];
+        rn_config.stream = params.stream;
+        rn_config.gridDim = rn_grid;
+        rn_config.blockDim = rn_block_size;
+        rn_config.attrs = rn_attrs;
+        rn_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        rn_attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 #ifndef DISABLE_CGA
-        attrs[1].id = cudaLaunchAttributeClusterDimension;
-        attrs[1].val.clusterDim.x = 1;
-        attrs[1].val.clusterDim.y = rn_cluster_size;
-        attrs[1].val.clusterDim.z = 1;
-        config.numAttrs = 2;
+        rn_attrs[1].id = cudaLaunchAttributeClusterDimension;
+        rn_attrs[1].val.clusterDim.x = 1;
+        rn_attrs[1].val.clusterDim.y = rn_cluster_size;
+        rn_attrs[1].val.clusterDim.z = 1;
+        rn_config.numAttrs = 2;
 #else
-        config.numAttrs = 1;
+        rn_config.numAttrs = 1;
 #endif
 
         bool const rn_use_cga = rn_cluster_size > 1;
@@ -920,23 +963,24 @@ void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
             = divUp(token_dim, num_elts_per_thread * rn_num_threads) * num_elts_per_thread * rn_num_threads;
         int const iters = dim_padded / rn_num_threads;
         assert(rn_loads_per_thread == iters / num_elts_per_thread);
-        size_t const shmem_size = 3 * rn_block_size * iters * tensorrt_llm::common::getDTypeSize(params.dtype);
+        size_t const shmem_size = 3 * rn_block_size * iters * getDTypeSize(params.dtype);
 
 #define RUN_RMSNORM_KERNEL(T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD)                                                     \
-    cudaFuncSetAttribute(&rmsnorm_lamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,                                     \
-        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);                                                      \
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(&rmsnorm_lamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,                     \
+        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));                                                     \
     rn_config.dynamicSmemBytes = shmem_size;                                                                           \
-    CHECK_CUDA(cudaLaunchKernelEx(&rn_config, &rmsnorm_lamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>, residual_out,  \
-        output, input, gamma, static_cast<float>(params.epsilon), residual_in, num_tokens, token_dim, params.nranks,   \
-        params.buffer_flags));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&rn_config, &rmsnorm_lamport<T_IN, T_OUT, USE_CGA, LOADS_PER_THREAD>,           \
+        residual_out, output, buffer_input, gamma, static_cast<float>(params.epsilon), residual_in, num_tokens,        \
+        token_dim, params.nranks, params.buffer_flags));
 
-        auto dispatch_rn = [&](auto* type_ptr)
+        // C++ 17 does not support capturing structured bindings
+        auto dispatch_rn = [&, rn_loads_per_thread](auto* type_ptr)
         {
             using T_IN = std::remove_pointer_t<decltype(type_ptr)>;
             using T_OUT = T_IN;
             T_OUT* residual_out = reinterpret_cast<T_OUT*>(params.residual_out);
             T_OUT* output = reinterpret_cast<T_OUT*>(params.output);
-            T_IN const* input = reinterpret_cast<T_IN const*>(params.input);
+            T_IN* buffer_input = reinterpret_cast<T_IN*>(params.buffer_ptr_local);
             T_IN const* gamma = reinterpret_cast<T_IN const*>(params.gamma);
             T_IN const* residual_in = reinterpret_cast<T_IN const*>(params.residual_in);
             if (rn_use_cga)
@@ -960,16 +1004,16 @@ void twoshot_allreduce_fusion_op(AllReduceFusionParams const& params)
             }
             return true;
         };
-    }
 
-    launched = (params.dtype == nvinfer1::DataType::kFLOAT && dispatch_rn((float*) nullptr))
-        || (params.dtype == nvinfer1::DataType::kBF16 && dispatch_rn((__nv_bfloat16*) nullptr))
-        || (params.dtype == nvinfer1::DataType::kHALF && dispatch_rn((__nv_half*) nullptr));
-    if (!launched)
-    {
-        TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch rmsnorm lamport kernel.");
-    }
+        launched = (params.dtype == nvinfer1::DataType::kFLOAT && dispatch_rn((float*) nullptr))
+            || (params.dtype == nvinfer1::DataType::kBF16 && dispatch_rn((__nv_bfloat16*) nullptr))
+            || (params.dtype == nvinfer1::DataType::kHALF && dispatch_rn((__nv_half*) nullptr));
+        if (!launched)
+        {
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch rmsnorm lamport kernel.");
+        }
 #undef RUN_RMSNORM_KERNEL
+    }
 }
 
 // Avoid polluting the global namespace

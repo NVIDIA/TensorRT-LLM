@@ -22,7 +22,7 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
-#include "tensorrt_llm/kernels/communicationKernels/mnnvlTwoShotAllreduceKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/quantization.h"
@@ -1151,9 +1151,9 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
     return {norm_out, residual_out};
 }
 
-std::tuple<torch::Tensor, torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input,
-    torch::optional<torch::Tensor> const& gamma, torch::optional<torch::Tensor> const& residual_in,
-    torch::optional<double> epsilon, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags, bool rmsnorm_fusion)
+std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
+    torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
+    torch::Tensor& buffer_flags, bool rmsnorm_fusion)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -1178,8 +1178,9 @@ std::tuple<torch::Tensor, torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& inp
     allreduce_params.num_tokens = num_tokens;
     allreduce_params.token_dim = hidden_dim;
     allreduce_params.buffer_ptrs_dev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    allreduce_params.buffer_ptr_local = comm_buffer.mutable_data_ptr();
     allreduce_params.multicast_ptr = mcast_mem->getMulticastPtr();
-    allreduce_params.buffer_flags = buffer_flags.mutable_data_ptr();
+    allreduce_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
     allreduce_params.input = input.const_data_ptr();
     allreduce_params.output = output.mutable_data_ptr();
 
@@ -1217,8 +1218,8 @@ std::tuple<torch::Tensor, torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& inp
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "mnnvl_fusion_allreduce(Tensor(input!) input, Tensor(residual?) residual, Tensor(gamma?) gamma, "
-        "float? epsilon, Tensor(comm_buf!) comm_buffer, Tensor(buffer_flags!) buffer_flags, bool rmsnorm_fusion) -> "
+        "mnnvl_fusion_allreduce(Tensor input, Tensor? residual, Tensor? gamma, "
+        "float? epsilon, Tensor comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion) -> "
         "Tensor[]");
     m.def(
         "allreduce("

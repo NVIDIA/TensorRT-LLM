@@ -27,7 +27,6 @@
 #include <cooperative_groups.h>
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
-#include "tensorrt_llm/common/mathUtils.h"
 
 namespace tensorrt_llm::common
 {
@@ -122,7 +121,7 @@ constexpr __device__ __host__ PackedType getPackedLamportInit()
 struct LamportBufferLayout
 {
     uint32_t num_stages = 1;
-    size_t bytes_per_buffer = 0;
+    uint32_t bytes_per_buffer = 0;
     static constexpr uint32_t num_lamport_buffers = 3;
 
     // Implicitly inlined
@@ -274,7 +273,8 @@ private:
         uint32_t bytes_to_clear, uint8_t dirty_index, uint8_t stage_idx)
     {
         // Round up to the float4 boundary
-        uint32_t clear_boundry = divUp<uint32_t>(bytes_to_clear, sizeof(PackedType));
+        // For the same reason that the divUp is shadowed, we have to define it again here.
+        uint32_t clear_boundry = (bytes_to_clear + sizeof(PackedType) - 1) / sizeof(PackedType);
         for (uint32_t packed_idx = global_tid; packed_idx < clear_boundry; packed_idx += num_threads)
         {
             reinterpret_cast<PackedType*>(
