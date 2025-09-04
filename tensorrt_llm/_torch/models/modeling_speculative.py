@@ -177,7 +177,7 @@ class Eagle3DraftModel(DecoderModel):
 
         if config.draft_vocab_size is not None and config.vocab_size != config.draft_vocab_size:
             self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
-                                                dtype=torch.int64),
+                                                dtype=torch.int32),
                                     requires_grad=False)
 
         if self.hidden_size_in != config.hidden_size:
