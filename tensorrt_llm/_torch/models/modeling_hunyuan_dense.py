@@ -372,52 +372,6 @@ class HunYuanPretrainedConfig(PretrainedConfig):
                 )
 
 
-def _get_tensor_stats(tensor):
-    dump_tensor_num = int(os.environ.get("DUMP_TENSOR_NUM", "10"))
-    """获取张量的统计信息：前N个值、均值和方差"""
-    if tensor is None or not isinstance(tensor, torch.Tensor):
-        return None, None, None, None, None
-
-    flat = tensor.reshape(-1)
-    length = len(flat)
-    if len(flat) == 0:
-        return [], [], [], None, None
-
-    dump_tensor_num = min(dump_tensor_num, len(flat))
-    first_values = flat[:dump_tensor_num].detach().cpu().tolist()
-
-    # 获取中间n个值
-    mid_start = max(0, (length - dump_tensor_num) // 2)
-    middle_values = flat[mid_start:mid_start +
-                         dump_tensor_num].detach().cpu().tolist()
-
-    # 获取最后n个值
-    last_values = flat[-dump_tensor_num:].detach().cpu().tolist()
-
-    # 修复：对于整数类型张量，转换为浮点类型再计算统计量
-    try:
-        if flat.dtype in [
-                torch.long, torch.int, torch.int32, torch.int64, torch.short,
-                torch.int8
-        ]:
-            # 整数类型：转换为float计算，或者跳过统计计算
-            flat_float = flat.float()
-            mean = float(torch.mean(flat_float).item())
-            var = float(torch.var(flat_float).item())
-        else:
-            # 浮点类型：直接计算
-            mean = float(torch.mean(flat).item())
-            var = float(torch.var(flat).item())
-    except Exception as e:
-        # 如果计算失败，返回None
-        print(
-            f"Warning: Could not compute statistics for tensor with dtype {flat.dtype}: {e}"
-        )
-        mean, var = None, None
-
-    return first_values, middle_values, last_values, mean, var
-
-
 class HunYuanTRTRotaryEmbedding(RotaryEmbedding):
 
     def __init__(self,
