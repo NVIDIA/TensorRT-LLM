@@ -308,8 +308,10 @@ PERF_METRIC_THRESHOLD = {
     PerfMetricType.CONTEXT_GPU_MEMORY:
     (0.1, 50),  # Ignore context GPU memory < 50MiB
     PerfMetricType.KV_CACHE_SIZE: (-0.1, 50),  # Ignore value < 50MiB
-    PerfMetricType.DISAGG_SERVER_E2EL: (0.1, 50),  # Ignore E2EL < 50ms?
-    PerfMetricType.DISAGG_SERVER_TTFT: (0.1, 50),  # Ignore TTFT < 50ms?
+    PerfMetricType.DISAGG_SERVER_E2EL: (0.1,
+                                        50),  # Ignore E2EL regression < 50ms
+    PerfMetricType.DISAGG_SERVER_TTFT: (0.1,
+                                        50),  # Ignore TTFT regression < 50ms
 }
 
 BUILDER_METRICS = [
@@ -1967,6 +1969,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             yaml.dump(ctx_config, f)
         with open(gen_config_path, 'w', encoding='utf-8') as f:
             yaml.dump(gen_config, f)
+
+        print_info(f"ctx_server_config: {ctx_config}")
+        print_info(f"gen_server_config: {gen_config}")
 
         model_path = MODEL_PATH_DICT[self._config.model_name]
         model_dir = os.path.join(llm_models_root(), model_path)

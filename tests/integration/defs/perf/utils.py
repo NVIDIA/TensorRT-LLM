@@ -567,8 +567,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
         }
 
         # Serialize the commands.
-        # serialized_cmd = self.get_commands().get_cmd_str(cmd_idx)
-        serialized_cmd = "placeholder for disaggregated server"
+        serialized_cmd = self.get_commands().get_cmd_str(cmd_idx)
         # Save engine building log + benchmarking log in the csv file.
         raw_result = ""
         if 0 in outputs:
