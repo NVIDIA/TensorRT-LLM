@@ -657,6 +657,7 @@ class PyTorchModelEngine(ModelEngine):
                 # Zero the KV cache; NaNs may be introduced during warmup
                 for layer_idx in kv_cache_manager.layer_offsets.keys():
                     kv_cache_manager.get_buffers(layer_idx).zero_()
+                torch.cuda.synchronize()
 
             stack.callback(clean_up_kv_cache)
 
