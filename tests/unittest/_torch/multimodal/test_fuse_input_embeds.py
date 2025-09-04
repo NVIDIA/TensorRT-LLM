@@ -9,7 +9,9 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 def make_embedding(num_embeddings: int = 100,
                    hidden_size: int = 16,
                    device: str = "cpu") -> Embedding:
+    torch.manual_seed(0)
     emb = Embedding(num_embeddings=num_embeddings, embedding_dim=hidden_size)
+    emb.weight.data.normal_(mean=0.0, std=0.02)
     return emb.to(device)
 
 
