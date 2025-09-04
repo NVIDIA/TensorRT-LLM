@@ -107,8 +107,7 @@ class OpenAIServer:
         if disable_harmony:
             self.use_harmony = False
         else:
-            self.use_harmony = (self.model_config.model_type == "gpt_oss"
-                                and self.llm.args.num_postprocess_workers == 0)
+            self.use_harmony = (self.model_config.model_type == "gpt_oss")
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
