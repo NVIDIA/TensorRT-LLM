@@ -395,7 +395,8 @@ class LmEvalEvaluator(Evaluator):
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
             fewshot_as_multiturn=self.fewshot_as_multiturn,
-            system_instruction=self.system_prompt)
+            system_instruction=self.system_prompt,
+            confirm_run_unsafe_code=True)
         # Normalize scores to range 0~100
         scores = results["results"][self.task_name]
         for metric in scores.keys():
@@ -615,6 +616,100 @@ class GPQAExtended(LmEvalEvaluator):
     @staticmethod
     def command(ctx, **kwargs) -> None:
         GPQAExtended.command_harness(ctx, **kwargs)
+
+
+class HumanEval(LmEvalEvaluator):
+
+    def __init__(self, **kwargs):
+        super().__init__("humaneval", **kwargs)
+
+    @click.command("humaneval")
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to HumanEval dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--fewshot_as_multiturn",
+                  is_flag=True,
+                  default=False,
+                  help="Apply fewshot as multiturn.")
+    @click.option("--system_prompt",
+                  type=str,
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=2048,
+                  help="Maximum generation length.")
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        HumanEval.command_harness(ctx, **kwargs)
+
+
+class JsonSchemaBenchEasy(LmEvalEvaluator):
+
+    def __init__(self, **kwargs):
+        super().__init__("jsonschema_bench_easy", **kwargs)
+
+    @click.command("jsonschema_bench_easy")
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to JsonSchemaBench dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--fewshot_as_multiturn",
+                  is_flag=True,
+                  default=False,
+                  help="Apply fewshot as multiturn.")
+    @click.option("--system_prompt",
+                  type=str,
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=2048,
+                  help="Maximum generation length.")
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        JsonSchemaBenchEasy.command_harness(ctx, **kwargs)
 
 
 class MMMU(LmEvalEvaluator):
