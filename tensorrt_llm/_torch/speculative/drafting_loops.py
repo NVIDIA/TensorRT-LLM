@@ -20,13 +20,11 @@ from tensorrt_llm._torch.speculative.interface import SpecMetadata
 @contextmanager
 def save_metadata_state(attn_metadata: AttentionMetadata,
                         spec_metadata: SpecMetadata) -> None:
+    attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda",
+                                       "kv_lens_cuda")
     batch_size = attn_metadata.num_seqs
 
     if attn_metadata.is_cuda_graph:
-        seq_len = attn_metadata._seq_lens[:batch_size].clone()
-        seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
-        kv_lens = attn_metadata.kv_lens_cuda.clone()
-
         assert spec_metadata.is_cuda_graph
         num_tokens = spec_metadata.num_tokens
         if isinstance(spec_metadata, Eagle3SpecMetadata):
@@ -40,12 +38,8 @@ def save_metadata_state(attn_metadata: AttentionMetadata,
     try:
         yield
     finally:
+        attn_metadata.restore_from_spec_dec()
         if attn_metadata.is_cuda_graph:
-            attn_metadata._seq_lens[:batch_size].copy_(seq_len[:batch_size])
-            attn_metadata._seq_lens_cuda[:batch_size].copy_(
-                seq_len_cuda[:batch_size])
-            attn_metadata.kv_lens_cuda[:batch_size].copy_(kv_lens[:batch_size])
-
             spec_metadata.num_tokens = num_tokens
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.hidden_states_read_indices[:batch_size].copy_(
