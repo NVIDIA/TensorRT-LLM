@@ -97,7 +97,7 @@ void logitsBitmask(torch::Tensor const& logits, torch::Tensor const& bitmask,
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("logits_bitmask(Tensor logits, Tensor bitmask, Tensor? token_mask=None, Tensor? d2t=None) -> ()");
+    m.def("logits_bitmask(Tensor(a!) logits, Tensor bitmask, Tensor? token_mask=None, Tensor? d2t=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
