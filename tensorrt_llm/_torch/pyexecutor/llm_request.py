@@ -300,7 +300,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_draft: bool = False,
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
-            is_first_draft: Optional[bool] = False,
+            is_first_draft: bool = False,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",

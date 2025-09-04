@@ -1,7 +1,7 @@
 import bisect
 import contextlib
 import weakref
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -42,14 +42,12 @@ class CUDAGraphRunner:
         self.max_beam_width = engine.max_beam_width
         self.spec_config = engine.spec_config
 
-        self.graphs: Dict[Union[Tuple[int, int], Tuple[int, int, int]],
-                          torch.cuda.CUDAGraph] = {}
-        self.static_inputs: Dict[Union[Tuple[int, int], Tuple[int, int, int]],
-                                 Dict[str, torch.Tensor]] = {}
-        self.graph_outputs: Dict[Union[Tuple[int, int], Tuple[int, int, int]],
+        self.graphs: Dict[Tuple[int, int, int], torch.cuda.CUDAGraph] = {}
+        self.static_inputs: Dict[Tuple[int, int, int], Dict[str,
+                                                            torch.Tensor]] = {}
+        self.graph_outputs: Dict[Tuple[int, int, int],
                                  Callable[[], Optional[torch.Tensor]]] = {}
-        self.graph_metadata: Dict[Union[Tuple[int, int], Tuple[int, int, int]],
-                                  Dict[str, Any]] = {}
+        self.graph_metadata: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
         self.memory_pool = engine._cuda_graph_mem_pool
         self.padding_dummy_request: Optional["Request"] = None
 
@@ -71,7 +69,7 @@ class CUDAGraphRunner:
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft)
         else:
             draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
-            key = (batch_size, draft_len)
+            key = (batch_size, draft_len, True)
 
         return key
 
@@ -109,6 +107,7 @@ class CUDAGraphRunner:
         - A boolean indicating if a graph can be used.
         - The attn_metadata for the graph, if applicable.
         - The spec_metadata for the graph, if applicable.
+        - The key for the graph.
         """
         engine = self._get_engine()
 
@@ -155,12 +154,12 @@ class CUDAGraphRunner:
             spec_metadata = None
         return True, attn_metadata, spec_metadata, key
 
-    def needs_capture(self, key: Union[Tuple[int, int], Tuple[int, int, int]]):
+    def needs_capture(self, key: Tuple[int, int, int]):
 
         return key not in self.graph_outputs
 
-    def capture(self, key: Union[Tuple[int, int], Tuple[int, int, int]],
-                forward_fn: Callable, initial_inputs: Dict[str, Any]):
+    def capture(self, key: Tuple[int, int, int], forward_fn: Callable,
+                initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
         batch_size = key[0]
@@ -168,7 +167,8 @@ class CUDAGraphRunner:
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
-        token_per_request = key[1] + 1
+        max_draft_len = key[1]
+        token_per_request = max_draft_len + 1
 
         static_tensors = {
             "input_ids":
@@ -195,7 +195,6 @@ class CUDAGraphRunner:
             "attn_metadata": initial_inputs["attn_metadata"],
             "spec_metadata": spec_metadata,
         }
-        print(f"capture graph {key}")
 
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
@@ -213,7 +212,7 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
-    def replay(self, key: Union[Tuple[int, int], Tuple[int, int, int]],
+    def replay(self, key: Tuple[int, int, int],
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
         batch_size = key[0]

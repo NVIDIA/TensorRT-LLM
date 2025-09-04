@@ -825,7 +825,6 @@ class PyTorchModelEngine(ModelEngine):
                 continue
 
             for draft_len in draft_lengths:
-                # def _run_cuda_graph_warmup(bs, draft_len):
                 with release_batch(get_cuda_graph_warmup_request(
                         bs, draft_len)) as batch:
                     if batch is None:

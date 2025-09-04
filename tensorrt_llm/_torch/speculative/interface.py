@@ -61,6 +61,14 @@ class SpeculativeDecodingMode(IntEnum):
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target()
 
+    def needs_kv_cache_recompute(self):
+        """
+        Whether the draft model needs to recompute the kv cache.
+        If true, the 1st draft model forward will recompute the kv cache for
+        the accepted draft tokens.
+        """
+        return self.is_eagle3()
+
     def need_load_draft_weights(self):
         """
         Whether the draft model and target model are in the same model engine,
