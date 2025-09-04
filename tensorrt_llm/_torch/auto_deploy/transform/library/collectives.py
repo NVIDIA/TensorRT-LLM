@@ -1,13 +1,12 @@
-import operator
 from typing import Tuple
 
 import torch
 from torch.fx import GraphModule
 
-from ...distributed.trtllm import is_trtllm_op_available
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.node_utils import get_op_overload_packet, get_user_if_pattern_match, is_op
+from ...utils.node_utils import get_op_overload_packet, is_op
+from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 # TODO: This is an overly simplified model that works well for vanilla Llama models.
@@ -80,18 +79,39 @@ class FuseCollectives(BaseTransform):
         return gm, info
 
 
+def _allreduce_residual_rmsnorm_pattern(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 0.1253
+):
+    """
+    Reference PyTorch composition of:
+        y = all_reduce(x)
+        z = y + residual
+        normed = RMSNorm(z, weight, eps)
+    Returns (normed, z)
+    """
+
+    input_dtype = x.dtype
+    hidden_states = torch.ops.auto_deploy.torch_dist_all_reduce(x)
+    add = residual + hidden_states
+
+    hidden_states = add.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+
+    normed = weight * hidden_states.to(input_dtype)
+
+    return normed, add
+
+
+def _allreduce_residual_rmsnorm_repl(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+):
+    return torch.ops.dist.fused_allreduce_residual_rmsnorm(x, residual, weight, eps)
+
+
 @TransformRegistry.register("fuse_allreduce_residual_rmsnorm")
 class FuseAllreduceResidualRMSNorm(BaseTransform):
-    """Essentially, this transformation fuses the following operators into one allreduce trtllm implementation.
-
-    * target pattern:
-        x = all_reduce(x)
-        y = x + residual
-        return rmsnorm(y), y
-    * replacement:
-        fused_allreduce_residual_rmsnorm(x, residual, rmsnorm_weight, rmsnorm_eps)
-
-    """
+    """Fuse (allreduce + residual add + RMSNorm) into one fused op with tuple output."""
 
     def _apply(
         self,
@@ -100,105 +120,29 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        if not is_trtllm_op_available():
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+        patterns = ADPatternMatcherPass()
 
-        num_ar_r_rms_fusions = 0
+        # Dummy shapes for tracing
+        bsz, hidden = 8, 512
+        dummy_args = [
+            torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # x
+            torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # residual
+            torch.randn(hidden, device="meta", dtype=torch.bfloat16),  # weight
+            0.1253,  # eps
+        ]
 
-        def trace_and_fuse(allreduce_node, graph):
-            # Check if all_reduce is followed by addition
-            users = list(allreduce_node.users.keys())
-            if len(users) != 1:
-                return  # Skip if all_reduce has more than one consumer
-            add_node = users[0]
-
-            # Traverse nodes for RMSNorm pattern which is composed of to_copy, pow, mean, add, refer
-            # the Huggingface LlamaRMSNorm implementation as example for more details
-            to_copy_1 = get_user_if_pattern_match(add_node, [torch.ops.aten.add, operator.add], 2)
-            # operand of pow and mul
-            pow_node = get_user_if_pattern_match(
-                to_copy_1, [torch.ops.aten._to_copy, torch.ops.aten.to], 2
-            )
-            mean_node = get_user_if_pattern_match(pow_node, torch.ops.aten.pow, 1)
-            add_eps_node = get_user_if_pattern_match(mean_node, torch.ops.aten.mean, 1)
-            rsqrt_node = get_user_if_pattern_match(
-                add_eps_node, [torch.ops.aten.add, operator.add], 1
-            )
-            mul_node_1 = get_user_if_pattern_match(rsqrt_node, torch.ops.aten.rsqrt, 1)
-            to_copy_2 = get_user_if_pattern_match(mul_node_1, torch.ops.aten.mul, 1)
-            mul_node_2 = get_user_if_pattern_match(
-                to_copy_2, [torch.ops.aten._to_copy, torch.ops.aten.to], 1
-            )
-            # check args of ops: pow(2) and mean(-1)
-            ARGS_MATCH = pow_node is not None and pow_node.args[1] == 2  # exponent
-            ARGS_MATCH &= mean_node is not None and mean_node.args[1] == [-1]  # dimensions
-
-            # Match found: Replace with fused operation
-            if (
-                to_copy_1
-                and pow_node
-                and mean_node
-                and add_eps_node
-                and rsqrt_node
-                and mul_node_1
-                and to_copy_2
-                and mul_node_2
-                and ARGS_MATCH
-            ):
-                # Gather the inputs for the custom operation
-                tensor = allreduce_node.args[0]
-                # Identify the residual argument in the add operation
-                # One of the args in add_node.args is the output of all_reduce
-                # The same idea also applies to norm_weight
-                residual = (
-                    add_node.args[0] if add_node.args[1] is allreduce_node else add_node.args[1]
-                )
-                norm_weight = (
-                    mul_node_2.args[0] if mul_node_2.args[1] is to_copy_2 else mul_node_2.args[1]
-                )
-                eps = add_eps_node.args[1]
-
-                # Insert nodes
-                with graph.inserting_before(allreduce_node):
-                    fused_node = graph.call_function(
-                        torch.ops.dist.fused_allreduce_residual_rmsnorm,
-                        args=(
-                            tensor,
-                            residual,
-                            norm_weight,
-                            eps,
-                        ),
-                    )
-                    # Extract outputs from the tuple returned by `fused_node`
-                    final_output_node = gm.graph.create_node(
-                        "call_function",
-                        target=operator.getitem,
-                        args=(fused_node, 0),
-                    )
-                    add_output_node = gm.graph.create_node(
-                        "call_function",
-                        target=operator.getitem,
-                        args=(fused_node, 1),
-                    )
-
-                    # Replace all uses of rmsnorm_node with final_output_node
-                    mul_node_2.replace_all_uses_with(final_output_node)
-
-                    # Replace all uses of add_node with add_output_node
-                    add_node.replace_all_uses_with(add_output_node)
-
-                nonlocal num_ar_r_rms_fusions
-                num_ar_r_rms_fusions += 1
-
-        # Traverse all nodes
-        for node in gm.graph.nodes:
-            if is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
-                trace_and_fuse(allreduce_node=node, graph=gm.graph)
-
-        info = TransformInfo(
-            skipped=False, num_matches=num_ar_r_rms_fusions, is_clean=False, has_valid_shapes=False
+        register_ad_pattern(
+            search_fn=_allreduce_residual_rmsnorm_pattern,
+            replace_fn=_allreduce_residual_rmsnorm_repl,
+            patterns=patterns,
+            dummy_args=dummy_args,
+            op_ignore_types={torch.ops.aten.to.dtype: (torch.dtype,)},
+            scalar_workaround={"eps": 0.1253},
         )
 
+        num_matches = patterns.apply(gm.graph)
+
+        info = TransformInfo(
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+        )
         return gm, info
