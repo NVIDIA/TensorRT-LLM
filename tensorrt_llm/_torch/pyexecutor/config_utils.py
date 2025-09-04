@@ -1,5 +1,7 @@
 def is_nemotron_hybrid(config):
-    if hasattr(config, "hybrid_override_pattern"):
+    if hasattr(config, "hybrid_override_pattern"
+               ) and config.hybrid_override_pattern is not None and len(
+                   config.hybrid_override_pattern) > 0:
         return True
     return False
 
