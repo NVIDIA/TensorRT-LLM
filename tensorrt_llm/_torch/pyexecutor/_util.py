@@ -3,6 +3,7 @@ import random
 from typing import Dict, List, Optional
 
 import torch
+from transformers import AutoTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
@@ -132,6 +133,58 @@ class KvCacheCreator:
             f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
             f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
         return int(available_kv_mem)
+
+    def _create_dummy_mm_context_request(
+            self, input_seq_len: int) -> List[trtllm.Request]:
+        self._model_name_or_path = getattr(self._model_engine.model,
+                                           "name_or_path", None)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self._model_name_or_path)
+        input_processor = create_input_processor(self._model_name_or_path,
+                                                 self._tokenizer)
+        if not (hasattr(input_processor, "get_prompt_for_profiling")):
+            logger.warning("The input processor of the model does not have the method [get_prompt_for_profiling] implemented." \
+            "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
+            "ViT's encoder")
+            return self._create_dummy_context_requests(input_seq_len)
+        text_prompt = input_processor.get_prompt_for_profiling()
+        max_beam_width = self._executor_config.max_beam_width
+        input_processor_with_hash = create_input_processor_with_hash(
+            input_processor)
+        prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
+            text_prompt, None)
+        multimodal_input = extra_processed_inputs.get('multimodal_input')
+        multimodal_data = extra_processed_inputs.get('multimodal_data')
+
+        requests = []
+        max_num_tokens = len(prompt_token_ids)
+        remaining_tokens = max(max_num_tokens, input_seq_len)
+        # add +1 to max_num_tokens to avoid assert in line 772 of tensorrt_llm/_torch/attention_backend/trtllm.py
+        self._executor_config.max_seq_len = remaining_tokens + 1
+        if remaining_tokens > input_seq_len:
+            logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len." \
+                           f"Multimedia prompt has {remaining_tokens} while the input_seq_len is: {input_seq_len}")
+        while remaining_tokens > 0:
+            req_mm_input = trtllm.MultimodalInput(
+                multimodal_hashes=multimodal_input.multimodal_hashes,
+                multimodal_positions=multimodal_input.multimodal_positions,
+                multimodal_lengths=multimodal_input.multimodal_lengths)
+            request = trtllm.Request(prompt_token_ids,
+                                     max_tokens=1,
+                                     streaming=False,
+                                     sampling_config=trtllm.SamplingConfig(
+                                         beam_width=max_beam_width, ),
+                                     output_config=trtllm.OutputConfig(),
+                                     end_id=-1,
+                                     multimodal_input=req_mm_input)
+            request.py_multimodal_data = multimodal_data
+            remaining_tokens -= max_num_tokens
+            requests.append(request)
+
+        if self._mapping.enable_attention_dp:
+            requests = requests * self._mapping.tp_size
+
+        return requests
 
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
