@@ -384,7 +384,11 @@ class TorchStore:
             torch.tensor(reason.value,
                          dtype=self.finish_reasons.dtype,
                          device="cuda")
-            for reason in FinishReason
+            for reason in [
+                FinishReason.NOT_FINISHED, FinishReason.END_ID,
+                FinishReason.STOP_WORDS, FinishReason.LENGTH,
+                FinishReason.TIMED_OUT, FinishReason.CANCELLED
+            ]  # `in FinishReason` clashes with PyBind11: `TypeError: 'pybind11_type' object is not iterable`
         }
 
 
