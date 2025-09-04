@@ -62,6 +62,9 @@ class Eagle3ResourceManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
+        slot_id = self.slot_manager.get_slot(request.request_id)
+        self.seq_lens[slot_id] = 0
+        self.start_indices[slot_id] = 0
         self.slot_manager.remove_slot(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
@@ -92,7 +95,7 @@ class Eagle3SpecMetadata(SpecMetadata):
 
     def __post_init__(self):
         if self.layers_to_capture is None:
-            if self.num_layers == 1:
+            if self.is_draft_model or self.num_layers == 1:
                 self.layers_to_capture = (self.num_layers - 1, )
             else:
                 if self.num_layers <= 5:
@@ -296,18 +299,13 @@ class Eagle3OneModelWorker(nn.Module):
             logits, attn_metadata, spec_metadata)
 
         # Save the old attn_metadata and spec_metadata
-        if attn_metadata.is_cuda_graph:
-            seq_len = attn_metadata._seq_lens[:batch_size].clone()
-            seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
         # Prepare inputs for the 1st draft model forward
         position_ids = position_ids.squeeze(0)
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
             position_ids=position_ids,
-            last_tokens_idx=last_tokens_idx,
             hidden_states=hidden_states,
             accepted_tokens=accepted_tokens,
             attn_metadata=attn_metadata,
@@ -324,7 +322,8 @@ class Eagle3OneModelWorker(nn.Module):
                                   num_accepted_tokens[num_contexts:] - 1 +
                                   attn_metadata.num_ctx_tokens)
                 gather_ids = torch.concat(
-                    [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
+                    [spec_metadata.gather_ids[:num_contexts], gather_ids_gen],
+                    dim=0)
             else:
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
@@ -388,10 +387,8 @@ class Eagle3OneModelWorker(nn.Module):
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn_metadata to support cuda graph
-        if attn_metadata.is_cuda_graph:
-            attn_metadata._seq_lens[:batch_size].copy_(seq_len)
-            attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
-            attn_metadata.on_update()
+        attn_metadata.restore_from_spec_dec()
+        attn_metadata.on_update()
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
@@ -482,7 +479,6 @@ class Eagle3OneModelWorker(nn.Module):
         self,
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor,
-        last_tokens_idx: torch.LongTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -506,7 +502,8 @@ class Eagle3OneModelWorker(nn.Module):
                                          device="cuda")
         input_ids_ctx[:-1].copy_(input_ctx_ids[1:])
         input_ids_ctx[
-            last_tokens_idx[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+            spec_metadata.
+            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
