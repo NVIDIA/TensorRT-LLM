@@ -28,7 +28,7 @@ if __name__ == '__main__':
     main()
 ```
 
-The blocks from the prompts are stored for reuse with the default priority of 35 on a scale from one to 100, where 100 is highest priority and one is lowest priority. Assume you know that the first four tokens of each prompt represent a system prompt that should be stored with high priority (100). You can achieve this by providing a KV cache retention config object when you submit the prompts for generation:
+The blocks from the prompts are stored for reuse with the default priority of 35 on a scale from 1 to 100, where 100 is highest priority and 1 is lowest priority. Assume you know that the first four tokens of each prompt represent a system prompt that should be stored with high priority (100). You can achieve this by providing a KV cache retention config object when you submit the prompts for generation:
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
