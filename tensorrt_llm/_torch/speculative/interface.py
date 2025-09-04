@@ -17,6 +17,7 @@ class SpeculativeDecodingMode(IntEnum):
     NGRAM = auto()
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
+    SAVE_HIDDEN_STATES = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -49,6 +50,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_draft_target(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
+
+    def is_save_hidden_states(self):
+        return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def without_logits(self):
         return self.is_mtp() or self.is_eagle3_one_model()
@@ -88,7 +92,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def has_spec_drafter(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided()
+        ) or self.is_user_provided() or self.is_save_hidden_states()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -198,9 +202,23 @@ class SpecMetadata:
         """
         return False
 
+    def is_final_output_capture(self):
+        """
+        Whether the layer should be captured (eg for Eagle3).
+        Captured after layer norm in modeling_speculative.
+        """
+        return False
+
     def maybe_capture_hidden_states(self, layer_id: int,
                                     hidden_states: torch.Tensor,
                                     residual: torch.Tensor) -> None:
+        """
+        Some spec decode algorithms require hidden states from the target
+        model. Use this method to record them. By default, does nothing.
+        """
+
+    def maybe_capture_final_hidden_states(self,
+                                          hidden_states: torch.Tensor) -> None:
         """
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.

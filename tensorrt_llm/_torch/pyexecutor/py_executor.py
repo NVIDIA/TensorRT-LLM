@@ -936,6 +936,8 @@ class PyExecutor:
         if self.drafter is not None:
             self.use_spec_decode = self.drafter.should_use_spec_decode(
                 self.active_requests)
+            self.draft_forward_post_needed = self.drafter.needs_draft_forward_post(
+            )
             self.model_engine.enable_spec_decode = self.use_spec_decode
             # If speculation is off, this function sets py_draft_tokens to None
             # for all active requests. If it's on, we initialize py_draft_tokens
@@ -1053,6 +1055,10 @@ class PyExecutor:
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
+                    if self.drafter is not None and self.draft_forward_post_needed:
+                        self.drafter.prepare_draft_tokens_post(
+                            scheduled_batch, self.resource_manager,
+                            self.is_warmup)
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state)
