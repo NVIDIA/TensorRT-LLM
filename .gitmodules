@@ -29,4 +29,4 @@
 [submodule "3rdparty/DeepGEMM"]
 	path = 3rdparty/DeepGEMM
 	url = https://github.com/ruoqianguo/DeepGEMM.git
-	branch = dev/ruoqiang/swapab_sm100
+	branch = swapab_sm100
