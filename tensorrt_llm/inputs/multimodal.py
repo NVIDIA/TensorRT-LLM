@@ -517,6 +517,9 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                     num_frames=len(item),
                 )
                 modality_token_lengths.append(num_tokens)
+            else:
+                # TODO: add audio support if needed
+                raise ValueError(f"Unsupported modality: {modality}")
 
         num_mm_tokens[modality] = modality_token_lengths
 
@@ -540,7 +543,7 @@ def find_mm_token_positions(
         input_ids: Token sequence (tensor, list, or numpy array)
         num_mm_tokens: List of lengths for each multimodal token chunk
         vocab_size: Size of the model's vocabulary
-        mm_token_ids: possible token ids for multimodal tokens
+        mm_token_ids: Possible token ids for multimodal tokens
 
     Returns:
         List of starting positions for each multimodal token chunk
@@ -561,8 +564,6 @@ def find_mm_token_positions(
     if mm_token_ids is None:
         mm_mask = input_ids >= vocab_size
     else:
-        if not isinstance(mm_token_ids, torch.Tensor):
-            mm_token_ids = torch.tensor(mm_token_ids)
         if mm_token_ids.ndim != 1:
             raise ValueError("mm_token_ids must be a 1D tensor")
         mm_token_ids = torch.unique(mm_token_ids)

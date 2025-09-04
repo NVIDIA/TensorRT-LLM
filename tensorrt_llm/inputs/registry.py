@@ -50,15 +50,22 @@ class BaseMultimodalInputProcessor:
     models. Specific processors can override these methods if they need custom logic.
     """
 
+    def get_processor(self) -> Optional[Any]:
+        """Return the processor object if available; otherwise raise NotImplementedError.
+        """
+        if not hasattr(self, 'processor') and not hasattr(self, '_processor'):
+            raise NotImplementedError(
+                f"cannot find processor in {self.__class__.__name__}. "
+                "Please ensure the processor is stored under self.processor or self._processor."
+            )
+        return getattr(self, 'processor', getattr(self, '_processor', None))
+
     def get_vocab_size(self) -> Optional[int]:
         """Return the tokenizer/model vocabulary size if available; otherwise None.
 
         Resolution order:
         1) self.model_config.vocab_size
         2) self.tokenizer.vocab_size
-
-        Raises:
-            NotImplementedError: If the vocabulary size cannot be determined.
         """
         # 1) Model config
         if hasattr(self, 'model_config') and getattr(
@@ -77,20 +84,11 @@ class BaseMultimodalInputProcessor:
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
         """Return multimodal token IDs if available; otherwise None.
-
-        Resolution order:
-        1) self.processor.mm_token_ids
-        2) self._processor.mm_token_ids
         """
-        # Processor
-        if hasattr(self, 'processor') and getattr(
-                self.processor, 'mm_token_ids', None) is not None:
-            return self.processor.mm_token_ids
-
-        # _Processor
-        if hasattr(self, '_processor') and getattr(
-                self._processor, 'mm_token_ids', None) is not None:
-            return self._processor.mm_token_ids
+        processor = self.get_processor()
+        if processor is not None and getattr(processor, 'mm_token_ids',
+                                             None) is not None:
+            return processor.mm_token_ids
 
         logger.warning(
             f"Cannot determine mm_token_ids from {self.__class__.__name__}. "
@@ -102,14 +100,11 @@ class BaseMultimodalInputProcessor:
     def get_num_multimodal_tokens(self):
         """
         Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
-
         """
-        if hasattr(self, 'processor') and hasattr(self.processor,
-                                                  '_get_num_multimodal_tokens'):
-            return self.processor._get_num_multimodal_tokens
-        elif hasattr(self, '_processor') and hasattr(
-                self._processor, '_get_num_multimodal_tokens'):
-            return self._processor._get_num_multimodal_tokens
+        processor = self.get_processor()
+        if processor is not None and hasattr(processor,
+                                             '_get_num_multimodal_tokens'):
+            return processor._get_num_multimodal_tokens
         else:
             raise NotImplementedError(
                 f"get_num_multimodal_tokens not implemented for {self.__class__.__name__}. "
@@ -491,8 +486,9 @@ def create_input_processor_with_hash(
         modalities = list(set(inputs['multi_modal_data'].keys())
                           ) if 'multi_modal_data' in inputs else []
         if len(modalities) > 0:
-            # TODO: support multiple modalities for multimodal hashing (for kv cache reuse, chunked prefill, etc.)
-            if len(modalities) == 1:
+            # TODO: support multimodal hashing for multiple modalities within the same request
+            # TODO: add audio support
+            if len(modalities) == 1 and modalities[0] in ['image', 'video']:
                 # only try multimodal hashing if the inputs only contain image data
                 if input_processor.multimodal_hashing_supported is not None:
                     use_multimodal_hashing = input_processor.multimodal_hashing_supported
