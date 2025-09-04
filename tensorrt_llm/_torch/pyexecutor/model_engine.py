@@ -294,7 +294,10 @@ class PyTorchModelEngine(ModelEngine):
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
         self.pytorch_backend_config = pytorch_backend_config
-        self.original_max_draft_len = spec_config.max_draft_len
+        if spec_config is not None:
+            self.original_max_draft_len = spec_config.max_draft_len
+        else:
+            self.original_max_draft_len = 0
         if spec_config is not None and is_draft_model:
             spec_config.max_draft_len = 0
         self.spec_config = spec_config
@@ -816,7 +819,7 @@ class PyTorchModelEngine(ModelEngine):
                 # value. This will save on memory.
                 and self.spec_config.max_concurrency is not None):
             draft_lengths.append(0)
-        if self.is_draft_model:
+        if self.is_spec_decode and self.is_draft_model:
             draft_lengths.append(self.original_max_draft_len)
 
         for bs in cuda_graph_batch_sizes:
@@ -1514,7 +1517,7 @@ class PyTorchModelEngine(ModelEngine):
                                         pin_memory=True)
             self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
                                                              non_blocking=True)
-        if len(num_accepted_draft_tokens) > 0:
+        if self.is_spec_decode and len(num_accepted_draft_tokens) > 0:
             num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
                                                      dtype=torch.int,
                                                      pin_memory=True)
