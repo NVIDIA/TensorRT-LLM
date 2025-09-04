@@ -29,8 +29,6 @@ The two model implementation supports the following speculative decoding algorit
 
 For all speculation algorithms, when speculation is enabled, a single sequence of draft tokens with length `max_draft_len` is created for every request. There is currently no way to dynamically disable speculation, thus speed ups are only observable at low batch sizes.
 
-Two-model based speculation implementations do not support overlap scheduler. It will be disabled automatically. 
-
 ### Draft/Target
 
 Draft/target is the simplest form of speculative decoding. In this approach, an arbitrary draft model is used to produce draft tokens. It is important to make sure that the draft and target models were trained with the same tokenizer, else the acceptance rate is extremely low and performance is regressed.
@@ -188,8 +186,7 @@ draft tokens to be attached to the `py_draft_tokens` field of request that specu
 
 ## Two Model Speculative Decoding Architecture
 
-Note that there are currently a few limitations on the two model implementation:
-* Overlap scheduling must be disabled.
+Two-model based speculation implementations do not support overlap scheduler. It will be disabled automatically. 
 
 In this approach, there are two new steps to the `PyExecutor`'s `_executor_loop`.
 * `_prepare_draft_requests`
