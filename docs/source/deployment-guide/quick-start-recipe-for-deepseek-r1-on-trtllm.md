@@ -35,7 +35,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc5 \
+nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc6 \
 /bin/bash
 ```
 
@@ -250,7 +250,7 @@ To run the evaluation harness exec into the running TensorRT-LLM container and i
 ```shell
 docker exec -it tensorrt_llm /bin/bash
 
-pip install lm_eval
+pip install -U lm-eval
 ```
 
 FP8 command for GSM8K:

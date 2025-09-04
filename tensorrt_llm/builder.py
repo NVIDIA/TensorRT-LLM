@@ -479,6 +479,44 @@ class Builder():
 
 @dataclass
 class BuildConfig:
+    """Configuration class for TensorRT-LLM engine building parameters.
+
+    This class contains all the configuration parameters needed to build a TensorRT-LLM engine,
+    including sequence length limits, batch sizes, optimization settings, and various features.
+
+    Args:
+        max_input_len (int): Maximum length of input sequences. Defaults to 1024.
+        max_seq_len (int, optional): The maximum possible sequence length for a single request, including both input and generated output tokens. Defaults to None.
+        opt_batch_size (int): Optimal batch size for engine optimization. Defaults to 8.
+        max_batch_size (int): Maximum batch size the engine can handle. Defaults to 2048.
+        max_beam_width (int): Maximum beam width for beam search decoding. Defaults to 1.
+        max_num_tokens (int): Maximum number of batched input tokens after padding is removed in each batch. Defaults to 8192.
+        opt_num_tokens (int, optional): Optimal number of batched input tokens for engine optimization. Defaults to None.
+        max_prompt_embedding_table_size (int): Maximum size of prompt embedding table for prompt tuning. Defaults to 0.
+        kv_cache_type (KVCacheType, optional): Type of KV cache to use (CONTINUOUS or PAGED). If None, defaults to PAGED. Defaults to None.
+        gather_context_logits (int): Whether to gather logits during context phase. Defaults to False.
+        gather_generation_logits (int): Whether to gather logits during generation phase. Defaults to False.
+        strongly_typed (bool): Whether to use strongly_typed. Defaults to True.
+        force_num_profiles (int, optional): Force a specific number of optimization profiles. If None, auto-determined. Defaults to None.
+        profiling_verbosity (str): Verbosity level for TensorRT profiling ('layer_names_only', 'detailed', 'none'). Defaults to 'layer_names_only'.
+        enable_debug_output (bool): Whether to enable debug output during building. Defaults to False.
+        max_draft_len (int): Maximum length of draft tokens for speculative decoding. Defaults to 0.
+        speculative_decoding_mode (SpeculativeDecodingMode): Mode for speculative decoding (NONE, MEDUSA, EAGLE, etc.). Defaults to SpeculativeDecodingMode.NONE.
+        use_refit (bool): Whether to enable engine refitting capabilities. Defaults to False.
+        input_timing_cache (str, optional): Path to input timing cache file. If None, no input cache used. Defaults to None.
+        output_timing_cache (str): Path to output timing cache file. Defaults to 'model.cache'.
+        lora_config (LoraConfig): Configuration for LoRA (Low-Rank Adaptation) fine-tuning. Defaults to default LoraConfig.
+        auto_parallel_config (AutoParallelConfig): Configuration for automatic parallelization. Defaults to default AutoParallelConfig.
+        weight_sparsity (bool): Whether to enable weight sparsity optimization. Defaults to False.
+        weight_streaming (bool): Whether to enable weight streaming for large models. Defaults to False.
+        plugin_config (PluginConfig): Configuration for TensorRT-LLM plugins. Defaults to default PluginConfig.
+        use_strip_plan (bool): Whether to use stripped plan for engine building. Defaults to False.
+        max_encoder_input_len (int): Maximum encoder input length for encoder-decoder models. Defaults to 1024.
+        dry_run (bool): Whether to perform a dry run without actually building the engine. Defaults to False.
+        visualize_network (str, optional): Path to save network visualization. If None, no visualization generated. Defaults to None.
+        monitor_memory (bool): Whether to monitor memory usage during building. Defaults to False.
+        use_mrope (bool): Whether to use Multi-RoPE (Rotary Position Embedding) optimization. Defaults to False.
+    """
     max_input_len: int = 1024
     max_seq_len: int = None
     opt_batch_size: int = 8

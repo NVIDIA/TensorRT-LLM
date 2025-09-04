@@ -1,4 +1,4 @@
-# Quick Start Recipe for Llama4 Scout 17B FP8 and NVFP4
+# Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell & Hopper Hardware
 
 ## Introduction
 
@@ -38,7 +38,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc4 \
+nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc6 \
 /bin/bash
 ```
 
@@ -177,7 +177,7 @@ These options provide finer control over performance and are set within a YAML f
 
 &emsp;**Default**: TRTLLM
 
-See the [TorchLlmArgs](https://github.com/nvidia/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_args.py#L1980) class for the full list of options which can be used in the `extra_llm_api_options`.
+See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) class for the full list of options which can be used in the `extra_llm_api_options`.
 
 ## Testing API Endpoint
 
@@ -227,7 +227,7 @@ To run the evaluation harness exec into the running TensorRT-LLM container and i
 ```shell
 docker exec -it tensorrt_llm /bin/bash
 
-pip install lm_eval
+pip install -U lm-eval
 ```
 
 FP8 command for GSM8K

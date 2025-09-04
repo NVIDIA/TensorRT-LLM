@@ -1,5 +1,3 @@
-(support-matrix)=
-
 # Support Matrix
 
 TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA GPUs. The following sections provide a list of supported GPU architectures as well as important features implemented in TensorRT-LLM.
