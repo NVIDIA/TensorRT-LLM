@@ -756,6 +756,9 @@ def generate_dummy_loras(
         )
     except Exception:
         # Fallback to auto device mapping if CPU loading fails
+        print(
+            "Warning: Loading model to CPU failed, falling back to auto device mapping"
+        )
         model = AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
             torch_dtype=torch.float16,
@@ -960,7 +963,7 @@ def test_llm_torch_multi_lora_support(
         # Create LoRA requests for different adapters
         lora_requests = []
         for i in range(len(input_prompts)):
-            if i in [0, 3]:  # Add some requests without LoRA
+            if i % 2 == 1:  # Add some requests without LoRA
                 lora_requests.append(None)
             else:  # With LoRA
                 lora_requests.append(
