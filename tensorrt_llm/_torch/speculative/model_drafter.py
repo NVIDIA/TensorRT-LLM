@@ -346,7 +346,6 @@ class ModelDrafter(Drafter):
 
         return new_requests
 
-
     def update_cur_draft_layer_idx(
             self,
             cur_draft_layer_idx: int,
@@ -423,7 +422,8 @@ class ModelDrafter(Drafter):
                 self.guided_decoder.add_batch(draft_batch)
                 self.guided_decoder.execute(outputs['logits'],
                                             d2t=outputs.get('d2t'))
-            sample_state = self._sample_async(draft_batch, outputs, resource_manager)
+            sample_state = self._sample_async(draft_batch, outputs,
+                                              resource_manager)
             previous_batch = sample_state
 
             self._update_request_states(draft_batch)
@@ -447,7 +447,8 @@ class ModelDrafter(Drafter):
                     self.guided_decoder.add_batch(draft_batch)
                     self.guided_decoder.execute(outputs['logits'],
                                                 d2t=outputs.get('d2t'))
-                sample_state = self._sample_async(draft_batch, outputs, resource_manager)
+                sample_state = self._sample_async(draft_batch, outputs,
+                                                  resource_manager)
                 self._update_request_states(draft_batch)
                 if previous_batch is not None:
                     new_requests = self._process_decoded_tokens(
