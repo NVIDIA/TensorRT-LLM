@@ -30,7 +30,7 @@ See [this example](../examples/kvcacheretentionconfig.md) for an example of how 
 
 ### Speculative Decoding
 
-Reuse across requests is only supported for one model MTP. All other [speculative decoding](speculative-decoding.md) algorithms must disable block reuse.
+Reuse across requests is supported by all speculative decoding models. Please see [speculative decoding](speculative-decoding.md) for more details.
 
 ## Limited Attention Window Size
 
