@@ -1057,28 +1057,40 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(
-        reason=
-        "Skipped because cyclic kv cache is disabled on the feature branch")
-    def test_auto_dtype_vswa(self):
-        # # NOTE: Test with VSWA kv cache config.
-        # self.kv_cache_config.max_attention_window = [
-        #     512, 512, 512, 512, 512, 32768
-        # ]  # Gemma3 1B attention window size pattern
-        # # TODO: uncomment to use the real window pattern when optimal KV cache allocation is supported
+    def test_auto_dtype_vswa_without_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
 
-        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_auto_dtype_chunked_prefill(self):
-        # # NOTE: Test with VSWA kv cache config.
-        # self.kv_cache_config.max_attention_window = [
-        #     512, 512, 512, 512, 512, 32768
-        # ]  # Gemma3 1B attention window size pattern
-        # # TODO: uncomment to use the real window pattern when optimal KV cache allocation is supported
+    def test_auto_dtype_vswa_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
 
         # chunked prefill case or more features
         extra_llm_config = dict(
@@ -1086,7 +1098,27 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             max_num_tokens=1024,
         )
         with LLM(self.MODEL_PATH,
-                 kv_cache_config=self.kv_cache_config,
+                 kv_cache_config=kv_cache_config,
+                 **extra_llm_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_auto_dtype_vswa_chunked_prefill_reuse(self):
+        # NOTE: Test with VSWA kv cache config.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+        )
+
+        # chunked prefill case or more features
+        extra_llm_config = dict(
+            enable_chunked_prefill=True,
+            max_num_tokens=1024,
+        )
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
                  **extra_llm_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
