@@ -430,8 +430,8 @@ protected:
         int worldSize = tensorrt_llm::mpi::MpiComm::world().getSize();
         int worldRank = tensorrt_llm::mpi::MpiComm::world().getRank();
         tensorrt_llm::mpi::MpiComm::world().barrier();
-        int contextRanks = contextTp * contextPp;
-        int genRanks = genTp * genPp;
+        int contextRanks = contextTp * contextPp * contextCp;
+        int genRanks = genTp * genPp * genCp;
         int nprocs = (contextRanks + genRanks);
 
         mIsContext = false;
@@ -446,8 +446,9 @@ protected:
         {
             return;
         }
-        TLLM_LOG_INFO("Run cacheTransceiverTest for ContextTp: %d, ContextPp: %d, GenTp: %d, GenPp:%d", contextTp,
-            contextPp, genTp, genPp);
+        TLLM_LOG_INFO(
+            "Run cacheTransceiverTest for ContextTp: %d, ContextPp: %d, ContextCp: %d, GenTp: %d, GenPp:%d, GenCp:%d",
+            contextTp, contextPp, contextCp, genTp, genPp, genCp);
         mComm = std::addressof(mParticipatingComm);
 
         mWorldSize = mComm->getSize();
@@ -457,7 +458,7 @@ protected:
             mIsContext = mRank < contextRanks;
             mIsGeneration = (mRank >= contextRanks && mRank < (contextRanks + genRanks));
             mRankInInstance = mIsContext ? mRank : (mRank - contextRanks);
-            mSizeInInstance = mIsContext ? (contextTp * contextPp) : (genTp * genPp);
+            mSizeInInstance = mIsContext ? (contextTp * contextPp * contextCp) : (genTp * genPp * genCp);
             int color = 0;
             if (mIsGeneration)
             {
@@ -483,7 +484,8 @@ protected:
             }
 
             mTpRank = mRankInInstance % mTpSize;
-            mPpRank = mRankInInstance / mTpSize;
+            mPpRank = mRankInInstance / (mTpSize * mCpSize);
+            mCpRank = (mRankInInstance % (mTpSize * mCpSize)) / mTpSize;
             mContextRankSize = contextRanks;
             mGenRankSize = genRanks;
             mContextTpSize = contextTp;
@@ -840,6 +842,19 @@ protected:
         return mRequester->receiveAsync(*llmRequest);
     }
 
+    // Called only by generationVerifyKVCache. Currently, generation ranks might over-allocate blocks when CP is
+    // enabled.
+    bool isBlockOverallocated(int blockIdx, int numTotalBlocks)
+    {
+        bool const generationHasCP = mCpSize > 1;
+        if (!generationHasCP)
+        {
+            return false;
+        }
+        int const numValidBlocks = getBlockNumAccountingForCP(mCpRank, mCpSize, numTotalBlocks, /*strict=*/true);
+        return blockIdx >= numValidBlocks;
+    }
+
     void generationVerifyKVCache(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         auto constexpr beamIdx{0};
@@ -849,12 +864,21 @@ protected:
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
+        int const numTotalBlocks = blockRange.getBlockIds().size();
         auto const numPools = mManager->getBlockManager().getNumPools();
         for (int poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
             for (auto& block : blockRange)
             {
+                if (isBlockOverallocated(blockIdx, numTotalBlocks))
+                {
+                    TLLM_LOG_INFO(
+                        "[generationVerifyKVCache] Skipping over-allocated block for request id %d (rank %d, blockIdx "
+                        "%d, numTotalBlocks %d)",
+                        llmRequest->mRequestId, mRank, blockIdx, numTotalBlocks);
+                    break;
+                }
                 verifyBlockData(block, blockIdx, llmRequest->getPromptLen(), poolIdx);
                 blockIdx++;
             }
@@ -965,7 +989,7 @@ protected:
         }
         int kvFactor = mCacheState->getAttentionConfig().mKvFactor;
         int tokensPerBlock = mCacheState->getModelConfig().mTokensPerBlock;
-        int startTokenId = blockId * tokensPerBlock;
+        int startTokenId = (blockId * mCpSize + mCpRank) * tokensPerBlock;
         int sizePerHead = mCacheState->getModelConfig().mSizePerHead;
 
         bufferManager.copy(blockData, *hostTensor);
@@ -1046,8 +1070,8 @@ protected:
     tensorrt_llm::mpi::MpiComm const* mComm;
     tensorrt_llm::mpi::MpiComm mParticipatingComm{nullptr, false};
     SizeType32 mWorldSize{0}, mRank{0}, mRankInInstance{0};
-    SizeType32 mSizeInInstance{0}, mTpRank{0}, mPpRank{0}, mTpSize{0}, mPpSize{0}, mCpSize{0}, mContextRankSize{0},
-        mGenRankSize{0}, mContextTpSize{0}, mContextPpSize{0}, mContextCpSize{0};
+    SizeType32 mSizeInInstance{0}, mTpRank{0}, mPpRank{0}, mCpRank{0}, mTpSize{0}, mPpSize{0}, mCpSize{0},
+        mContextRankSize{0}, mGenRankSize{0}, mContextTpSize{0}, mContextPpSize{0}, mContextCpSize{0};
     LlmRequest::RequestIdType mRequestId{0};
     bool mContextDP{false};
     bool mGenerationDP{false};
@@ -1098,6 +1122,11 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     bool generationDP = std::get<14>(param);
 
     bool isWindow = std::get<15>(param);
+
+    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
@@ -1192,6 +1221,10 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     bool generationDP = std::get<14>(param);
     bool isWindow = std::get<15>(param);
 
+    if (genCp > 1 && tensorrt_llm::common::getEnvUseNixlKvCache())
+    {
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL backend for CP.";
+    }
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
     if (mIsContext || mIsGeneration)
@@ -1339,6 +1372,44 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2ForMLAEvenLayer, AsymmetricalCacheTes
         testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false)));
+
+// Tests cases where there's non-trivial TP and PP on context side but only CP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2, 4),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false)));
+
+// Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & PP on gen side.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1, 2),
+        /*contextPp*/ testing::Values(1, 2),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(2),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(4),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(16),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(2),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
