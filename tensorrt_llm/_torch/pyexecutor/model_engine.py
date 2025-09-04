@@ -568,6 +568,7 @@ class PyTorchModelEngine(ModelEngine):
             if kv_cache_manager is not None:
                 buffer = kv_cache_manager.get_unique_primary_pool()
                 buffer.zero_()
+                torch.cuda.synchronize()
             return result
 
         return wrapper
