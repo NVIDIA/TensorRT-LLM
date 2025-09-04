@@ -403,6 +403,9 @@ class PyTorchModelEngine(ModelEngine):
             self.gather_ids_cuda = torch.empty((self.max_num_tokens, ),
                                                dtype=torch.int,
                                                device='cuda')
+            self.num_accepted_draft_tokens_cuda = torch.empty((batch_size, ),
+                                                              dtype=torch.int,
+                                                              device='cuda')
             self.previous_pos_indices_cuda = torch.empty(
                 (self.max_num_tokens, ), dtype=torch.int, device='cuda')
             self.previous_pos_id_offsets_cuda = torch.zeros(
@@ -1273,6 +1276,7 @@ class PyTorchModelEngine(ModelEngine):
         draft_lens = []
         multimodal_params_list = []
         gen_request_seq_slots = []  # per generation request
+        num_accepted_draft_tokens = []  # per request
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -1286,6 +1290,7 @@ class PyTorchModelEngine(ModelEngine):
             input_ids.extend(prompt_tokens)
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
+            num_accepted_draft_tokens.append(len(prompt_tokens) - 1)
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
@@ -1379,8 +1384,8 @@ class PyTorchModelEngine(ModelEngine):
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
                 prompt_lengths.append(request.py_prompt_len)
-
                 sequence_lengths.append(1 + num_draft_tokens)
+                num_accepted_draft_tokens.append(num_draft_tokens)
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
@@ -1401,6 +1406,7 @@ class PyTorchModelEngine(ModelEngine):
                 # overlap scheduler can only support the speculative decoding
                 # methods with a fixed number of draft tokens
                 sequence_lengths.append(1 + self.runtime_draft_len)
+                num_accepted_draft_tokens.append(self.runtime_draft_len)
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(self.runtime_draft_len)
                 gather_ids.extend(
@@ -1435,6 +1441,8 @@ class PyTorchModelEngine(ModelEngine):
                 len(input_ids) - 1 - (self.original_max_draft_len -
                                       request.py_num_accepted_draft_tokens))
             sequence_lengths.append(1 + self.original_max_draft_len)
+            num_accepted_draft_tokens.append(
+                request.py_num_accepted_draft_tokens)
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
@@ -1469,6 +1477,7 @@ class PyTorchModelEngine(ModelEngine):
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
+                num_accepted_draft_tokens.append(0)
                 gather_ids.append(len(position_ids) - 1)
 
             request_ids.append(request.py_request_id)
@@ -1506,6 +1515,13 @@ class PyTorchModelEngine(ModelEngine):
                                         pin_memory=True)
             self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
                                                              non_blocking=True)
+        if len(num_accepted_draft_tokens) > 0:
+            num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
+                                                     dtype=torch.int,
+                                                     pin_memory=True)
+            self.num_accepted_draft_tokens_cuda[:len(
+                num_accepted_draft_tokens)].copy_(num_accepted_draft_tokens,
+                                                  non_blocking=True)
         if next_draft_tokens_device is not None:
             # Initialize these two values to zeros
             self.previous_pos_id_offsets_cuda *= 0
@@ -1684,6 +1700,8 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = total_num_tokens
             spec_metadata.seq_lens = sequence_lengths
+            spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
+                num_accepted_draft_tokens)]
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 

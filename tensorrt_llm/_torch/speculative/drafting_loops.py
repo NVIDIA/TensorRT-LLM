@@ -105,9 +105,19 @@ class ChainDrafter(torch.nn.Module):
         logits = self.draft_model.forward(input_ids=input_ids,
                                           position_ids=position_ids,
                                           attn_metadata=attn_metadata,
-                                          spec_metadata=spec_metadata)
+                                          spec_metadata=spec_metadata,
+                                          return_context_logits=True)
+        logits = logits[spec_metadata.gather_ids]
 
         new_draft_tokens = [self.sample(logits)]
+        batch_size = attn_metadata.num_seqs
+        attn_metadata.kv_lens_cuda[:
+                                   batch_size] -= attn_metadata.seq_lens_cuda[:
+                                                                              batch_size] - spec_metadata.num_accepted_draft_tokens[:
+                                                                                                                                    batch_size] - 1
+        attn_metadata.seq_lens_cuda[:
+                                    batch_size] = spec_metadata.num_accepted_draft_tokens[:
+                                                                                          batch_size] + 1
 
         with save_metadata_state(attn_metadata, spec_metadata):
             batch_size = attn_metadata.num_seqs
@@ -117,7 +127,7 @@ class ChainDrafter(torch.nn.Module):
 
             prepare_for_generation(attn_metadata, spec_metadata,
                                    last_tokens_idx)
-
+            attn_metadata.use_spec_decoding = False
             for i in range(self.max_draft_len - 1):
                 logits = self.draft_model.forward(
                     input_ids=new_draft_tokens[-1],

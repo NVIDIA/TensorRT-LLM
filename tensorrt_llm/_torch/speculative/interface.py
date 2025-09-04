@@ -120,6 +120,8 @@ class SpecMetadata:
     seq_lens: Optional[List[int]] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
+    # The number of accepted draft tokens for each request.
+    num_accepted_draft_tokens: Optional[torch.Tensor] = None
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
