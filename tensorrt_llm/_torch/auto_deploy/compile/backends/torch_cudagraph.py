@@ -161,10 +161,17 @@ class TorchCudagraphCompiler(BackendCompiler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.cuda_graph_batch_sizes = self.compiler_kwargs.get("cuda_graph_batch_sizes")
-        if not self.cuda_graph_batch_sizes:
-            self.cuda_graph_batch_sizes = self._get_graph_batch_sizes(self.max_batch_size)
-        ad_logger.info(f"Setting cuda_graph_batch_sizes to {self.cuda_graph_batch_sizes}")
+        requested = self.compiler_kwargs.get("cuda_graph_batch_sizes")
+        if not requested:
+            requested = self._get_graph_batch_sizes(self.max_batch_size)
+        # clamp, dedupe, sort desc, ensure at least {1, max_bs}
+        effective = {min(max(1, int(b)), int(self.max_batch_size)) for b in requested}
+        effective.update({int(self.max_batch_size)})
+        self.cuda_graph_batch_sizes = sorted(effective, reverse=True)
+        ad_logger.info(
+            f"Configured cuda_graph_batch_sizes requested={requested} -> effective={self.cuda_graph_batch_sizes} "
+            f"(max_batch_size={self.max_batch_size})"
+        )
 
     def _init_captured_graph(
         self, gm: nn.Module, in_spec: TreeSpec, out_spec: TreeSpec

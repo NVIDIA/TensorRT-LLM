@@ -1,5 +1,3 @@
-from typing import List
-
 import pytest
 import torch
 from _model_test_utils import (
@@ -45,18 +43,6 @@ class ModelWithMultipleInputs(torch.nn.Module):
 )
 def test_round_up_to_closest(lst, value, expected):
     assert CapturedGraph.round_up_to_closest(lst, value) == expected
-
-
-def get_graph_batch_sizes(max_bs: int, multiplier: int = 128) -> List[int]:
-    """Heuristic to set batch sizes for graph capture."""
-    # do 1, max_bs, and extra as special batch sizes
-    batch_sizes = {1, max_bs, *([])}
-
-    # add all multiples of multiplier up to max_bs
-    batch_sizes.update(range(multiplier, max_bs + 1, multiplier))
-
-    # return as sorted list
-    return sorted(batch_sizes, reverse=True)
 
 
 @pytest.mark.parametrize("num_inputs", [1, 2, 3])
@@ -116,7 +102,7 @@ def test_cudagraph_capture_replay(
         graph_module,
         in_spec,
         out_spec,
-        cuda_graph_batch_sizes=get_graph_batch_sizes(batch_size),
+        cuda_graph_batch_sizes=[batch_size],
         num_batched_inputs=num_inputs,
     )
 

@@ -23,6 +23,7 @@ from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.sampling_params import SamplingParams
 
+# Global torch config, set the torch compile cache to fix up to llama 405B
 torch._dynamo.config.cache_size_limit = 20
 
 
