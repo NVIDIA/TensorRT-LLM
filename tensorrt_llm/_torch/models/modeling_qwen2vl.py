@@ -7,14 +7,13 @@ import torch.nn as nn
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..._utils import nvtx_range_debug
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -29,7 +28,7 @@ from .modeling_utils import register_auto_model, register_vision_encoder
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-class Qwen2VLInputProcessorBase(InputProcessor):
+class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -45,6 +44,9 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             trust_remote_code=trust_remote_code)
 
         self.tllm_multimodal_token_id = self.model_config.vocab_size + 1
+        # temporal patch size for video frames
+        self.temporal_patch_size = getattr(model_config.vision_config,
+                                           'temporal_patch_size', 1)
 
     @classmethod
     def get_rope_index(
@@ -219,38 +221,6 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         mrope_position_deltas = torch.tensor(
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
-
-    def get_num_tokens_per_image(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-        num_frames: int = 1,
-        do_resize: bool = True,
-    ):
-        patch_size = self.model_config.vision_config.patch_size
-        merge_size = self.model_config.vision_config.spatial_merge_size
-        temporal_patch_size = self.model_config.vision_config.temporal_patch_size
-        if do_resize:
-            resized_height, resized_width = smart_resize(
-                height=image_height,
-                width=image_width,
-                factor=patch_size * merge_size,
-                min_pixels=self.processor.image_processor.min_pixels,
-                max_pixels=self.processor.image_processor.max_pixels,
-            )
-            image_width, image_height = resized_width, resized_height
-
-        padded_num_frames = num_frames + num_frames % temporal_patch_size
-
-        grid_t = max(padded_num_frames // temporal_patch_size, 1)
-        grid_h = image_height // patch_size
-        grid_w = image_width // patch_size
-
-        num_patches = grid_t * grid_h * grid_w
-        num_vision_tokens = num_patches // (merge_size**2)
-
-        return num_vision_tokens
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):

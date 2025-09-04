@@ -1042,6 +1042,13 @@ class SlotManager:
             slot = self.slot_mapping.pop(request_id)
             self.free_slots.add(slot)
 
+    def shutdown(self):
+        req_ids_list = list(self.slot_mapping.keys())
+        for rid in req_ids_list:
+            self.remove_slot(rid)
+        assert len(self.slot_mapping) == 0 and len(
+            self.free_slots) == self.max_num_requests
+
 
 class ResourceManager:
 
