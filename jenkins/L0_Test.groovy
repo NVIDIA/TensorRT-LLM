@@ -1629,6 +1629,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 "--perf-log-formats yaml"
             ]
         }
+        if (stageName.contains("-Ray-")) {
+            testCmdLine += ["--run-ray"]
+        }
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
         sh "echo ${TRTLLM_WHL_PATH}"

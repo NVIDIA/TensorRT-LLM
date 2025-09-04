@@ -121,7 +121,8 @@ l0_h100:
       stage: pre_merge
       backend: pytorch
       orchestrator: ray
-  tests: []
+  tests:
+    - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
 - condition:
     ranges:
       system_gpu_count:
