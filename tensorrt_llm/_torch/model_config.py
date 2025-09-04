@@ -534,6 +534,9 @@ class ModelConfig(Generic[TConfig]):
                     break
 
         if head_size is None:
+            assert hidden_size % num_heads == 0, (
+                f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})"
+            )
             calculated_head_size = hidden_size // num_heads
             logger.warning(
                 f"head_size/head_dim is not set or None, using default value {calculated_head_size}"
