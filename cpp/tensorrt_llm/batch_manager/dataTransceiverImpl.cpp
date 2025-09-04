@@ -128,7 +128,22 @@ void DataSenderImpl::sendReadySignal(LlmRequest::RequestIdType requestId, bool i
     auto connections = session.getConnections();
     for (size_t i = 0; i < connections.size(); i++)
     {
-        connections.at(i)->send(executor::kv_cache::DataContext{kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
+        std::cout << "Connections " << i << " whether is nullptr: " << (connections.at(i) == nullptr) << std::endl;
+    }
+    for (size_t i = 0; i < connections.size(); i++)
+    {
+        auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+        if (agentConnectionManager != nullptr)
+        {
+            auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
+            std::cout << "Types of connections.at(i): " << typeid(*connections.at(i)).name() << std::endl;
+            TLLM_CHECK(agentConnection != nullptr);
+            agentConnection->sendReadySignal(executor::kv_cache::DataContext{kREADY_SIGNAL_TAG}, isReady);
+        }
+        else
+        {
+            connections.at(i)->send(executor::kv_cache::DataContext{kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
+        }
     }
 }
 
@@ -282,7 +297,17 @@ bool DataReceiverImpl::receiveReadySignal(TransferSession& session)
     // TODO: check if the logic is correct
     for (size_t i = 0; i < connections.size(); i++)
     {
-        connections.at(i)->recv(executor::kv_cache::DataContext{kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
+        auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+        if (agentConnectionManager != nullptr)
+        {
+            auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
+            TLLM_CHECK(agentConnection != nullptr);
+            isReady = agentConnection->recvReadySignal(executor::kv_cache::DataContext{kREADY_SIGNAL_TAG});
+        }
+        else
+        {
+            connections.at(i)->recv(executor::kv_cache::DataContext{kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
+        }
         isReadyFinal &= isReady;
     }
 
