@@ -118,14 +118,11 @@ def fake_profiler_mha(
 ):
     """Fake attn to count number of attn calls and record per-rank kv shape of each layer."""
 
-    # Get pointer to the factory model.
-    factory_model_ptr = kwargs["factory_model_ptr"]
-
     # Set layer idx to current attention module, so it can fetch its kv cache from cm input args later.
-    module._layer_idx = len(factory_model_ptr.kv_cache_shapes)
+    module._layer_idx = len(kwargs["kv_cache_shapes"])
 
     # Record kv cache shape for this layer, for initializing kv cache.
-    factory_model_ptr.kv_cache_shapes.append(
+    kwargs["kv_cache_shapes"].append(
         {
             "n_q_heads": query.shape[1],
             "n_kv_heads": key.shape[1],
@@ -196,12 +193,12 @@ class HFReplaceCachedAttn(BaseTransform):
         model.config._attn_implementation = "ad_cached_mha"
 
         # Add an empty list as attribute for profiler to write to.
-        model.kv_cache_shapes = []
+        kv_cache_shapes = []
 
         # Run forward with fake attn and dummy inputs.
         dummy_input_ids = model.dummy_inputs["input_ids"].to(model.device)
-        model.original_forward(input_ids=dummy_input_ids, factory_model_ptr=model)
-        num_layers = len(model.kv_cache_shapes)
+        model.original_forward(input_ids=dummy_input_ids, kv_cache_shapes=kv_cache_shapes)
+        num_layers = len(kv_cache_shapes)
 
         # Ends profiling, switch back to real attn operator.
         ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", cached_mha_for_hf)
@@ -226,9 +223,9 @@ class HFReplaceCachedAttn(BaseTransform):
         for layer_idx in range(num_layers):
             # Allowing each layer to have potentially different kv cache shapes.
             dummy_attn_node = _get_fake_attn_node(
-                model.kv_cache_shapes[layer_idx]["n_q_heads"],
-                model.kv_cache_shapes[layer_idx]["n_kv_heads"],
-                model.kv_cache_shapes[layer_idx]["head_dim"],
+                kv_cache_shapes[layer_idx]["n_q_heads"],
+                kv_cache_shapes[layer_idx]["n_kv_heads"],
+                kv_cache_shapes[layer_idx]["head_dim"],
                 model.dtype,
             )
             cache_initializers = attn_descriptor.get_cache_initializers(
