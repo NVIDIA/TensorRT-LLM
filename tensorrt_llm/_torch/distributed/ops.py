@@ -1,4 +1,5 @@
 import math
+import os
 import platform
 import threading
 from typing import List, Optional, Tuple, Union
@@ -86,8 +87,10 @@ def get_or_scale_allreduce_mnnvl_workspace(
         # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
         else:
             req_buffer_size_bytes = buffer_size_bytes
-            buffer_size_bytes = math.ceil(buffer_size_bytes /
-                                          (8 * 1024 * 1024)) * (8 * 1024 * 1024)
+            buffer_size_bytes = (NUM_LAMPORT_BUFFERS *
+                                 math.ceil(buffer_size_bytes /
+                                           (8 * 1024 * 1024)) *
+                                 (8 * 1024 * 1024))
             if mapping.tp_rank == 0:
                 logger.debug(
                     f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
@@ -99,16 +102,15 @@ def get_or_scale_allreduce_mnnvl_workspace(
             mapping.tp_rank,
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
             mapping.local_rank,
-            True,  # mnNvlink
+            True,  # mnNvlink; This Ops could support single-node through nvls as well but we currently only use it for MNNVL
         )
 
-        # We use per FP32 element in the buffer for lamport sync, thus the buffer is only
-        buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
-                                                (init_buffer_size_bytes //
-                                                 (torch.float32.itemsize), ),
-                                                torch.float32, 0)
+        # We use per FP32 element in the buffer for lamport sync
+        buffer = mcast_buf_handle.get_uc_buffer(
+            mapping.tp_rank, (buffer_size_bytes // (torch.float32.itemsize), ),
+            torch.float32, 0)
         buffer.fill_(-0.0)
-        # CPU barrier since we assume this should not be called in cuda graph
+        # Wait until the initialization is done
         torch.cuda.synchronize()
         comm.Barrier()
 
@@ -116,9 +118,11 @@ def get_or_scale_allreduce_mnnvl_workspace(
         # Should have the same lifetime with self._buffer
         # The flag should be binded to each buffer allocation
         # [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
-        buffer_flags = torch.tensor([0, 2, buffer_size_bytes, 0, 0, 0, 0, 0, 0],
-                                    dtype=torch.uint32,
-                                    device=mapping.local_device)
+        buffer_flags = torch.tensor(
+            [0, 2, buffer_size_bytes, 0, 0, 0, 0, 0, 0],
+            dtype=torch.uint32,
+            device=torch.device("cuda", mapping.local_rank),
+        )
 
         allreduce_mnnvl_workspaces[mapping] = {
             "handle": mcast_buf_handle,
@@ -346,9 +350,12 @@ class MNNVLAllReduce(nn.Module):
 
         arch = platform.machine().lower()
         is_on_aarch64 = "aarch64" in arch
-        return (dtype in MNNVLAllReduce.get_supported_dtypes()
-                and not mapping.has_cp() and mapping.is_multi_node()
-                and MnnvlMemory.supports_mnnvl() and is_on_aarch64)
+        # Add a bypass so that we can run the unittest on single-node
+        is_testing = os.environ.get("TLLM_TEST_MNNVL", "0") == "1"
+        return is_testing or (dtype in MNNVLAllReduce.get_supported_dtypes() and
+                              not mapping.has_cp() and mapping.is_multi_node()
+                              and MnnvlMemory.supports_mnnvl()
+                              and is_on_aarch64)
 
     def forward(
         self,
@@ -376,15 +383,15 @@ class MNNVLAllReduce(nn.Module):
             buffer_size_bytes=num_tokens * hidden_dim * self.dtype.itemsize)
 
         # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
-        buffer_base = workspace["uc_buffer"].view(3, -1)
+        buffer_base = workspace["uc_buffer"].view(self.dtype).view(3, -1)
         # The buffer flags is tied to the buffer and used to save the state of the buffer
         buffer_flags = workspace["buffer_flags"]
 
         if fusion_op == AllReduceFusionOp.NONE:
             output, _ = torch.ops.trtllm.mnnvl_fusion_allreduce(
                 input,
-                None,  # residual
                 None,  # gamma
+                None,  # residual
                 1e-6,  # epsilon
                 buffer_base,  # comm_buffer
                 buffer_flags,  # buffer_flags
@@ -395,8 +402,8 @@ class MNNVLAllReduce(nn.Module):
         elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
             output, residual_out = torch.ops.trtllm.mnnvl_fusion_allreduce(
                 input,
-                all_reduce_params.residual,  # residual
                 all_reduce_params.norm_weight,  # gamma
+                all_reduce_params.residual,  # residual
                 all_reduce_params.eps,  # epsilon
                 buffer_base,  # comm_buffer
                 buffer_flags,  # buffer_flags
