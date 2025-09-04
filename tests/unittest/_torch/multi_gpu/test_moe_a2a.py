@@ -55,6 +55,19 @@ def setup_test():
 #     completion_flags_size = ep_size * 4  # int32, one flag per rank
 #     return packed_tokens_size + sf_size + experts_size + final_scales_size + completion_flags_size
 
+def compute_target_rank_id(expert_id, num_experts_per_rank):
+    """Compute the rank that owns a given expert using contiguous partitioning.
+    Experts are divided evenly across ranks:
+      - Rank 0: experts [0, num_experts_per_rank)
+      - Rank 1: experts [num_experts_per_rank, 2 * num_experts_per_rank)
+      - ...
+    For example, with 32 experts and 4 ranks (8 experts per rank):
+      - Rank 0: experts 0-7
+      - Rank 1: experts 8-15
+      - Rank 2: experts 16-23
+      - Rank 3: experts 24-31
+    """
+    return expert_id // num_experts_per_rank
 
 def generate_token_selected_experts(local_num_tokens: int, ep_size: int,
                                     num_experts_per_rank: int,
@@ -111,7 +124,7 @@ def make_nvfp4_payloads(local_num_tokens: int, hidden_size: int, top_k: int,
 
 
 def fake_moe(hidden_states, token_selected_experts, token_final_scales, rank,
-             ep_size):
+             ep_size, num_experts_per_rank):
     """
     Simulate MoE computation by scaling tokens based on which experts belong to this rank.
 
@@ -137,7 +150,7 @@ def fake_moe(hidden_states, token_selected_experts, token_final_scales, rank,
         for k in range(top_k):
             expert_idx = token_selected_experts[token_idx, k].item()
             # Check if this expert belongs to current rank
-            expert_rank = expert_idx % ep_size
+            expert_rank = compute_target_rank_id(expert_idx, num_experts_per_rank)
             if expert_rank == rank:
                 # This expert is on our rank, apply scaling
                 scale = token_final_scales[token_idx, k]
@@ -213,9 +226,10 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
                                        rank, token_selected_experts)
 
         # Execute dispatch using wrapper to avoid pickle issues
+        num_experts = ep_size * num_experts_per_rank
         recv_buffers, send_counters, send_indices = moe_a2a_dispatch(
             token_selected_experts, payloads, workspace, max_tokens_per_rank,
-            rank, ep_size, top_k)
+            rank, ep_size, top_k, num_experts)
 
         # The completion flags are stored after all payloads in the workspace
         completion_flags_offset = sum(ep_size * max_tokens_per_rank *
@@ -243,7 +257,7 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
 
 def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
                     all_send_counters, all_send_indices, ep_size,
-                    all_num_tokens, top_k, max_tokens_per_rank):
+                    all_num_tokens, top_k, max_tokens_per_rank, num_experts_per_rank):
     """Verify dispatch results including actual content verification"""
 
     # Verify dimensions and dtypes
@@ -309,7 +323,7 @@ def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
 
         for token_idx in range(token_experts.shape[0]):
             experts = token_experts[token_idx]
-            target_ranks = experts % ep_size
+            target_ranks = compute_target_rank_id(experts, num_experts_per_rank)
             sent_to_rank.clear()
 
             # Due to deduplication, each token is sent to each unique target rank only once
@@ -340,7 +354,7 @@ def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
         # For each source token on this send rank
         for token_idx in range(local_num_tokens):
             experts = token_selected_experts[token_idx]
-            target_ranks = experts % ep_size
+            target_ranks = compute_target_rank_id(experts, num_experts_per_rank)
             unique_targets = set(target_ranks.tolist())
 
             # Verify send_indices records correct destinations
@@ -449,7 +463,7 @@ class TestMoEAlltoAll:
         # Verify dispatch results with content verification
         verify_dispatch(all_token_selected_experts, all_payloads,
                         all_recv_buffers, all_send_counters, all_send_indices,
-                        ep_size, all_num_tokens, top_k, max_tokens_per_rank)
+                        ep_size, all_num_tokens, top_k, max_tokens_per_rank, num_experts_per_rank)
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2,
                         reason='needs at least 2 GPUs to run multi-GPU test')
@@ -513,7 +527,7 @@ class TestMoEAlltoAll:
         # Verify combine results
         print("Starting verification...")
         verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
-                               hidden_size)
+                               hidden_size, num_experts_per_rank)
 
 
 def run_moe_a2a_dispatch_and_combine_single_rank(ep_size, all_num_tokens, top_k,
@@ -547,9 +561,10 @@ def run_moe_a2a_dispatch_and_combine_single_rank(ep_size, all_num_tokens, top_k,
                                           rank, token_selected_experts)
 
         # Run dispatch
+        num_experts = ep_size * num_experts_per_rank
         recv_buffers, send_counters, send_indices = moe_a2a_dispatch(
             token_selected_experts, payloads, workspace, max_tokens_per_rank,
-            rank, ep_size, top_k)
+            rank, ep_size, top_k, num_experts)
 
         hidden_states_recv = recv_buffers[
             0]  # [ep_size, max_tokens_per_rank, hidden_size]
@@ -571,13 +586,17 @@ def run_moe_a2a_dispatch_and_combine_single_rank(ep_size, all_num_tokens, top_k,
                 token_selected_experts_recv[source_rank],
                 token_final_scales_recv[source_rank],
                 rank,  # current rank owns certain experts
-                ep_size)
+                ep_size,
+                num_experts_per_rank)
 
         # Clear the workspace area where combine will place its flags
         # This prevents reading stale data from dispatch
         combine_flags_offset = ep_size * max_tokens_per_rank * hidden_size * 2  # bfloat16 = 2 bytes
         workspace[rank, combine_flags_offset:combine_flags_offset +
                   ep_size * 4].zero_()
+
+        # TODO: Current design of pulling may have data race.
+        # Before it gets fixed, device sync + MPI barrier are needed.
 
         # Ensure the clear is visible before combine starts
         torch.cuda.synchronize()
@@ -603,21 +622,12 @@ def run_moe_a2a_dispatch_and_combine_single_rank(ep_size, all_num_tokens, top_k,
         # For combine, we only have one payload (the processed hidden states)
         completion_flags_offset = ep_size * max_tokens_per_rank * hidden_size * 2  # bfloat16 = 2 bytes
 
-        # Debug: print memory layout info
-        # print(f"Rank {rank}: Workspace base address: {workspace.data_ptr():x}")
-        # print(f"Rank {rank}: Completion flags offset: {completion_flags_offset}")
-        # print(f"Rank {rank}: Workspace size per rank: {workspace.size(1)}")
-        # print(f"Rank {rank}: Total offset + flags size: {completion_flags_offset + ep_size * 4}")
 
         # Each rank has ep_size flags (one from each source rank). Check all the flags are marked.
         completion_flags_ptr = workspace[
             rank, completion_flags_offset:completion_flags_offset +
             ep_size * 4].clone()
 
-        # print(f"Rank {rank}: Completion flags ptr: {completion_flags_ptr.tolist()}")
-
-        # Debug: print the raw values before view
-        # print(f"Rank {rank}: Raw flags memory: {completion_flags_ptr.tolist()}")
 
         completion_flags = completion_flags_ptr.view(torch.int32)
         expected_flags = torch.ones(ep_size,
@@ -642,7 +652,7 @@ def run_moe_a2a_dispatch_and_combine_single_rank(ep_size, all_num_tokens, top_k,
 
 
 def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
-                           hidden_size):
+                           hidden_size, num_experts_per_rank):
     """Verify that combine correctly sums the dispatched tokens."""
 
     # Extract results
@@ -686,7 +696,7 @@ def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
 
                     for k in range(top_k):
                         expert_idx = experts[k].item()
-                        expert_rank = expert_idx % ep_size
+                        expert_rank = compute_target_rank_id(expert_idx, num_experts_per_rank)
                         if expert_rank == target_rank:
                             # This expert on target_rank processes our token
                             scale = token_scales[k]

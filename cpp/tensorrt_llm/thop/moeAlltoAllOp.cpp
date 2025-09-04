@@ -41,6 +41,7 @@ namespace
 //   - epRank: Current expert parallel rank
 //   - epSize: Total expert parallel size
 //   - topK: Number of experts selected per token
+//   - numExperts: Total number of experts (must be divisible by epSize)
 //
 // Returns:
 //   - recvBuffers: List of receive buffers, one for each payload
@@ -50,7 +51,8 @@ namespace
 //       If you want to dispatch token_selected_experts, include it explicitly in inputPayloads.
 std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
-    torch::Tensor const& workspace, int64_t maxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK)
+    torch::Tensor const& workspace, int64_t maxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
+    int64_t numExperts)
 {
     using tensorrt_llm::kernels::moe_a2a::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_a2a::MoeA2ADispatchParams;
@@ -70,6 +72,8 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor> moeA2ADispa
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
     TORCH_CHECK(!inputPayloads.empty(), "inputPayloads must not be empty");
     TORCH_CHECK(inputPayloads.size() <= kMaxPayloads, "Too many input payloads");
+    TORCH_CHECK(numExperts >= epSize, "numExperts must be greater than or equal to epSize");
+    TORCH_CHECK(numExperts % epSize == 0, "numExperts must be divisible by epSize for contiguous partitioning");
 
     // All input payloads must have the same first dimension (localNumTokens)
     for (auto const& payload : inputPayloads)
@@ -191,6 +195,7 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor> moeA2ADispa
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.top_k = static_cast<int>(topK);
+    params.num_experts_per_rank = static_cast<int>(numExperts) / static_cast<int>(epSize);
     params.stream = at::cuda::getCurrentCUDAStream();
 
     // Launch the dispatch kernel
@@ -380,7 +385,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def(
         "moe_a2a_dispatch(Tensor token_selected_experts, Tensor[] input_payloads, Tensor workspace, int "
         "max_tokens_per_rank, "
-        "int ep_rank, int ep_size, int top_k) -> (Tensor[], Tensor, Tensor)");
+        "int ep_rank, int ep_size, int top_k, int num_experts) -> (Tensor[], Tensor, Tensor)");
     module.def(
         "moe_a2a_combine(Tensor send_indices, Tensor payload, Tensor workspace, "
         "int max_tokens_per_rank, int ep_rank, int ep_size, int top_k) -> Tensor");

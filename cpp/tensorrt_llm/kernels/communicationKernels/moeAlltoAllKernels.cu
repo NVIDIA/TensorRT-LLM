@@ -24,6 +24,25 @@ namespace tensorrt_llm::kernels::moe_a2a
 {
 
 // ============================================================================
+// Helper Functions for Expert-to-Rank Mapping
+// ============================================================================
+
+__device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank)
+{
+    // Compute which rank owns a given expert using contiguous partitioning
+    // Experts are divided evenly across EP ranks:
+    // - Rank 0 gets experts [0, num_experts_per_rank)
+    // - Rank 1 gets experts [num_experts_per_rank, 2*num_experts_per_rank)
+    // - etc.
+    // Example: 32 experts, 4 ranks -> 8 experts per rank
+    // - Rank 0: experts 0-7
+    // - Rank 1: experts 8-15
+    // - Rank 2: experts 16-23
+    // - Rank 3: experts 24-31
+    return expert_id / num_experts_per_rank;
+}
+
+// ============================================================================
 // Helper Functions for Vectorized Memory Operations
 // ============================================================================
 
@@ -85,7 +104,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int* send_counters,       // [ep_size] atomic counters - each rank tracks its own
     int* send_indices,        // [local_num_tokens, ep_size] send index tensor
     int* local_token_counter, // Atomic counter for completed tokens on this rank
-    int local_num_tokens, int rank_id, int ep_size, int top_k)
+    int local_num_tokens, int rank_id, int ep_size, int top_k, int num_experts_per_rank)
 {
     // Constants
     constexpr int WARPS_PER_BLOCK = 8; // 256 threads / 32 threads per warp
@@ -119,8 +138,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     uint64_t already_copied = 0;
     for (int k = 0; k < top_k; k++)
     {
-        int expert_idx = token_selected_experts[local_token_idx * top_k + k];
-        int target_rank = expert_idx % ep_size;
+        int expert_id = token_selected_experts[local_token_idx * top_k + k];
+        // Use contiguous partitioning to determine target rank
+        int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
 
         if (already_copied & (1ULL << target_rank))
             continue;
@@ -228,7 +248,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 
     moeA2ADispatchKernel<<<grid_size, kBlockSize, 0, params.stream>>>(params.token_selected_experts, kernel_ptrs,
         params.num_payloads, params.max_tokens_per_rank, params.send_counters, params.send_indices,
-        params.local_token_counter, params.local_num_tokens, params.ep_rank, params.ep_size, params.top_k);
+        params.local_token_counter, params.local_num_tokens, params.ep_rank, params.ep_size, params.top_k, params.num_experts_per_rank);
 }
 
 // ============================================================================
