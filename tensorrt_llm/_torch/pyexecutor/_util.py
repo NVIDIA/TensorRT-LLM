@@ -168,7 +168,8 @@ class KvCacheCreator:
             req_mm_input = trtllm.MultimodalInput(
                 multimodal_hashes=multimodal_input.multimodal_hashes,
                 multimodal_positions=multimodal_input.multimodal_positions,
-                multimodal_lengths=multimodal_input.multimodal_lengths)
+                multimodal_lengths=multimodal_input.multimodal_lengths
+            ) if multimodal_input else None
             request = trtllm.Request(prompt_token_ids,
                                      max_tokens=1,
                                      streaming=False,
