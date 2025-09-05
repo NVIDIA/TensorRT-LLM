@@ -70,6 +70,9 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
 
+from ..distributed import allgather
+import os
+from tensorrt_llm.mapping import Mapping
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -170,9 +173,6 @@ class DeepseekV3MTPHead(nn.Module):
         if (self.model_config.mapping.enable_attention_dp and 
             getattr(self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
             # ADP + LM TP mode: perform All-Gather before LM_head
-            from ..distributed import allgather
-            import os
-            from tensorrt_llm.mapping import Mapping
             lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))
             assert self.model_config.mapping.tp_size % lm_tp_size == 0
             lm_pp_size = self.model_config.mapping.pp_size * self.model_config.mapping.tp_size // lm_tp_size

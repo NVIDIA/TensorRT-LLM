@@ -18,6 +18,8 @@ from .interface import SpecMetadata
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
+import os
+from tensorrt_llm.mapping import Mapping
 
 @dataclass(kw_only=True)
 class SampleStateTensorsMTP(SampleStateTensors):
@@ -1118,8 +1120,6 @@ class MTPWorker(nn.Module):
                       self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
             # For ADP + LM TP mode, we need to find the global argmax across all TP ranks
             # First, get local argmax and max values
-            import os
-            from tensorrt_llm.mapping import Mapping
             lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))
             assert self.model_config.mapping.tp_size % lm_tp_size == 0
             lm_pp_size = self.model_config.mapping.pp_size * self.model_config.mapping.tp_size // lm_tp_size
