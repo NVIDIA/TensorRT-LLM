@@ -904,7 +904,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                               - key: "kubernetes.io/hostname"
                                 operator: In
                                 values:
-                                - "lego-cg1-qct-066.ipp3a2.colossus\""""
+                                - "lego-cg1-qct-066.ipp3a2.colossus"
+                                - "lego-cg1-qct-069.ipp3a2.colossus\""""
     }
 
     def podConfig = [
@@ -2160,13 +2161,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
-        "PY312-DLFW-CU12": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE_12_9,
-            "B200_PCIe",
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "A10",
             X86_64_TRIPLE,
-            true,
+            false,
             "dlfw/",
-            DLFW_IMAGE_12_9,
+            DLFW_IMAGE,
             false,
         ],
         "PY310-UB2204-CU12": [
@@ -2199,13 +2200,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 12.8 install
         ],
-        "PY312-DLFW-CU12": [
-            LLM_SBSA_DOCKER_IMAGE_12_9,
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
             "GH200",
             AARCH64_TRIPLE,
             false,
             "dlfw/",
-            DLFW_IMAGE_12_9,
+            DLFW_IMAGE,
             false,
         ],
     ]
@@ -2319,6 +2320,24 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             } else {
                                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
                             }
+                        }
+
+                        // TODO: Remove this after public triton supports CUDA 13.
+                        if (key == "PY312-DLFW" && values[2] == X86_64_TRIPLE) {
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install https://download.pytorch.org/whl/nightly/pytorch_triton-3.3.1%2Bgitc8757738-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")
+                            sh """
+                                cd /usr/local/lib/python3.12/dist-packages/ && \
+                                ls -la | grep pytorch_triton && \
+                                mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
+                                cd triton-3.3.1+gitc8757738.dist-info && \
+                                echo "Current directory: \$(pwd)" && \
+                                echo "Files in directory:" && \
+                                ls -la && \
+                                sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
+                                sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
+                                echo "METADATA after update:" && \
+                                grep "^Name:" METADATA
+                            """
                         }
 
                         def libEnv = []
