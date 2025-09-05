@@ -160,6 +160,8 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            load_factoy_model: If True, will load weights for the factory model in addition to main
+                gm. This is useful for the transformers model.
 
         NOTE: we always call ``self._to_maybe_random(model, device)`` as a preprocessing step
         to ensure the model parameters already exist on the right device and have the desired dtype

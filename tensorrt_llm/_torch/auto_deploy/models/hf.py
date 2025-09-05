@@ -168,6 +168,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         self._set_sharding_config(model.config)
 
         # patch forward method
+        model.original_forward = model.forward
         model.forward = types.MethodType(self._simple_forward, model)
 
         model.eval()
