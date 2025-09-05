@@ -329,7 +329,6 @@ l0_h100:
   - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype TIMEOUT (90)
   - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b] TIMEOUT (90)
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
-  - unittest/trt/model_api/test_model_quantization.py # 20 mins on H100
   - unittest/bindings # 8 mins on H100
   - test_e2e.py::test_build_time_benchmark_sanity
   - accuracy/test_llm_api.py::TestEagleVicuna_7B_v1_3::test_auto_dtype
@@ -337,8 +336,6 @@ l0_h100:
   - unittest/trt/model/test_mamba.py # 3 mins
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
-  - unittest/trt/model_api/test_model_level_api.py # 9 mins on H100
-  - unittest/trt/model_api/test_model_api_multi_gpu.py # 0.5 mins on H100
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8_low_latency_gemm_plugin
   - examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_fp8_multimodal_general[fp8-fp8-cnn_dailymail-Qwen2-VL-7B-Instruct-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False]

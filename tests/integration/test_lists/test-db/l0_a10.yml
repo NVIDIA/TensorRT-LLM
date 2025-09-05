@@ -39,6 +39,14 @@ l0_a10:
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
+  # llmapi general tests
+  - unittest/llmapi/test_llm_utils.py
+  - unittest/llmapi/test_gc_utils.py
+  - unittest/llmapi/test_reasoning_parser.py
+  - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_utils.py
+  - unittest/llmapi/test_llm_args.py
+
 - condition:
     ranges:
       system_gpu_count:
@@ -114,12 +122,6 @@ l0_a10:
   - unittest/bindings
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_build_cache.py
-  - unittest/llmapi/test_llm_utils.py
-  - unittest/llmapi/test_gc_utils.py
-  - unittest/llmapi/test_reasoning_parser.py
-  - unittest/llmapi/test_serialization.py
-  - unittest/llmapi/test_utils.py
-  - unittest/llmapi/test_llm_args.py
   - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large # 6 mins
