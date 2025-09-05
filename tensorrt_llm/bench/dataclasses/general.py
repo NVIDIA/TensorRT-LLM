@@ -8,6 +8,7 @@ from pydantic import (AliasChoices, BaseModel, Field, computed_field,
 
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 
 class BenchmarkEnvironment(BaseModel):
@@ -23,6 +24,7 @@ class InferenceRequest(BaseModel):
     input_ids: Optional[List[int]] = Field(
         alias=AliasChoices("input_ids", "logits"))
     lora_request: Optional[LoRARequest] = None
+    guided_decoding_params: Optional[GuidedDecodingParams] = None
 
     @model_validator(mode="after")
     def verify_prompt_and_logits(self) -> InferenceRequest:
