@@ -50,12 +50,12 @@ from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
-from .mm_disaggregated_params import MultimodalDisaggParams
 from .functional import Tensor, constant
 from .llmapi import LLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
+from .mm_disaggregated_params import MultimodalDisaggParams
 from .models.automodel import AutoConfig, AutoModelForCausalLM
 from .module import Module
 from .network import Network, net_guard
