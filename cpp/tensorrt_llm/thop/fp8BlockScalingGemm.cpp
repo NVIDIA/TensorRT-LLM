@@ -182,7 +182,7 @@ torch::Tensor fp8_block_scale_gemm_blackwell(torch::Tensor const& mat1, torch::T
     float* outScalePtr = nullptr;
 
     // transposeMmaOutput is hardcoded for now
-    tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options = {.eltType = gemm::trtllm::gen::Dtype::E4m3,
+    tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options = {.eltTypeA = gemm::trtllm::gen::Dtype::E4m3,
         .outputType = gemm::trtllm::gen::Dtype::Bfloat16,
         .deepSeekFp8 = true,
         .transposeMmaOutput = true};

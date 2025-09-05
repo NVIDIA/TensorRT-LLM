@@ -427,8 +427,17 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
         auto& [request, future] = *it;
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
-            future.get();
-            request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+            try
+            {
+                future.get();
+                request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_ERROR(
+                    "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
+                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+            }
             it = mResponderFutures.erase(it);
         }
         else
@@ -521,19 +530,28 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     {
         if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())
         {
-            it->second.get();
-
-            // Gather the kv cache transfer time from all workers and update to leader rank
-            if (!common::getEnvKVCacheTransferOutputPath().empty())
+            try
             {
-                auto syncComm
-                    = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
-                updateKVCacheTransferBW(*syncComm, it->first);
+                it->second.get();
+                it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+
+                // Gather the kv cache transfer time from all workers and update to leader rank
+                if (!common::getEnvKVCacheTransferOutputPath().empty())
+                {
+                    auto syncComm
+                        = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
+                    updateKVCacheTransferBW(*syncComm, it->first);
+                }
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_ERROR(
+                    "Error occurred during generation transfer for request %ld: %s", it->first->mRequestId, e.what());
+                it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
                 it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
-            it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
             it = mRequesterFutures.erase(it);
         }
         else

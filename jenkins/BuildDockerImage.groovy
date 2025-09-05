@@ -295,8 +295,8 @@ def buildImage(config, imageKeyToTag)
 
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
-                def randomSleep = (Math.random() * 300 + 300).toInteger()
-                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, shortCommondRunTimeMax: 7200)
+                def randomSleep = (Math.random() * 600 + 600).toInteger()
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
                 BASE_IMAGE=${BASE_IMAGE} \
@@ -305,7 +305,7 @@ def buildImage(config, imageKeyToTag)
                 IMAGE_WITH_TAG=${dependentImageWithTag} \
                 STAGE=${dependent.dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-                """, sleepInSecs: randomSleep, numRetries: 3, shortCommondRunTimeMax: 7200)
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
@@ -324,8 +324,8 @@ def buildImage(config, imageKeyToTag)
         }
         stage ("make ${target}_${action} (${arch})") {
             sh "env | sort"
-            def randomSleep = (Math.random() * 300 + 300).toInteger()
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, shortCommondRunTimeMax: 7200)
+            def randomSleep = (Math.random() * 600 + 600).toInteger()
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             trtllm_utils.llmExecStepWithRetry(this, script: """
             cd ${LLM_ROOT} && make -C docker ${target}_${action} \
             BASE_IMAGE=${BASE_IMAGE} \
@@ -334,7 +334,7 @@ def buildImage(config, imageKeyToTag)
             IMAGE_WITH_TAG=${imageWithTag} \
             STAGE=${dockerfileStage} \
             BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-            """, sleepInSecs: randomSleep, numRetries: 3, shortCommondRunTimeMax: 7200)
+            """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             if (target == "ngc-release") {
                 imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
             }
@@ -563,53 +563,55 @@ pipeline {
             }
             steps {
                 script {
-                    container("python3") {
-                        // Install wget
-                        trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        container("python3") {
+                            // Install wget
+                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
 
-                        // Poll for build artifacts
-                        def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
-                        def requiredFiles = [
-                            "TensorRT-LLM-GH200.tar.gz",
-                            "TensorRT-LLM.tar.gz"
-                        ]
-                        def maxWaitMinutes = 60
-                        def pollIntervalSeconds = 60
+                            // Poll for build artifacts
+                            def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
+                            def requiredFiles = [
+                                "TensorRT-LLM-GH200.tar.gz",
+                                "TensorRT-LLM.tar.gz"
+                            ]
+                            def maxWaitMinutes = 60
+                            def pollIntervalSeconds = 60
 
-                        echo "Waiting for build artifacts..."
-                        echo "Required files: ${requiredFiles}"
+                            echo "Waiting for build artifacts..."
+                            echo "Required files: ${requiredFiles}"
 
-                        def startTime = System.currentTimeMillis()
-                        def maxWaitMs = maxWaitMinutes * 60 * 1000
+                            def startTime = System.currentTimeMillis()
+                            def maxWaitMs = maxWaitMinutes * 60 * 1000
 
-                        while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
-                            def missingFiles = []
+                            while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                                def missingFiles = []
 
-                            for (file in requiredFiles) {
-                                def fileUrl = "${artifactBaseUrl}${file}"
-                                def exitCode = sh(
-                                    script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
-                                    returnStatus: true
-                                )
+                                for (file in requiredFiles) {
+                                    def fileUrl = "${artifactBaseUrl}${file}"
+                                    def exitCode = sh(
+                                        script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
+                                        returnStatus: true
+                                    )
 
-                                if (exitCode != 0) {
-                                    missingFiles.add(file)
+                                    if (exitCode != 0) {
+                                        missingFiles.add(file)
+                                    }
                                 }
-                            }
 
-                            if (missingFiles.isEmpty()) {
-                                echo "All build artifacts are ready!"
-                                return
+                                if (missingFiles.isEmpty()) {
+                                    echo "All build artifacts are ready!"
+                                    return
+                                }
+
+                                def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                                echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                                echo "Missing files: ${missingFiles}"
+                                sleep(pollIntervalSeconds)
                             }
 
                             def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                            echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
-                            echo "Missing files: ${missingFiles}"
-                            sleep(pollIntervalSeconds)
+                            error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                         }
-
-                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                        error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                     }
                 }
             }
@@ -622,28 +624,28 @@ pipeline {
             }
             steps {
                 script {
-                    globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    def parameters = getCommonParameters()
-                    parameters += [
-                        'enableFailFast': false,
-                        'globalVars': globalVarsJson,
-                    ]
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
+                        def parameters = getCommonParameters()
+                        parameters += [
+                            'enableFailFast': false,
+                            'globalVars': globalVarsJson,
+                        ]
 
-                    echo "Trigger BuildDockerImageSanityTest job, params: ${parameters}"
+                        echo "Trigger BuildDockerImageSanityTest job, params: ${parameters}"
 
-                    def status = ""
-                    def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
-                    def handle = build(
-                        job: jobName,
-                        parameters: trtllm_utils.toBuildParameters(parameters),
-                        propagate: false,
-                    )
-                    echo "Triggered job: ${handle.absoluteUrl}"
-                    status = handle.result
+                        def status = ""
+                        def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
+                        def handle = build(
+                            job: jobName,
+                            parameters: trtllm_utils.toBuildParameters(parameters),
+                            propagate: false,
+                        )
+                        echo "Triggered job: ${handle.absoluteUrl}"
+                        status = handle.result
 
-                    if (status != "SUCCESS") {
-                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        if (status != "SUCCESS") {
                             error "Downstream job did not succeed"
                         }
                     }
@@ -661,7 +663,7 @@ pipeline {
                     container("python3") {
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                        def nspect_commit = "58ee430c8c3bd36bee2073405a547d3f8bc1932f"
+                        def nspect_commit = "0e46042381ae25cb7af2f1d45853dfd8e1d54e2d"
                         withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
                             trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                         }
@@ -684,7 +686,7 @@ pipeline {
                         }
                         cmd += imageKeyToTag.values().join(" ")
                         withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
-                            sh cmd
+                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 6, shortCommondRunTimeMax: 7200)
                         }
                     }
                 }

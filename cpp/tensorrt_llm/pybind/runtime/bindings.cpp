@@ -16,6 +16,7 @@
  */
 
 #include "bindings.h"
+#include "hostfunc.h"
 #include "moeBindings.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -215,11 +216,14 @@ void initBindings(pybind11::module_& m)
         .def(py::self == py::self);
 
     py::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
-        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, py::arg("tag"))
-        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, py::arg("tag"));
+        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, py::arg("tag"),
+            py::call_guard<py::gil_scoped_release>())
+        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, py::arg("tag"),
+            py::call_guard<py::gil_scoped_release>());
 
     py::classh<tr::BufferManager>(m, "BufferManager")
-        .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
+        .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false,
+            py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("stream", &tr::BufferManager::getStream);
 
     py::classh<tr::TllmRuntime>(m, "TllmRuntime")
@@ -241,30 +245,35 @@ void initBindings(pybind11::module_& m)
             }))
         .def_property_readonly("num_contexts", &tr::TllmRuntime::getNbContexts)
         .def_property_readonly("num_profiles", &tr::TllmRuntime::getNbProfiles)
-        .def("get_opt_profile_id", &tr::TllmRuntime::getOptProfileId, py::arg("num_tokens"), py::arg("split_points"))
-        .def("clear_contexts", &tr::TllmRuntime::clearContexts)
-        .def("execute_context", &tr::TllmRuntime::executeContext, py::arg("context_id"))
+        .def("get_opt_profile_id", &tr::TllmRuntime::getOptProfileId, py::arg("num_tokens"), py::arg("split_points"),
+            py::call_guard<py::gil_scoped_release>())
+        .def("clear_contexts", &tr::TllmRuntime::clearContexts, py::call_guard<py::gil_scoped_release>())
+        .def("execute_context", &tr::TllmRuntime::executeContext, py::arg("context_id"),
+            py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("stream_ptr", &tr::TllmRuntime::getStreamPtr)
         .def_property_readonly("buffer_manager",
             static_cast<tr::BufferManager& (tr::TllmRuntime::*) ()>(&tr::TllmRuntime::getBufferManager))
-        .def("set_layer_profiler", &tr::TllmRuntime::setLayerProfiler)
-        .def("has_layer_profiler", &tr::TllmRuntime::hasLayerProfiler, py::arg("context_id"))
+        .def("set_layer_profiler", &tr::TllmRuntime::setLayerProfiler, py::call_guard<py::gil_scoped_release>())
+        .def("has_layer_profiler", &tr::TllmRuntime::hasLayerProfiler, py::arg("context_id"),
+            py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("layer_profiler_info", &tr::TllmRuntime::getLayerProfileInfo)
-        .def("report_to_profiler", &tr::TllmRuntime::reportToProfiler, py::arg("context_id"))
+        .def("report_to_profiler", &tr::TllmRuntime::reportToProfiler, py::arg("context_id"),
+            py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("logits_dtype_from_engine",
             [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
 
     py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
         .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
-            py::arg("max_decoding_engine_tokens"))
-        .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
+            py::arg("max_decoding_engine_tokens"), py::call_guard<py::gil_scoped_release>())
+        .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"),
+            py::call_guard<py::gil_scoped_release>())
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
         .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), py::arg("max_num_sequences"),
-            py::arg("max_tokens_per_step"), py::arg("buffer_manager"))
+            py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::call_guard<py::gil_scoped_release>())
         .def_readwrite("generation_lengths", &tr::LookaheadDecodingBuffers::generationLengths)
         .def_readwrite("position_offsets", &tr::LookaheadDecodingBuffers::positionOffsets)
         .def_readwrite("packed_masks", &tr::LookaheadDecodingBuffers::packedMasks)
@@ -272,7 +281,8 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::ExplicitDraftTokensBuffers::Inputs>(m, "ExplicitDraftTokensBuffersInputs")
         .def("create", &tr::ExplicitDraftTokensBuffers::Inputs::create, py::arg("max_num_sequences"),
-            py::arg("runtime"), py::arg("model_config"), py::arg("world_config"))
+            py::arg("runtime"), py::arg("model_config"), py::arg("world_config"),
+            py::call_guard<py::gil_scoped_release>())
         .def_readwrite("temperatures", &tr::ExplicitDraftTokensBuffers::Inputs::temperatures)
         .def_readwrite("position_ids_base", &tr::ExplicitDraftTokensBuffers::Inputs::positionIdsBase)
         .def_readwrite("generation_lengths", &tr::ExplicitDraftTokensBuffers::Inputs::generationLengths)
@@ -290,8 +300,9 @@ void initBindings(pybind11::module_& m)
     py::class_<tr::DecodingOutput>(m, "DecodingOutput");
 
     py::class_<tr::CudaEvent>(m, "CudaEvent")
-        .def(py::init<unsigned int>(), py::arg("flags") = cudaEventDisableTiming)
-        .def("synchronize", &tr::CudaEvent::synchronize);
+        .def(py::init<unsigned int>(), py::arg("flags") = cudaEventDisableTiming,
+            py::call_guard<py::gil_scoped_release>())
+        .def("synchronize", &tr::CudaEvent::synchronize, py::call_guard<py::gil_scoped_release>());
 
     py::class_<tr::IGptDecoder, PyIGptDecoder>(m, "IGptDecoder")
         .def(
@@ -308,18 +319,21 @@ void initBindings(pybind11::module_& m)
             },
             py::arg("sampling_config"), py::arg("batch_size"), py::arg("batch_slots"), py::arg("output") = std::nullopt,
             py::arg("explicit_draft_tokens_d_type") = std::nullopt, py::arg("lookahead_prompt") = std::nullopt,
-            py::arg("lookahead_algo_configs") = std::nullopt);
+            py::arg("lookahead_algo_configs") = std::nullopt, py::call_guard<py::gil_scoped_release>());
 
     py::class_<tr::decoder::DecoderState>(m, "DecoderState")
-        .def(py::init<>())
+        .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
         .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_num_sequences"), py::arg("max_beam_width"),
             py::arg("max_attention_window"), py::arg("sink_token_length"), py::arg("max_sequence_length"),
-            py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
+            py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
+            py::call_guard<py::gil_scoped_release>())
         .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, py::arg("max_num_sequences"),
-            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("buffer_manager"))
+            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("buffer_manager"),
+            py::call_guard<py::gil_scoped_release>())
         .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
             py::arg("speculative_decoding_mode"), py::arg("max_tokens_per_engine_step"), py::arg("dtype"),
-            py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
+            py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
+            py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
         .def_property_readonly("cache_indirection_input", &tr::decoder::DecoderState::getCacheIndirectionInput)
@@ -328,27 +342,27 @@ void initBindings(pybind11::module_& m)
             "sequence_lengths", py::overload_cast<>(&tr::decoder::DecoderState::getSequenceLengths, py::const_))
         .def("get_sequence_lengths",
             py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getSequenceLengths, py::const_),
-            py::arg("batch_idx"))
+            py::arg("batch_idx"), py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("all_new_tokens", &tr::decoder::DecoderState::getAllNewTokens)
         .def_property_readonly("finished_sum", &tr::decoder::DecoderState::getFinishedSum)
         .def_property_readonly("finish_reasons", &tr::decoder::DecoderState::getFinishReasons)
         .def_property_readonly("ids", py::overload_cast<>(&tr::decoder::DecoderState::getIds, py::const_))
         .def("get_ids", py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getIds, py::const_),
-            py::arg("batch_idx"))
+            py::arg("batch_idx"), py::call_guard<py::gil_scoped_release>())
         .def_property_readonly(
             "gathered_ids", py::overload_cast<>(&tr::decoder::DecoderState::getGatheredIds, py::const_))
         .def("get_gathered_ids",
             py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getGatheredIds, py::const_),
-            py::arg("batch_idx"))
+            py::arg("batch_idx"), py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("parent_ids", &tr::decoder::DecoderState::getParentIds)
         .def_property_readonly(
             "cum_log_probs", py::overload_cast<>(&tr::decoder::DecoderState::getCumLogProbs, py::const_))
         .def("get_cum_log_probs",
             py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getCumLogProbs, py::const_),
-            py::arg("batch_idx"))
+            py::arg("batch_idx"), py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("log_probs", py::overload_cast<>(&tr::decoder::DecoderState::getLogProbs, py::const_))
         .def("get_log_probs", py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getLogProbs, py::const_),
-            py::arg("batch_idx"))
+            py::arg("batch_idx"), py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("next_draft_tokens", &tr::decoder::DecoderState::getNextDraftTokens)
         .def_property_readonly("prev_draft_tokens_lengths", &tr::decoder::DecoderState::getPrevDraftTokensLengths)
         .def_property_readonly("next_draft_tokens_lengths", &tr::decoder::DecoderState::getNextDraftTokensLengths)
@@ -362,21 +376,24 @@ void initBindings(pybind11::module_& m)
             py::overload_cast<>(&tr::decoder::DecoderState::getNumDecodingEngineTokens, py::const_))
         .def("get_num_decoding_engine_tokens",
             py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getNumDecodingEngineTokens, py::const_),
-            py::arg("batch_idx"))
+            py::arg("batch_idx"), py::call_guard<py::gil_scoped_release>())
         .def("set_num_decoding_engine_tokens", &tr::decoder::DecoderState::setNumDecodingEngineTokens,
-            py::arg("batch_idx"), py::arg("num_tokens"))
+            py::arg("batch_idx"), py::arg("num_tokens"), py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("speculative_decoding_mode", &tr::decoder::DecoderState::getSpeculativeDecodingMode)
         .def_property("generation_steps", &tr::decoder::DecoderState::getGenerationSteps,
             &tr::decoder::DecoderState::setGenerationSteps);
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
-        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))
+        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"),
+            py::call_guard<py::gil_scoped_release>())
         .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_num_sequences"),
-            py::arg("max_beam_width"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"))
-        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("input"))
+            py::arg("max_beam_width"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"),
+            py::call_guard<py::gil_scoped_release>())
+        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("input"),
+            py::call_guard<py::gil_scoped_release>())
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
         .def("finalize", &tr::GptDecoderBatched::finalize, py::arg("decoder_state"), py::arg("batch_idx"),
-            py::arg("sampling_config"), py::arg("streaming"))
+            py::arg("sampling_config"), py::arg("streaming"), py::call_guard<py::gil_scoped_release>())
         .def_property_readonly(
             "decoder_stream",
             [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
@@ -389,12 +406,12 @@ void initBindings(pybind11::module_& m)
             tr::lamportInitializeAll(reinterpret_cast<void*>(buffer_0), reinterpret_cast<void*>(buffer_1),
                 reinterpret_cast<void*>(buffer_2), size);
         },
-        "Lamport initialize all buffers");
+        "Lamport initialize all buffers", py::call_guard<py::gil_scoped_release>());
     m.def(
         "lamport_initialize",
         [](intptr_t buffer, size_t size)
         { tensorrt_llm::kernels::ar_fusion::lamport_initialize(reinterpret_cast<void*>(buffer), size, 0); },
-        "Lmaport initialize buffer");
+        "Lmaport initialize buffer", py::call_guard<py::gil_scoped_release>());
     m.def(
         "delay_kernel",
         [](int64_t delay_micro_secs, py::object py_stream)
@@ -402,13 +419,15 @@ void initBindings(pybind11::module_& m)
             // Get the raw stream handle from PyTorch stream object
             auto stream_ptr = py_stream.attr("cuda_stream").cast<int64_t>();
             cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            py::gil_scoped_release release;
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
         "Delay kernel launch on the default stream");
     m.def(
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
-        "Calculate the maximum workspace size needed for low precision all-reduce operations");
+        "Calculate the maximum workspace size needed for low precision all-reduce operations",
+        py::call_guard<py::gil_scoped_release>());
 
     py::enum_<tr::CudaVirtualMemoryAllocator::RestoreMode>(m, "CudaVirtualMemoryAllocatorRestoreMode")
         .value("NONE", tr::CudaVirtualMemoryAllocator::RestoreMode::NONE)
@@ -428,15 +447,19 @@ void initBindings(pybind11::module_& m)
                 std::make_shared<tr::CudaStream>(
                     reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
         },
-        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations");
+        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations",
+        py::call_guard<py::gil_scoped_release>());
 
     m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
-        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
+        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations",
+        py::call_guard<py::gil_scoped_release>());
 
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
-        .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
-        .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
-        .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
+        .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>(), py::call_guard<py::gil_scoped_release>())
+        .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
+            py::call_guard<py::gil_scoped_release>())
+        .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
+            py::call_guard<py::gil_scoped_release>());
 
     py::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
@@ -461,6 +484,8 @@ void initBindings(pybind11::module_& m)
 
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);
+    // Initialize HostFunc bindings
+    initHostFuncBindings(m);
 }
 
 void initBindingsEarly(py::module_& m)
