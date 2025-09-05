@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
@@ -50,6 +51,7 @@ class LlmManager:
                               post_proc_params: PostprocParams):
         # Set up sampling params with inference request
         self.request_seen.set()
+        sampling_params = copy.deepcopy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
         sampling_params.guided_decoding = request.guided_decoding_params
 
