@@ -1041,7 +1041,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
         )
 
-    tokens_per_block: int = Field(default=64,
+    tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
     def _to_pybind(self):
