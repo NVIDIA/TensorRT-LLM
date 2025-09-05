@@ -10,7 +10,6 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.speculation_gate import SpeculationGate
 from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
                                  KvCacheConfig)
-from tensorrt_llm.llmapi.llm_args import SamplerType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -42,8 +41,6 @@ def test_spec_gate_e2e():
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         max_seq_len=4096,
-        # Force TRTLLMSampler for testing avg_decoded_tokens_per_iter from C++ path
-        sampler_type=SamplerType.TRTLLMSampler,
     )
 
     spec_config = EagleDecodingConfig(
@@ -80,14 +77,6 @@ def test_spec_gate_e2e():
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
-
-    i = 0
-    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        print(f"prompt: {prompts[i]}")
-        print(f"spec: {text_spec}")
-        print(f"ref: {text_ref}")
-        print("-" * 100)
-        i += 1
 
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
