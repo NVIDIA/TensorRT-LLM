@@ -116,7 +116,10 @@ def test_single_image_chat(model_key, multimodal_model_config):
     encoder_outputs = encoder.generate(inputs)
 
     # Generate output using llm (pass mm_embeddings)
-    outputs = llm.generate(inputs, sampling_params=sampling_params, multimodal_disagg_params=encoder_outputs[0].multimodal_disagg_params)
+    outputs = llm.generate(
+        inputs,
+        sampling_params=sampling_params,
+        multimodal_disagg_params=encoder_outputs[0].multimodal_disagg_params)
 
     # Validate outputs
     assert len(outputs) == len(
@@ -196,7 +199,8 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
               trust_remote_code=True)
 
     config_path = os.path.join(llm._hf_model_dir, 'config.json')
-    assert os.path.exists(config_path), f"Model config not found at {config_path}"
+    assert os.path.exists(
+        config_path), f"Model config not found at {config_path}"
     with open(config_path, 'r') as f:
         model_config = json.load(f)
     model_type = model_config['model_type']
@@ -208,28 +212,36 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
                                              prompts=prompts,
                                              media=media,
                                              image_data_format="pt")
-    assert len(inputs) == len(prompts), f"Expected {len(prompts)} inputs, got {len(inputs)}"
+    assert len(inputs) == len(
+        prompts), f"Expected {len(prompts)} inputs, got {len(inputs)}"
 
     # Reference with raw inputs
     outputs_ref = llm.generate(inputs, sampling_params=sampling_params)
     assert outputs_ref is not None and len(outputs_ref) == len(prompts)
     for i, output in enumerate(outputs_ref):
-        assert len(output.outputs) > 0, f"Reference generation has no output text for input {i}"
+        assert len(
+            output.outputs
+        ) > 0, f"Reference generation has no output text for input {i}"
 
     # Encoder path
     encoder_outputs = encoder.generate(inputs)
     outputs = llm.generate(inputs,
                            sampling_params=sampling_params,
-                           multimodal_disagg_params=[eo.multimodal_disagg_params for eo in encoder_outputs])
+                           multimodal_disagg_params=[
+                               eo.multimodal_disagg_params
+                               for eo in encoder_outputs
+                           ])
 
     assert len(outputs) == len(prompts)
     for i, output in enumerate(outputs):
-        assert len(output.outputs) > 0, f"generation has no output text for input {i}"
+        assert len(
+            output.outputs) > 0, f"generation has no output text for input {i}"
 
     # Compare
     for i, (ref_output, test_output) in enumerate(zip(outputs_ref, outputs)):
         assert len(ref_output.outputs) == len(test_output.outputs), \
             f"Number of generated outputs don't match for output {i}: {len(ref_output.outputs)} vs {len(test_output.outputs)}"
-        for j, (ref_gen, test_gen) in enumerate(zip(ref_output.outputs, test_output.outputs)):
+        for j, (ref_gen, test_gen) in enumerate(
+                zip(ref_output.outputs, test_output.outputs)):
             assert ref_gen.text == test_gen.text, \
                 f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"

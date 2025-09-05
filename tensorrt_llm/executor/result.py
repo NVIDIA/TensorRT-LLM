@@ -13,10 +13,10 @@ import torch.nn.functional as F
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
-from ..mm_disaggregated_params import MultimodalDisaggParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
+from ..mm_disaggregated_params import MultimodalDisaggParams
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -368,7 +368,9 @@ class GenerationResultBase:
 
             if hasattr(response_result, 'mm_embedding_handle'
                        ) and response_result.mm_embedding_handle is not None:
-                self._multimodal_disaggregated_params.mm_embedding_handles = [response_result.mm_embedding_handle]
+                self._multimodal_disaggregated_params.mm_embedding_handles = [
+                    response_result.mm_embedding_handle
+                ]
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -520,8 +522,10 @@ class GenerationResult(GenerationResultBase):
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
         self._aborted = False
 
-        self._multimodal_disaggregated_params = MultimodalDisaggParams(prompt_token_ids=generation_request.prompt_token_ids,
-                                                                      multimodal_input=generation_request.multimodal_params.multimodal_input)
+        self._multimodal_disaggregated_params = MultimodalDisaggParams(
+            prompt_token_ids=generation_request.prompt_token_ids,
+            multimodal_input=generation_request.multimodal_params.
+            multimodal_input)
 
     @property
     def request_id(self) -> int:

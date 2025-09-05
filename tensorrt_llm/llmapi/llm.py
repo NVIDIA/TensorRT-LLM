@@ -21,7 +21,6 @@ from ..bindings import executor as tllm
 from ..bindings import steady_clock_now
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
-from ..mm_disaggregated_params import MultimodalDisaggParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
@@ -32,6 +31,7 @@ from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, get_cache_salt_id,
                       prompt_inputs)
 from ..logger import logger
+from ..mm_disaggregated_params import MultimodalDisaggParams
 from ..sampling_params import SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
@@ -252,8 +252,8 @@ class BaseLLM:
             DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
         scheduling_params: Optional[Union[SchedulingParams,
                                           List[SchedulingParams]]] = None,
-        multimodal_disagg_params: Optional[Union[MultimodalDisaggParams,
-                                                 Sequence[MultimodalDisaggParams]]] = None,
+        multimodal_disagg_params: Optional[Union[
+            MultimodalDisaggParams, Sequence[MultimodalDisaggParams]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -396,9 +396,12 @@ class BaseLLM:
         if is_mm_llm_ctx_only:
             prompt_token_ids = multimodal_disagg_params.prompt_token_ids
             if len(multimodal_disagg_params.mm_embedding_handles) == 1:
-                mm_embedding_handles = multimodal_disagg_params.mm_embedding_handles[0]
+                mm_embedding_handles = multimodal_disagg_params.mm_embedding_handles[
+                    0]
             else:
-                raise ValueError("Only one fused multimodal embedding (handle) is supported for MM-LLM context-only mode")
+                raise ValueError(
+                    "Only one fused multimodal embedding (handle) is supported for MM-LLM context-only mode"
+                )
 
             multimodal_params = MultimodalParams(
                 multimodal_input=multimodal_disagg_params.multimodal_input,
