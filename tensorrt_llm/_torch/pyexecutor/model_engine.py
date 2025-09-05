@@ -1133,6 +1133,26 @@ class PyTorchModelEngine(ModelEngine):
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
         return inputs
 
+    def _postprocess_inputs(self, inputs: Dict[str, Any]):
+        """
+        Postprocess to make sure model forward doesn't change the inputs.
+        It is only used in cuda graph capture, because other cases will prepare
+        new inputs before the model forward.
+        """
+        if self.enable_spec_decode and not self._disable_overlap_scheduler:
+            if inputs['attn_metadata'].kv_cache_manager is not None:
+                num_seqs = inputs['attn_metadata'].num_seqs
+                num_ctx_requests = inputs['attn_metadata'].num_contexts
+                num_gen_requests = inputs['attn_metadata'].num_generations
+                num_ctx_tokens = inputs['attn_metadata'].num_ctx_tokens
+                previous_batch_tokens = inputs['input_ids'].shape[
+                    0] - num_ctx_tokens
+                inputs['position_ids'][0, num_ctx_tokens:] -= (
+                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                inputs['attn_metadata'].kv_lens_cuda[
+                    num_ctx_requests:num_seqs] -= (
+                        self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
             return list(self.dist.tp_allgather(attn_metadata.num_tokens))
@@ -2206,8 +2226,12 @@ class PyTorchModelEngine(ModelEngine):
                                 gather_ids=gather_ids,
                                 gather_context_logits=gather_context_logits)
 
+                    def capture_postprocess_fn(inputs: Dict[str, Any]):
+                        self._postprocess_inputs(inputs)
+
                     self.cuda_graph_runner.capture(batch_size,
-                                                   capture_forward_fn, inputs)
+                                                   capture_forward_fn, inputs,
+                                                   capture_postprocess_fn)
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
