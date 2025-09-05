@@ -18,11 +18,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     TPShardingInfo,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
-    is_fake_quantized_linear_op,
-    is_linear_op,
-    is_op,
-)
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 from tensorrt_llm._torch.auto_deploy.utils.sharding_utils import FP8TPShardingInfo
 
 base_model_tp_plan = {
@@ -322,7 +318,7 @@ def _run_pattern_detection_job(
                     )
         elif model_cls == FP8MLP:
             for node in gm.graph.nodes:
-                if is_fake_quantized_linear_op(node):
+                if is_op(node, torch.ops.auto_deploy.torch_fake_quant_fp8_linear):
                     # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
                     # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
                     if "linear1" in node.args[1].name:

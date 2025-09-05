@@ -13,10 +13,7 @@ from _torch_test_utils import all_close, fp8_compatible, reset_parameters
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
-    is_fake_quantized_linear_op,
-    is_linear_op,
-)
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
 torch.manual_seed(0)
 
@@ -275,7 +272,10 @@ def test_fusion(get_model: Callable[[], TestModel], dtype: str):
         model,
         x,
         gm_transformed,
-        lambda gm: sum((is_linear_op(n) or is_fake_quantized_linear_op(n)) for n in gm.graph.nodes)
+        lambda gm: sum(
+            (is_linear_op(n) or is_op(n, torch.ops.auto_deploy.torch_fake_quant_fp8_linear))
+            for n in gm.graph.nodes
+        )
         == model.num_gemms_after_fusion,
         lambda num_p_og: num_p_og,  # unchanged since fusing doesn't change param count
         atol=tol,

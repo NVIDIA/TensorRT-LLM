@@ -6,8 +6,6 @@ from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
 )
 
-from .quant import QUANT_LINEAR_OPS, QUANT_OPS
-
 # FP4 tables (E2M1)
 e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
 e2m1_values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
@@ -278,11 +276,3 @@ def torch_fake_quant_nvfp4_linear(
     weight_zp: List[torch.Tensor],
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
-
-
-CUSTOM_QUANT_LINEAR_OPS = [
-    torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
-    torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
-]
-QUANT_LINEAR_OPS.extend(CUSTOM_QUANT_LINEAR_OPS)
-QUANT_OPS.extend(CUSTOM_QUANT_LINEAR_OPS)

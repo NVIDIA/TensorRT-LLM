@@ -299,15 +299,3 @@ def fp8_bmm_fake(
     """Fake implementation of fp8_bmm for testing and tracing."""
     # Use standard bmm
     return torch.bmm(input.to(torch.float), mat2.to(torch.float)).to(input.dtype)
-
-
-QUANT_LINEAR_OPS = [
-    torch.ops.auto_deploy.torch_quant_fp8_linear,
-    torch.ops.auto_deploy.torch_quant_nvfp4_linear,
-]
-
-QUANT_BMM_OPS = [
-    torch.ops.auto_deploy.torch_quant_fp8_bmm,
-]
-
-QUANT_OPS = QUANT_LINEAR_OPS + QUANT_BMM_OPS
