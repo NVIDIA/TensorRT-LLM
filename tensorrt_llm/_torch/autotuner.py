@@ -525,10 +525,14 @@ class AutoTuner:
             to get an average execution time. Stream synchronization and delays
             are used to ensure accurate timing.
         """
+
+        tensor_lists = self._prepare_input_tensors_with_batches(inputs)
+
         stream = torch.cuda.current_stream()
         # warm up, no timing
+        # always use the last batch for warmup
         for _ in range(self.warmup):
-            runner(inputs, tactic=tactic, **kwargs)
+            runner(tensor_lists[-1], tactic=tactic, **kwargs)
         stream.synchronize()
 
         # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
@@ -539,14 +543,14 @@ class AutoTuner:
         end = torch.cuda.Event(enable_timing=True)
 
         start.record(stream=stream)
-        for _ in range(self.repeat):
-            runner(inputs, tactic=tactic, **kwargs)
+        for r in range(self.repeat):
+            runner(tensor_lists[r], tactic=tactic, **kwargs)
         end.record(stream=stream)
         stream.synchronize()
 
         avg_time = start.elapsed_time(end) / self.repeat
 
-        shapes = self._get_input_sizes(inputs)
+        shapes = self._get_input_sizes(tensor_lists[-1])
         logger.debug(
             f"[Autotuner] Profiled runner={runner}, tactic={tactic}, shapes={shapes}: {avg_time:.6f}ms."
         )
@@ -733,6 +737,23 @@ class AutoTuner:
             tensors.append(tensor)
         return tensors
 
+    def _prepare_input_tensors_with_batches(
+            self,
+            inputs: List[torch.Tensor],
+        ) -> List[List[torch.Tensor]]:
+        if not self._all_tensors_smaller_than_l2_cache(inputs):
+            print(f"[Autotuner] All tensors are larger than L2 cache, use the same tensor for profiling")
+            return [inputs] * (self.repeat + 1)
+
+        inputs_list = [inputs]
+        # The last batch is for warmup
+        for _ in range(self.repeat):
+            inputs_list.append(list(t.clone() for t in inputs))
+
+        print(f"[Autotuner] All tensors are smaller than L2 cache, use {len(inputs_list)} different tensors for profiling")
+        return inputs_list
+
+
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
@@ -750,3 +771,10 @@ class AutoTuner:
             runner_id, tactic, profile = value
             logger.debug(
                 f"[Autotuner] {key}: (runner_id={runner_id}, tactic={tactic})")
+
+    def _all_tensors_smaller_than_l2_cache(self, inputs: List[torch.Tensor]) -> bool:
+        return all(input.numel() * input.element_size() <= self._get_l2_cache_size_in_bytes() for input in inputs)
+
+    def _get_l2_cache_size_in_bytes(self) -> int:
+        # TODO: Only consider Blackwell L2 cache
+        return 96 * 1024 * 1024
