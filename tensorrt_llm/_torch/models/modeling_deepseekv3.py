@@ -61,7 +61,8 @@ from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
                                  create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import (do_multi_stream,
+                                          maybe_execute_in_parallel)
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
@@ -233,6 +234,7 @@ class DeepseekV3Attention(MLA):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        prefetch_aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.max_draft_len + 1 if model_config.spec_config is not None else 1
@@ -255,7 +257,8 @@ class DeepseekV3Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream)
+                         aux_stream=aux_stream,
+                         prefetch_aux_stream=prefetch_aux_stream)
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
@@ -495,6 +498,7 @@ class Deepseekv3MoE(nn.Module):
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.prefetch_aux_stream = aux_stream_dict[AuxStreamType.Prefetch]
         self.event_dict = {
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
@@ -601,6 +605,29 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
+            if os.getenv("TRTLLM_ENABLE_PREFETCH") == "1" and do_multi_stream():
+                if hasattr(self, "next_kv_a_proj_with_mha_data"):
+                    if shared_output.shape[0] == 64:
+                        self.prefetch_aux_stream.wait_stream(
+                            torch.cuda.current_stream())
+                        with torch.cuda.stream(self.prefetch_aux_stream):
+                            torch.ops.trtllm.cute_host_prefetch(
+                                self.next_kv_a_proj_with_mha_data[:, :7168],
+                                delay_start=0,
+                                throttle_time=1400,
+                                throttle_mode=2,
+                                pdl=False)
+                    if shared_output.shape[0] == 256:
+                        self.prefetch_aux_stream.wait_stream(
+                            torch.cuda.current_stream())
+                        with torch.cuda.stream(self.prefetch_aux_stream):
+                            torch.ops.trtllm.cute_host_prefetch(
+                                self.next_kv_a_proj_with_mha_data[:, :7168],
+                                delay_start=0,
+                                throttle_time=1700,
+                                throttle_mode=2,
+                                pdl=False)
+
             if routed_output.dim() == 3:
                 assert shared_output.numel(
                 ) * self.top_k == routed_output.numel(
@@ -642,7 +669,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.self_attn = DeepseekV3Attention(
             model_config,
             layer_idx=layer_idx,
-            aux_stream=aux_stream_dict[AuxStreamType.Attention])
+            aux_stream=aux_stream_dict[AuxStreamType.Attention],
+            prefetch_aux_stream=aux_stream_dict[AuxStreamType.Prefetch])
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
@@ -1102,12 +1130,13 @@ class DeepseekV3Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
             AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.Prefetch: aux_stream_list[3],
         }
 
         self.embed_tokens = Embedding(
@@ -1500,3 +1529,9 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                if isinstance(layer.mlp, Deepseekv3MoE):
+                    layer.mlp.next_kv_a_proj_with_mha_data = self.model.layers[
+                        idx + 1].self_attn.kv_a_proj_with_mqa.weight.data
+                    self.model.layers[
+                        idx +
+                        1].self_attn.kv_a_proj_with_mqa_weight_is_passed_to_previous_layer = True
