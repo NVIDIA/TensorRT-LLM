@@ -48,6 +48,15 @@ accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-cutlass]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-triton]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-trtllm]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[tp2-cutlass]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[tp2-trtllm]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[tp2-triton]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[ep2-cutlass]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[ep2-trtllm]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[ep2-triton]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-cutlass]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-trtllm]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-triton]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-triton]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-trtllm]
@@ -133,6 +142,8 @@ accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
 accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp8
+accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestPhi4::test_fp8
 accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[latency]

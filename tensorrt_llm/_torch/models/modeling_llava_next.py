@@ -14,8 +14,8 @@ from transformers.models.llava_next.modeling_llava_next import (
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...llmapi.utils import download_hf_model
@@ -32,7 +32,7 @@ from .modeling_utils import (filter_weights, register_auto_model,
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-class LlavaNextInputProcessor(InputProcessor):
+class LlavaNextInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -55,17 +55,6 @@ class LlavaNextInputProcessor(InputProcessor):
         self.image_token_index = model_config.image_token_index
         self.vocab_size = model_config.vocab_size
         self.config = model_config.vision_config
-
-    def get_num_tokens_per_image(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-    ) -> int:
-        image_size = (image_height, image_width)
-        num_image_tokens = self.processor._get_num_multimodal_tokens(
-            [image_size])["num_image_tokens"][0]
-        return num_image_tokens
 
     def _postprocess(
         self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,

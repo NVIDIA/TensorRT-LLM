@@ -31,7 +31,7 @@ namespace kernels
 #define TLLM_GEN_COMMIT "541a9315-dirty"
 #define TLLM_GEN_EXPORT_VERSION "7.0"
 
-static constexpr size_t tllmGenGemmListLen = 46;
+static constexpr size_t tllmGenGemmListLen = 76;
 
 #ifndef EXCLUDE_SM_100
 extern unsigned char Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x256u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_schedS_sm100f_cubin[];
@@ -186,13 +186,14 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mTransposeMmaOutput */ 0
 , /* mTileM */ 128
 , /* mTileN */ 128
-, /* mTileK */ 256
-, /* mUseUnrollLoop2xForMma */ 1
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mTransposeMmaOutput */ 0
 , /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
+, /* mUseShuffledMatrixA */ 0
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
@@ -348,7 +349,7 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
 , /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
@@ -360,11 +361,11 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 128
-, /* mGridTriggerSecondaryA */ 1
+, /* mGridTriggerSecondaryA */ 0
 , /* mGridTriggerSecondaryB */ 0
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 1
-, /* mGridWaitForPrimaryB */ 0
+, /* mGridWaitForPrimaryB */ 1
 , /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
@@ -1288,10 +1289,6 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
 , /* mTransposeMmaOutput */ 1
-, /* mTileM */ 128
-, /* mTileN */ 128
-, /* mTileK */ 128
-, /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
 , /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 1
@@ -1432,7 +1429,6 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mUseUnrollLoop2xForMma */ 0
 , /* mUseCustomMmaSchedule */ 1
 , /* mUseHoistTryWaitForCustomMmaSchedule */ 0
-, /* mUseDeepSeekFp8 */ 1
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
 , /* mUseTmaStore */ 1
@@ -2085,7 +2081,7 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 128
-, /* mGridTriggerSecondaryA */ 1
+, /* mGridTriggerSecondaryA */ 0
 , /* mGridTriggerSecondaryB */ 0
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 1
@@ -2325,13 +2321,14 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mTransposeMmaOutput */ 0
 , /* mTileM */ 128
 , /* mTileN */ 128
-, /* mTileK */ 256
-, /* mUseUnrollLoop2xForMma */ 1
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mTransposeMmaOutput */ 1
 , /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
+, /* mUseShuffledMatrixA */ 1
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
@@ -2485,9 +2482,9 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
+, /* mClusterDimZ */ 2
 , /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
 , /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
@@ -2912,11 +2909,11 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mEpilogueLdtmDps */ 16
 , /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
-, /* mEpilogueTileN */ 8
+, /* mEpilogueTileN */ 16
 , /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
+, /* mGridTriggerSecondaryB */ 0
 , /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryA */ 1
 , /* mGridWaitForPrimaryB */ 1
 , /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
@@ -2928,12 +2925,12 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mMmaK */ 32
 , /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
-, /* mMmaN */ 8
+, /* mMmaN */ 16
 , /* mMockAllReduce */ 0
 , /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSplitK */ 2
 , /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
+, /* mNumStages */ 2
 , /* mNumStagesMma */ 1
 , /* mNumStagesMmaWithinWorkTile */ 1
 , /* mNumStagesMmaAcrossWorkTile */ 1
@@ -2970,7 +2967,7 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 2
 , /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
 , /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052679)
 , /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
@@ -2983,9 +2980,9 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
+, /* mGridTriggerSecondaryB */ 0
 , /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryA */ 1
 , /* mGridWaitForPrimaryB */ 1
 , /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
@@ -3002,7 +2999,7 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mN */ 256
 , /* mNumSlicesForSplitK */ 2
 , /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
+, /* mNumStages */ 2
 , /* mNumStagesMma */ 1
 , /* mNumStagesMmaWithinWorkTile */ 1
 , /* mNumStagesMmaAcrossWorkTile */ 1
@@ -3037,7 +3034,7 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
+, /* mClusterDimZ */ 2
 , /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
 , /* mDtypeA */ trtllm::gen::Dtype(17826828)
 , /* mDtypeB */ trtllm::gen::Dtype(17827853)
@@ -3052,9 +3049,9 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
+, /* mGridTriggerSecondaryB */ 0
 , /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryA */ 1
 , /* mGridWaitForPrimaryB */ 1
 , /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
@@ -3064,14 +3061,14 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
 , /* mMmaK */ 32
-, /* mMmaKind */ trtllm::gen::MmaKind(5)
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
 , /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSplitK */ 2
 , /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
+, /* mNumStages */ 2
 , /* mNumStagesMma */ 1
 , /* mNumStagesMmaWithinWorkTile */ 1
 , /* mNumStagesMmaAcrossWorkTile */ 1
@@ -3084,13 +3081,14 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mTransposeMmaOutput */ 1
 , /* mTileM */ 128
 , /* mTileN */ 8
-, /* mTileK */ 512
-, /* mUseUnrollLoop2xForMma */ 1
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mTransposeMmaOutput */ 1
 , /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUseDeepSeekFp8 */ 0
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
 , /* mUsePerTokenSfA */ 0
 , /* mUsePerTokenSfB */ 0
+, /* mUseShuffledMatrixA */ 1
 , /* mUseTmaStore */ 1
 , /* mUseTwoTmaLoadWarps */ 1
 , /* mUseTwoMmaWarps */ 0
@@ -3132,15 +3130,15 @@ static const gemm::GemmConfig tllmGenGemmList[] = {
 , /* mLayoutA */ gemm::MatrixLayout(0)
 , /* mLayoutB */ gemm::MatrixLayout(0)
 , /* mM */ 256
-, /* mMmaK */ 64
-, /* mMmaKind */ trtllm::gen::MmaKind(4)
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 128
 , /* mMockAllReduce */ 0
 , /* mN */ 256
 , /* mNumSlicesForSplitK */ 1
 , /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
+, /* mNumStages */ 2
 , /* mNumStagesMma */ 1
 , /* mNumStagesMmaWithinWorkTile */ 1
 , /* mNumStagesMmaAcrossWorkTile */ 1

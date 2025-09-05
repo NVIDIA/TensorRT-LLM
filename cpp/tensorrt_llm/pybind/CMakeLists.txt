@@ -15,8 +15,11 @@ set(SRCS
     executor/executorConfig.cpp
     executor/request.cpp
     runtime/bindings.cpp
+    runtime/hostfunc.cpp
+    common/tllmExceptions.cpp
     testing/modelSpecBinding.cpp
     runtime/moeBindings.cpp
+    testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
     thop/bindings.cpp

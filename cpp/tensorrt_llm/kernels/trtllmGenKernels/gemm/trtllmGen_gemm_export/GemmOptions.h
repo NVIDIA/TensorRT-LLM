@@ -183,6 +183,18 @@ struct GemmOptions
         , mSfLayoutC{sfLayoutC}
         , mSfReshapeFactor{sfReshapeFactor}
         , mTileScheduler{tileScheduler}
+        , mTransposeMmaOutput{transposeMmaOutput}
+        , mUseCustomMmaSchedule{useCustomMmaSchedule}
+        , mUseDeepSeekFp8{useDeepSeekFp8}
+        , mUseHoistTryWaitForCustomMmaSchedule{useHoistTryWaitForCustomMmaSchedule}
+        , mUsePerTokenSfA{usePerTokenSfA}
+        , mUsePerTokenSfB{usePerTokenSfB}
+        , mUseShuffledMatrixA{useShuffledMatrixA}
+        , mUseTmaStore{useTmaStore}
+        , mUseTwoTmaLoadWarps{useTwoTmaLoadWarps}
+        , mUseTwoMmaWarps{useTwoMmaWarps}
+        , mUseUnrollLoop2xForMma{useUnrollLoop2xForMma}
+        , mWorldSize{worldSize}
     {
     }
 
@@ -340,6 +352,32 @@ struct GemmOptions
     int mSfReshapeFactor{1};
     // Tile scheduler type.
     TileScheduler mTileScheduler{TileScheduler::Static};
+    // Save output of MMA in M-major format.
+    bool mTransposeMmaOutput{false};
+    // Use custom MMA schedule optimized for low-latency.
+    bool mUseCustomMmaSchedule{false};
+    // Use DeepSeek Fp8.
+    bool mUseDeepSeekFp8{false};
+    // The purpose of hoisting trywaits is to opportunistically peek at the availability of the next
+    // k-block. It benefits when the next k-block is already available and thus sustaining the
+    // momentum, but it adds latency to the first k-block for smaller k-loop.
+    bool mUseHoistTryWaitForCustomMmaSchedule{false};
+    // Apply per-token scales from A
+    bool mUsePerTokenSfA{false};
+    // Apply per-token scales from B
+    bool mUsePerTokenSfB{false};
+    // Reorder rows/cols in the A matrix for the better memory accesses in the M-major epilogue.
+    bool mUseShuffledMatrixA{false};
+    // Use TMA to store the result.
+    bool mUseTmaStore{true};
+    // Use two different warps for A and B matrix load.
+    bool mUseTwoTmaLoadWarps{false};
+    // Use two different warps for MMA tasks. Applicable only to DeepSeek FP8.
+    bool mUseTwoMmaWarps{false};
+    // Whether to unroll the loop by 2x.
+    bool mUseUnrollLoop2xForMma{true};
+    // World size for all-reduce.
+    int mWorldSize{1};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -521,7 +559,20 @@ inline std::string dumpOptions(GemmOptions const& options)
        << "," << std::endl;
     ss << "mSfReshapeFactor=" << options.mSfReshapeFactor << "," << std::endl;
     ss << "mTileScheduler="
-       << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler) << ")" << std::endl;
+       << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler) << ")"
+       << "," << std::endl;
+    ss << "mTransposeMmaOutput=" << options.mTransposeMmaOutput << "," << std::endl;
+    ss << "mUseCustomMmaSchedule=" << options.mUseCustomMmaSchedule << "," << std::endl;
+    ss << "mUseDeepSeekFp8=" << options.mUseDeepSeekFp8 << "," << std::endl;
+    ss << "mUseHoistTryWaitForCustomMmaSchedule=" << options.mUseHoistTryWaitForCustomMmaSchedule << "," << std::endl;
+    ss << "mUsePerTokenSfA=" << options.mUsePerTokenSfA << "," << std::endl;
+    ss << "mUsePerTokenSfB=" << options.mUsePerTokenSfB << "," << std::endl;
+    ss << "mUseShuffledMatrixA=" << options.mUseShuffledMatrixA << "," << std::endl;
+    ss << "mUseTmaStore=" << options.mUseTmaStore << "," << std::endl;
+    ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
+    ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
+    ss << "mUseUnrollLoop2xForMma=" << options.mUseUnrollLoop2xForMma << "," << std::endl;
+    ss << "mWorldSize=" << options.mWorldSize << std::endl;
     return ss.str();
 }
 
@@ -556,8 +607,7 @@ inline int32_t getShuffleBlockSize(int epilogueTileM)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Check if the options are valid or not.
-inline bool checkAndUpdateGemmOptions(
-    GemmOptions& options, bool isBlackwell, int /* tpGrpSize */, bool updateOptions = true)
+inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, int tpGrpSize, bool updateOptions = true)
 {
 
     if (options.mDtypeB == tg::Dtype::Void)
@@ -962,6 +1012,13 @@ inline bool checkAndUpdateGemmOptions(
         options.mClusterDimZ == 1 || options.mNumSlicesForSplitK > 1, "Cluster DimZ is only allowed for split-k.");
     TLLM_CHECK_ERROR(options.mTileM <= 128, "GEMM does not support TileM > 128.");
 
+    // FIXME: this is a bug in DeepSeek Fp8.
+    if (options.mUseDeepSeekFp8)
+    {
+        TLLM_CHECK_ERROR(options.mK % (options.mNumSlicesForSplitK * options.mTileK) == 0,
+            "K must be a multiple of TileK * numSlicesForSplitK for DeepSeekFp8");
+    }
+
     // When the A-matrix is shuffled, the output must be transposed.
     if (options.mUseShuffledMatrixA)
     {
@@ -1189,6 +1246,23 @@ inline bool checkAndUpdateGemmOptions(
             ")");
     }
 
+    // Number of iterations in K dimension after padding.
+    // Note the perCtaK in each CTA in the splitK group are padded to the same number of iterations.
+    // E.g., K = 512, TileK = 128, numSlicesForSplitK = 3. Then the padded K is
+    //
+    //   ceil(512 / (128*3)) * (128*3) = 768
+    //
+    int const paddedK = divUpMul(options.mK, options.mTileK * options.mNumSlicesForSplitK);
+    int const perCtaK = paddedK / options.mNumSlicesForSplitK;
+    // However, number of iterations is clamped to multiples of tileK within individual CTAs
+    // E.g., K = 448, TileK = 64, numSlicesForSplitK = 4.
+    //
+    //   paddedK                        = 512
+    //   perCtaK                        = 128
+    //   clampedPerCtaK for CTA 0, 1, 2 = 128
+    //   clampedPerCtaK for CTA 3       = 64
+    int const paddingForK = paddedK - options.mK;
+    int const clampedAndPaddedPerCtaK = divUpMul(perCtaK - paddingForK, options.mTileK);
     if (options.mUseUnrollLoop2xForMma)
     {
         // Number of iterations in K dimension after padding.
@@ -1217,6 +1291,11 @@ inline bool checkAndUpdateGemmOptions(
                 return false;
             }
         }
+    }
+    if (options.mNumSlicesForSplitK > 1)
+    {
+        TLLM_CHECK_ERROR(perCtaK * (options.mNumSlicesForSplitK - 1) < options.mK,
+            "K must be greater than perCtaK * (numSlicesForSplitK - 1) to ensure each CTA has work");
     }
 
     if (!isBlackwell && options.mTileScheduler == TileScheduler::Persistent)
