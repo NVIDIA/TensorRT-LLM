@@ -149,6 +149,7 @@ class Eagle3DraftModel(DecoderModel):
         self.dtype = config.torch_dtype
         self.hidden_size = config.hidden_size
         self.mapping = model_config.mapping
+        self.num_layers = model_config.pretrained_config.num_hidden_layers
 
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size
@@ -162,7 +163,13 @@ class Eagle3DraftModel(DecoderModel):
                              bias=getattr(config, "bias", False),
                              dtype=config.torch_dtype)
 
-        self.midlayer = Eagle3DecoderLayer(model_config, start_layer_idx)
+        if self.num_layers > 1:
+            self.midlayer = nn.ModuleList([
+                Eagle3DecoderLayer(model_config, start_layer_idx + i)
+                for i in range(self.num_layers)
+            ])
+        else:
+            self.midlayer = Eagle3DecoderLayer(model_config, start_layer_idx)
 
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
@@ -170,7 +177,7 @@ class Eagle3DraftModel(DecoderModel):
 
         if config.draft_vocab_size is not None and config.vocab_size != config.draft_vocab_size:
             self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
-                                                dtype=torch.int64),
+                                                dtype=torch.int32),
                                     requires_grad=False)
 
         if self.hidden_size_in != config.hidden_size:
@@ -211,11 +218,22 @@ class Eagle3DraftModel(DecoderModel):
         # we expect that to happen outside the model definition. This helps us
         # avoid data-dependent control flow and gives us better CUDA graph
         # coverage.
-        hidden_states, residual = self.midlayer(position_ids=position_ids,
+        residual = None
+        if self.num_layers > 1:
+            for layer in self.midlayer:
+                if residual is not None:
+                    hidden_states = hidden_states + residual
+                hidden_states, residual = layer(position_ids=position_ids,
                                                 embeds=inputs_embeds,
                                                 hidden_states=hidden_states,
                                                 attn_metadata=attn_metadata,
                                                 spec_metadata=spec_metadata)
+        else:
+            hidden_states, residual = self.midlayer(position_ids=position_ids,
+                                                    embeds=inputs_embeds,
+                                                    hidden_states=hidden_states,
+                                                    attn_metadata=attn_metadata,
+                                                    spec_metadata=spec_metadata)
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
