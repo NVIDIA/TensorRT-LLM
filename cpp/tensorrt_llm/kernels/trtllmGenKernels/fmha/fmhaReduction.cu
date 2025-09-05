@@ -152,8 +152,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(
         // The local headIdxO.
         int32_t localHeadIdxO{validRowIdx};
 
-        // Wait for the primary kernel to complete.
+// Wait for the primary kernel to complete.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
+#endif
 
         // Add offset to the pointers.
         float2* localPartialStatsPtr = partialStatsPtr + loadRowIdx;
@@ -238,8 +240,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(
         }
     }
 
-    // Trigger the secondary kernel.
+// Trigger the secondary kernel.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
