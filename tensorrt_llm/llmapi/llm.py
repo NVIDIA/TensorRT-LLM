@@ -18,6 +18,7 @@ from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
+from ..bindings import steady_clock_now
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
@@ -348,6 +349,9 @@ class BaseLLM:
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
 
+        arrival_time = steady_clock_now(
+        ) if self.args.return_perf_metrics else None
+
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
@@ -444,6 +448,7 @@ class BaseLLM:
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
+            arrival_time=arrival_time,
         )
 
         return RequestOutput._from_generation_result(result, prompt,
