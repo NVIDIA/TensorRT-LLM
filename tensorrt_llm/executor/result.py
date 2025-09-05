@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
+from ..mm_disaggregated_params import MultimodalDisaggParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
@@ -194,6 +195,9 @@ class GenerationResultBase:
         # GenerationResultBase instances on postprocess worker processes.
         self._params_transmitted = False
 
+        # For multimodal disaggregated serving
+        self.multimodal_disaggregated_params = None
+
     @property
     def outputs(self) -> List[CompletionOutput]:
         sampling_param = self.sampling_params
@@ -215,10 +219,6 @@ class GenerationResultBase:
     @property
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
-
-    @property
-    def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
-        return self._mm_embedding_handle
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -368,7 +368,7 @@ class GenerationResultBase:
 
             if hasattr(response_result, 'mm_embedding_handle'
                        ) and response_result.mm_embedding_handle is not None:
-                self._mm_embedding_handle = response_result.mm_embedding_handle
+                self._multimodal_disaggregated_params.mm_embedding_handles = [response_result.mm_embedding_handle]
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -520,6 +520,9 @@ class GenerationResult(GenerationResultBase):
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
         self._aborted = False
 
+        self._multimodal_disaggregated_params = MultimodalDisaggParams(prompt_token_ids=generation_request.prompt_token_ids,
+                                                                      multimodal_input=generation_request.multimodal_params.multimodal_input)
+
     @property
     def request_id(self) -> int:
         return self._generation_request.id
@@ -618,7 +621,7 @@ class GenerationResult(GenerationResultBase):
     def _repr_fields(self):
         return [
             'request_id', 'prompt_token_ids', 'outputs', 'finished',
-            "context_logits", "mm_embedding_handle"
+            "context_logits", "multimodal_disagg_params"
         ]
 
     def __repr__(self) -> str:
@@ -635,6 +638,10 @@ class GenerationResult(GenerationResultBase):
 
     def __hash__(self):
         return hash(self.request_id)
+
+    @property
+    def multimodal_disagg_params(self) -> Optional[MultimodalDisaggParams]:
+        return self._multimodal_disaggregated_params
 
 
 class IterationResult:
