@@ -1206,9 +1206,10 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
-                    if self.previous_batch is not None:
-                        self._update_requests(self.previous_batch.sample_state)
+                if self.previous_batch is not None:
+                    self._update_requests(self.previous_batch.sample_state)
 
+                if scheduled_batch.batch_size > 0:
                     if self.guided_decoder is not None:
                         # add_batch must be called again to have updated new tokens.
                         self.guided_decoder.add_batch(scheduled_batch)
@@ -1224,13 +1225,15 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    if self.previous_batch is not None:
-                        self._process_previous_batch()
-                        self.previous_batch: Optional[BatchState] = None
+                if self.previous_batch is not None:
+                    self._process_previous_batch()
+                    self.previous_batch: Optional[BatchState] = None
 
-                    if self.enable_iter_perf_stats:
-                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                            'num_ctx_tokens']
+                if self.enable_iter_perf_stats:
+                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                        'num_ctx_tokens']
+
+                if scheduled_batch.batch_size > 0:
 
                     self.previous_batch = BatchState(
                         sample_state=sample_state,
