@@ -944,7 +944,7 @@ class PyExecutor:
             self.send_handles[microbatch_id].wait()
             self.send_handles[microbatch_id] = None
 
-    def _prepare_and_schedule_batch(self):
+    def _prepare_and_schedule_batch(self, overlap_mode: bool = False):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
             return None, None
@@ -973,6 +973,12 @@ class PyExecutor:
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+        if overlap_mode:
+            new_generation_requests = []
+            for req in scheduled_batch.generation_requests:
+                if req.py_decoding_iter + 1 < req.py_max_new_tokens:
+                    new_generation_requests.append(req)
+            scheduled_batch.generation_requests = new_generation_requests
 
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -1158,7 +1164,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
-                scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                scheduled_batch, iter_stats = self._prepare_and_schedule_batch(
+                    overlap_mode=True)
                 if scheduled_batch is None:
                     break
 
@@ -1182,41 +1189,40 @@ class PyExecutor:
                     # the generation requests always have batch_idx.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
-                        key=lambda req:
-                        int(req.py_batch_idx is not None and req.
-                            py_decoding_iter + 1 < req.py_max_new_tokens),
+                        key=lambda req: int(req.py_batch_idx is not None),
                     )
-                    if scheduled_batch.batch_size > 0:
-                        if self.kv_cache_transceiver:
-                            # Return the first token to the client
-                            self._handle_first_token_response(scheduled_batch)
 
-                        # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
-                        if self.guided_decoder is not None and self.kv_cache_transceiver:
-                            self.guided_decoder.add_batch(scheduled_batch)
-                            self.guided_decoder.init_disagg_gen_requests()
+                    if self.kv_cache_transceiver:
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
 
-                        previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
-                        batch_outputs = self._forward_step(
-                            scheduled_batch, previous_tensors_device)
+                    # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
+                    if self.guided_decoder is not None and self.kv_cache_transceiver:
+                        self.guided_decoder.add_batch(scheduled_batch)
+                        self.guided_decoder.init_disagg_gen_requests()
 
-                        if self.previous_batch is not None:
-                            self._update_requests(
-                                self.previous_batch.sample_state)
+                    previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
-                        if self.guided_decoder is not None:
-                            # add_batch must be called again to have updated new tokens.
-                            self.guided_decoder.add_batch(scheduled_batch)
-                            self.guided_decoder.execute(batch_outputs['logits'])
-                        sample_state = self._sample_async(
-                            scheduled_batch, batch_outputs)
-                        assert sample_state is not None, "Sampling failed"
+                    batch_outputs = self._forward_step(scheduled_batch,
+                                                       previous_tensors_device)
 
-                        self._update_request_states(scheduled_batch)
+                    if self.previous_batch is not None:
+                        self._update_requests(self.previous_batch.sample_state)
 
-                        ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                            scheduled_batch.context_requests
-                        ) if self.kv_cache_transceiver else []
+                    if self.guided_decoder is not None:
+                        # add_batch must be called again to have updated new tokens.
+                        self.guided_decoder.add_batch(scheduled_batch)
+                        self.guided_decoder.execute(batch_outputs['logits'])
+
+                    sample_state = self._sample_async(scheduled_batch,
+                                                      batch_outputs)
+                    assert sample_state is not None, "Sampling failed"
+
+                    self._update_request_states(scheduled_batch)
+
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
 
                     if self.previous_batch is not None:
                         self._process_previous_batch()
@@ -1226,14 +1232,11 @@ class PyExecutor:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
 
-                    if scheduled_batch.batch_size > 0:
-                        self.previous_batch = BatchState(
-                            sample_state=sample_state,
-                            iter_start_time=iter_start_time,
-                            iter_stats=iter_stats,
-                            ctx_transmission_reqs=ctx_transmission_reqs)
-                    else:
-                        self.previous_batch = None
+                    self.previous_batch = BatchState(
+                        sample_state=sample_state,
+                        iter_start_time=iter_start_time,
+                        iter_stats=iter_stats,
+                        ctx_transmission_reqs=ctx_transmission_reqs)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
