@@ -160,16 +160,15 @@ void MLACacheFormatter::format(TransferSession& session)
     auto getBufferSizeForTarget = [&]()
     {
         std::vector<size_t> bufferSizeForTarget(pPDomainSize, 0);
-        std::vector<SizeType32> layerNumBufferTargetNum(pPDomainSize, 0);
-        size_t baseEleSize = cacheBlockSize * blockNum / selfAttentionLayerNum;
+        size_t cacheSizePerLayer = cacheBlockSize * blockNum / selfAttentionLayerNum;
         for (size_t i = 0; i < pPDomainSize; i++)
         {
-            layerNumBufferTargetNum[i] = targetInfo.getPeerPPDomainLayerNum(i);
-            bufferSizeForTarget[i] = baseEleSize * layerNumBufferTargetNum[i];
+            auto layerNum = targetInfo.getPeerPPDomainLayerNum(i);
+            bufferSizeForTarget[i] = cacheSizePerLayer * layerNum;
         }
-        return std::make_pair(bufferSizeForTarget, layerNumBufferTargetNum);
+        return bufferSizeForTarget;
     };
-    auto [bufferEleSizes, layerNumbufferTargetNum] = getBufferSizeForTarget();
+    auto bufferEleSizes = getBufferSizeForTarget();
     auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, static_cast<int>(pPDomainSize), bufferEleSizes, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);
@@ -212,8 +211,11 @@ void MLACacheFormatter::format(TransferSession& session)
         }
         else
         {
-            // bufferCoverTargetNum=0, mSendBuffer size < one outputSlice
-            // send multiple times
+
+            // If cacheIdx< bufferCoverTargetNum, the ouputSplitCaches.at(cacheIdx) is allocated by cudaMallocAsync,
+            // which is unable to be transferred by UCX GPU-direct RDMA. We need copy the data to pre-allocated
+            // cudaMalloc buffer,and then start send.
+            // bufferCoverTargetNum=0, mSendBuffer size < one outputSlice send multiple times
             size_t remainSendSize = outputSplitCaches.at(cacheIdx)->getSize();
             size_t needSendSize = outputSplitCaches.at(cacheIdx)->getSize();
             auto sendBufferIdx = bufferCoverTargetNum == 0 ? 0 : cacheIdx % bufferCoverTargetNum;
@@ -374,17 +376,15 @@ void MLACacheFormatter::unformat(TransferSession& session)
         auto getBufferSizeForTarget = [&]()
         {
             std::vector<size_t> bufferEleSizes(targetNum, 0);
-            std::vector<SizeType32> layerNumbufferTargetNum(targetNum, 0);
-            auto baseEleSize = cacheBlockSize * blockNum / selfAttentionLayerNum;
+            auto cacheSizePerLayer = cacheBlockSize * blockNum / selfAttentionLayerNum;
             for (size_t i = 0; i < targetNum; i++)
             {
-                layerNumbufferTargetNum[i]
-                    = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
-                bufferEleSizes[i] = baseEleSize * layerNumbufferTargetNum[i];
+                auto layerNum = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
+                bufferEleSizes[i] = cacheSizePerLayer * layerNum;
             }
-            return std::make_pair(bufferEleSizes, layerNumbufferTargetNum);
+            return bufferEleSizes;
         };
-        auto [bufferEleSizes, layerNumbufferTargetNum] = getBufferSizeForTarget();
+        auto bufferEleSizes = getBufferSizeForTarget();
 
         auto result = mCacheTransBufferManager->getOrAllocateRecvBuffers(
             cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);

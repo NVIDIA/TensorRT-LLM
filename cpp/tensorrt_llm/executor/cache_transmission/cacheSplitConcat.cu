@@ -76,24 +76,24 @@ TargetRanksInfo TargetRanksInfoForDP(
     // compute the target PP ranks and layer num need to be fetched from each target PP rank, according to [global start
     // layer id, global end layer id)
 
-    for (int pp_rank = 0; pp_rank < selfPPRank; pp_rank++)
+    for (int ppRank = 0; ppRank < selfPPRank; ppRank++)
     {
-        selfStartLayerId += selfNumLayerPerPP[pp_rank];
+        selfStartLayerId += selfNumLayerPerPP[ppRank];
     }
     int selfEndLayerId = selfStartLayerId + selfNumLayerPerPP[selfPPRank];
     int prePeerPPLayerId = 0;
     std::vector<int> targetPeerPPRanks;
     std::vector<int> targetPeerPPLayerNum;
-    for (int pp_rank = 0; pp_rank < peerPPNum; pp_rank++)
+    for (int ppRank = 0; ppRank < peerPPNum; ppRank++)
     {
         int peerPPStartLayerId = prePeerPPLayerId;
-        int peerPPEndLayerId = peerPPStartLayerId + peerNumLayerPerPP[pp_rank];
+        int peerPPEndLayerId = peerPPStartLayerId + peerNumLayerPerPP[ppRank];
 
-        prePeerPPLayerId += peerNumLayerPerPP[pp_rank];
+        prePeerPPLayerId += peerNumLayerPerPP[ppRank];
 
         if (selfStartLayerId < peerPPEndLayerId && selfEndLayerId > peerPPStartLayerId)
         {
-            targetPeerPPRanks.push_back(pp_rank);
+            targetPeerPPRanks.push_back(ppRank);
             int layerNumInDomainPP
                 = std::min(peerPPEndLayerId, selfEndLayerId) - std::max(peerPPStartLayerId, selfStartLayerId);
             targetPeerPPLayerNum.push_back(layerNumInDomainPP);
@@ -1033,6 +1033,8 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     }
     TLLM_CHECK(outputCacheNum == outputSplitBlocks.size());
     TLLM_CHECK(inputBlockNumSum > 0);
+    // we want to reduce the call of `cudaMemcpyAsync H2D` , cachePtrs is used to store the pointers of the cache blocks
+    // and the values of the prefix layer num.
     std::vector<uint64_t> cachePtrs;
     std::vector<SizeType32> windowSizes;
     std::vector<SizeType32> blockNumInwindow;
@@ -1137,13 +1139,12 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + inputBlockNumSum + outputSplitBlocks.size();
 
     int const tokensPerBlock = selfModelConfig.mTokensPerBlock;
-    int const numLayers
-        = selfParallelConfig.mAttentionLayerNumPerPP.at(selfIdx / selfParallelConfig.mTensorParallelism);
+    int selfPPRank = selfIdx / (selfParallelConfig.mTensorParallelism * selfParallelConfig.mContextParallelism);
+    int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
     int const dimsPerHead = selfModelConfig.mSizePerHead;
     int const DomainPPSize = targetRankInfo.mDomainPPSize;
     int const DomainTPSize = targetRankInfo.mDomainTPSize;
-    // int const layerNumDomainPP = numLayers / DomainPPSize;
     int const headNumDomainTP = headNum / (DomainTPSize / targetRankInfo.mPeerDupHeadFactor);
     int const kvFactor = selfAttentionConfig.mKvFactor;
     bool const isMLA = selfAttentionConfig.mAttentionType == CacheState::AttentionType::kMLA;
@@ -1403,6 +1404,11 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
         TLLM_CHECK(inputSplitBlock->getDataType() == cacheDataType);
         cachePtrs.push_back(reinterpret_cast<uint64_t>(inputSplitBlock->data()));
     }
+
+    // the prefix layer num is used to store the layer num of the previous PP ranks.
+    // which is helpful for the kernel to get layer num info.  refer to the function
+    // `getLayerIdInDomainPPandRankInDomainPP`.
+
     std::vector<uint64_t> prefixLayerNum(targetRankInfo.mDomainPPSize + 1, 0);
     prefixLayerNum[0] = 0;
     for (int i = 0; i < targetRankInfo.mDomainPPSize; i++)
@@ -1458,9 +1464,8 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     uint64_t* prefixLayerNumDevPtr
         = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + outputBlockNumSum + inputSplitBlocks.size();
     int const tokensPerBlock = selfModelConfig.mTokensPerBlock;
-    // int const numLayers = selfModelConfig.mNbKvHeadsPerLayer.size() / oPPNum;
-    int const numLayers
-        = selfParallelConfig.mAttentionLayerNumPerPP.at(selfIdx / selfParallelConfig.mTensorParallelism);
+    int selfPPRank = selfIdx / (selfParallelConfig.mTensorParallelism * selfParallelConfig.mContextParallelism);
+    int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "concatKVCache numLayers:%d", numLayers);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
     int const dimsPerHead = selfModelConfig.mSizePerHead;

@@ -113,6 +113,8 @@ public:
         bool mEnableAttentionDP;
         SizeType32 mDPrank;
         SizeType32 mDPsize;
+        // number of attention layers per pipeline parallelism rank, the size of the vector is equal to the pipeline
+        // parallelism size.
         std::vector<SizeType32> mAttentionLayerNumPerPP;
 
         [[nodiscard]] bool operator==(ParallelConfig const& other) const noexcept

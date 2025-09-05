@@ -220,21 +220,21 @@ void CacheFormatter::format(TransferSession& session)
 
         size_t allCacheBlockSize = 0;
         // gather cache blocks of the request.
-        std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocks;
+        std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
         for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
             SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
-            TLLM_CHECK_WITH_INFO(inputKvCacheBlocks.find(window) == inputKvCacheBlocks.end(),
+            TLLM_CHECK_WITH_INFO(inputKvCacheBlocksPerWindow.find(window) == inputKvCacheBlocksPerWindow.end(),
                 "window size already exists, which is not supported");
-            inputKvCacheBlocks.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
+            inputKvCacheBlocksPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
             auto maxBlockThisWindow = window / selfConfig.getModelConfig().mTokensPerBlock;
             // only block in window will be sent.
             SizeType32 blockNumThisWindow = 0;
             for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
             {
                 blockNum++;
-                inputKvCacheBlocks.at(window).push_back(it);
+                inputKvCacheBlocksPerWindow.at(window).push_back(it);
                 allCacheBlockSize += it->getSize();
                 blockNumThisWindow++;
                 if (blockNumThisWindow >= maxBlockThisWindow)
@@ -244,7 +244,7 @@ void CacheFormatter::format(TransferSession& session)
             }
         }
 
-        if (inputKvCacheBlocks.size() > 1)
+        if (inputKvCacheBlocksPerWindow.size() > 1)
         {
             if (selfConfig.getParallelConfig().mPipelineParallelism
                 != destConfig.getParallelConfig().mPipelineParallelism)
@@ -252,7 +252,7 @@ void CacheFormatter::format(TransferSession& session)
                 checkAlternateWindow(mCacheManager, selfConfig, destConfig);
             }
         }
-        TLLM_CHECK(!inputKvCacheBlocks.empty());
+        TLLM_CHECK(!inputKvCacheBlocksPerWindow.empty());
         TLLM_CHECK(blockNum > 0);
         int deviceId = mCacheManager->getBlockManager().getStreamDevice();
         auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
@@ -270,7 +270,7 @@ void CacheFormatter::format(TransferSession& session)
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             for (size_t i = 0; i < connections.size(); i++)
             {
-                for (auto const& [window, blocks] : inputKvCacheBlocks)
+                for (auto const& [window, blocks] : inputKvCacheBlocksPerWindow)
                 {
                     for (auto const& block : blocks)
                     {
@@ -303,16 +303,15 @@ void CacheFormatter::format(TransferSession& session)
         auto getBufferSizeForTarget = [&]()
         {
             std::vector<size_t> bufferSizeForTarget(targetNum, 0);
-            std::vector<SizeType32> layerNumbufferTargetNum(bufferTargetNum, 0);
-            //             // only first bufferTargetNum is used.
-            if (inputKvCacheBlocks.size() > 1)
+            // only first bufferTargetNum is used.
+            if (inputKvCacheBlocksPerWindow.size() > 1)
             {
                 // for VWSA
                 for (size_t i = 0; i < targetNum; i++)
                 {
                     bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetNum;
                 }
-                return std::make_pair(bufferSizeForTarget, layerNumbufferTargetNum);
+                return bufferSizeForTarget;
             }
 
             for (size_t i = 0; i < targetNum; i++)
@@ -320,14 +319,10 @@ void CacheFormatter::format(TransferSession& session)
                 bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetInfo.mDomainTPSize
                     / selfAttentionLayerNum * targetInfo.getPeerPPDomainLayerNum(i);
             }
-            for (size_t i = 0; i < bufferTargetNum; i++)
-            {
-                layerNumbufferTargetNum[i] = targetInfo.getPeerPPDomainLayerNum(i);
-            }
 
-            return std::make_pair(bufferSizeForTarget, layerNumbufferTargetNum);
+            return bufferSizeForTarget;
         };
-        auto [bufferEleSizes, layerNumbufferTargetNum] = getBufferSizeForTarget();
+        auto bufferEleSizes = getBufferSizeForTarget();
         auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(bufferTargetNum), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -335,7 +330,7 @@ void CacheFormatter::format(TransferSession& session)
         auto& onlyUseDynamicBuffer = std::get<2>(result);
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            " formatOutput bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d dupliacete:%d "
+            " format bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d duplicate:%d "
             "bufferCoverTargetNum:%d connections.size():%ld",
             bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDupHeadFactor, bufferCoverTargetNum,
             connections.size());
@@ -347,14 +342,15 @@ void CacheFormatter::format(TransferSession& session)
         }
         // TODO: add parameters for layerNumForEachOutput
         tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
-            inputKvCacheBlocks, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
+            inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
         bufferManager.getStream().synchronize();
 
         auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
         if (preAllocSendBuffer != nullptr)
         {
-            TLLM_CHECK(preAllocSendBuffer->getDataType() == inputKvCacheBlocks.begin()->second.front()->getDataType());
+            TLLM_CHECK(preAllocSendBuffer->getDataType()
+                == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
@@ -381,6 +377,10 @@ void CacheFormatter::format(TransferSession& session)
             }
             else
             {
+
+                // If cacheIdx< bufferCoverTargetNum, the ouputSplitCaches.at(cacheIdx) is allocated by cudaMallocAsync,
+                // which is unable to be transferred by UCX GPU-direct RDMA. We need copy the data to pre-allocated
+                // cudaMalloc buffer,and then start send.
                 // bufferCoverTargetNum == 0, mSendBuffer size < one outputSlice
                 // send multiple times
 
@@ -645,8 +645,7 @@ void CacheFormatter::unformat(TransferSession& session)
                     {
                         bufferSizeForTarget[i] = cacheBlockSizeSum / targetNum;
                     }
-                    // TODO: LayerNumbufferTargetNum for VWSA
-                    return std::make_pair(bufferSizeForTarget, std::vector<SizeType32>(targetNum, 0));
+                    return bufferSizeForTarget;
                 }
                 // for duplicate header, gen will not recv from TP which has duplicate header, and will not prepare
                 // buffer for it.
@@ -658,20 +657,18 @@ void CacheFormatter::unformat(TransferSession& session)
                     selfAttentionLayerNum);
                 TLLM_CHECK(targetNum == pickUpConnections.size());
                 // the sum of buffer size is cacheBlockSizeSum.
-                size_t baseEleSize = cacheBlockSizeSum / (validTpSize * selfAttentionLayerNum);
+                size_t cacheBlockSizePerLayer = cacheBlockSizeSum / (validTpSize * selfAttentionLayerNum);
 
                 std::vector<size_t> bufferEleSizes(targetNum, 0);
-                std::vector<SizeType32> layerNumbufferTargetNum(targetNum, 0);
 
                 for (size_t i = 0; i < targetNum; i++)
                 {
-                    layerNumbufferTargetNum[i]
-                        = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
-                    bufferEleSizes[i] = baseEleSize * layerNumbufferTargetNum[i];
+                    auto layerNum = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(pickUpConnections[i]));
+                    bufferEleSizes[i] = cacheBlockSizePerLayer * layerNum;
                 }
-                return std::make_pair(bufferEleSizes, layerNumbufferTargetNum);
+                return bufferEleSizes;
             };
-            auto [bufferEleSizes, layerNumbufferTargetNum] = getTargetBufferEleSize();
+            auto bufferEleSizes = getTargetBufferEleSize();
 
             size_t remainNoCoverTargetNum = 0;
             size_t bufferCoverTargetNum = 0;
