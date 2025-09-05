@@ -663,7 +663,7 @@ pipeline {
                     container("python3") {
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                        def nspect_commit = "58ee430c8c3bd36bee2073405a547d3f8bc1932f"
+                        def nspect_commit = "0e46042381ae25cb7af2f1d45853dfd8e1d54e2d"
                         withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
                             trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                         }
