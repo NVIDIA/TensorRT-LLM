@@ -1191,8 +1191,6 @@ class PyExecutor:
                             # Return the first token to the client
                             self._handle_first_token_response(scheduled_batch)
 
-                        previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
-
                         # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                         if self.guided_decoder is not None and self.kv_cache_transceiver:
                             self.guided_decoder.add_batch(scheduled_batch)
@@ -1205,11 +1203,6 @@ class PyExecutor:
                         if self.previous_batch is not None:
                             self._update_requests(
                                 self.previous_batch.sample_state)
-
-                        if self.guided_decoder is not None:
-                            self.guided_decoder.build(scheduled_batch)
-                            self.guided_decoder.execute(scheduled_batch,
-                                                        batch_outputs['logits'])
 
                         if self.guided_decoder is not None:
                             # add_batch must be called again to have updated new tokens.
