@@ -1213,6 +1213,9 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     }
     if (stageName.contains("-Ray-")) {
         makoArgs += ["orchestrator=ray"]
+    } else {
+        // Select tests with mpi or unspecified orchestrator
+        makoArgs += ["orchestrator=mpi"]
     }
 
     if (parseSysinfo) {
