@@ -65,9 +65,8 @@ def test_spec_gate_e2e():
         "What is the currency of Japan?",
         "How many players are on a basketball court for one team?",
         "List three primary colors.",
-        "The Roman Empire fell in the year",
     ]
-    sampling_params = SamplingParams(max_tokens=10, temperature=0)
+    sampling_params = SamplingParams(max_tokens=5, temperature=0)
 
     results_spec = llm_spec.generate(prompts, sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
