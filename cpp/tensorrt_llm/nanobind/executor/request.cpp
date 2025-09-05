@@ -394,7 +394,7 @@ void initRequestBindings(nb::module_& m)
         new (&kvCacheRetentionConfig) tle::KvCacheRetentionConfig(
             nb::cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(state[0]),
             nb::cast<tle::RetentionPriority>(state[1]), nb::cast<std::optional<std::chrono::milliseconds>>(state[2]),
-            nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::optional<std::string>>(state[4]));
+            nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::string>(state[4]));
     };
 
     auto kvCacheRetentionConfig = nb::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
@@ -417,7 +417,7 @@ void initRequestBindings(nb::module_& m)
     // TokenRangeRetentionPriority bindings have been defined.
     kvCacheRetentionConfig
         .def(nb::init<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>, tle::RetentionPriority,
-                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::optional<std::string>>(),
+                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::string>(),
             nb::arg("token_range_retention_configs"),
             nb::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             nb::arg("decode_duration_ms") = nb::none(), nb::arg("transfer_mode") = tle::KvCacheTransferMode::DRAM,
