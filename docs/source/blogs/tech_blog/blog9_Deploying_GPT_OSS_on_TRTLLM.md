@@ -1,7 +1,7 @@
-# Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM
+# Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM
 
 In the guide below, we will walk you through how to launch your own
-high-performance TensorRT-LLM server for **gpt-oss-120b** for inference.
+high-performance TensorRT LLM server for **gpt-oss-120b** for inference.
 This guide covers both low-latency and max-throughput cases.
 
 The typical use case for **low-latency**, is when we try to maximize the number of tokens per second per user with a limited concurrency (4, 8 or 16 users).
@@ -20,11 +20,11 @@ For **maximum throughput**, the goal is to maximize the amount of tokens produce
 We have a forthcoming guide for getting great performance on H100, however this guide focuses on the above GPUs.
 
 
-## Launching the TensorRT-LLM docker container
+## Launching the TensorRT LLM docker container
 
 The container image that you will use will be pulled from NVIDIA's NGC. This container is multi-platform and will run on both x64 and arm64 architectures: `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev`
 
-Run the follow docker command to start the TensorRT-LLM container in interactive mode:
+Run the follow docker command to start the TensorRT LLM container in interactive mode:
 
 ```bash
 docker run --rm --ipc=host -it \
@@ -52,7 +52,7 @@ This command:
 Lastly the container mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container.
 
 
-## Running the TensorRT-LLM Server
+## Running the TensorRT LLM Server
 
 As pointed out in the introduction, this guide covers low-latency and max-throughput cases. Each requires a different configurations and commands to run. We will first cover the Low-Latency use-case, followed by the max throughput use-case.
 
@@ -77,9 +77,9 @@ EOF
 > Note: If you are using NVIDIA H200 GPUs it is highly recommended to set the `moe_config.backend` to TRITON to use the OpenAI Triton MoE kernel. See the section [(H200 Only) Using OpenAI Triton Kernels for MoE](#h200-only-using-openai-triton-kernels-for-moe) for more details.
 
 
-#### Launching TensorRT-LLM Serve
+#### Launching TensorRT LLM Serve
 
-To launch the TensorRT-LLM Server to serve the model with the **low latency** config, run the following command. Commands for different GPU configurations are provided (1xGPU, 8xGPU, 4xGPU):
+To launch the TensorRT LLM Server to serve the model with the **low latency** config, run the following command. Commands for different GPU configurations are provided (1xGPU, 8xGPU, 4xGPU):
 
 <details open> <summary>1x B200/GB200/H200</summary>
 
@@ -153,9 +153,9 @@ EOF
 
 > Note: If you are using NVIDIA H200 GPUs it is highly recommended to set the `moe_config.backend` to TRITON to use the OpenAI Triton MoE kernel. See the section [(H200 Only) Using OpenAI Triton Kernels for MoE](#h200-only-using-openai-triton-kernels-for-moe) for more details.
 
-#### Launching TensorRT-LLM Serve
+#### Launching TensorRT LLM Serve
 
-To launch the TensorRT-LLM Server to serve the model with the **max throughput** config, run the following command. Commands for different GPU configurations are provided (1xGPU, 8xGPU, 4xGPU):
+To launch the TensorRT LLM Server to serve the model with the **max throughput** config, run the following command. Commands for different GPU configurations are provided (1xGPU, 8xGPU, 4xGPU):
 
 <details open> <summary>1x B200/GB200/H200</summary>
 
@@ -221,7 +221,7 @@ The initialization may take several minutes as it loads and optimizes the models
 
 ## (H200 Only) Using OpenAI Triton Kernels for MoE
 
-OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper based GPUs like NVIDIA's H200 for best performance. The NGC TensorRT-LLM container image mentioned above already includes the required kernels so you do not need to build or install them. It is highly recommended to enable them with the steps below:
+OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT LLM can leverage these kernels for Hopper based GPUs like NVIDIA's H200 for best performance. The NGC TensorRT LLM container image mentioned above already includes the required kernels so you do not need to build or install them. It is highly recommended to enable them with the steps below:
 
 ### Selecting Triton as the MoE backend
 

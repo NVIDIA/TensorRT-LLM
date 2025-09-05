@@ -1,9 +1,9 @@
-.. TensorRT-LLM documentation master file, created by
+.. TensorRT LLM documentation master file, created by
    sphinx-quickstart on Wed Sep 20 08:35:21 2023.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Welcome to TensorRT-LLM's Documentation!
+Welcome to TensorRT LLM's Documentation!
 ========================================
 
 .. toctree::
