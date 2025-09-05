@@ -59,6 +59,7 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
                                  MoEWeightLoadingMode, TRTLLMGenFusedMoE,
                                  create_moe)
+from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -559,6 +560,9 @@ class Deepseekv3MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
+            **({
+                "alltoall_result_do_sum": False
+            } if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output

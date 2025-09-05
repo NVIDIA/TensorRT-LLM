@@ -368,15 +368,16 @@ class WideEPMoE(MoE):
         return outputs
 
     def forward_chunk(
-            self,
-            x: Union[torch.Tensor, Fp4QuantizedTensor],
-            router_logits: torch.Tensor,
-            use_all_to_all: bool,
-            output_dtype: Optional[torch.dtype] = None,
-            all_rank_num_tokens: Optional[List[int]] = None,
-            all_rank_max_num_tokens: Optional[int] = None,
-            use_dp_padding: Optional[bool] = None,
-            repeating_info: Tuple = (True, True),
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        use_all_to_all: bool,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_max_num_tokens: Optional[int] = None,
+        use_dp_padding: Optional[bool] = None,
+        repeating_info: Tuple = (True, True),
+        alltoall_result_do_sum: bool = True,
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -388,6 +389,9 @@ class WideEPMoE(MoE):
 
         if self.layer_load_balancer and is_first_call:
             self.layer_load_balancer.start_wait_gpu_stage()
+
+        if not use_all_to_all or self.alltoall_method_type != AlltoallMethodType.MNNVL:
+            alltoall_result_do_sum = True
 
         use_deepseek_fp8_block_scale = False
         use_w4_group_scaling = False
@@ -679,7 +683,8 @@ class WideEPMoE(MoE):
                 if self.enable_dummy_allreduce:
                     self.dummy_allreduce()
                 final_hidden_states = self.alltoall_combine(
-                    final_hidden_states, alltoall_info, token_count)
+                    final_hidden_states, alltoall_info, token_count,
+                    alltoall_result_do_sum)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 final_hidden_states = self.unpad_tensors(
                     padded, final_hidden_states)
@@ -719,6 +724,7 @@ class WideEPMoE(MoE):
         all_rank_num_tokens: Optional[List[int]] = None,
         all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
+        alltoall_result_do_sum: bool = True,
     ) -> torch.Tensor:
         assert all_rank_num_tokens is not None
         assert use_dp_padding is not None
@@ -744,7 +750,8 @@ class WideEPMoE(MoE):
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 all_rank_max_num_tokens=all_rank_max_num_tokens,
                 use_dp_padding=use_dp_padding,
-                repeating_info=(is_first_call, is_last_call))
+                repeating_info=(is_first_call, is_last_call),
+                alltoall_result_do_sum=alltoall_result_do_sum)
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 use_all_to_all,
@@ -804,7 +811,8 @@ class WideEPMoE(MoE):
                                 all_rank_max_num_tokens=
                                 all_rank_max_num_tokens_list[idx_chunk],
                                 use_dp_padding=use_dp_padding,
-                                repeating_info=(is_first_call, is_last_call))
+                                repeating_info=(is_first_call, is_last_call),
+                                alltoall_result_do_sum=alltoall_result_do_sum)
                         if idx_chunk > 0:
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
@@ -822,7 +830,8 @@ class WideEPMoE(MoE):
                             all_rank_max_num_tokens=all_rank_max_num_tokens_list[
                                 idx_chunk],
                             use_dp_padding=use_dp_padding,
-                            repeating_info=(is_first_call, is_last_call))
+                            repeating_info=(is_first_call, is_last_call),
+                            alltoall_result_do_sum=alltoall_result_do_sum)
                         with torch.cuda.stream(self.aux_stream):
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
@@ -838,7 +847,8 @@ class WideEPMoE(MoE):
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk],
                         all_rank_max_num_tokens=all_rank_max_num_tokens_list[
                             idx_chunk],
-                        repeating_info=(is_first_call, is_last_call))
+                        repeating_info=(is_first_call, is_last_call),
+                        alltoall_result_do_sum=alltoall_result_do_sum)
 
                 outputs_list.append(outputs)
             if not use_all_to_all:
@@ -894,7 +904,8 @@ class WideEPMoE(MoE):
         return x, x_sf, token_selected_slots, token_final_scales
 
     def alltoall_combine(self, final_hidden_states: torch.Tensor,
-                         alltoall_info: MoEAlltoallInfo, token_count: int):
+                         alltoall_info: MoEAlltoallInfo, token_count: int,
+                         alltoall_result_do_sum: bool):
         top_k = self.routing_method.experts_per_token
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
@@ -907,7 +918,7 @@ class WideEPMoE(MoE):
             top_k=top_k,
             token_count=token_count,
             use_low_precision_combine=self.use_low_precision_combine,
-            do_reduce=False)
+            do_reduce=alltoall_result_do_sum)
 
         return final_hidden_states
 
