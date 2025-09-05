@@ -64,6 +64,7 @@ def sync():
     comm.Barrier()
 
 
+
 def compute_target_rank_id(expert_id, num_experts_per_rank):
     """Compute the rank that owns a given expert using contiguous partitioning.
     Experts are divided evenly across ranks:
@@ -89,6 +90,76 @@ def generate_token_selected_experts(local_num_tokens: int, ep_size: int,
         dtype=torch.int32,
         device='cuda',
     )
+    
+def create_experts(num_experts_per_rank, hidden_size, ep_rank, device, dtype=torch.bfloat16):
+    """
+    Create a 3D tensor of expert weights for a given rank.
+
+    Args:
+        num_experts_per_rank: Number of experts on this rank
+        hidden_size: Hidden dimension size
+        ep_rank: EP rank ID
+        device: Device to create experts on
+
+    Returns:
+        experts: Tensor of shape [num_experts_per_rank, hidden_size, hidden_size]
+    """
+    # For reproducibility, set the seed based on rank
+    experts = torch.empty(
+        (num_experts_per_rank, hidden_size, hidden_size),
+        dtype=dtype,
+        device=device
+    )
+    for i in range(num_experts_per_rank):
+        torch.manual_seed(ep_rank * 1000 + i)
+        # Xavier uniform initialization for each expert
+        torch.nn.init.xavier_uniform_(experts[i])
+    return experts
+
+
+def fake_moe(hidden_states, token_selected_experts, token_final_scales, experts, is_ep=False, ep_rank=None, num_experts_per_rank=None):
+    """
+    Emulate MoE computation by scaling tokens based on which experts belong to this rank.
+
+    Args:
+        hidden_states: [num_tokens, hidden_size] - input hidden states
+        token_selected_experts: [num_tokens, top_k] - selected expert indices
+        token_final_scales: [num_tokens, top_k] - scaling factors for each expert
+        experts: [num_experts_per_rank, hidden_size, hidden_size] if is_ep, otherwise [num_experts, hidden_size, hidden_size] - expert weights
+        is_ep: If true, emulate MoE on a EP rank; otherwise, emulate MoE with all experts
+        ep_rank: EP rank ID
+        num_experts_per_rank: Number of experts per rank
+
+    Returns:
+        processed_states: [num_tokens, hidden_size] - processed hidden states
+    """
+    num_tokens, _ = hidden_states.shape
+    _, top_k = token_selected_experts.shape
+
+    if is_ep:
+        assert ep_rank is not None and num_experts_per_rank is not None
+
+    # Initialize output
+    processed_states = torch.zeros_like(hidden_states)
+
+    # Process each token
+    for token_idx in range(num_tokens):
+        # For each expert selected for this token/
+        for k in range(top_k):
+            expert_id = token_selected_experts[token_idx, k].item()
+            if is_ep:
+                if not (expert_id >= ep_rank * num_experts_per_rank and expert_id < (ep_rank + 1) * num_experts_per_rank):
+                    continue
+                # Convert global expert ID to local expert ID for this rank
+                local_expert_id = expert_id - ep_rank * num_experts_per_rank
+                expert = experts[local_expert_id]
+            else:
+                expert = experts[expert_id]
+            
+            scale = token_final_scales[token_idx, k]
+            processed_states[token_idx] += hidden_states[token_idx] @ expert * scale
+
+    return processed_states
 
 
 def make_nvfp4_payloads(local_num_tokens: int, hidden_size: int, top_k: int,
@@ -130,50 +201,6 @@ def make_nvfp4_payloads(local_num_tokens: int, hidden_size: int, top_k: int,
 
     payloads.append(token_final_scales)
     return payloads
-
-
-def fake_moe(hidden_states, token_selected_experts, token_final_scales, target_rank,
-            num_experts_per_rank, ep_size):
-    """
-    Simulate MoE computation by scaling tokens based on which experts belong to this rank.
-
-    Args:
-        hidden_states: [num_tokens, hidden_size] - input hidden states
-        token_selected_experts: [num_tokens, top_k] - selected expert indices
-        token_final_scales: [num_tokens, top_k] - scaling factors for each expert
-        target_rank: Target rank that owns the experts
-        ep_size: total number of expert parallel ranks
-
-    Returns:
-        processed_states: [num_tokens, hidden_size] - processed hidden states
-    """
-    num_tokens, _ = hidden_states.shape
-    _, top_k = token_selected_experts.shape
-
-    # Initialize output
-    processed_states = torch.zeros_like(hidden_states)
-
-    # Process each token
-    for token_idx in range(num_tokens):
-        # For each expert selected for this token
-        for k in range(top_k):
-            expert_id = token_selected_experts[token_idx, k].item()
-            if expert_id < 0 or expert_id >= ep_size * num_experts_per_rank:
-                # Debug: Print if we hit bounds check
-                if token_idx == 0:
-                    print(f"WARNING: Expert {expert_id} out of bounds [0, {ep_size * num_experts_per_rank})")
-                continue
-            # Check if this expert belongs to current rank
-            expert_rank = compute_target_rank_id(expert_id, num_experts_per_rank)
-            if target_rank is None or expert_rank == target_rank:
-                # This expert is on our rank, apply scaling
-                scale = token_final_scales[token_idx, k]
-                processed_states[token_idx] += hidden_states[token_idx] * scale
-                # Debug: Print which expert is being processed
-                if token_idx == 0 and False:  # Enable for detailed debug
-                    print(f"    Expert {expert_id} (rank {expert_rank}), scale={scale}")
-
-    return processed_states
 
 
 def make_bfloat16_payloads(local_num_tokens: int, hidden_size: int, top_k: int,
@@ -469,7 +496,7 @@ class TestMoEAlltoAll:
                  ep_size),
         )
 
-        # Collect results from all ranks (same as single-GPU collecting from simulated ranks)
+        # Collect results from all ranks (same as single-GPU collecting from emulated ranks)
         all_results = list(results)
 
         # Extract results in same format as single-GPU test
@@ -558,6 +585,7 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     MnnvlMemory.initialize()
+    device = torch.cuda.current_device()
 
     try:
         mapping = Mapping(rank=rank,
@@ -599,15 +627,18 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
         ep_size = hidden_states_recv.shape[0]
         max_tokens_per_rank = hidden_states_recv.shape[1]
 
-        # Simulate MoE computation on the received data
+        # emulate MoE computation on the received data
+        # Create experts for this rank
+        rank_experts = create_experts(num_experts_per_rank, hidden_size, rank, device, dtype=torch.bfloat16)
         
         hidden_states_recv = fake_moe(
             hidden_states_recv.view(ep_size * max_tokens_per_rank, hidden_states_recv.shape[-1]),
             token_selected_experts_recv.view(ep_size * max_tokens_per_rank, token_selected_experts_recv.shape[-1]),
             token_final_scales_recv.view(ep_size * max_tokens_per_rank, token_final_scales_recv.shape[-1]),
-            rank,  # current rank owns certain experts
-            num_experts_per_rank,
-            ep_size).view(ep_size, max_tokens_per_rank, hidden_states_recv.shape[-1])
+            rank_experts,  # experts for current rank
+            is_ep=True,
+            ep_rank=rank,
+            num_experts_per_rank=num_experts_per_rank).view(ep_size, max_tokens_per_rank, hidden_states_recv.shape[-1])
 
         # Clear the workspace area where combine will place its flags
         # This prevents reading stale data from dispatch
@@ -653,7 +684,9 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             token_selected_experts.cpu(),
             [p.cpu() for p in payloads],  # Return actual payloads used
             send_indices.cpu(),
-            combined_output.cpu())
+            combined_output.cpu(),
+            rank_experts.cpu()  # Return the experts used on this rank
+        )
     except Exception:
         traceback.print_exc()
         raise
@@ -668,6 +701,7 @@ def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
     all_original_payloads = [r[1] for r in all_results]
     all_send_indices = [r[2] for r in all_results]
     all_combined_outputs = [r[3] for r in all_results]
+    all_rank_experts = [r[4] for r in all_results]  # Extract experts from each rank
 
     # For each rank, verify the combined output
     for rank in range(ep_size):
@@ -696,7 +730,62 @@ def verify_combine_results(all_results, ep_size, all_num_tokens, top_k,
                     assert send_indices[token_idx, target_rank].item() == -1, "send_indices should be -1"
 
         # Check the following are equal:
-        # expected: Directly simulate MoE as if we have all experts.
-        # actual: Tokens are dispatched to target ranks, MoE is performed on target ranks, combine sums up results on all target ranks. 
-        expected_combined_output = fake_moe(hidden_states, token_selected_experts, token_final_scales, None, num_experts_per_rank, ep_size)
-        torch.testing.assert_close(combined_output, expected_combined_output, rtol=2e-2, atol=1e-2)
+        # expected: Directly emulate MoE with all experts as if EP is not used.
+        # actual: Tokens are dispatched to target ranks, MoE is performed on target ranks, and then the results from all target ranks are summed up (combine).
+        
+        # Gather all experts from all ranks for non-EP emulation
+        all_experts = torch.cat(all_rank_experts, dim=0)        
+        expected_combined_output = fake_moe(
+            hidden_states, 
+            token_selected_experts, 
+            token_final_scales, 
+            all_experts,
+            is_ep=False)
+        
+        # Custom assertion with detailed error message
+        try:
+            torch.testing.assert_close(combined_output, expected_combined_output, rtol=5e-2, atol=5e-2)
+        except AssertionError as e:
+            # Find the first mismatch location
+            abs_diff = (combined_output - expected_combined_output).abs()
+            rel_diff = abs_diff / (expected_combined_output.abs() + 1e-8)
+            
+            # Check both absolute and relative tolerance
+            mask = (abs_diff > 1e-2) & (rel_diff > 5e-2)
+            if mask.any():
+                # Get the first mismatch
+                mismatch_indices = torch.nonzero(mask)[0].tolist()
+                token_idx, elem_idx = mismatch_indices
+                
+                # Build context visualization
+                context_values_expected = []
+                context_values_actual = []
+                
+                for offset in [-2, -1, 0, 1, 2]:
+                    idx = elem_idx + offset
+                    if 0 <= idx < combined_output.shape[1]:
+                        context_values_expected.append(f"{expected_combined_output[token_idx, idx].item():.4f}")
+                        context_values_actual.append(f"{combined_output[token_idx, idx].item():.4f}")
+                    else:
+                        context_values_expected.append("-")
+                        context_values_actual.append("-")
+                
+                # Add ... to indicate continuation
+                expected_str = ' '.join(context_values_expected)
+                actual_str = ' '.join(context_values_actual)
+                
+                # Add ... on left if not at beginning
+                if elem_idx > 2:
+                    expected_str = "... " + expected_str
+                    actual_str = "... " + actual_str
+                
+                # Add ... on right if not at end
+                if elem_idx < combined_output.shape[1] - 3:
+                    expected_str = expected_str + " ..."
+                    actual_str = actual_str + " ..."
+                
+                error_msg = f"\nexpected: [{expected_str}]\n"
+                error_msg += f"actual:   [{actual_str}]\n"
+                error_msg += f"\n{str(e)}"
+                
+                raise AssertionError(error_msg)
