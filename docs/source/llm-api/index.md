@@ -53,26 +53,44 @@ llm = LLM(model=<local_path_to_model>)
 
 The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:
 
-- RuntimeError: only rank 0 can start multi-node session, got 1
+### RuntimeError: only rank 0 can start multi-node session, got 1
 
   There is no need to add an `mpirun` prefix for launching single node multi-GPU inference with the LLM API.
 
   For example, you can run `python llm_inference_distributed.py` to perform multi-GPU on a single node.
 
-- Hang issue on Slurm Node
+### Hang issue on Slurm Node
 
   If you experience a hang or other issue on a node managed with Slurm, add prefix `mpirun -n 1 --oversubscribe --allow-run-as-root` to your launch script.
 
   For example, try `mpirun -n 1 --oversubscribe --allow-run-as-root python llm_inference_distributed.py`.
 
-- MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.
+### MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.
 
   Because the LLM API relies on the `mpi4py` library, put the LLM class in a function and protect the main entrypoint to the program under the `__main__` namespace to avoid a [recursive spawn](https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor) process in `mpi4py`.
 
   This limitation is applicable for multi-GPU inference only.
 
-- Cannot quit after generation
+### Cannot quit after generation
 
   The LLM instance manages threads and processes, which may prevent its reference count from reaching zero. To address this issue, there are two common solutions:
   1. Wrap the LLM instance in a function, as demonstrated in the quickstart guide. This will reduce the reference count and trigger the shutdown process.
   2. Use LLM as an contextmanager, with the following code: `with LLM(...) as llm: ...`, the shutdown methed will be invoked automatically once it goes out of the `with`-statement block.
+
+### Single node hanging when using `docker run --net=host`
+Here’s a refined version of your documentation text:
+
+The root cause may be related to `mpi4py`. There is a [workaround](https://github.com/mpi4py/mpi4py/discussions/491#discussioncomment-12660609) suggesting a change from `--net=host` to `--ipc=host`, or setting the following environment variables:
+
+```bash
+export OMPI_MCA_btl_tcp_if_include=lo
+export OMPI_MCA_oob_tcp_if_include=lo
+```
+
+Another option to improve compatibility with `mpi4py` is to launch the task using:
+
+```bash
+mpirun -n 1 --oversubscribe --allow-run-as-root python my_llm_task.py
+```
+
+This command can help avoid related runtime issues.
