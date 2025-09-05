@@ -25,7 +25,8 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
-from .modeling_multimodal_utils import fuse_input_embeds, find_uncached_mm_embeds
+from .modeling_multimodal_utils import (find_uncached_mm_embeds,
+                                        fuse_input_embeds)
 from .modeling_utils import (filter_weights, register_auto_model,
                              register_vision_encoder)
 
@@ -473,7 +474,8 @@ class LlavaNextModel(PreTrainedModel):
                     multimodal_param.multimodal_data["multimodal_embedding"]
                     for multimodal_param in multimodal_params
                 ]
-        mm_embeds = find_uncached_mm_embeds(mm_embeds, multimodal_params[:num_context_requests])
+        mm_embeds = find_uncached_mm_embeds(
+            mm_embeds, multimodal_params[:num_context_requests])
         input_ids, inputs_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens, input_ids, mm_embeds)
 
