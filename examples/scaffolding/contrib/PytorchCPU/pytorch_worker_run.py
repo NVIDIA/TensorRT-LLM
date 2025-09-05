@@ -1,86 +1,204 @@
 import argparse
 import asyncio
+import logging
+import sys
+import time
 
 from tensorrt_llm.scaffolding.contrib.PytorchCPU import PytorchWorker
-from tensorrt_llm.scaffolding.native_controller import \
-    NativeGenerationController
-from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
+from tensorrt_llm.scaffolding import NativeGenerationController, ScaffoldingLlm
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser()
-    # .e.g. DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
+    parser = argparse.ArgumentParser(
+        description="Run CPU inference using PyTorch worker for TensorRT-LLM scaffolding"
+    )
     parser.add_argument(
         '--model_dir',
         type=str,
         required=True,
-        help="Path to the directory containing the generation model")
-    parser.add_argument('--run_async', action='store_true')
+        help="Path to the directory containing the generation model or Hugging Face model name"
+    )
+    parser.add_argument(
+        '--run_async',
+        action='store_true',
+        help="Run in async mode (default: sync mode)"
+    )
+    parser.add_argument(
+        '--max_batch_size',
+        type=int,
+        default=32,
+        help="Maximum batch size for inference (default: 32)"
+    )
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=4096,
+        help="Maximum number of tokens to process (default: 4096)"
+    )
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=0.9,
+        help="Temperature for sampling (default: 0.9)"
+    )
+    parser.add_argument(
+        '--trust_remote_code',
+        action='store_true',
+        help="Trust remote code when loading models"
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help="Enable verbose logging"
+    )
     args = parser.parse_args()
     return args
 
 
-def test_sync(prompts, proposer_worker):
-    prototype_controller = NativeGenerationController(
-        sampling_params={"temperature": 0.9})
+def test_sync(prompts, proposer_worker, temperature=0.9):
+    """
+    Test synchronous generation with the PyTorch CPU worker.
 
-    llm = ScaffoldingLlm(
-        prototype_controller,
-        {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
-    )
-    results = llm.generate(prompts)
-    for result in results:
-        print(result.output.output_str)
-    print(f'main shutting down...')
-    llm.shutdown()
-    print(f'worker shutting down...')
-    proposer_worker.shutdown()
-    print(f'main shut down done')
+    Args:
+        prompts: List of prompts to generate responses for
+        proposer_worker: The PyTorch worker instance
+        temperature: Temperature for sampling
+    """
+    logger.info("Starting synchronous generation test")
+    start_time = time.time()
 
-
-def test_async(prompt, proposer_worker):
-
-    async def test_async_func(prompt, proposer_worker):
+    try:
         prototype_controller = NativeGenerationController(
-            sampling_params={"temperature": 0.9})
+            sampling_params={"temperature": temperature}
+        )
+
         llm = ScaffoldingLlm(
             prototype_controller,
             {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
         )
 
-        future = llm.generate_async(prompt)
+        logger.info(f"Processing {len(prompts)} prompts...")
+        results = llm.generate(prompts)
 
-        result = await future.aresult()
-        print(result.output.output_str)
+        for i, result in enumerate(results):
+            logger.info(f"Result {i+1}:")
+            print(f"Prompt: {prompts[i][:100]}...")
+            print(f"Response: {result.output.output_str}")
+            print("-" * 80)
 
-        print(f'main shutting down...')
-        llm.shutdown()
-        print(f'worker shutting down...')
-        proposer_worker.shutdown()
-        print(f'main shut down done')
+        elapsed_time = time.time() - start_time
+        logger.info(f"Generation completed in {elapsed_time:.2f} seconds")
 
-    asyncio.run(test_async_func(prompt, proposer_worker))
+    except Exception as e:
+        logger.error(f"Error during synchronous generation: {e}")
+        raise
+    finally:
+        logger.info('Shutting down...')
+        try:
+            llm.shutdown()
+            proposer_worker.shutdown()
+            logger.info('Shutdown completed successfully')
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+
+
+def test_async(prompt, proposer_worker, temperature=0.9):
+    """
+    Test asynchronous generation with the PyTorch CPU worker.
+
+    Args:
+        prompt: Single prompt to generate response for
+        proposer_worker: The PyTorch worker instance
+        temperature: Temperature for sampling
+    """
+    async def test_async_func(prompt, proposer_worker, temperature):
+        logger.info("Starting asynchronous generation test")
+        start_time = time.time()
+
+        try:
+            prototype_controller = NativeGenerationController(
+                sampling_params={"temperature": temperature}
+            )
+            llm = ScaffoldingLlm(
+                prototype_controller,
+                {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
+            )
+
+            logger.info("Generating response asynchronously...")
+            future = llm.generate_async(prompt)
+            result = await future.aresult()
+
+            elapsed_time = time.time() - start_time
+            logger.info(f"Async generation completed in {elapsed_time:.2f} seconds")
+
+            print(f"Prompt: {prompt[:100]}...")
+            print(f"Response: {result.output.output_str}")
+            print("-" * 80)
+
+        except Exception as e:
+            logger.error(f"Error during asynchronous generation: {e}")
+            raise
+        finally:
+            logger.info('Shutting down...')
+            try:
+                llm.shutdown()
+                proposer_worker.shutdown()
+                logger.info('Shutdown completed successfully')
+            except Exception as e:
+                logger.error(f"Error during shutdown: {e}")
+
+    asyncio.run(test_async_func(prompt, proposer_worker, temperature))
 
 
 def main():
+    """
+    Main function to run the PyTorch CPU worker example.
+    """
     args = parse_arguments()
 
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("Verbose logging enabled")
+
+    logger.info(f"Initializing PyTorch CPU worker with model: {args.model_dir}")
+
+    # Sample prompts for testing
     prompts = [
-        "Anton sold GPUs to 48 of his friends in April, and then he sold half as many GPUs in May. How many GPUs did Anton sell altogether in April and May?\r\n\r\n",
-        "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
-        "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
+        "Anton sold GPUs to 48 of his friends in April, and then he sold half as many GPUs in May. How many GPUs did Anton sell altogether in April and May?",
+        "There exist real numbers x and y, both greater than 1, such that log_x(y^x) = log_y(x^(4y)) = 10. Find xy.",
+        "Find the largest possible real part of (75+117i)z + (96+144i)/z where z is a complex number with |z|=4.",
+        "What is the capital of France?",
+        "Explain the concept of machine learning in simple terms.",
     ]
 
-    llm_worker = PytorchWorker(
-        args.model_dir,
-        max_batch_size=32,
-        max_num_tokens=4096,
-    )
+    try:
+        # Initialize the PyTorch worker
+        llm_worker = PytorchWorker(
+            model_path=args.model_dir,
+            max_batch_size=args.max_batch_size,
+            max_num_tokens=args.max_num_tokens,
+            trust_remote_code=args.trust_remote_code,
+        )
 
-    if args.run_async:
-        test_async(prompts[0], llm_worker)
-    else:
-        test_sync(prompts, llm_worker)
+        logger.info("PyTorch worker initialized successfully")
+
+        if args.run_async:
+            logger.info("Running in asynchronous mode")
+            test_async(prompts[0], llm_worker, args.temperature)
+        else:
+            logger.info("Running in synchronous mode")
+            test_sync(prompts, llm_worker, args.temperature)
+
+    except Exception as e:
+        logger.error(f"Failed to run example: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
