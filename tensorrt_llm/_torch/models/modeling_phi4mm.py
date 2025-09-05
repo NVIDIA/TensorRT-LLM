@@ -653,7 +653,3 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
             ]
 
         return lora_request
-
-    @property
-    def mm_token_ids(self):
-        return self.MM_TOKEN_IDS
