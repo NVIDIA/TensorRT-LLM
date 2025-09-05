@@ -4,7 +4,7 @@ trtllm-eval
 About
 -----
 
-The ``trtllm-eval`` command provides developers with a unified entry point for accuracy evaluation. It shares the core evaluation logic with the `accuracy test suite <https://github.com/NVIDIA/TensorRT-LLM/tree/main/tests/integration/defs/accuracy>`_ of TensorRT-LLM.
+The ``trtllm-eval`` command provides developers with a unified entry point for accuracy evaluation. It shares the core evaluation logic with the `accuracy test suite <https://github.com/NVIDIA/TensorRT-LLM/tree/main/tests/integration/defs/accuracy>`_ of TensorRT LLM.
 
 ``trtllm-eval`` is built on the offline API -- LLM API. Compared to the online ``trtllm-serve``, the offline API provides clearer error messages and simplifies the debugging workflow.
 
@@ -47,7 +47,7 @@ The following tasks are currently supported:
 
 .. note::
 
-    ``trtllm-eval`` originates from the TensorRT-LLM accuracy test suite and serves as a lightweight utility for verifying and debugging accuracy. At this time, ``trtllm-eval`` is intended solely for development and is not recommended for production use.
+    ``trtllm-eval`` originates from the TensorRT LLM accuracy test suite and serves as a lightweight utility for verifying and debugging accuracy. At this time, ``trtllm-eval`` is intended solely for development and is not recommended for production use.
 
 Usage and Examples
 ------------------

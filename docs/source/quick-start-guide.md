@@ -2,7 +2,7 @@
 
 # Quick Start Guide
 
-This is the starting point to try out TensorRT-LLM. Specifically, this Quick Start Guide enables you to quickly get set up and send HTTP requests using TensorRT-LLM.
+This is the starting point to try out TensorRT LLM. Specifically, this Quick Start Guide enables you to quickly get set up and send HTTP requests using TensorRT LLM.
 
 
 ## Launch Docker on a node with NVIDIA GPUs deployed
@@ -78,7 +78,7 @@ _Example Output_
 For detailed examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve/trtllm-serve.rst) section.
 
 ## Run Offline inference with LLM API
-The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing model loading, optimization, and inference, all through a single `LLM` instance.
+The LLM API is a Python API designed to facilitate setup and inference with TensorRT LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing model loading, optimization, and inference, all through a single `LLM` instance.
 
 Here is a simple example to show how to use the LLM API with TinyLlama.
 
@@ -95,14 +95,14 @@ To learn more about the LLM API, check out the [](llm-api/index) and [](examples
 In this Quick Start Guide, you have:
 
 - Learned how to deploy a model with `trtllm-serve` for online serving
-- Explored the LLM API for offline inference with TensorRT-LLM
+- Explored the LLM API for offline inference with TensorRT LLM
 
-To continue your journey with TensorRT-LLM, explore these resources:
+To continue your journey with TensorRT LLM, explore these resources:
 
 - **[Installation Guide](installation/index.rst)** - Detailed installation instructions for different platforms
 - **[Deployment Guide](examples/llm_api_examples)** - Comprehensive examples for deploying LLM inference in various scenarios
 - **[Model Support](models/supported-models.md)** - Check which models are supported and how to add new ones
-- **CLI Reference** - Explore TensorRT-LLM command-line tools:
+- **CLI Reference** - Explore TensorRT LLM command-line tools:
   - [`trtllm-serve`](commands/trtllm-serve/trtllm-serve.rst) - Deploy models for online serving
   - [`trtllm-bench`](commands/trtllm-bench.rst) - Benchmark model performance
   - [`trtllm-eval`](commands/trtllm-eval.rst) - Evaluate model accuracy

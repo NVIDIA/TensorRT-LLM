@@ -2,7 +2,7 @@
 
 ## In-flight Batching
 
-TensorRT-LLM supports in-flight batching of requests (also known as continuous
+TensorRT LLM supports in-flight batching of requests (also known as continuous
 batching or iteration-level batching) for higher serving throughput. With this feature,
 sequences in the context phase can be processed together with sequences in the
 generation phase. The purpose of that technique is to better interleave
@@ -38,7 +38,7 @@ Set a sufficiently high  `max_batch_size` when building the engine so that it do
 
 `max_seq_len` defines the maximum sequence length of single request​
 
-Starting from TensorRT-LLM v0.11, when `--remove_input_padding` and `--context_fmha` are enabled, `max_seq_len` can replace `max_input_len` and `max_output_len`, and is set to `max_position_embeddings` by default.
+Starting from TensorRT LLM v0.11, when `--remove_input_padding` and `--context_fmha` are enabled, `max_seq_len` can replace `max_input_len` and `max_output_len`, and is set to `max_position_embeddings` by default.
 
 Use default `max_seq_len` (which is `max_position_embeddings`), no need to tune it unless you are very sure what max sequence lengths would be on your workloads. If GPU memory is so limited that it cannot support even one request reaching `max_seq_len`, you need to reduce it.
 
@@ -58,7 +58,7 @@ sequence batching is enabled, requests in context phase will be executed with
 requests in generation phase. Those latter requests produce a lot fewer tokens
 than `max_input_len` (at most, `beam_width` tokens).
 
-Using a more realistic value for `max_num_tokens` allows TensorRT-LLM to
+Using a more realistic value for `max_num_tokens` allows TensorRT LLM to
 allocate more memory to store the KV cache and execute more requests together.
 It leads to an increased efficiency.
 
@@ -80,10 +80,10 @@ needs to be enabled. Except for the last chunk, the size of each context chunk n
 
 In the generation phase, a common optimization is to provide the MHA kernel
 with a cache containing the values of the past K and V elements that have
-already been computed.  That cache is known as the KV cache. TensorRT-LLM uses
-that technique to accelerate its generation phase. In TensorRT-LLM, there is
+already been computed.  That cache is known as the KV cache. TensorRT LLM uses
+that technique to accelerate its generation phase. In TensorRT LLM, there is
 one KV cache per Transformer layer, which means that there are as many KV
-caches as layers in a model. The current version of TensorRT-LLM supports two
+caches as layers in a model. The current version of TensorRT LLM supports two
 different types of KV caches: **contiguous** and **paged** KV caches.
 
 ### Contiguous KV Cache
@@ -106,7 +106,7 @@ A more efficient C++ implementation is included in the
 
 ## The schedulers
 
-This section visualizes how TensorRT-LLM schedules requests based on max-batch size and max-num tokens. The example starts out with a newly initialized engine as well as a few unscheduled requests that have come in. For the sake of this example, toy values are set to `max batch size = 4` and `max num tokens = 12`. Each square block represents a token, and its color represents which request it belongs to.
+This section visualizes how TensorRT LLM schedules requests based on max-batch size and max-num tokens. The example starts out with a newly initialized engine as well as a few unscheduled requests that have come in. For the sake of this example, toy values are set to `max batch size = 4` and `max num tokens = 12`. Each square block represents a token, and its color represents which request it belongs to.
 
 ![TRT-LLM Scheduler Visualization 1](../media/TRTLLM_Scheduler_Vis_1.svg)
 
@@ -135,9 +135,9 @@ Overall, the max batch size and max num tokens limits play a key role in determi
 
 ## Revisiting Paged Context Attention and Context Chunking
 
-[Previously](./useful-build-time-flags.md#paged-context-attention) we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Now that we understand the TensorRT-LLM scheduler, we can explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
+[Previously](./useful-build-time-flags.md#paged-context-attention) we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Now that we understand the TensorRT LLM scheduler, we can explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
 
-The [visualization](#the-schedulers) of the TensorRT-LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However, with context chunking, this is no longer the case, and the first chunk of Request 3 can be scheduled.
+The [visualization](#the-schedulers) of the TensorRT LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However, with context chunking, this is no longer the case, and the first chunk of Request 3 can be scheduled.
 
 ![TRT-LLM Scheduler Visualization Chunked Context 1](../media/TRTLLM_Scheduler_Vis_Chunked_Context_1.svg)
 

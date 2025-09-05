@@ -1,10 +1,10 @@
-# Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell & Hopper Hardware
+# Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell & Hopper Hardware
 
 ## Introduction
 
-This deployment guide provides step-by-step instructions for running the Llama-4-Scout-17B-16E-Instruct model using TensorRT-LLM with FP8 and NVFP4 quantization, optimized for NVIDIA GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT-LLM parameters, launching the server, and validating inference output.
+This deployment guide provides step-by-step instructions for running the Llama-4-Scout-17B-16E-Instruct model using TensorRT LLM with FP8 and NVFP4 quantization, optimized for NVIDIA GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT LLM parameters, launching the server, and validating inference output.
 
-The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack—starting with the PyTorch container from NGC, then installing TensorRT-LLM for model serving, FlashInfer for optimized CUDA kernels, and ModelOpt to enable FP8 and NVFP4 quantized execution.
+The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack—starting with the PyTorch container from NGC, then installing TensorRT LLM for model serving, FlashInfer for optimized CUDA kernels, and ModelOpt to enable FP8 and NVFP4 quantized execution.
 
 ## Access & Licensing
 
@@ -29,7 +29,7 @@ Note that NVFP4 is only supported on NVIDIA Blackwell platform.
 
 ### Run Docker Container
 
-Run the docker container using the TensorRT-LLM NVIDIA NGC image.
+Run the docker container using the TensorRT LLM NVIDIA NGC image.
 
 ```shell
 docker run --rm -it \
@@ -181,7 +181,7 @@ See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.h
 
 ### Basic Test
 
-Start a new terminal on the host to test the TensorRT-LLM server you just launched.
+Start a new terminal on the host to test the TensorRT LLM server you just launched.
 
 You can query the health/readiness of the server using:
 
@@ -220,7 +220,7 @@ Here is an example response, showing that the TRT-LLM server returns “New York
 
 We use the lm-eval tool to test the model’s accuracy. For more information see <https://github.com/EleutherAI/lm-evaluation-harness>.
 
-To run the evaluation harness exec into the running TensorRT-LLM container and install with this command:
+To run the evaluation harness exec into the running TensorRT LLM container and install with this command:
 
 ```shell
 docker exec -it tensorrt_llm /bin/bash
@@ -312,7 +312,7 @@ Run bench.sh to begin a serving benchmark. This will take a long time if you run
 ./bench.sh
 ```
 
-Sample TensorRT-LLM serving benchmark output. Your results may vary due to ongoing software optimizations.
+Sample TensorRT LLM serving benchmark output. Your results may vary due to ongoing software optimizations.
 
 ```
 ============ Serving Benchmark Result ============

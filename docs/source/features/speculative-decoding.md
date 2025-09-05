@@ -149,7 +149,7 @@ nontrivial methods, however.
 decoding algorithms.
 - `extend_ctx`: If true, the speculative decoding dispatches requests with `py_draft_tokens` attached to them
 to the *prefill* version of the attention kernels. This usually needs to be true. The exception is when you're on
-Blackwell using the TensorRT-LLM attention backend. In that case, use the generation kernels for better performance.
+Blackwell using the TensorRT LLM attention backend. In that case, use the generation kernels for better performance.
 This optimized kernel has one limitation; all draft lengths must be the same (or padding must be used) in this case.
 
 > *These may be refactored in the future to reduce the difficulty of adding a new speculative
