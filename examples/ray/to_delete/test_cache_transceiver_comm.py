@@ -24,7 +24,10 @@ def _run_distributed_worker():
             bm = importlib.import_module(
                 "tensorrt_llm.bindings.internal.batch_manager")
             cacheComm = getattr(bm, "CacheTransceiverComm")
-        comm = cacheComm(world_pg.boxed())
+        comm = cacheComm(
+            world_pg,
+            f"{torch._C._PYBIND11_COMPILER_TYPE}{torch._C._PYBIND11_STDLIB}{torch._C._PYBIND11_BUILD_ABI}"
+        )
 
         # Split into 2 subgroups by parity of world rank
         rank = dist.get_rank()

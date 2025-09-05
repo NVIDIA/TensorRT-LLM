@@ -31,12 +31,11 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
 from tensorrt_llm._torch.distributed.communicator import TorchDist
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
-from utils.util import find_free_port
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -668,7 +667,7 @@ def test_allreduce_pg_op(seq_len, hidden_size):
     try:
         ray.init(**ray_init_args)
 
-        master_port = find_free_port()
+        master_port = get_free_port()
         runtime_env = ray.runtime_env.RuntimeEnv()
         runtime_env["env_vars"] = os.environ.copy()
         runtime_env["env_vars"].update({

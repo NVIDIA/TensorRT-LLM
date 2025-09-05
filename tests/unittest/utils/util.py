@@ -442,10 +442,3 @@ def check_accuracy(a, b, atol, rtol, percent):
     if not (mismatch_percent < 1 - percent):
         raise Exception("Mismatch percentage is %f for rtol %f" %
                         (mismatch_percent, rtol))
-
-
-def find_free_port():
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
-        return s.getsockname()[1]

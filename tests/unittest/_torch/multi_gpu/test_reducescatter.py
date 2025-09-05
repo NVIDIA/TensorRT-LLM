@@ -1,15 +1,12 @@
 import os
-import sys
 
 import pytest
 import ray
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import TorchDist
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
-from utils.util import find_free_port
 
 
 @ray.remote(num_gpus=1)
@@ -102,7 +99,7 @@ def test_reducescatter_pg_op(seq_len, hidden_size, var_len):
     try:
         ray.init(**ray_init_args)
 
-        master_port = find_free_port()
+        master_port = get_free_port()
         runtime_env = ray.runtime_env.RuntimeEnv()
         runtime_env["env_vars"] = os.environ.copy()
         runtime_env["env_vars"].update({
