@@ -163,7 +163,7 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
 
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
-        Utils.exec(pipeline, script: "echo Sleeping to allow slurm job termination; sleep 30")
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
         Utils.exec(
             pipeline,
@@ -172,6 +172,8 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
                 "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
         )
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         Utils.exec(
             pipeline,
@@ -221,6 +223,8 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
                 "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
         )
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         Utils.exec(
             pipeline,
@@ -348,7 +352,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                def dockerGpuOption = ""
+                def dockerGPUOption = ""
 
                 node(nodeName) {
                     sh """
@@ -367,6 +371,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                     // Dynamically set GPU arguments based on environment variables
                     // https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
+                    // It's intentional to check NV_GPU first.
                     dockerGPUOption = sh(script: """
                         if [ -n "\$NV_GPU" ]; then
                             echo "--gpus '\\"device=\$NV_GPU\\"'"
@@ -386,7 +391,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
                     "-v /tmp/ccache:${CCACHE_DIR}:rw " +
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
-                    "--cap-add syslog"
+                    "--cap-add=SYSLOG"
 
                 echo "Final dockerArgs: ${dockerArgs}"
 
@@ -516,9 +521,9 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 ].join(" ")
 
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
-                scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
-                // TODO: check if the tee always returns 0
+                def scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
                 def scriptContent = """#!/bin/bash
+                    set -o pipefail
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
