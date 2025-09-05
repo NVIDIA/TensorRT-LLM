@@ -295,8 +295,8 @@ def buildImage(config, imageKeyToTag)
 
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
-                def randomSleep = (Math.random() * 300 + 300).toInteger()
-                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, shortCommondRunTimeMax: 7200)
+                def randomSleep = (Math.random() * 600 + 600).toInteger()
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
                 BASE_IMAGE=${BASE_IMAGE} \
@@ -305,7 +305,7 @@ def buildImage(config, imageKeyToTag)
                 IMAGE_WITH_TAG=${dependentImageWithTag} \
                 STAGE=${dependent.dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-                """, sleepInSecs: randomSleep, numRetries: 3, shortCommondRunTimeMax: 7200)
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
@@ -324,8 +324,8 @@ def buildImage(config, imageKeyToTag)
         }
         stage ("make ${target}_${action} (${arch})") {
             sh "env | sort"
-            def randomSleep = (Math.random() * 300 + 300).toInteger()
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, shortCommondRunTimeMax: 7200)
+            def randomSleep = (Math.random() * 600 + 600).toInteger()
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             trtllm_utils.llmExecStepWithRetry(this, script: """
             cd ${LLM_ROOT} && make -C docker ${target}_${action} \
             BASE_IMAGE=${BASE_IMAGE} \
@@ -334,7 +334,7 @@ def buildImage(config, imageKeyToTag)
             IMAGE_WITH_TAG=${imageWithTag} \
             STAGE=${dockerfileStage} \
             BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-            """, sleepInSecs: randomSleep, numRetries: 3, shortCommondRunTimeMax: 7200)
+            """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             if (target == "ngc-release") {
                 imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
             }
@@ -684,7 +684,7 @@ pipeline {
                         }
                         cmd += imageKeyToTag.values().join(" ")
                         withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
-                            sh cmd
+                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 6, shortCommondRunTimeMax: 7200)
                         }
                     }
                 }
