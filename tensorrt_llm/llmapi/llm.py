@@ -21,6 +21,7 @@ from ..bindings import executor as tllm
 from ..bindings import steady_clock_now
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
+from ..mm_disaggregated_params import MultimodalDisaggParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
@@ -54,7 +55,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
-        mm_embedding_handle (Dict[str, Any], optional): The multimodal embedding handle of the request.
+        multimodal_disagg_params (MultimodalDisaggParams, optional): The output of the multimodal encoder for the request.
         finished (bool): Whether the whole request is finished.
     """
 
@@ -84,7 +85,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     def _repr_fields(self):
         return [
             "request_id", "prompt", "prompt_token_ids", "outputs", "finished",
-            "mm_embedding_handle"
+            "multimodal_disagg_params"
         ]
 
 
@@ -251,6 +252,8 @@ class BaseLLM:
             DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
         scheduling_params: Optional[Union[SchedulingParams,
                                           List[SchedulingParams]]] = None,
+        multimodal_disagg_params: Optional[Union[MultimodalDisaggParams,
+                                                 Sequence[MultimodalDisaggParams]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -301,6 +304,7 @@ class BaseLLM:
                                                    i),
                 disaggregated_params=_item_at(disaggregated_params, i),
                 scheduling_params=_item_at(scheduling_params, i),
+                multimodal_disagg_params=_item_at(multimodal_disagg_params, i),
                 streaming=False)
             futures.append(future)
 
@@ -328,6 +332,7 @@ class BaseLLM:
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
+        multimodal_disagg_params: Optional[MultimodalDisaggParams] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -362,6 +367,8 @@ class BaseLLM:
         # TODO: Also support for trt backend
         is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
         is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
+        is_mm_llm_ctx_only = multimodal_disagg_params is not None and multimodal_disagg_params.mm_embedding_handles is not None
+
         if is_ctx_only and not self._on_trt_backend:
             sampling_params.max_tokens = 1
 
@@ -386,8 +393,19 @@ class BaseLLM:
         query_token_ids = None
         multimodal_params = None
 
-        if "prompt_token_ids" in inputs:
-            # TODO: if specify prompt_token_ids, the mm hashing is not supported yet
+        if is_mm_llm_ctx_only:
+            prompt_token_ids = multimodal_disagg_params.prompt_token_ids
+            if len(multimodal_disagg_params.mm_embedding_handles) == 1:
+                mm_embedding_handles = multimodal_disagg_params.mm_embedding_handles[0]
+            else:
+                raise ValueError("Only one fused multimodal embedding (handle) is supported for MM-LLM context-only mode")
+
+            multimodal_params = MultimodalParams(
+                multimodal_input=multimodal_disagg_params.multimodal_input,
+                multimodal_data={"multimodal_embedding": mm_embedding_handles})
+            prompt = None
+            query_token_ids = inputs.get("query_token_ids", None)
+        elif "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
