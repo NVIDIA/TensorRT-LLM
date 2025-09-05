@@ -109,12 +109,11 @@ struct GemmOptions
         MatrixLayout layoutA, MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN,
         bool mockAllReduce, int n, int numSlicesForSplitK, int numSlicesForSliceK, int numStages, int numStagesMma,
         int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors,
-        bool patchF2fp, bool useShuffledMatrixA, bool sliceK, SplitK splitK, bool transposeMmaOutput, int tileM,
-        int tileN, int tileK, bool useUnrollLoop2xForMma, bool useCustomMmaSchedule,
-        bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB,
-        bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, std::optional<int32_t> sfBlockSizeA,
-        tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int sfReshapeFactor,
-        TileScheduler tileScheduler)
+        bool patchF2fp, std::optional<int32_t> sfBlockSizeA, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
+        tg::SfLayout sfLayoutC, int sfReshapeFactor, bool sliceK, SplitK splitK, int tileK, int tileM, int tileN,
+        TileScheduler tileScheduler, bool transposeMmaOutput, bool useCustomMmaSchedule, bool useDeepSeekFp8,
+        bool useHoistTryWaitForCustomMmaSchedule, bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrixA,
+        bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int worldSize)
         : mAllReduceAlgo{allReduceAlgo}
         , mBiasType{biasType}
         , mBlockK(blockK)
@@ -161,27 +160,16 @@ struct GemmOptions
         , mNumStagesWorkId{numStagesWorkId}
         , mOutputDebugTensors{outputDebugTensors}
         , mPatchF2fp{patchF2fp}
-        , mUseShuffledMatrixA{useShuffledMatrixA}
-        , mSliceK{sliceK}
-        , mSplitK{splitK}
-        , mTransposeMmaOutput{transposeMmaOutput}
-        , mTileM{tileM}
-        , mTileN{tileN}
-        , mTileK{tileK}
-        , mUseUnrollLoop2xForMma{useUnrollLoop2xForMma}
-        , mUseCustomMmaSchedule{useCustomMmaSchedule}
-        , mUseHoistTryWaitForCustomMmaSchedule{useHoistTryWaitForCustomMmaSchedule}
-        , mUseDeepSeekFp8{useDeepSeekFp8}
-        , mUsePerTokenSfA{usePerTokenSfA}
-        , mUsePerTokenSfB{usePerTokenSfB}
-        , mUseTmaStore{useTmaStore}
-        , mUseTwoTmaLoadWarps{useTwoTmaLoadWarps}
-        , mUseTwoMmaWarps{useTwoMmaWarps}
         , mSfBlockSizeA{sfBlockSizeA}
         , mSfLayoutA{sfLayoutA}
         , mSfLayoutB{sfLayoutB}
         , mSfLayoutC{sfLayoutC}
         , mSfReshapeFactor{sfReshapeFactor}
+        , mSliceK{sliceK}
+        , mSplitK{splitK}
+        , mTileK{tileK}
+        , mTileM{tileM}
+        , mTileN{tileN}
         , mTileScheduler{tileScheduler}
         , mTransposeMmaOutput{transposeMmaOutput}
         , mUseCustomMmaSchedule{useCustomMmaSchedule}
@@ -302,40 +290,6 @@ struct GemmOptions
     bool mOutputDebugTensors{false};
     // Patch float conversions.
     bool mPatchF2fp{false};
-    // Reorder rows/cols in the A matrix for the better memory accesses in the M-major epilogue.
-    bool mUseShuffledMatrixA{false};
-    // Slice-K implementation to use TileM dimension for TileK.
-    bool mSliceK{false};
-    // The location of the exchange for split-K (it's None when split-K is disabled).
-    SplitK mSplitK{SplitK::None};
-    // Save output of MMA in M-major format.
-    bool mTransposeMmaOutput{false};
-    // M tile dimension of GEMM.
-    int mTileM{128};
-    // N tile dimension of GEMM.
-    int mTileN{32};
-    // K tile dimension of GEMM.
-    int mTileK{16};
-    // Whether to unroll the loop by 2x.
-    bool mUseUnrollLoop2xForMma{true};
-    // Use custom MMA schedule optimized for low-latency.
-    bool mUseCustomMmaSchedule{false};
-    // The purpose of hoisting trywaits is to opportunistically peek at the availability of the next
-    // k-block. It benefits when the next k-block is already available and thus sustaining the
-    // momentum, but it adds latency to the first k-block for smaller k-loop.
-    bool mUseHoistTryWaitForCustomMmaSchedule{false};
-    // Use DeepSeek Fp8.
-    bool mUseDeepSeekFp8{false};
-    // Apply per-token scales from A
-    bool mUsePerTokenSfA{false};
-    // Apply per-token scales from B
-    bool mUsePerTokenSfB{false};
-    // Use TMA to store the result.
-    bool mUseTmaStore{true};
-    // Use two different warps for A and B matrix load.
-    bool mUseTwoTmaLoadWarps{false};
-    // Use two different warps for MMA tasks. Applicable only to DeepSeek FP8.
-    bool mUseTwoMmaWarps{false};
     // Block size of A. For dtypeA == E2m1 and dtypeB == E4m3.
     std::optional<int32_t> mSfBlockSizeA{std::nullopt};
     // Scale factors layout for A.
@@ -350,6 +304,16 @@ struct GemmOptions
     // But it reduces the number of L2 requests under the hood and potentially improves perf.
     // Applies to layout 8x4 only.
     int mSfReshapeFactor{1};
+    // Slice-K implementation to use TileM dimension for TileK.
+    bool mSliceK{false};
+    // The location of the exchange for split-K (it's None when split-K is disabled).
+    SplitK mSplitK{SplitK::None};
+    // K tile dimension of GEMM.
+    int mTileK{16};
+    // M tile dimension of GEMM.
+    int mTileM{128};
+    // N tile dimension of GEMM.
+    int mTileN{32};
     // Tile scheduler type.
     TileScheduler mTileScheduler{TileScheduler::Static};
     // Save output of MMA in M-major format.
@@ -520,24 +484,6 @@ inline std::string dumpOptions(GemmOptions const& options)
     ss << "mNumStagesWorkId=" << options.mNumStagesWorkId << "," << std::endl;
     ss << "mOutputDebugTensors=" << options.mOutputDebugTensors << "," << std::endl;
     ss << "mPatchF2fp=" << options.mPatchF2fp << "," << std::endl;
-    ss << "mUseShuffledMatrixA=" << options.mUseShuffledMatrixA << "," << std::endl;
-    ss << "mSliceK=" << options.mSliceK << "," << std::endl;
-    ss << "mSplitK="
-       << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")"
-       << "," << std::endl;
-    ss << "mTransposeMmaOutput=" << options.mTransposeMmaOutput << "," << std::endl;
-    ss << "mTileM=" << options.mTileM << "," << std::endl;
-    ss << "mTileN=" << options.mTileN << "," << std::endl;
-    ss << "mTileK=" << options.mTileK << "," << std::endl;
-    ss << "mUseUnrollLoop2xForMma=" << options.mUseUnrollLoop2xForMma << "," << std::endl;
-    ss << "mUseCustomMmaSchedule=" << options.mUseCustomMmaSchedule << "," << std::endl;
-    ss << "mUseHoistTryWaitForCustomMmaSchedule=" << options.mUseHoistTryWaitForCustomMmaSchedule << "," << std::endl;
-    ss << "mUseDeepSeekFp8=" << options.mUseDeepSeekFp8 << "," << std::endl;
-    ss << "mUsePerTokenSfA=" << options.mUsePerTokenSfA << "," << std::endl;
-    ss << "mUsePerTokenSfB=" << options.mUsePerTokenSfB << "," << std::endl;
-    ss << "mUseTmaStore=" << options.mUseTmaStore << "," << std::endl;
-    ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
-    ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
     if (options.mSfBlockSizeA.has_value())
     {
         ss << "mSfBlockSizeA=" << options.mSfBlockSizeA.value() << "," << std::endl;
@@ -558,6 +504,13 @@ inline std::string dumpOptions(GemmOptions const& options)
        << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
        << "," << std::endl;
     ss << "mSfReshapeFactor=" << options.mSfReshapeFactor << "," << std::endl;
+    ss << "mSliceK=" << options.mSliceK << "," << std::endl;
+    ss << "mSplitK="
+       << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")"
+       << "," << std::endl;
+    ss << "mTileK=" << options.mTileK << "," << std::endl;
+    ss << "mTileM=" << options.mTileM << "," << std::endl;
+    ss << "mTileN=" << options.mTileN << "," << std::endl;
     ss << "mTileScheduler="
        << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler) << ")"
        << "," << std::endl;
@@ -609,6 +562,7 @@ inline int32_t getShuffleBlockSize(int epilogueTileM)
 // Check if the options are valid or not.
 inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, int tpGrpSize, bool updateOptions = true)
 {
+    options.mWorldSize = tpGrpSize;
 
     if (options.mDtypeB == tg::Dtype::Void)
     {
@@ -1265,23 +1219,17 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     int const clampedAndPaddedPerCtaK = divUpMul(perCtaK - paddingForK, options.mTileK);
     if (options.mUseUnrollLoop2xForMma)
     {
-        // Number of iterations in K dimension after padding.
-        // Note the perCtaK in each CTA in the splitK group are padded to the same number of iterations.
-        // E.g., K = 512, TileK = 128, numSlicesForSplitK = 3. Then the padded K is
+        // Check that the padded K and clamped padded K (K rounded to next multiple of tileK) is a
+        // multiple of 2*TileK when UnrollLoop2x is enabled. This is to avoid deadlock when mma runs
+        // even-numbered loop while the other warps run odd-numbered loop.
         //
-        //   ceil(512 / (128*3)) * (128*3) = 768
-        //
-        int paddedK = divUpMul(options.mK, options.mTileK * options.mNumSlicesForSplitK);
-        // Check that the padded K (K rounded to next multiple of tileK) is a multiple of 2*TileK when
-        // UnrollLoop2x is enabled. This is to avoid deadlock when mma runs even-numbered loop while the
-        // other warps run odd-numbered loop.
-        //
-        bool notSupported = (paddedK / options.mNumSlicesForSplitK) % (options.mTileK * 2) != 0;
+        bool notSupported
+            = (perCtaK % (options.mTileK * 2) != 0) || (clampedAndPaddedPerCtaK % (options.mTileK * 2) != 0);
         if (notSupported)
         {
             TLLM_LOG_WARNING("Size K / splitK must be a multiple of TileK * 2. Found TileK=", options.mTileK,
-                " and K=", options.mK, " (paddedK=", paddedK, ") and numSlicesForSplitK=", options.mNumSlicesForSplitK,
-                ". Disabling unrollLoop2xForMma.");
+                " and K=", options.mK, " (paddedK=", paddedK, " clampedAndPaddedPerCtaK=", clampedAndPaddedPerCtaK,
+                ") and numSlicesForSplitK=", options.mNumSlicesForSplitK, ". Disabling unrollLoop2xForMma.");
             if (updateOptions)
             {
                 options.mUseUnrollLoop2xForMma = false;
