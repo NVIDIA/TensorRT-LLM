@@ -67,7 +67,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self)
         act_buffer, act_scale_buffer, reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), n, m, stream);
 
     // Post-process the scale tensor for sm100 gemm/moe kernel
-    if (tensorrt_llm::common::getSMVersion() == 100)
+    if (tensorrt_llm::common::getSMFamily() == 100)
     {
         auto const num_n_blocks = (n + 127) / 128;
         auto const act_scal_elesize = num_n_blocks * m_padded;

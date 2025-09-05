@@ -427,7 +427,7 @@ class TestFunctional(unittest.TestCase):
 
         # skip tests based on the gpu_arch_lists
         if gpu_arch != 'all':
-            assert gpu_arch in [80, 86, 89, 90, 100, 120]
+            assert gpu_arch in [80, 86, 89, 90, 100, 103, 120]
             if getSMVersion() != gpu_arch:
                 pytest.skip(
                     "Skip the test as the target gpu arch doesn't match this gpu arch."
@@ -439,7 +439,7 @@ class TestFunctional(unittest.TestCase):
         skip_blackwell_for_fmha_tests(context_fmha_type, head_size)
 
         # Skip custom mask tests for Blackwell
-        if getSMVersion() == 100 and custom_mask_input:
+        if (getSMVersion() == 100 or getSMVersion == 103) and custom_mask_input:
             pytest.skip("Custom masked is not supported by TRTLLM-GEN for now.")
 
         if num_kv_heads == 0:

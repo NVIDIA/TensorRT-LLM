@@ -5,7 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_family
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -571,7 +571,7 @@ def fp8_block_scaling_bmm_out(
     out: torch.Tensor,
     mat2_dequant: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    sm_version = get_sm_version()
+    sm_version = get_sm_family()
     if sm_version == 90 or sm_version == 89:
         mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
             mat1)
@@ -892,7 +892,7 @@ class MLA(nn.Module):
                 ),
                 requires_grad=False,
             )
-            if get_sm_version() == 100:
+            if get_sm_family() == 100:
                 assert self.dtype == torch.bfloat16
                 self.k_b_proj_trans_dequant = nn.Parameter(
                     torch.empty(

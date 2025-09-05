@@ -40,7 +40,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_family, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
@@ -1479,7 +1479,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                             p.data.copy_(module_weights[n][:])
 
                 if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-                ) and get_sm_version() == 100 and hasattr(
+                ) and get_sm_family() == 100 and hasattr(
                         module, "weight_scale"):
                     weight, weight_scale = resmooth_to_fp8_e8m0(
                         module.weight, module.weight_scale)

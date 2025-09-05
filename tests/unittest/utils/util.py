@@ -84,7 +84,7 @@ skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 skip_blackwell = pytest.mark.skipif(
-    getSMVersion() == 100,
+    getSMVersion() == 100 or getSMVersion() == 103,
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
     getSMVersion() == 120, reason="This test is not supported on SM 120")
@@ -127,9 +127,9 @@ def skip_fp8_pre_ada(use_fp8):
 
 
 def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
-    if getSMVersion() == 100 and (head_size not in [32, 64, 128]
-                                  and context_fmha_type
-                                  != ContextFMHAType.disabled):
+    if (getSMVersion() == 100 or getSMVersion()
+            == 103) and (head_size not in [32, 64, 128]
+                         and context_fmha_type != ContextFMHAType.disabled):
         pytest.skip(
             "Context FMHA only supports head sizes [32, 64, 128] currently on blackwell."
         )
