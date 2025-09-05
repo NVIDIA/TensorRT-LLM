@@ -462,10 +462,8 @@ PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
     {
         auto&& f = ensureFutures.at(taskId);
         auto const values = f.get();
-        for (auto const& reqId : reqIds)
-        {
-            peftTable.try_emplace(reqId, values);
-        }
+        // Map task_id to layer-module-configs instead of request_id to layer-module-configs
+        peftTable.try_emplace(taskId, values);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
     return peftTable;
@@ -484,6 +482,11 @@ bool PeftCacheManager::isTaskDone(uint64_t taskId) const
 bool PeftCacheManager::isTaskDoneDevice(uint64_t taskId) const
 {
     return mDeviceLoraCache->isDone(taskId);
+}
+
+bool PeftCacheManager::isTaskCachedDevice(uint64_t const taskId) const
+{
+    return mDeviceLoraCache->has(taskId);
 }
 
 void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool terminate, bool pause)
@@ -645,3 +648,5 @@ SizeType32 NoOpPeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> l
     return 0;
 }
 } // namespace tensorrt_llm::batch_manager
+
+// TODO: merge C++ LoRA caching status with Py Slot manager
