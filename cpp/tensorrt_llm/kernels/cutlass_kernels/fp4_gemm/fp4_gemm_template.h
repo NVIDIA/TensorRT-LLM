@@ -440,7 +440,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getCon
                     }
                 }
                 CutlassGemmConfig config(tile_config, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
-                    cluster_config, ClusterShape::Undefined, ClusterShape::Undefined, mSm);
+                    cluster_config, tkc::ClusterShape::Undefined, tkc::ClusterShape::Undefined, mSm);
                 candidateConfigs.push_back(config);
             }
         }
