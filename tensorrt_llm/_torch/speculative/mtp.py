@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ..attention_backend import AttentionMetadata
@@ -473,9 +474,23 @@ class MTPWorker(nn.Module):
         for _, mtp_layer in enumerate(draft_model.mtp_layers):
             hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                       **draft_inputs)
-            logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
+            token_count = hidden_states.view(-1,
+                                             hidden_states.shape[-1]).shape[0]
+            all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
+            pad_len = all_rank_max_num_tokens - token_count
+            if pad_len > 0:
+                padded_hidden_states = F.pad(hidden_states.view(
+                    -1, hidden_states.shape[-1]), (0, 0, 0, pad_len),
+                                             mode="constant",
+                                             value=0)
+            else:
+                padded_hidden_states = hidden_states.view(
+                    -1, hidden_states.shape[-1])
+            logits = mtp_layer.shared_head(padded_hidden_states,
+                                           draft_model.lm_head,
                                            attn_metadata).float()
             new_draft_token = self.draft_sampler(logits)
+            new_draft_token = new_draft_token[:token_count]
             next_draft_tokens.append(new_draft_token)
             # shift input_ids and hidden_states
             input_ids = draft_inputs["input_ids"]
@@ -1041,12 +1056,13 @@ class MTPWorker(nn.Module):
         }
 
     @torch.compile(options={"max-autotune": True})
-    def get_local_max_and_combined(self, logits):
+    def get_local_max_and_combined(self, logits, mapping_lm_tp=None):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
         # Adjust indices based on TP rank and size
         vocab_per_rank = logits.shape[-1]
+        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.model_config.mapping
         max_index_per_rank = local_argmax.type(
-            torch.int32) + (self.model_config.mapping.tp_rank * vocab_per_rank)
+            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
         # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
         # Convert both to float32 to ensure consistent dtype
         max_index_per_rank_float = max_index_per_rank.float()
@@ -1095,6 +1111,34 @@ class MTPWorker(nn.Module):
             combined = self.get_local_max_and_combined(logits)
             gathered = allgather(combined, self.model_config.mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
+        elif (self.model_config is not None
+              and hasattr(self.model_config, 'mapping')
+              and self.model_config.mapping.tp_size > 1) and (
+                  self.model_config.mapping.enable_attention_dp and getattr(
+                      self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+            # For ADP + LM TP mode, we need to find the global argmax across all TP ranks
+            # First, get local argmax and max values
+            import os
+            from tensorrt_llm.mapping import Mapping
+            lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))
+            assert self.model_config.mapping.tp_size % lm_tp_size == 0
+            lm_pp_size = self.model_config.mapping.pp_size * self.model_config.mapping.tp_size // lm_tp_size
+            mapping_lm_tp = Mapping(
+                world_size=lm_tp_size * lm_pp_size,
+                rank=self.model_config.mapping.rank,
+                gpus_per_node=self.model_config.mapping.gpus_per_node,
+                tp_size=lm_tp_size,
+                pp_size=lm_pp_size,
+                enable_attention_dp=self.model_config.mapping.enable_attention_dp,
+                enable_lm_tp_in_adp=self.model_config.mapping.enable_lm_tp_in_adp,
+            )
+            combined = self.get_local_max_and_combined(logits, mapping_lm_tp)
+            gathered = allgather(combined, mapping_lm_tp, dim=-1)
+            batch_size = logits.shape[0]
+            local_batch_size = batch_size // mapping_lm_tp.tp_size
+            gathered = gathered.view(mapping_lm_tp.tp_size, local_batch_size, -1)
+            sliced_gathered = gathered[mapping_lm_tp.tp_rank]
+            draft_tokens = self.get_draft_tokens_from_gathered(sliced_gathered)
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
@@ -1194,10 +1238,26 @@ class MTPEagleWorker(MTPWorker):
                     **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+            hidden_states_gathered = hidden_states[gather_ids]
+            token_count = hidden_states_gathered.view(-1,
+                                             hidden_states_gathered.shape[-1]).shape[0]
+            max_num_requests = spec_metadata.max_num_requests
+            pad_len = max_num_requests - token_count
+            if pad_len > 0:
+                padded_hidden_states = F.pad(hidden_states_gathered.view(
+                    -1, hidden_states_gathered.shape[-1]), (0, 0, 0, pad_len),
+                                             mode="constant",
+                                             value=0)
+            elif pad_len == 0:
+                padded_hidden_states = hidden_states_gathered.view(
+                    -1, hidden_states_gathered.shape[-1])
+            else:
+                raise ValueError(f"In MTPEagleWorker.forward(), token_count < max_num_requests, which is not supported")
             logits = draft_model.mtp_layers[0].shared_head(
-                hidden_states[gather_ids], draft_model.lm_head, attn_metadata,
+                padded_hidden_states, draft_model.lm_head, attn_metadata,
                 True)
             new_draft_token = self.draft_sampler(logits)
+            new_draft_token = new_draft_token[:token_count]
 
             hidden_states, position_ids = self.update_draft_tokens(
                 next_draft_tokens, new_draft_token, hidden_states, gather_ids,

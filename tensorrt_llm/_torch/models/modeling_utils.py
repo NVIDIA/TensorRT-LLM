@@ -352,7 +352,7 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
-        if config.mapping.enable_attention_dp:
+        if config.mapping.enable_attention_dp and not getattr(config.mapping, 'enable_lm_tp_in_adp', False):
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
