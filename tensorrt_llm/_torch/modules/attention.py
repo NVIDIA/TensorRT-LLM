@@ -339,19 +339,13 @@ class Attention(nn.Module):
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
     ):
-
-        padded_num_tokens = attn_metadata.padded_num_tokens
         num_tokens = attn_metadata.num_tokens
 
-        if padded_num_tokens is not None:
-            assert q.shape[0] == padded_num_tokens
-            q = q[:num_tokens, :]
-            if k is not None:
-                assert k.shape[0] == padded_num_tokens
-                k = k[:num_tokens, :]
-            if v is not None:
-                assert v.shape[0] == padded_num_tokens
-                v = v[:num_tokens, :]
+        q = q[:num_tokens, :]
+        if k is not None:
+            k = k[:num_tokens, :]
+        if v is not None:
+            v = v[:num_tokens, :]
 
         out_scale = None
         out_scale_sf = None
@@ -956,12 +950,10 @@ class MLA(nn.Module):
         num_generations = attn_metadata.num_generations
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_tokens = attn_metadata.num_tokens
-        padded_num_tokens = attn_metadata.padded_num_tokens
 
-        if padded_num_tokens is not None:
-            hidden_states = hidden_states[:num_tokens, ...]
-            if position_ids is not None:
-                position_ids = position_ids[:num_tokens, ...]
+        hidden_states = hidden_states[:num_tokens, ...]
+        if position_ids is not None:
+            position_ids = position_ids[..., :num_tokens]
 
         if self.is_lite:
             compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(

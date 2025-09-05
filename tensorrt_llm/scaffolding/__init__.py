@@ -1,7 +1,11 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 from .benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
+from .contrib.TreeInference.tree_controllers import (MCTSController,
+                                                     TOTController)
 from .controller import (BestOfNController, Controller, MajorityVoteController,
                          NativeGenerationController, NativeRewardController,
-                         ParallelProcess)
+                         ParallelProcess, PRMController)
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
 from .scaffolding_llm import ScaffoldingLlm
@@ -16,8 +20,11 @@ __all__ = [
     "Controller",
     "NativeGenerationController",
     "NativeRewardController",
+    "PRMController",
     "MajorityVoteController",
     "BestOfNController",
+    "MCTSController",
+    "TOTController",
     "Task",
     "GenerationTask",
     "RewardTask",
