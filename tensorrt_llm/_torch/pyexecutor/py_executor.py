@@ -1930,16 +1930,20 @@ class PyExecutor:
                         not self.model_engine.speculation_permanently_disabled
                         and not request.is_dummy and not self.is_warmup):
                     if self.model_engine.speculation_gate is not None:
-                        avg_decoded = getattr(request,
-                                              'avg_decoded_tokens_per_iter',
-                                              None)
-                        disabled_now, _ = self.model_engine.speculation_gate.record_avg_decoded(
-                            avg_decoded,
-                            request_id=getattr(request, 'py_request_id', None))
-                        if disabled_now:
-                            # disable speculation permanently
-                            # starting from next iteration, _prepare_and_schedule_batch will set self.use_spec_decode to False
-                            self.model_engine.speculation_permanently_disabled = True
+                        # Response handling runs on multiple PP ranks. Only the last PP rank performs
+                        # sampling; restrict rolling stat updates to it to avoid overcounting.
+                        if (not getattr(self.dist, 'has_pp',
+                                        False)) or self.dist.is_last_pp_rank:
+                            avg_decoded = getattr(
+                                request, 'avg_decoded_tokens_per_iter', None)
+                            disabled_now, _ = self.model_engine.speculation_gate.record_avg_decoded(
+                                avg_decoded,
+                                request_id=getattr(request, 'py_request_id',
+                                                   None))
+                            if disabled_now:
+                                # disable speculation permanently
+                                # starting from next iteration, _prepare_and_schedule_batch will set self.use_spec_decode to False
+                                self.model_engine.speculation_permanently_disabled = True
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:
