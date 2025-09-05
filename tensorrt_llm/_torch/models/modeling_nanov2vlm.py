@@ -11,8 +11,8 @@ from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -171,7 +171,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         return mm_embedding
 
 
-class NanoV2VLInputProcessor(InputProcessor):
+class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -196,12 +196,82 @@ class NanoV2VLInputProcessor(InputProcessor):
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_path, trust_remote_code=True, use_fast=self.use_fast)
 
-        self.image_processor = transformers.AutoImageProcessor.from_pretrained(
+        self.processor = transformers.AutoImageProcessor.from_pretrained(
             model_path, trust_remote_code=True, use_fast=self.use_fast)
         self.img_context_token = "<image>"
         self.img_start_token = "<img>"
         self.img_end_token = "</img>"
         self.dtype = model_config.torch_dtype
+
+    def get_vocab_size(self):
+        return self.model_config.llm_config.vocab_size
+
+    def get_mm_token_ids(self):
+        return torch.tensor([IMAGE_TOKEN_ID], dtype=torch.int32)
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        **kwargs,
+    ):
+
+        def get_internvl_target_ratios(
+            min_num: int,
+            max_num: int,
+        ) -> list[tuple[int, int]]:
+            target_ratios = {(i, j)
+                             for n in range(min_num, max_num + 1)
+                             for i in range(1, n + 1)
+                             for j in range(1, n + 1)
+                             if min_num <= i * j <= max_num}
+            return sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        def find_closest_aspect_ratio(aspect_ratio, target_ratios, width,
+                                      height, image_size):
+            best_factor = float('-inf')
+            best_ratio = (1, 1)
+            area = width * height
+            for ratio in target_ratios:
+                target_aspect_ratio = ratio[0] / ratio[1]
+                factor_based_on_area_n_ratio = min(
+                    (ratio[0] * ratio[1] * image_size * image_size) / area,
+                    0.6) * min(target_aspect_ratio / aspect_ratio,
+                               aspect_ratio / target_aspect_ratio)
+                if factor_based_on_area_n_ratio > best_factor:
+                    best_factor = factor_based_on_area_n_ratio
+                    best_ratio = ratio
+            return best_ratio
+
+        def calculate_targets(
+            orig_width: int,
+            orig_height: int,
+            target_ratios: list[tuple[int, int]],
+            image_size: int,
+        ) -> int:
+            aspect_ratio = orig_width / orig_height
+
+            # find the closest aspect ratio to the target
+            target_aspect_ratio = find_closest_aspect_ratio(
+                aspect_ratio,
+                target_ratios,
+                width=orig_width,
+                height=orig_height,
+                image_size=image_size,
+            )
+            blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+            return blocks
+
+        target_ratios = get_internvl_target_ratios(1,
+                                                   self.processor.max_num_tiles)
+        blocks = calculate_targets(image_width, image_height, target_ratios,
+                                   self.image_size)
+        if self.processor.use_thumbnail and blocks != 1:
+            blocks += 1
+        num_image_tokens = self.num_image_token * blocks
+        return num_image_tokens
 
     @torch.inference_mode()
     def __call__(
@@ -220,9 +290,8 @@ class NanoV2VLInputProcessor(InputProcessor):
                 ]
 
         # Processing for multimodal data.
-        processed_images = self.image_processor(images=images,
-                                                return_tensors='pt').to(
-                                                    self.device)
+        processed_images = self.processor(images=images,
+                                          return_tensors='pt').to(self.device)
 
         # Insert enough special tokens for image embedding.
         parts = text_prompt.split(self.img_context_token)
@@ -256,7 +325,7 @@ class NanoV2VLInputProcessor(InputProcessor):
     model_type="NemotronH_Nano_VL_V2",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
-            "image": "<image>\n",
+            "image": "<image>",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
