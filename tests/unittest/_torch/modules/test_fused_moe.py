@@ -266,13 +266,11 @@ def test_fused_moe_alltoall(alltoall_method_type):
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
 
             # Evaluate outputs
@@ -455,13 +453,11 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
 
             # Evaluate outputs

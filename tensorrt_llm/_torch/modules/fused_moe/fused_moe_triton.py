@@ -1287,6 +1287,7 @@ class TritonFusedMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            layer_idx=layer_idx,
         )
         if not IS_TRITON_KERNELS_AVAILABLE:
             raise ImportError("Triton kernels are not available.")
@@ -1359,10 +1360,11 @@ class TritonFusedMoE(MoE):
 
         self._weights_created = True
 
-    def forward(
+    def forward_impl(
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
