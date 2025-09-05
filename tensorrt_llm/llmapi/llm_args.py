@@ -2621,6 +2621,9 @@ def update_llm_args_with_extra_dict(
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
         "attention_dp_config": AttentionDpConfig,
+        "kv_cache_config": KvCacheConfig,
+        "scheduler_config": SchedulerConfig,
+        "dynamic_batch_config": DynamicBatchConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
