@@ -10,13 +10,15 @@ set(SRCS
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
+    common/tllmExceptions.cpp
     executor/bindings.cpp
     executor/executor.cpp
     executor/executorConfig.cpp
     executor/request.cpp
     runtime/bindings.cpp
-    testing/modelSpecBinding.cpp
+    runtime/hostfunc.cpp
     runtime/moeBindings.cpp
+    testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
     ../runtime/ipcNvlsMemory.cu

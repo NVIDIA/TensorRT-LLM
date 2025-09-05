@@ -166,7 +166,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     )
 
     sharding_dims: List[str] = Field(
-        default=["tp", "ep", "dp"],
+        default=["tp", "ep", "bmm"],
         description="The sharding methods to apply by the heuristic sharding stage.",
     )
 

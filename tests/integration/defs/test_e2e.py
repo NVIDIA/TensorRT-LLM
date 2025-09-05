@@ -2071,6 +2071,9 @@ def test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance(
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param(
         'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
+    pytest.param('DeepSeek-R1-0528-FP4',
+                 'DeepSeek-R1/DeepSeek-R1-0528-FP4',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
                                                    model_name, model_path):
