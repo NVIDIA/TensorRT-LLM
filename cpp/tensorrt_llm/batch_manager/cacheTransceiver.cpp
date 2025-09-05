@@ -238,6 +238,14 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
 void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
+    // TEST HOOK: Skip creating responder future for a specific request ID to validate HOL blocking theory
+    if (llmRequest->mRequestId == 2049)
+    {
+        llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
+        TLLM_LOG_WARNING("TEST: Skipping responder future for context request 2049");
+        setContextState(llmRequest);
+        return;
+    }
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
     // If context phase params is already set, it means that the KV cache
     // transfer is already in progress.
@@ -252,6 +260,8 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
     setContextState(llmRequest);
     auto future = mDataResponder->respondAndSendAsync(*llmRequest);
     mResponderFutures.emplace_back(llmRequest, std::move(future));
+    TLLM_LOG_DEBUG("respondAndSendAsync: enqueued context request %ld, mResponderFutures.size()=%zu",
+        llmRequest->mRequestId, mResponderFutures.size());
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -301,9 +311,16 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     mpi::MpiComm const& mpiComm, std::vector<LlmRequest::RequestIdType> const& requestIds)
 {
+    TLLM_LOG_DEBUG("gatherRequestIds: Entry - rank %d, localSize=%zu, worldSize=%d", mpiComm.getRank(),
+        requestIds.size(), mpiComm.getSize());
+
     int localSize = static_cast<int>(requestIds.size());
     std::vector<int> sizes(mpiComm.getSize());
+
+    TLLM_LOG_DEBUG("gatherRequestIds: Starting allgather for sizes");
     mpiComm.allgather(&localSize, sizes.data(), 1, mpi::MpiType::kINT32);
+    TLLM_LOG_DEBUG("gatherRequestIds: allgather for sizes completed");
+
     // std::vector<LlmRequest::RequestIdType> all_data(total_size);
     std::vector<int> displs(mpiComm.getSize());
     int totalSize = 0;
@@ -311,10 +328,17 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     {
         displs[i] = totalSize;
         totalSize += sizes[i];
+        TLLM_LOG_DEBUG("gatherRequestIds: Rank %d has %d request IDs", i, sizes[i]);
     }
+
+    TLLM_LOG_DEBUG("gatherRequestIds: Total size across all ranks: %d", totalSize);
     std::vector<LlmRequest::RequestIdType> retData(totalSize);
+
+    TLLM_LOG_DEBUG("gatherRequestIds: Starting allgatherv for request IDs");
     mpiComm.allgatherv(requestIds.data(), static_cast<int>(requestIds.size()), mpi::MpiType::kUINT64, retData.data(),
         sizes, displs, mpi::MpiType::kUINT64);
+    TLLM_LOG_DEBUG("gatherRequestIds: allgatherv for request IDs completed, returning %zu total IDs", retData.size());
+
     return retData;
 }
 
@@ -370,46 +394,105 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
 
 void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
+    TLLM_LOG_DEBUG("checkContextTransferStatus: Entry with atLeastRequestNum=%s, mResponderFutures.size()=%zu",
+        atLeastRequestNum.has_value() ? std::to_string(atLeastRequestNum.value()).c_str() : "nullopt",
+        mResponderFutures.size());
+
+    // Dump current responder future queue order for diagnostics
+    {
+        std::ostringstream oss;
+        oss << "[";
+        bool first = true;
+        for (auto const& pair : mResponderFutures)
+        {
+            if (!first)
+            {
+                oss << ", ";
+            }
+            first = false;
+            oss << pair.first->mRequestId;
+        }
+        oss << "]";
+        TLLM_LOG_DEBUG("checkContextTransferStatus: mResponderFutures order: %s", oss.str().c_str());
+    }
+
     bool blockAll = !atLeastRequestNum.has_value();
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupTPInDPComm : mMpiGroupTensorParaComm;
+
+    TLLM_LOG_DEBUG("checkContextTransferStatus: blockAll=%s, syncComm=%s, syncComm.size=%d",
+        blockAll ? "true" : "false", syncComm ? "valid" : "null", syncComm ? syncComm->getSize() : 0);
+
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
+    TLLM_LOG_DEBUG(
+        "checkContextTransferStatus: Checking %zu responder futures for completion", mResponderFutures.size());
+
     for (auto&& [request, future] : mResponderFutures)
     {
+        TLLM_LOG_DEBUG("checkContextTransferStatus: Checking request %ld future status", request->mRequestId);
         if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
         {
+            TLLM_LOG_DEBUG("checkContextTransferStatus: Request %ld is ready", request->mRequestId);
             contextCompleteRequestIds.push_back(request->mRequestId);
         }
+        else
+        {
+            TLLM_LOG_DEBUG("checkContextTransferStatus: Request %ld is not ready", request->mRequestId);
+        }
     }
+
+    TLLM_LOG_DEBUG("checkContextTransferStatus: Found %zu ready requests", contextCompleteRequestIds.size());
 
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
     if ((syncComm) && syncComm->getSize() > 1)
     {
+        TLLM_LOG_DEBUG(
+            "checkContextTransferStatus: Gathering request IDs across %d ranks via MPI", syncComm->getSize());
         auto gatherRequestIdVec = gatherRequestIds(*syncComm, contextCompleteRequestIds);
+        TLLM_LOG_DEBUG("checkContextTransferStatus: MPI gather completed, received %zu total request IDs",
+            gatherRequestIdVec.size());
+
         for (auto&& requestId : gatherRequestIdVec)
         {
             frequencyMap[requestId]++;
         }
+        TLLM_LOG_DEBUG(
+            "checkContextTransferStatus: Built frequency map with %zu unique request IDs", frequencyMap.size());
     }
     else
     {
+        TLLM_LOG_DEBUG("checkContextTransferStatus: Single rank mode, building frequency map locally");
         for (auto&& requestId : contextCompleteRequestIds)
         {
             frequencyMap[requestId]++;
         }
+        TLLM_LOG_DEBUG(
+            "checkContextTransferStatus: Local frequency map built with %zu unique request IDs", frequencyMap.size());
     }
     std::vector<std::pair<LlmRequest::RequestIdType, int>> freqVec(frequencyMap.begin(), frequencyMap.end());
 
     std::sort(freqVec.begin(), freqVec.end(),
         [](std::pair<LlmRequest::RequestIdType, int> const& left,
             std::pair<LlmRequest::RequestIdType, int> const& right) { return left.second > right.second; });
+
+    TLLM_LOG_DEBUG("checkContextTransferStatus: Sorted frequency vector, processing %zu entries", freqVec.size());
+
     std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
+    int expectedFreq = (syncComm) ? syncComm->getSize() : 1;
+    TLLM_LOG_DEBUG("checkContextTransferStatus: Expected frequency for completion: %d", expectedFreq);
+
     for (auto&& [requestId, freq] : freqVec)
     {
-        if (freq == ((syncComm) ? syncComm->getSize() : 1))
+        TLLM_LOG_DEBUG(
+            "checkContextTransferStatus: Request %ld has frequency %d (expected %d)", requestId, freq, expectedFreq);
+        if (freq == expectedFreq)
         {
             toCompleteIdSet.insert(requestId);
+            TLLM_LOG_DEBUG("checkContextTransferStatus: Request %ld added to completion set (freq match)", requestId);
         }
     }
+
+    TLLM_LOG_DEBUG("checkContextTransferStatus: toCompleteIdSet.size()=%zu, atLeastRequestNum=%d",
+        toCompleteIdSet.size(), atLeastRequestNum.value_or(0));
 
     // Make sure there are at least atLeastRequestNum requests in toCompleteIdSet.
     // This will preserve the order of insertion for KVCache transfer requests.
@@ -418,24 +501,46 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
          ++it)
     {
         auto& [request, future] = *it;
+        TLLM_LOG_DEBUG(
+            "checkContextTransferStatus: Adding request %ld to completion set (min requirement)", request->mRequestId);
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    TLLM_LOG_DEBUG("checkContextTransferStatus: Final toCompleteIdSet.size()=%zu", toCompleteIdSet.size());
+
     // Complete all the requests in toCompleteIdSet
+    TLLM_LOG_DEBUG("checkContextTransferStatus: Starting completion phase, blockAll=%s", blockAll ? "true" : "false");
+
+    size_t completedCount = 0;
     for (auto it = mResponderFutures.begin(); it != mResponderFutures.end();)
     {
         auto& [request, future] = *it;
-        if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
+        bool shouldComplete = blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end());
+
+        TLLM_LOG_DEBUG("checkContextTransferStatus: Request %ld shouldComplete=%s", request->mRequestId,
+            shouldComplete ? "true" : "false");
+
+        if (shouldComplete)
         {
+            TLLM_LOG_DEBUG("checkContextTransferStatus: Blocking on future.get() for request %ld", request->mRequestId);
             future.get();
+            TLLM_LOG_DEBUG("checkContextTransferStatus: future.get() completed for request %ld", request->mRequestId);
+
             request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
             it = mResponderFutures.erase(it);
+            completedCount++;
+
+            TLLM_LOG_DEBUG(
+                "checkContextTransferStatus: Request %ld completed and removed from futures", request->mRequestId);
         }
         else
         {
             ++it;
         }
     }
+
+    TLLM_LOG_DEBUG("checkContextTransferStatus: Exit - completed %zu requests, remaining futures: %zu", completedCount,
+        mResponderFutures.size());
 }
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)

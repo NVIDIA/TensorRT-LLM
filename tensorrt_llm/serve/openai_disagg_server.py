@@ -4,6 +4,7 @@ import copy
 import itertools
 import os
 import signal
+import time
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -28,8 +29,9 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
                                                 CompletionResponse,
+                                                CompletionResponseChoice,
                                                 DisaggregatedParams,
-                                                ErrorResponse)
+                                                ErrorResponse, UsageInfo)
 from tensorrt_llm.serve.router import KvCacheAwareRouter, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -52,6 +54,11 @@ class OpenAIDisaggServer:
         self.gen_router = create_router(
             config.gen_router_config, self.gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = config.conditional_disagg_config
+
+        self.fail_only = os.getenv("FAIL_ONLY", "")
+        if self.fail_only:
+            logger.warning(f"Selective failure injection is enabled for context request ID {self.fail_only}")
+
 
         self.perf_metrics_max_requests = config.perf_metrics_max_requests
         if self.perf_metrics_max_requests > 0:
@@ -410,9 +417,30 @@ class OpenAIDisaggServer:
                     self.merge_streaming_responses(ctx_response, gen_server, req),
                     media_type="text/event-stream"
                 )
-        except:
+        except Exception as e:
             if gen_server is not None:
                 await self.gen_router.finish_request(req)
+
+            if self.fail_only and isinstance(e, HTTPException):
+                logger.info(f"Failing gracefully for request {req.disaggregated_params.ctx_request_id}")
+
+                # Return a mock successful response to the client while internally generation failed
+                # Lets us test KV cache leaks without client errors
+                mock_response = CompletionResponse(
+                    id=f"sim-failure-{int(time.time())}",
+                    object="text_completion",
+                    created=int(time.time()),
+                    model="simulated-failure",
+                    choices=[CompletionResponseChoice(
+                        index=0,
+                        text="[Generation failed by design.]",
+                        logprobs=None,
+                        finish_reason="length"
+                    )],
+                    usage=UsageInfo(prompt_tokens=0, completion_tokens=1, total_tokens=1)
+                )
+                return mock_response
+
             raise
 
 
@@ -481,6 +509,12 @@ class OpenAIDisaggServer:
 
 
     async def send_completion_request(self, url: str, request: CompletionRequest) -> Union[CompletionResponse, StreamingResponse]:
+        # Inject failure for specific context request ID when FAIL_ONLY is set
+        if self.fail_only and hasattr(request, 'disaggregated_params') and request.disaggregated_params and request.disaggregated_params.ctx_request_id:
+            if str(request.disaggregated_params.ctx_request_id) == self.fail_only:
+                logger.warning(f"INJECTING FAILURE for context request {request.disaggregated_params.ctx_request_id} as requested by FAIL_ONLY environment variable")
+                raise HTTPException(status_code=500, detail=f"Simulated server failure for request {request.disaggregated_params.ctx_request_id} for KV cache leak testing")
+
         return await self.send_request(url, request, "/v1/completions", CompletionResponse, self.create_completion_generator)
 
     async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:

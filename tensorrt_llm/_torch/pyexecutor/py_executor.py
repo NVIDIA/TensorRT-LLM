@@ -896,6 +896,7 @@ class PyExecutor:
                     self.micro_batches[prev_microbatch_id] = None
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._check_kv_transfer_timeout()
                     self._terminate_ctx_finished_requests()
 
                 # march forward in microbatch slots
@@ -918,6 +919,7 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             self._check_disagg_gen_transfer_status()
+            self._check_kv_transfer_timeout()
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -992,20 +994,23 @@ class PyExecutor:
             iter_start_time = time.time()
             iter_stats = None
             while True:
+                logger.debug("_executor_loop 1")
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-
+                logger.debug("_executor_loop 2")
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                logger.debug("_executor_loop 3")
                 if scheduled_batch is None:
                     break
-
+                logger.debug("_executor_loop 4")
                 self._pause_requests(scheduled_batch.paused_requests)
-
+                logger.debug("_executor_loop 5")
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
+                    logger.debug("_executor_loop 6")
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -1014,16 +1019,16 @@ class PyExecutor:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
-
+                    logger.debug("_executor_loop 7")
                     if self.kv_cache_transceiver and self.guided_decoder:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
-
+                    logger.debug("_executor_loop 8")
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
-
+                    logger.debug("_executor_loop 9")
                     if self.drafter is not None and self.use_spec_decode:
                         with request_context(
                                 is_draft=True,
@@ -1046,31 +1051,41 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
                                                  batch_outputs['logits'])
-
+                    logger.debug("_executor_loop 10")
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
-
+                    logger.debug("_executor_loop 11")
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state)
-
+                    logger.debug("_executor_loop 12")
                     if self.kv_cache_transceiver:
+                        logger.debug("_executor_loop 12.1")
                         ctx_transmission_reqs = self._send_disagg_ctx_cache(
                             scheduled_batch.context_requests)
+                        logger.debug(
+                            f"_executor_loop 12.2, ctx_transmission_reqs: {[req.py_request_id for req in ctx_transmission_reqs]}"
+                        )
                         # For context only req in transmission, we reset the state since sampler might have changed it
                         for req in ctx_transmission_reqs:
                             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-
+                        logger.debug(
+                            f"_executor_loop 12.3, ctx_transmission_reqs: {[req.py_request_id for req in ctx_transmission_reqs]}"
+                        )
+                    logger.debug("_executor_loop 13")
                     self._handle_canceled_requests()
+                    logger.debug("_executor_loop 14")
                     finished_requests = self._handle_responses()
+                    logger.debug("_executor_loop 15")
                     self.resource_manager.update_resources(scheduled_batch)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
-
+                    logger.debug("_executor_loop 16")
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._check_kv_transfer_timeout()
                     self._terminate_ctx_finished_requests()
-
+                    logger.debug("_executor_loop 17")
                 self._kv_connector_terminate_requests()
-
+                logger.debug("_executor_loop 18")
                 if self.enable_iter_perf_stats:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                         'num_ctx_tokens']
@@ -1080,6 +1095,7 @@ class PyExecutor:
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
+                logger.debug("_executor_loop 19")
 
     def _prepare_draft_requests(self):
         try:
@@ -1196,6 +1212,7 @@ class PyExecutor:
                         ctx_transmission_reqs=ctx_transmission_reqs)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._check_kv_transfer_timeout()
                     self._terminate_ctx_finished_requests()
 
                 self._kv_connector_terminate_requests()
@@ -1375,6 +1392,36 @@ class PyExecutor:
 
         return
 
+    def _check_kv_transfer_timeout(self):
+        if not self.kv_cache_transceiver:
+            return
+        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None or timeout_ms <= 0:
+            return
+
+        current_time = time.time()
+
+        for req in self.ctx_in_transmission_requests:
+            if req.py_kv_transfer_start_time is None:
+                continue
+            elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
+            if elapsed_time > timeout_ms and not req.py_to_cleanup:
+                logger.warning(
+                    f"Terminating context request {req.py_request_id} due to KV cache transfer timeout"
+                )
+                req.py_to_cleanup = True
+
+        for req in self.active_requests:
+            if req.is_disagg_generation_transmission_in_progress and req.py_kv_transfer_start_time is not None:
+                elapsed_time = (current_time -
+                                req.py_kv_transfer_start_time) * 1000
+                if elapsed_time > timeout_ms and not req.py_to_cleanup:
+                    logger.warning(
+                        f"Terminating generation request {req.py_request_id} due to KV cache transfer timeout"
+                    )
+                    req.py_to_cleanup = True
+        return
+
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -1449,6 +1496,7 @@ class PyExecutor:
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
+                req.py_kv_transfer_start_time = time.time()
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
@@ -1472,6 +1520,11 @@ class PyExecutor:
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_async(req)
 
+        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+            for req in new_gen_reqs:
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                    req.py_kv_transfer_start_time = time.time()
+
         block_transfer = all([
             req.is_disagg_generation_transmission_in_progress
             for req in self.active_requests
@@ -1483,6 +1536,9 @@ class PyExecutor:
 
     @nvtx_range("_send_disagg_ctx_cache")
     def _send_disagg_ctx_cache(self, scheduled_ctx_requests):
+        logger.debug(
+            f"_send_disagg_ctx_cache, start, scheduled_ctx_requests: {[req.py_request_id for req in scheduled_ctx_requests]}"
+        )
         if (scheduled_ctx_requests is None or len(scheduled_ctx_requests) == 0):
             return []
         for req in scheduled_ctx_requests:
@@ -1496,14 +1552,33 @@ class PyExecutor:
                             resource_mgr_type] is not None:
                         self.resource_manager.resource_managers[
                             resource_mgr_type].free_resources(req)
-
+        logger.debug(
+            f"_send_disagg_ctx_cache, before check_context_transfer_status, scheduled_ctx_requests: {[req.py_request_id for req in scheduled_ctx_requests]}"
+        )
+        # Supposed to be non-blocking but actually blocks, unknown reason
+        # Behavior: [2049, 3669, ..., 3679] -> [3669, ..., 3679] -> Later, block on 3680
+        # 2049 timed out only on the Python side. It's C++ responder future is likely still in the sender queue, so we block...?
+        # Functionally, we *need* cancelRequest.
         self.kv_cache_transceiver.check_context_transfer_status(0)
+        logger.debug(
+            f"_send_disagg_ctx_cache, after check_context_transfer_status, scheduled_ctx_requests: {[req.py_request_id for req in scheduled_ctx_requests]}"
+        )
 
         # Keep track of ctx requests that are in transmission
         ctx_transmission_reqs = [
             req for req in scheduled_ctx_requests
             if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         ]
+        logger.debug(
+            f"_send_disagg_ctx_cache, before kv_transfer_timeout_ms, ctx_transmission_reqs: {[req.py_request_id for req in ctx_transmission_reqs]}"
+        )
+        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+            for req in ctx_transmission_reqs:
+                if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS:
+                    req.py_kv_transfer_start_time = time.time()
+        logger.debug(
+            f"_send_disagg_ctx_cache, after kv_transfer_timeout_ms, ctx_transmission_reqs: {[req.py_request_id for req in ctx_transmission_reqs]}"
+        )
 
         return ctx_transmission_reqs
 
@@ -1754,6 +1829,14 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
+            # Check if generation request needs cleanup due to KV cache transfer timeout
+            if request.py_to_cleanup:
+                # This will terminate the request and send an error response
+                self._handle_errors(
+                    error_msg=f"Request {request.py_request_id} timed out",
+                    requests=[request])
+                continue
+
             if request.is_generation_only_request():
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
@@ -1795,9 +1878,19 @@ class PyExecutor:
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
         for request in self.ctx_in_transmission_requests[:]:
-            if request.is_disagg_context_complete_state:
+            if request.is_disagg_context_complete_state or request.py_to_cleanup:
+                check = request.py_request_id == 2049
+                if check:
+                    logger.info(
+                        f"self.ctx_in_transmission_requests: {[request.py_request_id for request in self.ctx_in_transmission_requests]}"
+                    )
+                request.py_kv_transfer_start_time = None
                 self._terminate_request(request)
                 self.ctx_in_transmission_requests.remove(request)
+                if check:
+                    logger.info(
+                        f"self.ctx_in_transmission_requests: {[request.py_request_id for request in self.ctx_in_transmission_requests]}"
+                    )
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.
