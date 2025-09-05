@@ -203,7 +203,7 @@ def test_should_use_spec_decode():
                                           max_num_tokens=4096 * 8,
                                           max_draft_len=4)
 
-    # Small token budget ON case: token_cap = 28 // (1+4) = 5 → min(8, 12, 5) = 5 <= 6 → True
+    # Small token budget ON case: token_cap = 28 // (1+4) = 5 → min(12, 8, 5) = 5 <= 6 → True
     active_requests = [object()] * 12
     assert drafter.should_use_spec_decode(active_requests,
                                           max_batch_size=8,
