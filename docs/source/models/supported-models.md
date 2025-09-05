@@ -18,6 +18,7 @@ The following is a table of supported models for the PyTorch backend:
 | `NemotronForCausalLM`                | Nemotron-3, Nemotron-4, Minitron   | `nvidia/Minitron-8B-Base`                    |
 | `NemotronNASForCausalLM`             | NemotronNAS                        | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`     |
 | `Qwen2ForCausalLM`                   | QwQ, Qwen2                         | `Qwen/Qwen2-7B-Instruct`                     |
+| `Phi3ForCausalLM`                    | Phi-4                              | `microsoft/Phi-4`                            |
 | `Qwen2ForProcessRewardModel`         | Qwen2-based                        | `Qwen/Qwen2.5-Math-PRM-7B`                   |
 | `Qwen2ForRewardModel`                | Qwen2-based                        | `Qwen/Qwen2.5-Math-RM-72B`                   |
 | `Qwen3ForCausalLM`                   | Qwen3                              | `Qwen/Qwen3-8B`                              |

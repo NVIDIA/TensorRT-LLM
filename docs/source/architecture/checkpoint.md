@@ -169,7 +169,7 @@ Here is the AWQ scaling factors of `mlp.fc` linear layer:
 - `transformer.layers.0.mlp.fc.prequant_scaling_factor`
 
     ```{note}
-    The linear weights in TensorRT-LLM checkpoint always follows (`out_feature`, `in_feature`) shape, whereas some quantized linear in TensorRT-LLM implemented by plugin may use (`in_feature`, `out_fature`) shape. The `trtllm-build` command adds a transpose operation to post-process it.
+    The linear weights in TensorRT LLM checkpoint always follows (`out_feature`, `in_feature`) shape, whereas some quantized linear in TensorRT LLM implemented by plugin may use (`in_feature`, `out_feature`) shape. The `trtllm-build` command adds a transpose operation to post-process it.
 
 ### Example
 

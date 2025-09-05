@@ -49,11 +49,11 @@ Note:
 * The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host
 * See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
+If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
 
 ### Creating the TRT-LLM Server config
 
-We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server and populate it with the following recommended performance settings.
+We create a YAML configuration file /tmp/config.yml for the TensorRT LLM Server and populate it with the following recommended performance settings.
 
 ```shell
 EXTRA_LLM_API_FILE=/tmp/config.yml
@@ -108,7 +108,7 @@ These options are used directly on the command line when you start the `trtllm-s
 
 #### `--backend pytorch`
 
-* **Description:** Tells TensorRT-LLM to use the **pytorch** backend.
+&emsp;**Description:** Tells TensorRT LLM to use the **pytorch** backend.
 
 #### `--max_batch_size`
 
@@ -124,7 +124,7 @@ These options are used directly on the command line when you start the `trtllm-s
 
 #### `--trust_remote_code`
 
-* **Description:** Allows TensorRT-LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+&emsp;**Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
 
 
 #### Extra LLM API Options (YAML Configuration)
@@ -264,7 +264,7 @@ Sample result in Blackwell
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT-LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh`(http://bench.sh) script.
 
 ```shell
 cat <<EOF >  bench.sh

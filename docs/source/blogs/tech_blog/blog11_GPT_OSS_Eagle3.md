@@ -1,4 +1,4 @@
-## Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT-LLM)
+## Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)
 
 This guide sets up a production endpoint that uses Eagle3 speculative decoding on NVIDIA GB200 or B200 GPUs only. It replaces the low‑latency flow from the previous guide and intentionally omits max‑throughput, Hopper, and benchmarking content.
 
@@ -17,7 +17,7 @@ Expected directory layout on the host (example):
   └─ eagle/         # Eagle3 speculative decoding assets
 ```
 
-### Get the TensorRT-LLM Container (1.1.0rc0)
+### Get the TensorRT LLM Container (1.1.0rc0)
 
 If required by your environment, log into NGC and pull the image:
 
@@ -30,7 +30,7 @@ docker login nvcr.io
 docker pull nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc0
 ```
 
-### Start the TensorRT-LLM Container
+### Start the TensorRT LLM Container
 
 Run the container and bind-mount your models directory to `/config/models` inside the container:
 
@@ -122,7 +122,7 @@ When `Status: 200` is returned, the endpoint is ready to serve requests.
 
 ### Sample Chat Completions Request
 
-Note: This Eagle3 + TensorRT-LLM endpoint currently supports only greedy sampling. The following Chat Completions parameters are ignored (no-ops): `temperature`, `top_p`, `top_k`, and `seed`.
+Note: This Eagle3 + TensorRT LLM endpoint currently supports only greedy sampling. The following Chat Completions parameters are ignored (no-ops): `temperature`, `top_p`, `top_k`, and `seed`.
 
 Send a simple OpenAI-compatible Chat Completions request to the running server:
 
