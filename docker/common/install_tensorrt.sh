@@ -66,7 +66,7 @@ install_ubuntu_requirements() {
     apt-get install -y --no-install-recommends \
         libcudnn9-cuda-12=${CUDNN_VER} \
         libcudnn9-dev-cuda-12=${CUDNN_VER} \
-	libcudnn9-headers-cuda-12=${CUDNN_VER} \
+        libcudnn9-headers-cuda-12=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
         libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
@@ -98,7 +98,7 @@ install_rockylinux_requirements() {
     done
 
     # Remove old packages
-    dnf remove -y "libnccl*" "cuda-compat*" "cuda-toolkit*" "libcublas*"
+    dnf remove -y "libnccl*"
 
     # Install new packages
     dnf -y install \
