@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@yanchaol-upload']) _
 
 import groovy.transform.Field
 
@@ -321,15 +321,21 @@ def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 
     for (it in artifacts) {
         def uploadpath = it.key
         def filepath = it.value
-        def spec = """{
-                    "files": [
-                        {
-                        "pattern": "${filepath}",
-                        "target": "${prefix}/${uploadpath}"
-                        }
-                    ]
-                }"""
+
+        def spec = """\
+        {
+        \"files\": [
+            {
+            \"pattern\": \"${filepath}\",
+            \"target\":  \"${prefix}/${uploadpath}\"
+            }
+        ],
+        \"buildInfo\": {\"skip\": true}
+        }
+        """
+
         echo "Uploading ${filepath} as ${uploadpath}. Spec: ${spec}"
+
         trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
             rtUpload (
                 serverId: serverId,
@@ -402,6 +408,8 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "rm -rf **/*.xml *.tar.gz"
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    sh "cd ${LLM_ROOT} && pwd && ls -alh && rm -rf .git"
+
     if (env.alternativeTRT) {
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -465,8 +473,9 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
 
+    sh "rm -rf ${tarName}"
+
     if (is_linux_x86_64) {
-        sh "rm -rf ${tarName}"
         sh "pigz --version || true"
         sh "bash -c 'tar --use-compress-program=\"pigz -k\" -cf ${tarName} TensorRT-LLM/'"
     } else {
@@ -485,6 +494,8 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
 
     // Step 1: cloning tekit source code
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    sh "cd ${LLM_ROOT} && pwd && ls -alh && rm -rf .git"
+
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
