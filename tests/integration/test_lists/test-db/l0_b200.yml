@@ -58,7 +58,6 @@ l0_b200:
   - unittest/_torch/thop/serial
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
-  - unittest/_torch/modeling -k "modeling_deepseek"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/auto_deploy/unit/singlegpu -k "not test_trtllm_bench_backend_comparison"
 - condition:
