@@ -51,7 +51,6 @@ public:
     using VecTokenExtraIds = Base::VecTokenExtraIds;
     using LogitsPostProcessor = Base::LogitsPostProcessor;
 
-    // 50 parameters
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,

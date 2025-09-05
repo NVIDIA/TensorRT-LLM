@@ -99,7 +99,6 @@ public:
     using MillisecondsType = std::chrono::milliseconds;
     using CacheSaltIDType = runtime::CacheSaltIDType;
 
-    // 50 parameters, 57 items in initialization list
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -203,7 +202,6 @@ public:
         initialize(*inputTokens, returnLogProbs);
     }
 
-    // 33 parameters, 40 items in initialization list
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -271,7 +269,6 @@ public:
         initialize(inputTokens, returnLogProbs);
     }
 
-    // 30 items in initialization list
     GenericLlmRequest(RequestIdType requestId, executor::Request const& req)
         : mRequestId(requestId)
         , mPromptLen(req.getInputTokenIds().size())

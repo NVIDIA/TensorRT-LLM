@@ -318,7 +318,6 @@ void initBindings(nb::module_& m)
                 auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
                 auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
-                // 50 parameters
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr, stop_words_list_tensor_ptr,
                     position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
