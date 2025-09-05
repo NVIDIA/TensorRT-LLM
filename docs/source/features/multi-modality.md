@@ -1,6 +1,6 @@
-# Multimodal Support in TensorRT-LLM
+# Multimodal Support in TensorRT LLM
 
-TensorRT-LLM supports a variety of multimodal models, enabling efficient inference with inputs beyond just text.
+TensorRT LLM supports a variety of multimodal models, enabling efficient inference with inputs beyond just text.
 
 ---
 
@@ -14,7 +14,7 @@ Multimodal LLMs typically handle non-text inputs by combining a multimodal encod
 
 ## Optimizations
 
-TensorRT-LLM incorporates some key optimizations to enhance the performance of multimodal inference:
+TensorRT LLM incorporates some key optimizations to enhance the performance of multimodal inference:
 
 * **In-Flight Batching**: Batches multimodal requests within the GPU executor to improve GPU utilization and throughput.
 * **CPU/GPU Concurrency**: Asynchronously overlaps data preprocessing on the CPU with image encoding on the GPU.
@@ -28,11 +28,11 @@ Please refer to the latest multimodal [support matrix](../models/supported-model
 
 ## Examples
 
-The following examples demonstrate how to use TensorRT-LLM's multimodal support in various scenarios, including quick run examples, serving endpoints, and performance benchmarking.
+The following examples demonstrate how to use TensorRT LLM's multimodal support in various scenarios, including quick run examples, serving endpoints, and performance benchmarking.
 
 ### Quick start
 
-Quickly try out TensorRT-LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py):
+Quickly try out TensorRT LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py):
 
 ```bash
 python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image

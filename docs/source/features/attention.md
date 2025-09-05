@@ -6,13 +6,13 @@
 
 This document details the implementation of multi-head attention (MHA),
 multi-query attention (MQA), and group-query attention (GQA) for autoregressive
-models in TensorRT-LLM's PyTorch backend.
+models in TensorRT LLM's PyTorch backend.
 
 Multi-head attention involves a sequence of batched matrix multiplications, a softmax operation, and another batched matrix multiplication,
 as described in the [Attention Is All You Need](https://arxiv.org/abs/1706.03762) paper.
 [Multi-query Attention (MQA)](https://arxiv.org/abs/1911.02150) and [Group-query Attention (GQA)](https://arxiv.org/abs/2307.09288) are
 variants of MHA that use fewer KV heads than the number of query heads.
-TensorRT-LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
+TensorRT LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
 The following sections explain how to use these implementations and provide a brief guide on implementing new backends.
 
 
@@ -115,7 +115,7 @@ that are shorter than the `max_sequence_length` to the maximum
 length. It may result in excessive memory consumption as well as unneeded
 computations on padding tokens (in the various matrix multiplications that
 surround the MHA block).
-To overcome that problem, TensorRT-LLM supports a mode without padding where
+To overcome that problem, TensorRT LLM supports a mode without padding where
 the different tokens are packed together and the user provides the operator
 with a 1D tensor containing the lengths of the different sequences.
 
@@ -155,9 +155,9 @@ Please be aware that this feature is only supported on Ada, Hopper and above.
 #### Generation Phase
 
 The generation phase is implemented using a single kernel called the masked
-multi-head attention in TensorRT-LLM. That kernel is able to apply
+multi-head attention in TensorRT LLM. That kernel is able to apply
 pre-processing on the Q, K, and V elements on-the-fly: it adds the QKV bias, applies
-RoPE, and performs dequantization and quantization. TensorRT-LLM will continue to add (or
+RoPE, and performs dequantization and quantization. TensorRT LLM will continue to add (or
 enable) additional features in future releases, such as enabling support for IA3.
 
 The masked MHA kernel has a special version that distributes the work across
@@ -202,7 +202,7 @@ Supported configurations can be found using the `shouldUse` function of the `Dec
 
 ### In-flight Batching
 
-TensorRT-LLM supports in-flight batching of requests (also known as continuous
+TensorRT LLM supports in-flight batching of requests (also known as continuous
 batching or iteration-level batching) for higher serving throughput. With this feature,
 sequences in the context phase can be processed together with sequences in
 the generation phase. The purpose of that technique is to better interleave
@@ -236,10 +236,10 @@ to be an integer multiple of the kv-cache block size.
 
 In the generation phase, a common optimization is to provide the MHA kernel
 with a cache containing the values of the past K and V elements that have
-already been computed.  That cache is known as the KV cache. TensorRT-LLM uses
-that technique to accelerate its generation phase. In TensorRT-LLM, there is
+already been computed.  That cache is known as the KV cache. TensorRT LLM uses
+that technique to accelerate its generation phase. In TensorRT LLM, there is
 one KV cache per Transformer layer, which means that there are as many KV
-caches as layers in a model. The current version of TensorRT-LLM supports two
+caches as layers in a model. The current version of TensorRT LLM supports two
 different types of KV caches: **contiguous** and **paged** KV caches.
 
 #### Contiguous KV Cache
@@ -266,7 +266,7 @@ blocks when required. See the implementation of
 
 In its current implementation, even if the rest of the network runs in INT8 or
 FP8, the attention operator works with FP32, FP16, and BFloat16 inputs and
-outputs. However, TensorRT-LLM supports INT8 and FP8
+outputs. However, TensorRT LLM supports INT8 and FP8
 (`QuantMode.INT8_KV_CACHE` and
 `QuantMode.FP8_KV_CACHE`) KV caches.
 
@@ -284,7 +284,7 @@ the MHA/MQA kernel. Dequantization is defined as
 
 ### Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache
 
-TensorRT-LLM has a feature called `Cyclic KV Cache`, which treats the kv cache
+TensorRT LLM has a feature called `Cyclic KV Cache`, which treats the kv cache
 as a circular buffer. This means that it only stores the kv cache for the last N
 tokens, where N is determined by the `attention_window_size` parameter in
 `TrtllmAttention.forward`. When the cache is full, new tokens’ kv cache will
@@ -304,7 +304,7 @@ the context kv cache are shared across beams.
 
 The StreamingLLM feature uses a window attention to perform efficient and stable LLM
 on long texts, which means that only `N` tokens need to be stored in the KV cache.
-Similar to the cyclic KV cache feature in TensorRT-LLM, `attention_window_size`
+Similar to the cyclic KV cache feature in TensorRT LLM, `attention_window_size`
 parameter is used to determine `N`. Different from the cyclic KV cache feature,
 the first `S` tokens, called sink tokens, are always kept in the attention window,
 where `S` is determined by `sink_token_length` parameter.

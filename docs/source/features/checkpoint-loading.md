@@ -16,7 +16,7 @@ The checkpoint loading design is built around a plugin-like architecture that is
 - **Checkpoint Loaders**: Orchestrate the loading process for specific formats
 - **Config Loaders**: Handle model configuration parsing and validation
 - **Weight Loaders**: Manage the actual loading of model weights from storage into memory
-- **Weight Mappers**: Map and transform loaded weights to TensorRT-LLM model's definition
+- **Weight Mappers**: Map and transform loaded weights to TensorRT LLM model's definition
 
 This modular design allows for easy extension to support new checkpoint formats while maintaining backward compatibility and performance optimizations. By separating the checkpoint loading components into four different subcomponents, any user can employ any relevant previous work while also introducing their own custom checkpoint-specific components.
 

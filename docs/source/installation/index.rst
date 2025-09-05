@@ -3,7 +3,7 @@
 Installation
 ============
 
-There are multiple ways to install and run TensorRT-LLM. For most users, the options below should be ordered from simple to complex. The approaches are equivalent in terms of the supported features.
+There are multiple ways to install and run TensorRT LLM. For most users, the options below should be ordered from simple to complex. The approaches are equivalent in terms of the supported features.
 
 Note: **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 

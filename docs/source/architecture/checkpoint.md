@@ -1,36 +1,36 @@
-# TensorRT-LLM Checkpoint
+# TensorRT LLM Checkpoint
 
 ## Overview
 
-The earlier versions (pre-0.8 version) of TensorRT-LLM were developed with a very aggressive timeline. For those versions, emphasis was not put on defining a unified workflow. Now that TensorRT-LLM has reached some level of feature richness, the development team has decided to put more effort into unifying the APIs and workflow of TensorRT-LLM. This file documents the workflow around TensorRT-LLM checkpoint and the set of CLI tools to generate checkpoint, build engines, and evaluate engines.
+The earlier versions (pre-0.8 version) of TensorRT LLM were developed with a very aggressive timeline. For those versions, emphasis was not put on defining a unified workflow. Now that TensorRT LLM has reached some level of feature richness, the development team has decided to put more effort into unifying the APIs and workflow of TensorRT LLM. This file documents the workflow around TensorRT LLM checkpoint and the set of CLI tools to generate checkpoint, build engines, and evaluate engines.
 
 There are three steps in the workflow:
 
-1. Convert weights from different source frameworks into TensorRT-LLM checkpoint.
-2. Build the TensorRT-LLM checkpoint into TensorRT engines with a unified build command.
-3. Load the engines to TensorRT-LLM model runner and evaluate with different evaluation tasks.
+1. Convert weights from different source frameworks into TensorRT LLM checkpoint.
+2. Build the TensorRT LLM checkpoint into TensorRT engines with a unified build command.
+3. Load the engines to TensorRT LLM model runner and evaluate with different evaluation tasks.
 
 ```
 NeMo -------------
                   |
 HuggingFace ------
                   |   convert                             build                    load
-Modelopt ---------  ----------> TensorRT-LLM Checkpoint --------> TensorRT Engine ------> TensorRT-LLM ModelRunner
+Modelopt ---------  ----------> TensorRT LLM Checkpoint --------> TensorRT Engine ------> TensorRT LLM ModelRunner
                   |
 JAX --------------
                   |
 DeepSpeed --------
 ```
 
-## Prepare the TensorRT-LLM Checkpoint
+## Prepare the TensorRT LLM Checkpoint
 
-TensorRT-LLM aims at supporting different sources:
+TensorRT LLM aims at supporting different sources:
 
 1. Trained models from NVIDIA NeMo, Microsoft DeepSpeed, and JAX
 2. Quantized models from NVIDIA Modelopt
 3. Popular models from HuggingFace
 
-TensorRT-LLM defines its own checkpoint format. A checkpoint directory includes:
+TensorRT LLM defines its own checkpoint format. A checkpoint directory includes:
 
 1. One config `json` file, which contains several model hyper-parameters.
 2. One or several rank weights files, each file contains a dictionary of tensors (weights).
@@ -107,7 +107,7 @@ Here is the model specific config list:
 ### Rank Weights
 
 Like PyTorch, the tensor (weight) name is a string containing hierarchical information,
-which is uniquely mapped to a certain parameter of a TensorRT-LLM model.
+which is uniquely mapped to a certain parameter of a TensorRT LLM model.
 
 For example, each transformer layer of the OPT model contains an `Attention` layer, an `MLP` layer. and two `LayerNorm` layers.
 
@@ -169,7 +169,7 @@ Here is the AWQ scaling factors of `mlp.fc` linear layer:
 - `transformer.layers.0.mlp.fc.prequant_scaling_factor`
 
     ```{note}
-    The linear weights in TensorRT-LLM checkpoint always follows (`out_feature`, `in_feature`) shape, whereas some quantized linear in TensorRT-LLM implemented by plugin may use (`in_feature`, `out_fature`) shape. The `trtllm-build` command adds a transpose operation to post-process it.
+    The linear weights in TensorRT LLM checkpoint always follows (`out_feature`, `in_feature`) shape, whereas some quantized linear in TensorRT LLM implemented by plugin may use (`in_feature`, `out_fature`) shape. The `trtllm-build` command adds a transpose operation to post-process it.
 
 ### Example
 
@@ -218,7 +218,7 @@ Here is the `config.json`:
 
 ## Build Checkpoint into TensorRT Engine
 
-TensorRT-LLM provides a unified build command: `trtllm-build`. Before using it,
+TensorRT LLM provides a unified build command: `trtllm-build`. Before using it,
 you may need to add it to the `PATH`.
 
 ```bash

@@ -1,6 +1,6 @@
 # Run benchmarking with `trtllm-serve`
 
-TensorRT-LLM provides the OpenAI-compatiable API via `trtllm-serve` command.
+TensorRT LLM provides the OpenAI-compatiable API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
 This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B:
@@ -19,7 +19,7 @@ The overall performance benchmarking involves:
 
 ## Launch the NGC container
 
-TensorRT-LLM distributes the pre-built container on [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags).
+TensorRT LLM distributes the pre-built container on [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags).
 
 You can launch the container using the following command:
 
@@ -114,7 +114,7 @@ Then we can run the benchmark using the command below.
 bash -x bench.sh &> output_bench.log
 ```
 
-Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.
+Below is some example TensorRT LLM serving benchmark output. Your actual results may vary.
 
 ```
 ============ Serving Benchmark Result ============
