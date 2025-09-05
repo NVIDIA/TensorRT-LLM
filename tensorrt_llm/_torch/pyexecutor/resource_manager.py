@@ -11,6 +11,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
@@ -316,6 +317,9 @@ class KVCacheManager(BaseResourceManager):
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
         self._stream = torch.cuda.Stream()
+        print(
+            f'kv cache manager stream: {self._stream}: {self._stream.cuda_stream}'
+        )
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -1170,6 +1174,8 @@ class PeftCacheManager(BaseResourceManager):
             binding_to_str_dtype(model_config.data_type),
             lora_config.swap_gate_up_proj_lora_b_weight)
         self._lora_manager = LoraManager()
+        self._batch_peft_table: Optional[Dict[int, list[
+            TaskLayerModuleConfig]]] = None  # task_id -> layer-module-configs mapping for the current batch
 
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:
@@ -1215,17 +1221,10 @@ class PeftCacheManager(BaseResourceManager):
         for req in context_batch:
             self.add_request_peft(req)
 
-        py_lora_task_layer_module_configs = self.impl.ensure_batch(
-            context_batch, generation_batch, False)
+        self._batch_peft_table = self.impl.ensure_batch(context_batch,
+                                                        generation_batch, False)
 
-        for req in context_batch:
-            req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
-                req.
-                py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
-        for req in generation_batch:
-            req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
-                req.
-                py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+        # torch.cuda.synchronize()
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -1235,3 +1234,12 @@ class PeftCacheManager(BaseResourceManager):
 
     def shutdown(self):
         pass
+
+    def get_and_reset_batch_peft_table(
+            self) -> Dict[int, list[TaskLayerModuleConfig]]:
+        batch_peft_table = self._batch_peft_table
+        self._batch_peft_table = None
+        return batch_peft_table
+
+    def is_task_cached_device(self, task_id: int) -> bool:
+        return self.impl.is_task_cached_device(task_id)

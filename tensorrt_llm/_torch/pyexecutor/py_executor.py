@@ -23,7 +23,8 @@ except ImportError:
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 mpi_disabled, nvtx_range, trace_func)
+                                 mpi_disabled, nvtx_range, trace_func, nvtx_pytorch_emit)
+from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -247,7 +248,9 @@ class PyExecutor:
         # During warmup, we don't enable the profiler
         self.is_warmup = True
         self.model_engine.warmup(self.resource_manager)
+
         if self.draft_model_engine is not None:
+            print('PyExecutor draft model engine warmup running!')
             self.draft_model_engine.warmup(self.resource_manager)
         self.is_warmup = False
 
@@ -365,7 +368,8 @@ class PyExecutor:
         with self.worker_lock:
             if self.worker_started == False:
                 self.worker_thread = threading.Thread(
-                    target=self._event_loop_wrapper, daemon=True)
+                    target=nvtx_pytorch_emit()(self._event_loop_wrapper),
+                    daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
 
