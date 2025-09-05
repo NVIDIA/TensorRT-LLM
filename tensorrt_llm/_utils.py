@@ -51,6 +51,21 @@ np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
 
 
+def nvtx_pytorch_emit(enabled: bool = False, record_shapes: bool = True):
+
+    def _emit_nvtx_decorator(func):
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with torch.autograd.profiler.emit_nvtx(enabled=enabled,
+                                                   record_shapes=record_shapes):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return _emit_nvtx_decorator
+
+
 def torch_to_numpy(x: torch.Tensor):
     assert isinstance(x, torch.Tensor), \
         f'x must be a torch.Tensor object, but got {type(x)}.'

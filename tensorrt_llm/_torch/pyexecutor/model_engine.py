@@ -16,6 +16,7 @@ import torch._dynamo.config
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
+from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.inputs.registry import (create_input_processor,
@@ -44,6 +45,7 @@ from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                    MoeLoadBalancerIterContext)
+from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
@@ -62,7 +64,8 @@ from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .model_loader import ModelLoader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
-                               ResourceManager, ResourceManagerType)
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -375,6 +378,9 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_runner = CUDAGraphRunner(self)
 
+        # Initialize CUDA Graph LoRA manager if LoRA is enabled
+        self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
+
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
         if self.use_beam_search:
@@ -418,6 +424,26 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype),
             swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
+
+    def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
+        """Initialize CUDA Graph LoRA manager with model configuration."""
+        # Get model configuration
+        if self.cuda_graph_runner.enabled:
+            max_lora_size = lora_config.max_loras or 8  # Default fallback
+            max_batch_size = self.batch_size  # Use engine's max batch size
+
+            self.cuda_graph_lora_manager = CudaGraphLoraManager(
+                max_lora_size=max_lora_size,
+                max_batch_size=max_batch_size,
+                max_lora_rank=lora_config.max_lora_rank,
+                model=self.model,
+                lora_model_config=self.lora_model_config,
+                device='cuda')
+
+            logger.info(
+                f"Initialized CUDA Graph LoRA manager, "
+                f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
+            )
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -503,6 +529,7 @@ class PyTorchModelEngine(ModelEngine):
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        # print('--------------------------------start of warmup--------------------------------')
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
@@ -1063,6 +1090,7 @@ class PyTorchModelEngine(ModelEngine):
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
+    @nvtx_range("PyTorchModelEngine._preprocess_inputs")
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
         Make some changes to the device inputs and avoid block the async data transfer
@@ -1221,10 +1249,12 @@ class PyTorchModelEngine(ModelEngine):
             self,
             scheduled_requests: ScheduledRequests,
             kv_cache_manager: KVCacheManager,
+            peft_cache_manager: PeftCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None):
+            cache_indirection_buffer: Optional[torch.Tensor] = None,
+            maybe_graph: bool = False):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -1698,7 +1728,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+            scheduled_requests, attn_metadata, peft_cache_manager, maybe_graph)
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
@@ -1780,6 +1810,7 @@ class PyTorchModelEngine(ModelEngine):
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
 
+    @nvtx_range("_prepare_tp_inputs_no_cache")
     def _prepare_tp_inputs_no_cache(
             self,
             scheduled_requests: ScheduledRequests,
@@ -2155,8 +2186,46 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_lora_params_from_requests(self,
                                        scheduled_requests: ScheduledRequests,
-                                       attn_metadata: AttentionMetadata):
+                                       attn_metadata: AttentionMetadata,
+                                       peft_cache_manager: PeftCacheManager,
+                                       maybe_graph: bool = False):
         '''
+        Get LoRA parameters from scheduled requests.
+
+        Uses CUDA Graph compatible mode if available, otherwise falls back to legacy mode.
+
+        Returns:
+            Dictionary containing LoRA parameters, or None if no LoRA requests
+        '''
+        # Check if we should use CUDA Graph mode
+        use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
+
+        # ctx_tasks = {request.lora_task_id for request in scheduled_requests.context_requests if request.lora_task_id is not None}
+        # gen_tasks = {request.lora_task_id for request in scheduled_requests.generation_requests if request.lora_task_id is not None}
+        # print(f'ctx_tasks ({len(scheduled_requests.context_requests)}): {ctx_tasks}')
+        # print(f'gen_tasks ({len(scheduled_requests.generation_requests)}): {gen_tasks}')
+
+        if use_cuda_graph_mode:
+            # Get PEFT table from request's py_lora_task_layer_module_configs
+            # Since all requests with the same task_id have the same layer-module-configs,
+            # we can extract it from any request that has LoRA configurations
+            return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
+                scheduled_requests, attn_metadata, peft_cache_manager)
+        else:
+            if self.cuda_graph_lora_manager is not None:
+                self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
+                    peft_cache_manager)
+            peft_table = peft_cache_manager.get_and_reset_batch_peft_table()
+            return self._get_legacy_lora_params_from_requests(
+                scheduled_requests, attn_metadata, peft_table)
+
+    def _get_legacy_lora_params_from_requests(
+            self, scheduled_requests: ScheduledRequests,
+            attn_metadata: AttentionMetadata,
+            peft_table: Dict[int, list[TaskLayerModuleConfig]]):
+        '''
+        Legacy LoRA parameter preparation logic.
+
         lora_params: dict
         {
             layer_id: dict
@@ -2173,13 +2242,17 @@ class PyTorchModelEngine(ModelEngine):
         tmp_lora_params = {}
 
         request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
+        if not peft_table:
+            return None
 
         # trace all requests to get the union set of the lora params
         for request in request_list:
-            if request.py_lora_task_layer_module_configs is None:
+            if request.lora_task_id is None:
                 continue
 
-            for module in request.py_lora_task_layer_module_configs:
+            layer_module_configs = peft_table[request.lora_task_id]
+
+            for module in layer_module_configs:
                 module_id = module.module_id
                 layer_id = module.layer_id
 
@@ -2206,7 +2279,7 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in request_list:
             # Need to set default values for this case
-            if request.py_lora_task_layer_module_configs is None:
+            if request.lora_task_id is None:
                 for layer_id in lora_params:
                     for module_id in lora_params[layer_id]:
                         current_lora_params = lora_params[layer_id][module_id]
@@ -2246,14 +2319,15 @@ class PyTorchModelEngine(ModelEngine):
         return lora_params
 
     @nvtx_range("_prepare_inputs")
-    def _prepare_inputs(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: KVCacheManager,
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None):
+    def _prepare_inputs(self,
+                        scheduled_requests: ScheduledRequests,
+                        kv_cache_manager: KVCacheManager,
+                        peft_cache_manager: PeftCacheManager,
+                        attn_metadata: AttentionMetadata,
+                        spec_metadata: Optional[SpecMetadata] = None,
+                        new_tensors_device: Optional[SampleStateTensors] = None,
+                        cache_indirection_buffer: Optional[torch.Tensor] = None,
+                        maybe_graph: bool = False):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -2267,10 +2341,12 @@ class PyTorchModelEngine(ModelEngine):
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
         return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
-                                       attn_metadata, spec_metadata,
-                                       new_tensors_device,
-                                       cache_indirection_buffer)
+                                       peft_cache_manager, attn_metadata, 
+                                       spec_metadata, new_tensors_device,
+                                       cache_indirection_buffer,
+                                       maybe_graph)
 
+    @nvtx_range("PyTorchModelEngine.forward")
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def forward(
@@ -2282,8 +2358,11 @@ class PyTorchModelEngine(ModelEngine):
         cache_indirection_buffer: Optional[torch.Tensor] = None,
         spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
     ):
+        # torch.cuda.current_stream().synchronize()   # pass
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        peft_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.PEFT_CACHE_MANAGER)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.enable_spec_decode:
@@ -2319,6 +2398,16 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     return self._forward_step(inputs, gather_ids,
                                               gather_context_logits)
+        '''
+        print(f'--------------------------------before pad_batch context requests: {len(scheduled_requests.context_requests)}, generation requests: {len(scheduled_requests.generation_requests)}')
+        for reqs in scheduled_requests.all_requests():
+            print(f'request: {reqs.py_request_id}: lora task id: {reqs.lora_task_id}')
+        print('--------------------------------end of before pad_batch--------------------------------')
+        import traceback
+        traceback.print_stack()
+        '''
+        # torch.cuda.synchronize()  # Pass with only adding this
+        # torch.cuda.current_stream().synchronize()
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager) as padded_requests:
 
@@ -2333,10 +2422,11 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
-
+            # torch.cuda.current_stream().synchronize()   # pass
             inputs, gather_ids = self._prepare_inputs(
-                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
-                new_tensors_device, cache_indirection_buffer)
+                padded_requests, kv_cache_manager, peft_cache_manager,
+                attn_metadata, spec_metadata, new_tensors_device,
+                cache_indirection_buffer, maybe_graph)
 
             self.iter_counter += 1
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
@@ -2372,7 +2462,10 @@ class PyTorchModelEngine(ModelEngine):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
+            # torch.cuda.synchronize()  # Pass with only adding this
+            # torch.cuda.current_stream().synchronize()   # Pass with only adding this
             self._execute_logit_post_processors(scheduled_requests, outputs)
+            # torch.cuda.synchronize()  # Pass with only adding this
 
             return outputs
 
