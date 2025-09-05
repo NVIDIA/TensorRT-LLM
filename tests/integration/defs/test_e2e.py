@@ -29,11 +29,12 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
                                        check_output)
 
 from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
-                     prune_checkpoint, quantize_data, refit_model,
+                     prune_checkpoint, quantize_data, refit_model, similar,
                      venv_check_call)
-from .conftest import (llm_models_root, skip_no_sm120, skip_nvlink_inactive,
-                       skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper,
-                       tests_path, unittest_path)
+from .conftest import (get_device_count, llm_models_root, skip_no_sm120,
+                       skip_nvlink_inactive, skip_post_blackwell,
+                       skip_pre_blackwell, skip_pre_hopper, tests_path,
+                       unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -2956,3 +2957,79 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
     if os.environ.get("SLURM_PROCID", '0') == '0':
         mmlu_accuracy = get_mmlu_accuracy(output)
         assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+
+
+@pytest.mark.parametrize("workflow", ["trt", "torch"])
+@pytest.mark.parametrize("tp_size", [1, 8], ids=["tp1", "tp8"])
+@pytest.mark.parametrize(["model_path", "lora_path"], [
+    ("llama-3.1-model/Llama-3.1-8B-Instruct", "lora/evian2-8b-instruct_vhf-lora-v1_jetart"),
+    ("llama-3.3-models/Llama-3.3-70B-Instruct", "lora/llama3-70b-instruct-lora_vhf-squad-v1"),
+    ("nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1", "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64")
+    ("Mixtral-8x7B-v0.1", "lora/mixtral-8x7b-instruct-v0-1_vhf-lora-v1"),
+    ("Mistral-7B-Instruct-v0.3", "lora/mistral-7b-instruct-v0-3_vhf_lora_squad"),
+    ("starcoder2-7b", "lora/starcoder2-7b_vhf-lora-squad-030325211133")
+])
+def test_llmapi_lora(workflow, model_path, lora_path, tp_size):
+    device_count = get_device_count()
+    if device_count < tp_size:
+        pytest.skip(f"Need at least {tp_size} GPUs to run this test")
+
+    if workflow == "trt":
+        from tensorrt_llm._tensorrt_engine import LLM
+    else:
+        from tensorrt_llm import LLM
+    from tensorrt_llm.executor.request import LoRARequest
+    from tensorrt_llm.lora_helper import LoraConfig
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    # Configure LoRA
+    lora_config = LoraConfig(
+        lora_dir=[f"/code/tensorrt_llm/{lora_path}"],
+        max_lora_rank=8,
+        max_loras=1,
+        max_cpu_loras=1
+    )
+
+    # Initialize LLM with LoRA support
+    llm = LLM(f"{llm_models_root()}/{model_path}",
+              lora_config=lora_config,
+              tensor_parallel_size=tp_size)
+    try:
+        # Create LoRA request
+        lora_request = LoRARequest("my-lora-task", 0,
+                                   f"{llm_models_root()}/{lora_path}")
+
+        # Test multiple prompts
+        prompts = [
+            "Hello, how are you?",
+            "What is the capital of France?",
+            "Explain the concept of machine learning.",
+        ]
+
+        sampling_params = SamplingParams(max_tokens=50,
+                                         add_special_tokens=False,
+                                         temperature=0.0,
+                                         top_k=1)
+
+        # Generate with LoRA
+        print("=== Generating with LoRA adapter ===")
+        lora_outputs = llm.generate(prompts,
+                                    sampling_params,
+                                    lora_request=[lora_request] * len(prompts))
+
+        # Generate without LoRA (baseline)
+        print("=== Generating without LoRA adapter (baseline) ===")
+        baseline_outputs = llm.generate(prompts,
+                                        sampling_params,
+                                        lora_request=[None] * len(prompts))
+
+        for i, (prompt, lora_out, baseline_out) in enumerate(
+                zip(prompts, lora_outputs, baseline_outputs)):
+            print(f"\nPrompt {i+1}: {prompt}")
+            print(f"LoRA text:       {lora_out.outputs[0].text.strip()}")
+            print(f"Baseline text:   {baseline_out.outputs[0].text.strip()}")
+            print("-" * 80)
+            assert similar(lora_out.outputs[0].text,
+                           baseline_out.outputs[0].text)
+    finally:
+        llm.shutdown()
