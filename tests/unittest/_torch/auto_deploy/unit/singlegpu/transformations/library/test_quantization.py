@@ -8,16 +8,11 @@ from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MLP, BMMDynamicModel, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.quant import QUANT_OPS
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale
-
-
-def check_quantized(gm):
-    return any(is_op(n, QUANT_OPS) for n in gm.graph.nodes)
 
 
 class DummyFactory(ModelFactory):
@@ -56,7 +51,7 @@ class DummyFactory(ModelFactory):
     ],
 )
 def test_quantization(quant_config, atol, rtol, num_p_og):
-    pytest.skip("https://nvbugspro.nvidia.com/bug/5170222")
+    # pytest.skip("https://nvbugspro.nvidia.com/bug/5170222")
     model = MLP(32, 64, 32).to(torch.float16).to("cuda")
     x = torch.randn(3, 32, dtype=torch.float16).to("cuda")
 
@@ -68,6 +63,9 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
         model.linear2.register_buffer(
             "input_scale", torch.tensor([1.0], device=model.linear2.weight.device)
         )
+        QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear
+    elif quant_config.get("quant_algo") == "FP8":
+        QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_fp8_linear
     # set up sequence+cache objects
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     gm_transformed = InferenceOptimizer(
@@ -84,7 +82,7 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
         model,
         x,
         gm_transformed,
-        check_quantized,
+        lambda gm: any(is_op(n, QUANT_OP) for n in gm.graph.nodes),
         num_p_og,
         atol,
         rtol,
@@ -161,12 +159,13 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
         },
     )(None, gm)
     gm_transformed.to("cuda")
+    QUANT_OP = torch.ops.auto_deploy.torch_quant_fp8_bmm
 
     run_test_transformed_gm(
         model,
         x,
         gm_transformed,
-        check_quantized,
+        lambda gm: any(is_op(n, QUANT_OP) for n in gm.graph.nodes),
         num_p_og,
         atol,
         rtol,

@@ -80,8 +80,8 @@ transforms:
   fuse_quant:
     stage: post_load_fusion
   # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-  # fuse_moe:
-  #   stage: post_load_fusion
+  fuse_moe:
+    stage: post_load_fusion
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   fuse_collectives:
