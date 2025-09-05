@@ -1,6 +1,6 @@
 # Architecture Overview
 
-The `LLM` class is a core entry point for the TensorRT-LLM, providing a simplified `generate()` API for efficient large language model inference. This abstraction aims to streamline the user experience, as demonstrated with TinyLlama:
+The `LLM` class is a core entry point for the TensorRT LLM, providing a simplified `generate()` API for efficient large language model inference. This abstraction aims to streamline the user experience, as demonstrated with TinyLlama:
 
 ```python
 from tensorrt_llm import LLM
@@ -16,7 +16,7 @@ The `LLM` class automatically manages essential pre and post-processing steps, i
 
 Internally, the `LLM` class orchestrates the creation of a dedicated `PyExecutor(Worker)` process on each rank.
 
-![TRT-LLM Architecture Overview](../media/TRTLLM_Architecture_Overview.png)
+![TensorRT LLM Architecture Overview](../media/TRTLLM_Architecture_Overview.png)
 
 This `PyExecutor` operates in a continuous background loop, designed for the efficient, asynchronous processing of inference requests.
 
@@ -45,13 +45,13 @@ During each iteration of its background loop, the `PyExecutor` performs the foll
 
 ## Runtime Optimizations
 
-TensorRT-LLM enhances inference throughput and reduces latency by integrating a suite of runtime optimizations, including CUDA Graph, [Overlap Scheduler](../features/overlap-scheduler.md), [Speculative decoding](../features/speculative-decoding.md), etc.
+TensorRT LLM enhances inference throughput and reduces latency by integrating a suite of runtime optimizations, including CUDA Graph, [Overlap Scheduler](../features/overlap-scheduler.md), [Speculative decoding](../features/speculative-decoding.md), etc.
 
 ### CUDA Graph
 
 CUDA Graphs drastically reduce the CPU-side overhead associated with launching GPU kernels, which is particularly impactful in PyTorch-based inference where Python's host-side code can be a bottleneck. By capturing a sequence of CUDA operations as a single graph, the entire sequence can be launched with one API call, minimizing CPU-GPU synchronization and driver overhead.
 
-To maximize the "hit rate" of these cached graphs, TensorRT-LLM employs CUDA Graph padding. If an incoming batch's size doesn't match a captured graph, it's padded to the nearest larger, supported size for which a graph exists. While this incurs minor overhead from computing "wasted" tokens, it's often a better trade-off than falling back to slower eager mode execution. This optimization has a significant impact, demonstrating up to a 22% end-to-end throughput increase on certain models and hardware.
+To maximize the "hit rate" of these cached graphs, TensorRT LLM employs CUDA Graph padding. If an incoming batch's size doesn't match a captured graph, it's padded to the nearest larger, supported size for which a graph exists. While this incurs minor overhead from computing "wasted" tokens, it's often a better trade-off than falling back to slower eager mode execution. This optimization has a significant impact, demonstrating up to a 22% end-to-end throughput increase on certain models and hardware.
 
 ### Overlap Scheduler
 
@@ -72,4 +72,4 @@ if self.previous_batch is not None:
     self._process_previous_batch()
 ```
 
-This approach effectively reduces GPU idle time and improves overall hardware occupancy. While it introduces one extra decoding step into the pipeline, the resulting throughput gain is a significant trade-off. For this reason, the Overlap Scheduler is enabled by default in TensorRT-LLM.
+This approach effectively reduces GPU idle time and improves overall hardware occupancy. While it introduces one extra decoding step into the pipeline, the resulting throughput gain is a significant trade-off. For this reason, the Overlap Scheduler is enabled by default in TensorRT LLM.

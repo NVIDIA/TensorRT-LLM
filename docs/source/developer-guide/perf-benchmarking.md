@@ -1,6 +1,6 @@
 (perf-benchmarking)=
 
-# TensorRT-LLM Benchmarking
+# TensorRT LLM Benchmarking
 
 ```{important}
 This benchmarking suite is a work in progress.
@@ -12,7 +12,7 @@ easier for users to reproduce our officially published [performance overview](./
 
 - A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.
 - An entirely Python workflow for benchmarking.
-- Ability to benchmark various flows and features within TensorRT-LLM.
+- Ability to benchmark various flows and features within TensorRT LLM.
 
 `trtllm-bench` executes all benchmarks using [in-flight batching] -- for more information see
 the [in-flight batching section](../advanced/gpt-attention.md#in-flight-batching) that describes the concept
@@ -65,7 +65,7 @@ sudo nvidia-smi boost-slider --vboost <max_boost_slider>
 
 #### Validated Networks for Benchmarking
 
-While `trtllm-bench` should be able to run any network that TensorRT-LLM supports, the following are the list
+While `trtllm-bench` should be able to run any network that TensorRT LLM supports, the following are the list
 that have been validated extensively and is the same listing as seen on the
 [Performance Overview](./perf-overview.md) page.
 
@@ -102,7 +102,7 @@ For more information about quantization, refer to [](../reference/precision.md) 
 the [support matrix](../reference/precision.md#support-matrix) of the supported quantization methods for each network.
 
 ```{tip}
-Although TensorRT-LLM supports more quantization modes than listed above, `trtllm-bench` currently only configures for
+Although TensorRT LLM supports more quantization modes than listed above, `trtllm-bench` currently only configures for
 a smaller subset.
 ```
 
@@ -417,7 +417,7 @@ P99:  1059.0000           137.0000          1178.0000
 #### Quantization in the PyTorch Flow
 
 To run a quantized benchmark with `trtllm-bench` utilizing the PyTorch flow, you will need to use a pre-quantized
-checkpoint. For the Llama-3.1 models, TensorRT-LLM provides the following checkpoints via HuggingFace:
+checkpoint. For the Llama-3.1 models, TensorRT LLM provides the following checkpoints via HuggingFace:
 
 - [`nvidia/Llama-3.1-8B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8)
 - [`nvidia/Llama-3.1-70B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8)

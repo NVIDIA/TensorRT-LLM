@@ -1,10 +1,10 @@
-# Parallelism in TensorRT-LLM
+# Parallelism in TensorRT LLM
 
 Parallelism across multiple GPUs becomes necessary when either
 * the model cannot fit in a single GPU’s memory, or
 * a single GPU cannot deliver the desired performance.
 
-TensorRT-LLM supports multiple parallelism strategies for deployment on both single and multiple nodes:
+TensorRT LLM supports multiple parallelism strategies for deployment on both single and multiple nodes:
 * **Tensor Parallel (TP)** - Shards model weights across GPUs
 * **Pipeline Parallel (PP)** - Distributes model layers across GPUs
 * **Data Parallel (DP)** - Replicates model across GPUs for different requests
@@ -48,7 +48,7 @@ Wide-EP is an advanced form of expert parallelism that addresses the inherent wo
 
 ### Attention Module
 
-TensorRT-LLM supports two strategies for attention modules:
+TensorRT LLM supports two strategies for attention modules:
 
 - **Tensor Parallelism (TP)** — best for small batch sizes
 - **Data Parallelism (DP)** — best for large batch sizes
@@ -90,7 +90,7 @@ Tensor Parallelism is supported for the FFN layers of dense models.
 
 MoE replaces a single FFN with multiple experts. A router selects the top-k experts for each token and dispatches the corresponding hidden states.
 
-TensorRT-LLM supports three execution patterns for MoE:
+TensorRT LLM supports three execution patterns for MoE:
 
 * **TP** - Every expert's weight matrix is sliced across all GPUs. Each GPU sees all tokens.
 * **EP** - Full weights of each expert reside on a single GPU. Each GPU only sees tokens routed to its local experts.
@@ -122,7 +122,7 @@ The product of `moe_tensor_parallel_size` and `moe_expert_parallel_size` must eq
 
 ## Wide Expert Parallelism (Wide-EP)
 
-Wide Expert Parallelism (Wide-EP) is TensorRT-LLM's advanced solution for large-scale MoE model inference. It addresses the challenges of traditional expert parallelism through intelligent load balancing and expert replication strategies.
+Wide Expert Parallelism (Wide-EP) is TensorRT LLM's advanced solution for large-scale MoE model inference. It addresses the challenges of traditional expert parallelism through intelligent load balancing and expert replication strategies.
 
 ### Motivation for Wide-EP
 
@@ -170,7 +170,7 @@ The system maintains a routing table that maps Expert IDs to Slot IDs, which can
 
 ### References
 
-- [Technical Blog: Scaling Expert Parallelism in TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
+- [Technical Blog: Scaling Expert Parallelism in TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
 - [DeepSeek-V3 Paper](https://arxiv.org/abs/2412.19437)
 - [EPLB Implementation](https://github.com/deepseek-ai/EPLB)
 

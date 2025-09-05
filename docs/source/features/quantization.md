@@ -1,10 +1,10 @@
 # Quantization
 
-## Quantization in TensorRT-LLM
+## Quantization in TensorRT LLM
 
 Quantization is a technique used to reduces memory footprint and computational cost by converting the model's weights and/or activations from high-precision floating-point numbers (like BF16) to lower-precision data types, such as INT8, FP8, or FP4.
 
-TensorRT-LLM offers a variety of quantization recipes to optimize LLM inference. These recipes can be broadly categorized as follows:
+TensorRT LLM offers a variety of quantization recipes to optimize LLM inference. These recipes can be broadly categorized as follows:
 
 * FP4
 * FP8 Per Tensor
@@ -23,7 +23,7 @@ The default PyTorch backend supports FP4 and FP8 quantization on the latest Blac
 
 ### Running Pre-quantized Models
 
-TensorRT-LLM can directly run [pre-quantized models](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) generated with the [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+TensorRT LLM can directly run [pre-quantized models](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) generated with the [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
 
 ```python
 from tensorrt_llm import LLM
@@ -34,7 +34,7 @@ llm.generate("Hello, my name is")
 #### FP8 KV Cache
 
 ```{note}
-TensorRT-LLM allows you to enable the FP8 KV cache manually, even for checkpoints that do not have it enabled by default.
+TensorRT LLM allows you to enable the FP8 KV cache manually, even for checkpoints that do not have it enabled by default.
 ```
 
 Here is an example of how to set the FP8 KV Cache option:
