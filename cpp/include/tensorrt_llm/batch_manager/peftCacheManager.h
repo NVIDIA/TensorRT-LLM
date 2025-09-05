@@ -57,7 +57,10 @@ class BasePeftCacheManager
 public:
     using LlmRequestPtr = std::shared_ptr<LlmRequest>;
     using RequestVector = std::vector<LlmRequestPtr>;
-    using PeftTable = std::map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using PeftTable = std::unordered_map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using TaskPeftTable = std::unordered_map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using TaskIdToReqIds = std::unordered_map<uint64_t, std::vector<uint64_t>>;
+    using EnsureBatchTaskResult = std::tuple<TaskPeftTable, TaskIdToReqIds>;
 
     virtual ~BasePeftCacheManager() = default;
 
@@ -99,6 +102,8 @@ public:
 class PeftCacheManager : public BasePeftCacheManager
 {
 public:
+    using EnsureBatchTaskResult = BasePeftCacheManager::EnsureBatchTaskResult;
+
     PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 
@@ -109,11 +114,16 @@ public:
     PeftTable ensureBatch(RequestVector const& contextRequests, RequestVector const& generationRequests,
         bool resetGpuCache = false) override;
 
+    EnsureBatchTaskResult ensureBatchMapTaskId(
+        RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache = false);
+
     [[nodiscard]] bool isTaskCached(uint64_t taskId) const;
 
     [[nodiscard]] bool isTaskDone(uint64_t taskId) const;
 
     [[nodiscard]] bool isTaskDoneDevice(uint64_t taskId) const;
+
+    [[nodiscard]] bool isTaskCachedDevice(uint64_t const taskId) const;
 
     void resetDeviceCache() override;
 
@@ -159,7 +169,7 @@ private:
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mTaskIdToReqIds;
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mTaskIdToPausedReqIds;
 
-    std::tuple<std::map<uint64_t, std::future<void>>, std::map<uint64_t, std::vector<uint64_t>>> getTaskMaps(
+    std::tuple<std::unordered_map<uint64_t, std::future<void>>, TaskIdToReqIds> getTaskMaps(
         RequestVector const& contextRequests, RequestVector const& generationRequests);
 
     runtime::ModelConfig mModelConfig;
