@@ -78,7 +78,6 @@ The following tips typically assist new LLM API users who are familiar with othe
   2. Use LLM as an contextmanager, with the following code: `with LLM(...) as llm: ...`, the shutdown methed will be invoked automatically once it goes out of the `with`-statement block.
 
 ### Single node hanging when using `docker run --net=host`
-Here’s a refined version of your documentation text:
 
 The root cause may be related to `mpi4py`. There is a [workaround](https://github.com/mpi4py/mpi4py/discussions/491#discussioncomment-12660609) suggesting a change from `--net=host` to `--ipc=host`, or setting the following environment variables:
 
