@@ -18,8 +18,8 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import SpecMetadata, get_spec_worker
-from .checkpoints.base_weight_mapper import BaseWeightMapper
 from ..utils import AuxStreamType
+from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
 
