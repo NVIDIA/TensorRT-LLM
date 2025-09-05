@@ -417,9 +417,6 @@ class OpenAIServer:
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
                 vocab_size=self.tokenizer.tokenizer.vocab_size)
-            # TODO: better way to enable metrics
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
-                sampling_params.return_perf_metrics = True
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 

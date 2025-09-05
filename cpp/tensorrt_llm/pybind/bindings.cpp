@@ -16,6 +16,7 @@
  */
 
 #include <pybind11/cast.h>
+#include <pybind11/chrono.h>
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
@@ -498,4 +499,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, py::return_value_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
+
+    m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
 }

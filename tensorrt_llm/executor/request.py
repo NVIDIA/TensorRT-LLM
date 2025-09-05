@@ -97,6 +97,7 @@ class GenerationRequest:
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        arrival_time: Optional[float] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -122,6 +123,7 @@ class GenerationRequest:
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
         self.scheduling_params = scheduling_params
+        self.arrival_time = arrival_time
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"
