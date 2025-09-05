@@ -100,6 +100,7 @@ public:
         RequestIdType, TensorPtr&, BeamTokens const&, TStream const&, std::optional<RequestIdType>)>;
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
+    using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
     using CacheSaltIDType = runtime::CacheSaltIDType;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
@@ -138,7 +139,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<TimePoint> arrivalTime = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -197,6 +199,11 @@ public:
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
     {
+        if (mReturnPerfMetrics)
+        {
+            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(std::chrono::steady_clock::now());
+        }
+
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
             mState = LlmRequestState::kENCODER_INIT;
@@ -304,6 +311,11 @@ public:
         , mAllottedTimeMs(req.getAllottedTimeMs())
         , mCacheSaltID(req.getCacheSaltID())
     {
+        if (mReturnPerfMetrics)
+        {
+            mPerfMetrics.timingMetrics.arrivalTime = std::chrono::steady_clock::now();
+        }
+
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
             mState = LlmRequestState::kDISAGG_GENERATION_INIT;
@@ -2146,10 +2158,6 @@ private:
             mSequenceFinalVec = std::make_shared<std::vector<bool>>(getNumSubRequests(), false);
         }
 
-        if (mReturnPerfMetrics)
-        {
-            mPerfMetrics.timingMetrics.arrivalTime = std::chrono::steady_clock::now();
-        }
         mStartTime = std::chrono::steady_clock::now();
     }
 
@@ -2197,7 +2205,7 @@ public:
     using TokenExtraIdType = Base::TokenExtraIdType;
     using VecTokenExtraIds = Base::VecTokenExtraIds;
 
-    // 49 parameters, 49 parameters in Base class constructor
+    // 50 parameters, 50 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2234,7 +2242,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<TimePoint> arrivalTime = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, std::move(multimodalHashes),
@@ -2247,11 +2256,12 @@ public:
             std::move(encoderOutputLength), std::move(crossAttentionMask), llmRequestType,
             std::move(inputTokenExtraIds), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
             returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams,
-            cacheSaltID)
+            cacheSaltID,
+            arrivalTime)
     {
     }
 
-    // 49 parameters, 49 parameters in Base class constructor
+    // 50 parameters, 50 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2286,7 +2296,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<TimePoint> arrivalTime = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2316,7 +2327,7 @@ public:
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
-            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID)
+            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID, arrivalTime)
     {
     }
 
