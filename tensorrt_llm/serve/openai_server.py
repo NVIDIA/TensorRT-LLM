@@ -22,7 +22,8 @@ from tensorrt_llm._tensorrt_engine import LLM
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
-from tensorrt_llm.inputs import PromptInputs, prompt_inputs
+from tensorrt_llm.inputs import prompt_inputs
+from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder
@@ -30,7 +31,6 @@ from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -165,21 +165,6 @@ class OpenAIServer:
                                        code=status_code.value)
         return JSONResponse(content=error_response.model_dump(),
                             status_code=error_response.code)
-
-    # A wrapper that calls llm.preprocess_inputs to do tokenization if necessary, before passing it to generate_async.
-    # This way we can use multi-threading to parallelize tokenization with different thread, because the tokenizer execution will release GIL.
-    async def generate_async_wrapper(
-            self,
-            inputs: PromptInputs,
-            sampling_params: Optional[SamplingParams] = None,
-            **kwargs) -> RequestOutput:
-        preprocessed_inputs = await asyncio.to_thread(self.llm.preprocess_inputs, inputs, sampling_params)
-        promise = self.llm.generate_async(
-                    inputs,
-                    sampling_params=sampling_params,
-                    preprocessed_inputs=preprocessed_inputs,
-                    **kwargs)
-        return promise
 
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
@@ -441,8 +426,8 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
-            promise = await self.generate_async_wrapper(
-                prompt,
+            promise = self.llm.generate_async(
+                inputs=prompt,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
@@ -529,7 +514,9 @@ class OpenAIServer:
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 
-            promise = await self.generate_async_wrapper(prompt)
+            promise = self.llm.generate_async(
+                inputs=prompt,
+            )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             response = await create_mm_embedding_response(promise)
@@ -648,8 +635,15 @@ class OpenAIServer:
                     postproc_args=postproc_args,
                 )
 
-                promise = await self.generate_async_wrapper(
-                    prompt,
+                prompt = prompt_inputs(prompt)
+                if prompt.get("prompt") is not None:
+                    prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(self.llm.input_processor, prompt, sampling_params)
+                    tokens_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids, query_token_ids=extra_processed_inputs.get("query_token_ids") if extra_processed_inputs is not None else None)
+                else:
+                    tokens_prompt = prompt
+
+                promise = self.llm.generate_async(
+                    inputs=tokens_prompt,
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
                     streaming=request.stream,
@@ -727,8 +721,8 @@ class OpenAIServer:
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
 
             # Generate
-            promise = await self.generate_async_wrapper(
-                harmony_tokens,
+            promise = self.llm.generate_async(
+                inputs=harmony_tokens,
                 sampling_params=sampling_params,
                 streaming=bool(request.stream),
                 lora_request=request.lora_request,

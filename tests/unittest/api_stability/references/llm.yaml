@@ -196,20 +196,7 @@ methods:
         annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
         default: null
         status: prototype
-      preprocessed_inputs:
-        annotation: Optional[tensorrt_llm.inputs.data.PreprocessedInputs]
-        default: null
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
-  preprocess_inputs:
-    parameters:
-      inputs:
-        annotation: tensorrt_llm.inputs.PromptInputs
-        default: inspect._empty
-      sampling_params:
-        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
-        default: null
-    return_annotation: tensorrt_llm.inputs.data.PreprocessedInputs
-    status: beta
   get_kv_cache_events:
     parameters:
       timeout:
