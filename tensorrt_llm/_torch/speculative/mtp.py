@@ -19,7 +19,9 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
 import os
+
 from tensorrt_llm.mapping import Mapping
+
 
 @dataclass(kw_only=True)
 class SampleStateTensorsMTP(SampleStateTensors):
@@ -1129,14 +1131,17 @@ class MTPWorker(nn.Module):
                 gpus_per_node=self.model_config.mapping.gpus_per_node,
                 tp_size=lm_tp_size,
                 pp_size=lm_pp_size,
-                enable_attention_dp=self.model_config.mapping.enable_attention_dp,
-                enable_lm_tp_in_adp=self.model_config.mapping.enable_lm_tp_in_adp,
+                enable_attention_dp=self.model_config.mapping.
+                enable_attention_dp,
+                enable_lm_tp_in_adp=self.model_config.mapping.
+                enable_lm_tp_in_adp,
             )
             combined = self.get_local_max_and_combined(logits, mapping_lm_tp)
             gathered = allgather(combined, mapping_lm_tp, dim=-1)
             batch_size = logits.shape[0]
             local_batch_size = batch_size // mapping_lm_tp.tp_size
-            gathered = gathered.view(mapping_lm_tp.tp_size, local_batch_size, -1)
+            gathered = gathered.view(mapping_lm_tp.tp_size, local_batch_size,
+                                     -1)
             sliced_gathered = gathered[mapping_lm_tp.tp_rank]
             draft_tokens = self.get_draft_tokens_from_gathered(sliced_gathered)
         else:
@@ -1239,8 +1244,8 @@ class MTPEagleWorker(MTPWorker):
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
             hidden_states_gathered = hidden_states[gather_ids]
-            token_count = hidden_states_gathered.view(-1,
-                                             hidden_states_gathered.shape[-1]).shape[0]
+            token_count = hidden_states_gathered.view(
+                -1, hidden_states_gathered.shape[-1]).shape[0]
             max_num_requests = spec_metadata.max_num_requests
             pad_len = max_num_requests - token_count
             if pad_len > 0:
@@ -1252,10 +1257,11 @@ class MTPEagleWorker(MTPWorker):
                 padded_hidden_states = hidden_states_gathered.view(
                     -1, hidden_states_gathered.shape[-1])
             else:
-                raise ValueError(f"In MTPEagleWorker.forward(), token_count < max_num_requests, which is not supported")
+                raise ValueError(
+                    f"In MTPEagleWorker.forward(), token_count < max_num_requests, which is not supported"
+                )
             logits = draft_model.mtp_layers[0].shared_head(
-                padded_hidden_states, draft_model.lm_head, attn_metadata,
-                True)
+                padded_hidden_states, draft_model.lm_head, attn_metadata, True)
             new_draft_token = self.draft_sampler(logits)
             new_draft_token = new_draft_token[:token_count]
 
