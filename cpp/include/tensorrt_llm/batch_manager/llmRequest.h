@@ -63,6 +63,9 @@ enum class LlmRequestState : int32_t
     kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 21, ///< Waiting context-only request transmitting the kv cache,
                                             /// after computation finished
     kDISAGG_CONTEXT_COMPLETE = 22,          ///< Context-only request finished kv cache transmission.
+
+    // error states
+    kDISAGG_TRANS_ERROR = -1, ///< Error occurred during kv cache transmission
 };
 
 enum LlmRequestType

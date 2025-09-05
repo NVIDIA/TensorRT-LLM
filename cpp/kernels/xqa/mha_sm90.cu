@@ -632,6 +632,8 @@ CUBIN_EXPORT __global__
 #ifdef NDEBUG
 #if !OPTIMIZE_FOR_LATENCY
     __launch_bounds__(128 * 3, headElems* ctaNbQHeads <= 128 * 16 ? 3 : 2)
+#else
+    __launch_bounds__(128 * 3)
 #endif
 #else
     __launch_bounds__(128 * 3, 1)
@@ -1086,6 +1088,23 @@ CUBIN_EXPORT __global__
                     }
                     printf("\n\n");
                 }
+            }
+            smem.gemm1WarpGrpBar.arrive_and_wait();
+#else
+            if (blockIdx.y == 1 && threadIdx.x == 0)
+            {
+                printf("rowMax:\n");
+                for (int i = 0; i < ctaNbQHeads; i++)
+                {
+                    printf("%f, ", smem.xRowMax[idxXBuf][i]);
+                }
+                printf("\n");
+                printf("rowSum:\n");
+                for (int i = 0; i < ctaNbQHeads; i++)
+                {
+                    printf("%f, ", smem.xRowSum[idxXBuf][i]);
+                }
+                printf("\n");
             }
             smem.gemm1WarpGrpBar.arrive_and_wait();
 #endif
