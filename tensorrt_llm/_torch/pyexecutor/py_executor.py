@@ -969,10 +969,16 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
-            self.use_spec_decode = self.drafter.should_use_spec_decode(
-                self.active_requests, self.max_batch_size,
-                self.model_engine.max_num_tokens,
-                self.model_engine.spec_config.max_draft_len)
+            # Honor permanent disable flag based on rolling acceptance first
+            if getattr(self.model_engine, 'speculation_permanently_disabled',
+                       False):
+                self.use_spec_decode = False
+            else:
+                self.use_spec_decode = self.drafter.should_use_spec_decode(
+                    self.active_requests, self.max_batch_size,
+                    self.model_engine.max_num_tokens,
+                    self.model_engine.spec_config.max_draft_len)
+
             self.model_engine.enable_spec_decode = self.use_spec_decode
 
             # Set up draft_tokens in active_requests, because they could be used in the scheduling stage.
@@ -1920,6 +1926,20 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
+                if (self.model_engine.enable_spec_decode and
+                        not self.model_engine.speculation_permanently_disabled
+                        and not request.is_dummy and not self.is_warmup):
+                    if self.model_engine.speculation_gate is not None:
+                        avg_decoded = getattr(request,
+                                              'avg_decoded_tokens_per_iter',
+                                              None)
+                        disabled_now, _ = self.model_engine.speculation_gate.record_avg_decoded(
+                            avg_decoded,
+                            request_id=getattr(request, 'py_request_id', None))
+                        if disabled_now:
+                            # disable speculation permanently
+                            # starting from next iteration, _prepare_and_schedule_batch will set self.use_spec_decode to False
+                            self.model_engine.speculation_permanently_disabled = True
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:
