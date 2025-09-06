@@ -936,10 +936,18 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
-            self.use_spec_decode = self.drafter.should_use_spec_decode(
-                self.active_requests)
+            # Honor permanent disable flag based on rolling acceptance first
+            if getattr(self.model_engine, 'speculation_permanently_disabled',
+                       False):
+                self.use_spec_decode = False
+            else:
+                self.use_spec_decode = self.drafter.should_use_spec_decode(
+                    self.active_requests, self.max_batch_size,
+                    self.model_engine.max_num_tokens,
+                    self.model_engine.spec_config.max_draft_len)
+
             self.model_engine.enable_spec_decode = self.use_spec_decode
-            # If speculation is off, this function sets py_draft_tokens to None
+            # If speculation is off, this function sets py_draft_tokens to []
             # for all active requests. If it's on, we initialize py_draft_tokens
             # with dummy draft tokens to make the scheduler aware of the fact
             # that speculation is about to happen.
@@ -1103,7 +1111,7 @@ class PyExecutor:
                     req.py_draft_tokens = [0] * max_draft_len
                     req.py_draft_pages_allocated = max_draft_len
                 else:
-                    req.py_draft_tokens = None
+                    req.py_draft_tokens = []
                     req.py_draft_pages_allocated = 0
 
         except Exception as e:
@@ -1818,6 +1826,24 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
+                if (self.model_engine.enable_spec_decode and
+                        not self.model_engine.speculation_permanently_disabled
+                        and not request.is_dummy and not self.is_warmup):
+                    if self.model_engine.speculation_gate is not None:
+                        # Response handling runs on multiple PP ranks. Only the last PP rank performs
+                        # sampling; restrict rolling stat updates to it to avoid overcounting.
+                        if (not getattr(self.dist, 'has_pp',
+                                        False)) or self.dist.is_last_pp_rank:
+                            avg_decoded = getattr(
+                                request, 'avg_decoded_tokens_per_iter', None)
+                            disabled_now, _ = self.model_engine.speculation_gate.record_avg_decoded(
+                                avg_decoded,
+                                request_id=getattr(request, 'py_request_id',
+                                                   None))
+                            if disabled_now:
+                                # disable speculation permanently
+                                # starting from next iteration, _prepare_and_schedule_batch will set self.use_spec_decode to False
+                                self.model_engine.speculation_permanently_disabled = True
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:
