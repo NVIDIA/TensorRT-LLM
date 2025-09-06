@@ -372,7 +372,6 @@
             "_comment": "Tile 8 to 128",
             "dtypeC": ["bf16", "fp16", "e4m3"],
             "useUnrollLoop2xForMma": [true, false],
-            "smVersion": ["100a", "103a"],
             "mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimZ": [[8, 8, 8, 512, 2, 2], [16, 16, 16, 512, 2, 2], [32, 32, 32, 512, 2, 2], [64, 64, 64, 512, 2, 2], [128, 128, 128, 256, 1, 1]]
         }
     ]
