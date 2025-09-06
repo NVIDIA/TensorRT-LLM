@@ -523,6 +523,7 @@ def executor_request_to_llm_request(
         mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         mrope_position_deltas=mrope_position_deltas,
         lookahead_config=None,
+        kv_cache_retention_config=executor_request.kv_cache_retention_config,
         return_log_probs=executor_request.output_config.return_log_probs,
         return_context_logits=executor_request.output_config.
         return_context_logits,
