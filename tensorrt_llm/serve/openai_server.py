@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import asyncio
+import gc
 import os
 import re
 import signal
@@ -749,6 +750,12 @@ class OpenAIServer:
             return self.create_error_response(message=str(e), err_type="internal_error")
 
     async def __call__(self, host, port):
+        # Disable the python GC for serve process by default because long GC events (500ms) are impacting the tokenization and detokenization progress, which drags down the overall throughput.
+        # NOTE: Disabling GC straightup is quite aggressive and could cause potential memory issue. We need further experiments to make sure it's safe.
+        # TODO: Before merge it back to main, we should either do enough pressure test to make sure it's safe, or enable GC by default
+        if os.environ.get("TRTLLM_SERVE_ENABLE_GC", "0") == "0":
+            gc.disable()
+
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         config = uvicorn.Config(self.app,
