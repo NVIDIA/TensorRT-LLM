@@ -807,10 +807,12 @@ class AutoTuner:
                 device,
             ))
 
-    def _checkCudaErrors(self, result) -> None:
-        if result[0].value:
-            raise RuntimeError("CUDA error code={}({})".format(
-                result[0].value, self._cudaGetErrorEnum(result[0])))
+    def _checkCudaErrors(self, result) -> Any:
+        status = result[0]
+        if status != driver.CUresult.CUDA_SUCCESS:
+            code = getattr(status, "value", status)
+            raise RuntimeError(
+                f"CUDA error code={code}({self._cudaGetErrorEnum(status)})")
         # CUDA APIs always return the status as the first element of the result tuple
         if len(result) == 1:
             return None
