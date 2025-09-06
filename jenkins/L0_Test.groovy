@@ -1844,29 +1844,45 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Run the isolated tests one by one to avoid any potential conflicts
-        for (int i = 0; i < isolateTestList.size(); i++) {
-            def isolateTest = isolateTestList[i]
-            def isolateTestCmdLine = testCmdLine.findAll { cmd ->
-                !cmd.contains("--test-list=") &&
-                !cmd.contains("--test-prefix=") &&
-                !cmd.contains("--csv=") &&
-                !cmd.contains("--junit-xml")
+        if (preprocessedLists.isolateCount > 0) {
+            echo "Found ${preprocessedLists.isolateCount} isolated tests to run"
+            def isolateTestLines = readFile(file: isolateTestList).readLines()
+
+            for (int i = 0; i < isolateTestLines.size(); i++) {
+                def isolateTestName = isolateTestLines[i].trim()
+                echo "Running isolated test ${i+1}/${isolateTestLines.size()}: ${isolateTestName}"
+
+                // Create a temporary file for this single isolated test
+                def singleTestFile = "${testListFile}_isolated_${i}.txt"
+                sh "echo '${isolateTestName}' > ${singleTestFile}"
+
+                def isolateTestCmdLine = testCmdLine.findAll { cmd ->
+                    !cmd.contains("--test-list=") &&
+                    !cmd.contains("--test-prefix=") &&
+                    !cmd.contains("--csv=") &&
+                    !cmd.contains("--junit-xml")
+                }
+                isolateTestCmdLine += ["--test-list=${singleTestFile}"]
+                isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
+                isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
+                isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+
+                try {
+                    sh """
+                        cd ${llmSrc}/tests/integration/defs && \
+                        ${isolateTestCmdLine.join(" ")}
+                    """
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    error "The isolated test ${isolateTestName} failed."
+                } finally {
+                    // Clean up the temporary test file
+                    sh "rm -f ${singleTestFile}"
+                }
             }
-            isolateTestCmdLine += ["--test-list=${isolateTest}"]
-            isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
-            isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
-            isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
-            echo "Running isolated test: ${isolateTest}"
-            try {
-                sh """
-                    cd ${llmSrc}/tests/integration/defs && \
-                    ${isolateTestCmdLine.join(" ")}
-                """
-            } catch (InterruptedException e) {
-                throw e
-            } catch (Exception e) {
-                error "The isolated test ${isolateTest} failed."
-            }
+        } else {
+            echo "No isolated tests to run"
         }
 
         if (perfMode) {
