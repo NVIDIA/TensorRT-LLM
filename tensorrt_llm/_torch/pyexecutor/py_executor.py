@@ -918,7 +918,7 @@ class PyExecutor:
             self.send_handles[microbatch_id].wait()
             self.send_handles[microbatch_id] = None
 
-    def _prepare_and_schedule_batch(self):
+    def _prepare_and_schedule_batch(self, overlap_mode: bool = False):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
             return None, None
@@ -947,6 +947,15 @@ class PyExecutor:
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+        if overlap_mode:
+            new_generation_requests = []
+            for req in scheduled_batch.generation_requests:
+                # Generation logits are hard to deal with and distinguish between EOS and length
+                # Currently, last logits are skipped with overlap, but then we splinter cases based on stopping conditions.
+                # For now, just treat req with gen logits like before and let them overschedule.
+                if req.py_return_generation_logits or req.py_decoding_iter + 1 < req.py_max_new_tokens:
+                    new_generation_requests.append(req)
+            scheduled_batch.generation_requests = new_generation_requests
 
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -1132,7 +1141,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
-                scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                scheduled_batch, iter_stats = self._prepare_and_schedule_batch(
+                    overlap_mode=True)
                 if scheduled_batch is None:
                     break
 
@@ -1173,9 +1183,10 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
-                    if self.previous_batch is not None:
-                        self._update_requests(self.previous_batch.sample_state)
+                if self.previous_batch is not None:
+                    self._update_requests(self.previous_batch.sample_state)
 
+                if scheduled_batch.batch_size > 0:
                     if self.guided_decoder is not None:
                         # add_batch must be called again to have updated new tokens.
                         self.guided_decoder.add_batch(scheduled_batch)
@@ -1191,13 +1202,15 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    if self.previous_batch is not None:
-                        self._process_previous_batch()
-                        self.previous_batch: Optional[BatchState] = None
+                if self.previous_batch is not None:
+                    self._process_previous_batch()
+                    self.previous_batch: Optional[BatchState] = None
 
-                    if self.enable_iter_perf_stats:
-                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                            'num_ctx_tokens']
+                if self.enable_iter_perf_stats:
+                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                        'num_ctx_tokens']
+
+                if scheduled_batch.batch_size > 0:
 
                     self.previous_batch = BatchState(
                         sample_state=sample_state,
