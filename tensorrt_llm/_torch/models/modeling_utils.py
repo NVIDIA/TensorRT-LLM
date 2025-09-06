@@ -776,6 +776,7 @@ def run_concurrently(func,
         }
 
         # Process completed tasks as they finish
+
         for result in futures.as_completed(future_to_result):
             arg = future_to_result[result]
             try:
@@ -789,6 +790,9 @@ def run_concurrently(func,
                     f"Error executing {func.__name__} with args {arg}: {str(e)}"
                 )
                 raise
+    # cleanup the cache so that any subsequent tasks can use the free memory (specifically the sequential tasks)
+    torch.cuda.empty_cache()
+    pbar.close()
 
 
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
@@ -820,60 +824,76 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
         'gate_up_proj': ['gate_proj', 'up_proj']
     }
+    # serial_load_modules is the list of modules that are loaded serially before running concurrently
+    serial_load_modules = []
+    # serial_retry_oomed_modules is the list of modules that are loaded serially after running concurrently due to OOM error
+    serial_retry_oomed_modules = []
 
     def load_single_module(name, module):
-        if len(module._parameters) > 0:
-            # skip load weights if module is in skip_modules
-            if any(skip_module in name for skip_module in skip_modules):
-                return
+        try:
+            if len(module._parameters) > 0:
+                # skip load weights if module is in skip_modules
+                if any(skip_module in name for skip_module in skip_modules):
+                    return
 
-            # skip load weights if tie word embeddings is enabled and layer is lm_head
-            if model.config.tie_word_embeddings and name.startswith("lm_head"):
-                return
+                # skip load weights if tie word embeddings is enabled and layer is lm_head
+                if model.config.tie_word_embeddings and name.startswith(
+                        "lm_head"):
+                    return
 
-            # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
-            if hasattr(model, "model") and hasattr(
-                    model.model, 'has_custom_embed_tokens'
-            ) and model.model.has_custom_embed_tokens and name == "model.embed_tokens":
-                return
-            if hasattr(model, 'has_custom_lm_head'
-                       ) and model.has_custom_lm_head and name == "lm_head":
-                return
+                # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
+                if hasattr(model, "model") and hasattr(
+                        model.model, 'has_custom_embed_tokens'
+                ) and model.model.has_custom_embed_tokens and name == "model.embed_tokens":
+                    return
+                if hasattr(model, 'has_custom_lm_head'
+                           ) and model.has_custom_lm_head and name == "lm_head":
+                    return
 
-            names = name.split('.')
-            # WAR: better solution is that llama has its own load_weights function.
-            if names[-1] == 'next_layer_layernorm':
-                return
-            if names[-1] in params_map:
-                module_weights = []
-                for new_name in params_map[names[-1]]:
-                    fw = filter_weights('.'.join(names[:-1] + [new_name]),
-                                        weights)
-                    if new_name in ['k_proj', 'v_proj']:
-                        num_kv_heads_list = [num_kv_heads
-                                             ] * len(fw) if isinstance(
-                                                 num_kv_heads,
-                                                 int) else num_kv_heads
-                        fw = {
-                            k:
-                            duplicate_kv_weight(
-                                weight=v[:],
-                                num_kv_heads=num_kv_heads_list[i],
-                                tensor_parallel_size=tp_size)
-                            if k in ["weight", "bias"] else v
-                            for i, (k, v) in enumerate(fw.items())
-                        }
+                names = name.split('.')
+                # WAR: better solution is that llama has its own load_weights function.
+                if names[-1] == 'next_layer_layernorm':
+                    return
+                if names[-1] in params_map:
+                    module_weights = []
+                    for new_name in params_map[names[-1]]:
+                        fw = filter_weights('.'.join(names[:-1] + [new_name]),
+                                            weights)
+                        if new_name in ['k_proj', 'v_proj']:
+                            num_kv_heads_list = [num_kv_heads
+                                                 ] * len(fw) if isinstance(
+                                                     num_kv_heads,
+                                                     int) else num_kv_heads
+                            fw = {
+                                k:
+                                duplicate_kv_weight(
+                                    weight=v[:],
+                                    num_kv_heads=num_kv_heads_list[i],
+                                    tensor_parallel_size=tp_size)
+                                if k in ["weight", "bias"] else v
+                                for i, (k, v) in enumerate(fw.items())
+                            }
 
-                    module_weights.append(fw)
-                module.load_weights(weights=module_weights)
-            else:
-                module_weights = filter_weights(name, weights)
-                if hasattr(module, 'load_weights'):
-                    module.load_weights(weights=[module_weights])
+                        module_weights.append(fw)
+                    module.load_weights(weights=module_weights)
                 else:
-                    for n, p in module._parameters.items():
-                        if p is not None:
-                            p.data.copy_(module_weights[n][:])
+                    module_weights = filter_weights(name, weights)
+                    if hasattr(module, 'load_weights'):
+                        module.load_weights(weights=[module_weights])
+                    else:
+                        for n, p in module._parameters.items():
+                            if p is not None:
+                                p.data.copy_(module_weights[n][:])
+        except torch.OutOfMemoryError as e:
+            logger.warning(
+                f"Out of memory error in {load_single_module.__name__} with args {name, module}: {str(e)}"
+            )
+            serial_retry_oomed_modules.append((name, module))
+        except Exception as e:
+            logger.warning(
+                f"Error executing {load_single_module.__name__} with args {name, module}: {str(e)}"
+            )
+            raise
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       False) in ["True", "true", "1", "yes", "y"]:
@@ -902,6 +922,15 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         args_list = [(name, module) for name, module in model.named_modules()
                      if name not in serial_load_modules]
         run_concurrently(load_single_module, args_list, pbar=pbar)
+
+        # Now retry the modules that failed due to OOM error
+        if serial_retry_oomed_modules:
+            pbar = tqdm(serial_retry_oomed_modules,
+                        desc="Loading weights serially")
+            for name, module in serial_retry_oomed_modules:
+                load_single_module(name, module)
+                pbar.update(1)
+            pbar.close()
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
