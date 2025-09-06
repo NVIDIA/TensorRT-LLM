@@ -69,6 +69,7 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
 
 // Type alias for multimodal hash key (hash array + start offset)
 using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
@@ -115,6 +116,7 @@ struct BlockKey
     // Extra keys for multimodal data (similar to VLLM's approach)
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
     std::vector<MmKey> extraKeys;
+    std::optional<CacheSaltIDType> cacheSaltID = std::nullopt;
 
     BlockKey() = default;
 
@@ -129,24 +131,25 @@ struct BlockKey
     }
 
     explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
-        std::vector<MmKey> extraKeys = {})
+        std::vector<MmKey> extraKeys = {}, std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
         : usesExtraIds{usesExtraIds}
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
         , extraKeys{std::move(extraKeys)}
+        , cacheSaltID{cacheSaltID}
     {
     }
 
     bool operator==(BlockKey const& other) const noexcept
     {
         return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
-            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys);
+            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID);
     }
 
     int partialMatch(BlockKey const& other) const noexcept
     {
         SizeType32 numMatched{0};
-        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys)
+        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID)
         {
             auto [matchEnd, otherMatchEnd] = std::mismatch(
                 uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());
