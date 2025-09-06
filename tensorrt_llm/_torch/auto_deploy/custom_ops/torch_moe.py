@@ -235,8 +235,8 @@ def torch_quant_fp8_moe_fake(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("auto_deploy::torch_quant_fp4_moe", mutates_args=())
-def torch_quant_fp4_moe(
+@torch.library.custom_op("auto_deploy::torch_quant_nvfp4_moe", mutates_args=())
+def torch_quant_nvfp4_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -273,7 +273,7 @@ def torch_quant_fp4_moe(
         def mlp(inp):
             if inp.shape[0] == 0:
                 return torch.zeros_like(inp)
-            gate_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+            gate_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                 inp,
                 w1_weight[i],
                 bias=None,
@@ -281,7 +281,7 @@ def torch_quant_fp4_moe(
                 weight_scale=w1_weight_scale[i],
                 alpha=w1_alpha[i],
             )
-            up_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+            up_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                 inp,
                 w3_weight[i],
                 bias=None,
@@ -290,7 +290,7 @@ def torch_quant_fp4_moe(
                 alpha=w3_alpha[i],
             )
             prod = F.silu(gate_out) * up_out
-            return torch.ops.auto_deploy.torch_quant_fp4_linear(
+            return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                 prod,
                 w2_weight[i],
                 bias=None,
@@ -305,8 +305,8 @@ def torch_quant_fp4_moe(
     return _template_moe(x, selected_experts, routing_weights, mlps)
 
 
-@torch_quant_fp4_moe.register_fake
-def torch_quant_fp4_moe_fake(
+@torch_quant_nvfp4_moe.register_fake
+def torch_quant_nvfp4_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
