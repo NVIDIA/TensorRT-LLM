@@ -1,5 +1,5 @@
 import copy
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -39,18 +39,44 @@ class FakeFactory(ModelFactory):
 
 
 class SequenceEmbeddingInfo(SequenceInfo):
-    hidden_size: int
-    dtype: torch.dtype
+    """A sequence info object for testing that replaces the input_ids with an embedding tensor.
 
-    def set_example_sequence(self) -> None:
-        super().set_example_sequence()
-        # set input ids to a 3D tensor (actually input embeddings)
-        self.input_ids = torch.rand(
-            *self.input_ids.shape,
+    This is useful to run tests without the tokenizer in the loop.
+    """
+
+    def _add_hidden_dim(self, input_ids: Sequence[Sequence[Any]]) -> torch.Tensor:
+        return torch.rand(
+            *input_ids.shape,
             self.hidden_size,
-            device=self.input_ids.device,
+            device=self.device,
             dtype=self.dtype,
         )
+
+    def __init__(self, *args, hidden_size: int, dtype: torch.dtype, **kwargs):
+        self._initialized = False
+        super().__init__(*args, **kwargs)
+
+        # overwrite input_ids with an embedding tensor and run reset again
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self._args_device["input_ids"] = self._add_hidden_dim(self._args_device["input_ids"])
+        self._args_host["input_ids"] = self._args_device["input_ids"].cpu()
+        self._initialized = True
+        self.reset()
+
+    def nest_sequences(self, input_ids: Sequence[Sequence[Any]], *args, **kwargs) -> None:
+        # convert input_ids to an embedding tensor if needed
+        if not (isinstance(input_ids, torch.Tensor) and input_ids.ndim == 3) and self._initialized:
+            # first convert to a list of tensors
+            input_embeds = [
+                torch.tensor(ids, device=self.device, dtype=self.dtype) for ids in input_ids
+            ]
+            # then add the hidden dimension to every tensor
+            input_embeds = [self._add_hidden_dim(ids) for ids in input_embeds]
+        else:
+            input_embeds = input_ids
+
+        super().nest_sequences(input_embeds, *args, **kwargs)
 
 
 def count_parameters(model: torch.nn.Module):
