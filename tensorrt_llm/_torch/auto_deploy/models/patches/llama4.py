@@ -1,15 +1,13 @@
+"""A patch to handle vision branch in Llama4ForConditionalGeneration."""
+
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from _model_test_utils import _hf_model_dir_or_hub_id
-from PIL import Image
-from transformers import AutoConfig, AutoProcessor, Llama4ForConditionalGeneration
-from transformers.models.llama4.modeling_llama4 import Llama4CausalLMOutputWithPast
-from utils.llm_data import llm_models_root
+from transformers import Llama4ForConditionalGeneration
+from transformers.models.llama4.modeling_llama4 import Llama4CausalLMOutputWithPast, Llama4TextMoe
 
-from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
+from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
 
 # Copy from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama4/modeling_llama4.py#L1651
@@ -76,30 +74,34 @@ def _forward_with_cond(
             vision_feature_select_strategy=vision_feature_select_strategy,
             image_sizes=None,
         )
-        original_inputs_embeds_shape = inputs_embeds.shape
 
         vision_flat = image_features.view(-1, image_features.size(-1))
-        projected_vision_flat = self.multi_modal_projector(vision_flat)
+        projected_vision_flat = self.multi_modal_projector(vision_flat).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        # NOTE: get_placeholder_mask is not supported by torch.export due to numel check ###########
+        # special_image_mask = self.get_placeholder_mask(
+        #     input_ids, inputs_embeds=inputs_embeds, image_features=projected_vision_flat
+        # )
+        if input_ids is None:
+            special_image_mask = inputs_embeds == self.get_input_embeddings()(
+                torch.tensor(
+                    self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device
+                )
+            )
+            special_image_mask = special_image_mask.all(-1)
+        else:
+            special_image_mask = input_ids == self.config.image_token_id
 
-        special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
-        final_mask = special_image_mask.to(inputs_embeds.device)
-        inputs_embeds = inputs_embeds.view(-1, inputs_embeds.size(-1))
+        # n_image_tokens = special_image_mask.sum()
+        special_image_mask = (
+            special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        )
+        ### END OF get_placeholder_mask ############################################################
 
-        final_mask_1d = final_mask[..., 0].reshape(-1)
-        # num_tokens_to_fill = final_mask_1d.sum()
+        inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, projected_vision_flat)
 
-        # This condition statement breaks torch.export:
-        # TODO: sanity check on the inputs for this
-        # if num_tokens_to_fill != projected_vision_flat.size(0):
-        #     raise ValueError(
-        #         f"Mismatch: final_mask wants {num_tokens_to_fill} embeddings, "
-        #         f"but multi_modal_projector returned {projected_vision_flat.size(0)}"
-        #     )
-
-        expanded_mask = final_mask_1d.unsqueeze(-1).expand(-1, inputs_embeds.size(-1))
-        inputs_embeds.masked_scatter_(expanded_mask, projected_vision_flat)
-
-        return inputs_embeds.view(original_inputs_embeds_shape)
+        return inputs_embeds
 
     def _no_vision_branch(inputs_embeds, pixel_values, input_ids):
         return inputs_embeds
@@ -132,7 +134,10 @@ def _forward_with_cond(
 
     loss = None
     if labels is not None:
+        # Shift so that tokens < n predict n
         if attention_mask is not None:
+            # we use the input attention mask to shift the logits and labels, because it is 2D.
+            # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft
             shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)
             shift_logits = logits[..., :-1, :][
                 shift_attention_mask.to(logits.device) != 0
@@ -141,6 +146,7 @@ def _forward_with_cond(
         else:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),
@@ -161,81 +167,65 @@ def _forward_with_cond(
     )
 
 
-def test_build_run_llama4_vlm():
-    atol = 1e-3
-    rtol = 1e-3
+@ExportPatchRegistry.register("hf_llama4_vision")
+class Llama4VisionPatch(BaseExportPatch):
+    """Patch for Llama4ForConditionalGeneration to make it compatible with torch.export.
 
-    model_id = _hf_model_dir_or_hub_id(
-        f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
-        "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-    )
-    processor = AutoProcessor.from_pretrained(model_id)
+    This patch replaces the forward method of Llama4ForConditionalGeneration with
+    a version that uses the torch.cond to handle the optional vision branch.
+    """
 
-    config = AutoConfig.from_pretrained(model_id)
-    config.text_config.num_hidden_layers = 2
-    config.text_config.intermediate_size = 64
-    config.text_config.intermediate_size_mlp = 128
-    config.vision_config.num_hidden_layers = 2
-
-    # The returned cache <class 'transformers.cache_utils.HybridChunkedCache'> breaks torch.export
-    config.text_config.use_cache = False
-
-    model = Llama4ForConditionalGeneration(config).eval().to("cuda").bfloat16()
-
-    img1 = Image.new("RGB", (16, 16), color=(128, 128, 128))
-    img2 = Image.new("RGB", (16, 16), color=(64, 64, 64))
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img1},
-                {"type": "image", "image": img2},
-                {"type": "text", "text": "What's the difference?"},
-            ],
-        },
-    ]
-
-    inputs = (
-        processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
+    def _apply_patch(self):
+        """Apply the Llama4 vision patch."""
+        # Store original forward method
+        self.original_values["Llama4ForConditionalGeneration.forward"] = (
+            Llama4ForConditionalGeneration.forward
         )
-        .to(model.device)
-        .to(torch.bfloat16)
-    )
 
-    with torch.inference_mode():
-        # the original model queried with text-only
-        out_text_only = model(inputs["input_ids"], None, inputs["attention_mask"])
+        # Apply patch by replacing the forward method
+        Llama4ForConditionalGeneration.forward = _forward_with_cond
 
-    Llama4ForConditionalGeneration.forward = _forward_with_cond
+    def _revert_patch(self):
+        """Revert the Llama4 vision patch."""
+        # Restore original forward method
+        Llama4ForConditionalGeneration.forward = self.original_values[
+            "Llama4ForConditionalGeneration.forward"
+        ]
 
-    with torch.inference_mode():
-        out_real = model(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
-        out_dummy = model(
-            inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
-        )
-        torch.testing.assert_close(out_dummy.logits, out_text_only.logits, rtol=rtol, atol=atol)
 
-    gm = torch_export_to_gm(
-        model,
-        (inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"]),
-        kwargs={},
-    )
-    move_to_device(gm, model.device)
+def _moe_forward_with_transpose(self, hidden_states):
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    router_scores, router_logits = self.router(hidden_states)
+    routed_in = hidden_states.repeat(router_scores.shape[1], 1)
 
-    with torch.inference_mode():
-        out_real_gm = gm(inputs["input_ids"], inputs["pixel_values"], inputs["attention_mask"])
-        torch.testing.assert_close(out_real.logits, out_real_gm.logits, rtol=rtol, atol=atol)
-        out_dummy_gm = gm(
-            inputs["input_ids"], torch.zeros_like(inputs["pixel_values"]), inputs["attention_mask"]
-        )
-        torch.testing.assert_close(out_dummy.logits, out_dummy_gm.logits, rtol=rtol, atol=atol)
-        torch.testing.assert_close(out_dummy_gm.logits, out_text_only.logits, rtol=rtol, atol=atol)
+    # BUG IN ORIGINAL CODE
+    # routed_in = routed_in * router_scores.reshape(-1, 1)
+    # END OF BUG IN ORIGINAL CODE
 
-        assert not torch.allclose(out_real.logits, out_dummy.logits, rtol=rtol, atol=atol), (
-            "Expected outputs to differ between text only input and text+image input"
-        )
+    # PATCH STARTED
+    routed_in = routed_in * router_scores.transpose(0, 1).reshape(-1, 1)
+    # PATCH ENDED
+
+    routed_out = self.experts(routed_in)
+    out = self.shared_expert(hidden_states)
+    out.add_(routed_out.reshape(router_scores.shape[1], -1, routed_out.shape[-1]).sum(dim=0))
+    return out, router_logits
+
+
+# TODO: remove this patch once https://github.com/huggingface/transformers/pull/40609 is merged,
+# gets released, and TRT-LLM updates to the relevant transformers version
+@ExportPatchRegistry.register("hf_llama4_moe")
+class Llama4MoEPatch(BaseExportPatch):
+    """Patch for Llama4 MoE routing to fix its current accuracy issue."""
+
+    def _apply_patch(self):
+        """Apply the Llama4 MoE routing patch."""
+        # Store original forward method
+        self.original_values["Llama4TextMoe.forward"] = Llama4TextMoe.forward
+
+        # Apply patch by replacing the forward method
+        Llama4TextMoe.forward = _moe_forward_with_transpose
+
+    def _revert_patch(self):
+        """Revert the Llama4 MoE routing patch."""
+        Llama4TextMoe.forward = self.original_values["Llama4TextMoe.forward"]
