@@ -8,6 +8,7 @@ from functools import lru_cache
 from typing import Any, Callable, Dict, List, Set, Tuple, Union
 
 import torch
+from cuda.bindings import driver
 
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
@@ -526,13 +527,26 @@ class AutoTuner:
             are used to ensure accurate timing.
         """
 
-        tensor_lists = self._prepare_input_tensors_with_batches(inputs)
+        use_cold_l2 = True
+
+        if use_cold_l2:
+            tensor_lists, num_buffers = self._prepare_input_tensors_with_batches(
+                inputs)
+            buffer_idx = 0
+        else:
+            tensor_lists = [inputs]
+            num_buffers = 1
+            buffer_idx = 0
 
         stream = torch.cuda.current_stream()
         # warm up, no timing
         # always use the last batch for warmup
         for _ in range(self.warmup):
-            runner(tensor_lists[-1], tactic=tactic, **kwargs)
+            # runner(tensor_lists[-1], tactic=tactic, **kwargs)
+            runner(tensor_lists[buffer_idx % num_buffers],
+                   tactic=tactic,
+                   **kwargs)
+            buffer_idx += 1
         stream.synchronize()
 
         # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
@@ -543,8 +557,11 @@ class AutoTuner:
         end = torch.cuda.Event(enable_timing=True)
 
         start.record(stream=stream)
-        for r in range(self.repeat):
-            runner(tensor_lists[r], tactic=tactic, **kwargs)
+        for _ in range(self.repeat):
+            runner(tensor_lists[buffer_idx % num_buffers],
+                   tactic=tactic,
+                   **kwargs)
+            buffer_idx += 1
         end.record(stream=stream)
         stream.synchronize()
 
@@ -738,21 +755,29 @@ class AutoTuner:
         return tensors
 
     def _prepare_input_tensors_with_batches(
-            self,
-            inputs: List[torch.Tensor],
-        ) -> List[List[torch.Tensor]]:
-        if not self._all_tensors_smaller_than_l2_cache(inputs):
-            print(f"[Autotuner] All tensors are larger than L2 cache, use the same tensor for profiling")
-            return [inputs] * (self.repeat + 1)
+        self,
+        inputs: List[torch.Tensor],
+    ) -> Tuple[List[List[torch.Tensor]], int]:
+        # TODO: only consider tensor parameter?
+        one_buffer_bytes = sum(
+            input.numel() *
+            input.element_size() if isinstance(input, torch.Tensor) else 0
+            for input in inputs)
+        num_buffers = ceil(self._get_l2_cache_size_in_bytes() /
+                           one_buffer_bytes)
+        num_buffers = min(num_buffers, self.repeat)
 
         inputs_list = [inputs]
         # The last batch is for warmup
-        for _ in range(self.repeat):
-            inputs_list.append(list(t.clone() for t in inputs))
+        for _ in range(num_buffers - 1):
+            inputs_list.append(
+                list(t.clone() if isinstance(t, torch.Tensor) else t
+                     for t in inputs))
 
-        print(f"[Autotuner] All tensors are smaller than L2 cache, use {len(inputs_list)} different tensors for profiling")
-        return inputs_list
-
+        logger.debug(
+            f"[Autotuner] To cold L2 cache, use {num_buffers} different tensors for profiling"
+        )
+        return inputs_list, num_buffers
 
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
@@ -772,9 +797,31 @@ class AutoTuner:
             logger.debug(
                 f"[Autotuner] {key}: (runner_id={runner_id}, tactic={tactic})")
 
-    def _all_tensors_smaller_than_l2_cache(self, inputs: List[torch.Tensor]) -> bool:
-        return all(input.numel() * input.element_size() <= self._get_l2_cache_size_in_bytes() for input in inputs)
+    def _get_l2_cache_size_in_bytes(self, device_id: int = 0) -> int:
+        device = self._checkCudaErrors(driver.cuDeviceGet(device_id))
+        return self._checkCudaErrors(
+            driver.cuDeviceGetAttribute(
+                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
+                device,
+            ))
 
-    def _get_l2_cache_size_in_bytes(self) -> int:
-        # TODO: Only consider Blackwell L2 cache
-        return 96 * 1024 * 1024
+    def _checkCudaErrors(self, result) -> None:
+        if result[0].value:
+            raise RuntimeError("CUDA error code={}({})".format(
+                result[0].value, self._cudaGetErrorEnum(result[0])))
+        # CUDA APIs always return the status as the first element of the result tuple
+        if len(result) == 1:
+            return None
+        elif len(result) == 2:
+            return result[1]
+        else:
+            return result[1:]
+
+    def _cudaGetErrorEnum(error) -> str:
+        if isinstance(error, driver.CUresult):
+            err, name = driver.cuGetErrorName(error)
+            return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
+        elif isinstance(error, nvrtc.nvrtcResult):
+            return nvrtc.nvrtcGetErrorString(error)[1]
+        else:
+            raise RuntimeError("Unknown error type: {}".format(error))
