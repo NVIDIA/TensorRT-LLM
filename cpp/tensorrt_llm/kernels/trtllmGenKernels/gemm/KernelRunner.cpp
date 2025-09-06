@@ -18,6 +18,7 @@
 
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "trtllmGen_gemm_export/GemmInterface.h"
 #include "trtllmGen_gemm_export/GemmOptions.h"
@@ -33,6 +34,23 @@ using namespace gemm::gemm;
 
 static GemmInterface::ModuleCache globalTrtllmGenGemmModuleCache;
 
+constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
+{
+    if (gpuSM == 103)
+    {
+        return kernelSM == SmVersion::Sm103a || kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 100)
+    {
+        return kernelSM == SmVersion::Sm100a || kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 90)
+    {
+        return kernelSM == SmVersion::Sm90a;
+    }
+    return true;
+}
+
 TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& options_)
     : mOptions(options_)
 {
@@ -41,7 +59,7 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
     auto const configs = gemm.getGemmConfigs();
 
     mPassingConfigIndices.clear();
-
+    int gpuNativeSmVersion = tensorrt_llm::common::getSMVersion();
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i)
     {
         auto const options = configs[i].mOptions;
@@ -50,7 +68,8 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
         if (options.mDtypeA == mOptions.eltTypeA && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
-            && (mOptions.eltTypeB == gemm::trtllm::gen::Dtype::Void || options.mDtypeB == mOptions.eltTypeB))
+            && (mOptions.eltTypeB == gemm::trtllm::gen::Dtype::Void || options.mDtypeB == mOptions.eltTypeB)
+            && isSMCompatible(gpuNativeSmVersion, configs[i].mSm))
         {
             mPassingConfigIndices.push_back(i);
         }

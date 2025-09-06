@@ -213,7 +213,7 @@
             "useCudaGraph": true,
             "biasType": "m",
             "act": "swiglu",
-            "patchF2fp": true,
+            "patchF2fp": false,
             "clampLimit": 2
         }
     },

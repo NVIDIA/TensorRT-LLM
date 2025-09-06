@@ -218,8 +218,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     gemmData.mInputBuffers.mPtrPerTokenSfA = mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
     gemmData.mInputBuffers.mPtrPerTokenSfB = mOptions.transposeMmaOutput ? perTokensSfA : perTokensSfB;
     gemmData.mInputBuffers.mPtrBias = ptrBias;
-    gemmData.mInputBuffers.mPtrSwiGluAlpha = ptrAlpha;
-    gemmData.mInputBuffers.mPtrSwiGluBeta = ptrBeta;
+    gemmData.mInputBuffers.mPtrGatedActAlpha = ptrAlpha;
+    gemmData.mInputBuffers.mPtrGatedActBeta = ptrBeta;
     gemmData.mInputBuffers.mPtrClampLimit = ptrClampLimit;
 
     gemmData.mInputBuffers.mPtrRouteMap = routeMap;
