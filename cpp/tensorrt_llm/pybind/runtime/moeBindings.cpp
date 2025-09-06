@@ -85,32 +85,41 @@ void initMoeBindings(pybind11::module_& m)
     py::class_<tr::SingleLayerMoeLoadBalancer, std::shared_ptr<tr::SingleLayerMoeLoadBalancer>>(
         m, "SingleLayerMoeLoadBalancer")
         .def("add_single_weight_slot", &tr::SingleLayerMoeLoadBalancer::addSingleWeightSlot, py::arg("slot_id"),
-            py::arg("name"), py::arg("weight_slot"), "Add a single weight slot for a specific slot ID")
+            py::arg("name"), py::arg("weight_slot"), "Add a single weight slot for a specific slot ID",
+            py::call_guard<py::gil_scoped_release>())
         .def("add_single_host_weight", &tr::SingleLayerMoeLoadBalancer::addSingleHostWeight, py::arg("expert_id"),
-            py::arg("name"), py::arg("host_weight"), "Add a single host weight for a specific expert ID")
+            py::arg("name"), py::arg("host_weight"), "Add a single host weight for a specific expert ID",
+            py::call_guard<py::gil_scoped_release>())
         .def("set_initial_weight_assignments", &tr::SingleLayerMoeLoadBalancer::setInitialWeightAssignments,
-            py::arg("initial_weight_assignments"), "Set initial weight assignments for each slot")
+            py::arg("initial_weight_assignments"), "Set initial weight assignments for each slot",
+            py::call_guard<py::gil_scoped_release>())
         .def("get_pointer", &tr::SingleLayerMoeLoadBalancer::getSelfPtr,
-            "Get the pointer of the SingleLayerMoeLoadBalancer")
+            "Get the pointer of the SingleLayerMoeLoadBalancer", py::call_guard<py::gil_scoped_release>())
         .def("get_layer_id", &tr::SingleLayerMoeLoadBalancer::getLayerId,
-            "Get the layer id of the SingleLayerMoeLoadBalancer");
+            "Get the layer id of the SingleLayerMoeLoadBalancer", py::call_guard<py::gil_scoped_release>());
 
     // Bind MoeLoadBalancer class
     py::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
         .def(py::init<int, int, int>(), py::arg("ep_rank"), py::arg("ep_size"), py::arg("layer_updates_per_iter"),
-            "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency")
+            "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency",
+            py::call_guard<py::gil_scoped_release>())
         .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, py::arg("use_gpu_memcpy"),
-            "Set whether to use GPU memcpy for weight updates")
+            "Set whether to use GPU memcpy for weight updates", py::call_guard<py::gil_scoped_release>())
         .def("add_layer", &tr::MoeLoadBalancer::AddLayer, py::arg("expert_count"), py::arg("top_k"),
-            py::arg("slot_count_per_rank"), "Add a new MOE layer to the load balancer")
+            py::arg("slot_count_per_rank"), "Add a new MOE layer to the load balancer",
+            py::call_guard<py::gil_scoped_release>())
         .def("finalize_model", &tr::MoeLoadBalancer::finalizeModel,
-            "Finalize the model structure, must be called after all layers are added")
+            "Finalize the model structure, must be called after all layers are added",
+            py::call_guard<py::gil_scoped_release>())
         .def("set_warm_up_iter_count", &tr::MoeLoadBalancer::setWarmUpIterCount, py::arg("iter_count"),
-            "Set the number of warm-up iterations")
+            "Set the number of warm-up iterations", py::call_guard<py::gil_scoped_release>())
         .def("start_iter", &tr::MoeLoadBalancer::startIter, py::arg("iter_id"), py::arg("enable_statistic"),
-            py::arg("enable_update_weights"), "Start a new iteration with the given ID and settings")
-        .def("end_iter", &tr::MoeLoadBalancer::endIter, py::arg("iter_id"), "End the iteration with the given ID")
-        .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources");
+            py::arg("enable_update_weights"), "Start a new iteration with the given ID and settings",
+            py::call_guard<py::gil_scoped_release>())
+        .def("end_iter", &tr::MoeLoadBalancer::endIter, py::arg("iter_id"), "End the iteration with the given ID",
+            py::call_guard<py::gil_scoped_release>())
+        .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
+            py::call_guard<py::gil_scoped_release>());
 
     m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
         "If current system support host accessible device memory");
