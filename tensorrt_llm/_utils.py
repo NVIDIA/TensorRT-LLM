@@ -866,7 +866,10 @@ def nvtx_range(msg: str,
     Returns:
         contextmanager: A context manager that marks the NVTX range.
     """
-    return nvtx.annotate(msg, color=color, domain=domain, category=category)
+    if os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+        return nvtx.annotate(msg, color=color, domain=domain, category=category)
+    else:
+        return _null_context_manager()
 
 
 def nvtx_range_debug(msg: str,
@@ -889,8 +892,7 @@ def nvtx_range_debug(msg: str,
         contextmanager: A context manager that either marks the NVTX range if enabled,
                         or a null context manager that does nothing if disabled.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
         return _null_context_manager()
@@ -912,7 +914,8 @@ def nvtx_mark(msg: str,
         domain (str, optional): The domain name for the marker. Defaults to "TensorRT-LLM".
         category (str, optional): The category for the marker. Defaults to None.
     """
-    nvtx.mark(msg, color=color, category=category, domain=domain)
+    if os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+        nvtx.mark(msg, color=color, category=category, domain=domain)
 
 
 def volume(d: Sequence[int]):
