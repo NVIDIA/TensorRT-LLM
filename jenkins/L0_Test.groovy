@@ -597,6 +597,65 @@ def trimForStageList(stageNameList)
     return trimedList
 }
 
+def preprocessTestList(String testListFile)
+{
+    def regularTests = []
+    def isolateTests = []
+
+    // Read the test list file
+    def lines = readFile(file: testListFile).readLines()
+
+    lines.each { line ->
+        def trimmedLine = line.trim()
+        if (trimmedLine && !trimmedLine.startsWith('#')) {
+            if (trimmedLine.contains(' ISOLATE')) {
+                // Remove ' ISOLATE' from the line and add to isolate list
+                def cleanedLine = trimmedLine.replaceAll(' ISOLATE', '').trim()
+                if (cleanedLine) {
+                    isolateTests.add(cleanedLine)
+                }
+            } else {
+                // Add to regular test list
+                regularTests.add(trimmedLine)
+            }
+        }
+    }
+
+    // Write the regular tests back to the original file
+    def regularTestContent = regularTests.join('\n') + (regularTests.size() > 0 ? '\n' : '')
+    if (regularTests.size() > 0) {
+        echo "Writing ${regularTests.size()} regular tests to ${testListFile}"
+        sh "echo 'Writing to file: ${testListFile}'"
+        sh "echo '${regularTestContent.replace("'", "'\\''")}' > ${testListFile}"
+        sh "echo 'File written. Contents:' && cat ${testListFile}"
+    } else {
+        echo "No regular tests found, creating empty file: ${testListFile}"
+        sh "touch ${testListFile}"
+        sh "echo 'Empty file created. File exists:' && ls -la ${testListFile}"
+    }
+
+    // Create a separate file for isolate tests
+    def isolateTestFile = testListFile.replaceAll('\\.txt$', '_isolate.txt')
+    def isolateTestContent = isolateTests.join('\n') + (isolateTests.size() > 0 ? '\n' : '')
+    if (isolateTests.size() > 0) {
+        echo "Writing ${isolateTests.size()} isolate tests to ${isolateTestFile}"
+        sh "echo 'Writing to isolate file: ${isolateTestFile}'"
+        sh "echo '${isolateTestContent.replace("'", "'\\''")}' > ${isolateTestFile}"
+        sh "echo 'Isolate file written. Contents:' && cat ${isolateTestFile}"
+    } else {
+        echo "No isolate tests found, creating empty file: ${isolateTestFile}"
+        sh "touch ${isolateTestFile}"
+        sh "echo 'Empty isolate file created. File exists:' && ls -la ${isolateTestFile}"
+    }
+
+    return [
+        regular: testListFile,
+        isolate: isolateTestFile,
+        regularCount: regularTests.size(),
+        isolateCount: isolateTests.size()
+    ]
+}
+
 // Test filter flags
 @Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
@@ -1607,6 +1666,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
+
+        // Preprocess the testDBList to separate ISOLATE tests
+        def preprocessedLists = preprocessTestList(testDBList)
+        def regularTestList = preprocessedLists.regular
+        def isolateTestList = preprocessedLists.isolate
+
         testList = "${testList}_${splitId}"
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
@@ -1626,12 +1691,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "--splits ${splits}",
             "--group ${splitId}",
             "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
-            "--test-list=${testDBList}",
             "--output-dir=${WORKSPACE}/${stageName}/",
             "--csv=${WORKSPACE}/${stageName}/report.csv",
             "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
             "-o junit_logging=out-err"
         ]
+
+        // Only add --test-list if there are regular tests to run
+        if (preprocessedLists.regularCount > 0) {
+            testCmdLine.add(testCmdLine.size() - 4, "--test-list=${regularTestList}")
+        }
         if (perfMode) {
             testCmdLine += [
                 "--perf",
@@ -1678,11 +1747,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             ]) {
                 sh "env | sort"
                 try {
-                    sh """
-                        rm -rf ${stageName}/ && \
-                        cd ${llmSrc}/tests/integration/defs && \
-                        ${testCmdLine.join(" ")}
-                    """
+                    if (preprocessedLists.regularCount > 0) {
+                        sh """
+                            rm -rf ${stageName}/ && \
+                            cd ${llmSrc}/tests/integration/defs && \
+                            ${testCmdLine.join(" ")}
+                        """
+                    } else {
+                        echo "No regular tests to run for stage ${stageName}"
+                        sh "mkdir -p ${stageName}"
+                        // Create an empty results.xml file for consistency
+                        sh """
+                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
+                            echo '<testsuites>' >> ${stageName}/results.xml
+                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
+                            echo '</testsuite>' >> ${stageName}/results.xml
+                            echo '</testsuites>' >> ${stageName}/results.xml
+                        """
+                    }
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
@@ -1692,6 +1774,48 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     }
                 }
             }
+        }
+
+        // Run the isolated tests one by one to avoid any potential conflicts
+        if (preprocessedLists.isolateCount > 0) {
+            echo "Found ${preprocessedLists.isolateCount} isolated tests to run"
+            def isolateTestLines = readFile(file: isolateTestList).readLines()
+
+            for (int i = 0; i < isolateTestLines.size(); i++) {
+                def isolateTestName = isolateTestLines[i].trim()
+                echo "Running isolated test ${i+1}/${isolateTestLines.size()}: ${isolateTestName}"
+
+                // Create a temporary file for this single isolated test
+                def singleTestFile = "${isolateTestList}_isolated_${i}.txt"
+                sh "echo '${isolateTestName}' > ${singleTestFile}"
+
+                def isolateTestCmdLine = testCmdLine.findAll { cmd ->
+                    !cmd.contains("--test-list=") &&
+                    !cmd.contains("--test-prefix=") &&
+                    !cmd.contains("--csv=") &&
+                    !cmd.contains("--junit-xml")
+                }
+                isolateTestCmdLine += ["--test-list=${singleTestFile}"]
+                isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
+                isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
+                isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+
+                try {
+                    sh """
+                        cd ${llmSrc}/tests/integration/defs && \
+                        ${isolateTestCmdLine.join(" ")}
+                    """
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    error "The isolated test ${isolateTestName} failed."
+                } finally {
+                    // Clean up the temporary test file
+                    sh "rm -f ${singleTestFile}"
+                }
+            }
+        } else {
+            echo "No isolated tests to run"
         }
 
         if (perfMode) {
