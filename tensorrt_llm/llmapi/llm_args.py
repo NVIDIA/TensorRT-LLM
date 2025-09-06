@@ -2666,6 +2666,22 @@ def update_llm_args_with_extra_dict(
             logger.warning(f"Overriding {field_name} {extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
+
+    # For trtllm-bench or trtllm-serve, build_config may be passed for the PyTorch
+    # backend, overwriting the knobs there since build_config always has the highest priority
+    if "build_config" in llm_args:
+        for key in [
+                "max_batch_size",
+                "max_num_tokens",
+                "max_beam_width",
+                "max_seq_len",
+        ]:
+            if key in llm_args_dict:
+                logger.info(
+                    f"Overriding {key} from build_config to {llm_args_dict[key]}"
+                )
+                setattr(llm_args["build_config"], key, llm_args_dict[key])
+
     return llm_args
 
 
