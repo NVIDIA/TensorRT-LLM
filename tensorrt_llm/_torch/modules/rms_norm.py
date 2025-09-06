@@ -14,7 +14,8 @@
 # limitations under the License.
 
 import enum
-from typing import Optional, Tuple, Union
+from types import EllipsisType  # https://stackoverflow.com/a/66636313
+from typing import Optional, Tuple, TypeAlias, Union, cast
 
 import torch
 from torch import nn
@@ -23,6 +24,9 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 
 class RMSNorm(nn.Module):
+
+    _ARGUMENT_NOT_SPECIFIED_SENTINEL = ...
+    _ArgumentNotSpecifiedSentinelType: TypeAlias = EllipsisType
 
     def __init__(
         self,
@@ -48,12 +52,19 @@ class RMSNorm(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = ...,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        residual: Union[
+            Optional[torch.Tensor],
+            _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        return_residual = True
+        if residual is self._ARGUMENT_NOT_SPECIFIED_SENTINEL:
+            return_residual = False
+            residual = None
+
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_rmsnorm)
-            if isinstance(residual, torch.Tensor):
+            if residual is not None:
                 flashinfer_fused_add_rmsnorm(hidden_states, residual,
                                              self.weight, self.variance_epsilon)
             else:
@@ -62,7 +73,7 @@ class RMSNorm(nn.Module):
         else:
             input_dtype = hidden_states.dtype
             hidden_states = hidden_states.to(torch.float32)
-            if isinstance(residual, torch.Tensor):
+            if residual is not None:
                 hidden_states = hidden_states + residual.to(torch.float32)
                 residual = hidden_states.to(input_dtype)
 
@@ -71,20 +82,22 @@ class RMSNorm(nn.Module):
                                                         self.variance_epsilon)
             hidden_states = self.weight * hidden_states.to(input_dtype)
 
-        if residual is ...:
-            return hidden_states
+        if return_residual:
+            return hidden_states, cast(Optional[torch.Tensor], residual)
         else:
-            return hidden_states, residual
+            return hidden_states
 
     def skip_forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = ...,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if residual is ...:
+        residual: Union[
+            Optional[torch.Tensor],
+            _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        if residual is self._ARGUMENT_NOT_SPECIFIED_SENTINEL:
             return hidden_states
         else:
-            return hidden_states, residual
+            return hidden_states, cast(Optional[torch.Tensor], residual)
 
 
 class GroupRMSNormKernelSelection(enum.Enum):
