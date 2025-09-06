@@ -1,18 +1,31 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 import os
 
 import torch
 from transformers import AutoTokenizer
 
-from tensorrt_llm.llmapi.llm import LLM
-from tensorrt_llm.sampling_params import SamplingParams
-from tensorrt_llm.scaffolding import GenerationTask, TaskStatus, Worker
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm import sampling_params, scaffolding
+from tensorrt_llm._torch.pyexecutor import config
+from tensorrt_llm.llmapi import llm
 
 logger = logging.getLogger(__name__)
 
 
-class PytorchWorker(Worker):
+class PytorchWorker(scaffolding.Worker):
     """
     A worker implementation for CPU inference using PyTorch backend.
 
@@ -52,7 +65,6 @@ class PytorchWorker(Worker):
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_path,
-                legacy=False,
                 trust_remote_code=trust_remote_code,
                 use_fast=True,
             )
@@ -62,7 +74,7 @@ class PytorchWorker(Worker):
             raise
 
         # Configure PyTorch backend for CPU inference
-        pytorch_config = PyTorchConfig(
+        pytorch_config = config.PyTorchConfig(
             use_cuda_graph=False,  # Disable CUDA graphs for CPU
             attn_backend='torch',  # Use torch attention backend for CPU
             torch_compile_enabled=False,  # Disable torch compile for CPU
@@ -71,7 +83,7 @@ class PytorchWorker(Worker):
         )
 
         try:
-            self.llm = LLM(
+            self.llm = llm.LLM(
                 model=model_path,
                 tokenizer=self.tokenizer,
                 backend='pytorch',
@@ -85,70 +97,79 @@ class PytorchWorker(Worker):
             logger.error(f"Failed to initialize LLM: {e}")
             raise
 
-    def convert_task_params(self, task: GenerationTask) -> SamplingParams:
+    def convert_task_params(
+            self,
+            task: scaffolding.GenerationTask) -> sampling_params.SamplingParams:
         """
         Convert a GenerationTask to SamplingParams for the LLM.
 
         Args:
-            task: The generation task containing sampling parameters
+            task: The generation task containing sampling parameters.
 
         Returns:
-            SamplingParams object configured for the task
+            SamplingParams object configured for the task.
         """
         try:
-            sampling_params = SamplingParams(
-                max_tokens=task.max_tokens or 512,  # Default max tokens
-                temperature=task.temperature or 1.0,
-                top_p=task.top_p or 1.0,
-                top_k=task.top_k or -1,
-                return_context_logits=task.return_context_logits or False,
-                frequency_penalty=task.frequency_penalty or 0.0,
-                presence_penalty=task.presence_penalty or 0.0,
-                stop=task.stop or [],
+            task_sampling_params = sampling_params.SamplingParams(
+                max_tokens=task.max_tokens
+                if task.max_tokens is not None else 512,
+                temperature=task.temperature
+                if task.temperature is not None else 1.0,
+                top_p=task.top_p if task.top_p is not None else 1.0,
+                top_k=task.top_k if task.top_k is not None else -1,
+                return_context_logits=(task.return_context_logits
+                                       if task.return_context_logits is not None
+                                       else False),
+                frequency_penalty=(task.frequency_penalty if
+                                   task.frequency_penalty is not None else 0.0),
+                presence_penalty=(task.presence_penalty if task.presence_penalty
+                                  is not None else 0.0),
+                stop=task.stop if task.stop is not None else [],
             )
-            return sampling_params
+            return task_sampling_params
         except Exception as e:
             logger.error(f"Failed to convert task parameters: {e}")
             # Return default sampling params as fallback
-            return SamplingParams(max_tokens=512, temperature=1.0)
+            return sampling_params.SamplingParams(max_tokens=512,
+                                                  temperature=1.0)
 
-    async def generation_handler(self, task: GenerationTask) -> TaskStatus:
+    async def generation_handler(
+            self, task: scaffolding.GenerationTask) -> scaffolding.TaskStatus:
         """
         Handle generation requests for the given task.
 
         Args:
-            task: The generation task to process
+            task: The generation task to process.
 
         Returns:
-            TaskStatus indicating success or failure
+            TaskStatus indicating success or failure.
         """
         try:
             # Convert task parameters to SamplingParams
-            sampling_params = self.convert_task_params(task)
+            task_sampling_params = self.convert_task_params(task)
 
             # Generate response using the LLM
             result = await self.llm.generate_async(
-                task.input_str,
-                sampling_params=sampling_params
-            )
+                task.input_str, sampling_params=task_sampling_params)
 
             # Extract results and populate task
             if result.outputs and len(result.outputs) > 0:
                 output = result.outputs[0]
-                task.output_tokens = output.token_ids
-                task.cumulative_logprob = output.cumulative_logprob
-                task.logprobs = output.logprobs
-                task.output_str = output.text
+                task.output_tokens = getattr(output, 'token_ids', None)
+                task.cumulative_logprob = getattr(output, 'cumulative_logprob',
+                                                  None)
+                task.logprobs = getattr(output, 'logprobs', None)
+                task.output_str = getattr(output, 'text', None)
                 task.context_logits = getattr(result, 'context_logits', None)
 
-                return TaskStatus.SUCCESS
+                return scaffolding.TaskStatus.SUCCESS
             else:
                 logger.error("No outputs generated from LLM")
-                return TaskStatus.WORKER_EXECEPTION
+                return scaffolding.TaskStatus.WORKER_EXCEPTION
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
-            return TaskStatus.WORKER_EXECEPTION
+            return scaffolding.TaskStatus.WORKER_EXCEPTION
 
     def shutdown(self):
         """
@@ -160,4 +181,4 @@ class PytorchWorker(Worker):
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
 
-    task_handlers = {GenerationTask: generation_handler}
+    task_handlers = {scaffolding.GenerationTask: generation_handler}
