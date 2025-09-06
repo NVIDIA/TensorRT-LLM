@@ -40,11 +40,13 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 # import CUstream type from the cuda driver bindings
-from cuda.bindings.driver import CUstream
+# from cuda.bindings.driver import CUstream
+from cuda import cuda
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
+
 # import the current_stream function from torch
-from torch.cuda import current_stream
+# from torch.cuda import current_stream
 
 
 def supports_pdl():
@@ -236,20 +238,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
-        print(f"Kernel configured with:")
-        print(
-            f"  - Store method: {'TMA (shared memory + TMA)' if self.use_tma_store else 'STG (direct global memory)'}"
-        )
-        print(f"  - Prefetch: {'enabled' if self.use_prefetch else 'disabled'}")
-        if self.use_prefetch:
-            print(f"  - Prefetch mode: Both A and B (default)")
-        elif self.prefetch_A_only:
-            print(f"  - Prefetch mode: A only")
-        elif self.prefetch_B_only:
-            print(f"  - Prefetch mode: B only")
-        else:
-            print(f"  - Prefetch mode: Disabled")
-        print(f"  - Prefetch distance: {self.prefetch_dist}")
+        # print(f"Kernel configured with:")
+        # print(
+        #     f"  - Store method: {'TMA (shared memory + TMA)' if self.use_tma_store else 'STG (direct global memory)'}"
+        # )
+        # print(f"  - Prefetch: {'enabled' if self.use_prefetch else 'disabled'}")
+        # if self.use_prefetch:
+        #     print(f"  - Prefetch mode: Both A and B (default)")
+        # elif self.prefetch_A_only:
+        #     print(f"  - Prefetch mode: A only")
+        # elif self.prefetch_B_only:
+        #     print(f"  - Prefetch mode: B only")
+        # else:
+        #     print(f"  - Prefetch mode: Disabled")
+        # print(f"  - Prefetch distance: {self.prefetch_dist}")
 
         self.cta_group = (tcgen05.CtaGroup.TWO
                           if self.use_2cta_instrs else tcgen05.CtaGroup.ONE)
@@ -323,6 +325,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
+        # print(f"limin: mma_inst_shape_k * mma_inst_tile_k = {mma_inst_shape_k * mma_inst_tile_k}")
         self.mma_tiler = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1],
@@ -433,7 +436,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         c_tensor: cute.Tensor,
         alpha: cutlass.Float32,
         max_active_clusters: cutlass.Constexpr,
-        stream: CUstream,
+        stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         use_pdl: cutlass.Constexpr = False,
     ):
@@ -457,7 +460,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
-        :type stream: CUstream
+        :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
         :param use_pdl: Whether to enable Programmatic Dependent Launch (PDL) features
@@ -595,14 +598,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
 
         # Compute grid size
-        print(f"limin: alpha = {alpha}")
-        print(f"limin: max_active_clusters = {max_active_clusters}")
+        # print(f"limin: alpha = {alpha}")
+        # print(f"limin: max_active_clusters = {max_active_clusters}")
         self.tile_sched_params, grid = self._compute_grid(
             c_tensor,
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
             max_active_clusters,
         )
+        # print(f"limin: grid = {grid}")
 
         self.buffer_align_bytes = 1024
 
@@ -694,6 +698,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
+            min_blocks_per_mp=1,
         )
         return
 
@@ -828,7 +833,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_arrive_relaxed()
+            # limin-todo: qusta's optimization
+            # cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_arrive_relaxed(aligned=True)
 
         #
         # Setup smem tensor A/B/SFA/SFB
@@ -884,9 +891,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                    cute.slice_(self.mma_tiler, (None, 0, None)),
                                    (None, None, None))
         # (bN, bK, RestN, RestK, RestL)
-        gSFB_nkl = cute.local_tile(mSFB_nkl,
-                                   cute.slice_(self.mma_tiler, (0, None, None)),
-                                   (None, None, None))
+        # limin-todo: yuhan's opt
+        # gSFB_nkl = cute.local_tile(mSFB_nkl,
+        #                            cute.slice_(self.mma_tiler, (0, None, None)),
+        #                            (None, None, None))
+        gSFB_nkl = cute.local_tile(
+            mSFB_nkl, cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+            (None, None, None))
         # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(mC_mnl,
                                  cute.slice_(self.mma_tiler, (None, None, 0)),
@@ -1025,9 +1036,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # ((atom_v, rest_v), RestK)
                 tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None,
                                        mma_tile_coord_mnl[2])]
+                # limin-todo: yuhan's opt
+                slice_n = mma_tile_coord_mnl[1]
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    slice_n = mma_tile_coord_mnl[1] // 2
+
+                # limin-todo: yuhan's opt
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, mma_tile_coord_mnl[1], None,
+                # tBgSFB_slice = tBgSFB[(None, mma_tile_coord_mnl[1], None,
+                #                        mma_tile_coord_mnl[2])]
+                tBgSFB_slice = tBgSFB[(None, slice_n, None,
                                        mma_tile_coord_mnl[2])]
+
                 prefetch_dist = self.prefetch_dist
                 # Sending a batch of inflight Prefetches before starting TMALDG loop
                 # Prefetch logic: use_prefetch for both A&B, or explicit A-only/B-only
@@ -1306,6 +1326,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
+                # limin-todo: yuhan's opt
+                tCtSFB_mma = tCtSFB
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    # Move in increments of 64 columns of SFB
+                    offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
+                    shifted_ptr = cute.recast_ptr(
+                        acc_tmem_ptr +
+                        tcgen05.find_tmem_tensor_col_offset(tCtAcc_base) +
+                        tcgen05.find_tmem_tensor_col_offset(tCtSFA) + offset,
+                        dtype=self.sf_dtype,
+                    )
+                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+
                 #
                 # Reset the ACCUMULATE field for each tile
                 #
@@ -1362,9 +1395,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 tcgen05.Field.SFA,
                                 tCtSFA[sf_kblock_coord].iterator,
                             )
+                            # limin-todo: yuhan's opt
+                            # tiled_mma.set(
+                            #     tcgen05.Field.SFB,
+                            #     tCtSFB[sf_kblock_coord].iterator,
+                            # )
                             tiled_mma.set(
                                 tcgen05.Field.SFB,
-                                tCtSFB[sf_kblock_coord].iterator,
+                                tCtSFB_mma[sf_kblock_coord].iterator,
                             )
 
                             cute.gemm(
@@ -1946,36 +1984,36 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             c_dtype, c_smem_layout_staged_one) if use_tma_store else 0)
         c_bytes = c_bytes_per_stage * num_c_stage
 
-        # Debug print: Show all byte calculations
-        print(f"\n=== Shared Memory Allocation Debug ===")
-        print(f"Total SMEM capacity: {smem_capacity:,} bytes")
-        print(f"Occupancy: {occupancy}")
-        print(f"SMEM per CTA: {smem_capacity // occupancy:,} bytes")
-        print(f"\n--- Per-Stage Memory Requirements ---")
-        print(
-            f"A bytes per stage: {cute.size_in_bytes(a_dtype, a_smem_layout_staged_one):,} bytes"
-        )
-        print(
-            f"B bytes per stage: {cute.size_in_bytes(b_dtype, b_smem_layout_staged_one):,} bytes"
-        )
-        print(
-            f"SFA bytes per stage: {cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one):,} bytes"
-        )
-        print(
-            f"SFB bytes per stage: {cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one):,} bytes"
-        )
-        print(f"Total A/B/SFA/SFB per stage: {ab_bytes_per_stage:,} bytes")
-        print(f"C bytes per stage: {c_bytes_per_stage:,} bytes")
-        print(f"Initial C stages: {num_c_stage}")
-        print(f"Total C bytes: {c_bytes:,} bytes")
-        print(f"Barrier helpers: {mbar_helpers_bytes:,} bytes")
-        print(f"\n--- Memory Allocation Calculation ---")
-        print(
-            f"Reserved bytes (barriers + C): {mbar_helpers_bytes + c_bytes:,} bytes"
-        )
-        print(
-            f"Available for A/B/SFA/SFB: {smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes):,} bytes"
-        )
+        # # Debug print: Show all byte calculations
+        # print(f"\n=== Shared Memory Allocation Debug ===")
+        # print(f"Total SMEM capacity: {smem_capacity:,} bytes")
+        # print(f"Occupancy: {occupancy}")
+        # print(f"SMEM per CTA: {smem_capacity // occupancy:,} bytes")
+        # print(f"\n--- Per-Stage Memory Requirements ---")
+        # print(
+        #     f"A bytes per stage: {cute.size_in_bytes(a_dtype, a_smem_layout_staged_one):,} bytes"
+        # )
+        # print(
+        #     f"B bytes per stage: {cute.size_in_bytes(b_dtype, b_smem_layout_staged_one):,} bytes"
+        # )
+        # print(
+        #     f"SFA bytes per stage: {cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one):,} bytes"
+        # )
+        # print(
+        #     f"SFB bytes per stage: {cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one):,} bytes"
+        # )
+        # print(f"Total A/B/SFA/SFB per stage: {ab_bytes_per_stage:,} bytes")
+        # print(f"C bytes per stage: {c_bytes_per_stage:,} bytes")
+        # print(f"Initial C stages: {num_c_stage}")
+        # print(f"Total C bytes: {c_bytes:,} bytes")
+        # print(f"Barrier helpers: {mbar_helpers_bytes:,} bytes")
+        # print(f"\n--- Memory Allocation Calculation ---")
+        # print(
+        #     f"Reserved bytes (barriers + C): {mbar_helpers_bytes + c_bytes:,} bytes"
+        # )
+        # print(
+        #     f"Available for A/B/SFA/SFB: {smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes):,} bytes"
+        # )
 
         # Calculate A/B/SFA/SFB stages:
         # Start with total smem per CTA (capacity / occupancy)
@@ -1984,10 +2022,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         num_ab_stage = (smem_capacity // occupancy -
                         (mbar_helpers_bytes + c_bytes)) // ab_bytes_per_stage
 
-        print(f"Calculated A/B/SFA/SFB stages: {num_ab_stage}")
-        print(
-            f"Total A/B/SFA/SFB bytes: {occupancy * ab_bytes_per_stage * num_ab_stage:,} bytes"
-        )
+        # print(f"Calculated A/B/SFA/SFB stages: {num_ab_stage}")
+        # print(
+        #     f"Total A/B/SFA/SFB bytes: {occupancy * ab_bytes_per_stage * num_ab_stage:,} bytes"
+        # )
 
         # Refine epilogue stages (like reference implementation):
         # Calculate remaining smem after allocating for A/B/SFA/SFB stages and reserved bytes
@@ -2001,19 +2039,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Epilogue stages calculation removed - no shared memory needed for epilogue
         # All remaining shared memory goes to A/B/SFA/SFB stages for better performance
 
-        print(
-            f"Final C stages: {num_c_stage} (shared memory: {'allocated' if use_tma_store else 'not allocated'})"
-        )
-        print(
-            f"Total C bytes: {num_c_stage * c_bytes_per_stage:,} bytes ({'TMA store' if use_tma_store else 'STG direct'})"
-        )
-        print(
-            f"Total allocated: {occupancy * ab_bytes_per_stage * num_ab_stage + occupancy * mbar_helpers_bytes:,} bytes"
-        )
-        print(
-            f"Unused SMEM: {smem_capacity - (occupancy * ab_bytes_per_stage * num_ab_stage + occupancy * mbar_helpers_bytes):,} bytes"
-        )
-        print(f"=== End Shared Memory Debug ===\n")
+        # print(
+        #     f"Final C stages: {num_c_stage} (shared memory: {'allocated' if use_tma_store else 'not allocated'})"
+        # )
+        # print(
+        #     f"Total C bytes: {num_c_stage * c_bytes_per_stage:,} bytes ({'TMA store' if use_tma_store else 'STG direct'})"
+        # )
+        # print(
+        #     f"Total allocated: {occupancy * ab_bytes_per_stage * num_ab_stage + occupancy * mbar_helpers_bytes:,} bytes"
+        # )
+        # print(
+        #     f"Unused SMEM: {smem_capacity - (occupancy * ab_bytes_per_stage * num_ab_stage + occupancy * mbar_helpers_bytes):,} bytes"
+        # )
+        # print(f"=== End Shared Memory Debug ===\n")
 
         return num_acc_stage, num_ab_stage, num_c_stage, c_bytes_per_stage
 
@@ -2042,6 +2080,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
+        # cute.printf(f"limin: gc: {gc}")
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
@@ -2049,7 +2088,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             num_ctas_mnl, cluster_shape_mnl)
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters)
-
+        # cute.printf(f"limin: cta_tile_shape_mnk: {cta_tile_shape_mnk}")
+        # print(f"limin: cluster_shape_mn: {cluster_shape_mn}")
+        # cute.printf(f"limin: num_ctas_mnl: {num_ctas_mnl}")
+        # print(f"limin: cluster_shape_mnl: {cluster_shape_mnl}")
+        # cute.printf(f"limin: grid: {grid}")
         return tile_sched_params, grid
 
     @staticmethod
@@ -2171,7 +2214,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if not mma_tiler_mn[0] in [128, 256]:
             is_valid = False
         # TODO: Add tile_n=64(Should be higher priority for low latency cases) and tile_n=192 support # {$nv-internal-release}
-        if not mma_tiler_mn[1] in [128, 256]:
+        # if not mma_tiler_mn[1] in [128, 256]:
+        # limin-todo: yuhan's opt
+        if not mma_tiler_mn[1] in [128, 256, 64]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
@@ -2353,6 +2398,7 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
     def ceil_div(a, b):
         return (a + b - 1) // b
 
+    # fully dynamic shape
     @cute.jit
     def __call__(
         self,
@@ -2370,7 +2416,101 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
         c_ptr: cute.Pointer,
         alpha: cutlass.Float32,
         max_active_clusters: cutlass.Constexpr,
-        current_stream: CUstream,
+        current_stream: cuda.CUstream,
+        epilogue_op: cutlass.Constexpr = lambda x: x,
+        use_pdl: cutlass.Constexpr = False,
+    ):
+
+        # m, k, l
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
+        )
+        # n, k, l
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout(
+                (n, k, l),
+                order=(1, 0, 2),
+            ),
+        )
+        # m, n, l
+        c_tensor = cute.make_tensor(c_ptr,
+                                    layout=cute.make_ordered_layout(
+                                        (m, n, l),
+                                        order=(1, 0, 2),
+                                    ))
+        # (1, int(sf_m/128), int(sf_k/4), 32, 4, 4).permute(3, 4, 1, 5, 2, 0) => (32, 4, int(sf_m/128), 4, int(sf_k/4), l)
+        sfa_tensor = cute.make_tensor(a_sf_ptr,
+                                      layout=cute.make_ordered_layout(
+                                          (32, 4, sf_m, 4, sf_k, l),
+                                          order=(2, 1, 4, 0, 3, 5),
+                                      ))
+        sfb_tensor = cute.make_tensor(b_sf_ptr,
+                                      layout=cute.make_ordered_layout(
+                                          (32, 4, sf_n, 4, sf_k, l),
+                                          order=(2, 1, 4, 0, 3, 5),
+                                      ))
+
+        Sm100BlockScaledPersistentDenseGemmKernel(
+            self.sf_vec_size,
+            self.mma_tiler_mn,
+            self.cluster_shape_mn,
+            self.use_prefetch,
+            self.prefetch_A_only,
+            self.prefetch_B_only,
+            self.prefetch_dist,
+            self.use_tma_store,
+        )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha,
+          max_active_clusters, current_stream, epilogue_op, use_pdl)
+
+
+class Sm100BlockScaledPersistentDenseGemmKernelStaticWrapper:
+    compiled_gemm = {}
+
+    def __init__(
+        self,
+        sf_vec_size: int,
+        mma_tiler_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int],
+        use_prefetch: bool = True,
+        prefetch_A_only: bool = False,
+        prefetch_B_only: bool = False,
+        prefetch_dist: int = 3,
+        use_tma_store: bool = False,
+    ):
+        self.sf_vec_size = sf_vec_size
+        self.mma_tiler_mn = mma_tiler_mn
+        self.cluster_shape_mn = cluster_shape_mn
+        self.use_prefetch = use_prefetch
+        self.prefetch_A_only = prefetch_A_only
+        self.prefetch_B_only = prefetch_B_only
+        self.prefetch_dist = prefetch_dist
+        self.use_tma_store = use_tma_store
+
+    @staticmethod
+    def ceil_div(a, b):
+        return (a + b - 1) // b
+
+    # fully dynamic shape
+    @cute.jit
+    def __call__(
+        self,
+        m: cutlass.Constexpr,
+        n: cutlass.Constexpr,
+        k: cutlass.Constexpr,
+        sf_m: cutlass.Constexpr,
+        sf_n: cutlass.Constexpr,
+        sf_k: cutlass.Constexpr,
+        l: cutlass.Constexpr,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        alpha: cutlass.Float32,
+        max_active_clusters: cutlass.Constexpr,
+        current_stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         use_pdl: cutlass.Constexpr = False,
     ):
@@ -2680,17 +2820,19 @@ def run(
     max_active_clusters = hardware_info.get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1])
 
-    # Initialize stream for both paths
-    if use_graph:
-        # For CUDA graphs, use the imported current_stream function
-        stream = current_stream()
-        print("Using current stream function for graph capture")
-    else:
-        # For normal execution, use the default stream (original behavior)
-        stream = cutlass_torch.default_stream()
-        print("Using default stream for normal execution")
+    torch_stream = torch.cuda.Stream()
+    current_stream = cuda.CUstream(torch_stream.cuda_stream)
+    # # Initialize stream for both paths
+    # if use_graph:
+    #     # For CUDA graphs, use the imported current_stream function
+    #     stream = current_stream()
+    #     print("Using current stream function for graph capture")
+    # else:
+    #     # For normal execution, use the default stream (original behavior)
+    #     stream = cutlass_torch.default_stream()
+    #     print("Using default stream for normal execution")
 
-    print("stream =", stream)
+    print("stream =", current_stream)
     print(f"Kernel configuration:")
     print(
         f"  - Store method: {'TMA (shared memory + TMA)' if use_tma_store else 'STG (direct global memory)'}"
@@ -2708,8 +2850,10 @@ def run(
             sfa_tensor,
             sfb_tensor,
             c_tensor,
+            1.0,
             max_active_clusters,
-            CUstream(stream.cuda_stream),
+            # cuda.CUstream(stream.cuda_stream),
+            current_stream,
             use_pdl=use_pdl,
         )
         print("Compiled kernel for CUDA graph execution")
@@ -2722,8 +2866,10 @@ def run(
             sfa_tensor,
             sfb_tensor,
             c_tensor,
+            1.0,
             max_active_clusters,
-            stream,
+            # stream,
+            current_stream,
             use_pdl=use_pdl,
         )
         print("Compiled kernel for standard execution")
@@ -2739,12 +2885,21 @@ def run(
                 sfa_tensor,
                 sfb_tensor,
                 c_tensor,
-                CUstream(stream.cuda_stream),
+                1.0,
+                # cuda.CUstream(stream.cuda_stream),
+                current_stream,
             )
         else:
             # For normal mode, execute directly (original behavior)
-            compiled_gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor,
-                          stream)
+            compiled_gemm(
+                a_tensor,
+                b_tensor,
+                sfa_tensor,
+                sfb_tensor,
+                c_tensor,
+                1.0,
+                # stream)
+                current_stream)
 
         # Ensure reference execution completes
         torch.cuda.synchronize()
@@ -2833,7 +2988,7 @@ def run(
         _, sfb_tensor, _ = create_scale_factor_tensor(l, n, k, sf_vec_size,
                                                       sf_dtype)
         return cute.testing.JitArguments(a_tensor, b_tensor, sfa_tensor,
-                                         sfb_tensor, c_tensor, stream)
+                                         sfb_tensor, c_tensor, 1.0, stream)
 
     workspace_count = 1
     if use_cold_l2:
@@ -2857,13 +3012,13 @@ def run(
         # Capture our graph (following exact NVIDIA pattern)
         with torch.cuda.graph(g):
             # Get a FRESH stream for capture (this is the key difference)
-            graph_stream = CUstream(current_stream().cuda_stream)
+            # graph_stream = cuda.CUstream(current_stream().cuda_stream)
             # Run iterations of our compiled kernel
             iterations = 100
 
             for i in range(iterations):
                 compiled_gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor,
-                              c_tensor, graph_stream)
+                              c_tensor, 1.0, current_stream)
 
         # Replay our graph
         g.replay()
@@ -2882,7 +3037,7 @@ def run(
             compiled_gemm,
             workspace_generator=generate_tensors,
             workspace_count=workspace_count,
-            stream=stream,
+            stream=current_stream,
             warmup_iterations=warmup_iterations,
             iterations=iterations,
         )
@@ -2906,19 +3061,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mnkl",
         type=parse_comma_separated_ints,
-        default=(512, 256, 256, 1),
+        default=(128, 24576, 1536, 1),
         help="mnkl dimensions (comma-separated)",
     )
     parser.add_argument(
         "--mma_tiler_mn",
         type=parse_comma_separated_ints,
-        default=(128, 128),
+        default=(128, 256),
         help="Mma tile shape (comma-separated)",
     )
     parser.add_argument(
         "--cluster_shape_mn",
         type=parse_comma_separated_ints,
-        default=(1, 1),
+        default=(1, 4),
         help="Cluster shape (comma-separated)",
     )
     parser.add_argument("--ab_dtype",
@@ -2926,7 +3081,7 @@ if __name__ == "__main__":
                         default=cutlass.Float4E2M1FN)
     parser.add_argument("--sf_dtype",
                         type=cutlass.dtype,
-                        default=cutlass.Float8E8M0FNU)
+                        default=cutlass.Float8E4M3FN)
     parser.add_argument("--sf_vec_size", type=int, default=16)
     parser.add_argument("--c_dtype",
                         type=cutlass.dtype,
@@ -2940,12 +3095,12 @@ if __name__ == "__main__":
                         help="Tolerance for validation")
     parser.add_argument("--warmup_iterations",
                         type=int,
-                        default=0,
+                        default=5,
                         help="Warmup iterations")
     parser.add_argument(
         "--iterations",
         type=int,
-        default=1,
+        default=10,
         help="Number of iterations to run the kernel",
     )
     parser.add_argument("--skip_ref_check",
