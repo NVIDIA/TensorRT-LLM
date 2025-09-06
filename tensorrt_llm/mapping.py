@@ -225,6 +225,8 @@ class Mapping(object):
         self.auto_parallel = auto_parallel
         self.world_size = world_size
         self.enable_attention_dp = enable_attention_dp
+        if enable_lm_head_tp_in_adp:
+            assert enable_attention_dp, "enable_lm_head_tp_in_adp requires enable_attention_dp"
         self.enable_lm_head_tp_in_adp = enable_lm_head_tp_in_adp
         self.rank = rank
         self.gpus_per_node = gpus_per_node

@@ -37,8 +37,7 @@ class LMHead(Linear):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
         mapping = mapping or Mapping()
-        if (mapping.enable_attention_dp
-                and getattr(mapping, 'enable_lm_head_tp_in_adp', False)):
+        if mapping.enable_lm_head_tp_in_adp:
             mapping = create_lm_head_tp_mapping(self.mapping)
 
         tp_size = mapping.tp_size
