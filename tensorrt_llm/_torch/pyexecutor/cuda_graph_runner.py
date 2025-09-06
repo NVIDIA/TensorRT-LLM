@@ -304,6 +304,7 @@ class CUDAGraphRunner:
         self.static_inputs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self.padding_dummy_request = None
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()

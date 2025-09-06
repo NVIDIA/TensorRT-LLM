@@ -100,7 +100,7 @@ class GatedMLP(nn.Module):
 
     def _apply_activation(self, x):
         if self.activation == F.silu:
-            if self.down_proj.has_fp8_qdq:
+            if self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8:
                 return swiglu(x,
                               quant_scale=self.down_proj.input_scale,
                               quant_type=torch.float8_e4m3fn)

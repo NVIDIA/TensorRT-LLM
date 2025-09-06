@@ -226,5 +226,106 @@ def test_deepseek_eagle3():
             pass
 
 
+@pytest.mark.parametrize("use_one_model", [True, False])
+def test_multi_eagle3(use_one_model: bool):
+    use_cuda_graph = True
+    attn_backend = "TRTLLM"
+    disable_overlap_scheduler = False
+    enable_block_reuse = False
+    enable_chunked_prefill = False
+
+    # Eagle3 one model works with overlap scheduler and block reuse.
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 150:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    eagle_config = {
+        'architectures': ['LlamaForCausalLMEagle3'],
+        'attention_bias': False,
+        'attention_dropout': 0.0,
+        'bos_token_id': 128000,
+        'eos_token_id': [128001, 128008, 128009],
+        'eagle_config': {
+            'use_aux_hidden_state': False,
+            'use_input_layernorm_in_first_layer': True,
+            'use_last_layernorm': True,
+            'use_mtp_layernorm': False
+        },
+        'head_dim': 128,
+        'hidden_act': 'silu',
+        'hidden_size': 4096,
+        'initializer_range': 0.02,
+        'intermediate_size': 16384,
+        'max_position_embeddings': 131072,
+        'mlp_bias': False,
+        'model_type': 'llama',
+        'num_attention_heads': 32,
+        'num_eagle_features': 1,
+        'num_hidden_layers': 2,
+        'num_key_value_heads': 8,
+        'pretraining_tp': 1,
+        'rms_norm_eps': 1e-05,
+        'rope_scaling': {
+            'factor': 8.0,
+            'high_freq_factor': 4.0,
+            'low_freq_factor': 1.0,
+            'original_max_position_embeddings': 8192,
+            'rope_type': 'llama3'
+        },
+        'rope_theta': 500000.0,
+        'tie_word_embeddings': False,
+        'torch_dtype': 'bfloat16',
+        'transformers_version': '4.52.4',
+        'use_cache': True,
+        'vocab_size': 128256,
+        'draft_vocab_size': 128256
+    }
+    with tempfile.TemporaryDirectory() as temp_dir:
+        eagle_model_dir = Path(temp_dir)
+        config_path = eagle_model_dir / "config.json"
+        with config_path.open("w") as f:
+            json.dump(eagle_config, f, indent=2)
+        target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+        # bs > 1 gives non-deterministic when doing IFB. There are slight chances
+        # that ref and spec does not match 100%
+        max_batch_size = 16
+        max_draft_len = 3
+        kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
+                                        free_gpu_memory_fraction=0.5)
+        cuda_graph_config = CudaGraphConfig(
+            batch_sizes=[1]) if use_cuda_graph else None
+
+        llm_common_config = dict(
+            model=target_model_dir,
+            attn_backend=attn_backend,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            cuda_graph_config=cuda_graph_config,
+            max_batch_size=max_batch_size,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=enable_chunked_prefill,
+            load_format="dummy",
+        )
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model_dir=eagle_model_dir,
+            # Llama 3 does not support one model eagle.
+            eagle3_one_model=use_one_model,
+            num_eagle_layers=2,
+            load_format="dummy")
+
+        llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+
+        tok_ids = llm_spec.tokenizer.encode("The future of AI is")
+
+        sampling_params = SamplingParams(max_tokens=32, temperature=0)
+        for output in llm_spec.generate_async(tok_ids,
+                                              sampling_params,
+                                              streaming=True):
+            pass
+
+
 if __name__ == "__main__":
     unittest.main()

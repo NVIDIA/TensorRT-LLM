@@ -73,7 +73,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
     using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;
 
     if constexpr (!should_filter_tma_warp_specialized_gemm_problem_shape_v<cutlass::arch::Sm90, CTAShape, ClusterShape,
-                      ActivationType>)
+                      false, ActivationType>)
     {
         using CutlassWeightType = typename TllmToCutlassTypeAdapter<WeightType>::type;
 

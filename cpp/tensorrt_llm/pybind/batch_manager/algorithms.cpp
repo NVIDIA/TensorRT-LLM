@@ -86,9 +86,10 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
         .def("name", [](AssignReqSeqSlots const&) { return AssignReqSeqSlots::name; });
 
     py::class_<AllocateKvCache>(m, AllocateKvCache::name)
-        .def(py::init())
+        .def(py::init(), py::call_guard<py::gil_scoped_release>())
         .def("__call__", &AllocateKvCache::operator(), py::arg("kv_cache_manager"), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("model_config"), py::arg("cross_kv_cache_manager") = std::nullopt)
+            py::arg("generation_requests"), py::arg("model_config"), py::arg("cross_kv_cache_manager") = std::nullopt,
+            py::call_guard<py::gil_scoped_release>())
         .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
 
     py::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)

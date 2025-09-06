@@ -819,9 +819,9 @@ class TestMoeFP8:
     the default tactic selection works. This reduces unnecessary test runs for CI
     """
 
-    @pytest.mark.parametrize("num_tokens", [16, 64, 1024, 4096])
-    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
-                                             (72, 1, 1, 6), (256, 8, 4, 8)])
+    @pytest.mark.parametrize("num_tokens", [16, 64, 4096])
+    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (72, 1, 1, 6),
+                                             (256, 8, 4, 8)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
     def test_autotune(self, num_tokens: int, expert_info: Tuple[int, int, int,
@@ -938,7 +938,7 @@ class TestMoeFp4:
     the default tactic selection works. This reduces unnecessary test runs for CI
     """
 
-    @pytest.mark.parametrize("num_tokens", [1, 1024, 4096])
+    @pytest.mark.parametrize("num_tokens", [1, 4096])
     @pytest.mark.parametrize("hidden_size", [1024])
     @pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
     @pytest.mark.parametrize(

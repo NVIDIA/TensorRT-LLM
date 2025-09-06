@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <future>
@@ -189,6 +190,12 @@ private:
             mSender->sendSync(*resp.mRequest);
             mSender->release(id);
             resp.mPromise.set_value();
+        }
+        catch (tensorrt_llm::common::RequestSpecificException const& e)
+        {
+            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
+            auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
+            resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
         {
@@ -495,6 +502,15 @@ private:
                     TLLM_CHECK_WITH_INFO(requestAndPromise.mRequest != nullptr, "requestAndPromise.mRequest is null");
                     requestSync(*requestAndPromise.mRequest);
                     requestAndPromise.mPromise->set_value();
+                }
+                catch (tensorrt_llm::common::RequestSpecificException const& err)
+                {
+                    TLLM_LOG_ERROR("Exception in DataRequester request(): request id:%zu , request context id:%zu : %s",
+                        requestAndPromise.mRequest->mRequestId,
+                        requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
+                    auto new_exception = TLLM_REQUEST_EXCEPTION(
+                        requestAndPromise.mRequest->mRequestId, err.getErrorCode(), "%s", err.what());
+                    requestAndPromise.mPromise->set_exception(std::make_exception_ptr(new_exception));
                 }
                 catch (std::exception const& err)
                 {

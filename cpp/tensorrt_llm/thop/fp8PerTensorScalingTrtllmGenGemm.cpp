@@ -37,7 +37,7 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
     auto eltType = gemm::trtllm::gen::Dtype::E4m3;
 
     tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options
-        = {.eltType = eltType, .outputType = outDtype, .deepSeekFp8 = false, .transposeMmaOutput = lowLatencyKernel};
+        = {.eltTypeA = eltType, .outputType = outDtype, .deepSeekFp8 = false, .transposeMmaOutput = lowLatencyKernel};
 
     tensorrt_llm::kernels::TrtllmGenGemmRunner runner(options);
 
