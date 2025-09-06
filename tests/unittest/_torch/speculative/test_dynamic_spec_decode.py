@@ -51,7 +51,8 @@ def test_dynamic_spec_decode():
     )
 
     # Mock should_use_spec_decode to return True for first two calls, then False
-    def mock_should_use_spec_decode(self, requests):
+    def mock_should_use_spec_decode(self, requests, max_batch_size,
+                                    max_num_tokens, max_draft_len):
         if not hasattr(mock_should_use_spec_decode, 'call_count'):
             mock_should_use_spec_decode.call_count = 0
         mock_should_use_spec_decode.call_count += 1
@@ -84,6 +85,61 @@ def test_dynamic_spec_decode():
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
         assert text_spec == text_ref
+
+
+def test_should_use_spec_decode():
+    from tensorrt_llm._torch.speculative.drafter import Drafter
+
+    class _DummyDrafter(Drafter):
+
+        def prepare_draft_tokens(self,
+                                 scheduled_requests,
+                                 resource_manager=None) -> None:
+            return
+
+    drafter = _DummyDrafter(max_concurrency=6)
+
+    # Compare min(len(requests), max_batch_size, token_cap) with max_concurrency
+
+    # Small active_requests ON case: num_effective_requests = min(5, 8, very_large) = 5 <= 6 → True
+    active_requests = [object()] * 5
+    assert drafter.should_use_spec_decode(active_requests,
+                                          max_batch_size=8,
+                                          max_num_tokens=4096 * 8,
+                                          max_draft_len=4)
+
+    # Small batch size ON case: num_effective_requests = min(12, 5, very_large) = 5 <= 6 → True
+    active_requests = [object()] * 12
+    assert drafter.should_use_spec_decode(active_requests,
+                                          max_batch_size=5,
+                                          max_num_tokens=4096 * 8,
+                                          max_draft_len=4)
+
+    # Small token budget ON case: token_cap = 28 // (1+4) = 5 → min(8, 12, 5) = 5 <= 6 → True
+    active_requests = [object()] * 12
+    assert drafter.should_use_spec_decode(active_requests,
+                                          max_batch_size=8,
+                                          max_num_tokens=28,
+                                          max_draft_len=4)
+
+    # Generic OFF case: num_effective_requests = min(12, 8, very_large) = 8 > 6 → False
+    active_requests = [object()] * 12
+    assert not drafter.should_use_spec_decode(active_requests,
+                                              max_batch_size=8,
+                                              max_num_tokens=4096 * 8,
+                                              max_draft_len=4)
+
+    # Edge case - None active requests OFF case
+    active_requests = []
+    assert not drafter.should_use_spec_decode(active_requests,
+                                              max_batch_size=8,
+                                              max_num_tokens=4096 * 8,
+                                              max_draft_len=4)
+
+    # Edge case - Token cap equals 0 OFF case: token_cap = 4 // (1+4) = 0 → min(12, 8, 0) = 0 <= 6 → False
+    active_requests = [object()] * 12
+    assert not drafter.should_use_spec_decode(
+        active_requests, max_batch_size=8, max_num_tokens=4, max_draft_len=4)
 
 
 if __name__ == "__main__":
