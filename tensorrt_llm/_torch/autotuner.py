@@ -4,13 +4,17 @@ import inspect
 import itertools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
+from math import ceil
 from typing import Any, Callable, Dict, List, Set, Tuple, Union
 
 import torch
+from cuda.bindings import driver
 
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
+
+# from cupti import cupti
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -213,6 +217,108 @@ def autotune(tune_mode: bool = True):
         AutoTuner.get().is_tuning_mode = old_mode
         if autotune_enabled:
             logger.info("[Autotuner] Autotuning process ends")
+
+
+# https://gitlab-master.nvidia.com/dlarch-fastkernels/dynamic-kernel-generator/-/merge_requests/11520
+class CuptiProfiler:
+    """A class for managing CUPTI profiling measurements with start, stop, and duration methods.
+
+    This class provides a clean interface for measuring CUDA kernel execution times
+    using CUPTI (CUDA Profiling Tools Interface). It encapsulates the complexity
+    of buffer management, callback registration, and activity tracking.
+
+    Example usage:
+        profiler = CuptiProfiler()
+        profiler.start()
+        # ... run your CUDA kernels ...
+        profiler.stop()
+        duration = profiler.get_duration()  # Returns total duration in milliseconds
+    """
+
+    def __init__(self, buffer_size: int = 8 * 1024 * 1024):
+        """Initialize the CUPTI profiler.
+
+        Args:
+            buffer_size: Size of the CUPTI buffer in bytes (default: 8MB)
+        """
+        self.buffer_size = buffer_size
+        self.timings = []
+        self._is_active = False
+        self._buffer_requested_callback = None
+        self._buffer_completed_callback = None
+
+    def _buffer_requested(self):
+        """Internal callback for CUPTI buffer requests."""
+        max_num_records = 0
+        return self.buffer_size, max_num_records
+
+    def _buffer_completed(self, activities: list):
+        """Internal callback for processing completed CUPTI activities."""
+        for activity in activities:
+            start = activity.start if hasattr(activity, "start") else "nil"
+            end = activity.end if hasattr(activity, "end") else "nil"
+            duration = end - start if start != "nil" and end != "nil" else "nil"
+            name = activity.name[:100] if hasattr(activity,
+                                                  "name") else "unknown"
+            # Convert to milliseconds
+            if duration != "nil":
+                self.timings.append((name, duration / 1e6))
+                # print(f"Activity: {name}, Duration: {duration / 1e6} ms")
+
+    def start(self):
+        """Start CUPTI profiling.
+
+        Enables CUPTI activity tracking for concurrent kernels and registers
+        the necessary callbacks for buffer management.
+
+        Raises:
+            ValueError: If CUPTI activity cannot be enabled
+        """
+        if self._is_active:
+            raise RuntimeError("CUPTI profiler is already active")
+
+        # Clear previous timings
+        self.timings = []
+
+        try:
+            cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
+        except cupti.cuptiError as e:
+            raise ValueError(
+                f"\033[91mError while enabling Activity Kind {cupti.ActivityKind.CONCURRENT_KERNEL.name}: {e}. Please disable CUPTI if you using profilers\033[0m"
+            )
+
+        # Register callbacks
+        self._buffer_requested_callback = self._buffer_requested
+        self._buffer_completed_callback = partial(self._buffer_completed)
+
+        cupti.activity_register_callbacks(self._buffer_requested_callback,
+                                          self._buffer_completed_callback)
+
+        self._is_active = True
+
+    def stop(self):
+        """Stop CUPTI profiling.
+
+        Flushes all activities, disables CUPTI tracking, and finalizes the profiler.
+        This method should be called after the kernels you want to measure have completed.
+        """
+        if not self._is_active:
+            raise RuntimeError("CUPTI profiler is not active")
+
+        # Flush all activities and cleanup
+        cupti.activity_flush_all(0)
+        cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
+        cupti.finalize()
+
+        self._is_active = False
+
+    def get_duration(self) -> float:
+        """Get the total duration of all measured activities in milliseconds.
+
+        Returns:
+            Total duration in milliseconds. Returns 0.0 if no activities were recorded.
+        """
+        return sum(timing[1] for timing in self.timings)
 
 
 @dataclass
@@ -525,33 +631,137 @@ class AutoTuner:
             to get an average execution time. Stream synchronization and delays
             are used to ensure accurate timing.
         """
+        use_cupti = False
+        use_cold_l2 = True
+
+        if use_cold_l2:
+            tensor_lists, num_buffers = self._prepare_input_tensors_with_batches(
+                inputs)
+            buffer_idx = 0
+        else:
+            tensor_lists = [inputs]
+            num_buffers = 1
+            buffer_idx = 0
+
         stream = torch.cuda.current_stream()
         # warm up, no timing
         for _ in range(self.warmup):
-            runner(inputs, tactic=tactic, **kwargs)
+            # runner(inputs, tactic=tactic, **kwargs)
+            runner(tensor_lists[buffer_idx % num_buffers],
+                   tactic=tactic,
+                   **kwargs)
+            buffer_idx += 1
         stream.synchronize()
 
-        # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
-        # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
-        # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
-        delay_kernel(self.stream_delay_micro_secs, stream)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        if not use_cupti:
+            # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
+            # TODO: This is build time sensitive, O(tactic_num * impl_num * num_profile * tunable_ops)
+            # Consider apply a preprofiling to estimate the kernel execution time, then decide the necessity.
+            delay_kernel(self.stream_delay_micro_secs, stream)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
 
-        start.record(stream=stream)
-        for _ in range(self.repeat):
-            runner(inputs, tactic=tactic, **kwargs)
-        end.record(stream=stream)
-        stream.synchronize()
+            start.record(stream=stream)
+            # for _ in range(self.repeat):
+            #     runner(inputs, tactic=tactic, **kwargs)
+            for _ in range(self.repeat):
+                runner(tensor_lists[buffer_idx % num_buffers],
+                       tactic=tactic,
+                       **kwargs)
+                buffer_idx += 1
+            end.record(stream=stream)
+            stream.synchronize()
 
-        avg_time = start.elapsed_time(end) / self.repeat
+            avg_time = start.elapsed_time(end) / self.repeat
+        else:
+            # Use the new CuptiProfiler class
+            profiler = CuptiProfiler()
+            profiler.start()
 
-        shapes = self._get_input_sizes(inputs)
+            # _loop_and_call_kernel(iterations, workspace_index)
+            for _ in range(self.repeat):
+                runner(tensor_lists[buffer_idx % num_buffers],
+                       tactic=tactic,
+                       **kwargs)
+                buffer_idx += 1
+            # Synchronize device
+            stream.synchronize()
+
+            profiler.stop()
+            # microseconds.
+            avg_time = profiler.get_duration() / self.repeat
+
+        # shapes = self._get_input_sizes(inputs)
+        shapes = self._get_input_sizes(tensor_lists[-1])
         logger.debug(
             f"[Autotuner] Profiled runner={runner}, tactic={tactic}, shapes={shapes}: {avg_time:.6f}ms."
         )
 
         return avg_time
+
+    def _prepare_input_tensors_with_batches(
+        self,
+        inputs: List[torch.Tensor],
+    ) -> Tuple[List[List[torch.Tensor]], int]:
+        # TODO: only consider tensor parameter?
+        one_buffer_bytes = sum(
+            input.numel() *
+            input.element_size() if isinstance(input, torch.Tensor) else 0
+            for input in inputs)
+        num_buffers = ceil(self._get_l2_cache_size_in_bytes() /
+                           one_buffer_bytes)
+        num_buffers = min(num_buffers, self.repeat)
+
+        inputs_list = [inputs]
+        # The last batch is for warmup
+        for _ in range(num_buffers - 1):
+            inputs_list.append(
+                list(t.clone() if isinstance(t, torch.Tensor) else t
+                     for t in inputs))
+
+        logger.debug(
+            f"[Autotuner] To cold L2 cache, use {num_buffers} different tensors for profiling"
+        )
+        return inputs_list, num_buffers
+
+    def _get_l2_cache_size_in_bytes(self, device_id: int = 0) -> int:
+        device = self._checkCudaErrors(driver.cuDeviceGet(device_id))
+        return self._checkCudaErrors(
+            driver.cuDeviceGetAttribute(
+                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
+                device,
+            ))
+
+    def _checkCudaErrors(self, result) -> None:
+        if result[0].value:
+            raise RuntimeError("CUDA error code={}({})".format(
+                result[0].value, self._cudaGetErrorEnum(result[0])))
+        # CUDA APIs always return the status as the first element of the result tuple
+        if len(result) == 1:
+            return None
+        elif len(result) == 2:
+            return result[1]
+        else:
+            return result[1:]
+
+    def _cudaGetErrorEnum(error) -> str:
+        if isinstance(error, driver.CUresult):
+            err, name = driver.cuGetErrorName(error)
+            return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
+        elif isinstance(error, nvrtc.nvrtcResult):
+            return nvrtc.nvrtcGetErrorString(error)[1]
+        else:
+            raise RuntimeError("Unknown error type: {}".format(error))
+
+    def _all_tensors_smaller_than_l2_cache(self,
+                                           inputs: List[torch.Tensor]) -> bool:
+        all_bytes = sum(input.numel() * input.element_size()
+                        for input in inputs)
+        return all_bytes <= self._get_l2_cache_size_in_bytes()
+
+    # def _get_l2_cache_size_in_bytes(self) -> int:
+    #     # TODO: Only consider Blackwell L2 cache
+    #     return 256 * 1024 * 1024
 
     def _optimization_profiles(
             self, tuning_config: TuningConfig,
