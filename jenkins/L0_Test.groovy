@@ -667,12 +667,30 @@ def preprocessTestList(String testListFile)
 
     // Write the regular tests back to the original file
     def regularTestContent = regularTests.join('\n') + (regularTests.size() > 0 ? '\n' : '')
-    sh "echo '${regularTestContent.replace("'", "'\\''")}' > ${testListFile}"
+    if (regularTests.size() > 0) {
+        echo "Writing ${regularTests.size()} regular tests to ${testListFile}"
+        sh "echo 'Writing to file: ${testListFile}'"
+        sh "echo '${regularTestContent.replace("'", "'\\''")}' > ${testListFile}"
+        sh "echo 'File written. Contents:' && cat ${testListFile}"
+    } else {
+        echo "No regular tests found, creating empty file: ${testListFile}"
+        sh "touch ${testListFile}"
+        sh "echo 'Empty file created. File exists:' && ls -la ${testListFile}"
+    }
 
     // Create a separate file for isolate tests
     def isolateTestFile = testListFile.replaceAll('\\.txt$', '_isolate.txt')
     def isolateTestContent = isolateTests.join('\n') + (isolateTests.size() > 0 ? '\n' : '')
-    sh "echo '${isolateTestContent.replace("'", "'\\''")}' > ${isolateTestFile}"
+    if (isolateTests.size() > 0) {
+        echo "Writing ${isolateTests.size()} isolate tests to ${isolateTestFile}"
+        sh "echo 'Writing to isolate file: ${isolateTestFile}'"
+        sh "echo '${isolateTestContent.replace("'", "'\\''")}' > ${isolateTestFile}"
+        sh "echo 'Isolate file written. Contents:' && cat ${isolateTestFile}"
+    } else {
+        echo "No isolate tests found, creating empty file: ${isolateTestFile}"
+        sh "touch ${isolateTestFile}"
+        sh "echo 'Empty isolate file created. File exists:' && ls -la ${isolateTestFile}"
+    }
 
     return [
         regular: testListFile,
@@ -1740,12 +1758,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "--splits ${splits}",
             "--group ${splitId}",
             "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
-            "--test-list=${regularTestList}",
             "--output-dir=${WORKSPACE}/${stageName}/",
             "--csv=${WORKSPACE}/${stageName}/report.csv",
             "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
             "-o junit_logging=out-err"
         ]
+
+        // Only add --test-list if there are regular tests to run
+        if (preprocessedLists.regularCount > 0) {
+            testCmdLine.add(testCmdLine.size() - 4, "--test-list=${regularTestList}")
+        }
         if (perfMode) {
             testCmdLine += [
                 "--perf",
@@ -1792,11 +1814,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             ]) {
                 sh "env | sort"
                 try {
-                    sh """
-                        rm -rf ${stageName}/ && \
-                        cd ${llmSrc}/tests/integration/defs && \
-                        ${testCmdLine.join(" ")}
-                    """
+                    if (preprocessedLists.regularCount > 0) {
+                        sh """
+                            rm -rf ${stageName}/ && \
+                            cd ${llmSrc}/tests/integration/defs && \
+                            ${testCmdLine.join(" ")}
+                        """
+                    } else {
+                        echo "No regular tests to run for stage ${stageName}"
+                        sh "mkdir -p ${stageName}"
+                        // Create an empty results.xml file for consistency
+                        sh """
+                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
+                            echo '<testsuites>' >> ${stageName}/results.xml
+                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
+                            echo '</testsuite>' >> ${stageName}/results.xml
+                            echo '</testsuites>' >> ${stageName}/results.xml
+                        """
+                    }
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
