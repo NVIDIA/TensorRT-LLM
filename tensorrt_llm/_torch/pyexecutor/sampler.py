@@ -403,6 +403,7 @@ class SampleStateTorch(SampleState):
 
 
 class TorchSampler(Sampler):
+    SampleState = SampleStateTorch
 
     def is_generation_model(self) -> bool:
         return True
