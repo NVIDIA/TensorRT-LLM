@@ -540,9 +540,7 @@ class AutoTuner:
 
         stream = torch.cuda.current_stream()
         # warm up, no timing
-        # always use the last batch for warmup
         for _ in range(self.warmup):
-            # runner(tensor_lists[-1], tactic=tactic, **kwargs)
             runner(tensor_lists[buffer_idx % num_buffers],
                    tactic=tactic,
                    **kwargs)
