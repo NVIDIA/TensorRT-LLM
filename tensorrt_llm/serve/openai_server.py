@@ -462,7 +462,8 @@ class OpenAIServer:
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
                 lora_request=request.lora_request,
-                disaggregated_params=disaggregated_params
+                disaggregated_params=disaggregated_params,
+                cache_salt=request.cache_salt,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:

@@ -711,8 +711,8 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto allottedTimeMs = allottedTimeInt
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
         : std::nullopt;
+    auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
 
-    // 35 parameters
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalInput),
@@ -721,7 +721,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs);
+        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, cacheSaltID);
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)
