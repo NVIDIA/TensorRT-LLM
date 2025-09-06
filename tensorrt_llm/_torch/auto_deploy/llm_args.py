@@ -211,6 +211,17 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
             self.attn_page_size = self.max_seq_len
         return self
 
+    @field_validator("model_factory", mode="after")
+    @classmethod
+    def model_factory_exists(cls, value: str) -> str:
+        if not ModelFactoryRegistry.has(value):
+            raise ValueError(
+                f"'{value}' does not exist in the model factory registry. Available values: "
+                f"{ModelFactoryRegistry.entries()}."
+            )
+
+        return value
+
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments."""
