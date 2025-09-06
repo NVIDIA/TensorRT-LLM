@@ -819,7 +819,8 @@ class AutoTuner:
         else:
             return result[1:]
 
-    def _cudaGetErrorEnum(error) -> str:
+    def _cudaGetErrorEnum(self, error) -> str:
+        from cuda.bindings import nvrtc
         if isinstance(error, driver.CUresult):
             err, name = driver.cuGetErrorName(error)
             return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
