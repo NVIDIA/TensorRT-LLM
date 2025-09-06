@@ -9,6 +9,7 @@ from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed import allgather
+from ..utils import create_lm_head_tp_mapping
 from .linear import Linear, TensorParallelMode
 
 
@@ -35,6 +36,9 @@ class LMHead(Linear):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
         mapping = mapping or Mapping()
+        if mapping.enable_lm_head_tp_in_adp:
+            mapping = create_lm_head_tp_mapping(mapping)
+
         tp_size = mapping.tp_size
 
         # Attention DP doesn't work with embedding parallelization.
@@ -80,12 +84,26 @@ class LMHead(Linear):
             return self.out_features
 
     def forward(
-            self,
-            input: torch.Tensor,
-            *,
-            all_reduce_params: Optional[AllReduceParams] = None
+        self,
+        input: torch.Tensor,
+        *,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        is_mtp_head: bool = False,
     ) -> torch.Tensor:
-        output = super().forward(input, all_reduce_params=all_reduce_params)
+        if is_mtp_head and (self.mapping.enable_attention_dp and getattr(
+                self.mapping, 'enable_lm_head_tp_in_adp', False)):
+            tp_rank = self.mapping.tp_rank
+            tp_size = self.mapping.tp_size
+            tensor_shape = self.weight.shape
+            width = tensor_shape[0]
+            slice_width = math.ceil(width / tp_size)
+            slice_start = tp_rank * slice_width
+            slice_end = min((tp_rank + 1) * slice_width, width)
+            slice_obj = [slice(None)] * len(tensor_shape)
+            slice_obj[0] = slice(slice_start, slice_end)
+            output = F.linear(input, self.weight[tuple(slice_obj)], None)
+        else:
+            output = super().forward(input, all_reduce_params=all_reduce_params)
         if (self.tp_mode == TensorParallelMode.COLUMN and self.gather_output
                 and self.padding_size > 0):
             output = output[..., :-self.padding_size]
