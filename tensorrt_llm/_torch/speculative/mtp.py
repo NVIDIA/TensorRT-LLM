@@ -1117,9 +1117,10 @@ class MTPWorker(nn.Module):
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
         elif (self.model_config is not None
               and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size > 1) and (
-                  self.model_config.mapping.enable_attention_dp and getattr(
-                      self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
+              and self.model_config.mapping.tp_size
+              > 1) and (self.model_config.mapping.enable_attention_dp
+                        and getattr(self.model_config.mapping,
+                                    'enable_lm_head_tp_in_adp', False)):
             # For ADP + LM TP mode, we need to find the global argmax across all TP ranks
             # First, get local argmax and max values
             lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))

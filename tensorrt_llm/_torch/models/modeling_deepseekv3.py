@@ -188,14 +188,14 @@ class DeepseekV3MTPHead(nn.Module):
             hidden_states = allgather(hidden_states, mapping_lm_tp, dim=0)
 
         # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
-        if (not self.model_config.mapping.enable_attention_dp) or (
-                self.model_config.mapping.enable_attention_dp and getattr(
-                    self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
+        if (not self.model_config.mapping.enable_attention_dp
+            ) or (self.model_config.mapping.enable_attention_dp and getattr(
+                self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
             lm_head.gather_output = False
         logits = lm_head(hidden_states, is_mtp_head=True)
-        if (not self.model_config.mapping.enable_attention_dp) or (
-                self.model_config.mapping.enable_attention_dp and getattr(
-                    self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
+        if (not self.model_config.mapping.enable_attention_dp
+            ) or (self.model_config.mapping.enable_attention_dp and getattr(
+                self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
             lm_head.gather_output = True
         return logits
 
