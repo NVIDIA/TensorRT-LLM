@@ -1853,7 +1853,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 echo "Running isolated test ${i+1}/${isolateTestLines.size()}: ${isolateTestName}"
 
                 // Create a temporary file for this single isolated test
-                def singleTestFile = "${testListFile}_isolated_${i}.txt"
+                def singleTestFile = "${isolateTestList}_isolated_${i}.txt"
                 sh "echo '${isolateTestName}' > ${singleTestFile}"
 
                 def isolateTestCmdLine = testCmdLine.findAll { cmd ->
