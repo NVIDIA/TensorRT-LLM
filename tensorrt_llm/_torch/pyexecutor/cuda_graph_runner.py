@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from ...inputs.multimodal import MultimodalParams
 from ..expert_statistic import ExpertStatistic
 from ..modules.multi_stream_utils import with_multi_stream
 from ..utils import make_weak_ref, piecewise_cuda_graph
@@ -161,8 +162,21 @@ class CUDAGraphRunner:
                         dtype=torch.int32),
         }
         if engine.use_mrope:
-            static_tensors["mrope_position_deltas"] = torch.zeros(
-                (batch_size, 1), device="cuda", dtype=torch.int32)
+            static_tensors["position_ids"] = torch.zeros(
+                (3, 1, batch_size * self.max_beam_width * token_per_request),
+                device="cuda",
+                dtype=torch.int32)
+            static_tensors["multimodal_params"] = [
+                MultimodalParams(
+                    multimodal_data={
+                        "mrope_config": {
+                            "mrope_position_deltas":
+                            torch.zeros(
+                                (1, 1), device="cuda", dtype=torch.int32)
+                        }
+                    }) for _ in range(batch_size)
+            ]
+
         self.static_inputs[key] = static_tensors
 
         capture_inputs = initial_inputs.copy()
@@ -191,6 +205,7 @@ class CUDAGraphRunner:
     def replay(self, batch_size: int,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
+        engine = self._get_engine()
         key = (batch_size, self.draft_len)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
@@ -205,12 +220,19 @@ class CUDAGraphRunner:
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
-        static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
-
-        if "mrope_position_deltas" in current_inputs:
-            assert "mrope_position_deltas" in static_tensors
-            static_tensors["mrope_position_deltas"][:batch_size].copy_(
-                current_inputs["mrope_position_deltas"])
+        if engine.use_mrope and current_inputs.get(
+                'multimodal_params') is not None:
+            static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
+            for i, multimodal_param in enumerate(
+                    current_inputs['multimodal_params']):
+                # NOTE: Currently, we only need 'mrope_position_deltas' on generation phase for multimodal models.
+                static_tensors['multimodal_params'][i].multimodal_data[
+                    'mrope_config']['mrope_position_deltas'].copy_(
+                        multimodal_param.multimodal_data['mrope_config']
+                        ['mrope_position_deltas'],
+                        non_blocking=True)
+        else:
+            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         self.graphs[key].replay()
         output_ref = self.graph_outputs[key]
