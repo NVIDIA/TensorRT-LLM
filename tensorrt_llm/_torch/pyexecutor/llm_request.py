@@ -278,6 +278,17 @@ class LlmResponse:
     def has_error(self):
         return self.error_msg is not None
 
+    def clear_context_logits(self):
+        """Clear context logits from the response result.
+
+        This is used to drop context logits after prompt_logprobs have been computed
+        when the user didn't explicitly request them.
+        """
+        if self.result and hasattr(self.result, '_py_result'):
+            py_result = self.result._py_result
+            if hasattr(py_result, '_context_logits'):
+                py_result._context_logits = None
+
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
