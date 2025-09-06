@@ -199,7 +199,7 @@ void Executor::initBindings(nb::module_& m)
             nb::arg("decoder_json_config_str"), nb::arg("model_type"), nb::arg("executor_config"))
         .def("shutdown", &Executor::shutdown)
         .def("__enter__", &Executor::enter)
-        .def("__exit__", &Executor::exit)
+        .def("__exit__", &Executor::exit, nb::arg("type").none(), nb::arg("value").none(), nb::arg("traceback").none())
         .def("enqueue_request", &Executor::enqueueRequest, nb::arg("request"))
         .def("enqueue_requests", &Executor::enqueueRequests, nb::arg("requests"))
         .def("await_responses",
