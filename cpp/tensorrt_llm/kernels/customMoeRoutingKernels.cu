@@ -38,17 +38,18 @@ static constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T>
-__device__ T calcSoftmax(cg::thread_block_tile<WARP_SIZE> const& warp, T score, int32_t laneIdx, int32_t NumTopExperts)
+template <typename DataType>
+__device__ DataType calcSoftmax(
+    cg::thread_block_tile<WARP_SIZE> const& warp, DataType score, int32_t laneIdx, int32_t NumTopExperts)
 {
-    T maxScore = T{-INFINITY};
+    DataType maxScore = DataType{-INFINITY};
     if (laneIdx < NumTopExperts)
     {
         maxScore = score >= maxScore ? score : maxScore;
     }
-    maxScore = cg::reduce(warp, maxScore, cg::greater<T>());
+    maxScore = cg::reduce(warp, maxScore, cg::greater<DataType>());
 
-    float sumScore{0.f};
+    float sumScore = float{0.f};
     float newScore;
     // Get the summation of scores for each token
     if (laneIdx < NumTopExperts)
@@ -61,7 +62,7 @@ __device__ T calcSoftmax(cg::thread_block_tile<WARP_SIZE> const& warp, T score, 
 
     if (laneIdx < NumTopExperts)
     {
-        score = static_cast<T>(newScore / sumScore);
+        score = static_cast<DataType>(newScore / sumScore);
     }
 
     return score;
@@ -70,31 +71,35 @@ __device__ T calcSoftmax(cg::thread_block_tile<WARP_SIZE> const& warp, T score, 
 template <typename DataType, int VecSize>
 __device__ void calcSoftmax(cg::thread_block_tile<WARP_SIZE> const& warp, DataType (&scores)[VecSize])
 {
-    DataType maxScore = DataType{-INFINITY};
-    DataType sumScore = DataType{0.f};
-
+    // Compute in float to support half/bfloat16 inputs safely.
+    float maxScore = -INFINITY;
+    float sumScore = 0.f;
     // Get the max score for each token
 #pragma unroll
     for (int i = 0; i < VecSize; ++i)
     {
-        maxScore = scores[i] >= maxScore ? scores[i] : maxScore;
+        float si = static_cast<float>(scores[i]);
+        maxScore = si >= maxScore ? si : maxScore;
     }
-    maxScore = cg::reduce(warp, maxScore, cg::greater<DataType>());
+    maxScore = cg::reduce(warp, maxScore, cg::greater<float>());
 
     // Get the summation of scores for each token
 #pragma unroll
     for (int i = 0; i < VecSize; ++i)
     {
-        scores[i] = static_cast<DataType>(exp(scores[i] - maxScore));
-        sumScore += scores[i];
+        float si = static_cast<float>(scores[i]);
+        float e = expf(si - maxScore);
+        scores[i] = static_cast<DataType>(e);
+        sumScore += e;
     }
-    sumScore = cg::reduce(warp, sumScore, cg::plus<DataType>());
+    sumScore = cg::reduce(warp, sumScore, cg::plus<float>());
 
     // Normalize the scores
 #pragma unroll
     for (int i = 0; i < VecSize; ++i)
     {
-        scores[i] = static_cast<DataType>(scores[i] / sumScore);
+        float si = static_cast<float>(scores[i]) / sumScore;
+        scores[i] = static_cast<DataType>(si);
     }
 }
 
@@ -205,7 +210,7 @@ int nextPowerOfTwo(int num)
         break;
 
 template <typename InputT, typename OutputT, typename IdxT, bool DoSoftmaxBeforeTopK>
-void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
+void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream)
 {
 
@@ -249,20 +254,25 @@ void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
 }
 
 #define INSTANTIATE_RENORM_MOE_ROUTING(InputT, OutputT, IdxT, DoSoftmaxBeforeTopK)                                     \
-    template void invokeRenormMoeRouting<InputT, OutputT, IdxT, DoSoftmaxBeforeTopK>(InputT * routerLogits,            \
+    template void invokeCustomMoeRouting<InputT, OutputT, IdxT, DoSoftmaxBeforeTopK>(InputT * routerLogits,            \
         OutputT * topkValues, IdxT * topkIndices, int64_t const numTokens, int64_t const numExperts,                   \
         int64_t const topK, cudaStream_t const stream);
 
 INSTANTIATE_RENORM_MOE_ROUTING(float, float, int32_t, false);
 INSTANTIATE_RENORM_MOE_ROUTING(half, float, int32_t, false);
-#ifdef ENABLE_BF16
-INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t, false);
-#endif
-
 INSTANTIATE_RENORM_MOE_ROUTING(float, float, int32_t, true);
 INSTANTIATE_RENORM_MOE_ROUTING(half, float, int32_t, true);
+
 #ifdef ENABLE_BF16
+INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t, false);
+INSTANTIATE_RENORM_MOE_ROUTING(float, __nv_bfloat16, int32_t, false);
+INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t, false);
+INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, false);
+
 INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t, true);
+INSTANTIATE_RENORM_MOE_ROUTING(float, __nv_bfloat16, int32_t, true);
+INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t, true);
+INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, true);
 #endif
 
 } // namespace tensorrt_llm::kernels

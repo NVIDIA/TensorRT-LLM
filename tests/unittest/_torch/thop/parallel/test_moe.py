@@ -832,26 +832,31 @@ class TestMoeFP8:
                               expert_info,
                               hidden_size,
                               intermediate_size,
-                              use_autotune=True)
+                              use_autotune=True,
+                              use_topk_as_input=False)
 
     @pytest.mark.parametrize("num_tokens", [16])
     @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
+    @pytest.mark.parametrize("use_topk_as_input", [False, True],
+                             ids=["use_score_as_input", "use_topk_as_input"])
     def test_no_autotune(self, num_tokens: int, expert_info: Tuple[int, int,
                                                                    int, int],
-                         hidden_size: int, intermediate_size: int):
+                         hidden_size: int, intermediate_size: int,
+                         use_topk_as_input: bool):
 
         self.run_moe_fp8_test(num_tokens,
                               expert_info,
                               hidden_size,
                               intermediate_size,
-                              use_autotune=False)
+                              use_autotune=False,
+                              use_topk_as_input=use_topk_as_input)
 
     def run_moe_fp8_test(self, num_tokens: int, expert_info: Tuple[int, int,
                                                                    int, int],
                          hidden_size: int, intermediate_size: int,
-                         use_autotune: bool):
+                         use_autotune: bool, use_topk_as_input: bool):
         torch.random.manual_seed(0)
 
         #
@@ -906,12 +911,21 @@ class TestMoeFP8:
                         None, scores, gemm1_weights, gemm1_scales, None,
                         gemm2_weights, gemm2_scales, None, permute_info, False)
 
+        if use_topk_as_input:
+            topk_ids = permute_info["topKIndices"].to(torch.int32)
+            topk_weights = permute_info["topKLogits"].to(torch.bfloat16)
+            expert_logits = None
+        else:
+            topk_ids = None
+            topk_weights = None
+
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 expert_logits, routing_bias, hidden_states, hidden_states_scale,
                 gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                0, num_experts, routed_scaling, routing_method_type)
+                0, num_experts, routed_scaling, routing_method_type,
+                topk_weights, topk_ids)
 
         output_dequant_actual = output.to(torch.float)
         #
@@ -1013,9 +1027,10 @@ class TestMoeFp4:
                               hidden_size,
                               intermediate_size,
                               routing_info,
-                              use_autotune=True)
+                              use_autotune=True,
+                              use_topk_as_input=False)
 
-    @pytest.mark.parametrize("num_tokens", [1])
+    @pytest.mark.parametrize("num_tokens", [1, 150])
     @pytest.mark.parametrize("hidden_size", [1024])
     @pytest.mark.parametrize("intermediate_size", [1024])
     @pytest.mark.parametrize(
@@ -1033,20 +1048,35 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.DeepSeekV3
                 },
                 id="RoutingDSv3"),
+            pytest.param(
+                {
+                    "num_experts": 128,
+                    "top_k": 4,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_topk_4"),
         ],
     )
+    @pytest.mark.parametrize("use_topk_as_input", [False, True],
+                             ids=["use_score_as_input", "use_topk_as_input"])
     def test_no_autotune(self, num_tokens, hidden_size, intermediate_size,
-                         routing_info):
+                         routing_info, use_topk_as_input):
 
         self.run_moe_fp4_test(num_tokens,
                               hidden_size,
                               intermediate_size,
                               routing_info,
-                              use_autotune=False)
+                              use_autotune=False,
+                              use_topk_as_input=use_topk_as_input)
 
     def run_moe_fp4_test(self, num_tokens: int, hidden_size: int,
                          intermediate_size: int, routing_info: dict,
-                         use_autotune: bool) -> None:
+                         use_autotune: bool, use_topk_as_input: bool) -> None:
 
         torch.random.manual_seed(0)
 
@@ -1248,6 +1278,14 @@ class TestMoeFp4:
         scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (
             1.0 / args.gemm2_scales_global)
 
+        if use_topk_as_input:
+            topk_ids = permute_info["topKIndices"].to(torch.int32)
+            topk_weights = permute_info["topKLogits"].to(torch.bfloat16)
+            expert_logits = None
+        else:
+            topk_ids = None
+            topk_weights = None
+
         with autotune(use_autotune):
             output = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 expert_logits,
@@ -1270,7 +1308,9 @@ class TestMoeFp4:
                 num_experts,
                 routed_scaling,
                 routing_method_type,
-                do_finalize=True)
+                do_finalize=True,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights)
 
         output_dequant_actual = output[0].to(torch.float)
 
@@ -1290,8 +1330,10 @@ class TestMoeFp4:
 @pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True)])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
+@pytest.mark.parametrize("use_topk_as_input", [False, True],
+                         ids=["use_score_as_input", "use_topk_as_input"])
 def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
-                                  intermediate_size):
+                                  intermediate_size, use_topk_as_input):
     torch.random.manual_seed(0)
 
     #
@@ -1396,13 +1438,21 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     scale_c_fc2 = (1.0 / args_dequant.c_global_sf) * (1.0 /
                                                       args.gemm2_scales_global)
 
+    # set topk_weights and topk_ids
+    topk_weights = None
+    topk_ids = None
+    if use_topk_as_input:
+        topk_ids = permute_info["topKIndices"].to(torch.int32).cuda()
+        topk_weights = permute_info["topKLogits"].to(torch.bfloat16).cuda()
+
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
-        expert_logits.to(torch.bfloat16) if use_routing_scales_on_input else
-        expert_logits, routing_bias, hidden_states_quant,
-        gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
-        gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k, n_groups,
-        top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
-        use_routing_scales_on_input, tile_tokens_dim, routing_method_type)
+        expert_logits.to(torch.bfloat16)
+        if use_routing_scales_on_input else expert_logits, routing_bias,
+        hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
+        scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
+        top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
+        routed_scaling, use_routing_scales_on_input, tile_tokens_dim,
+        routing_method_type, topk_weights, topk_ids)
 
     output_dequant_actual = output.to(torch.float)
 
@@ -1452,9 +1502,11 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
 @pytest.mark.parametrize("act_type_str", ["SwiGlu", "GatedSilu"])
 @pytest.mark.parametrize("use_autotune", [True, False],
                          ids=["autotune", "no_autotune"])
+@pytest.mark.parametrize("use_topk_as_input", [False, True],
+                         ids=["use_score_as_input", "use_topk_as_input"])
 def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                             routing_info, dtype_activation, act_type_str,
-                            use_autotune):
+                            use_autotune, use_topk_as_input):
     torch.random.manual_seed(0)
 
     #
@@ -1492,6 +1544,11 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         if top_k != 4 or dtype_activation != "mxfp8" or act_type_str != "SwiGlu" or not use_autotune:
             pytest.skip(
                 "1024 tokens is tested only with topk=4, mxfp8, SwiGlu, and autotune"
+            )
+    if use_topk_as_input:
+        if dtype_activation != "mxfp8" or top_k != 4 or act_type_str != "SwiGlu" or not use_autotune:
+            pytest.skip(
+                "use_topk_as_input is tested only with mxfp8, topk=4, SwiGlu, num_tokens=256, and autotune"
             )
 
     assert top_k <= num_experts
@@ -1590,6 +1647,14 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
             expert_logits, top_k, num_experts, padding)
     else:
         raise ValueError("Invalid routing method type")
+
+    if use_topk_as_input:
+        topk_ids = permute_info["topKIndices"].to(torch.int32)
+        topk_weights = permute_info["topKLogits"]
+        expert_logits = None
+    else:
+        topk_ids = None
+        topk_weights = None
 
     input_hidden_states = None
     input_hidden_global_scale = None
@@ -1747,7 +1812,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 unpadded_hidden_size, 0, num_experts, routed_scaling,
-                tile_tokens_dim, routing_method_type, act_type.value)
+                tile_tokens_dim, routing_method_type, act_type.value,
+                topk_weights, topk_ids)
         elif dtype_activation == "bf16":
             output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -1759,7 +1825,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 0, num_experts, routed_scaling, tile_tokens_dim,
-                routing_method_type, act_type.value)
+                routing_method_type, act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "fp8":
             output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
@@ -1772,7 +1838,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 scale_c_fc1, scale_gate_fc1, scale_c_fc2, num_experts, top_k,
                 n_groups, top_k_groups, intermediate_size, 0, num_experts,
                 routed_scaling, tile_tokens_dim, routing_method_type,
-                act_type.value)
+                act_type.value, topk_weights, topk_ids)
         else:
             raise ValueError("Invalid dtype_activation")
 

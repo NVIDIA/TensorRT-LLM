@@ -10,15 +10,14 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe)
+                                 RoutingMethodType, create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -46,6 +45,7 @@ class Qwen3Gate(nn.Module):
                                                dtype=dtype),
                                    requires_grad=False)
         self.routing_method_type = routing_method_type
+        self.moe_backend = moe_backend
         # FIXME: out_dtype=float32 does not work
         # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
         self.out_dtype = dtype
@@ -65,9 +65,15 @@ class Qwen3Gate(nn.Module):
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
         if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
-            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
+            return RenormalizeNaiveMoeRoutingMethod(
+                top_k=self.top_k,
+                output_dtype=torch.bfloat16
+                if self.moe_backend.upper() == "TRTLLM" else torch.float32)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
-            return RenormalizeMoeRoutingMethod(top_k=self.top_k)
+            return RenormalizeMoeRoutingMethod(
+                top_k=self.top_k,
+                output_dtype=torch.bfloat16
+                if self.moe_backend.upper() == "TRTLLM" else torch.float32)
         else:
             raise ValueError(
                 f"Unsupported routing method: {self.routing_method_type}")
@@ -131,13 +137,6 @@ class Qwen3MoE(nn.Module):
 
         if not do_finalize:
             assert not self.enable_attention_dp
-
-        if self.enable_attention_dp and self.mapping.tp_size > 1:
-            if isinstance(self.experts, TRTLLMGenFusedMoE):
-                hidden_states = allgather(hidden_states,
-                                          self.mapping,
-                                          dim=0,
-                                          sizes=all_rank_num_tokens)
 
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
