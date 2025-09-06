@@ -322,6 +322,8 @@ class OpenAIDisaggServer:
             raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
         if choices[0].disaggregated_params is None:
             raise ValueError("Context server did not return disaggregated params")
+        if choices[0].disaggregated_params.ctx_request_id is None:
+            raise ValueError("Invalid disaggregated params in context phase response.")
 
         return ctx_response
 

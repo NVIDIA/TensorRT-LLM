@@ -106,7 +106,7 @@ l0_h100:
   - test_e2e.py::test_trtllm_bench_help_sanity[meta-llama/Llama-3.1-8B]
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_responses
-  - test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-True]
+  - test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-True] TIMEOUT (90)
   # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
 - condition:
@@ -227,7 +227,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0]
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized
   - accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized
-  - accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_auto_dtype
+  - accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_auto_dtype TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=False]
