@@ -5,7 +5,7 @@ import operator
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from functools import partial
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -16,7 +16,6 @@ from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
 from .node_utils import extract_param_names_from_lin_node, is_op, num_users_of_weight_node
 from .quantization_utils import (
-    QuantizationImpl,
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
@@ -279,7 +278,6 @@ class QuantizationShardingMixin(ABC):
     @abstractmethod
     def scale_names(self) -> List[str]: ...
 
-    @abstractmethod
     def shard_scales(
         self,
         dim: int,
@@ -287,9 +285,9 @@ class QuantizationShardingMixin(ABC):
         world_size: int,
         weight_shape: torch.Size,
         **scales: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]: ...
+    ) -> Dict[str, torch.Tensor]:
+        return {k: v for k, v in scales.items() if isinstance(v, torch.Tensor)}
 
-    @abstractmethod
     def shard_load_hook(
         self,
         state_dict,
@@ -300,7 +298,8 @@ class QuantizationShardingMixin(ABC):
         dim: int,
         rank: int,
         world_size: int,
-    ) -> None: ...
+    ) -> None:
+        return
 
     def quantization_cb(
         self,
@@ -571,13 +570,13 @@ def _insert_sharded_moe(
     node: Node,
     rank: int,
     world_size: int,
+    scale_names: Sequence[str] = (),
 ):
     """Update the torch_moe node with sharded weight lists,
     sharded `selected_experts` and `final_scales(router_logics)`.
     Add an all_reduce node after the moe node.
     """
-    quant_impl = QuantizationImpl.create(node)
-    scale_names = quant_impl.scale_names() if quant_impl else []
+    scale_names = list(scale_names)
 
     num_experts = len(node.args[3])
     args = list(node.args)
@@ -659,23 +658,74 @@ class EPShardingInfo(ShardingTransformInfo):
     rank: int
     world_size: int
 
+    @classmethod
+    def from_node(cls, node: Node, **kwargs) -> "EPShardingInfo":
+        """
+        Create the correct EPShardingInfo subclass (FP8/NVFP4/base) based on `node`.
+        """
+        subcls = _resolve_ep_cls_from_node(node)
+        return subcls(target_node=node.name, **kwargs)
+
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
-        if not is_op(
-            node,
-            (
-                torch.ops.auto_deploy.torch_moe,
-                torch.ops.auto_deploy.torch_quant_fp8_moe,
-                torch.ops.auto_deploy.torch_quant_fp4_moe,
-            ),
-        ):
+        if not is_op(node, torch.ops.auto_deploy.torch_moe):
             ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
             return False
         return True
 
     def apply(self, gm: GraphModule, node: Node) -> None:
         """Apply EP sharding transformation to the graph module."""
-        _insert_sharded_moe(gm, node, self.rank, self.world_size)
+        _insert_sharded_moe(gm, node, self.rank, self.world_size, [])
+
+
+class FP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
+    """FP8-specific EP sharding behavior."""
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
+            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
+            return False
+        return True
+
+    def scale_names(self) -> List[str]:
+        return ["input_scale", "weight_scale"]
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+
+
+class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
+    """NVFP4-specific EP sharding behavior."""
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_moe):
+            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
+            return False
+        return True
+
+    def scale_names(self) -> List[str]:
+        return ["input_scale", "weight_scale", "alpha"]
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_moe(gm, node, self.rank, self.world_size, self.scale_names())
+
+
+EP_SHARDING_RULES = [
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
+]
+
+
+def _resolve_ep_cls_from_node(node: Node) -> type[EPShardingInfo]:
+    for pred, cls in EP_SHARDING_RULES:
+        try:
+            if pred(node):
+                return cls
+        except Exception:
+            # Missing op variant in this build or other harmless issues — keep trying.
+            pass
+    return EPShardingInfo
 
 
 class ShardingConfig(BaseModel):

@@ -655,13 +655,13 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Transfo
             (
                 torch.ops.auto_deploy.torch_moe,
                 torch.ops.auto_deploy.torch_quant_fp8_moe,
-                torch.ops.auto_deploy.torch_quant_fp4_moe,
+                torch.ops.auto_deploy.torch_quant_nvfp4_moe,
             ),
         ):
             continue
         sharding_config.ep_transforms.append(
-            EPShardingInfo(
-                target_node=node.name,
+            EPShardingInfo.from_node(
+                node,
                 rank=rank,
                 world_size=world_size,
             )
