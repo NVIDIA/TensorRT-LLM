@@ -485,6 +485,9 @@ class GenerationExecutorWorker(GenerationExecutor):
                     raise ValueError(
                         "`max_tokens` must be set when `default_max_tokens` cannot be deduced"
                     )
+            assert (
+                len(prompt_token_ids) <= executor_config.max_seq_len
+            ), f"`prompt_token_ids` length ({len(prompt_token_ids)}) is greater than `max_seq_len` ({executor_config.max_seq_len})"
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = executor_config.max_seq_len - splited_prompt_len - query_token_len
             if default_max_tokens <= 0:
