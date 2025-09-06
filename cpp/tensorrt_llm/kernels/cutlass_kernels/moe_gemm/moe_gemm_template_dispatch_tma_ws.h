@@ -150,7 +150,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
         }
         return dispatchMoeGemmFinalDispatchTmaWarpSpecialized<cutlass::arch::Sm100, T, WeightType, OutputType,
             EpilogueTag, FUSION, TileShape, ClusterShape>(
-            hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
+            hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy, workspace_size);
     }
 // #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
