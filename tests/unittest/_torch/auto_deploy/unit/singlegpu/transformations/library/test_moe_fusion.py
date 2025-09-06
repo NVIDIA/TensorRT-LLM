@@ -274,7 +274,7 @@ class MoEPatternModel(nn.Module):
         ),
         pytest.param(
             "NVFP4",
-            torch.ops.auto_deploy.torch_quant_fp4_moe,
+            torch.ops.auto_deploy.torch_quant_nvfp4_moe,
             0.05,
             0.01,
             marks=[
@@ -306,6 +306,12 @@ def test_moe_matching(quant_type, expected_op, atol, rtol):
             None,
             {
                 "match_moe_pattern": {
+                    "stage": "pattern_matcher",
+                },
+                "match_fp8_moe_pattern": {
+                    "stage": "pattern_matcher",
+                },
+                "match_nvfp4_moe_pattern": {
                     "stage": "pattern_matcher",
                 },
             },

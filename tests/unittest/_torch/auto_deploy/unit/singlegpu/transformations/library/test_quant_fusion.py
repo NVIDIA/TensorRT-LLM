@@ -126,9 +126,7 @@ def test_fuse_quant_rewrites_fp8_linear(use_bias):
     gm_transformed = InferenceOptimizer(
         None,
         {
-            "fuse_quant": {
-                "stage": "pattern_matcher",
-            },
+            "fuse_fp8_linear": {"stage": "post_load_fusion", "backend": "torch"},
         },
     )(None, gm)
     gm_transformed.to("cuda")
@@ -162,9 +160,7 @@ def test_fuse_quant_rewrites_fp4_linear(use_bias):
     gm_transformed = InferenceOptimizer(
         None,
         {
-            "fuse_quant": {
-                "stage": "pattern_matcher",
-            },
+            "fuse_nvfp4_linear": {"stage": "post_load_fusion", "backend": "trtllm"},
         },
     )(None, gm)
     gm_transformed.to("cuda")

@@ -1,12 +1,19 @@
-from typing import Tuple
+from typing import Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 # with bias=None
@@ -242,20 +249,24 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     )
 
 
-@TransformRegistry.register("fuse_quant")
-class FuseQuant(BaseTransform):
-    """
-    Use ADPatternMatcherPass to rewrite reference quantized linear ops into fused ones:
+class FuseFP8LinearConfig(TransformConfig):
+    """Configuration for FP8 linear fusion transform."""
 
-      FP8:
-        torch_fake_quant_fp8_linear(x, w_fp8, bias, [in_s], [w_s], [], [])
-        -> torch_quant_fp8_linear(x, w_fp8, bias=bias, input_scale=in_s, weight_scale=w_s)
+    backend: str = Field(
+        default="torch",
+        description="Backend to use for FP8 linear computation (default: 'torch').",
+    )
 
-      FP4 (NVFP4):
-        torch_fake_quant_nvfp4_linear(x, w_fp4, bias, [s_in2], [cutlass_vec, alpha], [], [])
-        -> torch_quant_nvfp4_linear(x, w_fp4, bias=bias, input_scale=s_in2,
-                                  weight_scale=cutlass_vec, alpha=alpha)
-    """
+
+@TransformRegistry.register("fuse_fp8_linear")
+class FuseFP8Linear(BaseTransform):
+    """Matches and replaces FP8 fake quantized linear ops with fused torch backend ops."""
+
+    config: FuseFP8LinearConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseFP8LinearConfig
 
     def _apply(
         self,
@@ -264,14 +275,58 @@ class FuseQuant(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        if self.config.backend.lower() != "torch":
+            raise ValueError(f"Unsupported FP8 backend: {self.config.backend}")
+
         patterns = ADPatternMatcherPass()
         _register_quant_fp8_linear_patterns(patterns)
-        _register_quant_fp4_linear_patterns(patterns)
-        num_matches = patterns.apply(gm.graph)
+        cnt = patterns.apply(gm.graph)
 
         info = TransformInfo(
-            skipped=(num_matches == 0),
-            num_matches=num_matches,
+            skipped=(cnt == 0),
+            num_matches=cnt,
+            is_clean=False,
+            has_valid_shapes=False,
+        )
+        return gm, info
+
+
+class FuseNVFP4LinearConfig(TransformConfig):
+    """Configuration for NVFP4 linear fusion transform."""
+
+    backend: str = Field(
+        default="trtllm",
+        description="Backend to use for NVFP4 linear computation (default: 'trtllm').",
+    )
+
+
+@TransformRegistry.register("fuse_nvfp4_linear")
+class FuseNVFP4Linear(BaseTransform):
+    """Matches and replaces NVFP4 fake quantized linear ops with fused TensorRT-LLM ops."""
+
+    config: FuseNVFP4LinearConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseNVFP4LinearConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        if self.config.backend.lower() != "trtllm":
+            raise ValueError(f"Unsupported NVFP4 backend: {self.config.backend}")
+
+        patterns = ADPatternMatcherPass()
+        _register_quant_fp4_linear_patterns(patterns)
+        cnt = patterns.apply(gm.graph)
+
+        info = TransformInfo(
+            skipped=(cnt == 0),
+            num_matches=cnt,
             is_clean=False,
             has_valid_shapes=False,
         )

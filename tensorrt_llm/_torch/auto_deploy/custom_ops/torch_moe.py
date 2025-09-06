@@ -235,8 +235,8 @@ def torch_quant_fp8_moe_fake(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("auto_deploy::torch_quant_fp4_moe", mutates_args=())
-def torch_quant_fp4_moe(
+@torch.library.custom_op("auto_deploy::torch_quant_nvfp4_moe", mutates_args=())
+def torch_quant_nvfp4_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -305,8 +305,8 @@ def torch_quant_fp4_moe(
     return _template_moe(x, selected_experts, routing_weights, mlps)
 
 
-@torch_quant_fp4_moe.register_fake
-def torch_quant_fp4_moe_fake(
+@torch_quant_nvfp4_moe.register_fake
+def torch_quant_nvfp4_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
