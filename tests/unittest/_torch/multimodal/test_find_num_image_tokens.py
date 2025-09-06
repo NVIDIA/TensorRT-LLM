@@ -136,13 +136,10 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
             # Get predicted number of tokens using get_num_tokens_per_image
             if model_type == 'llava_next':
                 predicted_num_tokens = input_processor.get_num_tokens_per_image(
-                    image_width=image_width, image_height=image_height)
+                    image=test_image)
             elif model_type == 'qwen2_5_vl':
                 predicted_num_tokens = input_processor.get_num_tokens_per_image(
-                    image_width=image_width,
-                    image_height=image_height,
-                    num_frames=1,
-                    do_resize=True)
+                    image=test_image)
             else:
                 raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -235,7 +232,6 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             test_video = load_video(test_video_url, num_frames=8, format="pil")
             # load_video returns a list of frames, we only have one video
             video_width, video_height = test_video[0].size
-            num_frames = len(test_video)
 
             # Get actual embedding tensor for this image
             actual_embedding = SharedTensorContainer.from_dict(
@@ -245,17 +241,13 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             # The first dimension should be the number of image tokens
             actual_num_tokens = actual_embedding.shape[0]
 
-            # Get predicted number of tokens using get_num_tokens_per_image
+            # Get predicted number of tokens using get_num_tokens_per_video
             if model_type == 'llava_next':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video_width=video_width,
-                    video_height=video_height,
-                    num_frames=num_frames)
+                    video=test_video)
             elif model_type == 'qwen2_5_vl':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
-                    video_width=video_width,
-                    video_height=video_height,
-                    num_frames=num_frames)
+                    video=test_video)
 
             # The key assertion: predicted should match actual
             assert predicted_num_tokens == actual_num_tokens, \
