@@ -151,12 +151,6 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     Args:
         mm_node: Matmul node in the graph.
     """
-    assert (
-        is_linear_op(mm_node)
-        or is_fake_quantized_linear_op(mm_node)
-        or is_quantized_linear_op(mm_node)
-        or is_bmm_op(mm_node)
-    ), f"Expecting linear or bmm node, Found: {mm_node}"
     weight_node = extract_weight_node(mm_node)
 
     assert weight_node, "Cannot identify weight parameter of linear node."
@@ -266,15 +260,6 @@ def is_linear_op(node: Node) -> bool:
     return is_op(node, lin_ops)
 
 
-def is_quantized_linear_op(node: Node) -> bool:
-    quantized_linear_op = {
-        torch.ops.auto_deploy.torch_quant_fp8_linear,
-        torch.ops.auto_deploy.torch_quant_nvfp4_linear,
-    }
-
-    return is_op(node, quantized_linear_op)
-
-
 def is_fake_quantized_linear_op(node: Node) -> bool:
     quantized_linear_op = {
         torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
@@ -288,14 +273,6 @@ def is_bmm_op(node: Node) -> bool:
     bmm_ops = {torch.ops.aten.bmm}
 
     return is_op(node, bmm_ops)
-
-
-def is_quantized_bmm_op(node: Node) -> bool:
-    quantized_bmm_op = {
-        torch.ops.auto_deploy.torch_quant_fp8_bmm,
-    }
-
-    return is_op(node, quantized_bmm_op)
 
 
 def is_dist_op(node: Node) -> bool:
