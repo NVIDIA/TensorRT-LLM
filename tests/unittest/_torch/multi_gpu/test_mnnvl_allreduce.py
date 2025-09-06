@@ -184,6 +184,9 @@ def row_linear_residual_norm_fusion_forward(
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
                                          fusion):
 
+    if strategy == AllReduceStrategy.NCCL_SYMMETRIC:
+        pytest.skip("NCCL symmetric is not supported for nccl version < 2.27.")
+
     torch.manual_seed(42)
     tensor_parallel_size = 2
 

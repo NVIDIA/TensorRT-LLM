@@ -35,13 +35,22 @@ struct UBBuffer
     void* addr;
     int handle;
     size_t size;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 0)
     ncclWindow_t window;
+#endif
 
-    UBBuffer(void* a = nullptr, int h = -1, size_t s = 0, ncclWindow_t w = nullptr)
+    UBBuffer(void* a = nullptr, int h = -1, size_t s = 0
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 0)
+        ,
+        ncclWindow_t w = nullptr
+#endif
+        )
         : addr(a)
         , handle(h)
         , size(s)
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 0)
         , window(w)
+#endif
     {
     }
 
@@ -76,6 +85,8 @@ protected:
     bool mIsInitialized;
     tensorrt_llm::runtime::WorldConfig mWorldConfig;
 };
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 0)
 
 class NCCLHelper
 {
@@ -125,6 +136,13 @@ private:
     std::shared_ptr<ncclComm_t> mComm;
     static std::unique_ptr<NCCLHelper> mNCCLHelper;
 };
+#else
+class NCCLUserBufferAllocator : public UserBufferAllocator
+{
+public:
+    void initialize(tensorrt_llm::runtime::WorldConfig const& world_config) override;
+};
+#endif
 
 #else
 using communicator = void;

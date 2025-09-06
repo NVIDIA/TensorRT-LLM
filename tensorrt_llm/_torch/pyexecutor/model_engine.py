@@ -2334,6 +2334,8 @@ class PyTorchModelEngine(ModelEngine):
         if not ub.ub_supported():
             return False
         use_nccl_symmetric = self.pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+        if use_nccl_symmetric:
+            return False
         ub.initialize_userbuffers_manager(
             self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
             self.mapping.rank, self.mapping.gpus_per_node,

@@ -83,6 +83,8 @@ communicator* UserBufferAllocator::comm()
     return mUbComm;
 }
 
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 0)
+
 void NCCLUserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
 {
     if (!isInitialized())
@@ -243,6 +245,18 @@ bool NCCLHelper::isLoaded() const
 {
     return mIsLoaded;
 }
+
+#else
+
+void NCCLUserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
+{
+    TLLM_CHECK_WITH_INFO(false,
+        "NCCL symmetric is not supported for nccl version < 2.27. Please upgrade nccl to 2.27 or higher and rebuild "
+        "tensorrt_llm or disable nccl symmetric");
+    return;
+}
+
+#endif
 
 bool UserBufferAllocator::use_nccl_symmetric = false;
 
