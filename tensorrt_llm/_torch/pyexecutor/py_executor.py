@@ -1232,11 +1232,11 @@ class PyExecutor:
                     self._process_previous_batch()
                     self.previous_batch: Optional[BatchState] = None
 
-                if self.enable_iter_perf_stats:
-                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                        'num_ctx_tokens']
-
                 if scheduled_batch.batch_size > 0:
+
+                    if self.enable_iter_perf_stats:
+                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                            'num_ctx_tokens']
 
                     self.previous_batch = BatchState(
                         sample_state=sample_state,
