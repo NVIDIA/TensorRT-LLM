@@ -5,9 +5,11 @@ import itertools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
+from math import ceil
 from typing import Any, Callable, Dict, List, Set, Tuple, Union
 
 import torch
+from cuda.bindings import driver
 
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
@@ -525,10 +527,25 @@ class AutoTuner:
             to get an average execution time. Stream synchronization and delays
             are used to ensure accurate timing.
         """
+
+        use_cold_l2 = True
+
+        if use_cold_l2:
+            tensor_lists, num_buffers = self._prepare_input_tensors_with_batches(
+                inputs)
+            buffer_idx = 0
+        else:
+            tensor_lists = [inputs]
+            num_buffers = 1
+            buffer_idx = 0
+
         stream = torch.cuda.current_stream()
         # warm up, no timing
         for _ in range(self.warmup):
-            runner(inputs, tactic=tactic, **kwargs)
+            runner(tensor_lists[buffer_idx % num_buffers],
+                   tactic=tactic,
+                   **kwargs)
+            buffer_idx += 1
         stream.synchronize()
 
         # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
@@ -540,13 +557,16 @@ class AutoTuner:
 
         start.record(stream=stream)
         for _ in range(self.repeat):
-            runner(inputs, tactic=tactic, **kwargs)
+            runner(tensor_lists[buffer_idx % num_buffers],
+                   tactic=tactic,
+                   **kwargs)
+            buffer_idx += 1
         end.record(stream=stream)
         stream.synchronize()
 
         avg_time = start.elapsed_time(end) / self.repeat
 
-        shapes = self._get_input_sizes(inputs)
+        shapes = self._get_input_sizes(tensor_lists[-1])
         logger.debug(
             f"[Autotuner] Profiled runner={runner}, tactic={tactic}, shapes={shapes}: {avg_time:.6f}ms."
         )
@@ -733,6 +753,34 @@ class AutoTuner:
             tensors.append(tensor)
         return tensors
 
+    def _prepare_input_tensors_with_batches(
+        self,
+        inputs: List[torch.Tensor],
+    ) -> Tuple[List[List[torch.Tensor]], int]:
+        one_buffer_bytes = sum(
+            input.numel() *
+            input.element_size() if isinstance(input, torch.Tensor) else 0
+            for input in inputs)
+        if one_buffer_bytes <= 0:
+            logger.debug(
+                "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
+            )
+            return [inputs], 1
+        num_buffers = ceil(self._get_l2_cache_size_in_bytes() /
+                           one_buffer_bytes)
+        num_buffers = min(num_buffers, self.repeat)
+
+        inputs_list = [inputs]
+        for _ in range(num_buffers - 1):
+            inputs_list.append(
+                list(t.clone() if isinstance(t, torch.Tensor) else t
+                     for t in inputs))
+
+        logger.debug(
+            f"[Autotuner] To cold L2 cache, use {num_buffers} different tensors for profiling"
+        )
+        return inputs_list, num_buffers
+
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
@@ -750,3 +798,35 @@ class AutoTuner:
             runner_id, tactic, profile = value
             logger.debug(
                 f"[Autotuner] {key}: (runner_id={runner_id}, tactic={tactic})")
+
+    def _get_l2_cache_size_in_bytes(self, device_id: int = 0) -> int:
+        device = self._checkCudaErrors(driver.cuDeviceGet(device_id))
+        return self._checkCudaErrors(
+            driver.cuDeviceGetAttribute(
+                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
+                device,
+            ))
+
+    def _checkCudaErrors(self, result) -> Any:
+        status = result[0]
+        if status != driver.CUresult.CUDA_SUCCESS:
+            code = getattr(status, "value", status)
+            raise RuntimeError(
+                f"CUDA error code={code}({self._cudaGetErrorEnum(status)})")
+        # CUDA APIs always return the status as the first element of the result tuple
+        if len(result) == 1:
+            return None
+        elif len(result) == 2:
+            return result[1]
+        else:
+            return result[1:]
+
+    def _cudaGetErrorEnum(self, error) -> str:
+        from cuda.bindings import nvrtc
+        if isinstance(error, driver.CUresult):
+            err, name = driver.cuGetErrorName(error)
+            return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
+        elif isinstance(error, nvrtc.nvrtcResult):
+            return nvrtc.nvrtcGetErrorString(error)[1]
+        else:
+            raise RuntimeError("Unknown error type: {}".format(error))
