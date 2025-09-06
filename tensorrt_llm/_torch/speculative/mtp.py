@@ -225,12 +225,12 @@ class MTPSampler(TorchSampler):
         new_tokens_lens: torch.Tensor
 
     def create_store(self) -> Store:
-        num_tokens, seq_slots, _ = self.NEW_TOKENS_SHAPE
+        num_tokens, seq_slots, _, _ = self.NEW_TOKENS_SHAPE
         draft_len = num_tokens - 1
         assert draft_len == self.draft_len
         return self.Store(
-            new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
-            next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
+            new_tokens=int_tensor(self.NEW_TOKENS_SHAPE[:-1]),
+            next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE[:-1]),
             next_draft_tokens=int_tensor((seq_slots, draft_len)),
             new_tokens_lens=int_tensor((seq_slots, )),
         )

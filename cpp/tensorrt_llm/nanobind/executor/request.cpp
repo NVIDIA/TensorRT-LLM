@@ -198,17 +198,19 @@ void initRequestBindings(nb::module_& m)
     auto outputConfigGetstate = [](tle::OutputConfig const& self)
     {
         return nb::make_tuple(self.returnLogProbs, self.returnContextLogits, self.returnGenerationLogits,
-            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics, self.additionalModelOutputs);
+            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics, self.additionalModelOutputs,
+            self.topLogProbs);
     };
     auto outputConfigSetstate = [](tle::OutputConfig& outputConfig, nb::tuple const& state)
     {
-        if (state.size() != 7)
+        if (state.size() != 8)
         {
             throw std::runtime_error("Invalid OutputConfig state!");
         }
         new (&outputConfig) tle::OutputConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]),
             nb::cast<bool>(state[2]), nb::cast<bool>(state[3]), nb::cast<bool>(state[4]), nb::cast<bool>(state[5]),
-            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(state[6]));
+            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(state[6]),
+            nb::cast<std::optional<SizeType32>>(state[7]));
     };
     nb::class_<tle::OutputConfig>(m, "OutputConfig")
         .def(
@@ -216,17 +218,18 @@ void initRequestBindings(nb::module_& m)
             [](tle::OutputConfig& self, std::optional<bool> return_log_probs, std::optional<bool> return_context_logits,
                 std::optional<bool> return_generation_logits, std::optional<bool> exclude_input_from_output,
                 std::optional<bool> return_encoder_output, std::optional<bool> return_perf_metrics,
-                std::optional<std::vector<tle::AdditionalModelOutput>> additional_model_outputs)
+                std::optional<std::vector<tle::AdditionalModelOutput>> additional_model_outputs,
+                std::optional<SizeType32> top_logprobs)
             {
                 new (&self) tle::OutputConfig(return_log_probs.value_or(false), return_context_logits.value_or(false),
                     return_generation_logits.value_or(false), exclude_input_from_output.value_or(false),
                     return_encoder_output.value_or(false), return_perf_metrics.value_or(false),
-                    additional_model_outputs);
+                    additional_model_outputs, top_logprobs);
             },
             nb::arg("return_log_probs") = nb::none(), nb::arg("return_context_logits") = nb::none(),
             nb::arg("return_generation_logits") = nb::none(), nb::arg("exclude_input_from_output") = nb::none(),
             nb::arg("return_encoder_output") = nb::none(), nb::arg("return_perf_metrics") = nb::none(),
-            nb::arg("additional_model_outputs") = nb::none())
+            nb::arg("additional_model_outputs") = nb::none(), nb::arg("top_logprobs") = nb::none())
         .def_rw("return_log_probs", &tle::OutputConfig::returnLogProbs)
         .def_rw("return_context_logits", &tle::OutputConfig::returnContextLogits)
         .def_rw("return_generation_logits", &tle::OutputConfig::returnGenerationLogits)
@@ -234,6 +237,7 @@ void initRequestBindings(nb::module_& m)
         .def_rw("return_encoder_output", &tle::OutputConfig::returnEncoderOutput)
         .def_rw("return_perf_metrics", &tle::OutputConfig::returnPerfMetrics)
         .def_rw("additional_model_outputs", &tle::OutputConfig::additionalModelOutputs)
+        .def_rw("top_logprobs", &tle::OutputConfig::topLogProbs)
         .def("__getstate__", outputConfigGetstate)
         .def("__setstate__", outputConfigSetstate);
 
