@@ -174,6 +174,7 @@ class PyTorchModelEngine(ModelEngine):
         self.model = loader.load(checkpoint_dir=model_path,
                                  checkpoint_loader=checkpoint_loader,
                                  drafting_loop_wrapper=drafting_loop_wrapper)
+        self.model_is_wrapped = drafting_loop_wrapper is not None
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
