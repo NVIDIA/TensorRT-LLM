@@ -7,7 +7,7 @@ from unittest import mock
 import pytest
 import torch
 import transformers
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -17,7 +17,6 @@ from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
 from tensorrt_llm._torch.pyexecutor import resource_manager
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.models import modeling_utils
 
@@ -400,10 +399,7 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
-        graph_runner = None
-        if use_cuda_graph:
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+        graph_runner = create_mock_cuda_graph_runner(1) if use_cuda_graph else None
 
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
@@ -417,13 +413,13 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                graph_runner.capture(1, lambda inputs: mistral.forward(**inputs), inputs)
+                graph_runner.capture(1, False, lambda inputs: mistral.forward(**inputs), inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(1, inputs)
+                    logits = graph_runner.replay(1, False, inputs)
                 return logits
 
         if use_cuda_graph:
