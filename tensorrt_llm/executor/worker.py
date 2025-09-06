@@ -18,8 +18,7 @@ from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import (BaseLlmArgs, KvCacheConnectorConfig,
-                               PybindMirror, TorchLlmArgs)
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, PybindMirror
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
@@ -86,7 +85,9 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(
             self)  # TODO: make it weakref
         self._executor_config = executor_config
-        self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
+            "pytorch", "_autodeploy"
+        ]
         self.llm_args = llm_args
 
         if not self._is_pytorch_backend and kv_connector_config is not None:
@@ -468,7 +469,6 @@ class GenerationExecutorWorker(GenerationExecutor):
                 )
 
         if self._is_pytorch_backend:
-            assert isinstance(self.llm_args, TorchLlmArgs)
             if not self.llm_args.disable_overlap_scheduler:
                 is_disaggregated = self.engine.kv_cache_transceiver is not None
                 if is_disaggregated and (
