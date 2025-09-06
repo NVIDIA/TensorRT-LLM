@@ -67,10 +67,37 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
     content: List[ChatCompletionLogProbsContent] = []
     for token_id, logprob in zip(token_ids, logprobs):
         token = tokenizer.decode(token_id)
+        # Handle different formats for logprobs
+        if isinstance(logprob, (int, float)):
+            # If logprob is already a number
+            logprob_value = float(logprob)
+        elif isinstance(logprob, dict):
+            # If logprob is a dict (e.g., from PyTorch backend with top-k logprobs),
+            # extract the logprob value for the actual token
+            logprob_value = logprob.get(token_id, -9999.0) if token_id in logprob else list(logprob.values())[0] if logprob else -9999.0
+        elif hasattr(logprob, 'logprob'):
+            # If logprob is an object with a logprob attribute (e.g., Logprob dataclass)
+            logprob_value = float(logprob.logprob)
+        elif hasattr(logprob, '__getitem__'):
+            # If logprob is indexable (list/tuple), take the first element
+            logprob_value = float(logprob[0]) if len(logprob) > 0 else -9999.0
+        else:
+            # Fallback - try to convert to float
+            try:
+                logprob_value = float(logprob)
+            except (TypeError, ValueError):
+                logprob_value = -9999.0
         # returning multiple logprobs is not supported
+        # Ensure logprob_value is a float
+        if not isinstance(logprob_value, (int, float)):
+            # If we still have a non-numeric value, extract it
+            if hasattr(logprob_value, 'logprob'):
+                logprob_value = float(logprob_value.logprob)
+            else:
+                logprob_value = -9999.0
         first_logprob = ChatCompletionLogProbsContent(
             token=token,
-            logprob=max(logprob, -9999.0),
+            logprob=max(float(logprob_value), -9999.0),
             bytes=list(token.encode("utf-8", errors="replace")))
         content.append(first_logprob)
     chat_logprobs = ChatCompletionLogProbs(content=content)
