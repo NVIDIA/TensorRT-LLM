@@ -1880,15 +1880,32 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
 @pytest.mark.skip(reason="https://nvbugs/5516660")
 @force_ampere
 @pytest.mark.parametrize(
-    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
-    [(2, None, True, False), (None, 2, False, False)])
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
+    [
+        # TRT backend test cases
+        (2, None, True, False, "trt"),  # prompt_logprobs with context_logits
+        (None, 2, False, False, "trt"),  # generation logprobs only (top-2)
+        (2, None, False, False,
+         "trt"),  # prompt_logprobs without context_logits
+        (None, None, False, False, "trt"),  # no logprobs at all
+        # PyTorch backend test cases (adjusted for PyTorch limitations)
+        (2, None, True, False, "pytorch"
+         ),  # prompt_logprobs with context_logits
+        (None, 1, False, False,
+         "pytorch"),  # generation logprobs only (top-1, PyTorch limit)
+        (2, None, False, False,
+         "pytorch"),  # prompt_logprobs without context_logits
+        (None, None, False, False, "pytorch"),  # no logprobs at all
+    ])
 def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                              logprobs: Optional[int],
                              return_context_logits: bool,
-                             return_generation_logits: bool):
-    llm_return_logprobs_test_harness(prompt_logprobs, logprobs,
+                             return_generation_logits: bool, backend: str):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
                                      return_context_logits,
-                                     return_generation_logits)
+                                     return_generation_logits,
+                                     backend=backend)
 
 
 @pytest.mark.skip(reason="https://nvbugs/5516660")

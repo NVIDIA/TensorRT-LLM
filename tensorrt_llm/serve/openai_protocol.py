@@ -250,6 +250,13 @@ class CompletionRequest(OpenAIBaseModel):
             "If true (the default), special tokens (e.g. BOS) will be added to "
             "the prompt."),
     )
+    prompt_logprobs: Optional[int] = Field(
+        default=None,
+        description=
+        ("Number of log probabilities to return for each token in the prompt. "
+         "If set, the response will include log probabilities for the prompt tokens."
+         ),
+    )
     response_format: Optional[ResponseFormat] = Field(
         default=None,
         description=
@@ -304,17 +311,13 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
 
-            # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=bool(self.logprobs),
+            # Support both logprobs and prompt_logprobs
+            logprobs=self.logprobs,
+            prompt_logprobs=self.prompt_logprobs,
         )
         return sampling_params
 
-    @model_validator(mode="before")
-    @classmethod
-    def check_logprobs(cls, data):
-        if data.get("logprobs"):
-            raise ValueError("logprobs is not supported")
-        return data
+    # Removed the check_logprobs validator since logprobs is now supported
 
     @model_validator(mode="before")
     @classmethod
@@ -565,6 +568,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "For most models, the chat template takes care of adding the "
             "special tokens so this should be set to false (as is the "
             "default)."),
+    )
+    prompt_logprobs: Optional[int] = Field(
+        default=None,
+        description=
+        ("Number of log probabilities to return for each token in the prompt. "
+         "If set, the response will include log probabilities for the prompt tokens."
+         ),
     )
     documents: Optional[List[Dict[str, str]]] = Field(
         default=None,

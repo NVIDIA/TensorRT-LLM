@@ -1604,6 +1604,7 @@ def test_openai_chat_example(llm_root, llm_venv, backend: str):
 
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_reasoning(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
