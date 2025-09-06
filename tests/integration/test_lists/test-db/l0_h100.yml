@@ -356,3 +356,17 @@ l0_h100:
   - examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16]
   - unittest/trt/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
   - unittest/trt/attention/test_gpt_attention_no_cache.py
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: fmha
+  tests:
+  - test_fmha.py::test_fmha

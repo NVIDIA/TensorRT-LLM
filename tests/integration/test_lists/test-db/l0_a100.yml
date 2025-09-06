@@ -107,3 +107,17 @@ l0_a100:
   - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-max_utilization---1-1-1-False-tensorrt_llm_bls]
   - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-guaranteed_no_evict---1-1-1-False-ensemble]
   - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: fmha
+  tests:
+  - test_fmha.py::test_fmha
