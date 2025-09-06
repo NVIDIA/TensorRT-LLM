@@ -147,6 +147,10 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
     collected_chunks = []
     collected_messages = []
     async for chunk in response:
+        # Last streaming response will only contains usage info
+        if len(chunk.choices) <= 0:
+            continue
+
         collected_chunks.append(chunk)
         collected_messages.append(chunk.choices[0].delta)
 
@@ -198,6 +202,10 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
     reasoning_chunks: list[str] = []
     tool_arg_chunks: list[str] = []
     async for chunk in response:
+        # Last streaming response will only contains usage info
+        if len(chunk.choices) <= 0:
+            continue
+
         delta = chunk.choices[0].delta
         if hasattr(delta, "tool_calls") and delta.tool_calls:
             function = delta.tool_calls[0].function
