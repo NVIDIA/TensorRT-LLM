@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
+from _torch.helpers import create_mock_engine
 from parameterized import parameterized
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLConfig
 from transformers import \
@@ -66,7 +67,7 @@ QWEN2_5_VL_7B_CONFIG = {
     "use_sliding_window": False,
     "vision_config": {
         "depth":
-        8,  # NOTE: Only 8 layers for testing, 32 layers for full model. At least 8 layer needed for global Attention
+        2,  # NOTE: Only 8 layers for testing, 32 layers for full model. At least 8 layer needed for global Attention
         "hidden_act": "silu",
         "hidden_size": 1280,
         "intermediate_size": 3420,
@@ -77,7 +78,7 @@ QWEN2_5_VL_7B_CONFIG = {
         "spatial_merge_size": 2,
         "spatial_patch_size": 14,
         "window_size": 112,
-        "fullatt_block_indexes": [7, 15, 23, 31],
+        "fullatt_block_indexes": [0],
         "tokens_per_second": 2,
         "temporal_patch_size": 2
     },
@@ -86,7 +87,7 @@ QWEN2_5_VL_7B_CONFIG = {
         "mrope_section": [16, 24, 24]
     },
     "vocab_size": 152064,
-    "attn_implementation": "flash_attention_2",
+    # "_attn_implementation": "flash_attention_2",
     "_name_or_path":
     str(os.path.join(llm_models_root(), "Qwen2.5-VL-7B-Instruct"))
 }
@@ -241,7 +242,7 @@ class TestQwen2_5_VL(unittest.TestCase):
 
         model_config = ModelConfig(pretrained_config=qwen2_5_vl_config)
         qwen2_5_vl = Qwen2_5_VLModel(model_config,
-                                     disable_fuse_rope=True).to(device)
+                                     disable_fuse_rope=False).to(device)
 
         prompt, media = self.get_test_inputs("image")
         prompt, media = prompt * 2, media * 2
@@ -346,9 +347,9 @@ class TestQwen2_5_VL(unittest.TestCase):
         Scenario(modality="multiple_image",
                  use_cuda_graph=False,
                  disable_fuse_rope=False),
-        # TODO: Achieve video accuracy
-        # Scenario(modality="video", use_cuda_graph=False,
-        #          disable_fuse_rope=False),
+        Scenario(modality="video",
+                 use_cuda_graph=False,
+                 disable_fuse_rope=False),
     ])
     @torch.no_grad()
     def test_qwen2_5_vl_allclose_to_hf(self, scenario: Scenario) -> None:
@@ -475,6 +476,12 @@ class TestQwen2_5_VL(unittest.TestCase):
                 keyword=["mrope_config.mrope_position_deltas"])
             gen_multimodal_params_list.append(multimodal_param)
 
+        graph_runner = None
+        if scenario.use_cuda_graph:
+            mock_engine = create_mock_engine(1)
+            mock_engine.use_mrope = True
+            graph_runner = CUDAGraphRunner(mock_engine)
+
         def run_forward(input_ids, position_ids, attn_metadata,
                         multimodal_params):
             attn_metadata.prepare()
@@ -484,26 +491,27 @@ class TestQwen2_5_VL(unittest.TestCase):
                                           attn_metadata=attn_metadata,
                                           multimodal_params=multimodal_params)
             else:
-                graph_runner = CUDAGraphRunner(attn_metadata.max_num_requests,
-                                               "cuda", attn_metadata)
+                inputs = {
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                    "attn_metadata": attn_metadata,
+                    "multimodal_params": multimodal_params,
+                }
                 graph_runner.capture(
-                    lambda inputs: qwen2_5_vl.forward(**inputs))
+                    batch_size=1,
+                    forward_fn=lambda inputs: qwen2_5_vl.forward(**inputs),
+                    initial_inputs=inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.run({
-                        "input_ids":
-                        input_ids,
-                        "position_ids":
-                        position_ids,
-                        "attn_metadata":
-                        attn_metadata,
-                        "multimodal_params":
-                        multimodal_params,
-                    })
+                    logits = graph_runner.replay(batch_size=1,
+                                                 current_inputs=inputs)
                 return logits
+
+        if scenario.use_cuda_graph:
+            attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
 
         with torch.inference_mode():
             attn_metadata.prepare()
