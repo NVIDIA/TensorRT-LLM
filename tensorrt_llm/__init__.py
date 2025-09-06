@@ -55,6 +55,7 @@ from .llmapi import LLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
+from .mm_disaggregated_params import MultimodalDisaggParams
 from .models.automodel import AutoConfig, AutoModelForCausalLM
 from .module import Module
 from .network import Network, net_guard
@@ -111,6 +112,7 @@ __all__ = [
     'TrtLlmArgs',
     'SamplingParams',
     'DisaggregatedParams',
+    'MultimodalDisaggParams',
     'KvCacheConfig',
     'math_utils',
     '__version__',
