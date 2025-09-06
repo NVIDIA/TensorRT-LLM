@@ -10,6 +10,7 @@ from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed import allgather
+from ..utils import create_lm_head_tp_mapping
 from .linear import Linear, TensorParallelMode
 
 
@@ -38,18 +39,7 @@ class LMHead(Linear):
         mapping = mapping or Mapping()
         if (mapping.enable_attention_dp
                 and getattr(mapping, 'enable_lm_head_tp_in_adp', False)):
-            lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))
-            assert mapping.tp_size % lm_tp_size == 0, f"mapping.tp_size % lm_tp_size == 0, {mapping.tp_size} % {lm_tp_size} != 0"
-            lm_pp_size = mapping.pp_size * mapping.tp_size // lm_tp_size
-            mapping = Mapping(
-                world_size=lm_tp_size * lm_pp_size,
-                rank=mapping.rank,
-                gpus_per_node=mapping.gpus_per_node,
-                tp_size=lm_tp_size,
-                pp_size=lm_pp_size,
-                enable_attention_dp=mapping.enable_attention_dp,
-                enable_lm_head_tp_in_adp=mapping.enable_lm_head_tp_in_adp,
-            )
+            mapping = create_lm_head_tp_mapping(self.mapping)
 
         tp_size = mapping.tp_size
 

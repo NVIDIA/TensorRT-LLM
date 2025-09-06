@@ -13,6 +13,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
                                   add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
+from ..utils import create_lm_head_tp_mapping
 from .interface import SpecMetadata
 
 if TYPE_CHECKING:
@@ -1123,20 +1124,7 @@ class MTPWorker(nn.Module):
                                     'enable_lm_head_tp_in_adp', False)):
             # For ADP + LM TP mode, we need to find the global argmax across all TP ranks
             # First, get local argmax and max values
-            lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))
-            assert self.model_config.mapping.tp_size % lm_tp_size == 0
-            lm_pp_size = self.model_config.mapping.pp_size * self.model_config.mapping.tp_size // lm_tp_size
-            mapping_lm_tp = Mapping(
-                world_size=lm_tp_size * lm_pp_size,
-                rank=self.model_config.mapping.rank,
-                gpus_per_node=self.model_config.mapping.gpus_per_node,
-                tp_size=lm_tp_size,
-                pp_size=lm_pp_size,
-                enable_attention_dp=self.model_config.mapping.
-                enable_attention_dp,
-                enable_lm_head_tp_in_adp=self.model_config.mapping.
-                enable_lm_head_tp_in_adp,
-            )
+            mapping_lm_tp = create_lm_head_tp_mapping(self.model_config.mapping)
             combined = self.get_local_max_and_combined(logits, mapping_lm_tp)
             gathered = allgather(combined, mapping_lm_tp, dim=-1)
             batch_size = logits.shape[0]
