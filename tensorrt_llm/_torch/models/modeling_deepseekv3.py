@@ -169,7 +169,7 @@ class DeepseekV3MTPHead(nn.Module):
 
         # Add pre-lm gather logic
         if (self.model_config.mapping.enable_attention_dp and getattr(
-                self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+                self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
             # ADP + LM TP mode: perform All-Gather before LM_head
             lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))
             assert self.model_config.mapping.tp_size % lm_tp_size == 0
@@ -182,20 +182,20 @@ class DeepseekV3MTPHead(nn.Module):
                 pp_size=lm_pp_size,
                 enable_attention_dp=self.model_config.mapping.
                 enable_attention_dp,
-                enable_lm_tp_in_adp=self.model_config.mapping.
-                enable_lm_tp_in_adp,
+                enable_lm_head_tp_in_adp=self.model_config.mapping.
+                enable_lm_head_tp_in_adp,
             )
             hidden_states = allgather(hidden_states, mapping_lm_tp, dim=0)
 
         # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
         if (not self.model_config.mapping.enable_attention_dp) or (
                 self.model_config.mapping.enable_attention_dp and getattr(
-                    self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+                    self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
             lm_head.gather_output = False
         logits = lm_head(hidden_states, is_mtp_head=True)
         if (not self.model_config.mapping.enable_attention_dp) or (
                 self.model_config.mapping.enable_attention_dp and getattr(
-                    self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+                    self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
             lm_head.gather_output = True
         return logits
 

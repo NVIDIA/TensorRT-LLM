@@ -37,7 +37,7 @@ class LMHead(Linear):
         local_out_features = num_embeddings
         mapping = mapping or Mapping()
         if (mapping.enable_attention_dp
-                and getattr(mapping, 'enable_lm_tp_in_adp', False)):
+                and getattr(mapping, 'enable_lm_head_tp_in_adp', False)):
             lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))
             assert mapping.tp_size % lm_tp_size == 0, f"mapping.tp_size % lm_tp_size == 0, {mapping.tp_size} % {lm_tp_size} != 0"
             lm_pp_size = mapping.pp_size * mapping.tp_size // lm_tp_size
@@ -48,7 +48,7 @@ class LMHead(Linear):
                 tp_size=lm_tp_size,
                 pp_size=lm_pp_size,
                 enable_attention_dp=mapping.enable_attention_dp,
-                enable_lm_tp_in_adp=mapping.enable_lm_tp_in_adp,
+                enable_lm_head_tp_in_adp=mapping.enable_lm_head_tp_in_adp,
             )
 
         tp_size = mapping.tp_size
@@ -103,7 +103,7 @@ class LMHead(Linear):
         is_mtp_head: bool = False,
     ) -> torch.Tensor:
         if is_mtp_head and (self.mapping.enable_attention_dp and getattr(
-                self.mapping, 'enable_lm_tp_in_adp', False)):
+                self.mapping, 'enable_lm_head_tp_in_adp', False)):
             tp_rank = self.mapping.tp_rank
             tp_size = self.mapping.tp_size
             tensor_shape = self.weight.shape

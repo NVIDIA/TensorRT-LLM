@@ -1119,7 +1119,7 @@ class MTPWorker(nn.Module):
               and hasattr(self.model_config, 'mapping')
               and self.model_config.mapping.tp_size > 1) and (
                   self.model_config.mapping.enable_attention_dp and getattr(
-                      self.model_config.mapping, 'enable_lm_tp_in_adp', False)):
+                      self.model_config.mapping, 'enable_lm_head_tp_in_adp', False)):
             # For ADP + LM TP mode, we need to find the global argmax across all TP ranks
             # First, get local argmax and max values
             lm_tp_size = int(os.getenv('LM_TP_SIZE', 2))
@@ -1133,8 +1133,8 @@ class MTPWorker(nn.Module):
                 pp_size=lm_pp_size,
                 enable_attention_dp=self.model_config.mapping.
                 enable_attention_dp,
-                enable_lm_tp_in_adp=self.model_config.mapping.
-                enable_lm_tp_in_adp,
+                enable_lm_head_tp_in_adp=self.model_config.mapping.
+                enable_lm_head_tp_in_adp,
             )
             combined = self.get_local_max_and_combined(logits, mapping_lm_tp)
             gathered = allgather(combined, mapping_lm_tp, dim=-1)
