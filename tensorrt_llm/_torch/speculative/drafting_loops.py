@@ -20,8 +20,7 @@ from tensorrt_llm._torch.speculative.interface import SpecMetadata
 @contextmanager
 def save_metadata_state(attn_metadata: AttentionMetadata,
                         spec_metadata: SpecMetadata) -> None:
-    attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda",
-                                       "kv_lens_cuda")
+    attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
     batch_size = attn_metadata.num_seqs
 
     if attn_metadata.is_cuda_graph:
