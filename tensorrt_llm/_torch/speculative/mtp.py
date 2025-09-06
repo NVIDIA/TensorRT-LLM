@@ -7,6 +7,7 @@ from torch import nn
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
+from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
@@ -100,7 +101,7 @@ class MTPSpecMetadata(SpecMetadata):
     Metadata for MTP.
     """
     # The number of MTP modules in the model
-    mtp_num_modules: int = 1,
+    mtp_num_modules: int = 1
     # The hidden states manager for MTP
     mtp_hidden_states_manager: Optional[MTPHiddenStatesManager] = None
     # The slot ids for each request.
@@ -247,7 +248,7 @@ class MTPSampler(TorchSampler):
 
         state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
-        new_tokens_lens = state.host.new_tokens_lens
+        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = self.BEAM
         for req in state.scheduled_requests.context_requests:
@@ -260,12 +261,13 @@ class MTPSampler(TorchSampler):
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            num_new_tokens = new_tokens_lens[req.py_seq_slot]
+            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
                 if self._handle_stop_criteria(req, new_token):
                     break
-            req.py_rewind_len = self.draft_len - (num_new_tokens - 1)
+            req.py_num_accepted_draft_tokens = num_new_tokens - 1
+            req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list)
 
     def sample_async(
@@ -325,6 +327,7 @@ class MTPWorker(nn.Module):
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
+        self.guided_decoder: Optional[CapturableGuidedDecoder] = None
 
     def forward(
         self,
@@ -438,8 +441,12 @@ class MTPWorker(nn.Module):
 
         batch_size = attn_metadata.num_seqs
 
-        # Sample and verify draft tokens
         raw_logits = logits
+
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
+
+        # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
 
@@ -470,11 +477,20 @@ class MTPWorker(nn.Module):
         next_draft_tokens = []
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-        for _, mtp_layer in enumerate(draft_model.mtp_layers):
+        for i, mtp_layer in enumerate(draft_model.mtp_layers):
+            if self.guided_decoder is not None:
+                new_tokens = draft_inputs['input_ids'][last_tokens_idx]
+                self.guided_decoder.add_draft_batch(new_tokens,
+                                                    num_accepted_tokens,
+                                                    draft_step=i)
+
             hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                       **draft_inputs)
             logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
                                            attn_metadata).float()
+            if self.guided_decoder is not None:
+                self.guided_decoder.execute_draft_batch(logits, draft_step=i)
+
             new_draft_token = self.draft_sampler(logits)
             next_draft_tokens.append(new_draft_token)
             # shift input_ids and hidden_states
@@ -580,21 +596,23 @@ class MTPWorker(nn.Module):
             None
         '''
 
-        def unpack_sequence(packed_seq, seq_len):
-            max_length = seq_len.max()
-            num_sequences = seq_len.shape[0]
+        def unpack_sequence(packed_seq_cuda, seq_lens_cuda, seq_lens_cpu):
+            # max_length is used as tensor shape, so it should be from host;
+            # otherwise, an implicit D2H copy will be triggered.
+            max_length = seq_lens_cpu.max().item()
+            num_sequences = seq_lens_cuda.shape[0]
             # initialize a zero tensor to store the result
             result = torch.zeros(
-                (num_sequences, max_length, packed_seq.shape[1]),
-                dtype=packed_seq.dtype,
-                device=packed_seq.device)
+                (num_sequences, max_length, packed_seq_cuda.shape[1]),
+                dtype=packed_seq_cuda.dtype,
+                device=packed_seq_cuda.device)
             # get mask
             seq_indices = torch.arange(
-                max_length,
-                device=seq_len.device).unsqueeze(0).expand(num_sequences, -1)
-            mask = seq_indices < seq_len.unsqueeze(1)
+                max_length, device=seq_lens_cuda.device).unsqueeze(0).expand(
+                    num_sequences, -1)
+            mask = seq_indices < seq_lens_cuda.unsqueeze(1)
             # unpack
-            result[mask] = packed_seq
+            result[mask] = packed_seq_cuda
             return result
 
         batch_size = attn_metadata.num_seqs
@@ -602,6 +620,7 @@ class MTPWorker(nn.Module):
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_gens = batch_size - num_contexts
         seq_lens = attn_metadata.seq_lens_cuda
+        seq_lens_cpu = attn_metadata.seq_lens
         hidden_size = hidden_states.shape[-1]
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
 
@@ -624,11 +643,13 @@ class MTPWorker(nn.Module):
             # context
             if num_contexts > 0:
                 seq_lens_ctx = seq_lens[:num_contexts]
+                seq_lens_ctx_cpu = seq_lens_cpu[:num_contexts]
                 unpacked_input_ids_ctx = unpack_sequence(
-                    input_ids[:num_ctx_tokens].unsqueeze(1),
-                    seq_lens_ctx).squeeze(2)
+                    input_ids[:num_ctx_tokens].unsqueeze(1), seq_lens_ctx,
+                    seq_lens_ctx_cpu).squeeze(2)
                 unpacked_hidden_states_ctx = unpack_sequence(
-                    hidden_states[:num_ctx_tokens], seq_lens_ctx)
+                    hidden_states[:num_ctx_tokens], seq_lens_ctx,
+                    seq_lens_ctx_cpu)
                 cat_tokens_ctx = torch.cat(
                     (mtp_tokens[:num_contexts], unpacked_input_ids_ctx), dim=1)
                 cat_hidden_states_ctx = torch.cat(
@@ -859,6 +880,7 @@ class MTPWorker(nn.Module):
 
     def change_attn_metadata(self, num_accepted_tokens: torch.Tensor,
                              attn_metadata: AttentionMetadata):
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
         batch_size = attn_metadata.num_seqs
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
 
@@ -882,10 +904,7 @@ class MTPWorker(nn.Module):
                     i] -= mtp_num_modules + 1 - num_accepted_tokens[i].item()
 
     def restore_attn_metadata(self, attn_metadata: AttentionMetadata):
-        batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        attn_metadata._seq_lens[num_contexts:batch_size] += 1
-        attn_metadata._seq_lens_cuda[num_contexts:batch_size] += 1
+        attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
 
     def prepare_drafter_inputs(
@@ -1101,6 +1120,11 @@ class MTPWorker(nn.Module):
 
         return draft_tokens
 
+    def set_guided_decoder(self,
+                           guided_decoder: CapturableGuidedDecoder) -> bool:
+        self.guided_decoder = guided_decoder
+        return True
+
 
 class MTPEagleWorker(MTPWorker):
 
@@ -1134,15 +1158,17 @@ class MTPEagleWorker(MTPWorker):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        # Sample and verify draft tokens
         raw_logits = logits
+
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
+
+        # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
 
         # Save the old attn_metadata and spec_metadata
-        if attn_metadata.is_cuda_graph:
-            seq_len = attn_metadata._seq_lens[:batch_size].clone()
-            seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
         # Prepare inputs for the 1st MTP layer
         @torch.compile(options={"max-autotune": True})
@@ -1194,9 +1220,19 @@ class MTPEagleWorker(MTPWorker):
                     **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+
+            if self.guided_decoder is not None:
+                new_tokens = inputs["input_ids"][gather_ids]
+                self.guided_decoder.add_draft_batch(new_tokens,
+                                                    num_accepted_tokens,
+                                                    draft_step=i)
+
             logits = draft_model.mtp_layers[0].shared_head(
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata,
                 True)
+            if self.guided_decoder is not None:
+                self.guided_decoder.execute_draft_batch(logits, draft_step=i)
+
             new_draft_token = self.draft_sampler(logits)
 
             hidden_states, position_ids = self.update_draft_tokens(
@@ -1244,10 +1280,8 @@ class MTPEagleWorker(MTPWorker):
             }
 
         # restore attn_metadata to support cuda graph
-        if attn_metadata.is_cuda_graph:
-            attn_metadata._seq_lens[:batch_size].copy_(seq_len)
-            attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
-            attn_metadata.on_update()
+        attn_metadata.restore_from_spec_dec()
+        attn_metadata.on_update()
 
         @torch.compile(options={"max-autotune": True})
         def prepare_next_tokens(next_draft_tokens, accepted_tokens,

@@ -82,32 +82,41 @@ void initMoeBindings(nb::module_& m)
     // Bind SingleLayerMoeLoadBalancer class
     nb::class_<tr::SingleLayerMoeLoadBalancer>(m, "SingleLayerMoeLoadBalancer")
         .def("add_single_weight_slot", &tr::SingleLayerMoeLoadBalancer::addSingleWeightSlot, nb::arg("slot_id"),
-            nb::arg("name"), nb::arg("weight_slot"), "Add a single weight slot for a specific slot ID")
+            nb::arg("name"), nb::arg("weight_slot"), "Add a single weight slot for a specific slot ID",
+            nb::call_guard<nb::gil_scoped_release>())
         .def("add_single_host_weight", &tr::SingleLayerMoeLoadBalancer::addSingleHostWeight, nb::arg("expert_id"),
-            nb::arg("name"), nb::arg("host_weight"), "Add a single host weight for a specific expert ID")
+            nb::arg("name"), nb::arg("host_weight"), "Add a single host weight for a specific expert ID",
+            nb::call_guard<nb::gil_scoped_release>())
         .def("set_initial_weight_assignments", &tr::SingleLayerMoeLoadBalancer::setInitialWeightAssignments,
-            nb::arg("initial_weight_assignments"), "Set initial weight assignments for each slot")
+            nb::arg("initial_weight_assignments"), "Set initial weight assignments for each slot",
+            nb::call_guard<nb::gil_scoped_release>())
         .def("get_pointer", &tr::SingleLayerMoeLoadBalancer::getSelfPtr,
-            "Get the pointer of the SingleLayerMoeLoadBalancer")
+            "Get the pointer of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>())
         .def("get_layer_id", &tr::SingleLayerMoeLoadBalancer::getLayerId,
-            "Get the layer id of the SingleLayerMoeLoadBalancer");
+            "Get the layer id of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>());
 
     // Bind MoeLoadBalancer class
     nb::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
         .def(nb::init<int, int, int>(), nb::arg("ep_rank"), nb::arg("ep_size"), nb::arg("layer_updates_per_iter"),
-            "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency")
+            "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency",
+            nb::call_guard<nb::gil_scoped_release>())
         .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, nb::arg("use_gpu_memcpy"),
-            "Set whether to use GPU memcpy for weight updates")
+            "Set whether to use GPU memcpy for weight updates", nb::call_guard<nb::gil_scoped_release>())
         .def("add_layer", &tr::MoeLoadBalancer::AddLayer, nb::arg("expert_count"), nb::arg("top_k"),
-            nb::arg("slot_count_per_rank"), "Add a new MOE layer to the load balancer")
+            nb::arg("slot_count_per_rank"), "Add a new MOE layer to the load balancer",
+            nb::call_guard<nb::gil_scoped_release>())
         .def("finalize_model", &tr::MoeLoadBalancer::finalizeModel,
-            "Finalize the model structure, must be called after all layers are added")
+            "Finalize the model structure, must be called after all layers are added",
+            nb::call_guard<nb::gil_scoped_release>())
         .def("set_warm_up_iter_count", &tr::MoeLoadBalancer::setWarmUpIterCount, nb::arg("iter_count"),
-            "Set the number of warm-up iterations")
+            "Set the number of warm-up iterations", nb::call_guard<nb::gil_scoped_release>())
         .def("start_iter", &tr::MoeLoadBalancer::startIter, nb::arg("iter_id"), nb::arg("enable_statistic"),
-            nb::arg("enable_update_weights"), "Start a new iteration with the given ID and settings")
-        .def("end_iter", &tr::MoeLoadBalancer::endIter, nb::arg("iter_id"), "End the iteration with the given ID")
-        .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources");
+            nb::arg("enable_update_weights"), "Start a new iteration with the given ID and settings",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("end_iter", &tr::MoeLoadBalancer::endIter, nb::arg("iter_id"), "End the iteration with the given ID",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
+            nb::call_guard<nb::gil_scoped_release>());
 
     m.def("is_host_accessible_device_memory_supported", &tr::HostAccessibleDeviceAllocator::isSupported,
         "If current system support host accessible device memory");
