@@ -96,7 +96,7 @@ install_rockylinux_requirements() {
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
-        wget -q --timeout=180 --tries=3 "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
+        wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
     # Remove old packages
@@ -138,7 +138,7 @@ install_tensorrt() {
     if [ "$ARCH" = "x86_64" ];then
         curl -L --insecure --connect-timeout 600 --max-time 3600 --retry 3 -o /tmp/TensorRT.tar "${RELEASE_URL_TRT}"
     else
-        wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
+        wget --retry-connrefused --timeout=180 --tries=10 --continue ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     fi
     tar -xf /tmp/TensorRT.tar -C /usr/local/
     mv /usr/local/TensorRT-* /usr/local/tensorrt

@@ -68,7 +68,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         get_small_model_config(
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             attn_backend="flashinfer",
-            compile_backend="torch-opt",
+            compile_backend="torch-simple",
         ),
         get_small_model_config(
             "deepseek-ai/DeepSeek-V3",
