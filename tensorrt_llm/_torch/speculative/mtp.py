@@ -19,10 +19,6 @@ from .interface import SpecMetadata
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
-import os
-
-from tensorrt_llm.mapping import Mapping
-
 
 @dataclass(kw_only=True)
 class SampleStateTensorsMTP(SampleStateTensors):
@@ -1117,9 +1113,9 @@ class MTPWorker(nn.Module):
             gathered = allgather(combined, self.model_config.mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
         elif (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size
-                > 1) and self.model_config.mapping.enable_lm_head_tp_in_adp:
+              and hasattr(self.model_config, 'mapping')
+              and self.model_config.mapping.tp_size
+              > 1) and self.model_config.mapping.enable_lm_head_tp_in_adp:
             # For ADP + LM head TP mode, we need to find the global argmax across all TP ranks
             mapping_lm_tp = create_lm_head_tp_mapping(self.model_config.mapping)
             combined = self.get_local_max_and_combined(logits, mapping_lm_tp)

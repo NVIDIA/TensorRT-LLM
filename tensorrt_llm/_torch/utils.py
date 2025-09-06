@@ -12,8 +12,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 
-from .model_config import ModelConfig
-
 is_torch_compiling_flag = False
 
 aux_stream_name_list = [
