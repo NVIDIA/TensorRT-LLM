@@ -66,14 +66,6 @@ using OptVec = std::optional<std::vector<T>>;
 #error "TRTLLM_NB_MODULE must be defined"
 #endif
 
-namespace
-{
-tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& configs)
-{
-    return tr::SamplingConfig(configs);
-}
-} // namespace
-
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
     m.doc() = "TensorRT-LLM Python bindings for C++ runtime";
@@ -430,10 +422,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def("__getstate__", SamplingConfigGetState)
         .def("__setstate__", SamplingConfigSetState)
         .def("__eq__", &tr::SamplingConfig::operator==);
-
-    nb::bind_vector<std::vector<tr::SamplingConfig>>(m, "SamplingConfigVector");
-
-    m.def("make_sampling_config", &makeSamplingConfig, nb::arg("configs"));
 
     nb::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(nb::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,

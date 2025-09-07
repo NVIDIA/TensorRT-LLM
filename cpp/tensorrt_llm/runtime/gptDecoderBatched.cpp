@@ -19,8 +19,6 @@
 #include "common.h"
 #include "decoderState.h"
 #include "iBuffer.h"
-#include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
@@ -39,37 +37,6 @@ GptDecoderBatched::GptDecoderBatched(GptDecoderBatched::CudaStreamPtr stream)
     : mRuntimeStream{std::move(stream)}
     , mBufferManager{mRuntimeStream}
 {
-}
-
-void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    std::vector<SamplingConfig> samplingConfigs;
-    samplingConfigs.reserve(genRequests.size());
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
-
-    SizeType32 batchIdx = 0;
-    for (auto const& llmReq : genRequests)
-    {
-        samplingConfigs.push_back(llmReq->mSamplingConfig);
-        batchSlotsRange[batchIdx] = llmReq->mSeqSlot.value();
-        batchIdx += 1;
-    }
-    auto const batchSize = batchIdx;
-    std::optional<SamplingConfig> samplingConfig;
-    if (batchSize > 0)
-    {
-        samplingConfig = SamplingConfig(samplingConfigs);
-    }
-    TensorPtr batchSlotsView = ITensor::slice(batchSlots, 0, batchSize);
-    mDecoder->disableLookahead(samplingConfig, batchSize, batchSlots);
-
-    CudaEvent event{};
-    mDecoderStream->record(event);
-    mRuntimeStream->wait(event);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,

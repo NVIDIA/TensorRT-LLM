@@ -25,11 +25,6 @@
 #include <memory>
 #include <vector>
 
-namespace tensorrt_llm::batch_manager
-{
-class LlmRequest;
-}
-
 namespace tensorrt_llm::runtime
 {
 class SamplingConfig;
@@ -81,17 +76,12 @@ class IGptDecoderBatched
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
-    using LlmRequestPtr = std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>;
-    using RequestVector = std::vector<LlmRequestPtr>;
     using TensorPtr = std::shared_ptr<ITensor>;
 
     //! @brief Setup the decoder before calling `forward()`
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
         = 0;
-
-    //! @brief Disable Lookahead decoding.
-    virtual void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
     virtual CudaEvent forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) = 0;

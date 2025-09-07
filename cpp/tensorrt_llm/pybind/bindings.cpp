@@ -60,14 +60,6 @@ using OptVec = std::optional<std::vector<T>>;
 #error "TRTLLM_PYBIND_MODULE must be defined"
 #endif
 
-namespace
-{
-tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& configs)
-{
-    return tr::SamplingConfig(configs);
-}
-} // namespace
-
 PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 {
     m.doc() = "TensorRT-LLM Python bindings for C++ runtime";
@@ -420,8 +412,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("normalize_log_probs", &tr::SamplingConfig::normalizeLogProbs)
         .def(py::pickle(SamplingConfigGetState, SamplingConfigSetState))
         .def("__eq__", &tr::SamplingConfig::operator==);
-
-    m.def("make_sampling_config", &makeSamplingConfig, py::arg("configs"));
 
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(py::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
