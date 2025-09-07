@@ -4,8 +4,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
-                          PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
+from transformers import (AutoConfig, AutoProcessor, AutoTokenizer,
+                          PretrainedConfig, PreTrainedModel,
+                          Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
     Qwen2_5_VisionTransformerPretrainedModel
@@ -333,9 +334,10 @@ class Qwen2VisionModelBase(nn.Module):
         # Currently, copying vision encoder on all devices.
         # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
         hf_model_config = AutoConfig.from_pretrained(model_path)
-        vision_model = model_class(config=hf_model_config.vision_config,
-                                   torch_dtype=pretrained_config.torch_dtype,
-                                   attn_implementation='flash_attention_2')
+        vision_model = model_class._from_config(
+            hf_model_config.vision_config,
+            torch_dtype=pretrained_config.torch_dtype,
+            attn_implementation='flash_attention_2')
         # TODO: Make vision model compatible with meta init mode and load_weights at the same place
         self.visual = vision_model.to(self.device)
         self.post_config()
