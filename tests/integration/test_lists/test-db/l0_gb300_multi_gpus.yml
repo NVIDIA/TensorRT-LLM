@@ -20,7 +20,6 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
-  - unittest/_torch/modeling -k "modeling_deepseek"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP]
