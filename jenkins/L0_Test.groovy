@@ -270,6 +270,163 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
     }
 }
 
+def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
+    // Run the isolated tests one by one to avoid any potential conflicts
+    def isolateTestList = preprocessedLists.isolate
+    echo "Found ${preprocessedLists.isolateCount} isolated tests to run"
+    sh "cat ${isolateTestList}"
+    def isolateTestLines = readFile(file: isolateTestList).readLines()
+
+    for (int i = 0; i < isolateTestLines.size(); i++) {
+        def isolateTestName = isolateTestLines[i].trim()
+        echo "Running isolated test ${i+1}/${isolateTestLines.size()}: ${isolateTestName}"
+
+        // Create a temporary file for this single isolated test
+        def singleTestFile = "${isolateTestList}_isolated_${i}.txt"
+        sh "echo '${isolateTestName}' > ${singleTestFile}"
+        sh "cat ${singleTestFile}"
+
+        def isolateTestCmdLine = testCmdLine.findAll { cmd ->
+            !cmd.contains("--test-list=") &&
+            !cmd.contains("--test-prefix=") &&
+            !cmd.contains("--csv=") &&
+            !cmd.contains("--junit-xml")
+        }
+        isolateTestCmdLine += ["--test-list=${singleTestFile}"]
+        isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
+        isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
+        isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+
+        try {
+            sh """
+                cd ${llmSrc}/tests/integration/defs && \
+                ${isolateTestCmdLine.join(" ")}
+            """
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            error "The isolated test ${isolateTestName} failed."
+        } finally {
+            // Clean up the temporary test file
+            sh "rm -f ${singleTestFile}"
+        }
+    }
+}
+
+def processShardTestList(llmSrc, testDBList, splitId, splits) {
+    // List tests in current shard before running pytest
+    echo "Listing tests in current shard (${splitId}/${splits}) before execution..."
+    def testListCmd = [
+        "LLM_ROOT=${llmSrc}",
+        "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
+        "pytest",
+        "--collect-only",
+        "--test-list=${testDBList}",
+        "--quiet",
+        "--rootdir ${llmSrc}/tests/integration/defs",
+        "--splits ${splits}",
+        "--group ${splitId}"
+    ]
+
+    def shardTestList = ""
+    try {
+        shardTestList = sh(
+            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')} | grep '::' | sed 's/.*::\\([^:]*\\)::.*/\\1/' | sort | uniq",
+            returnStdout: true
+        ).trim()
+    } catch (Exception e) {
+        echo "Warning: Could not list tests in shard: ${e.getMessage()}"
+        shardTestList = ""
+    }
+
+    if (shardTestList) {
+        echo "Tests in current shard:"
+        shardTestList.split('\n').each { test ->
+            if (test.trim()) {
+                echo "  - ${test.trim()}"
+            }
+        }
+
+        // Split the shard test list into regular and isolate tests
+        def shardRegularTests = []
+        def shardIsolateTests = []
+
+        // Read the original test list to check for ISOLATE markers
+        def originalTestLines = readFile(file: testDBList).readLines()
+        def isolateMarkerTests = originalTestLines.findAll { line ->
+            line.trim() && line.contains(' ISOLATE')
+        }.collect { line ->
+            line.replaceAll(' ISOLATE', '').trim()
+        }
+
+        shardTestList.split('\n').each { test ->
+            def trimmedTest = test.trim()
+            if (trimmedTest) {
+                if (isolateMarkerTests.contains(trimmedTest)) {
+                    shardIsolateTests.add(trimmedTest)
+                } else {
+                    shardRegularTests.add(trimmedTest)
+                }
+            }
+        }
+
+        echo "Regular tests in shard: ${shardRegularTests.size()}"
+        shardRegularTests.each { test ->
+            echo "  - ${test}"
+        }
+
+        echo "Isolate tests in shard: ${shardIsolateTests.size()}"
+        shardIsolateTests.each { test ->
+            echo "  - ${test}"
+        }
+
+        // Define file paths for regular and isolate tests
+        def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
+        def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
+
+        // Create shard-specific test files
+        if (shardRegularTests.size() > 0) {
+            def shardRegularContent = shardRegularTests.join('\n') + '\n'
+            sh "echo '${shardRegularContent.replace("'", "'\\''")}' > ${regularTestList}"
+            echo "Created ${regularTestList} with ${shardRegularTests.size()} regular tests for this shard"
+        } else {
+            sh "touch ${regularTestList}"
+            echo "No regular tests in this shard, created empty file: ${regularTestList}"
+        }
+
+        if (shardIsolateTests.size() > 0) {
+            def shardIsolateContent = shardIsolateTests.join('\n') + '\n'
+            sh "echo '${shardIsolateContent.replace("'", "'\\''")}' > ${isolateTestList}"
+            echo "Created ${isolateTestList} with ${shardIsolateTests.size()} isolate tests for this shard"
+        } else {
+            sh "touch ${isolateTestList}"
+            echo "No isolate tests in this shard, created empty file: ${isolateTestList}"
+        }
+
+        // Return preprocessed lists object for compatibility
+        return [
+            regular: regularTestList,
+            isolate: isolateTestList,
+            regularCount: shardRegularTests.size(),
+            isolateCount: shardIsolateTests.size()
+        ]
+    } else {
+        echo "No tests found in current shard or failed to list tests"
+        // Create empty files and preprocessed lists object
+        def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
+        def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
+        sh "touch ${regularTestList}"
+        sh "touch ${isolateTestList}"
+
+        return [
+            regular: regularTestList,
+            isolate: isolateTestList,
+            regularCount: 0,
+            isolateCount: 0
+        ]
+    }
+}
+
 def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner)
 {
     runner {
@@ -640,30 +797,6 @@ def trimForStageList(stageNameList)
     }
     return trimedList
 }
-
-def preprocessTestList(String testListFile)
-{
-    def regularTests = []
-    def isolateTests = []
-
-    // Read the test list file
-    def lines = readFile(file: testListFile).readLines()
-
-    lines.each { line ->
-        def trimmedLine = line.trim()
-        if (trimmedLine && !trimmedLine.startsWith('#')) {
-            if (trimmedLine.contains(' ISOLATE')) {
-                // Remove ' ISOLATE' from the line and add to isolate list
-                def cleanedLine = trimmedLine.replaceAll(' ISOLATE', '').trim()
-                if (cleanedLine) {
-                    isolateTests.add(cleanedLine)
-                }
-            } else {
-                // Add to regular test list
-                regularTests.add(trimmedLine)
-            }
-        }
-    }
 
     // Write the regular tests back to the original file
     def regularTestContent = regularTests.join('\n') + (regularTests.size() > 0 ? '\n' : '')
@@ -1734,12 +1867,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
 
-        // Preprocess the testDBList to separate ISOLATE tests
-        def preprocessedLists = preprocessTestList(testDBList)
-        def regularTestList = preprocessedLists.regular
-        def isolateTestList = preprocessedLists.isolate
+        // Process shard test list and create separate files for regular and isolate tests
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits)
 
-        testList = "${testList}_${splitId}"
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
             "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
@@ -1843,46 +1973,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        // Run the isolated tests one by one to avoid any potential conflicts
-        if (preprocessedLists.isolateCount > 0) {
-            echo "Found ${preprocessedLists.isolateCount} isolated tests to run"
-            def isolateTestLines = readFile(file: isolateTestList).readLines()
-
-            for (int i = 0; i < isolateTestLines.size(); i++) {
-                def isolateTestName = isolateTestLines[i].trim()
-                echo "Running isolated test ${i+1}/${isolateTestLines.size()}: ${isolateTestName}"
-
-                // Create a temporary file for this single isolated test
-                def singleTestFile = "${isolateTestList}_isolated_${i}.txt"
-                sh "echo '${isolateTestName}' > ${singleTestFile}"
-
-                def isolateTestCmdLine = testCmdLine.findAll { cmd ->
-                    !cmd.contains("--test-list=") &&
-                    !cmd.contains("--test-prefix=") &&
-                    !cmd.contains("--csv=") &&
-                    !cmd.contains("--junit-xml")
-                }
-                isolateTestCmdLine += ["--test-list=${singleTestFile}"]
-                isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
-                isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
-                isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
-
-                try {
-                    sh """
-                        cd ${llmSrc}/tests/integration/defs && \
-                        ${isolateTestCmdLine.join(" ")}
-                    """
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    error "The isolated test ${isolateTestName} failed."
-                } finally {
-                    // Clean up the temporary test file
-                    sh "rm -f ${singleTestFile}"
-                }
-            }
+        // Run the isolated tests if exists
+        if (preprocessedLists.isolatedCount > 0) {
+            echo "There are ${preprocessedLists.isolatedCount} isolated tests to run"
+            runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
         } else {
-            echo "No isolated tests to run"
+            echo "No isolated tests to run for stage ${stageName}"
         }
 
         if (perfMode) {
