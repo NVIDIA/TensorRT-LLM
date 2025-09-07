@@ -9,5 +9,6 @@ examples/**/.git
 examples/**/*.bin
 examples/**/*.engine
 examples/**/*.onnx
+examples/**/*.safetensors
 examples/**/c-model
 examples/models/core/gpt/gpt*

@@ -670,7 +670,7 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
-    // 34 parameters
+    /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -697,7 +697,8 @@ public:
         std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt);
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -745,6 +746,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
+    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
 
     void setStreaming(bool streaming);
@@ -780,6 +782,7 @@ public:
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
+    void setCacheSaltID(CacheSaltIDType cacheSaltID);
 
 private:
     friend class Serialization;
@@ -1006,7 +1009,8 @@ public:
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
         SizeType32 attentionDpEventsGatherPeriodMs = 5,
-        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
+        uint64_t const& maxGpuTotalBytes = 0);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] bool getEnablePartialReuse() const;
@@ -1022,11 +1026,12 @@ public:
     [[nodiscard]] size_t getEventBufferMaxSize() const;
     [[nodiscard]] bool getUseUvm() const;
     [[nodiscard]] SizeType32 getAttentionDpEventsGatherPeriodMs() const;
+    [[nodiscard]] uint64_t getMaxGpuTotalBytes() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
     void setCopyOnPartialReuse(bool copyOnPartialReuse);
-    void setMaxTokens(SizeType32 maxTokens);
+    void setMaxTokens(std::optional<SizeType32> maxTokens);
     void setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentionWindowVec);
     void setSinkTokenLength(SizeType32 sinkTokenLength);
     void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
@@ -1037,6 +1042,7 @@ public:
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
     void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
+    void setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1095,6 +1101,10 @@ private:
 
     /// @brief The period in milliseconds to gather attention DP events across ranks
     SizeType32 mAttentionDpEventsGatherPeriodMs;
+    /// @brief The maximum size in bytes of GPU memory that can be allocated for the KV cache.
+    /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
+    /// be allocated.
+    uint64_t mMaxGpuTotalBytes;
 };
 
 /// @brief Configuration class for the runtime perf knobs

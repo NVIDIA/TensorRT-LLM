@@ -339,7 +339,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
-        self.py_lora_task_layer_module_configs = None
+        self.py_lora_task_layer_module_configs: list[
+            tensorrt_llm.bindings.internal.runtime.
+            TaskLayerModuleConfig] | None = None
 
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
@@ -544,6 +546,7 @@ def executor_request_to_llm_request(
         priority=0.5,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
+        cache_salt_id=executor_request.cache_salt_id,
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
     if child_req_ids:

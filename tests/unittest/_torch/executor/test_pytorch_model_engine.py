@@ -67,6 +67,7 @@ class DummyModelEngine(PyTorchModelEngine):
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
+        self.model_is_wrapped = False
         super().__init__(model_path="",
                          pytorch_backend_config=pytorch_backend_config,
                          checkpoint_loader=None,
@@ -140,6 +141,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
         seqlens_and_batch_sizes = [
             (5, 1),
@@ -155,8 +158,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch.generation_requests = []
 
             pages_before = kv_cache_manager.get_num_free_blocks()
-            with model_engine._maybe_pad_batch(
-                    batch, kv_cache_manager) as padded_batch:
+            with model_engine.cuda_graph_runner.pad_batch(
+                    batch, resource_manager) as padded_batch:
                 # No padding for prefill
                 self.assertIs(batch, padded_batch)
             self.assertEqual(kv_cache_manager.get_num_free_blocks(),
@@ -166,9 +169,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch.context_requests = []
             batch.generation_requests = requests
             pages_before = kv_cache_manager.get_num_free_blocks()
-            new_dummy_block = 1 if model_engine.cuda_graph_dummy_request is None else 0
-            with model_engine._maybe_pad_batch(
-                    batch, kv_cache_manager) as padded_batch:
+            new_dummy_block = 1 if model_engine.cuda_graph_runner.padding_dummy_request is None else 0
+            with model_engine.cuda_graph_runner.pad_batch(
+                    batch, resource_manager) as padded_batch:
                 if batch_size < 8 and max_seq_len < 25:
                     self.assertEqual(
                         len(padded_batch.generation_requests) % 8, 0)

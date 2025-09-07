@@ -183,16 +183,17 @@ _str_to_binding_dtype_dict = dict(
 )
 _binding_to_str_dtype = {v: k for k, v in _str_to_binding_dtype_dict.items()}
 
-_binding_dtype_size = {
-    DataType.INT64: 8,
-    DataType.FLOAT: 4,
-    DataType.INT32: 4,
-    DataType.BF16: 2,
-    DataType.HALF: 2,
-    DataType.BOOL: 1,
-    DataType.FP8: 1,
-    DataType.INT8: 1,
-    DataType.UINT8: 1,
+_binding_dtype_bits = {
+    DataType.INT64: 64,
+    DataType.FLOAT: 32,
+    DataType.INT32: 32,
+    DataType.BF16: 16,
+    DataType.HALF: 16,
+    DataType.BOOL: 8,
+    DataType.FP8: 8,
+    DataType.INT8: 8,
+    DataType.UINT8: 8,
+    DataType.NVFP4: 4,
 }
 
 
@@ -204,6 +205,12 @@ def binding_to_str_dtype(binding_dtype) -> str:
 
 def binding_dtype_size(dtype: DataType):
     return _binding_dtype_size[dtype]
+
+
+def get_size_in_bytes(num_elements: int, dtype: DataType):
+    total_num_bits = _binding_dtype_bits[dtype] * num_elements
+    assert total_num_bits % 8 == 0, f"Total number of bits {total_num_bits} must be divisible by 8"
+    return total_num_bits // 8
 
 
 def str_dtype_to_binding(dtype):
@@ -922,11 +929,13 @@ class TensorWrapper:
         data_ptr: int,
         dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
         shape: Sequence[int],
+        strides: Optional[Sequence[int]] = None,
     ):
         assert isinstance(data_ptr, int)
         self._data_ptr = data_ptr
         self.dtype = dtype
         self.shape = shape
+        self.strides = strides
 
     def data_ptr(self):
         return self._data_ptr
@@ -962,10 +971,17 @@ class TensorWrapper:
     @property
     def __cuda_array_interface__(self):
         return {
-            "shape": self.shape,
-            "typestr": torch_dtype_to_np_typestr(self.dtype),
+            "shape":
+            self.shape,
+            "typestr":
+            torch_dtype_to_np_typestr(self.dtype),
             "data": (self.data_ptr() if self.numel() > 0 else 0, False),
-            "version": 3,
+            "strides": [
+                i * torch.tensor([], dtype=self.dtype).element_size()
+                for i in self.strides
+            ] if self.strides is not None else None,
+            "version":
+            3,
         }
 
     @staticmethod

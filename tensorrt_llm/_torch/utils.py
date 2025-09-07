@@ -80,7 +80,8 @@ def make_weak_ref(x):
 
     if isinstance(x, torch.Tensor):
         return convert_to_torch_tensor(
-            TensorWrapper(x.data_ptr(), x.dtype, x.shape)) if x.is_cuda else x
+            TensorWrapper(x.data_ptr(), x.dtype, x.shape,
+                          x.stride())) if x.is_cuda else x
     elif isinstance(x, tuple):
         return tuple(make_weak_ref(i) for i in x)
     elif isinstance(x, list):
@@ -275,3 +276,11 @@ def piecewise_cuda_graph(enable: bool):
         yield
     finally:
         set_piecewise_cuda_graph_flag(prev_enable)
+
+
+def set_per_request_piecewise_cuda_graph_flag(enable: bool):
+    _global_attrs.per_request_piecewise_cuda_graph_flag = enable
+
+
+def get_per_request_piecewise_cuda_graph_flag() -> bool:
+    return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)

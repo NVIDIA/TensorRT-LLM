@@ -171,6 +171,8 @@ class TrtllmAttentionWrapper:
         kv_scale_quant_orig: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         out_scale_sf: Optional[torch.Tensor] = None,
+        kv_scales_sf: Optional[torch.Tensor] = None,
+        kv_scales_sf_inv: Optional[torch.Tensor] = None,
         use_nvfp4_output: bool = False,
         use_paged_context_fmha: bool = False,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
@@ -216,6 +218,8 @@ class TrtllmAttentionWrapper:
             kv_scale_quant_orig (torch.Tensor): The tensor to store the scaling factor for dequantization from INT8/FP8 in the KV cache, with shape (1) on GPU.
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             out_scale_sf (torch.Tensor): The tensor to store the global scale for NVFP4 scaling factors, with shape (1) on GPU.
+            kv_scales_sf (torch.Tensor): The tensor to store the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
+            kv_scales_sf_inv (torch.Tensor): The tensor to store the inverse of the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
@@ -240,8 +244,8 @@ class TrtllmAttentionWrapper:
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
         self.workspace = workspace
         self.cache_indirection = cache_indirection
-        self.kv_scale_orig_quant = kv_scale_orig_quant
-        self.kv_scale_quant_orig = kv_scale_quant_orig
+        self.kv_scale_orig_quant = kv_scale_orig_quant if kv_scales_sf_inv is None else kv_scales_sf_inv
+        self.kv_scale_quant_orig = kv_scale_quant_orig if kv_scales_sf is None else kv_scales_sf
         self.out_scale = out_scale
         self.out_scale_sf = out_scale_sf
         self.use_paged_context_fmha = use_paged_context_fmha
@@ -478,7 +482,6 @@ class TrtllmAttentionWrapper:
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
         )
-
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
         return output, output_sf
@@ -765,8 +768,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
+
+            error_message = (
+                f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
+                f"exceeds the KV cache manager's maximum supported length "
+                f"({self.kv_cache_manager.max_seq_len}).")
+
             assert self.kv_lens[:self.num_seqs].max(
-            ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
+            ) <= self.kv_cache_manager.max_seq_len, error_message
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         self.kv_lens_runtime = self.kv_lens[:self.num_seqs]
@@ -1051,14 +1060,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
         self.v_head_dim = self.mla_params.v_head_dim if self.is_mla_enable else head_dim
-
-        self.kv_cache_scaling_factor = torch.tensor(
-            [1.0],
-            dtype=torch.float32,
-            device='cuda',
-        )
+        self.kv_cache_scaling_factor = torch.ones(1,
+                                                  dtype=torch.float32,
+                                                  device='cuda')
         self.kv_scale_quant_orig = self.kv_cache_scaling_factor
-        self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
+        self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1070,6 +1076,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
+            self.has_fp4_kv_cache = self.quant_config.layer_quant_mode.has_fp4_kv_cache(
+            )
 
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
@@ -1077,6 +1085,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_fp8_rowwise = self.quant_config.layer_quant_mode.has_fp8_rowwise(
             )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
+            self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
+            )
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if metadata.kv_cache_manager is None:
@@ -1092,6 +1102,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         out_scale: Optional[torch.Tensor] = None,
         out_scale_sf: Optional[torch.Tensor] = None,
+        kv_scales_sf: Optional[torch.Tensor] = None,
+        kv_scales_sf_inv: Optional[torch.Tensor] = None,
         *,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
@@ -1159,6 +1171,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_scale_quant_orig=self.kv_scale_quant_orig,
             out_scale=out_scale,
             out_scale_sf=out_scale_sf,
+            kv_scales_sf=kv_scales_sf,
+            kv_scales_sf_inv=kv_scales_sf_inv,
             use_nvfp4_output=use_nvfp4_output,
             use_paged_context_fmha=use_paged_context_fmha,
             attention_input_type=attention_input_type,
@@ -1182,7 +1196,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # Use UINT8 as the container dtype for NVFP4.
                 out_dtype = torch.uint8
             elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
-                  or self.has_fp8_rowwise) and self.has_fp8_kv_cache:
+                  or self.has_fp8_rowwise
+                  or self.has_w4a8_nvfp4_fp8) and (self.has_fp8_kv_cache
+                                                   or self.has_fp4_kv_cache):
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 

@@ -64,8 +64,10 @@ def _run_job(
     gm_transformed = InferenceOptimizer(
         None,
         {
-            "detect_dp_bmm_shard": {
+            "detect_sharding": {
                 "stage": "sharding",
+                "use_sharding_from_factory": False,
+                "sharding_dims": ["bmm"],
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -124,8 +126,9 @@ def _run_pattern_detection_job(
     optimizer = InferenceOptimizer(
         None,
         {
-            "detect_dp_bmm_shard": {
+            "detect_sharding": {
                 "stage": "sharding",
+                "use_sharding_from_factory": False,
             },
         },
     )

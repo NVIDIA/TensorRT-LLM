@@ -3,7 +3,8 @@ cd $resourcePathNode
 llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
 # generate .coveragerc in workspace
-cat << EOF > $jobWorkspace/.coveragerc
+coverageConfigFile="$jobWorkspace/.coveragerc"
+cat << EOF > "$coverageConfigFile"
 [run]
 branch = True
 data_file = $jobWorkspace/.coverage.$stageName
@@ -21,7 +22,7 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     which python3
     python3 --version
     apt-get install -y libffi-dev
-    nvidia-smi
+    nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
     cd $llmSrcNode && pip3 install --retries 1 -r requirements-dev.txt
     cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
     git config --global --add safe.directory "*"
@@ -34,7 +35,7 @@ else
     done
 fi
 testList="$testList_$splitId"
-export CPP_TEST_TIMEOUT_OVERRIDDEN=7200
+export CPP_TEST_TIMEOUT_OVERRIDDEN=$pytestTestTimeout
 export LLM_ROOT=$llmSrcNode
 export LLM_MODELS_ROOT=$MODEL_CACHE_DIR
 export UCX_TLS=^gdr_copy
@@ -43,6 +44,7 @@ testCmdLines=(
     "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
     "pytest"
     "-v"
+    "--timeout-method=thread"
     "--timeout=$pytestTestTimeout"
     "--test-list=$testListPathNode"
     "--waives-file=$waivesListPathNode"

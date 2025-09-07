@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
@@ -68,6 +69,7 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
 
 // Type alias for multimodal hash key (hash array + start offset)
 using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
@@ -114,6 +116,7 @@ struct BlockKey
     // Extra keys for multimodal data (similar to VLLM's approach)
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
     std::vector<MmKey> extraKeys;
+    std::optional<CacheSaltIDType> cacheSaltID = std::nullopt;
 
     BlockKey() = default;
 
@@ -128,24 +131,25 @@ struct BlockKey
     }
 
     explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
-        std::vector<MmKey> extraKeys = {})
+        std::vector<MmKey> extraKeys = {}, std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
         : usesExtraIds{usesExtraIds}
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
         , extraKeys{std::move(extraKeys)}
+        , cacheSaltID{cacheSaltID}
     {
     }
 
     bool operator==(BlockKey const& other) const noexcept
     {
         return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
-            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys);
+            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID);
     }
 
     int partialMatch(BlockKey const& other) const noexcept
     {
         SizeType32 numMatched{0};
-        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys)
+        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID)
         {
             auto [matchEnd, otherMatchEnd] = std::mismatch(
                 uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());
@@ -192,6 +196,8 @@ struct KvCacheStats
     float cacheHitRate;
     // Number of free blocks for every configured attention-window size.
     std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
+    // GPU bytes allocated for KV-cache
+    std::size_t allocatedBytes{};
 };
 
 // Basic building block of a paged KV cache - a single
@@ -477,7 +483,6 @@ public:
     SizeType32 numKvHeads;
     SizeType32 sizePerHead;
     SizeType32 tokensPerBlock;
-    SizeType32 quantSize;
     SizeType32 blockSize;
 
     // Memory pools. Primary is fast memory, secondary is slower memory used for offloading.
@@ -488,15 +493,14 @@ public:
     bool containsBlockScales;
 
     KVCacheBlockPool(SizeType32 numLayers, SizeType32 kvFactor, SizeType32 numKvHeads, SizeType32 sizePerHead,
-        SizeType32 tokensPerBlock, SizeType32 quantSize, runtime::ITensor::SharedPtr primaryPtr = nullptr,
+        SizeType32 tokensPerBlock, runtime::ITensor::SharedPtr primaryPtr = nullptr,
         runtime::ITensor::SharedPtr secondaryPtr = nullptr, bool containsBlockScales = false)
         : numLayers(numLayers)
         , kvFactor(kvFactor)
         , numKvHeads(numKvHeads)
         , sizePerHead(sizePerHead)
         , tokensPerBlock(tokensPerBlock)
-        , quantSize(quantSize)
-        , blockSize((numKvHeads * sizePerHead * tokensPerBlock) / quantSize)
+        , blockSize(numKvHeads * sizePerHead * tokensPerBlock)
         , primaryPtr(std::move(primaryPtr))
         , secondaryPtr(std::move(secondaryPtr))
         , containsBlockScales(containsBlockScales)
@@ -536,7 +540,8 @@ public:
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool,
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-        std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse);
+        std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager);
 
     ~WindowBlockManager();
 
@@ -642,6 +647,15 @@ public:
     [[nodiscard]] SizeType32 getBlockSize(SizeType32 poolIdx) const
     {
         return mPools.at(poolIdx).blockSize;
+    }
+
+    [[nodiscard]] SizeType32 getNumEltsPerContainer() const
+    {
+#ifdef ENABLE_FP4
+        return mDataType == nvinfer1::DataType::kFP4 ? 2 : 1;
+#else
+        return 1;
+#endif
     }
 
     [[nodiscard]] SizeType32 getNumPools(bool includeBlockScalePools = true) const noexcept
@@ -833,6 +847,8 @@ private:
     bool mEnablePartialReuse;
     // Whether partially matched blocks that are already in use should be copied and reused.
     bool mCopyOnPartialReuse;
+    // The kv cache connector manager
+    std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
 };
 
 class BlockManager
@@ -850,7 +866,8 @@ public:
         SizeType32 sinkBubbleLength, bool onboardBlocks, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnPartialReuse = true);
+        bool copyOnPartialReuse = true,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
 
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
@@ -1236,6 +1253,8 @@ public:
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockPoolPointers() const = 0;
 
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockScalePoolPointers() const = 0;
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getLayerToPoolMapping() const = 0;
 
     virtual void getBlockOffsetsOfBatch(
@@ -1285,6 +1304,7 @@ public:
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
         = 0;
 
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
 
@@ -1371,7 +1391,8 @@ public:
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true);
+        bool copyOnpartialReuse = true,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1381,7 +1402,8 @@ public:
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true);
+        bool copyOnpartialReuse = true,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1391,7 +1413,8 @@ public:
         bool enableBlockReuse = true, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true);
+        bool copyOnpartialReuse = true,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1474,6 +1497,7 @@ public:
                                                                    : static_cast<float>(kvCacheStats.reusedBlocks)
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
         kvCacheStats.numFreeBlocksPerWindowSize = getNumFreeBlocksPerWindowSize();
+        kvCacheStats.allocatedBytes = mAllocatedBytes;
         return kvCacheStats;
     }
 
@@ -1540,7 +1564,7 @@ public:
         return mLayerToPoolMapping;
     }
 
-    [[nodiscard]] runtime::ITensor::SharedPtr getBlockScalePoolPointers() const
+    [[nodiscard]] runtime::ITensor::SharedPtr getBlockScalePoolPointers() const override
     {
         // TODO: add a new optional model input so the attention plugin can access these
         return mBlockScalePoolPointers;
@@ -1621,6 +1645,7 @@ public:
     std::vector<SizeType32> getNewlyAllocatedBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
 
+    runtime::ITensor::SharedPtr getUniquePrimaryPool() const override;
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
 
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
@@ -1677,6 +1702,8 @@ private:
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;
     runtime::ITensor::SharedPtr mBlockScalePoolPointers;
+    // GPU bytes allocated for KV-cache
+    std::size_t mAllocatedBytes{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

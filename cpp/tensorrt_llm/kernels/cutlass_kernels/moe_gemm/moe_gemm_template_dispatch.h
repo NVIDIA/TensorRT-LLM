@@ -471,17 +471,18 @@ void dispatchMoeGemmToCutlass(GroupedGemmInput<T, WeightType, GemmOutputType, Ge
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs() const
+std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
+    bool supports_finalize_fusion) const
 {
-    return getConfigs(sm_);
+    return getConfigs(sm_, supports_finalize_fusion);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
-    int sm)
+    int sm, bool supports_finalize_fusion)
 {
-    std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs = getTmaWarpSpecializedConfigs(sm);
+    std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs
+        = getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion);
     std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
     std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
     return candidate_configs;
@@ -517,7 +518,8 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedConfigs(int sm)
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedConfigs(
+    int sm, bool supports_finalize_fusion)
 {
     using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     static constexpr auto weight_only_flag
@@ -554,6 +556,45 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
 
     std::vector<cutlass_extensions::CutlassGemmConfig> tma_ws_configs
         = kernels::cutlass_kernels::get_candidate_configs(sm, max_split_k, config_type_param);
+    if (supports_finalize_fusion)
+    {
+        // Duplicate the configs and set the epilogue fusion type to FINALIZE
+        auto finalize_configs = tma_ws_configs;
+        std::transform(finalize_configs.begin(), finalize_configs.end(), std::back_inserter(tma_ws_configs),
+            [](auto& config)
+            {
+                config.epilogue_fusion_type = cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+                return config;
+            });
+
+        // Finalize fusion is only supported for TMA epilogue schedule
+        tma_ws_configs.erase(std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
+                                 [](auto& config)
+                                 {
+                                     return config.epilogue_fusion_type
+                                         == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
+                                         && config.epilogue_schedule != cutlass_extensions::EpilogueScheduleType::TMA;
+                                 }),
+            tma_ws_configs.end());
+    }
+
+    auto swap_ab_configs = tma_ws_configs;
+    std::transform(swap_ab_configs.begin(), swap_ab_configs.end(), std::back_inserter(tma_ws_configs),
+        [](auto& config)
+        {
+            TLLM_CHECK_WITH_INFO(!config.swap_ab, "Swap AB is already set");
+            config.swap_ab = true;
+            return config;
+        });
+
+    if (use_w4_groupwise)
+    {
+        // w4 groupwise implementation requires swap_ab to be true
+        tma_ws_configs.erase(
+            std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(), [](auto& config) { return !config.swap_ab; }),
+            tma_ws_configs.end());
+    }
+
     return tma_ws_configs;
 }
 
@@ -566,11 +607,11 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isTmaWarpSpecializ
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpecialized() const
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpecialized(int sm)
 {
-    return (sm_ == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
-        || (sm_ >= 100 && sm_ < 120 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>())
-        || ((sm_ == 120 || sm_ == 121) && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
+    return (sm == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
+        || (sm >= 100 && sm < 120 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>())
+        || ((sm == 120 || sm == 121) && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
@@ -815,7 +856,9 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType>() && !use_w4afp8
         && !use_wfp4a16)
     {
-        auto configs = getTmaWarpSpecializedConfigs(sm_);
+        // Finalize fusion may not actually be supported by the kernel,
+        // if they are not we will catch the error and skip them
+        auto configs = getTmaWarpSpecializedConfigs(sm_, true);
         auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
         if constexpr (use_wfp4afp4)
         {
