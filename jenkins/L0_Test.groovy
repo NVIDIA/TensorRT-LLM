@@ -343,13 +343,24 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         }
 
         stage('Checking if the Node is Online') {
-            def counter = 0
-            // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
-            // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
-            while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
-                // Wait 10 minutes to check status of the node again
-                sleep(time: 10, unit: 'MINUTES')
-                counter++
+            withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                def remote = [
+                        ip           : cluster.ip,
+                        host         : cluster.host,
+                        user         : "${pipeline.USERNAME}",
+                        passwd       : "${pipeline.PASSWORD}",
+                        allowAnyHosts: true,
+                ]
+                def counter = 0
+                // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
+                // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
+                while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
+                    // Wait 10 minutes to check status of the node again
+                    sleep(time: 10, unit: 'MINUTES')
+                    // Avoid the node being stuck in the held state.
+                    Utils.exec(pipeline, Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""))
+                    counter++
+                }
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
