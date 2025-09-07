@@ -110,20 +110,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     constexpr int WARPS_PER_BLOCK = 8; // 256 threads / 32 threads per warp
     constexpr int WARP_SIZE = 32;
 
-    // Initialize completion_flags at kernel start
-    if (blockIdx.x == 0 && threadIdx.x == 0)
-    {
-        // Note: init flags that this rank will be writing to in the future, rather than local flags,
-        // which prevents racing for flags between ranks.
-        for (int target_rank = 0; target_rank < ep_size; target_rank++)
-        {
-            ptrs.completion_flags[target_rank][rank_id] = 0;
-        }
-        // Device-level threadfence prevents reordering the writing of the flags (which might be done by another thread
-        // in the same rank) in front of the initializations above.
-        __threadfence();
-    }
-
     // Determine which warp this thread belongs to and which token it handles
     int warp_id_in_block = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -173,36 +159,46 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         already_copied |= 1ULL << target_rank;
     }
 
-    // TODO: Is this membar sufficient/necessary?
-    // __threadfence_system();
+    // (A) __syncwarp guarantees: If lane0's sent data are visible, then all lanes' sent data are visible
+    __syncwarp();
 
     // Finished sending this token. Check if we're the last token to complete.
     if (lane_id == 0)
     {
-        int completed_tokens = atomicAdd(local_token_counter, 1) + 1;
-
-        if (completed_tokens == local_num_tokens)
+        int cnt;
+        // (B) .release guarantees: If increment of local_token_counter is visible, then lane0's sent data are visible
+        asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
+                     : "=r"(cnt) 
+                     : "l"(local_token_counter), "r"(1));
+        
+        if (cnt + 1 == local_num_tokens)  // The last token dispatched
         {
-            // Signal completion to all ranks with proper release semantics
+            // Signal to each target rank that this source rank has completed sending
             for (int target_rank = 0; target_rank < ep_size; target_rank++)
             {
-                // Set flag in target rank's completion flags array at position rank_id
-                int* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
-                // Use release store for cross-GPU visibility
-                asm volatile("st.release.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(1));
+                uint32_t* flag_addr = &ptrs.completion_ptrs.completion_flags[target_rank][rank_id];
+                uint32_t flag_value = *ptrs.completion_ptrs.flag_val;
+                // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
+                asm volatile("st.release.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
             }
 
-            // Busy wait until source_rank signals completion
+            // Busy wait until all source ranks targeting this rank have completed sending
+            uint32_t expected_value = *ptrs.completion_ptrs.flag_val;
             for (int source_rank = 0; source_rank < ep_size; source_rank++)
             {
-                int* flag_ptr = &ptrs.completion_flags[rank_id][source_rank];
-                int flag_value = 0;
+                volatile uint32_t* flag_ptr = &ptrs.completion_ptrs.completion_flags[rank_id][source_rank];
+                uint32_t flag_value;
                 do
                 {
-                    // Use acquire load for cross-GPU visibility
-                    asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-                } while (flag_value == 0);
+                    // Regular load is sufficient here since we're checking for equality
+                    flag_value = *flag_ptr;
+                    // printf("###Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
+                } while (flag_value != expected_value);
+                printf("###Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
             }
+
+            // Increment flag_val for usage in next communication
+            *ptrs.completion_ptrs.flag_val += 1;
         }
     }
 }
@@ -236,15 +232,17 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
             = params.payloads[i].element_size * params.payloads[i].elements_per_token;
     }
 
-    // Fill receive buffer pointers and completion flags
+    // Fill receive buffer pointers
     for (int rank = 0; rank < params.ep_size; rank++)
     {
         for (int payload = 0; payload < params.num_payloads; payload++)
         {
             kernel_ptrs.recv_buffers[rank][payload] = params.recv_buffers[rank][payload];
         }
-        kernel_ptrs.completion_flags[rank] = params.completion_flags[rank];
     }
+    
+    // Copy completion flag pointers
+    kernel_ptrs.completion_ptrs = params.completion_ptrs;
 
     moeA2ADispatchKernel<<<grid_size, kBlockSize, 0, params.stream>>>(params.token_selected_experts, kernel_ptrs,
         params.num_payloads, params.max_tokens_per_rank, params.send_counters, params.send_indices,
@@ -380,18 +378,6 @@ __global__ void moeA2ACombineKernel(int const* send_indices, // [local_num_token
     constexpr int WARPS_PER_BLOCK = 8;
     constexpr int WARP_SIZE = 32;
 
-    // Initialize completion_flags at kernel start
-    // if (blockIdx.x == 0 && threadIdx.x == 0) {
-    //     // Note: init flags that this rank will be writing to in the future, rather than local flags,
-    //     // which prevents racing for flags between ranks.
-    //     for (int target_rank = 0; target_rank < ep_size; target_rank++) {
-    //         ptrs.completion_flags[target_rank][rank_id] = 0;
-    //     }
-    //     // Device-level threadfence prevents reordering the writing of the flags (which might be done by another
-    //     thread in the same rank) in front of the initializations above.
-    //     __threadfence();
-    // }
-
     // One warp per token
     int warp_id_in_block = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -450,40 +436,46 @@ __global__ void moeA2ACombineKernel(int const* send_indices, // [local_num_token
         __syncwarp();
     }
 
+    // (A) __syncwarp guarantees: If lane0's combined data are visible, then all lanes' combined data are visible
+    __syncwarp();
+
     // Finished combining this token. Check if we're the last token to complete.
-    // if (lane_id == 0) {
-    //     atomicAdd(local_token_counter, 1);
+    if (lane_id == 0)
+    {
+        int cnt;
+        // (B) .release guarantees: If increment of local_token_counter is visible, then lane0's combined data are visible
+        asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
+                     : "=r"(cnt) 
+                     : "l"(local_token_counter), "r"(1));
+        
+        if (cnt + 1 == local_num_tokens)  // The last token combined
+        {
+            // Signal to each target rank that this source rank has completed combining
+            for (int target_rank = 0; target_rank < ep_size; target_rank++)
+            {
+                uint32_t* flag_addr = &ptrs.completion_ptrs.completion_flags[target_rank][rank_id];
+                uint32_t flag_value = *ptrs.completion_ptrs.flag_val;
+                // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
+                asm volatile("st.release.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
+            }
 
-    //     // Only the first thread in the block will do the synchronization - exactly the same thread as flag
-    //     initialization if(blockIdx.x == 0 && threadIdx.x == 0) {
-    //         // Busy wait until all tokens are completed
-    //         int completed_tokens;
-    //         do {
-    //             completed_tokens = *local_token_counter;
-    //         } while (completed_tokens != local_num_tokens);
+            uint32_t expected_value = *ptrs.completion_ptrs.flag_val;
+            // Busy wait until all source ranks targeting this rank have completed combining
+            for (int source_rank = 0; source_rank < ep_size; source_rank++)
+            {
+                volatile uint32_t* flag_ptr = &ptrs.completion_ptrs.completion_flags[rank_id][source_rank];
+            
+                uint32_t flag_value;
+                do
+                {
+                    flag_value = *flag_ptr;
+                } while (flag_value != expected_value);
+            }
 
-    //         //if (completed_tokens == local_num_tokens) {
-    //             // Signal completion to all ranks with proper release semantics
-    //             for (int target_rank = 0; target_rank < ep_size; target_rank++) {
-    //                 // Set flag in target rank's completion flags array at position rank_id
-    //                 int* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
-    //                 // Use release store for cross-GPU visibility
-    //                 asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(1));
-    //             }
-
-    //             // Busy wait until source_rank signals completion
-    //             for (int source_rank = 0; source_rank < ep_size; source_rank++) {
-    //                 int* flag_ptr = &ptrs.completion_flags[rank_id][source_rank];
-    //                 int flag_value = 0;
-    //                 do {
-    //                     // Use acquire load for cross-GPU visibility
-    //                     asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-    //                 } while (flag_value !=1 );
-    //             }
-    //         //}
-    //     }
-
-    // }
+            // Increment flag_val for potential next round
+            *ptrs.completion_ptrs.flag_val += 1;
+        }
+    }
 }
 
 // ============================================================================
@@ -509,12 +501,14 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Set output data pointer in src_data_ptrs[0]
     kernel_ptrs.src_data_ptrs[0] = params.output_data;
 
-    // Fill recv buffer and completion flags pointers
+    // Fill recv buffer pointers
     for (int rank = 0; rank < params.ep_size; rank++)
     {
         kernel_ptrs.recv_buffers[rank][0] = params.recv_buffers[rank];
-        kernel_ptrs.completion_flags[rank] = params.completion_flags[rank];
     }
+    
+    // Copy completion flag pointers
+    kernel_ptrs.completion_ptrs = params.completion_ptrs;
 
     // Launch appropriate kernel based on data type
     switch (params.dtype)

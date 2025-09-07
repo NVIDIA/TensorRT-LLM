@@ -25,8 +25,7 @@ from mpi4py import MPI
 
 import tensorrt_llm as tllm
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.distributed.ops import (moe_a2a_combine,
-                                                 moe_a2a_dispatch)
+from tensorrt_llm._torch.distributed import MoeAlltoAll
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -244,21 +243,16 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
 
-    # Initialize MnnvlMemory after setting CUDA device
-    MnnvlMemory.initialize()
-
     try:
         mapping = Mapping(
             rank=rank,
             tp_size=ep_size,
-            pp_size=1,
-            cp_size=1,
+            moe_ep_size=ep_size,
             world_size=ep_size,
         )
 
-        # Create MNNVL workspace (multi-GPU equivalent of single-GPU workspace)
-        mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
-        workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
+        # Create MoeAlltoAll manager
+        moe_a2a = MoeAlltoAll(mapping, max_tokens_per_rank, workspace_size_per_rank)
 
         # Get the number of tokens for this specific rank (same as single-GPU)
         rank_local_tokens = all_num_tokens[rank]
@@ -271,23 +265,27 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
 
         # Execute dispatch using wrapper to avoid pickle issues
         num_experts = ep_size * num_experts_per_rank
-        recv_buffers, send_counters, send_indices = moe_a2a_dispatch(
-            token_selected_experts, payloads, workspace, max_tokens_per_rank,
-            rank, ep_size, top_k, num_experts)
+        recv_buffers, send_counters, send_indices = moe_a2a.dispatch(
+            token_selected_experts, payloads, max_tokens_per_rank,
+            top_k, num_experts)
 
-        # The completion flags are stored after all payloads in the workspace
-        completion_flags_offset = sum(ep_size * max_tokens_per_rank *
-                                      (p.shape[1] * p.element_size())
-                                      for p in payloads)
-        # Each rank has ep_size flags (one from each source rank). Check all the flags are marked.
-        completion_flags_ptr = workspace[
-            rank, completion_flags_offset:completion_flags_offset + ep_size * 4]
-        completion_flags = completion_flags_ptr.view(torch.int32)
-        expected_flags = torch.ones(ep_size,
-                                    dtype=completion_flags.dtype,
-                                    device=completion_flags.device)
-        assert torch.all(completion_flags == expected_flags), (
-            f"Rank {rank} completion flags: {completion_flags}, expected: {expected_flags}"
+        # TODO: remove this after synchronization is okay.
+        # sync()
+
+        # Verify completion flags after dispatch
+        completion_flags_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.COMPLETION_FLAGS_OFFSET_INDEX].item()
+        completion_flags = moe_a2a.workspace[
+            rank, completion_flags_offset:completion_flags_offset + ep_size * 4].view(torch.int32).cpu()
+        flag_val_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.FLAG_VAL_OFFSET_INDEX].item()
+        expected_flag_val = moe_a2a.workspace[
+            rank, flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu() - 1
+
+
+        print("completion_flags_ptr (hex):", hex(moe_a2a.workspace[
+            rank, completion_flags_offset:completion_flags_offset + ep_size * 4].data_ptr()))
+
+        assert torch.all(completion_flags == expected_flag_val), (
+            f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
         )
 
         # Return results to be collected (move to CPU for MPI transfer)
@@ -584,19 +582,16 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
     """Worker function for dispatch and combine test."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
-    MnnvlMemory.initialize()
     device = torch.cuda.current_device()
 
     try:
         mapping = Mapping(rank=rank,
                           tp_size=ep_size,
-                          pp_size=1,
-                          cp_size=1,
+                          moe_ep_size=ep_size,
                           world_size=ep_size)
 
-        # Create workspace
-        mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
-        workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
+        # Create MoeAlltoAll manager
+        moe_a2a = MoeAlltoAll(mapping, max_tokens_per_rank, workspace_size_per_rank)
 
         rank_local_tokens = all_num_tokens[rank]
 
@@ -609,9 +604,9 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
 
         # Run dispatch
         num_experts = ep_size * num_experts_per_rank
-        recv_buffers, send_counters, send_indices = moe_a2a_dispatch(
-            token_selected_experts, payloads, workspace, max_tokens_per_rank,
-            rank, ep_size, top_k, num_experts)
+        recv_buffers, send_counters, send_indices = moe_a2a.dispatch(
+            token_selected_experts, payloads, max_tokens_per_rank,
+            top_k, num_experts)
 
         # TODO: remove this
         sync()
@@ -640,44 +635,29 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             ep_rank=rank,
             num_experts_per_rank=num_experts_per_rank).view(ep_size, max_tokens_per_rank, hidden_states_recv.shape[-1])
 
-        # Clear the workspace area where combine will place its flags
-        # This prevents reading stale data from dispatch
-        completion_flags_offset = ep_size * max_tokens_per_rank * hidden_size * 2  # bfloat16 = 2 bytes
-        workspace[rank, completion_flags_offset:completion_flags_offset +
-                  ep_size * 4].zero_()
-
         # TODO: remove this
         sync()
 
         # Run combine on the received data
-        combined_output = moe_a2a_combine(send_indices,
-                                          hidden_states_recv, workspace,
-                                          max_tokens_per_rank, rank, ep_size,
+        combined_output = moe_a2a.combine(send_indices,
+                                          hidden_states_recv,
+                                          max_tokens_per_rank,
                                           top_k)
 
         # TODO: remove this
         sync()
 
-        # Verify completion flags after combine (same pattern as dispatch)
-        # The completion flags are stored after the payload in the workspace
-        # For combine, we only have one payload (the processed hidden states)
-
-        # Each rank has ep_size flags (one from each source rank). Check all the flags are marked.
-        completion_flags_ptr = workspace[
-            rank, completion_flags_offset:completion_flags_offset +
-            ep_size * 4].clone()
-
-
-        completion_flags = completion_flags_ptr.view(torch.int32)
-        expected_flags = torch.ones(ep_size,
-                                    dtype=completion_flags.dtype,
-                                    device=completion_flags.device)
-
-        # # Use element-wise comparison to avoid kernel launch issues
-        if not torch.all(completion_flags == expected_flags).item():
-            print(
-                f"ERROR: Rank {rank} completion flags after combine: {completion_flags.tolist()}, expected: {expected_flags.tolist()}"
-            )
+        # Verify completion flags after combine
+        completion_flags_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.COMPLETION_FLAGS_OFFSET_INDEX].item()
+        completion_flags_ptr = moe_a2a.workspace[
+            rank, completion_flags_offset:completion_flags_offset + ep_size * 4]
+        completion_flags = completion_flags_ptr.view(torch.int32).cpu()
+        flag_val_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.FLAG_VAL_OFFSET_INDEX].item()
+        expected_flag_val = moe_a2a.workspace[
+            rank, flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu() - 1
+        assert torch.all(completion_flags == expected_flag_val), (
+            f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
+        )
 
         # Return results for verification
         return (

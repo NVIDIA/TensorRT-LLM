@@ -36,6 +36,15 @@ struct PayloadDescriptor
     int elements_per_token; // Number of elements per token (e.g., hidden_size, top_k)
 };
 
+// Completion flag pointers for synchronizatione
+struct CompletionFlagPtrs
+{
+    // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
+    uint32_t* completion_flags[kMaxRanks];
+    // The value of the flag for this round (stored on the local rank)
+    uint32_t* flag_val;
+};
+
 // Kernel pointers packed into a struct for device access
 // Dispatch kernel pointers - const source data
 struct DispatchKernelPointers
@@ -43,7 +52,7 @@ struct DispatchKernelPointers
     void const* src_data_ptrs[kMaxPayloads];     // Array of source data pointers
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers
     int payload_bytes_per_token[kMaxPayloads];   // Bytes per token for each payload
-    int* completion_flags[kMaxRanks];            // Per-rank completion flags pointers
+    CompletionFlagPtrs completion_ptrs;          // Completion flags for synchronization
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -51,7 +60,7 @@ struct CombineKernelPointers
 {
     void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
     void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
-    int* completion_flags[kMaxRanks];                  // Per-rank completion flags pointers
+    CompletionFlagPtrs completion_ptrs;                // Completion flags for synchronization
 };
 
 // Dispatch phase parameters
@@ -76,7 +85,7 @@ struct MoeA2ADispatchParams
 
     // Receive buffers and synchronization
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // Per-rank receive buffers for each payload
-    int* completion_flags[kMaxRanks];            // Per-rank completion flags pointers
+    CompletionFlagPtrs completion_ptrs;          // Completion flags for synchronization
 
     // Communication tracking
     int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
@@ -112,7 +121,7 @@ struct MoeA2ACombineParams
 
     // Synchronization
     int* local_token_counter;         // Atomic counter for completed tokens
-    int* completion_flags[kMaxRanks]; // Per-rank completion flags pointers
+    CompletionFlagPtrs completion_ptrs; // Completion flags for synchronization
 
     cudaStream_t stream;
 };
