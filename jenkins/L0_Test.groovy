@@ -798,41 +798,6 @@ def trimForStageList(stageNameList)
     return trimedList
 }
 
-    // Write the regular tests back to the original file
-    def regularTestContent = regularTests.join('\n') + (regularTests.size() > 0 ? '\n' : '')
-    if (regularTests.size() > 0) {
-        echo "Writing ${regularTests.size()} regular tests to ${testListFile}"
-        sh "echo 'Writing to file: ${testListFile}'"
-        sh "echo '${regularTestContent.replace("'", "'\\''")}' > ${testListFile}"
-        sh "echo 'File written. Contents:' && cat ${testListFile}"
-    } else {
-        echo "No regular tests found, creating empty file: ${testListFile}"
-        sh "touch ${testListFile}"
-        sh "echo 'Empty file created. File exists:' && ls -la ${testListFile}"
-    }
-
-    // Create a separate file for isolate tests
-    def isolateTestFile = testListFile.replaceAll('\\.txt$', '_isolate.txt')
-    def isolateTestContent = isolateTests.join('\n') + (isolateTests.size() > 0 ? '\n' : '')
-    if (isolateTests.size() > 0) {
-        echo "Writing ${isolateTests.size()} isolate tests to ${isolateTestFile}"
-        sh "echo 'Writing to isolate file: ${isolateTestFile}'"
-        sh "echo '${isolateTestContent.replace("'", "'\\''")}' > ${isolateTestFile}"
-        sh "echo 'Isolate file written. Contents:' && cat ${isolateTestFile}"
-    } else {
-        echo "No isolate tests found, creating empty file: ${isolateTestFile}"
-        sh "touch ${isolateTestFile}"
-        sh "echo 'Empty isolate file created. File exists:' && ls -la ${isolateTestFile}"
-    }
-
-    return [
-        regular: testListFile,
-        isolate: isolateTestFile,
-        regularCount: regularTests.size(),
-        isolateCount: isolateTests.size()
-    ]
-}
-
 // Test filter flags
 @Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
