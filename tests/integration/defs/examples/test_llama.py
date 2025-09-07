@@ -4042,16 +4042,14 @@ def test_llama_3_x_fp8_with_bf16_lora(llama_example_root, llm_datasets_root,
 
 @skip_pre_ada
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize(
-    "llama_model_root",
-    [
-        'llama-v3-8b-instruct-hf',
-        'llama-3.1-8b-instruct',
-        'llama-3.2-1b-instruct',
-        'llama-3.2-3b-instruct',
-        # 'llama-3.3-70b-instruct', # TODO: Remains to be tested on 8 GPUs
-    ],
-    indirect=True)
+@pytest.mark.parametrize("llama_model_root", [
+    'llama-v3-8b-instruct-hf',
+    'llama-3.1-8b-instruct',
+    'llama-3.2-1b-instruct',
+    'llama-3.2-3b-instruct',
+    'llama-3.3-70b-instruct',
+],
+                         indirect=True)
 def test_llama_3_x_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
                                         qcache_dir_without_install_package,
                                         llm_venv, engine_dir, llama_model_root):
