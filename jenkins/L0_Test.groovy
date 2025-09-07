@@ -331,7 +331,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
     def shardTestList = ""
     try {
         shardTestList = sh(
-            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')} | grep '::' | sed 's/.*::\\([^:]*\\)::.*/\\1/' | sort | uniq",
+            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')} | grep '::'",
             returnStdout: true
         ).trim()
     } catch (Exception e) {
