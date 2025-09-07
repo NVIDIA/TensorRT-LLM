@@ -589,7 +589,8 @@ class PerfTestConfig:
             f"Invalid runtime {labels[0]}!"
         self.runtime = labels.pop(0)
         self.api = labels.pop(0) if labels[0] == "exe" else ""
-        self.backend = labels.pop(0) if labels[0] in ["pytorch", "_autodeploy"] else ""
+        self.backend = labels.pop(0) if labels[0] in ["pytorch", "_autodeploy"
+                                                      ] else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
         self.static_batching = labels.pop(
             0) if labels[0] == "static_batching" else ""
@@ -1316,10 +1317,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.backend == "_autodeploy":
             import yaml
             autodeploy_config_path = os.path.join(engine_dir,
-                                                 "extra_llm_api_options.yaml")
+                                                  "extra_llm_api_options.yaml")
             if not os.path.exists(autodeploy_config_path):
-                os.makedirs(os.path.dirname(autodeploy_config_path), exist_ok=True)
-            
+                os.makedirs(os.path.dirname(autodeploy_config_path),
+                            exist_ok=True)
+
             # Create _autodeploy specific configuration
             autodeploy_config = {
                 'compile_backend': self._config.ad_compile_backend,
@@ -1327,11 +1329,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 'runtime': self._config.extra_runtime,
                 'skip_loading_weights': self._config.skip_loading_weights
             }
-            
+
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:
                 yaml.dump(autodeploy_config, f, default_flow_style=False)
-            benchmark_cmd += [f"--extra_llm_api_options={autodeploy_config_path}"]
+            benchmark_cmd += [
+                f"--extra_llm_api_options={autodeploy_config_path}"
+            ]
         return benchmark_cmd
 
     def get_gpt_manager_runtime_benchmark_command(self, engine_dir, bs,
