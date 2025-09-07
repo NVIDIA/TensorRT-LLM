@@ -1130,7 +1130,7 @@ def transformMakoArgsToJson(optList) {
 
 def getMakoOpts(getMakoScript, makoArgs=[]) {
     // We want to save a map for the Mako opts
-    def turtleOutput = ""
+    def makoOutput = ""
 
     // Echo the command
     // NOTE: We redirect stderr to stdout so that we can capture
@@ -1154,17 +1154,17 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
 
         // Capture the mako output, add timeout in case any hang
         timeout(time: 30, unit: 'MINUTES'){
-            turtleOutput = sh(label: "Capture Mako Parameters", script: listMakoCmd, returnStdout: true)
+            makoOutput = sh(label: "Capture Mako Parameters", script: listMakoCmd, returnStdout: true)
         }
     }
 
     // Validate output
-    assert turtleOutput: "Mako opts not found - could not construct test db test list."
+    assert makoOutput: "Mako opts not found - could not construct test db test list."
 
-    // Split each line of turtle output into a list
-    def turtleOutList = turtleOutput.split("\n")
+    // Split each line of mako output into a list
+    def outputList = makoOutput.split("\n")
 
-    def makoOptsJson = transformMakoArgsToJson(turtleOutList)
+    def makoOptsJson = transformMakoArgsToJson(outputList)
 
     return makoOptsJson
 }
