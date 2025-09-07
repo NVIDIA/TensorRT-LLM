@@ -23,7 +23,7 @@
 namespace tensorrt_llm::common
 {
 
-constexpr static size_t getDTypeSize(nvinfer1::DataType type)
+static constexpr size_t getDTypeSize(nvinfer1::DataType type)
 {
     switch (type)
     {
@@ -43,7 +43,7 @@ constexpr static size_t getDTypeSize(nvinfer1::DataType type)
     return 0;
 }
 
-constexpr static size_t getDTypeSizeInBits(nvinfer1::DataType type)
+static constexpr size_t getDTypeSizeInBits(nvinfer1::DataType type)
 {
     switch (type)
     {
