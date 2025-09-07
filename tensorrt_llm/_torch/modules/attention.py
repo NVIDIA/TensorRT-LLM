@@ -285,7 +285,6 @@ class Attention(nn.Module):
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
         self.support_nvfp4_output = self.attn.support_nvfp4_output()
-        self.enable_attn_nvfp4_output = True
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -295,16 +294,10 @@ class Attention(nn.Module):
         # which could be modified after __init__
         self.attn.update_quant_config(self.quant_config)
 
-        self.out_scale = None
-        self.out_scale_sf = None
         self.o_proj.create_weights()
         self.has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                                 or self.o_proj.has_fp8_block_scales
                                 or self.o_proj.has_fp8_rowwise)
-        if self.has_quant_scale:
-            self.out_scale = self.o_proj.inv_input_scale.data
-        if self.o_proj.has_nvfp4 and self.support_nvfp4_output and self.enable_attn_nvfp4_output:
-            self.out_scale_sf = self.o_proj.input_scale.data
 
     def split_qkv(self, q, k=None, v=None):
         if k is None and v is None:
@@ -360,6 +353,13 @@ class Attention(nn.Module):
                 assert v.shape[0] == padded_num_tokens
                 v = v[:num_tokens, :]
 
+        out_scale = None
+        out_scale_sf = None
+        if self.has_quant_scale:
+            out_scale = self.o_proj.inv_input_scale
+        if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output:
+            out_scale_sf = self.o_proj.input_scale
+
         mrope_config = None
         if mrope_rotary_cos_sin is not None or mrope_position_deltas is not None:
             mrope_config = dict()
@@ -373,8 +373,8 @@ class Attention(nn.Module):
             k,
             v,
             attn_metadata,
-            out_scale=self.out_scale,
-            out_scale_sf=self.out_scale_sf,
+            out_scale=out_scale,
+            out_scale_sf=out_scale_sf,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
             attention_window_size=attention_window_size,

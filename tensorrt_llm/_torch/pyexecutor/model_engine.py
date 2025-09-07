@@ -959,7 +959,7 @@ class PyTorchModelEngine(ModelEngine):
 
             except Exception:
                 logger.info(
-                    f"Fallback to regular model init: {traceback.format_exc(limit=1)}\n"
+                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
 
