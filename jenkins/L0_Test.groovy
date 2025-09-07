@@ -1861,7 +1861,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Only add --test-list if there are regular tests to run
         if (preprocessedLists.regularCount > 0) {
-            testCmdLine.add(testCmdLine.size() - 4, "--test-list=${regularTestList}")
+            testCmdLine.add(testCmdLine.size() - 4, "--test-list=${preprocessedLists.regular}")
         }
         if (perfMode) {
             testCmdLine += [
