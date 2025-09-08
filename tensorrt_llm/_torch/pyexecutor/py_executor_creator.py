@@ -24,11 +24,11 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..distributed import MPIDist
+from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla)
+                    create_py_executor_instance, instantiate_sampler)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -238,7 +238,11 @@ def create_py_executor(
 
     mapping = _get_mapping(executor_config)
 
-    dist = MPIDist(mapping=mapping)
+    from tensorrt_llm._utils import mpi_disabled
+    if mpi_disabled():
+        dist = TorchDist(mapping=mapping)
+    else:
+        dist = MPIDist(mapping=mapping)
     cache_transceiver_config = executor_config.cache_transceiver_config
     spec_config = executor_config.speculative_config
     has_draft_model_engine = False

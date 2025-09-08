@@ -11,7 +11,7 @@ from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
 from tensorrt_llm._torch.pyexecutor.sampler_utils import (
     BEAM_0, SINGLE_BEAM_WIDTH, handle_stop_single_beam)
-from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
+from tensorrt_llm._utils import mpi_disabled, nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
@@ -1041,8 +1041,15 @@ class TRTLLMSampler(Sampler):
             2 if self.is_trt_overlap else 1)
         self.micro_batch_idx = 0
 
-        self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
-                                            mapping.tp_size, mapping.pp_size)
+        if mpi_disabled():
+            self.world_config = WorldConfig(mapping.tp_size,
+                                            mapping.pp_size,
+                                            mapping.cp_size,
+                                            gpus_per_node=mapping.gpus_per_node)
+        else:
+            self.world_config = WorldConfig.mpi(mapping.gpus_per_node,
+                                                mapping.tp_size,
+                                                mapping.pp_size)
         self.model_config = ModelConfig(vocab_size, num_hidden_layers,
                                         num_hidden_layers, 0, num_heads,
                                         hidden_size, self.model_datatype)

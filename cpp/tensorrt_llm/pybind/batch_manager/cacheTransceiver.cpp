@@ -26,10 +26,51 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 #include <torch/extension.h>
+#include <typeinfo>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 namespace tb = tensorrt_llm::batch_manager;
+
+namespace pybind11_conduit_v1
+{
+
+inline void* get_raw_pointer_ephemeral(PyObject* py_obj, std::type_info const* cpp_type_info, std::string pybind11_abi)
+{
+    PyObject* cpp_type_info_capsule = PyCapsule_New(
+        const_cast<void*>(static_cast<void const*>(cpp_type_info)), typeid(std::type_info).name(), nullptr);
+    if (cpp_type_info_capsule == nullptr)
+    {
+        return nullptr;
+    }
+    PyObject* cpp_conduit = PyObject_CallMethod(
+        py_obj, "_pybind11_conduit_v1_", "yOy", pybind11_abi.c_str(), cpp_type_info_capsule, "raw_pointer_ephemeral");
+    Py_DECREF(cpp_type_info_capsule);
+    if (cpp_conduit == nullptr)
+    {
+        return nullptr;
+    }
+    void* raw_ptr = PyCapsule_GetPointer(cpp_conduit, cpp_type_info->name());
+    Py_DECREF(cpp_conduit);
+    if (PyErr_Occurred())
+    {
+        return nullptr;
+    }
+    return raw_ptr;
+}
+
+template <typename T>
+T* get_type_pointer_ephemeral(PyObject* py_obj, std::string pybind11_abi)
+{
+    void* raw_ptr = get_raw_pointer_ephemeral(py_obj, &typeid(T), pybind11_abi);
+    if (raw_ptr == nullptr)
+    {
+        return nullptr;
+    }
+    return static_cast<T*>(raw_ptr);
+}
+
+} // namespace pybind11_conduit_v1
 
 namespace
 {
@@ -92,6 +133,83 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
             py::arg("cache_manager"), py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"),
             py::arg("tokens_per_block"), py::arg("world_config"), py::arg("attention_layer_num_per_pp"),
             py::arg("dtype"), py::arg("attention_type"), py::arg("cache_transceiver_config") = std::nullopt);
+
+    py::classh<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
+        .def(py::init(
+                 [](py::object pg_obj, std::string pybind11_abi)
+                 {
+                     auto* pg = pybind11_conduit_v1::get_type_pointer_ephemeral<c10d::ProcessGroup>(
+                         pg_obj.ptr(), pybind11_abi);
+                     if (pg == nullptr)
+                     {
+                         throw std::runtime_error("Failed to get process group pointer");
+                     }
+                     return tb::CacheTransceiverComm(c10::intrusive_ptr<c10d::ProcessGroup>::reclaim_copy(pg));
+                 }),
+            py::arg("process_group"), py::arg("pybind11_abi"))
+        .def("get_rank", &tb::CacheTransceiverComm::getRank)
+        .def("get_size", &tb::CacheTransceiverComm::getSize)
+        .def("split", &tb::CacheTransceiverComm::split, py::arg("color"), py::arg("key"))
+        .def(
+            "allgather",
+            [](tb::CacheTransceiverComm const& self, int64_t input)
+            {
+                std::vector<int64_t> out(static_cast<size_t>(self.getSize()));
+                c10d::AllgatherOptions options;
+                bool ok = self.allgather(input, std::ref(out), options);
+                return py::make_tuple(ok, out);
+            },
+            py::arg("input"))
+        .def(
+            "allgather",
+            [](tb::CacheTransceiverComm const& self, double input)
+            {
+                std::vector<double> out(static_cast<size_t>(self.getSize()));
+                c10d::AllgatherOptions options;
+                bool ok = self.allgather(input, std::ref(out), options);
+                return py::make_tuple(ok, out);
+            },
+            py::arg("input"))
+        .def(
+            "allgather",
+            [](tb::CacheTransceiverComm const& self, char input)
+            {
+                std::vector<char> out(static_cast<size_t>(self.getSize()));
+                c10d::AllgatherOptions options;
+                bool ok = self.allgather(input, std::ref(out), options);
+                return py::make_tuple(ok, out);
+            },
+            py::arg("input"))
+        .def(
+            "allgatherv",
+            [](tb::CacheTransceiverComm const& self, std::vector<int64_t> input, std::vector<int> const& sizes)
+            {
+                int total_size = std::accumulate(sizes.begin(), sizes.end(), 0);
+                std::vector<int64_t> output(total_size);
+                bool ok = self.allgatherv(std::ref(input), std::ref(output), std::cref(sizes));
+                return py::make_tuple(ok, output);
+            },
+            py::arg("input"), py::arg("sizes"))
+        .def(
+            "allgatherv",
+            [](tb::CacheTransceiverComm const& self, std::vector<double> input, std::vector<int> const& sizes)
+            {
+                int total_size = std::accumulate(sizes.begin(), sizes.end(), 0);
+                std::vector<double> output(total_size);
+                bool ok = self.allgatherv(std::ref(input), std::ref(output), std::cref(sizes));
+                return py::make_tuple(ok, output);
+            },
+            py::arg("input"), py::arg("sizes"))
+        .def(
+            "allgatherv",
+            [](tb::CacheTransceiverComm const& self, std::vector<char> input, std::vector<int> const& sizes)
+            {
+                int total_size = std::accumulate(sizes.begin(), sizes.end(), 0);
+                std::vector<char> output(total_size);
+                bool ok = self.allgatherv(std::ref(input), std::ref(output), std::cref(sizes));
+                return py::make_tuple(ok, output);
+            },
+            py::arg("input"), py::arg("sizes"));
 
     py::class_<tb::kv_cache_manager::CacheTransBufferManager>(m, "CacheTransBufferManager")
         .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), py::arg("cache_manager"),

@@ -1,6 +1,5 @@
 import bisect
 import contextlib
-import copy
 import functools
 import gc
 import inspect
@@ -990,7 +989,7 @@ class PyTorchModelEngine(ModelEngine):
 
             try:
                 # config will be modified in-place for some models, like Qwen2
-                config_copy = copy.deepcopy(config)
+                config_copy = config.clone()
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config_copy)
 
