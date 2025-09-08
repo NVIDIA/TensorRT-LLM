@@ -408,6 +408,7 @@ class Mistral3VLM(PreTrainedModel):
                 input_ids=input_ids,
                 mm_embeds=mm_embeds,
                 mm_token_ids=self._image_token_ids,
+                **kwargs,
             )
 
         return self.llm.forward(
@@ -500,6 +501,10 @@ class Mistral3VLM(PreTrainedModel):
             ) for image in pixel_values
         ]
         return torch.cat(pixel_values), batched_image_sizes
+
+    @property
+    def mm_token_ids(self):
+        return self._image_token_ids
 
 
 # Original implementation:
