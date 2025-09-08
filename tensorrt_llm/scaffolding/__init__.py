@@ -5,7 +5,7 @@ from .controller import (BestOfNController, Controller, MajorityVoteController,
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
 from .scaffolding_llm import ScaffoldingLlm
-from .task import GenerationTask, RewardTask, Task, TaskStatus
+from .task import GenerationTask, StreamGenerationTask,RewardTask, Task, TaskStatus
 from .task_collection import (GenerationTokenCounter, TaskCollection,
                               with_task_collection)
 from .worker import OpenaiWorker, TRTLLMWorker, TRTOpenaiWorker, Worker
@@ -20,6 +20,7 @@ __all__ = [
     "BestOfNController",
     "Task",
     "GenerationTask",
+    "StreamGenerationTask",
     "RewardTask",
     "Worker",
     "OpenaiWorker",

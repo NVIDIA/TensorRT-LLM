@@ -1,6 +1,7 @@
+import copy
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 
 import torch
 
@@ -114,6 +115,30 @@ class GenerationTask(Task):
 
     def create_scaffolding_output(self) -> GenerationResult:
         return self._result
+
+
+@dataclass
+class StreamGenerationTask(GenerationTask):
+    # input field
+    # if the flag is set to True, the worker will cancel the generation work
+    cancel_flag: Optional[bool] = field(default=False)
+    # the task will be returned to the controller with at least new streaming_step tokens
+    # if the streaming_step is set to 0,
+    # the task will be returned to the controller immediately with
+    # new tokens that have already been generated.
+    streaming_step: Optional[int] = field(default=1)
+
+    #result field
+    # worker set this field and identify the same task by this field
+    request_handle: Any = field(default=None)
+    # worker set this field to True when the generation is finished
+    end_flag: bool = field(default=False)
+
+    @staticmethod
+    def create_from_generation_task(task: GenerationTask) -> "StreamGenerationTask":
+        stream_task = StreamGenerationTask()
+        stream_task.__dict__ = copy.deepcopy(task.__dict__)
+        return stream_task
 
 
 @dataclass

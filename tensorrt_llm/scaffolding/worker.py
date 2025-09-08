@@ -1,6 +1,7 @@
 from abc import ABC
 from typing import Callable
 
+import asyncio
 import openai
 from transformers import AutoTokenizer
 
@@ -9,7 +10,7 @@ from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .task import GenerationTask, Task, TaskStatus
+from .task import GenerationTask, StreamGenerationTask, Task, TaskStatus
 
 ExecutorCls = GenerationExecutor
 
@@ -202,8 +203,45 @@ class TRTLLMWorker(Worker):
         # TODO: error handle
         return TaskStatus.SUCCESS
 
+    async def stream_generation_handler(self,
+                                    task: StreamGenerationTask) -> TaskStatus:
+
+        async def get_step_or_more_tokens(task: StreamGenerationTask):
+            if task.cancel_flag:
+                task.end_flag = True
+                task.request_handle.abort()
+                return TaskStatus.SUCCESS
+
+            for _ in range(task.streaming_step):
+                await task.request_handle._aresult_step()
+                if task.request_handle._done:
+                    break
+            while not task.request_handle._done:
+                async_task = asyncio.create_task(
+                    task.request_handle._aresult_step())
+                if not async_task.done():
+                    async_task.cancel()
+                    break
+            
+            '''
+            task.output_str = task.request_handle.outputs[0].text
+            task.output_tokens = task.request_handle.outputs[0].token_ids
+            task.cumulative_logprob = task.request_handle.outputs[
+                0].cumulative_logprob
+            task.logprobs = task.request_handle.outputs[0].logprobs
+            '''
+            if task.request_handle._done:
+                task.end_flag = True
+
+        sampling_params = self.convert_task_params(task)
+        if task.request_handle is None:
+            task.request_handle = self.llm.generate_async(
+                task.input_str, sampling_params=sampling_params, streaming=True)
+            task._result = task.request_handle
+        await get_step_or_more_tokens(task)
+
     def shutdown(self):
         if self.own_llm:
             self.llm.shutdown()
 
-    task_handlers = {GenerationTask: generation_handler}
+    task_handlers = {GenerationTask: generation_handler, StreamGenerationTask: stream_generation_handler}
