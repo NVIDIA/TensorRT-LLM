@@ -81,6 +81,77 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
+def initialize_dummy_weights(
+    model: torch.nn.Module,
+    low: float = -1e-3,
+    high: float = 1e-3,
+    seed: int = 0,
+) -> None:
+    """
+    This is similar to this function in SGLang with a few changes:
+    https://github.com/sgl-project/sglang/blob/e074e76b31d4fff13e87a455dbc3acdaa92c537a/python/sglang/srt/model_loader/weight_utils.py#L577
+    This method is used to initialize weights with dummy values for testing
+    models without checkpoints. Unquantized (FP16/BF16/etc) values are generated
+    from a uniform distribution over the interval (low, high).
+    For some quantized types (FP8/NVFP4), torch has no built-in way to generate random values.
+    We simply generate values uniformly across an interval that has been empirically verified
+    to not generate NaNs/inf for these.
+    """
+
+    def _get_random_min_max(dtype: torch.dtype) -> Tuple[int, int]:
+        # These values are not necessarily the largest possible min/max,
+        # they need to be small enough to avoid NaNs.
+        if dtype in (torch.float8_e4m3fn, torch.int8):
+            return (-3.0, 3.0)
+
+        elif dtype == float4_e2m1x2:
+            # These correspond to bits of 2 packed FP4 values.
+            # Because we only go up to 64, the high 4 bits will
+            # always be 0. But this is fine - we just need values
+            # that won't generate NaNs.
+            return (0, 64)
+
+        else:
+            raise NotImplementedError(f"Unknown quantized type: {dtype}.")
+
+    for param in model.state_dict().values():
+        generator = torch.Generator(device=param.data.device)
+        generator.manual_seed(seed)
+        dtype = param.data.dtype
+
+        if param.data.element_size() < 2:
+            # We need to do a cast/round since torch doesn't have uniform_
+            # support for these dtypes.
+            tmp_param = torch.empty(param.data.shape,
+                                    dtype=torch.float16,
+                                    device=param.data.device)
+
+            quant_min, quant_max = _get_random_min_max(dtype)
+            tmp_param = tmp_param.uniform_(quant_min,
+                                           quant_max,
+                                           generator=generator)
+
+            param.data.copy_(tmp_param.to(dtype))
+
+        # Note: no need to to mess with int32 params, these are probably
+        # constants and not weights.
+        elif torch.is_floating_point(param):
+            param.uniform_(low, high, generator=generator)
+
+
+def get_rank_model_storage(model):
+    total_bytes = 0
+    for _, param in model.named_parameters():
+        if param.device.type == 'cuda' and param.device.index == torch.cuda.current_device(
+        ):
+            total_bytes += param.element_size() * param.nelement()
+    for _, buf in model.named_buffers():
+        if buf.device.type == 'cuda' and buf.device.index == torch.cuda.current_device(
+        ):
+            total_bytes += buf.element_size() * buf.nelement()
+    return total_bytes
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -133,31 +204,77 @@ class ModelLoader:
         """
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
+        load_format = self.pytorch_backend_config.load_format
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
 
-            # Attempt to initialize the model on the meta device for speed
             try:
+                # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config_copy)
-                self._materialize_meta_model(model)
+
+                memo = dict()
+
+                def init_meta_tensor(t: torch.Tensor):
+                    if t.device != torch.device('meta'):
+                        return t
+                    if t not in memo:
+                        memo[t] = torch.empty_like(t, device='cuda')
+                    return memo[t]
+
+                model._apply(init_meta_tensor)
                 config = config_copy
+
             except Exception:
-                logger.info("Fallback to regular model init: "
-                            f"{traceback.format_exc(limit=1)}\n")
+                logger.info(
+                    f"Fallback to regular model init: {traceback.format_exc(limit=1)}\n"
+                )
                 model = AutoModelForCausalLM.from_config(config)
 
             model.to("cuda")
+            rank_model_storage = get_rank_model_storage(model)
+            logger.info(
+                f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
+            )
+            if load_format == LoadFormat.AUTO:
+                if hasattr(model, 'llm_checkpoint_dir'):
+                    weights = checkpoint_loader.load_weights(
+                        model.llm_checkpoint_dir)
+                else:
+                    weights = checkpoint_loader.load_weights(checkpoint_dir)
 
-            logger.info("Use %.2f GB for model weights.",
-                        self._get_rank_model_storage(model) / (1024**3))
+                weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                    model, config)
+                self._call_load_weights(model.load_weights, weights,
+                                        weight_mapper)
 
-            self._load_weights(model, config, checkpoint_dir, checkpoint_loader)
+                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                ):
+                    weights = checkpoint_loader.load_weights(
+                        self.spec_config.speculative_model_dir)
+                    self._call_load_weights(model.load_draft_weights, weights,
+                                            weight_mapper)
+
+            elif load_format == LoadFormat.DUMMY:
+                initialize_dummy_weights(model)
+                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                ):
+                    model.draft_model.load_weights_from_target_model(model)
+
+            elif load_format == LoadFormat.VISION_ONLY:
+                # Vision weights are already loaded within the model.
+                logger.info(
+                    "LoadFormat.VISION_ONLY: skipping weight loading; using preloaded vision weights."
+                )
+
+            else:
+                raise NotImplementedError(
+                    f"No load support for load format: {load_format}")
 
             if isinstance(moe_load_balancer, MoeLoadBalancer):
-                self.moe_load_balancer = moe_load_balancer
+                setattr(self, "moe_load_balancer", moe_load_balancer)
                 moe_load_balancer.register_weight_slots_after_to_cuda()
                 logger.info("moe_load_balancer finalizing model...")
                 moe_load_balancer.finalize_model()
@@ -167,45 +284,11 @@ class ModelLoader:
 
         if drafting_loop_wrapper is not None:
             model = drafting_loop_wrapper(model)
+            self.model_is_wrapped = True
+        else:
+            self.model_is_wrapped = False
 
         return model
-
-    def _load_weights(self, model: DecoderModelForCausalLM, config: ModelConfig,
-                      checkpoint_dir: str,
-                      checkpoint_loader: BaseCheckpointLoader):
-        """Handles the logic for loading weights based on the specified format."""
-        load_format = self.pytorch_backend_config.load_format
-
-        if load_format == LoadFormat.AUTO:
-            checkpoint_path = (getattr(model, 'llm_checkpoint_dir', None)
-                               or checkpoint_dir)
-            weights = checkpoint_loader.load_weights(checkpoint_path)
-            weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                model, config)
-            self._call_load_weights(model.load_weights, weights, weight_mapper)
-
-            # Load draft model weights if needed for speculative decoding
-            if self.spec_config and self.spec_config.spec_dec_mode.need_load_draft_weights(
-            ):
-                draft_weights = checkpoint_loader.load_weights(
-                    self.spec_config.speculative_model_dir)
-                self._call_load_weights(model.load_draft_weights, draft_weights,
-                                        weight_mapper)
-
-        elif load_format == LoadFormat.DUMMY:
-            self._initialize_dummy_weights(model)
-            if self.spec_config and self.spec_config.spec_dec_mode.need_load_draft_weights(
-            ):
-                model.draft_model.load_weights_from_target_model(model)
-
-        elif load_format == LoadFormat.VISION_ONLY:
-            logger.info(
-                "LoadFormat.VISION_ONLY: skipping weight loading; using preloaded vision weights."
-            )
-
-        else:
-            raise NotImplementedError(
-                f"No load support for load format: {load_format}")
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,
@@ -243,69 +326,10 @@ class ModelLoader:
                             sub_config).num_hidden_layers = num_layers_override
         return config
 
-    @staticmethod
-    def _materialize_meta_model(model: torch.nn.Module):
-        """Converts a model on the 'meta' device to a materialized model on CUDA."""
-        memo = {}
-
-        def init_meta_tensor(t: torch.Tensor):
-            if t.device != torch.device('meta'):
-                return t
-            if t not in memo:
-                memo[t] = torch.empty_like(t, device='cuda')
-            return memo[t]
-
-        model._apply(init_meta_tensor)
-
-    @staticmethod
-    def _call_load_weights(load_method: Callable, weights, weight_mapper):
+    def _call_load_weights(self, load_method: Callable, weights, weight_mapper):
         """Calls the model's weight loading method with the correct arguments."""
         args = inspect.getfullargspec(load_method).args
         if "weight_mapper" in args:
             load_method(weights, weight_mapper=weight_mapper)
         else:
             load_method(weights)
-
-    @staticmethod
-    def _get_rank_model_storage(model: torch.nn.Module) -> int:
-        """Calculates the total memory in bytes used by the model's weights and buffers on the current device."""
-        total_bytes = 0
-        current_device_idx = torch.cuda.current_device()
-        for param in model.parameters():
-            if param.device.type == 'cuda' and param.device.index == current_device_idx:
-                total_bytes += param.element_size() * param.nelement()
-        for buf in model.buffers():
-            if buf.device.type == 'cuda' and buf.device.index == current_device_idx:
-                total_bytes += buf.element_size() * buf.nelement()
-        return total_bytes
-
-    @staticmethod
-    def _initialize_dummy_weights(model: torch.nn.Module,
-                                  low: float = -1e-3,
-                                  high: float = 1e-3,
-                                  seed: int = 0) -> None:
-        """Initializes model weights with random dummy values for testing purposes."""
-
-        # This function's logic is copied directly from the original file
-        def _get_random_min_max(dtype: torch.dtype) -> Tuple[int, int]:
-            if dtype in (torch.float8_e4m3fn, torch.int8):
-                return (-3.0, 3.0)
-            elif dtype == float4_e2m1x2:
-                return (0, 64)
-            else:
-                raise NotImplementedError(f"Unknown quantized type: {dtype}.")
-
-        for param in model.state_dict().values():
-            generator = torch.Generator(device=param.data.device)
-            generator.manual_seed(seed)
-            dtype = param.data.dtype
-
-            if param.data.element_size() < 2:
-                tmp_param = torch.empty_like(param.data,
-                                             dtype=torch.float16,
-                                             device=param.data.device)
-                quant_min, quant_max = _get_random_min_max(dtype)
-                tmp_param.uniform_(quant_min, quant_max, generator=generator)
-                param.data.copy_(tmp_param.to(dtype))
-            elif torch.is_floating_point(param):
-                param.uniform_(low, high, generator=generator)
