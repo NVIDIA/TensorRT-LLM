@@ -226,6 +226,7 @@ class TrtllmAttentionWrapper:
             mrope_config (dict): The dictionary containing the mRope configuration.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
+            chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -862,7 +863,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
-        chunked_ld_global_offset: torch.
+        chunked_global_offset: torch.
         Tensor,  # [chunked_loop_num + 1, num_contexts]
         cu_chunked_seq_len: torch.Tensor,
         merge_op_tensor: torch.Tensor,
@@ -877,35 +878,32 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         chunk_size = self.runtime_features.chunk_size
         chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
         total_chunk_size = chunk_size * chunk_batch_size
-        cached_kv_lens = torch.tensor(
-            self.kv_cache_params.num_cached_tokens_per_seq,
-            dtype=torch.int,
-            device='cpu',
-        )
         remain_buffer_len = total_chunk_size
         current_batch_idx = 0
         max_chunk_len_per_loop.clear()
-        temp_max_chunk_len = 0
+        max_chunk_len = 0
         # cal chunked_seq_len
-        for b_id in range(num_contexts):
-            temp_cached_kv_len = cached_kv_lens[b_id].item()
-            while temp_cached_kv_len > 0:
-                used_buffer_len = min(remain_buffer_len, temp_cached_kv_len)
-                chunked_seq_len[current_batch_idx, b_id] = used_buffer_len
-                temp_max_chunk_len = max(temp_max_chunk_len, used_buffer_len)
+        for batch_idx in range(num_contexts):
+            cached_kv_len = self.kv_cache_params.num_cached_tokens_per_seq[
+                batch_idx]
+            while cached_kv_len > 0:
+                used_buffer_len = min(remain_buffer_len, cached_kv_len)
+                chunked_seq_len[current_batch_idx, batch_idx] = used_buffer_len
+                max_chunk_len = max(max_chunk_len, used_buffer_len)
                 remain_buffer_len -= used_buffer_len
-                temp_cached_kv_len -= used_buffer_len
-                chunked_ld_global_offset[
-                    current_batch_idx + 1, b_id] = chunked_ld_global_offset[
+                cached_kv_len -= used_buffer_len
+                chunked_global_offset[
+                    current_batch_idx + 1, batch_idx] = chunked_global_offset[
                         current_batch_idx,
-                        b_id] + chunked_seq_len[current_batch_idx, b_id]
+                        batch_idx] + chunked_seq_len[current_batch_idx,
+                                                     batch_idx]
                 if remain_buffer_len == 0:
                     current_batch_idx += 1
                     remain_buffer_len = total_chunk_size
-                    max_chunk_len_per_loop.append(temp_max_chunk_len)
-                    temp_max_chunk_len = 0
+                    max_chunk_len_per_loop.append(max_chunk_len)
+                    max_chunk_len = 0
         if len(max_chunk_len_per_loop) < chunked_loop_num:
-            max_chunk_len_per_loop.append(temp_max_chunk_len)
+            max_chunk_len_per_loop.append(max_chunk_len)
         assert len(
             max_chunk_len_per_loop
         ) == chunked_loop_num, f"max_chunk_len_per_loop size {len(max_chunk_len_per_loop)} != chunked_loop_num {chunked_loop_num}"
@@ -926,7 +924,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # set merge op for last attn
         for s in range(num_contexts):
-            if cached_kv_lens[s] == 0:
+            if self.kv_cache_params.num_cached_tokens_per_seq[s] == 0:
                 merge_op_tensor[chunked_loop_num, s] = 2  # copy only
             else:
                 merge_op_tensor[chunked_loop_num, s] = 1  # merge
@@ -950,9 +948,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 chunk_size = self.runtime_features.chunk_size
                 chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
                 total_chunk_size = chunk_size * chunk_batch_size
-                self.chunked_loop_num = (self.num_ctx_cached_tokens +
-                                         total_chunk_size -
-                                         1) // total_chunk_size
+                self.chunked_loop_num = math.ceil(self.num_ctx_cached_tokens /
+                                                  total_chunk_size)
                 self.chunked_seq_len = torch.zeros(
                     (self.chunked_loop_num, self.num_seqs),
                     dtype=torch.int,
@@ -973,13 +970,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
-                self.chunked_ld_global_offset = torch.zeros(
+                self.chunked_global_offset = torch.zeros(
                     (self.chunked_loop_num + 1, self.num_contexts),
                     dtype=torch.int64,
                     device='cuda',
                 )
-                self.host_chunked_ld_global_offset = torch.zeros_like(
-                    self.chunked_ld_global_offset,
+                self.host_chunked_global_offset = torch.zeros_like(
+                    self.chunked_global_offset,
                     device='cpu',
                     pin_memory=True,
                 )
@@ -998,7 +995,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
                 self.pre_process_for_chunked_prefill(
                     chunked_seq_len=self.host_chunked_seq_len,
-                    chunked_ld_global_offset=self.host_chunked_ld_global_offset,
+                    chunked_global_offset=self.host_chunked_global_offset,
                     cu_chunked_seq_len=self.host_cu_chunked_seq_len,
                     merge_op_tensor=self.host_merge_op_tensor,
                     max_chunk_len_per_loop=self.max_chunk_len_per_loop,
@@ -1009,8 +1006,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                               non_blocking=True)
                 self.merge_op_tensor.copy_(self.host_merge_op_tensor,
                                            non_blocking=True)
-                self.chunked_ld_global_offset.copy_(
-                    self.host_chunked_ld_global_offset, non_blocking=True)
+                self.chunked_global_offset.copy_(
+                    self.host_chunked_global_offset, non_blocking=True)
         else:
             self.num_ctx_cached_tokens = 0
             self.max_ctx_cached_token_len = 0
@@ -1404,7 +1401,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         num_ctx_cached_tokens: int,
         cu_chunked_seq_len: torch.Tensor,
-        chunked_ld_global_offset: torch.Tensor,
+        chunked_global_offset: torch.Tensor,
         chunked_max_seq_len: int,
         out_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1429,7 +1426,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.num_contexts,
             num_ctx_cached_tokens,
             cu_chunked_seq_len,
-            chunked_ld_global_offset,
+            chunked_global_offset,
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
