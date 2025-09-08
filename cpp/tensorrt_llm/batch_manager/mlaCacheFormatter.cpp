@@ -97,13 +97,10 @@ void MLACacheFormatter::format(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     TLLM_CHECK(!connections.empty());
-    // diff start
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
     }
-
-    // diff end
 
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
     auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
@@ -150,28 +147,28 @@ void MLACacheFormatter::format(TransferSession& session)
     auto cacheBlockSize = inputKvCacheBlocks.at(0)->getSize();
 
     auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
-    // diff start
 
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
 
     size_t const pPDomainSize = targetInfo.mDomainPPSize;
-    TLLM_CHECK((cacheBlockSize * blockNum) % pPDomainSize == 0);
-    auto const targetBufferSize = (cacheBlockSize * blockNum) / pPDomainSize;
+    size_t const cPDomainSize = targetInfo.mDomainCPSize;
+    TLLM_CHECK((cacheBlockSize * blockNum) % (pPDomainSize * cPDomainSize) == 0);
+    // @B: This works as if all output caches are of the same size. Is this a fair assumption?
+    auto const targetBufferSize = (cacheBlockSize * blockNum) / (pPDomainSize * cPDomainSize);
+    TLLM_LOG_INFO("[MLACacheFormatter::format] BEFORE getOrAllocateSendBuffers cacheBlockSize: %zu, blockNum: %d, pPDomainSize: %zu, cPDomainSize: %zu, targetBufferSize: %zu", cacheBlockSize, blockNum, pPDomainSize, cPDomainSize, targetBufferSize);
     auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
-        cacheBufferId, pPDomainSize, targetBufferSize, bufferManager);
+        cacheBufferId, pPDomainSize * cPDomainSize, targetBufferSize, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);
     auto& bufferCoverTargetNum = std::get<1>(result);
     auto& onlyUseDynamicBuffer = std::get<2>(result);
-    auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
-    if (agentConnnecion != nullptr)
+    auto* agentConnnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+    if (agentConnnection != nullptr)
     {
-        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == pPDomainSize, "Agent need all buffer pre-allocated");
+        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == pPDomainSize * cPDomainSize, "Agent need all buffer pre-allocated");
         TLLM_CHECK(onlyUseDynamicBuffer == false);
     }
-    // diff end
 
-    // The size of outputSplitCaches should be equal to pPDomainSize
-
+    // The size of outputSplitCaches should be equal to pPDomainSize * cPDomainSize.
     SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(0);
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
     inputKvCacheBlocksPerWindow.emplace(window, inputKvCacheBlocks);
@@ -191,8 +188,9 @@ void MLACacheFormatter::format(TransferSession& session)
 
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         auto startTime = std::chrono::steady_clock::now();
-        auto cacheIdx = processIdx % pPDomainSize;
+        auto cacheIdx = processIdx % (pPDomainSize * cPDomainSize);
         size_t size;
+        // @B: What does this check mean?
         if (cacheIdx < bufferCoverTargetNum)
         {
             size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
@@ -252,7 +250,7 @@ void MLACacheFormatter::format(TransferSession& session)
         else
         {
             // concurrency num
-            auto concurrencyNum = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize);
+            auto concurrencyNum = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
 
             auto remainSendNum = connections.size();
 
@@ -300,10 +298,9 @@ void MLACacheFormatter::unformat(TransferSession& session)
     auto& bufferManager = session.getBufferManager();
     auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
     bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
-    // diff start
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
-    // diff end
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
+    printf("[MLACacheFormatter::unformat] pickUpConnections.size(): %zu, connections.size(): %zu, blockRange.size(): %zu\n", pickUpConnections.size(), connections.size(), blockRange.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
@@ -346,10 +343,10 @@ void MLACacheFormatter::unformat(TransferSession& session)
     }
     else
     {
-        auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
-        if (agentConnnecion != nullptr)
+        auto* agentConnnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+        if (agentConnnection != nullptr)
         {
-            cacheBufferId = agentConnnecion->getCacheBufferId();
+            cacheBufferId = agentConnnection->getCacheBufferId();
             TLLM_CHECK(cacheBufferId.has_value());
         }
         else
@@ -368,7 +365,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
         auto& bufferCoverTargetNum = std::get<1>(result);
         size_t remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
         auto& onlyUseDynamicBuffer = std::get<2>(result);
-        if (agentConnnecion != nullptr)
+        if (agentConnnection != nullptr)
         {
             TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
             TLLM_CHECK(onlyUseDynamicBuffer == false);
@@ -489,7 +486,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
             outputCachesPerWindow.emplace(window, outputBuffers);
             NVTX3_SCOPED_RANGE(formatInputConcatenate);
 
-            // recvSplitCaches size == ppdomainsize
+            // recvSplitCaches size == ppdomainsize * cPDomainSize.
             executor::kv_cache::concatKvCacheV2Dispatch(
                 recvSplitCaches, outputCachesPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
         }
@@ -562,14 +559,6 @@ void MLACacheFormatter::unformat(TransferSession& session)
         && (selfConfig.getParallelConfig().mTensorParallelism % selfConfig.getParallelConfig().mDPsize != 0))
     {
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be divisible by DP size");
-        return false;
-    }
-    if (selfConfig.getParallelConfig().mContextParallelism != 1
-        || destConfig.getParallelConfig().mContextParallelism != 1)
-    {
-        TLLM_LOG_WARNING(
-            "MLACacheFormatter::inquireSupport: context parallelism is not currently supported (selfCP=%d, destCP=%d).",
-            selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
         return false;
     }
     if (destConfig.getParallelConfig().mEnableAttentionDP
