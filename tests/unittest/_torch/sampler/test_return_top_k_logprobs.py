@@ -64,6 +64,15 @@ def test_generate_with_top_logprobs(top_logprobs: int, top_k: int, top_p: float,
                 assert len(output.outputs[0].top_logprobs) == max_tokens
                 assert len(output.outputs[0].logprobs[0]) == 1
                 assert len(output.outputs[0].top_logprobs[0]) == top_logprobs
+                sampled_token = list(output.outputs[0].logprobs[0].keys())[0]
+                sampled_token_logprob = output.outputs[0].logprobs[0][
+                    sampled_token].logprob
+                if sampled_token in output.outputs[0].top_logprobs[0]:
+                    assert sampled_token_logprob == output.outputs[
+                        0].top_logprobs[0][sampled_token].logprob
+                else:
+                    assert sampled_token_logprob <= list(
+                        output.outputs[0].top_logprobs[0].values())[-1].logprob
     else:
         # expected to fail testcases
         with pytest.raises(ValueError, match="top_logprobs.*"):
@@ -77,7 +86,7 @@ def test_generate_with_top_logprobs(top_logprobs: int, top_k: int, top_p: float,
 
 @force_ampere  # Save H100 resource
 @pytest.mark.threadleak(enabled=False)
-def test_generate_with_top_logprobs_and_disabler_logprobs(
+def test_generate_with_top_logprobs_and_disabled_logprobs(
         llm_torch, input_prompts):
     max_tokens = 8
     top_logprobs = 2

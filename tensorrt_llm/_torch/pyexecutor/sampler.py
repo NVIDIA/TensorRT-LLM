@@ -388,11 +388,12 @@ def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
 class TorchStore:
 
     def __init__(self, *, max_draft_len: int, max_num_sequences: int,
-                 max_beam_width: int):
+                 max_beam_width: int, max_top_logprobs: int):
         self.max_draft_len = max_draft_len
         self.max_num_sequences = max_num_sequences
         self.max_beam_width = max_beam_width
         self.max_tokens = max_draft_len + 1
+        self.max_top_logprobs = max_top_logprobs
         assert max_beam_width == SINGLE_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.new_tokens = int_tensor(
             (self.max_tokens, max_num_sequences, max_beam_width))
@@ -416,6 +417,19 @@ class TorchStore:
                 FinishReason.TIMED_OUT, FinishReason.CANCELLED
             ]  # `in FinishReason` clashes with PyBind11: `TypeError: 'pybind11_type' object is not iterable`
         }
+        """Preallocate buffer needed to provide top logprobs"""
+        if self.max_top_logprobs > 0:
+            self.top_log_probs_host = torch.empty(
+                (max_num_sequences, max_beam_width, self.max_tokens,
+                 max_top_logprobs),
+                device="cpu",
+                pin_memory=True)
+            self.top_tokens_host = int_tensor(
+                (self.max_tokens, max_num_sequences, max_beam_width,
+                 max_top_logprobs))
+        else:
+            self.top_log_probs_host = None
+            self.top_tokens_host = None
 
 
 @dataclass(kw_only=True)
@@ -446,6 +460,7 @@ class TorchSampler(Sampler):
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
         self.enable_mixed_sampler = args.enable_mixed_sampler
+        self.max_top_logprobs = args.max_top_logprobs
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -453,17 +468,14 @@ class TorchSampler(Sampler):
         with torch.inference_mode(False):
             self.store = TorchStore(max_draft_len=args.max_draft_len,
                                     max_num_sequences=args.max_num_sequences,
-                                    max_beam_width=args.max_beam_width)
+                                    max_beam_width=args.max_beam_width,
+                                    max_top_logprobs=args.max_top_logprobs)
         self.max_num_sequences = args.max_num_sequences
         self.max_tokens = self.store.max_tokens
 
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
         self._generator = None
-
-    @property
-    def calculate_top_logprobs(self):
-        return self.max_top_logprobs > 0
 
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
@@ -480,19 +492,18 @@ class TorchSampler(Sampler):
             self._generator.manual_seed(self._global_seed)
         return self._generator
 
-    def handle_logprobs(self, request: LlmRequest, state: SampleStateTorch, *,
-                        beam: int, count: int):
+    def _maybe_get_top_logprobs(self, request: LlmRequest,
+                                state: SampleStateTorch, *, beam: int,
+                                count: int):
         current_slice = slice(0, count), request.py_seq_slot, beam
-        if request.py_return_log_probs:
+        if request.calculate_top_logprobs:
             assert state.host.log_probs is not None
-            log_probs = state.host.log_probs[request.py_seq_slot, beam, :count]
-            current_tokens = state.host.new_tokens[current_slice]
             top_log_probs = state.host.top_log_probs[request.py_seq_slot,
                                                      beam, :count]
             top_current_tokens = state.host.top_tokens[current_slice]
             token_top_log_probs = [{
                 int(token[k]):
-                Logprob(logprob=logprob[k], rank=k)
+                Logprob(logprob=logprob[k], rank=1)
                 for k in range(request.py_top_logprobs)
             } for token, logprob in zip(top_current_tokens,
                                         top_log_probs.tolist())]
@@ -516,7 +527,7 @@ class TorchSampler(Sampler):
                                                                count=count)
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs(
-                [token_log_probs], top_log_probs=[token_top_log_probs])
+                [token_log_probs], top_log_probs=token_top_log_probs)
 
     FinishReasons: TypeAlias = list[list[int]]
     """`(num_seq_slots, num_steps)`"""
@@ -637,15 +648,15 @@ class TorchSampler(Sampler):
             self.handle_logprobs(req, state, beam=BEAM_0, count=processed)
             req.py_decoding_iter += 1
 
-    def log_probs_host(self, scheduled_requests: ScheduledRequests):
-        """Shape: max_num_sequences, max_beam_width == 1, max_tokens, 1 + max_top_logprobs)
-        The last dimension contains log_probs for the sampled tokens and additionally log_probs for the top tokens if top_logprobs is specified"""
+    def log_probs_host(
+            self, scheduled_requests: ScheduledRequests) -> torch.Tensor | None:
+        """Shape: (max_num_sequences, max_beam_width == 1, max_tokens)"""
         if any(req.py_return_log_probs
                for req in scheduled_requests.all_requests()):
-            return torch.empty((self.max_num_sequences, self.MAX_BEAM_WIDTH,
-                                self.max_tokens, 1 + self.max_top_logprobs),
-                               device="cpu",
-                               pin_memory=True)
+            return torch.empty(
+                (self.max_num_sequences, SINGLE_BEAM_WIDTH, self.max_tokens),
+                device="cpu",
+                pin_memory=True)
         return None
 
     def sample_async(
@@ -656,6 +667,8 @@ class TorchSampler(Sampler):
         new_tokens = self.store.new_tokens
         finish_reasons = self.store.finish_reasons
         log_probs_host = self.log_probs_host(scheduled_requests)
+        top_log_probs_host = self.store.top_log_probs_host
+        top_tokens_host = self.store.top_tokens_host
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in requests],
             dtype=torch.int64,  # for index_fill_
@@ -667,7 +680,9 @@ class TorchSampler(Sampler):
                                num_context_logits_prefix_sum,
                                seq_slots=seq_slots,
                                seq_slots_host=seq_slots_host,
-                               log_probs_host=log_probs_host)
+                               log_probs_host=log_probs_host,
+                               top_log_probs_host=top_log_probs_host,
+                               top_tokens_host=top_tokens_host)
         self._write_finish_reasons(requests,
                                    finish_reasons=finish_reasons,
                                    seq_slots=seq_slots,
@@ -675,15 +690,7 @@ class TorchSampler(Sampler):
 
         new_tokens_host = new_tokens.to(device="cpu", non_blocking=True)
         finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
-        # Setup these optional values if possible
-        log_probs = None
-        top_log_probs = None
-        top_tokens = None
-        if log_probs_host is not None:
-            log_probs = log_probs_host[..., 0]
-            if self.calculate_top_logprobs:
-                top_log_probs = log_probs_host[..., 1:]
-                top_tokens = new_tokens[..., 1:]
+
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         return SampleStateTorch(
@@ -693,6 +700,8 @@ class TorchSampler(Sampler):
                 new_tokens=new_tokens_host,
                 log_probs=log_probs_host,
                 finish_reasons=finish_reasons_host,
+                top_tokens=top_tokens_host,
+                top_log_probs=top_log_probs_host,
             ),
             sampler_event=sampler_event,
         )
@@ -950,7 +959,9 @@ class TorchSampler(Sampler):
                           *,
                           seq_slots: torch.Tensor,
                           seq_slots_host: torch.Tensor,
-                          log_probs_host: torch.Tensor | None = None):
+                          log_probs_host: torch.Tensor | None = None,
+                          top_log_probs_host: torch.Tensor | None = None,
+                          top_tokens_host: torch.Tensor | None = None):
 
         # raw_logits should contain only the logits from the gen requests.
         # If return context logits is requested, fetch only the logits from gen requests.
@@ -981,8 +992,8 @@ class TorchSampler(Sampler):
             next_tokens = torch.argmax(logits, dim=-1)
             self.append_eagle3(next_tokens, model_outputs)
             int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
-            next_tokens = int_next_tokens.view(1, -1, SINGLE_BEAM_WIDTH, 1)
-            new_tokens[:1, ..., :1].index_copy_(1, seq_slots, next_tokens)
+            next_tokens = int_next_tokens.view(1, -1, SINGLE_BEAM_WIDTH)
+            new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
             return
 
         strategies = sampling_strategies(requests)
@@ -1003,7 +1014,7 @@ class TorchSampler(Sampler):
             ]
             logits = self._apply_embedding_bias(logits, requests,
                                                 steps_per_request)
-            batched_next_tokens, batched_softmax, batched_indices = sample(
+            batched_next_tokens, batched_softmax, batched_all_token_ids = sample(
                 batched_strategy, logits, generator)
             self.append_eagle3(batched_next_tokens, model_outputs)
 
@@ -1011,8 +1022,9 @@ class TorchSampler(Sampler):
         for i, (strategy, slot, steps, request) in enumerate(
                 zip(strategies, seq_slots_host, num_steps, requests)):
             # if request.calculate_top_logprobs, then request.py_top_logprobs is the number of top tokens to sample
-            # otherwise, it is None and should be defaulted to0
-            num_top_tokens = request.py_top_logprobs if request.calculate_top_logprobs else 0
+            # otherwise, it is None and should be defaulted to 0
+            need_top_logprobs = request.calculate_top_logprobs
+            num_top_tokens = request.py_top_logprobs if need_top_logprobs else 0
             if num_top_tokens > self.max_top_logprobs:
                 raise ValueError(
                     f"top_logprobs {request.py_top_logprobs} cannot exceed max_top_logprobs {self.max_top_logprobs}"
@@ -1020,40 +1032,44 @@ class TorchSampler(Sampler):
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
 
-            req = requests[i]
-
             if batched_next_tokens is None:
-                logits = self._apply_embedding_bias(logits, [req])
-                next_tokens, softmax, indices = sample(strategy, logits,
-                                                       generator)
+                logits = self._apply_embedding_bias(logits, [request])
+                next_tokens, softmax, all_token_ids = sample(
+                    strategy, logits, generator)
             else:
                 # Batched processing already applied bias, just use the results
                 next_tokens = batched_next_tokens[input_slice]
                 softmax = batched_softmax[input_slice]
-                indices = batched_indices[
-                    input_slice] if strategy != GREEDY else None
+                all_token_ids = None if not need_top_logprobs else batched_all_token_ids[
+                    input_slice]
 
-            current_slice = slice(0, steps), slot, BEAM_0, slice(
-                0, 1 + num_top_tokens)
-            if request.calculate_top_logprobs and strategy != GREEDY:
-                # concatenate the sampled tokens with the top tokens
-                next_tokens = torch.cat(
-                    [next_tokens.unsqueeze(1), indices[:, :num_top_tokens]],
-                    dim=1)
-            else:
-                next_tokens = next_tokens.unsqueeze(1)
+            current_slice = slice(0, steps), slot, BEAM_0
             new_tokens[current_slice] = next_tokens
             if request.py_draft_logits is not None:
                 request.py_target_probs = softmax.clone()
             if log_probs_host is not None:
                 assert BEAM_0 == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
-                token_probs = torch.gather(softmax, dim=1,
-                                           index=next_tokens).reshape(
-                                               steps, -1)
+                token_probs = torch.gather(
+                    softmax, dim=1,
+                    index=next_tokens.unsqueeze(1)).reshape(steps)
 
                 log_probs = torch.log(token_probs)
-                log_probs_host[slot, BEAM_0, :steps, :1 + num_top_tokens].copy_(
-                      log_probs, non_blocking=True)
+                log_probs_host[slot, BEAM_0, :steps].copy_(log_probs,
+                                                           non_blocking=True)
+                if need_top_logprobs:
+                    top_token_ids = all_token_ids[:, :num_top_tokens]
+                    top_token_probs = torch.gather(softmax,
+                                                   dim=1,
+                                                   index=top_token_ids).reshape(
+                                                       steps, -1)
+                    top_log_probs = torch.log(top_token_probs)
+                    top_log_probs_host[slot,
+                                       BEAM_0, :steps, :num_top_tokens].copy_(
+                                           top_log_probs, non_blocking=True)
+                    top_tokens_host[:steps, slot,
+                                    BEAM_0, :num_top_tokens].copy_(
+                                        top_token_ids, non_blocking=True)
+
             offset += steps
 
 
