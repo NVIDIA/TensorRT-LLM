@@ -1196,7 +1196,7 @@ class MLA(nn.Module):
                 metadata=attn_metadata,
                 num_ctx_cached_tokens=total_ctx_chunked_tokens,
                 cu_chunked_seq_len=temp_cu_chunked_seq_len,
-                chunked_ld_global_offset=chunked_global_offset,
+                chunked_global_offset=chunked_global_offset,
                 chunked_max_seq_len=chunked_max_seq_len,
                 out_dtype=q.dtype)
 
