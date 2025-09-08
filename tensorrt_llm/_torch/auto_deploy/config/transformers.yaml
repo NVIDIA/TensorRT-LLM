@@ -12,6 +12,7 @@ transforms:
     stage: factory
     run_graph_cleanup: false
     requires_clean_graph: false
+    attn_backend: flashinfer
 
   move_cm_to_device:
     stage: weight_load
