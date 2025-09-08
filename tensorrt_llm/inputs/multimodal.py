@@ -505,19 +505,14 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                 if isinstance(item, torch.Tensor):
                     item = ToPILImage()(item)
                 num_tokens = input_processor.get_num_tokens_per_image(
-                    image_width=item.width,
-                    image_height=item.height,
-                )
+                    image=item, )
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
                 assert isinstance(item, list), "Video must be a list of frames"
                 if isinstance(item[0], torch.Tensor):
                     item = [ToPILImage()(frame) for frame in item]
                 num_tokens = input_processor.get_num_tokens_per_video(
-                    video_width=item[0].width,
-                    video_height=item[0].height,
-                    num_frames=len(item),
-                )
+                    video=item, )
                 modality_token_lengths.append(num_tokens)
             else:
                 # TODO: add audio support if needed
