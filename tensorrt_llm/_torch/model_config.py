@@ -118,7 +118,7 @@ class ModelConfig(Generic[TConfig]):
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
-    moe_low_precision_combine: bool = False
+    use_low_precision_moe_combine: bool = False
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 

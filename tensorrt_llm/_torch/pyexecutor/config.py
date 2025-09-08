@@ -60,7 +60,7 @@ class PyTorchConfig:
     moe_backend: str = 'CUTLASS'
 
     moe_disable_finalize_fusion: bool = False
-    moe_low_precision_combine: bool = False
+    use_low_precision_moe_combine: bool = False
 
     enable_mixed_sampler: bool = False
     """

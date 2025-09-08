@@ -307,8 +307,8 @@ class PyTorchModelEngine(ModelEngine):
             moe_backend=pytorch_backend_config.moe_backend,
             moe_disable_finalize_fusion=pytorch_backend_config.
             moe_disable_finalize_fusion,
-            moe_low_precision_combine=pytorch_backend_config.
-            moe_low_precision_combine,
+            use_low_precision_moe_combine=pytorch_backend_config.
+            use_low_precision_moe_combine,
             load_format=pytorch_backend_config.load_format,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
