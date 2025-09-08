@@ -141,14 +141,8 @@ void tma_warp_specialized_generic_moe_gemm_kernelLauncher(TmaWarpSpecializedGrou
 #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (ArchTag::kMinComputeCapability == 103)
     {
-        static bool first_time = true;
-        if (first_time)
-        {
-            TLLM_LOG_WARNING(
-                "Falling back to sm100f version. For best performance please recompile with support for blackwell by "
-                "passing 103-real as an arch to build_wheel.py.");
-            first_time = false;
-        }
+        // fallback sm100f logic is done in dispatchMoeGemmFinalDispatchTmaWarpSpecialized
+        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
     }
 #endif
 #ifndef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS

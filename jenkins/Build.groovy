@@ -112,7 +112,7 @@ def BUILD_CONFIGS = [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
-    (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
+    // (BUILD_JOBS_FOR_CONFIG): "4", // TODO: Remove after fix the build OOM issue on SBSA
   ],
 ]
 
@@ -131,8 +131,8 @@ def globalVars = [
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "64Gi"
+BUILD_MEMORY_REQUEST = "64Gi"
+BUILD_MEMORY_LIMIT = "80Gi"
 BUILD_JOBS = "8"
 
 TESTER_CORES = "12"
