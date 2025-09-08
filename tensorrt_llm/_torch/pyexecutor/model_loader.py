@@ -22,7 +22,6 @@ from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from .config import LoadFormat, PyTorchConfig
 
-# Constants from the original file for KV cache validation
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
@@ -189,7 +188,7 @@ class ModelLoader:
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
-                                                 torch.nn.Module]] = None
+                                                 torch.nn.Module]] = None,
     ) -> DecoderModelForCausalLM:
         """
         Loads the model, its weights, and applies necessary configurations.
@@ -308,7 +307,11 @@ class ModelLoader:
             moe_load_balancer=self.pytorch_backend_config.moe_load_balancer,
             lora_config=self.lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
-            mm_encoder_only=self.pytorch_backend_config.mm_encoder_only)
+            mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,
+            attn_backend=self.pytorch_backend_config.attn_backend,
+            moe_backend=self.pytorch_backend_config.moe_backend,
+            moe_disable_finalize_fusion=self.pytorch_backend_config.
+            moe_disable_finalize_fusion)
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)
