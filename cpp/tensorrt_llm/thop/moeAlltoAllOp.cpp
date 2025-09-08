@@ -279,6 +279,9 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor> moeA2ADispa
     params.num_experts_per_rank = static_cast<int>(numExperts) / static_cast<int>(epSize);
     params.stream = at::cuda::getCurrentCUDAStream();
 
+    // Prepare for dispatch (zero counters/indices and increment flag_val)
+    moe_a2a_prepare_dispatch_launch(params);
+
     // Launch the dispatch kernel
     moe_a2a_dispatch_launch(params);
     cudaError_t result = cudaGetLastError();
@@ -391,29 +394,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
     // Get workspace base pointer
     auto* workspace_ptr = workspace.data_ptr<uint8_t>();
 
-    // Copy the payload data to workspace at the correct offset
+    // Prepare for combine: zero output and copy payload to workspace recv buffer
     auto* current_rank_workspace = workspace_ptr + (epRank * workspace.stride(0));
-    auto recvBuffer = torch::from_blob(
-        current_rank_workspace + offsets.payload_data_offset, 
-        {epSize, maxTokensPerRank, elementsPerToken}, 
-        payload.options()
-    );
     
-    // TODO: Copy and sync here should be removed.
-    // Copy the entire payload to workspace using PyTorch tensor operations
-    recvBuffer.copy_(payload, /*non_blocking=*/true);
-    cudaDeviceSynchronize();
-    tensorrt_llm::mpi::MpiComm::world().barrier();
-
-    // Get local_token_counter from workspace (reuse from dispatch)
-    uint8_t* rank_workspace = workspace_ptr + epRank * workspace.stride(0);
-    torch::Tensor localTokenCounter = torch::from_blob(
-        rank_workspace + offsets.local_token_counter_offset,
-        {1},
-        torch::TensorOptions().dtype(torch::kInt32).device(workspace.device())
-    );
-    localTokenCounter.zero_();  // Reset for combine phase
-
     // Create output tensor (NOT on workspace, like dispatch payloads)
     torch::Tensor output = torch::zeros({localNumTokens, elementsPerToken}, payload.options());
 
@@ -428,7 +411,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
     params.output_data = output.data_ptr();
     params.elements_per_token = static_cast<int>(elementsPerToken);
     params.dtype = nvDtype;
-    params.local_token_counter = localTokenCounter.data_ptr<int>();
+    params.local_token_counter = reinterpret_cast<int*>(current_rank_workspace + offsets.local_token_counter_offset);
     params.stream = at::cuda::getCurrentCUDAStream();
 
     // Set up completion flag pointers for all ranks (reuse from dispatch)
@@ -437,7 +420,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
         uint8_t* rank_base = workspace_ptr + rank * workspace.stride(0);
         params.completion_ptrs.completion_flags[rank] = reinterpret_cast<uint32_t*>(rank_base + offsets.completion_flags_offset);
     }
-    params.completion_ptrs.flag_val = reinterpret_cast<uint32_t*>(rank_workspace + offsets.flag_val_offset);
+    params.completion_ptrs.flag_val = reinterpret_cast<uint32_t*>(current_rank_workspace + offsets.flag_val_offset);
     
     // Calculate and store recv buffer pointers
     for (int target_rank = 0; target_rank < epSize; target_rank++)
@@ -448,6 +431,10 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
         // Store receive buffer pointer for this rank (at payload_data_offset)
         params.recv_buffers[target_rank] = target_workspace + offsets.payload_data_offset;
     }
+
+    // Prepare combine: zero output and stage payload into current rank's workspace slot
+    params.prepare_payload = payload.data_ptr();
+    moe_a2a_prepare_combine_launch(params);
 
     // Launch the combine kernel
     moe_a2a_combine_launch(params);
@@ -486,9 +473,6 @@ torch::Tensor moeA2AInitializeOp(
 
     // Calculate auxiliary data offsets
     MoeA2ADataOffsets offsets = calculateOffsets(epSize, maxNumTokensPerRank);
-
-    // Initialize flag_val to one
-    workspace[epRank].slice(0, offsets.flag_val_offset, offsets.flag_val_offset + sizeof(int)).view(torch::kUInt32).fill_(1);
     
     // Return moe_a2a_metainfo as a tensor containing offsets
     torch::Tensor moe_a2a_metainfo = torch::zeros({NUM_METAINFO_FIELDS}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));

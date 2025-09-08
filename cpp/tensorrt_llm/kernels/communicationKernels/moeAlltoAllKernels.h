@@ -97,6 +97,8 @@ struct MoeA2ADispatchParams
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
+// Prepare for dispatch: zero send_counters, send_indices, local_token_counter and increment flag_val
+void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 
 // Combine phase parameters
 struct MoeA2ACombineParams
@@ -124,9 +126,13 @@ struct MoeA2ACombineParams
     CompletionFlagPtrs completion_ptrs; // Completion flags for synchronization
 
     cudaStream_t stream;
+    // Prepare-only field: original payload tensor pointer used to stage into workspace
+    void const* prepare_payload;
 };
 
 // Combine kernels
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
+
+void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 
 } // namespace tensorrt_llm::kernels::moe_a2a

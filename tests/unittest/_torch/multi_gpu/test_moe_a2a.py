@@ -278,7 +278,7 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
             rank, completion_flags_offset:completion_flags_offset + ep_size * 4].view(torch.int32).cpu()
         flag_val_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.FLAG_VAL_OFFSET_INDEX].item()
         expected_flag_val = moe_a2a.workspace[
-            rank, flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu() - 1
+            rank, flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu()
 
 
         print("completion_flags_ptr (hex):", hex(moe_a2a.workspace[
@@ -609,7 +609,7 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             top_k, num_experts)
 
         # TODO: remove this
-        sync()
+        # sync()  # commented out: combine kernel handles readiness
 
 
         hidden_states_recv = recv_buffers[
@@ -636,7 +636,7 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             num_experts_per_rank=num_experts_per_rank).view(ep_size, max_tokens_per_rank, hidden_states_recv.shape[-1])
 
         # TODO: remove this
-        sync()
+        # sync()  # commented out: combine kernel handles readiness
 
         # Run combine on the received data
         combined_output = moe_a2a.combine(send_indices,
@@ -645,7 +645,7 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
                                           top_k)
 
         # TODO: remove this
-        sync()
+        # sync()  # commented out: not needed after in-kernel sync
 
         # Verify completion flags after combine
         completion_flags_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.COMPLETION_FLAGS_OFFSET_INDEX].item()
@@ -654,7 +654,7 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
         completion_flags = completion_flags_ptr.view(torch.int32).cpu()
         flag_val_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.FLAG_VAL_OFFSET_INDEX].item()
         expected_flag_val = moe_a2a.workspace[
-            rank, flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu() - 1
+            rank, flag_val_offset:flag_val_offset + 4].view(torch.int32).cpu()
         assert torch.all(completion_flags == expected_flag_val), (
             f"Rank {rank} completion flags: {completion_flags}, expected flag val: {expected_flag_val}"
         )
