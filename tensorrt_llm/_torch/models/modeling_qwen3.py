@@ -7,6 +7,7 @@ from transformers import Qwen3Config
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
+from ..distributed import AllReduceParams
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -80,12 +81,15 @@ class Qwen3DecoderLayer(DecoderLayer):
             model_config,
             layer_idx=layer_idx,
         )
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
 
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             bias=config.mlp_bias if hasattr(config, "mlp_bias") else False,
             dtype=config.torch_dtype,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
             config=model_config,
         )
 
@@ -95,6 +99,9 @@ class Qwen3DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
+        self.disable_allreduce = (self.mapping.tp_size == 1
+                                  or self.enable_attention_dp)
+
 
     def forward(
         self,
@@ -119,13 +126,22 @@ class Qwen3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             mrope_config=mrope_config,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_allreduce),
             **kwargs,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_allreduce),
+            cutlass_min_latency_mode=False,
+        )
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
