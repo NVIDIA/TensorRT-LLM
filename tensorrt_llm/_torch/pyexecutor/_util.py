@@ -387,6 +387,9 @@ class KvCacheCreator:
 
         # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
         if kv_cache_manager is not None:
+            if kv_cache_manager.max_seq_len < self._max_seq_len:
+                self._dummy_reqs = self._create_dummy_context_requests(
+                    max(1, kv_cache_manager.max_seq_len - 1))
             self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
