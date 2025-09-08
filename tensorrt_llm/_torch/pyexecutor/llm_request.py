@@ -422,7 +422,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     @property
     def calculate_top_logprobs(self):
-        return self.py_top_logprobs is not None
+        return self.py_top_logprobs is not None and self.py_top_logprobs > 0
 
     def finish_by(self, reason: FinishReason, beam: int) -> None:
         """CPP finish by reason does not support beam_width > 1"""
