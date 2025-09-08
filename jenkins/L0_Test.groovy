@@ -362,6 +362,14 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
         shardTestList.split('\n').each { test ->
             def trimmedTest = test.trim()
             if (trimmedTest) {
+                // Process test_unittests.py::test_unittests_v2[xxxx] pattern
+                if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
+                    // Extract content between [ and ]
+                    def startIndex = trimmedTest.indexOf('[') + 1
+                    def endIndex = trimmedTest.lastIndexOf(']')
+                    trimmedTest = trimmedTest.substring(startIndex, endIndex)
+                }
+
                 if (isolateMarkerTests.contains(trimmedTest)) {
                     shardIsolateTests.add(trimmedTest)
                 } else {
