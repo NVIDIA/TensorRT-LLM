@@ -42,7 +42,8 @@ from tensorrt_llm.serve.scripts.backend_request_func import (
 from tensorrt_llm.serve.scripts.benchmark_dataset import (
     AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
     HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
-    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset, vllmCustomDataset)
+    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset,
+    vllmCustomDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
 # isort: on
@@ -704,7 +705,7 @@ def main(args: argparse.Namespace):
         input_requests = dataset.sample(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
-            output_len=1, # TODO: fix this
+            output_len=1,  # TODO: fix this
         )
 
     else:
