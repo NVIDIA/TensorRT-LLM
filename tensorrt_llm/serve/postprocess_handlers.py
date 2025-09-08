@@ -63,8 +63,7 @@ class ChatPostprocArgs(PostprocArgs):
         )
 
 
-def create_logprobs(token_ids: List[int],
-                    tokenizer: TransformersTokenizer,
+def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
                     logprobs: List[float] | TokenLogprobs,
                     top_logprobs: bool) -> ChatCompletionLogProbs:
     assert len(token_ids) == len(logprobs), \
@@ -195,7 +194,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
-            choice.logprobs = create_logprobs(token_ids, args.tokenizer, logprobs, args.top_logprobs)
+            choice.logprobs = create_logprobs(token_ids, args.tokenizer,
+                                              logprobs, args.top_logprobs)
         if output.finish_reason is not None:
             choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
@@ -263,7 +263,9 @@ def chat_response_post_processor(
         )
 
         if args.return_logprobs:
-            choice.logprobs = create_logprobs(output.token_ids, args.tokenizer, output.logprobs, args.top_logprobs)
+            choice.logprobs = create_logprobs(output.token_ids, args.tokenizer,
+                                              output.logprobs,
+                                              args.top_logprobs)
         choices.append(choice)
 
     if args.echo and args.last_message_content:
