@@ -368,7 +368,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
 
         // Create shard-specific test files
         if (shardRegularTests.size() > 0) {
-            def shardRegularContent = shardRegularTests.join('\n') + '\n'
+            def shardRegularContent = shardRegularTests.join('\n')
             sh "echo '${shardRegularContent.replace("'", "'\\''")}' > ${regularTestList}"
             echo "Created ${regularTestList} with ${shardRegularTests.size()} regular tests for this shard"
         } else {
@@ -378,7 +378,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
         sh "cat ${regularTestList}"
 
         if (shardIsolateTests.size() > 0) {
-            def shardIsolateContent = shardIsolateTests.join('\n') + '\n'
+            def shardIsolateContent = shardIsolateTests.join('\n')
             sh "echo '${shardIsolateContent.replace("'", "'\\''")}' > ${isolateTestList}"
             echo "Created ${isolateTestList} with ${shardIsolateTests.size()} isolate tests for this shard"
         } else {
