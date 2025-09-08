@@ -474,7 +474,7 @@ class LlavaNextModel(PreTrainedModel):
                     for multimodal_param in multimodal_params
                 ]
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embeds)
+            self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs)
 
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)

@@ -94,6 +94,26 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         """
     }
 
+    if (arch == "amd64") {
+        // For x86_64, we block some nodes to avoid unstable network access.
+        selectors += """
+                affinity:
+                    nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                            nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: "kubernetes.io/hostname"
+                                      operator: NotIn
+                                      values:
+                                        - "sc-ipp-blossom-prod-k8w-105"
+                                        - "sc-ipp-blossom-prod-k8w-114"
+                                        - "sc-ipp-blossom-prod-k8w-115"
+                                        - "sc-ipp-blossom-prod-k8w-121"
+                                        - "sc-ipp-blossom-prod-k8w-123"
+                                        - "sc-ipp-blossom-prod-k8w-124"
+        """
+    }
+
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 

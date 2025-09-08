@@ -20,9 +20,12 @@ from tensorrt_llm._torch.speculative.interface import SpecMetadata
 @contextmanager
 def save_metadata_state(attn_metadata: AttentionMetadata,
                         spec_metadata: SpecMetadata) -> None:
-    attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda",
-                                       "kv_lens_cuda")
+    attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
     batch_size = attn_metadata.num_seqs
+    # Do not use prepare_for_spec_dec for this special field.
+    # TRTLLM attention uses views of this tensor internally and prepare_for_spec_dec
+    # creates a copy. If you write to the copy, TRTLLM attention won't see the updates.
+    kv_lens = attn_metadata.kv_lens_cuda[:batch_size].clone()
 
     if attn_metadata.is_cuda_graph:
         assert spec_metadata.is_cuda_graph
@@ -39,6 +42,8 @@ def save_metadata_state(attn_metadata: AttentionMetadata,
         yield
     finally:
         attn_metadata.restore_from_spec_dec()
+        attn_metadata.kv_lens_cuda[:batch_size].copy_(kv_lens)
+
         if attn_metadata.is_cuda_graph:
             spec_metadata.num_tokens = num_tokens
             if isinstance(spec_metadata, Eagle3SpecMetadata):
