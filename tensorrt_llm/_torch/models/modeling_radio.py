@@ -1,3 +1,6 @@
+# Note: The code is to extract image embedding from RADIO model, to support Nano v2 VLM.
+# TODO: Check and add more compatible logic for the full-series RADIO model.
+
 import math
 from collections import namedtuple
 from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
@@ -13,12 +16,14 @@ from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 
 input_dim_t = Union[int, Tuple[int, int]]
 
-DEFAULT_VERSION = "radio_v2.5-h"
+# Need for model weight loading.
+NUM_ATTENTION_HEADS = 16
 
 
 class Resolution(NamedTuple):
@@ -27,12 +32,15 @@ class Resolution(NamedTuple):
 
 
 class RADIOConfig(PretrainedConfig):
-    """Pretrained Hugging Face configuration for RADIO models."""
+    """Pretrained Hugging Face configuration for RADIO models.
+
+    Copy from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py.
+    """
 
     def __init__(
         self,
         args: Optional[dict] = None,
-        version: Optional[str] = DEFAULT_VERSION,
+        version: str = "radio_v2.5-h",
         patch_size: Optional[int] = None,
         max_resolution: Optional[int] = None,
         preferred_resolution: Optional[Resolution] = None,
@@ -60,12 +68,13 @@ class RADIOConfig(PretrainedConfig):
         self.vitdet_window_size = vitdet_window_size
         self.feature_normalizer_config = feature_normalizer_config
         self.inter_feature_normalizer_config = inter_feature_normalizer_config
-        self.num_key_value_heads = 16  # Hardcoded for model weight loading
-        self.num_attention_heads = 16  # Hardcoded for model weight loading
+        self.num_key_value_heads = NUM_ATTENTION_HEADS
+        self.num_attention_heads = NUM_ATTENTION_HEADS
         super().__init__(**kwargs)
 
 
 class ClsToken(nn.Module):
+    """Copy from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/cls_token.py."""
 
     def __init__(
         self,
@@ -87,33 +96,26 @@ class ClsToken(nn.Module):
             elif register_multiple:
                 self.num_registers = register_multiple - (num_tokens %
                                                           register_multiple)
-
             scale = ndim**-0.5
             self.token = nn.Parameter(
                 torch.randn(num_tokens + self.num_registers, ndim) * scale)
         else:
             self.token = None
-
         self.num_patches = self.num_tokens + self.num_registers
-
-    def disable(self):
-        self.token = None
-        self.enabled = False
 
     def forward(self, x: torch.Tensor):
         if self.token is None:
             return x
-
         token = self.token.unsqueeze(0).expand(x.shape[0], -1, -1)
         x = torch.cat([
             token,
             x,
         ], dim=1)
-
         return x
 
 
 class ViTPatchGenerator(nn.Module):
+    """Copy from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/vit_patch_generator.py."""
 
     def __init__(
         self,
@@ -220,12 +222,11 @@ class ViTPatchGenerator(nn.Module):
         if not self.abs_pos:
             return patches
 
-        pos_enc = self.get_pos_enc(patches.shape[0], patch_idxs, input_size)
+        pos_enc = self.get_pos_enc(patch_idxs, input_size)
         return patches + pos_enc, pos_enc
 
     def get_pos_enc(
         self,
-        batch_size: int,
         patch_idxs: Optional[torch.Tensor] = None,
         input_size: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
@@ -233,21 +234,18 @@ class ViTPatchGenerator(nn.Module):
             input_dims = self.input_dims
         else:
             input_dims = tuple(d // self.patch_size for d in input_size)
-
-        pos_embed = self._get_pos_embeddings(batch_size, input_dims)
-
+        pos_embed = self._get_pos_embeddings(input_dims)
         if patch_idxs is None:
             return pos_embed
 
         exp_patch_idxs = patch_idxs.unsqueeze(-1).expand(
             -1, -1, pos_embed.shape[-1])
-
         pos_embed = torch.gather(pos_embed.expand(patch_idxs.shape[0], -1, -1),
                                  dim=1,
                                  index=exp_patch_idxs)
         return pos_embed
 
-    def _get_pos_embeddings(self, batch_size: int, input_dims: Tuple[int, int]):
+    def _get_pos_embeddings(self, input_dims: Tuple[int, int]):
         if (self.num_rows, self.num_cols) == input_dims:
             return self.pos_embed
 
@@ -284,6 +282,7 @@ class ViTPatchGenerator(nn.Module):
 
 
 class Im2Patches(nn.Module):
+    """Copy from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/vit_patch_generator.py."""
 
     def __init__(self, patch_size: int):
         super().__init__()
@@ -309,18 +308,23 @@ class Im2Patches(nn.Module):
 
 
 class ViTPatchLinear(nn.Linear):
+    """Copy from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/vit_patch_generator.py."""
 
     def __init__(self,
                  patch_size: int,
                  embed_dim: int,
                  bias: bool = False,
-                 **factory):
-        super().__init__(3 * (patch_size**2), embed_dim, bias=bias, **factory)
+                 **kwargs):
+        super().__init__(3 * (patch_size**2), embed_dim, bias=bias, **kwargs)
         self.patch_size = patch_size
 
 
 class Block(nn.Module):
-    """Transformer block with pre-normalization."""
+    """Transformer block with pre-normalization.
+
+    Copy from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py
+    and use trtllm_attn and trtllm_mlp to replace attn and mlp.
+    """
 
     def __init__(
         self,
@@ -349,6 +353,8 @@ class Block(nn.Module):
             mlp_ratio: Ratio of mlp hidden dim to embedding dim.
             qkv_bias: If True, add a learnable bias to query, key, value.
             qk_norm: If True, apply normalization to query and key.
+            scale_attn_norm: Enable scaling for attention norm if True.
+            scale_mlp_norm: Enable scaling for mlp norm if True.
             proj_bias: If True, add bias to output projection.
             proj_drop: Projection dropout rate.
             attn_drop: Attention dropout rate.
@@ -356,13 +362,18 @@ class Block(nn.Module):
             drop_path: Stochastic depth rate.
             act_layer: Activation layer.
             norm_layer: Normalization layer.
+            layer_idx: Layer index.
+            model_config: Model configuration.
         """
         super().__init__()
         self.model_config = model_config
         self.norm1 = norm_layer(dim)
 
         if qk_norm:
-            raise IOError("Block does not support qk_norm for now.")
+            raise IOError(
+                "Limited RADIO model support: Block does not support qk_norm for now."
+            )
+
         self.attn = trtllm_attention.Attention(
             hidden_size=dim,
             num_attention_heads=num_heads,
@@ -379,17 +390,26 @@ class Block(nn.Module):
             max_position_embeddings=None,
         )
         if init_values:
-            raise IOError("Block does not support LayerScale for now.")
+            raise IOError(
+                "Limited RADIO model support: Block does not support LayerScale for now."
+            )
         self.ls1 = nn.Identity()
         if drop_path > 0.:
-            raise IOError("Block does not support DropPath for now.")
+            raise IOError(
+                "Limited RADIO model support: Block does not support DropPath for now."
+            )
         self.drop_path1 = nn.Identity()
 
         self.norm2 = norm_layer(dim)
         if scale_mlp_norm:
-            raise IOError("Block does not support scale_mlp_norm for now.")
+            raise IOError(
+                "Limited RADIO model support: Block does not support scale_mlp_norm for now."
+            )
         if proj_drop > 0.:
-            raise IOError("Block does not support proj_drop for now.")
+            raise IOError(
+                "Limited RADIO model support: Block does not support proj_drop for now."
+            )
+
         self.mlp = trtllm_mlp.MLP(
             hidden_size=dim,
             intermediate_size=int(dim * mlp_ratio),
@@ -400,10 +420,14 @@ class Block(nn.Module):
             layer_idx=layer_idx,
         )
         if init_values:
-            raise IOError("Block does not support LayerScale for now.")
+            raise IOError(
+                "Limited RADIO model support: Block does not support LayerScale for now."
+            )
         self.ls2 = nn.Identity()
         if drop_path > 0.:
-            raise IOError("Block does not support DropPath for now.")
+            raise IOError(
+                "Limited RADIO model support: Block does not support DropPath for now."
+            )
         self.drop_path2 = nn.Identity()
 
     def forward(
@@ -435,7 +459,10 @@ class Block(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    """ Vision Transformer."""
+    """ Vision Transformer.
+
+    Copy from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
+    """
 
     def __init__(
         self,
@@ -462,15 +489,10 @@ class VisionTransformer(nn.Module):
         pre_norm: bool = False,
         final_norm: bool = True,
         fc_norm: Optional[bool] = None,
-        pool_include_prefix: bool = False,
         drop_rate: float = 0.,
-        pos_drop_rate: float = 0.,
-        patch_drop_rate: float = 0.,
         proj_drop_rate: float = 0.,
         attn_drop_rate: float = 0.,
         drop_path_rate: float = 0.,
-        weight_init: Literal['skip', 'jax', 'jax_nlhb', 'moco', ''] = '',
-        fix_init: bool = False,
         norm_layer: Optional[nn.Module] = None,
         act_layer: Optional[nn.Module] = None,
         cpe_max_size: Optional[int] = None,
@@ -490,6 +512,10 @@ class VisionTransformer(nn.Module):
             num_heads: Number of attention heads.
             mlp_ratio: Ratio of mlp hidden dim to embedding dim.
             qkv_bias: Enable bias for qkv projections if True.
+            qk_norm: Enable normalization for qk projections if True.
+            scale_attn_norm: Enable scaling for attention norm if True.
+            scale_mlp_norm: Enable scaling for mlp norm if True.
+            proj_bias: Enable bias for projection.
             init_values: Layer-scale init values (layer-scale enabled if not None).
             class_token: Use class token.
             no_embed_class: Don't include position embeddings for class (or reg) tokens.
@@ -498,14 +524,15 @@ class VisionTransformer(nn.Module):
             final_norm: Enable norm after transformer blocks, before head (standard in most ViT).
             fc_norm: Move final norm after pool (instead of before), if None, enabled when global_pool == 'avg'.
             drop_rate: Head dropout rate.
-            pos_drop_rate: Position embedding dropout rate.
+            proj_drop_rate: Projection dropout rate.
             attn_drop_rate: Attention dropout rate.
             drop_path_rate: Stochastic depth rate.
-            weight_init: Weight initialization scheme.
-            fix_init: Apply weight initialization fix (scaling w/ layer index).
             norm_layer: Normalization layer.
             act_layer: MLP activation layer.
-            block_fn: Transformer block layer.
+            cpe_max_size: Maximum size for CPE.
+            special_args: Special arguments in RADIOConfig.
+            model_config: Model configuration.
+            **kwargs: Additional keyword arguments, to store unused arguments.
         """
         super().__init__()
         assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map')
@@ -534,13 +561,12 @@ class VisionTransformer(nn.Module):
         self.num_reg_tokens = reg_tokens
         self.has_class_token = class_token
         self.no_embed_class = no_embed_class
-        self.pool_include_prefix = pool_include_prefix
 
         self.patch_drop = nn.Identity()
         self.norm_pre = norm_layer(embed_dim) if pre_norm else nn.Identity()
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)
-               ]  # stochastic depth decay rule
+        # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim,
@@ -564,7 +590,7 @@ class VisionTransformer(nn.Module):
         self.norm = norm_layer(
             embed_dim) if final_norm and not use_fc_norm else nn.Identity()
 
-        # Classifier Head
+        # Classifier Head but not used for RADIO embedding models.
         self.attn_pool = None
         self.fc_norm = norm_layer(
             embed_dim) if final_norm and use_fc_norm else nn.Identity()
@@ -633,6 +659,7 @@ class VisionTransformer(nn.Module):
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
         x = self.patch_generator(x)
+
         batch_size, seq_len, hidden_size = x.shape
         if self.model_config is not None:
             seq_lengths = [seq_len] * batch_size
@@ -645,11 +672,13 @@ class VisionTransformer(nn.Module):
         for block in self.blocks:
             x = block(x, attn_metadata=attn_metadata)
         x = x.reshape(batch_size, seq_len, hidden_size)
+
         x = self.norm(x)
         return x
 
 
 class RADIOVisionModelBase(nn.Module):
+    """Copy and modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/radio_model.py"""
 
     def __init__(
         self,
@@ -765,13 +794,6 @@ class RADIOVisionModelBase(nn.Module):
         x: torch.Tensor,
         feature_fmt: str = 'NLC'
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        '''
-        Forward process for model.
-        Args:
-            x: Input tensor. Unless `make_preprocessor_external` has been called, then the dynamic range of `x` is expected to be `[0, 1]`,
-                             otherwise `x` is expected to be mean centered with unit standard deviation.
-            feature_format: ['NLC', 'NCHW'] - The output format for the features.
-        '''
         res_step = self.min_resolution_step
         if res_step is not None and (x.shape[-2] % res_step != 0
                                      or x.shape[-1] % res_step != 0):
@@ -815,17 +837,17 @@ class RADIOVisionModelBase(nn.Module):
                 f'Unsupported feature_fmt: {feature_fmt}. Must be one of ["NLC", "NCHW"]'
             )
 
-        ret = fmt_feat
-
-        if self.adaptors:
-            raise ValueError("Adaptors are not supported for RADIO models.")
-
-        return ret
+        return fmt_feat
 
 
 class RADIOVisionModel(PreTrainedModel):
+    """Copy and modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
     def __init__(self, model_config: model_config_lib.ModelConfig):
+        """
+        Args:
+            model_config: Model configuration.
+        """
         config = model_config.pretrained_config
         super().__init__(config)
         self.model_config = model_config
@@ -840,22 +862,22 @@ class RADIOVisionModel(PreTrainedModel):
             in_chans = args.in_chans
         elif args.input_size is not None:
             in_chans = args.input_size[0]
-        model = VisionTransformer(
+        vit_model = VisionTransformer(
             img_size=224,
             patch_size=16,
             embed_dim=1280,
             depth=32,
-            num_heads=16,
+            num_heads=NUM_ATTENTION_HEADS,
             in_chans=in_chans,
             drop_rate=args.drop,
-            weight_init=args.model_kwargs.pop("weight_init", "skip"),
             special_args=args,
             model_config=model_config,
         )
-        if hasattr(model, 'norm') and not getattr(args, 'model_norm', False):
-            model.norm = nn.Identity()
-        model.head = nn.Identity()
-        model.to(dtype=config.torch_dtype)
+        if hasattr(vit_model,
+                   'norm') and not getattr(args, 'model_norm', False):
+            vit_model.norm = nn.Identity()
+        vit_model.head = nn.Identity()
+        vit_model.to(dtype=config.torch_dtype)
 
         input_conditioner = nn.Identity()
         input_conditioner.dtype = config.torch_dtype
@@ -878,7 +900,7 @@ class RADIOVisionModel(PreTrainedModel):
             )
 
         self.radio_model = RADIOVisionModelBase(
-            model,
+            vit_model,
             input_conditioner,
             patch_size=config.patch_size,
             max_resolution=config.max_resolution,
@@ -889,6 +911,54 @@ class RADIOVisionModel(PreTrainedModel):
             inter_feature_normalizer=inter_feature_normalizer,
             model_config=model_config,
         )
+
+    def load_weights(self, weights):
+        # Load radio_model weights for pytorch modules.
+        filter_weights = {
+            k.replace('radio_model.', ''): v
+            for k, v in weights.items() if k.startswith('radio_model.')
+        }
+        missing_keys, unexpected_keys = self.radio_model.load_state_dict(
+            filter_weights, strict=False)
+
+        # Check missing and unexpected keys.
+        # The input conditioner is not initialized in current implementation.
+        unexpected_keys.remove("input_conditioner.norm_mean")
+        unexpected_keys.remove("input_conditioner.norm_std")
+        for m in missing_keys:
+            if not m.startswith('model.blocks.'):
+                raise ValueError(f"Missing key: {m}")
+        for u in unexpected_keys:
+            if not u.startswith('model.blocks.'):
+                raise ValueError(f"Unexpected key: {u}")
+
+        # Load weights for vision transformer module.
+        model_weights = {
+            k.replace('radio_model.model.', ''): v
+            for k, v in weights.items() if k.startswith('radio_model.model.')
+        }
+        converted_weights = dict()
+        for name in model_weights:
+            # Handle with weights and bias for vision transformer's qkv projection.
+            if "attn.qkv." in name:
+                q_name = name.replace("attn.qkv.", "attn.q_proj.")
+                k_name = name.replace("attn.qkv.", "attn.k_proj.")
+                v_name = name.replace("attn.qkv.", "attn.v_proj.")
+                dim_shape = model_weights[name].shape[0] // 3
+                converted_weights[q_name] = model_weights[name][:dim_shape]
+                converted_weights[k_name] = model_weights[name][dim_shape:2 *
+                                                                dim_shape]
+                converted_weights[v_name] = model_weights[name][2 * dim_shape:]
+            else:
+                converted_weights[name] = model_weights[name]
+        pattern_mapping = {
+            r'(.*?)attn.proj.(.*)': r'\1attn.o_proj.\2',
+            r'(.*?)mlp.fc1.(.*)': r'\1mlp.up_proj.\2',
+            r'(.*?)mlp.fc2.(.*)': r'\1mlp.down_proj.\2',
+        }
+        modeling_utils._load_weights_impl(self.radio_model.model,
+                                          converted_weights,
+                                          params_map=pattern_mapping)
 
     def forward(self, x: torch.Tensor):
         return self.radio_model.forward(x)
