@@ -647,7 +647,8 @@ def create_py_executor_instance(
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, kv_cache_manager, attention_type, cache_transceiver_config)
+        mapping, dist, kv_cache_manager, attention_type,
+        cache_transceiver_config)
     return PyExecutor(
         resource_manager,
         scheduler,
