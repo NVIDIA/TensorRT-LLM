@@ -73,6 +73,11 @@ def add_llm_args(parser):
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
     parser.add_argument('--moe_cluster_size', type=int, default=-1)
+    parser.add_argument(
+        '--low_precision_combine',
+        default=False,
+        action='store_true',
+        help='Use low precision combine in MoE (only for NVFP4 quantization)')
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
@@ -229,7 +234,7 @@ def setup_llm(args, **kwargs):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_config=MoeConfig(backend=args.moe_backend),
+        moe_config=MoeConfig(backend=args.moe_backend, low_precision_combine=args.low_precision_combine),
         sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
