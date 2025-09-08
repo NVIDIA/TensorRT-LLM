@@ -39,7 +39,7 @@ def get_spec_metadata(spec_config,
             is_draft_model=is_draft_model,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
-            is_mtp_eagle=spec_config.is_mtp_eagle,
+            is_mtp_eagle=False,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
