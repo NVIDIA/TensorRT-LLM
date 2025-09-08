@@ -75,9 +75,6 @@ RUN pip3 uninstall -y opencv && \
     rm -rf /usr/local/lib/python3*/dist-packages/cv2/ && \
     pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
 
-# COPY bringup_fix.sh bringup_fix.sh
-# RUN bash ./bringup_fix.sh && rm bringup_fix.sh
-
 # WARs against security issues inherited from pytorch:25.06
 # * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
 RUN pip3 install --upgrade --no-cache-dir \

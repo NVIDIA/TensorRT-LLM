@@ -41,7 +41,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     )
 
 
-@pytest.mark.skip("https://nvbugswb.nvidia.com/NVBugs5/redir.aspx?url=/5443039")
 @pytest.mark.parametrize(
     "experiment_config",
     [

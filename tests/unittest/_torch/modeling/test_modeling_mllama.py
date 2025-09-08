@@ -2,7 +2,6 @@ import re
 import unittest
 from copy import deepcopy
 
-import pytest
 import torch
 from _torch.helpers import create_mock_engine
 from parameterized import parameterized
@@ -10,7 +9,6 @@ from test_modeling_llama import Scenario, reduce_llama_config
 from transformers import MllamaConfig
 from transformers import \
     MllamaForConditionalGeneration as HFMllamaForConditionalGeneration
-from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -291,8 +289,6 @@ class TestMLlama(unittest.TestCase):
         """
         Compare output to HF
         """
-        if scenario.backend == "FLASHINFER" and getSMVersion() == 120:
-            pytest.skip("https://nvbugspro.nvidia.com/bug/5458945")
         backend = scenario.backend
         metadata_cls = get_attention_backend(backend).Metadata
 

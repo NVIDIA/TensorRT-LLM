@@ -799,7 +799,6 @@ def trtllm_bench_unified_comparison(
             )
 
 
-@pytest.mark.skip("https://nvbugswb.nvidia.com/NVBugs5/redir.aspx?url=/5443039")
 def test_trtllm_bench(llm_root):  # noqa: F811
     model_path_or_name, model_name, model_path = tiny_llama_details()
 
