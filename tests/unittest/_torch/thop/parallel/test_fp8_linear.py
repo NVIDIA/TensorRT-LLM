@@ -11,6 +11,9 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 @skip_pre_hopper
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fp8_linear(dtype):
+    print(
+        f"TORCHINDUCTOR_COMPILE_THREADS is: {os.environ.get('TORCHINDUCTOR_COMPILE_THREADS')}"
+    )
     SEQ_LEN = 10
     HIDDEN_SIZE = 128
     torch.manual_seed(0)
