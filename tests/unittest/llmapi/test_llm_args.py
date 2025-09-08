@@ -438,12 +438,16 @@ class TestTorchLlmArgs:
             assert llm.args.max_seq_len == 128
             assert llm.args.max_batch_size == 8
 
-            executor_config = llm.args.get_executor_config(
-                llm._hf_model_dir, llm.tokenizer)
-            assert executor_config.max_beam_width == 1
-            assert executor_config.max_num_tokens == 256
-            assert executor_config.max_seq_len == 128
-            assert executor_config.max_batch_size == 8
+            (
+                max_beam_width,
+                max_num_tokens,
+                max_seq_len,
+                max_batch_size,
+            ) = llm.args.get_runtime_sizes()
+            assert max_beam_width == 1
+            assert max_num_tokens == 256
+            assert max_seq_len == 128
+            assert max_batch_size == 8
 
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
