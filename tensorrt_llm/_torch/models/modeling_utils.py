@@ -885,7 +885,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
 
                     module_weights.append(fw)
                 module.load_weights(weights=module_weights)
-
             else:
                 module_weights = filter_weights(name, weights)
                 if hasattr(module, 'load_weights'):

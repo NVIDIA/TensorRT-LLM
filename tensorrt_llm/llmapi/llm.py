@@ -656,22 +656,6 @@ class BaseLLM:
                                              self.llm_build_stats))
         self._engine_dir, self._hf_model_dir = model_loader()
 
-    def update_weights_from_ipc_handles_async(self, handles: dict):
-        result = self._executor.async_update_weights_from_ipc_handles(handles)
-        return result
-
-    def update_weights_from_ipc_handles(self, handles: dict):
-        result = self._executor.update_weights_from_ipc_handles(handles)
-        return result
-
-    def update_weights(self, weights: dict):
-        result = self._executor.update_weights(weights)
-        return result
-
-    def update_weights_async(self, weights: dict):
-        result = self._executor.async_update_weights(weights)
-        return result
-
     @property
     def _on_trt_backend(self) -> bool:
         return isinstance(self.args, TrtLlmArgs)
