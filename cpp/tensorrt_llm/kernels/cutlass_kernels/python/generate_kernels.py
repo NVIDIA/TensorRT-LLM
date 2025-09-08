@@ -109,6 +109,7 @@ def GetDataTypeNames(type, is_mx_fpx=None):
 CudaTypeName = {
     e2m1: "SafeFP4",
     DataType.e4m3: "__nv_fp8_e4m3",
+    DataType.e5m2: "cutlass::float_e5m2_t",
     DataType.bf16: "__nv_bfloat16",
     DataType.f16: "half",
     DataType.f32: "float",
@@ -218,9 +219,8 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 {out_tag}*, int, int, int, const int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig, char*, size_t, cudaStream_t, int*
 );"""
     elif operation.gemm_kind == GemmKind.Grouped:
-        if operation.act_type != operation.weight_type and (
-                operation.act_type != DataType.e4m3
-                or operation.weight_type != e2m1):
+        if operation.act_type != operation.weight_type and not (
+                (operation.act_type in [DataType.e4m3, DataType.e5m2]) and (operation.weight_type == e2m1)):
             # Mixed MoE GEMM
             weight_tag = CudaTypeName[operation.weight_type]
             instantiation = f"""
@@ -250,6 +250,7 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             guard_map = {
                 e2m1: "defined(ENABLE_FP4)",
                 DataType.e4m3: "defined(ENABLE_FP8)",
+                DataType.e5m2: "defined(ENABLE_FP8)",
                 DataType.bf16: "defined(ENABLE_BF16)"
             }
             guard_act = guard_map[
@@ -267,6 +268,8 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
 #if {guard_act} && {guard_weight}
         INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag}, {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, false, {"true" if operation.swap_ab else "false"});
 #endif"""
+    # if operation.arch == 120:
+    #     print(f"instantiation: {instantiation}")
     return instantiation
 
 
@@ -635,7 +638,7 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 120
-    supported_dtypes = [e2m1]
+    supported_dtypes = [e2m1, (DataType.e5m2, e2m1)]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_mnk = [[128, 128, 128], [128, 128, 256], [256, 128, 128],
@@ -663,17 +666,22 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
         epi_schedule = EpilogueScheduleType.NoSmemWarpSpecialized
 
-        otypes = [dtype]
-        if dtype in [DataType.e4m3, e2m1]:
+        if isinstance(dtype, tuple):
+            act_type, weight_type = dtype
+        else:
+            act_type, weight_type = dtype, dtype
+
+        otypes = [act_type]
+        if act_type in [DataType.e5m2, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
             moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
                                                      arch,
-                                                     dtype,
-                                                     dtype,
-                                                     dtype,
-                                                     dtype,
+                                                     act_type,
+                                                     weight_type,
+                                                     act_type,
+                                                     act_type,
                                                      otype,
                                                      quant_op,
                                                      epi_tag,
@@ -684,6 +692,7 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
                                                      mainloop_schedule,
                                                      epi_schedule,
                                                      epi_fusion,
+                                                     is_mx_fpx=(act_type == DataType.e5m2 and weight_type == e2m1),
                                                      swap_ab=swap_ab)
 
             operations.append(moe_gemm_operation)
@@ -872,8 +881,7 @@ if __name__ == "__main__":
             return False
         # Only w4a8fp8 and not wfp4afp8
         return (op.act_type != op.weight_type) and (
-            op.gemm_kind == GemmKind.Grouped) and (op.act_type != DataType.e4m3
-                                                   or op.weight_type != e2m1)
+            op.gemm_kind == GemmKind.Grouped) and not (((op.act_type == DataType.e4m3) or (op.act_type == DataType.e5m2)) and (op.weight_type == e2m1))
 
     # Fix OOM error in CI. If len(operations) is more than GROUP_SIZE, it will be split into multiple sub groups.
     GROUP_SIZE = 8
