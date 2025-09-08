@@ -82,7 +82,7 @@ transforms:
   # check if we can fuse rmsnorm
   fuse_rmsnorm:
     stage: post_load_fusion
-    backend: flashinfer
+    backend: triton
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
