@@ -200,8 +200,6 @@ class AccuracyTask:
             evaluate_kwargs.update(self.EVALUATE_KWARGS)
         accuracy = evaluator.evaluate(llm, sampling_params, streaming,
                                       **evaluate_kwargs)
-
-        print(f"Accuracy: {accuracy}, Threshold: {threshold}")
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
