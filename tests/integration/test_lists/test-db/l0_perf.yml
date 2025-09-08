@@ -40,6 +40,6 @@ l0_perf:
         linux_distribution_name: ubuntu*
       terms:
         stage: pre_merge
-        backend: _autodeploy
+        backend: pytorch
     tests:
       - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-_autodeploy-float16-input_output_len:128,128-reqs:8192]
