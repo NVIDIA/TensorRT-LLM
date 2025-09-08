@@ -571,8 +571,12 @@ def fp8_block_scaling_bmm_out(
     if sm_version == 90 or sm_version == 89:
         mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
             mat1)
+
+        output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
         torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
-                                                   mat1_scale, mat2_scale, out)
+                                                   mat1_scale, mat2_scale, output)
+        out.copy_(output)
+
     elif sm_version == 100:
         torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
     else:
