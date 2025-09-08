@@ -655,7 +655,7 @@ def testFilter = [
     (ONLY_ONE_GROUP_CHANGED): "",
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
-    (DETAILED_LOG): false,
+    (DETAILED_LOG): true,
 ]
 
 @Field
