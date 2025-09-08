@@ -3,6 +3,8 @@ from typing import Dict, List, Optional, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version
+
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor, next_positive_power_of_2
 from .interface import MoE, MoEWeightLoadingMode
@@ -77,6 +79,11 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
         )
+
+        sm_version = get_sm_version()
+        if sm_version >= 120:
+            raise NotImplementedError(
+                "TRTLLMGenFusedMoE does not support SM120 and above.")
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
