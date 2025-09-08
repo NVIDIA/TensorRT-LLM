@@ -599,8 +599,7 @@ class vllmCustomDataset(BenchmarkDataset):
                 self.data.append(row.to_dict())
         else:
             raise NotImplementedError(
-                "Only JSONL format is supported for CustomDataset."
-            )
+                "Only JSONL format is supported for CustomDataset.")
 
         random.seed(self.random_seed)
         random.shuffle(self.data)
@@ -626,7 +625,10 @@ class vllmCustomDataset(BenchmarkDataset):
             # apply template
             if not skip_chat_template:
                 prompt = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
+                    [{
+                        "role": "user",
+                        "content": prompt
+                    }],
                     add_generation_prompt=True,
                     tokenize=False,
                 )
@@ -638,13 +640,12 @@ class vllmCustomDataset(BenchmarkDataset):
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
                     request_id=request_id_prefix + str(i),
-                )
-            )
-        self.maybe_oversample_requests(
-            sampled_requests, num_requests, request_id_prefix
-        )
+                ))
+        self.maybe_oversample_requests(sampled_requests, num_requests,
+                                       request_id_prefix)
 
         return sampled_requests
+
 
 class RandomImageDataset(BenchmarkDataset):
     DEFAULT_PREFIX_LEN = 0
