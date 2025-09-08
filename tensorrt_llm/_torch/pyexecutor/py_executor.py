@@ -1140,7 +1140,7 @@ class PyExecutor:
                                 f"sleep 5 seconds, num_request_queue: {self.executor_request_queue.get_request_queue_size()}"
                             )
                             time.sleep(5)
-                            break
+                            continue
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
