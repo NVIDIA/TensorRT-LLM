@@ -367,6 +367,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
             sh "touch ${regularTestList}"
             echo "No regular tests in this shard, created empty file: ${regularTestList}"
         }
+        sh "cat ${regularTestList}"
 
         if (shardIsolateTests.size() > 0) {
             def shardIsolateContent = shardIsolateTests.join('\n') + '\n'
@@ -376,6 +377,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
             sh "touch ${isolateTestList}"
             echo "No isolate tests in this shard, created empty file: ${isolateTestList}"
         }
+        sh "cat ${isolateTestList}"
 
         // Return preprocessed lists object for compatibility
         return [
@@ -1794,8 +1796,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "--timeout=${pytestTestTimeout}",
             "--rootdir ${llmSrc}/tests/integration/defs",
             "--test-prefix=${stageName}",
-            "--splits ${splits}",
-            "--group ${splitId}",
             "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
             "--output-dir=${WORKSPACE}/${stageName}/",
             "--csv=${WORKSPACE}/${stageName}/report.csv",
@@ -1883,8 +1883,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Run the isolated tests if exists
-        if (preprocessedLists.isolatedCount > 0) {
-            echo "There are ${preprocessedLists.isolatedCount} isolated tests to run"
+        if (preprocessedLists.isolateCount > 0) {
+            echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
             runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
         } else {
             echo "No isolated tests to run for stage ${stageName}"
