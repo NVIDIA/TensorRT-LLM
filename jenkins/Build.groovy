@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@yanchaol-upload']) _
 
 import groovy.transform.Field
 
@@ -57,37 +57,37 @@ def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   // cmake-vars cannot be empty, so passing (default) multi-device configuration.
   (CONFIG_LINUX_X86_64_VANILLA) : [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
+    (WHEEL_EXTRA_ARGS) : "--clean --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_PYBIND) : [
-    (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
+    (WHEEL_EXTRA_ARGS) : "--clean --binding_type pybind --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
     (TARNAME) : "pybind-TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=0 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_UCX=0 --micro_benchmarks",
+    (WHEEL_EXTRA_ARGS) : "--clean --extra-cmake-vars ENABLE_MULTI_DEVICE=0 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_UCX=0 --micro_benchmarks",
     (TARNAME) : "single-device-TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_LLVM) : [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --micro_benchmarks -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
+    (WHEEL_EXTRA_ARGS) : "--clean --extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --micro_benchmarks -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64): [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON",
+    (WHEEL_EXTRA_ARGS) : "--clean --extra-cmake-vars WARNING_IS_ERROR=ON",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64_PYBIND): [
-    (WHEEL_EXTRA_ARGS) : "--binding_type pybind --extra-cmake-vars WARNING_IS_ERROR=ON",
+    (WHEEL_EXTRA_ARGS) : "--clean --binding_type pybind --extra-cmake-vars WARNING_IS_ERROR=ON",
     (TARNAME) : "pybind-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
-    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
+    (WHEEL_EXTRA_ARGS) : "--clean --extra-cmake-vars WARNING_IS_ERROR=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
@@ -318,24 +318,31 @@ def downloadArtifacts(stageName, reuseArtifactPath, artifacts, serverId = 'Artif
 
 def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 'Artifactory')
 {
-    for (it in artifacts) {
-        def uploadpath = it.key
-        def filepath = it.value
-        def spec = """{
-                    "files": [
-                        {
-                        "pattern": "${filepath}",
-                        "target": "${prefix}/${uploadpath}"
-                        }
-                    ]
-                }"""
-        echo "Uploading ${filepath} as ${uploadpath}. Spec: ${spec}"
-        trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
-            rtUpload (
-                serverId: serverId,
-                spec: spec,
-            )
-        })
+    withEnv(['JFROG_CLI_COLLECT_BUILD_INFO=false']) {
+        for (item in artifacts) {
+            def uploadpath = item.key
+            def filepath = item.value
+
+            def spec = """\
+            {
+            \"files\": [
+                {
+                \"pattern\": \"${filepath}\",
+                \"target\":  \"${prefix}/${uploadpath}\"
+                }
+            ]
+            }
+            """
+
+            echo "Uploading ${filepath} as ${uploadpath}. Spec: ${spec}"
+
+            trtllm_utils.llmRetry(retryTimes, "uploadArtifacts", {
+                rtUpload (
+                    serverId: serverId,
+                    spec: spec,
+                )
+            })
+        }
     }
 }
 
@@ -436,10 +443,10 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks")
     }
     if (is_linux_x86_64) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py")
     }
 
     // Build tritonserver artifacts
@@ -465,8 +472,9 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
 
+    sh "rm -rf ${tarName}"
+
     if (is_linux_x86_64) {
-        sh "rm -rf ${tarName}"
         sh "pigz --version || true"
         sh "bash -c 'tar --use-compress-program=\"pigz -k\" -cf ${tarName} TensorRT-LLM/'"
     } else {
@@ -483,7 +491,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "ccache -sv"
     sh "cat ${CCACHE_DIR}/ccache.conf"
 
-    // Step 1: cloning tekit source code
+    // Step 1: cloning TRT-LLM source code
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
@@ -585,7 +593,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --benchmarks --micro_benchmarks")
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, true, false, "cp312", "-a '90-real' -b Debug --benchmarks --micro_benchmarks")
                         }
                     }
                 })
