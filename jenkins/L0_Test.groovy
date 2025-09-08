@@ -380,7 +380,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     // Wait 10 minutes to check status of the node again
                     sleep(time: 10, unit: 'MINUTES')
                     // Avoid the node being stuck in the held state.
-                    Utils.exec(pipeline, Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""))
+                    Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""), numRetries: 3)
                     counter++
                 }
             }
