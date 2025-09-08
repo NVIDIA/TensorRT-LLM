@@ -204,5 +204,7 @@ GPT-OSS/MXFP4:
     accuracy: 90.3
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 90.3
+  - quant_algo: W4A16_MXFP4
+    accuracy: 90.3
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 88.36
