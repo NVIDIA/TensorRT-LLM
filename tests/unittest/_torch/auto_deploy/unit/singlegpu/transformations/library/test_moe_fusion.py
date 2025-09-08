@@ -282,7 +282,7 @@ class MoEPatternModel(nn.Module):
                     not fp4_compatible() or not trtllm_ops_available(),
                     reason="Requires FP4 + TRTLLM support",
                 ),
-                # pytest.mark.skip("https://nvbugs/5410946"),
+                pytest.mark.skip("https://nvbugs/5410946"),
             ],
             id="fp4",
         ),

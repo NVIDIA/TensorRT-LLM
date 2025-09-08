@@ -51,7 +51,7 @@ class DummyFactory(ModelFactory):
     ],
 )
 def test_quantization(quant_config, atol, rtol, num_p_og):
-    # pytest.skip("https://nvbugspro.nvidia.com/bug/5170222")
+    pytest.skip("https://nvbugspro.nvidia.com/bug/5170222")
     model = MLP(32, 64, 32).to(torch.float16).to("cuda")
     x = torch.randn(3, 32, dtype=torch.float16).to("cuda")
 

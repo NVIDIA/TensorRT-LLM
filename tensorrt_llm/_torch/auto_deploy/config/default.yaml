@@ -77,8 +77,9 @@ transforms:
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
-  fuse_gemms:
-    stage: post_load_fusion
+  # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  # fuse_gemms:
+  #   stage: post_load_fusion
   fuse_fp4_gemms:
     stage: post_load_fusion
   fuse_fp8_gemms:

@@ -98,153 +98,173 @@ class Quantization(BaseTransform):
     ) -> Tuple[object, ...]:
         return ()
 
-
-def _insert_quantized_linear(
-    gm: GraphModule,
-    node: Node,
-    quantization_impl: Quantization,
-    is_quantized_graph: bool = False,
-):
-    """Replaces the matmul node with a new custom quantized linear node.
-
-    The state_dict is also updated to contain the sharded weights.
-    """
-    param_name, _ = extract_param_names_from_lin_node(node)
-    original_weight = gm.get_parameter(param_name)
-    new_param = nn.Parameter(
-        quantization_impl.quantize_weight(original_weight), requires_grad=False
-    )
-    modname, _, attrname = param_name.rpartition(".")
-
-    submod = gm.get_submodule(modname)
-    setattr(submod, attrname, new_param)
-
-    # check modelopt quantizers from graph
-    if is_quantized_graph:
-        input_params, weight_params, output_params = get_quantization_params_from_linear_node(node)
-        # redirect to input and weight
-        node.args = (input_params.input_node, weight_params.input_node, *node.args[2:])
-
-        # redirect output to skip output quantizer if any
-        user = list(node.users.keys())[0]
-        if len(node.users) == 1 and is_quantized_op(user):
-            user.replace_all_uses_with(node)
-
-        # when loading the state_dict, we need to convert input amax to input scale
-        input_scale_name = quantization_impl.scale_names()[0]
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                quantization_impl.convert_amax_hook,
-                scale_name=modname + "." + input_scale_name,
-                amax_name=input_params.amax.target,
+    # Transform logic for ModelOPT linear layers
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        qcfg = factory.get_quant_config()
+        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
+
+        excluded = qcfg.get("exclude_modules", [])
+        cnt = 0
+        for n in gm.graph.nodes:
+            if not is_linear_op(n):
+                continue
+            if should_skip_quantization(n, excluded):
+                continue
+            self._insert_quantized_linear(gm, n, is_quantized_graph=False)
+            cnt += 1
+
+        return gm, TransformInfo(
+            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
         )
-        # Note: canonicalize_graph() will remove input/weight/output quantizer
 
-    for scale_name, scale in quantization_impl.default_scales(original_weight.shape).items():
-        submod.register_buffer(scale_name, scale)
+    def _insert_quantized_linear(
+        self,
+        gm: GraphModule,
+        node: Node,
+        is_quantized_graph: bool = False,
+    ):
+        """Replaces the matmul node with a new custom quantized linear node.
 
-    gm._register_load_state_dict_pre_hook(
-        partial(quantization_impl.load_hook, weight_name=param_name)
-    )
-
-    with gm.graph.inserting_before(node):
-        scales = {}
-        for scale_name in quantization_impl.scale_names():
-            scales[scale_name] = gm.graph.create_node("get_attr", modname + "." + scale_name)
-
-    custom_args = quantization_impl.build_custom_args_for_linear(scales)
-
-    node.target = quantization_impl.target_op()
-    node.args = (*node.args, *custom_args)
-
-
-def _insert_quantized_bmm(
-    gm: GraphModule,
-    node: Node,
-    quantization_impl: Quantization,
-    is_quantized_graph: bool = False,
-) -> bool:
-    """Replace a bmm op with its quantized equivalent and wire scales/state_dict hooks.
-
-    Returns:
-        True if quantization was applied; False if skipped (e.g., unknown shape).
-    """
-    weight_node = node.args[1]
-
-    # Weight is a parameter
-    if weight_node.op == "get_attr":
-        # Handle parameter tensor
-        param_name = weight_node.target
+        The state_dict is also updated to contain the sharded weights.
+        """
+        param_name, _ = extract_param_names_from_lin_node(node)
         original_weight = gm.get_parameter(param_name)
-        weight_shape = original_weight.shape
-
-        # Quantize the weight
-        new_param = nn.Parameter(
-            quantization_impl.quantize_weight(original_weight), requires_grad=False
-        )
-
-        # Update the parameter in the model
+        new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
         modname, _, attrname = param_name.rpartition(".")
+
         submod = gm.get_submodule(modname)
         setattr(submod, attrname, new_param)
 
-        # Register load state dict hook
-        gm._register_load_state_dict_pre_hook(
-            partial(quantization_impl.load_hook, weight_name=param_name)
-        )
-        if quantization_impl.post_load_hook:
-            gm.register_load_state_dict_post_hook(
-                partial(quantization_impl.post_load_hook, weight_name=param_name)
+        # check modelopt quantizers from graph
+        if is_quantized_graph:
+            input_params, weight_params, output_params = get_quantization_params_from_linear_node(
+                node
             )
+            # redirect to input and weight
+            node.args = (input_params.input_node, weight_params.input_node, *node.args[2:])
 
-        # Setup scale names and target module for parameter case
-        def get_scale_name(scale_name):
-            return attrname + "_" + scale_name
+            # redirect output to skip output quantizer if any
+            user = list(node.users.keys())[0]
+            if len(node.users) == 1 and is_quantized_op(user):
+                user.replace_all_uses_with(node)
 
-        scale_target_module = submod
-        scale_name_prefix = f"{modname}."
+            # when loading the state_dict, we need to convert input amax to input scale
+            input_scale_name = self.scale_names()[0]
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    self.convert_amax_hook,
+                    scale_name=modname + "." + input_scale_name,
+                    amax_name=input_params.amax.target,
+                )
+            )
+            # Note: canonicalize_graph() will remove input/weight/output quantizer
 
-    # Weight is a dynamic tensor
-    elif hasattr(weight_node, "meta") and "val" in weight_node.meta:
-        weight_shape = weight_node.meta["val"].shape
+        for scale_name, scale in self.default_scales(original_weight.shape).items():
+            submod.register_buffer(scale_name, scale)
 
-        # Create a unique identifier for this dynamic weight node
-        node_id = f"bmm_dynamic_{id(node)}"
+        gm._register_load_state_dict_pre_hook(partial(self.load_hook, weight_name=param_name))
 
-        # Setup scale names and target module for dynamic case
-        def get_scale_name(scale_name):
-            return f"{node_id}_{scale_name}"
+        with gm.graph.inserting_before(node):
+            scales = {}
+            for scale_name in self.scale_names():
+                scales[scale_name] = gm.graph.create_node("get_attr", modname + "." + scale_name)
 
-        scale_target_module = gm  # Register in root module
-        scale_name_prefix = ""
+        custom_args = self.build_custom_args_for_linear(scales)
 
-    else:
-        # If we can't determine the shape, skip quantization
-        return False
+        node.target = self.target_op()
+        node.args = (*node.args, *custom_args)
 
-    # Common logic for both parameter and dynamic tensor cases
-    # Register scales in the target module
-    for scale_name, scale in quantization_impl.default_scales(weight_shape).items():
-        scale_buffer_name = get_scale_name(scale_name)
-        scale_target_module.register_buffer(scale_buffer_name, scale)
+    def _insert_quantized_bmm(
+        self,
+        gm: GraphModule,
+        node: Node,
+        is_quantized_graph: bool = False,
+    ) -> bool:
+        """Replace a bmm op with its quantized equivalent and wire scales/state_dict hooks.
 
-    # Change node target to quantized bmm op
-    node.target = quantization_impl.target_op()
+        Returns:
+            True if quantization was applied; False if skipped (e.g., unknown shape).
+        """
+        weight_node = node.args[1]
 
-    # Insert scale nodes
-    with gm.graph.inserting_before(node):
-        scales = {}
-        for scale_name in quantization_impl.scale_names():
+        # Weight is a parameter
+        if weight_node.op == "get_attr":
+            # Handle parameter tensor
+            param_name = weight_node.target
+            original_weight = gm.get_parameter(param_name)
+            weight_shape = original_weight.shape
+
+            # Quantize the weight
+            new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
+
+            # Update the parameter in the model
+            modname, _, attrname = param_name.rpartition(".")
+            submod = gm.get_submodule(modname)
+            setattr(submod, attrname, new_param)
+
+            # Register load state dict hook
+            gm._register_load_state_dict_pre_hook(partial(self.load_hook, weight_name=param_name))
+            if self.post_load_hook:
+                gm.register_load_state_dict_post_hook(
+                    partial(self.post_load_hook, weight_name=param_name)
+                )
+
+            # Setup scale names and target module for parameter case
+            def get_scale_name(scale_name):
+                return attrname + "_" + scale_name
+
+            scale_target_module = submod
+            scale_name_prefix = f"{modname}."
+
+        # Weight is a dynamic tensor
+        elif hasattr(weight_node, "meta") and "val" in weight_node.meta:
+            weight_shape = weight_node.meta["val"].shape
+
+            # Create a unique identifier for this dynamic weight node
+            node_id = f"bmm_dynamic_{id(node)}"
+
+            # Setup scale names and target module for dynamic case
+            def get_scale_name(scale_name):
+                return f"{node_id}_{scale_name}"
+
+            scale_target_module = gm  # Register in root module
+            scale_name_prefix = ""
+
+        else:
+            # If we can't determine the shape, skip quantization
+            return False
+
+        # Common logic for both parameter and dynamic tensor cases
+        # Register scales in the target module
+        for scale_name, scale in self.default_scales(weight_shape).items():
             scale_buffer_name = get_scale_name(scale_name)
-            scales[scale_name] = gm.graph.create_node(
-                "get_attr", f"{scale_name_prefix}{scale_buffer_name}"
-            )
+            scale_target_module.register_buffer(scale_buffer_name, scale)
 
-    # Update node arguments and kwargs
-    scale_values = [scales[scale_name] for scale_name in quantization_impl.scale_names()]
-    node.args = (*node.args, *scale_values)
-    return True
+        # Change node target to quantized bmm op
+        node.target = self.target_op()
+
+        # Insert scale nodes
+        with gm.graph.inserting_before(node):
+            scales = {}
+            for scale_name in self.scale_names():
+                scale_buffer_name = get_scale_name(scale_name)
+                scales[scale_name] = gm.graph.create_node(
+                    "get_attr", f"{scale_name_prefix}{scale_buffer_name}"
+                )
+
+        # Update node arguments and kwargs
+        scale_values = [scales[scale_name] for scale_name in self.scale_names()]
+        node.args = (*node.args, *scale_values)
+        return True
 
 
 @TransformRegistry.register("quantize_fp8_linear_from_config")
@@ -281,33 +301,6 @@ class FP8LinearQuantizationFromConfig(Quantization):
             amax = state_dict[amax_name]
             scale = amax / FP8_MAX
             state_dict[scale_name] = scale
-
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
-        excluded = qcfg.get("exclude_modules", [])
-        cnt = 0
-        for n in gm.graph.nodes:
-            if not is_linear_op(n):
-                continue
-            if should_skip_quantization(n, excluded):
-                continue
-            _insert_quantized_linear(gm, n, self, is_quantized_graph=False)
-            cnt += 1
-
-        return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
-        )
 
 
 @TransformRegistry.register("quantize_nvfp4_linear_from_config")
@@ -399,33 +392,6 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
             scale = ((448 * 6) / amax).float()
             state_dict[scale_name] = scale
 
-    def _apply(
-        self,
-        gm: GraphModule,
-        cm: CachedSequenceInterface,
-        factory: ModelFactory,
-        shared_config: SharedConfig,
-    ) -> Tuple[GraphModule, TransformInfo]:
-        qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
-        excluded = qcfg.get("exclude_modules", [])
-        cnt = 0
-        for n in gm.graph.nodes:
-            if not is_linear_op(n):
-                continue
-            if should_skip_quantization(n, excluded):
-                continue
-            _insert_quantized_linear(gm, n, self, is_quantized_graph=False)
-            cnt += 1
-
-        return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
-        )
-
 
 @TransformRegistry.register("quantize_fp8_bmm_from_config")
 class FP8BMMQuantizationFromConfig(Quantization):
@@ -499,7 +465,7 @@ class FP8BMMQuantizationFromConfig(Quantization):
                 continue
             if should_skip_quantization(n, excluded):
                 continue
-            if _insert_quantized_bmm(gm, n, self, is_quantized_graph=False):
+            if self._insert_quantized_bmm(gm, n, is_quantized_graph=False):
                 cnt += 1
 
         return gm, TransformInfo(
@@ -529,7 +495,7 @@ class FP8QuantizationFromGraph(FP8LinearQuantizationFromConfig):
                 algo_n = get_quantization_from_linear_node(n)
                 if (algo_n or "").upper() != "FP8":
                     continue
-                _insert_quantized_linear(gm, n, self, is_quantized_graph=True)
+                self._insert_quantized_linear(gm, n, is_quantized_graph=True)
                 cnt += 1
 
         remove_output_quantizers(gm)
@@ -560,7 +526,7 @@ class NVFP4QuantizationFromGraph(NVFP4LinearQuantizationFromConfig):
                 algo_n = get_quantization_from_linear_node(n)
                 if (algo_n or "").upper() != "NVFP4":
                     continue
-                _insert_quantized_linear(gm, n, self, is_quantized_graph=True)
+                self._insert_quantized_linear(gm, n, is_quantized_graph=True)
                 cnt += 1
 
         remove_output_quantizers(gm)
