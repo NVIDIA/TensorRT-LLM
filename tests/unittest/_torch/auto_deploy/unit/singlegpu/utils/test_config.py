@@ -41,7 +41,7 @@ def create_settings_with_default_yaml(default_yaml_path: Path):
     class SettingsWithDefaultYaml(DynamicYamlMixInForSettings, BaseSettings):
         """Settings class with default yaml file."""
 
-        model_config = ConfigDict(yaml_file=str(default_yaml_path))
+        yaml_default: str = str(default_yaml_path)
 
         simple: SimpleModel
         option: OptionModel
@@ -55,12 +55,46 @@ def create_nested_settings(nested_default_yaml_path: Path):
     class NestedSettings(DynamicYamlMixInForSettings, BaseSettings):
         """Nested settings class for testing precedence."""
 
-        model_config = ConfigDict(yaml_file=str(nested_default_yaml_path))
+        yaml_default: str = str(nested_default_yaml_path)
 
         args: BasicSettings
         extra_field: str = "default"
 
     return NestedSettings
+
+
+def create_mode_based_settings(
+    train_yaml: Path,
+    eval_yaml: Path,
+    default_mode: str = "",
+    default_yaml_default: str = "",
+):
+    """Create a settings class that selects default yaml via a mode mapping.
+
+    The returned class overrides _get_yaml_default_from_mode to map
+    mode -> yaml file path and optionally sets default values for
+    `mode` and `yaml_default` to enable precedence testing.
+    """
+
+    class ModeBasedSettings(DynamicYamlMixInForSettings, BaseSettings):
+        """Settings class whose default yaml is determined by `mode`."""
+
+        # Allow explicit defaults for precedence testing
+        mode: Literal["train", "eval", ""] = default_mode
+        yaml_default: str = default_yaml_default
+
+        simple: SimpleModel
+        option: OptionModel
+
+        @classmethod
+        def _get_yaml_default_from_mode(cls, mode: str | None) -> str | None:
+            mapping = {
+                "train": str(train_yaml),
+                "eval": str(eval_yaml),
+            }
+            return mapping.get((mode or ""))
+
+    return ModeBasedSettings
 
 
 @pytest.fixture
@@ -159,7 +193,7 @@ args:
     option: "off"
 """)
 
-    # Inner config (for args.yaml_configs)
+    # Inner config (for args.yaml_extra)
     files["inner_config"] = temp_dir / "inner_config.yaml"
     files["inner_config"].write_text("""
 simple:
@@ -183,7 +217,7 @@ def test_no_yaml_configs():
 
 def test_single_yaml_config(basic_yaml_files):
     """Test loading a single yaml config file."""
-    settings = BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
+    settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
     assert settings.simple.value == 200
     assert settings.simple.name == "config1"
@@ -195,9 +229,7 @@ def test_single_yaml_config(basic_yaml_files):
 def test_multiple_yaml_configs_merging(basic_yaml_files):
     """Test merging multiple yaml configs in order."""
     # Order: config1, config2 (config2 should override config1)
-    settings = BasicSettings(
-        yaml_configs=[basic_yaml_files["config1"], basic_yaml_files["config2"]]
-    )
+    settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"], basic_yaml_files["config2"]])
 
     assert settings.simple.value == 200  # from config1
     assert settings.simple.name == "config2"  # overridden by config2
@@ -210,7 +242,7 @@ def test_partial_yaml_config(basic_yaml_files):
     """Test partial yaml config with some missing fields."""
     with pytest.raises(ValidationError):
         # Should fail because 'name' is missing from simple
-        BasicSettings(yaml_configs=[basic_yaml_files["partial"]])
+        BasicSettings(yaml_extra=[basic_yaml_files["partial"]])
 
 
 # Default YAML file tests
@@ -229,7 +261,7 @@ def test_default_yaml_file_loading(basic_yaml_files):
 def test_default_yaml_with_additional_configs(basic_yaml_files):
     """Test default yaml file with additional configs."""
     SettingsWithDefaultYaml = create_settings_with_default_yaml(basic_yaml_files["default"])
-    settings = SettingsWithDefaultYaml(yaml_configs=[basic_yaml_files["config1"]])
+    settings = SettingsWithDefaultYaml(yaml_extra=[basic_yaml_files["config1"]])
 
     # Additional configs should override default
     assert settings.simple.value == 200  # from config1
@@ -243,7 +275,7 @@ def test_multiple_additional_configs_with_default(basic_yaml_files):
     """Test multiple additional configs with default yaml file."""
     SettingsWithDefaultYaml = create_settings_with_default_yaml(basic_yaml_files["default"])
     settings = SettingsWithDefaultYaml(
-        yaml_configs=[basic_yaml_files["config1"], basic_yaml_files["config2"]]
+        yaml_extra=[basic_yaml_files["config1"], basic_yaml_files["config2"]]
     )
 
     # Order: default.yaml, config1.yaml, config2.yaml
@@ -271,7 +303,7 @@ def test_nested_default_yaml(nested_yaml_files):
 def test_nested_with_outer_yaml_configs(nested_yaml_files):
     """Test nested settings with yaml configs at outer level."""
     NestedSettings = create_nested_settings(nested_yaml_files["nested_default"])
-    settings = NestedSettings(yaml_configs=[nested_yaml_files["nested_override1"]])
+    settings = NestedSettings(yaml_extra=[nested_yaml_files["nested_override1"]])
 
     # Outer config should override inner defaults
     assert settings.args.simple.value == 150
@@ -286,7 +318,7 @@ def test_nested_with_inner_yaml_configs(nested_yaml_files):
     """Test nested settings with yaml configs at inner level."""
     NestedSettings = create_nested_settings(nested_yaml_files["nested_default"])
     # Create nested settings with inner yaml configs
-    settings = NestedSettings(args=BasicSettings(yaml_configs=[nested_yaml_files["inner_config"]]))
+    settings = NestedSettings(args=BasicSettings(yaml_extra=[nested_yaml_files["inner_config"]]))
 
     # Inner yaml configs should be processed
     assert settings.args.simple.value == 300
@@ -302,10 +334,10 @@ def test_nested_precedence_outer_over_inner(nested_yaml_files):
     NestedSettings = create_nested_settings(nested_yaml_files["nested_default"])
     # Both outer and inner yaml configs
     # Outer yaml config gets converted to init arguments for inner settings ("args")
-    # The yaml_configs for the inner settings are passed in as yaml setting with lower precedence
+    # The yaml_extra for the inner settings are passed in as yaml setting with lower precedence
     settings = NestedSettings(
-        yaml_configs=[nested_yaml_files["nested_override1"]],
-        args={"yaml_configs": [nested_yaml_files["inner_config"]]},
+        yaml_extra=[nested_yaml_files["nested_override1"]],
+        args={"yaml_extra": [nested_yaml_files["inner_config"]]},
     )
 
     # Outer should take precedence over inner
@@ -322,8 +354,8 @@ def test_inner_init_precedence_over_outer_yaml(nested_yaml_files):
     NestedSettings = create_nested_settings(nested_yaml_files["nested_default"])
     # Both outer and inner yaml configs
     settings = NestedSettings(
-        yaml_configs=[nested_yaml_files["nested_override1"]],
-        args=BasicSettings(yaml_configs=[nested_yaml_files["inner_config"]]),
+        yaml_extra=[nested_yaml_files["nested_override1"]],
+        args=BasicSettings(yaml_extra=[nested_yaml_files["inner_config"]]),
     )
 
     # Initialized BasicSettings takes precedence over yaml since it's a init argument
@@ -342,7 +374,7 @@ def test_init_overrides_yaml(basic_yaml_files):
     init_option = OptionModel(name="init_option", option="on")
 
     settings = BasicSettings(
-        simple=init_simple, option=init_option, yaml_configs=[basic_yaml_files["config1"]]
+        simple=init_simple, option=init_option, yaml_extra=[basic_yaml_files["config1"]]
     )
 
     # Init values should override yaml
@@ -359,7 +391,7 @@ def test_env_overrides_yaml(basic_yaml_files):
         os.environ,
         {"SIMPLE": '{"value": 888, "name": "env_value"}', "OPTION": '{"name": "env_option"}'},
     ):
-        settings = BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
+        settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
         # Environment should override yaml
         assert settings.simple.value == 888
@@ -372,7 +404,7 @@ def test_env_overrides_yaml(basic_yaml_files):
 def test_partial_env_override(basic_yaml_files):
     """Test partial environment variable override."""
     with patch.dict(os.environ, {"SIMPLE": '{"flag": true}', "OPTION": '{"option": "on"}'}):
-        settings = BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
+        settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
         # Mix of env and yaml values
         assert settings.simple.value == 200  # from yaml
@@ -383,6 +415,22 @@ def test_partial_env_override(basic_yaml_files):
 
 
 # Error handling tests
+def test_deprecated_yaml_configs_field_error(basic_yaml_files):
+    """Test that using deprecated yaml_configs field raises ValueError."""
+    with pytest.raises(
+        ValueError, match=r"The 'yaml_configs' field is deprecated.*Please use 'yaml_extra' instead"
+    ):
+        BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
+
+
+def test_empty_yaml_configs_allowed():
+    """Test that empty yaml_configs list doesn't raise error."""
+    # Empty yaml_configs should not raise error (but validation will still fail for missing fields)
+    with pytest.raises(ValidationError):
+        # Should fail validation for missing required fields, not for yaml_configs deprecation
+        BasicSettings(yaml_configs=[])
+
+
 def test_missing_yaml_file(temp_dir):
     """Test handling of missing yaml file."""
     missing_file = temp_dir / "missing.yaml"
@@ -390,7 +438,7 @@ def test_missing_yaml_file(temp_dir):
     # Should not raise error for missing file (gracefully ignored)
     with pytest.raises(ValidationError):
         # But should still fail validation for missing required fields
-        BasicSettings(yaml_configs=[missing_file])
+        BasicSettings(yaml_extra=[missing_file])
 
 
 def test_invalid_yaml_syntax(temp_dir):
@@ -407,7 +455,7 @@ option:
 """)
 
     with pytest.raises(ValidationError):
-        BasicSettings(yaml_configs=[invalid_yaml])
+        BasicSettings(yaml_extra=[invalid_yaml])
 
 
 def test_malformed_yaml_file(temp_dir):
@@ -426,7 +474,7 @@ option:
 """)
 
     with pytest.raises(Exception):  # Should raise yaml parsing error
-        BasicSettings(yaml_configs=[malformed_yaml])
+        BasicSettings(yaml_extra=[malformed_yaml])
 
 
 # Deep merging tests
@@ -454,7 +502,7 @@ option:
   # name should remain from base
 """)
 
-    settings = BasicSettings(yaml_configs=[base_yaml, override_yaml])
+    settings = BasicSettings(yaml_extra=[base_yaml, override_yaml])
 
     # Deep merge should preserve non-overridden values
     assert settings.simple.value == 200  # overridden
@@ -500,7 +548,7 @@ option:
   option: "off"
 """)
 
-    settings = BasicSettings(yaml_configs=[yaml1, yaml2, yaml3])
+    settings = BasicSettings(yaml_extra=[yaml1, yaml2, yaml3])
 
     # Final result should be deep merge of all three
     assert settings.simple.value == 200  # from yaml2
@@ -538,7 +586,7 @@ def create_some_nested_settings_with_default_yaml(default_yaml_path: Path):
     class SomeNestedSettingsWithDefaultYaml(DynamicYamlMixInForSettings, BaseSettings):
         """Nested settings with default yaml file."""
 
-        model_config = ConfigDict(yaml_file=str(default_yaml_path))
+        yaml_default: str = str(default_yaml_path)
 
         args: SomeSettings
         extra_field: str = "default_extra"
@@ -603,7 +651,7 @@ extra_field: "default_extra_value"
 def test_nested_dict_deep_merge_basic(dict_config_yaml_files):
     """Test basic deep merging of nested dictionaries."""
     # Test with only inner config
-    settings = SomeNestedSettings(args={"yaml_configs": [dict_config_yaml_files["inner_config"]]})
+    settings = SomeNestedSettings(args={"yaml_extra": [dict_config_yaml_files["inner_config"]]})
 
     # Should have k1 and k2 from inner config
     assert len(settings.args.configs) == 2
@@ -631,8 +679,8 @@ def test_nested_dict_deep_merge_with_outer_yaml(dict_config_yaml_files):
     # Create settings with both inner and outer configs
     # Use args as dict to allow deep merging, not as explicitly initialized object
     settings = SomeNestedSettings(
-        yaml_configs=[dict_config_yaml_files["outer_config"]],
-        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+        yaml_extra=[dict_config_yaml_files["outer_config"]],
+        args={"yaml_extra": [dict_config_yaml_files["inner_config"]]},
     )
 
     # Should have k1 (merged), k2 (from inner), and k3 (from outer)
@@ -671,8 +719,8 @@ def test_nested_dict_deep_merge_with_default_yaml(dict_config_yaml_files):
 
     # Create settings with default yaml and additional outer config
     settings = SomeNestedSettingsWithDefaultYaml(
-        yaml_configs=[dict_config_yaml_files["outer_config"]],
-        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+        yaml_extra=[dict_config_yaml_files["outer_config"]],
+        args={"yaml_extra": [dict_config_yaml_files["inner_config"]]},
     )
 
     # Should have k1 (from outer, overriding both default and inner),
@@ -734,8 +782,8 @@ extra_field: "partial_extra_value"
     # Test with multiple yaml configs: default -> outer -> partial_override
     # and inner config for args
     settings = SomeNestedSettingsWithDefaultYaml(
-        yaml_configs=[dict_config_yaml_files["outer_config"], partial_override],
-        args={"yaml_configs": [dict_config_yaml_files["inner_config"]]},
+        yaml_extra=[dict_config_yaml_files["outer_config"], partial_override],
+        args={"yaml_extra": [dict_config_yaml_files["inner_config"]]},
     )
 
     # Should have all keys
@@ -764,8 +812,8 @@ def test_nested_dict_explicit_init_vs_yaml_precedence(dict_config_yaml_files):
     # When we pass an explicitly initialized SomeSettings object,
     # it should take precedence over outer yaml configs
     settings = SomeNestedSettings(
-        yaml_configs=[dict_config_yaml_files["outer_config"]],
-        args=SomeSettings(yaml_configs=[dict_config_yaml_files["inner_config"]]),
+        yaml_extra=[dict_config_yaml_files["outer_config"]],
+        args=SomeSettings(yaml_extra=[dict_config_yaml_files["inner_config"]]),
     )
 
     # Should only have k1 and k2 from inner config (explicit init takes precedence)
@@ -823,7 +871,7 @@ simple:
 
     SettingsWithDefaultYaml = create_settings_with_default_yaml(default_config)
     # Simulate CLI usage: default + user + experiment configs
-    settings = SettingsWithDefaultYaml(yaml_configs=[user_config, experiment_config])
+    settings = SettingsWithDefaultYaml(yaml_extra=[user_config, experiment_config])
 
     # Should have proper precedence
     assert settings.simple.value == 999  # from experiment (highest priority)
@@ -834,10 +882,10 @@ simple:
 
 
 def test_empty_yaml_configs_list():
-    """Test with empty yaml_configs list."""
-    # Should behave same as no yaml_configs
+    """Test with empty yaml_extra list."""
+    # Should behave same as no yaml_extra
     with pytest.raises(ValidationError):
-        BasicSettings(yaml_configs=[])
+        BasicSettings(yaml_extra=[])
 
 
 def test_relative_and_absolute_paths(basic_yaml_files, temp_dir):
@@ -854,7 +902,7 @@ def test_relative_and_absolute_paths(basic_yaml_files, temp_dir):
     SettingsWithDefaultYaml = create_settings_with_default_yaml(relative_default)
 
     settings = SettingsWithDefaultYaml(
-        yaml_configs=[
+        yaml_extra=[
             relative_config,  # absolute path (Path object)
             basic_yaml_files["config2"],  # absolute path (Path object)
         ]
@@ -863,3 +911,177 @@ def test_relative_and_absolute_paths(basic_yaml_files, temp_dir):
     # Should work with both path types
     assert settings.simple.value == 200  # from relative_config (same as config1)
     assert settings.simple.name == "config2"  # from config2
+
+
+# Error for deprecated model_config.yaml_file
+def test_model_config_yaml_file_raises_error(temp_dir):
+    """Using model_config.yaml_file must raise a clear error."""
+    mc_default = temp_dir / "mc_default.yaml"
+    mc_default.write_text(
+        """
+simple:
+  value: 1
+  name: "mc"
+option:
+  name: "mc_option"
+  option: "on"
+        """
+    )
+
+    class SettingsUsingModelConfig(DynamicYamlMixInForSettings, BaseSettings):
+        # Intentionally use deprecated mechanism to trigger the error
+        model_config = ConfigDict(yaml_file=str(mc_default))
+
+        simple: SimpleModel
+        option: OptionModel
+
+    with pytest.raises(
+        ValueError, match=r"Static yaml config via yaml_file in config is not supported"
+    ):
+        SettingsUsingModelConfig()
+
+
+# =============================================================
+# Additional tests for mode/yaml_default handling and precedence
+# =============================================================
+
+
+@pytest.fixture
+def mode_yaml_files(temp_dir):
+    """Create yaml files for testing mode and yaml_default precedence."""
+    files = {}
+
+    files["train"] = temp_dir / "train.yaml"
+    files["train"].write_text(
+        """
+simple:
+  value: 111
+  name: "train"
+  flag: true
+option:
+  name: "train_option"
+  option: "on"
+        """
+    )
+
+    files["eval"] = temp_dir / "eval.yaml"
+    files["eval"].write_text(
+        """
+simple:
+  value: 222
+  name: "eval"
+  flag: false
+option:
+  name: "eval_option"
+  option: "off"
+        """
+    )
+
+    return files
+
+
+# 1) Handling when mode and/or yaml_default is provided
+def test_error_when_both_mode_and_yaml_default_are_provided(mode_yaml_files):
+    """Providing both mode and yaml_default must raise a ValueError."""
+    ModeBasedSettings = create_mode_based_settings(
+        mode_yaml_files["train"], mode_yaml_files["eval"]
+    )
+
+    with pytest.raises(
+        ValueError, match=r"Cannot provide both 'mode' and 'yaml_default' simultaneously"
+    ):
+        ModeBasedSettings(mode="train", yaml_default=str(mode_yaml_files["eval"]))
+
+
+def test_only_mode_uses_mode_selected_default_yaml(mode_yaml_files):
+    """Providing only mode picks the default yaml based on the mode mapping."""
+    ModeBasedSettings = create_mode_based_settings(
+        mode_yaml_files["train"], mode_yaml_files["eval"]
+    )
+
+    settings = ModeBasedSettings(mode="eval")
+    assert settings.simple.value == 222
+    assert settings.simple.name == "eval"
+    assert settings.simple.flag is False
+    assert settings.option.name == "eval_option"
+    assert settings.option.option == "off"
+
+
+def test_only_yaml_default_uses_that_file(mode_yaml_files):
+    """Providing only yaml_default picks that yaml file as default."""
+    ModeBasedSettings = create_mode_based_settings(
+        mode_yaml_files["train"], mode_yaml_files["eval"]
+    )
+
+    settings = ModeBasedSettings(yaml_default=str(mode_yaml_files["train"]))
+    assert settings.simple.value == 111
+    assert settings.simple.name == "train"
+    assert settings.simple.flag is True
+    assert settings.option.name == "train_option"
+    assert settings.option.option == "on"
+
+
+# 2) Precedence order for determining the default yaml
+# Order (highest to lowest):
+# 1. provided mode
+# 2. provided yaml_default
+# 3. yaml_default from default mode
+# 4. default yaml_default
+
+
+def test_default_selection_prefers_provided_mode_over_class_defaults(mode_yaml_files):
+    """Provided mode overrides any class default yaml_default or default mode mapping."""
+    ModeBasedSettings = create_mode_based_settings(
+        mode_yaml_files["train"],
+        mode_yaml_files["eval"],
+        default_mode="train",
+        default_yaml_default=str(mode_yaml_files["train"]),
+    )
+
+    settings = ModeBasedSettings(mode="eval")
+    # Must select eval.yaml despite class defaults pointing to train
+    assert settings.simple.name == "eval"
+    assert settings.option.name == "eval_option"
+
+
+def test_default_selection_prefers_provided_yaml_default_over_default_mode(mode_yaml_files):
+    """Provided yaml_default takes precedence over the class default mode mapping."""
+    ModeBasedSettings = create_mode_based_settings(
+        mode_yaml_files["train"],
+        mode_yaml_files["eval"],
+        default_mode="train",
+        default_yaml_default="",
+    )
+
+    settings = ModeBasedSettings(yaml_default=str(mode_yaml_files["eval"]))
+    assert settings.simple.name == "eval"
+    assert settings.option.name == "eval_option"
+
+
+def test_default_selection_uses_default_mode_mapping_when_no_args(mode_yaml_files):
+    """If nothing is provided, the class default mode decides the default yaml."""
+    ModeBasedSettings = create_mode_based_settings(
+        mode_yaml_files["train"],
+        mode_yaml_files["eval"],
+        default_mode="train",
+        default_yaml_default=str(mode_yaml_files["eval"]),  # different on purpose
+    )
+
+    settings = ModeBasedSettings()
+    # Must select train.yaml because default_mode maps to train
+    assert settings.simple.name == "train"
+    assert settings.option.name == "train_option"
+
+
+def test_default_selection_falls_back_to_default_yaml_default(mode_yaml_files):
+    """If no mode and no provided yaml_default, use the class default yaml_default."""
+    ModeBasedSettings = create_mode_based_settings(
+        mode_yaml_files["train"],
+        mode_yaml_files["eval"],
+        default_mode="",
+        default_yaml_default=str(mode_yaml_files["eval"]),  # only yaml_default set
+    )
+
+    settings = ModeBasedSettings()
+    assert settings.simple.name == "eval"
+    assert settings.option.name == "eval_option"

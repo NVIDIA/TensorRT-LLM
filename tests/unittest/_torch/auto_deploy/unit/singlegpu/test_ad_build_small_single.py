@@ -22,7 +22,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
 
     # check that llm_args and experiment_config have the same args
     expected_ad_config: AutoDeployConfig = experiment_config.args
-    expected_llm_args: LlmArgs = expected_ad_config.to_llm_args()
+    expected_llm_args: LlmArgs = LlmArgs(**expected_ad_config.to_llm_kwargs())
     assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"
 
     # check expected parallel config

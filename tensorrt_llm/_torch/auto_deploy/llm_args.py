@@ -18,14 +18,9 @@ PathLike = Union[str, Path]
 
 
 def _get_config_dict() -> SettingsConfigDict:
-    # yaml_file = "default.yaml"
-    yaml_file = "transformers.yaml"
-    print(f"Using config file: {yaml_file}")
-
     return SettingsConfigDict(
         arbitrary_types_allowed=True,
         extra="forbid",
-        yaml_file=str(files("tensorrt_llm._torch.auto_deploy.config") / yaml_file),
         nested_model_default_partial_update=True,
     )
 
@@ -188,6 +183,14 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
 
     ### NEW INFERENCE OPTIMIZER CONFIG #############################################################
+    # NOTE: needs explicit setting in LlmArgs below as well due to mix-in inheritance structure
+    mode: Literal["graph", "transformers"] = Field(
+        default="graph",
+        description="The mode to use for the inference optimizer. Currently, we "
+        "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
+        "or transformers-only cached attention optimization.",
+    )
+
     transforms: Dict[str, TransformConfig] = Field(
         default_factory=dict,
         description="A dictionary of transform configurations. The key is the transform name and "
@@ -233,9 +236,27 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         """Convert the arguments to a dictionary."""
         return self.model_dump()
 
-    def to_llm_args(self) -> "LlmArgs":
-        """Convert the arguments to a LlmArgs instance that is used for the LLM API."""
-        return LlmArgs(**self.to_dict())
+    def to_llm_kwargs(self) -> Dict[str, Any]:
+        """Convert the arguments to a dictionary that can be used as kwargs for the LLM API."""
+        kwargs = self.to_dict()
+
+        # ensure we remove the mode and yaml_default fields since they otherwise may conflict each
+        # other.
+        if "mode" not in self.model_fields_set:
+            kwargs.pop("mode")
+        if "yaml_default" not in self.model_fields_set:
+            kwargs.pop("yaml_default")
+        return kwargs
+
+    ### PRIVATE METHODS ############################################################################
+    @classmethod
+    def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
+        config_path = files("tensorrt_llm._torch.auto_deploy.config")
+        mapping = {
+            "graph": str(config_path / "default.yaml"),
+            "transformers": str(config_path / "transformers.yaml"),
+        }
+        return mapping.get(mode)
 
 
 class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
@@ -255,6 +276,14 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     """
 
     model_config = _get_config_dict()
+
+    # NOTE: redeclare mode field from AutoDeployConfig to ensure correct default+validation
+    mode: Literal["graph", "transformers"] = Field(
+        default="graph",
+        description="The mode to use for the inference optimizer. Currently, we "
+        "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
+        "or transformers-only cached attention optimization.",
+    )
 
     build_config: Optional[object] = Field(
         default_factory=lambda: BuildConfig(),
@@ -345,11 +374,11 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     def get_pytorch_backend_config(self) -> "LlmArgs":
         """Return the LlmArgs (self) object."""
         # TODO: can we just pass through self directly??
-        return type(self)(**self.to_dict())
+        return type(self)(**self.to_llm_kwargs())
 
     def to_dict(self) -> Dict:
         """Convert model to a dictionary such that cls(**self.to_dict()) == self."""
-        self_dict = dict(self)
-        self_dict.pop("build_config")
-        self_dict.pop("mpi_session")
+        self_dict = super().to_dict()
+        self_dict.pop("build_config", None)
+        self_dict.pop("mpi_session", None)
         return self_dict
