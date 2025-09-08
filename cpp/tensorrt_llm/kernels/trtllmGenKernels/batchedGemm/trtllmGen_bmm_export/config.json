@@ -33,6 +33,7 @@
             "numExperts": 128,
             "useCudaGraph": true,
             "clampLimit": 2,
+            "smVersion": "100f",
             "useTmaOobOpt": true
         },
         "BatchedGemmPerTensorScalingFp8LowLatency": {
@@ -66,6 +67,7 @@
             "numExperts": 128,
             "useCudaGraph": true,
             "clampLimit": 2,
+            "smVersion": "100f",
             "useTmaOobOpt": true
         },
         "BatchedGemmDeepSeekFp8LowLatency": {
@@ -102,6 +104,7 @@
             "numExperts": 128,
             "useCudaGraph": true,
             "clampLimit": 2,
+            "smVersion": "100f",
             "useTmaOobOpt": true
         },
         "BatchedGemmMxE2m1E4m3LowLatency": {
@@ -141,6 +144,7 @@
             "biasType": "m",
             "act": "swiglu",
             "clampLimit": 2,
+            "smVersion": "100f",
             "useTmaOobOpt": true
         },
         "BatchedGemmMxE2m1MxE4m3LowLatency": {
@@ -179,6 +183,7 @@
             "biasType": "m",
             "act": "swiglu",
             "clampLimit": 2,
+            "smVersion": "100f",
             "useTmaOobOpt": true
         },
         "BatchedGemmMxE2m1Bf16LowLatency": {
@@ -220,6 +225,7 @@
             "act": "swiglu",
             "patchF2fp": false,
             "clampLimit": 2,
+            "smVersion": "100f",
             "useTmaOobOpt": true
         }
     },

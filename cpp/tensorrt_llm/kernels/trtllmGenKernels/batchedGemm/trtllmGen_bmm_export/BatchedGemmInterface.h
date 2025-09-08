@@ -234,13 +234,29 @@ struct BatchedGemmData
         // The dtype is float32.
         void const* mPtrBias{nullptr};
 
-        // The output tensor scaling factor for MxFp{4,8}, Fp8 and NvFp4 quantization.
+        // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
+        // scaleC = dequantA * dequantB * quantC,
+        // where dequantA is global dequantization scaling factor of A
+        //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+        //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+        //    otherwise it is 1.
+        // dequantB is defined similarly to dequantA.
+        // quantC is the quantization scaling factor of C.
+        //    if dtypeC is FP8, it transforms the range from [-amaxC, amaxC] to [-448, 448]
+        //    if dtypeC is NvFp4, it transforms the range from [-amaxC, amaxC] to [-448 * 6, 448 * 6],
+        //    otherwise it is 1.
         // Shape is [B].
         float const* mPtrScaleC{nullptr};
 
-        // The output gate scale for MxFp{4,8} and NvFp4 quantization.
+        // The output gate scale for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
+        // scaleGate = dequantA * dequantB,
+        // where dequantA is global dequantization scaling factor of A
+        //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
+        //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
+        //    otherwise it is 1.
+        // dequantB is defined similarly to dequantA.
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 
@@ -274,7 +290,7 @@ struct BatchedGemmData
         // beta' = beta / dqAb
         // out = scaleC * (x1 + beta') * x0
         //
-        // Note this assumes that scaleAb == scaleGate which is true in TRT-LLM MoE use-case
+        // Note this assumes that dequantScaleAb == scaleGate which is true in TRT-LLM MoE use-case
         //
         float const* mPtrClampLimit{nullptr};
 
@@ -286,6 +302,10 @@ struct BatchedGemmData
         // The formula for SwiGlu (for GeGlu, replace sigmoid with phi):
         //
         //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) * (x_linear + beta)
+        //
+        // The beta is added before applying the global scaling factor. I.e.
+        // x_linear = (x_linear + beta') * scaleC
+        // Thus, the beta' = beta / (dequantA * dequantB), where the beta is the original beta.
         float const* mPtrGatedActAlpha{nullptr};
         float const* mPtrGatedActBeta{nullptr};
 
