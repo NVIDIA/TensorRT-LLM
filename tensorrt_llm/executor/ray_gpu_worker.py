@@ -1,5 +1,4 @@
 import copy
-import json
 import os
 from pathlib import Path
 from queue import Queue
@@ -12,7 +11,7 @@ from tensorrt_llm.logger import logger
 
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
-from ..builder import ConfigEncoder, Engine, EngineConfig
+from ..builder import Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..lora_manager import LoraConfig, LoraManager
@@ -150,17 +149,11 @@ class RayGPUWorker(GenerationExecutor):
         self._client_id_to_request_id: Dict[int, int] = {}
 
         self._executor_config = executor_config
-        self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
-            "pytorch", "_autodeploy"
-        ]
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
         self.llm_args = llm_args
 
         if not self._is_pytorch_backend:
             raise ValueError(f"Ray GPU worker only supports pytorch backend")
-
-        if not self._is_pytorch_backend and kv_connector_config is not None:
-            raise ValueError(
-                "KV connector config is only supported for PyTorch backend")
 
         if self.global_rank > 1:
             from tensorrt_llm.logger import logger
@@ -197,14 +190,6 @@ class RayGPUWorker(GenerationExecutor):
                 args["tokenizer"] = tokenizer
                 args["lora_config"] = lora_config
                 args["kv_connector_config"] = kv_connector_config
-            elif self.llm_args.backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.llm_args import \
-                    LlmArgs as ADLlmArgs
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-                assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args.get_pytorch_backend_config()
             else:
                 raise ValueError(
                     f"Unsupported backend config: {self.llm_args.backend}")
@@ -226,29 +211,7 @@ class RayGPUWorker(GenerationExecutor):
                 self.max_seq_len = _executor.max_seq_len
             return _executor
 
-        def _create_engine(executor_config):
-            if executor_config is None:
-                executor_config = tllm.ExecutorConfig(1)
-            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-                processor_batched=batched_logits_processor, replicate=False)
-            comm_ranks, device_ids = _get_comm_ranks_device_id()
-            executor_config.parallel_config = tllm.ParallelConfig(
-                participant_ids=comm_ranks, device_ids=device_ids)
-
-            if isinstance(engine, Engine):
-                return tllm.Executor(engine.engine,
-                                     json.dumps(engine.config.to_dict(),
-                                                cls=ConfigEncoder),
-                                     tllm.ModelType.DECODER_ONLY,
-                                     executor_config=executor_config,
-                                     managed_weights=engine.managed_weights)
-
-            assert not hasattr(executor_config, "backend")
-            return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                 executor_config)
-
-        self.engine = _create_py_executor(
-        ) if self.llm_args is not None else _create_engine(executor_config)
+        self.engine = _create_py_executor()
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
