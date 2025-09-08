@@ -40,13 +40,41 @@ class CUDAGraphRunner:
         self.max_beam_width = engine.max_beam_width
         self.spec_config = engine.spec_config
 
+        self.max_possible_draft_len = (self.spec_config.max_draft_len
+                                       if self.enable_spec_decode else 0)
+
         self.graphs: Dict[Tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self.static_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
         self.graph_outputs: Dict[Tuple[int, int],
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self.memory_pool = engine._cuda_graph_mem_pool
         self.padding_dummy_request: Optional["Request"] = None
+
+        self.shared_static_tensors: Dict[str, torch.Tensor] = {}
+        if self.enabled:
+            self._create_shared_static_tensors()
+
+    def _create_shared_static_tensors(self):
+        """Allocates static tensors sized for the largest possible batch."""
+        engine = self._get_engine()
+
+        token_per_request = self.max_possible_draft_len + 1
+        max_total_tokens = (self.max_supported_batch_size *
+                            self.max_beam_width * token_per_request)
+        max_total_tokens = min(max_total_tokens, engine.max_num_tokens)
+
+        self.shared_static_tensors = {
+            "input_ids":
+            torch.ones((max_total_tokens, ), device="cuda", dtype=torch.int32),
+            "position_ids":
+            torch.zeros((1, max_total_tokens), device="cuda",
+                        dtype=torch.int32),
+        }
+        if engine.use_mrope:
+            self.shared_static_tensors["mrope_position_deltas"] = torch.zeros(
+                (self.max_supported_batch_size, 1),
+                device="cuda",
+                dtype=torch.int32)
 
     @property
     def enable_spec_decode(self):
@@ -139,38 +167,32 @@ class CUDAGraphRunner:
     def capture(self, batch_size: int, forward_fn: Callable,
                 initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
-        engine = self._get_engine()
         key = (batch_size, self.draft_len)
-        spec_metadata = initial_inputs.get("spec_metadata", None)
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
-        token_per_request = spec_metadata.max_draft_len + 1 if spec_metadata is not None else 1
+        token_per_request = self.max_possible_draft_len + 1
+        num_tokens_for_capture = (batch_size * self.max_beam_width *
+                                  token_per_request)
 
-        static_tensors = {
+        sliced_static_tensors = {
             "input_ids":
-            torch.ones((batch_size * self.max_beam_width * token_per_request, ),
-                       device="cuda",
-                       dtype=torch.int32),
+            self.shared_static_tensors["input_ids"][:num_tokens_for_capture],
             "position_ids":
-            torch.zeros((
-                1,
-                batch_size * self.max_beam_width * token_per_request,
-            ),
-                        device="cuda",
-                        dtype=torch.int32),
+            self.shared_static_tensors["position_ids"]
+            [:, :num_tokens_for_capture],
         }
-        if engine.use_mrope:
-            static_tensors["mrope_position_deltas"] = torch.zeros(
-                (batch_size, 1), device="cuda", dtype=torch.int32)
-        self.static_inputs[key] = static_tensors
+        if "mrope_position_deltas" in self.shared_static_tensors:
+            sliced_static_tensors["mrope_position_deltas"] = \
+                self.shared_static_tensors["mrope_position_deltas"][:batch_size]
 
+        # Use the sliced tensors for capture
         capture_inputs = initial_inputs.copy()
-        capture_inputs.update(static_tensors)
+        capture_inputs.update(sliced_static_tensors)
 
         self.graph_metadata[key] = {
             "attn_metadata": initial_inputs["attn_metadata"],
-            "spec_metadata": spec_metadata,
+            "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
         # We have to do warm up runs to initialize PyTorch's
@@ -198,7 +220,7 @@ class CUDAGraphRunner:
             assert current_inputs.get(
                 "spec_metadata") is stored_meta["spec_metadata"]
 
-        static_tensors = self.static_inputs[key]
+        static_tensors = self.shared_static_tensors
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
@@ -301,9 +323,9 @@ class CUDAGraphRunner:
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
-        self.static_inputs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self.padding_dummy_request = None
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()
