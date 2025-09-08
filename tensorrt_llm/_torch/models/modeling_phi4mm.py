@@ -404,6 +404,7 @@ class Phi4MMInputProcessor(InputProcessor):
 
         self.tokenizer = tokenizer
         self.use_fast = True
+        model_path = "microsoft/Phi-4-multimodal-instruct"
         if self.tokenizer is None:
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_path,
