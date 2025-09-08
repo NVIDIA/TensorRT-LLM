@@ -18,7 +18,7 @@ import os
 import subprocess
 
 # The markers in our test lists, need to be preprocess before checking
-MARKER_LIST_IN_TEST = [" TIMEOUT", " ISOLATE"]
+MARKER_LIST_IN_TEST = [" TIMEOUT"]
 
 
 def install_python_dependencies(llm_src):
