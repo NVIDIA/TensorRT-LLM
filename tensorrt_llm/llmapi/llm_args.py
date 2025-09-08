@@ -367,6 +367,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
+            "SaveState": SaveHiddenStatesDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
             "AUTO": AutoDecodingConfig,
         }
@@ -461,6 +462,42 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_one_model:
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
+
+    @functools.cached_property
+    def num_capture_layers(self):
+        """
+        Returns the number of layers to capture of the target model.
+        If eagle3_layers_to_capture is not None, return the length of the set.
+        Otherwise, assume Eagle3 base set and return 3.
+        """
+        if self.eagle3_layers_to_capture is not None:
+            return len(self.eagle3_layers_to_capture)
+        return 3
+
+
+class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
+    output_directory: str
+    write_interval: int = 20
+    file_prefix: str = "data"
+    eagle3_layers_to_capture: Optional[Set[int]] = None
+    save_last_layer_post_norm: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "SaveState"
+
+    def validate(self) -> None:
+        if self.output_directory is None or not self.eagle3_layers_to_capture:
+            raise ValueError(
+                "Save directory and layers to capture must be provided")
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     @functools.cached_property
     def num_capture_layers(self):
@@ -953,6 +990,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
+    SaveHiddenStatesDecodingConfig,
     AutoDecodingConfig,
 ]]
 
@@ -1765,6 +1803,17 @@ class BaseLlmArgs(StrictBaseModel):
                 assert self.backend in ['pytorch', '_autodeploy']
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.AUTO
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
+            elif isinstance(self.speculative_config,
+                            SaveHiddenStatesDecodingConfig):
+                assert self.backend in ['pytorch']
+                self.build_config.max_batch_size = 1
+                self.max_batch_size = 1
+                self.disable_overlap_scheduler = True
+                self.cuda_graph_config = None
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.SAVE_HIDDEN_STATES
+                self.build_config.max_draft_len = 1
+                self.speculative_config.max_draft_len = 1
 
             else:
                 raise ValueError(
