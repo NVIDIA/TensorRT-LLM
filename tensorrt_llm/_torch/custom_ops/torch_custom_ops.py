@@ -22,7 +22,7 @@ from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
-
+from .cute_dsl_kernels.blackwell.utils import make_ptr
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
@@ -1045,18 +1045,15 @@ def pad_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
 
 
-# add nvfp4 cute dsl gemm
 class CuteDSLNVFP4BlackwellLinear(TunableRunner):
     kernel_dict = dict()
 
-    # TODO:
-    # tuning_config = TuningConfig(
-    #     dynamic_tensor_specs=(DynamicTensorSpec(
-    #         0, 0, get_last_power_of_2_num_tokens_buckets,
-    #         last_positive_power_of_2), ),
-    #     constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
-    # )
-    tuning_config = TuningConfig()
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+    )
 
     def __init__(self):
         super().__init__()
@@ -1081,65 +1078,15 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         c_major = "n"
         sf_vec_size = 16
 
-        # # TODO:
-        # use_tma_store_candi = [True]
-        # mma_tiler_mn_candi = [(256, 128)]
-        # cluster_shape_mn_candi = [
-        #     (4, 2),
-        # ]
-        # use_prefetch_candi = [True]
-        # prefetch_A_only_candi = [False]
-        # prefetch_B_only_candi = [False]
-        # prefetch_dist_candi = [1]
-        # use_pdl_candi = [False]
-
         # full shamoo
-        use_tma_store_candi = [True]
         mma_tiler_mn_candi = [(256, 128), (128, 128), (128, 256), (256, 256),
                               (256, 64), (128, 64)]
         cluster_shape_mn_candi = [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2),
                                   (2, 4), (4, 1), (4, 2), (4, 4)]
-        use_prefetch_candi = [True]
-        prefetch_A_only_candi = [False]
-        prefetch_B_only_candi = [False]
-        prefetch_dist_candi = [1, 2, 3, 4, 5, 6, 7]
-        use_pdl_candi = [True]
-
-        # use_tma_store_candi = [True]
-        # TODO:
-        # mma_tiler_mn_candi = [(256, 128),  (256, 64)]
-        # mma_tiler_mn_candi = [(256, 128)]
-        # cluster_shape_mn_candi = [
-        #    # (2, 1),
-        #    # (2, 2),
-        #    (2, 4),
-        #    # (4, 2),
-        #    # (4, 4)
-        # ]
-        # mma_tiler_mn_candi = [(128, 128)]
-        # cluster_shape_mn_candi = [
-        #    # (2, 1),
-        #    # (2, 2),
-        #    (1, 4),
-        #    # (4, 2),
-        #    # (4, 4)
-        # ]
-        # use_prefetch_candi = [True]
-        # prefetch_A_only_candi = [False]
-        # prefetch_B_only_candi = [False]
-        # prefetch_dist_candi = [7]
-        # use_pdl_candi = [True]
         return [
-            (use_tma_store, mma_tiler_mn, cluster_shape_mn, use_prefetch,
-             prefetch_A_only, prefetch_B_only, prefetch_dist, use_pdl)
-            for use_tma_store in use_tma_store_candi
+            (mma_tiler_mn, cluster_shape_mn)
             for mma_tiler_mn in mma_tiler_mn_candi
             for cluster_shape_mn in cluster_shape_mn_candi
-            for use_prefetch in use_prefetch_candi
-            for prefetch_A_only in prefetch_A_only_candi
-            for prefetch_B_only in prefetch_B_only_candi
-            for prefetch_dist in prefetch_dist_candi
-            for use_pdl in use_pdl_candi
             if Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
                 cutlass.Float4E2M1FN,  # ab_dtype,
                 # cutlass.Float8E8M0FNU,  # sf_dtype
@@ -1158,32 +1105,32 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             )
         ]
 
-    # m, n, k	config	time	cuda_dsl config
-    # 128, 7168, 16384	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x1	19.72	(256, 128), (2, 4), 7
-    # 128, 24576, 1536	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x4	9.721	(128, 128), (1, 4), 0
-    # 128, 2112, 7168	256x64x256_0_tnn_align32_o_vs16_2sm_bias_bf16_relu 2x1	9.468	(256, 64), (2, 4), 2
-    # 128, 4096, 7168	256x64x256_0_tnn_align32_o_vs16_2sm_bias_bf16_relu 2x1	10.29	(256, 128) (2, 4), 2
-    # 128, 7168, 2048	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x4	6.924	(256, 128), (2, 4), 1
-    def get_tactic_for_deepseek_r1(self, m, n, k):
-        if m == 128:
-            if n == 7168 and k == 16384:
-                return ((256, 128), (2, 4), True, 7)
-            elif n == 24576 and k == 1536:
-                return ((128, 128), (1, 4), False, 0)
-            elif n == 2112 and k == 7168:
-                return ((256, 64), (2, 4), True, 2)
-            elif n == 4096 and k == 7168:
-                return ((256, 128), (2, 4), True, 2)
-            elif n == 7168 and k == 2048:
-                return ((256, 128), (2, 4), True, 1)
-            else:
-                raise ValueError(
-                    f"Invalid input: m = {m}, n = {n}, k = {k}, no matching tactic found"
-                )
-        else:
-            raise ValueError(
-                f"Invalid input: m = {m}, no matching tactic found (we only have predefined tactics for m = 128)"
-            )
+    # # m, n, k	config	time	cuda_dsl config
+    # # 128, 7168, 16384	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x1	19.72	(256, 128), (2, 4), 7
+    # # 128, 24576, 1536	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x4	9.721	(128, 128), (1, 4), 0
+    # # 128, 2112, 7168	256x64x256_0_tnn_align32_o_vs16_2sm_bias_bf16_relu 2x1	9.468	(256, 64), (2, 4), 2
+    # # 128, 4096, 7168	256x64x256_0_tnn_align32_o_vs16_2sm_bias_bf16_relu 2x1	10.29	(256, 128) (2, 4), 2
+    # # 128, 7168, 2048	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x4	6.924	(256, 128), (2, 4), 1
+    # def get_tactic_for_deepseek_r1(self, m, n, k):
+    #     if m == 128:
+    #         if n == 7168 and k == 16384:
+    #             return ((256, 128), (2, 4), True, 7)
+    #         elif n == 24576 and k == 1536:
+    #             return ((128, 128), (1, 4), False, 0)
+    #         elif n == 2112 and k == 7168:
+    #             return ((256, 64), (2, 4), True, 2)
+    #         elif n == 4096 and k == 7168:
+    #             return ((256, 128), (2, 4), True, 2)
+    #         elif n == 7168 and k == 2048:
+    #             return ((256, 128), (2, 4), True, 1)
+    #         else:
+    #             raise ValueError(
+    #                 f"Invalid input: m = {m}, n = {n}, k = {k}, no matching tactic found"
+    #             )
+    #     else:
+    #         raise ValueError(
+    #             f"Invalid input: m = {m}, no matching tactic found (we only have predefined tactics for m = 128)"
+    #         )
 
     def forward(
         self,
@@ -1205,20 +1152,13 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         sf_vec_size = 16
 
         if isinstance(tactic, tuple):
-            use_tma_store, mma_tiler_mn, cluster_shape_mn, use_prefetch, prefetch_A_only, prefetch_B_only, prefetch_dist, use_pdl = tactic
+            mma_tiler_mn, cluster_shape_mn = tactic
         else:
             # fallback to default tactic
-            use_tma_store, mma_tiler_mn, cluster_shape_mn, use_prefetch, prefetch_A_only, prefetch_B_only, prefetch_dist, use_pdl = [
-                True,
+            mma_tiler_mn, cluster_shape_mn = [
                 (128, 64),
                 (1, 4),
-                True,  # use_prefetch
-                False,  # prefetch_A_only
-                False,  # prefetch_B_only
-                5,  # prefetch_dist
-                False,  # use_pdl
             ]
-        # print(f"limin: use_tma_store = {use_tma_store}, mma_tiler_mn = {mma_tiler_mn}, cluster_shape_mn = {cluster_shape_mn}, prefetch_dist = {prefetch_dist}")
 
         a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha, output_dtype = inputs
         assert output_dtype == torch.bfloat16
@@ -1230,8 +1170,8 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         sf_k = pad_up(real_k // sf_vec_size, 4)
         sf_n = pad_up(n, 128)
 
-        mma_tiler_mn, cluster_shape_mn, use_prefetch, prefetch_dist = self.get_tactic_for_deepseek_r1(
-            m, n, real_k)
+        # mma_tiler_mn, cluster_shape_mn, use_prefetch, prefetch_dist = self.get_tactic_for_deepseek_r1(
+        #     m, n, real_k)
         # print(f"limin: m = {m}, real_k = {real_k}, n = {n}")
         # print(f"limin: sf_m = {sf_m}, sf_k = {sf_k}, sf_n = {sf_n}")
         # print(
@@ -1281,47 +1221,17 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         torch_stream = torch.cuda.current_stream()
         stream = cuda.CUstream(torch_stream.cuda_stream)
 
-        is_static = False
-
-        if is_static:
-            gemm_wrapper_func = Sm100BlockScaledPersistentDenseGemmKernelStaticWrapper
-            cache_key = (
-                m,
-                n,
-                k,
-                sf_vec_size,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                use_prefetch,
-                prefetch_A_only,
-                prefetch_B_only,
-                prefetch_dist,
-                use_tma_store,
-                use_pdl,
-            )
-        else:
-            gemm_wrapper_func = Sm100BlockScaledPersistentDenseGemmKernelWrapper
-            cache_key = (
-                sf_vec_size,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                use_prefetch,
-                prefetch_A_only,
-                prefetch_B_only,
-                prefetch_dist,
-                use_tma_store,
-                use_pdl,
-            )
+        gemm_wrapper_func = Sm100BlockScaledPersistentDenseGemmKernelWrapper
+        cache_key = (
+            sf_vec_size,
+            mma_tiler_mn,
+            cluster_shape_mn,
+        )
         if cache_key not in CuteDSLNVFP4BlackwellLinear.kernel_dict:
             gemm = gemm_wrapper_func(
                 sf_vec_size,
                 mma_tiler_mn,
                 cluster_shape_mn,
-                use_prefetch,
-                prefetch_A_only,
-                prefetch_B_only,
-                prefetch_dist,
-                use_tma_store,
             )
             # Compute max active clusters on current device
             hardware_info = cutlass.utils.HardwareInfo()
@@ -1348,7 +1258,6 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
                 alpha,
                 max_active_clusters,
                 stream,
-                use_pdl=use_pdl,
             )
 
             CuteDSLNVFP4BlackwellLinear.kernel_dict[cache_key] = compiled_gemm
@@ -1357,13 +1266,9 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             compiled_gemm = CuteDSLNVFP4BlackwellLinear.kernel_dict[cache_key]
 
         # launch gemm kernel
-        if is_static:
-            compiled_gemm(a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha,
-                          stream)
-        else:
-            compiled_gemm(m, n, real_k, sf_m // 128, sf_n // 128, sf_k // 4,
-                          a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha,
-                          stream)
+        compiled_gemm(m, n, real_k, sf_m // 128, sf_n // 128, sf_k // 4,
+                      a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha,
+                      stream)
         return c_tensor
 
 
