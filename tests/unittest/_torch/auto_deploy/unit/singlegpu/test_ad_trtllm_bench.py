@@ -799,15 +799,17 @@ def trtllm_bench_unified_comparison(
             )
 
 
-def test_trtllm_bench(llm_root):  # noqa: F811
+@pytest.mark.parametrize("compile_backend", ["torch-compile", "torch-opt", "torch-cudagraph"])
+def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
     model_path_or_name, model_name, model_path = tiny_llama_details()
-
     with tempfile.TemporaryDirectory() as temp_dir:
         with open(f"{temp_dir}/extra_llm_api_options.yaml", "w") as f:
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": 2},
-                    "cuda_graph_batch_sizes": [1, 2],
+                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                    "max_batch_size": 128,
+                    "compile_backend": compile_backend,
                 },
                 f,
             )
