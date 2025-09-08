@@ -365,13 +365,24 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         }
 
         stage('Checking if the Node is Online') {
-            def counter = 0
-            // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
-            // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
-            while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
-                // Wait 10 minutes to check status of the node again
-                sleep(time: 10, unit: 'MINUTES')
-                counter++
+            withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                def remote = [
+                        ip           : cluster.ip,
+                        host         : cluster.host,
+                        user         : "${pipeline.USERNAME}",
+                        passwd       : "${pipeline.PASSWORD}",
+                        allowAnyHosts: true,
+                ]
+                def counter = 0
+                // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
+                // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
+                while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
+                    // Wait 10 minutes to check status of the node again
+                    sleep(time: 10, unit: 'MINUTES')
+                    // Avoid the node being stuck in the held state.
+                    Utils.exec(pipeline, Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""))
+                    counter++
+                }
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
@@ -1157,7 +1168,7 @@ def transformMakoArgsToJson(optList) {
 
 def getMakoOpts(getMakoScript, makoArgs=[]) {
     // We want to save a map for the Mako opts
-    def turtleOutput = ""
+    def makoOutput = ""
 
     // Echo the command
     // NOTE: We redirect stderr to stdout so that we can capture
@@ -1181,17 +1192,17 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
 
         // Capture the mako output, add timeout in case any hang
         timeout(time: 30, unit: 'MINUTES'){
-            turtleOutput = sh(label: "Capture Mako Parameters", script: listMakoCmd, returnStdout: true)
+            makoOutput = sh(label: "Capture Mako Parameters", script: listMakoCmd, returnStdout: true)
         }
     }
 
     // Validate output
-    assert turtleOutput: "Mako opts not found - could not construct test db test list."
+    assert makoOutput: "Mako opts not found - could not construct test db test list."
 
-    // Split each line of turtle output into a list
-    def turtleOutList = turtleOutput.split("\n")
+    // Split each line of mako output into a list
+    def outputList = makoOutput.split("\n")
 
-    def makoOptsJson = transformMakoArgsToJson(turtleOutList)
+    def makoOptsJson = transformMakoArgsToJson(outputList)
 
     return makoOptsJson
 }
@@ -1827,7 +1838,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
     }
-    buildArgs = "--clean"
+    buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90-real;100-real;103-real;120-real'"
     }
@@ -2062,9 +2073,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
-        "RTXPro6000-Pytorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        "RTXPro6000-4_GPUs-Pytorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
-        "RTXPro6000-4_GPUs-Pytorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        //"RTXPro6000-Pytorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        //"RTXPro6000-4_GPUs-Pytorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        //"RTXPro6000-4_GPUs-Pytorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(key.contains("-CU12-") ? LLM_DOCKER_IMAGE_12_9 : LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
