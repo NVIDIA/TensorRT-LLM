@@ -1041,6 +1041,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
         )
 
+    tokens_per_block: int = Field(default=32,
+                                  description="The number of tokens per block.")
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1945,6 +1948,9 @@ class BaseLlmArgs(StrictBaseModel):
         if spec_config is not None and spec_config.decoding_type == "AUTO":
             from tensorrt_llm._torch.speculative import suggest_spec_config
             spec_config = suggest_spec_config(max_batch_size)
+
+        if self.kv_cache_config is not None:
+            executor_config.tokens_per_block = self.kv_cache_config.tokens_per_block
 
         update_executor_config(
             executor_config,

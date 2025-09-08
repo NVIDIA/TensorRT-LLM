@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceParams
@@ -29,6 +30,7 @@ class GatedMLP(nn.Module):
                  reduce_output: bool = True,
                  layer_idx: Optional[int] = None,
                  use_cute_dsl_blockscaling_mm: bool = False):
+
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -98,12 +100,21 @@ class GatedMLP(nn.Module):
             [LoraModuleType.MLP_GATE_UP],
             [2 * self.intermediate_size // mapping.tp_size])
 
-    def _apply_activation(self, x):
+    def _apply_activation(self, x, *, has_lora: bool = False):
         if self.activation == F.silu:
-            if self.down_proj.has_fp8_qdq:
-                return swiglu(x,
-                              quant_scale=self.down_proj.input_scale,
-                              quant_type=torch.float8_e4m3fn)
+            if self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8:
+                if has_lora:
+                    # NOTE: This is a WAR, since LoRA grouped_gemm does not support FP8 yet.
+                    # TODO: Remove this path when LoRA grouped_gemm supports FP8
+                    # see: cpp/tensorrt_llm/thop/loraOp.cpp::lora_grouped_gemm
+                    logger.warning(
+                        f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype bf16/fp16, layer_idx={self.layer_idx}"
+                    )
+                    return swiglu(x)
+                else:
+                    return swiglu(x,
+                                  quant_scale=self.down_proj.input_scale,
+                                  quant_type=torch.float8_e4m3fn)
             else:
                 return swiglu(x)
         elif callable(self.activation):
@@ -155,7 +166,7 @@ class GatedMLP(nn.Module):
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
-        h2 = self._apply_activation(h1)
+        h2 = self._apply_activation(h1, has_lora=True)
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 lora_params=lora_params,

@@ -12,7 +12,7 @@ fi
 PARSED_CMAKE_VERSION=$(echo $CMAKE_VERSION | sed 's/\.[0-9]*$//')
 CMAKE_FILE_NAME="cmake-${CMAKE_VERSION}-linux-${ARCH}"
 RELEASE_URL_CMAKE=${GITHUB_URL}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_FILE_NAME}.tar.gz
-wget --no-verbose --timeout=180 --tries=3 ${RELEASE_URL_CMAKE} -P /tmp
+wget --retry-connrefused --timeout=180 --tries=10 --continue ${RELEASE_URL_CMAKE} -P /tmp
 tar -xf /tmp/${CMAKE_FILE_NAME}.tar.gz -C /usr/local/
 ln -s /usr/local/${CMAKE_FILE_NAME} /usr/local/cmake
 

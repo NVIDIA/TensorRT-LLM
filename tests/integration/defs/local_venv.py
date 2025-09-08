@@ -23,7 +23,7 @@ class PythonVenvRunnerImpl(PythonRunnerInterface):
         venv_dir (str): Path to the virtualenv root directory, or None if this is
                         an externally-built virtualenv
         venv_bin (str): Path to the Python executable to use when running tests
-        workspace (str): Path to the TURTLE workspace
+        workspace (str): Path to the test workspace
     """
 
     def __init__(self, pip_opts, venv_dir, venv_bin, workspace):

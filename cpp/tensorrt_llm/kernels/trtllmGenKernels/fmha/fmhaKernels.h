@@ -30,6 +30,7 @@
 #include "cubin/kernelMetaInfo.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -39,6 +40,20 @@ namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+constexpr bool isSMCompatible(int gpuSM, int kernelSM)
+{
+    if (gpuSM == kSM_103)
+    {
+        return kernelSM == kSM_100f || kernelSM == kSM_103;
+    }
+    else if (gpuSM == kSM_100)
+    {
+        return kernelSM == kSM_100f || kernelSM == kSM_100;
+    }
+
+    return gpuSM == kernelSM;
+}
 
 class TllmGenFmhaKernel
 {
@@ -66,7 +81,7 @@ public:
         for (unsigned int i = 0; i < mKernelMetaCount; ++i)
         {
             auto const& kernelMeta = mKernelMeta[i];
-            if (static_cast<unsigned int>(kernelMeta.mSM) == mSM && kernelMeta.mDataTypeQ == mDtypeQ
+            if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ
                 && kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut)
             {
                 // Load CUmodules
@@ -618,7 +633,7 @@ inline TllmGenFmhaKernel const* getTllmFmhaKernels(
     Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm)
 {
 
-#ifndef EXCLUDE_SM_100
+#if !defined(EXCLUDE_SM_100) || !defined(EXCLUDE_SM_103)
     return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
         sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm);
 #else

@@ -1686,6 +1686,207 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
 
+TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
+{
+    // Test that cache_salt_id prevents KV cache reuse between requests with same tokens
+    // but different cache_salt_id values.
+    using VecTokenExtraIds = LlmRequest::VecTokenExtraIds;
+    using CacheSaltIDType = LlmRequest::CacheSaltIDType;
+
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr blocksInPrimaryPool = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+    auto constexpr numReturnSequences = 1;
+    auto constexpr maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    auto constexpr beamWidth = 1;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, stream, maxAttentionWindow, beamWidth,
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0,
+        onboardBlocks);
+    blockManager.allocatePools(false);
+
+    EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
+    EXPECT_EQ(blockManager.getMaxNumBlocks(), blocksInPrimaryPool);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    // Create shared input tokens
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Test Case 1: Request without cache_salt_id
+    LlmRequest::RequestIdType requestId{0};
+    auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt,
+        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt); // No cache_salt_id
+
+    GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
+
+    // Add first request and get blocks 0, 1, 2
+    auto constexpr beamIdx = 0;
+    auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
+    auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
+    blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
+    EXPECT_EQ(llmRequest0->getContextCurrentPosition(), 0);
+    EXPECT_THAT(seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2}));
+
+    // Add generated tokens
+    llmRequest0->addNewToken(3, beamIdx);
+    llmRequest0->addNewToken(4, beamIdx);
+    auto numTokens = llmRequest0->getNumTokens(beamIdx);
+    auto numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
+    EXPECT_EQ(numBlocks, 3);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+
+    // Release blocks to make them available for reuse
+    blockManager.releaseBlocks(seq0, llmRequest0);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Test Case 2: Request with same tokens but with cache_salt_id = 12345
+    requestId = 1;
+    CacheSaltIDType cacheSaltId1{12345};
+    auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt,
+        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        cacheSaltId1); // With cache_salt_id = 12345
+
+    GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
+
+    // Should NOT reuse blocks despite same tokens, because cache_salt_id is different
+    auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
+    auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
+    blockManager.addSequence(seq1, promptLen1, numContextBlocks1, *llmRequest1, maxAttentionWindow);
+    EXPECT_EQ(llmRequest1->getContextCurrentPosition(), 0); // No reuse, starts from scratch
+    EXPECT_THAT(seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({3, 4, 5}));
+
+    llmRequest1->addNewToken(3, beamIdx);
+    llmRequest1->addNewToken(4, beamIdx);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+
+    // Release blocks
+    blockManager.releaseBlocks(seq1, llmRequest1);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Test Case 3: Request with same tokens and same cache_salt_id = 12345
+    requestId = 2;
+    auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt,
+        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        cacheSaltId1); // Same cache_salt_id = 12345
+
+    GenerationRequest seq2{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
+
+    // SHOULD reuse blocks because both tokens and cache_salt_id match
+    auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
+    auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
+    blockManager.addSequence(seq2, promptLen2, numContextBlocks2, *llmRequest2, maxAttentionWindow);
+    EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 2 * tokensPerBlock); // Reuse blocks 3,4
+    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({3, 4, 6}));
+
+    llmRequest2->addNewToken(3, beamIdx);
+    llmRequest2->addNewToken(4, beamIdx);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+
+    // Release blocks
+    blockManager.releaseBlocks(seq2, llmRequest2);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Test Case 4: Request with same tokens but different cache_salt_id = 67890
+    requestId = 3;
+    CacheSaltIDType cacheSaltId2{67890};
+    auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt,
+        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        cacheSaltId2); // Different cache_salt_id = 67890
+
+    GenerationRequest seq3{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
+
+    // Should NOT reuse blocks from any previous request because cache_salt_id is different
+    auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
+    auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
+    blockManager.addSequence(seq3, promptLen3, numContextBlocks3, *llmRequest3, maxAttentionWindow);
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 0); // No reuse
+    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({7, 8, 9}));
+
+    llmRequest3->addNewToken(5, beamIdx);
+    llmRequest3->addNewToken(6, beamIdx);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Test Case 5: Request without cache_salt_id again
+    requestId = 4;
+    auto llmRequest4 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt,
+        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt); // No cache_salt_id
+
+    GenerationRequest seq4{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
+
+    // Should reuse blocks from request0 (blocks 0,1) because both have no cache_salt_id
+    auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
+    auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
+    blockManager.addSequence(seq4, promptLen4, numContextBlocks4, *llmRequest4, maxAttentionWindow);
+    EXPECT_EQ(llmRequest4->getContextCurrentPosition(), 2 * tokensPerBlock); // Reuse blocks 0,1
+    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 10}));
+
+    llmRequest4->addNewToken(7, beamIdx);
+    numTokens = llmRequest4->getNumTokens(beamIdx);
+    numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks * 2);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks * 2);
+
+    // Clean up
+    blockManager.releaseBlocks(seq3, llmRequest3);
+    blockManager.releaseBlocks(seq4, llmRequest4);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+}
+
 TEST_F(KVCacheManagerTest, KVCacheManagerPerRequestStatsTest)
 {
     auto constexpr numLayers = 12;

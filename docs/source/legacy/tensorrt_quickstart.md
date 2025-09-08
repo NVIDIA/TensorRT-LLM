@@ -1,7 +1,7 @@
 # LLM API with TensorRT Engine
 A simple inference example with TinyLlama using the LLM API:
 
-```{literalinclude} ../../examples/llm-api/_tensorrt_engine/quickstart_example.py
+```{literalinclude} ../../../examples/llm-api/_tensorrt_engine/quickstart_example.py
     :language: python
     :linenos:
 ```

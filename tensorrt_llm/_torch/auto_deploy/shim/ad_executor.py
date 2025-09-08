@@ -1,6 +1,6 @@
-from itertools import chain
+from collections import defaultdict
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch._prims_common import DeviceLikeType
@@ -105,13 +105,19 @@ class ADEngine(ModelEngine):
             max_batch_size=max_batch_size,
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
-            device=device,
         )
 
+        factory = ad_config.create_factory()
+
+        # pass in extra arguments defined by the model factory
+        for name, (none_input, dynamic_shape_callback) in factory.get_extra_inputs().items():
+            seq_info.add_extra_arg(name, none_input, dynamic_shape_callback)
+
+        # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
+        # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
+
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(
-            factory=ad_config.create_factory(), ad_config=ad_config
-        )
+        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
 
         # construct engine
         return cls(build_and_optimize, seq_info, device, max_beam_width)
@@ -176,7 +182,11 @@ class ADEngine(ModelEngine):
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
-        previous_batch_indices: List[int] = []
+        flat_gather_idx: List[int] = []
+        extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+        dummy_token = -1
+
         # look at context requests first
         for request in context_requests:
             # store input ids and pos of first token in sequence
@@ -186,6 +196,15 @@ class ADEngine(ModelEngine):
             request.py_batch_idx = request.seq_slot
             last_logit_only.append(True)
 
+            # get cache indices
+            cache_indices = kv_cache_manager.get_cache_indices(request)
+            page_assignments.append(cache_indices)
+
+            # store extra arguments
+            if request.py_multimodal_data is not None:
+                for k, v in request.py_multimodal_data.items():
+                    extra_args[k].append(v)
+
         # look at generate requests next
         # TODO: we should also handle extend requests (for speculative decoding) here
         for request in gen_requests:
@@ -194,30 +213,34 @@ class ADEngine(ModelEngine):
                 input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
                 input_pos.append(request.max_beam_num_tokens - 1)
             else:
-                # insert a dummy token to indicate the new tokens
-                input_ids.append([-1])
-                previous_batch_indices.append(request.py_batch_idx)
+                input_ids.append([dummy_token])
                 input_pos.append(request.max_beam_num_tokens)
+                flat_gather_idx.append(request.py_batch_idx)
 
             request.py_batch_idx = request.seq_slot
 
             # return all logits
             last_logit_only.append(False)
 
-        # extract cache information for all requests
-        for request in chain(context_requests, gen_requests):
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
 
         # update the sequence info object now
-        si = self.cache_seq_interface.info
-        si.update_pos(input_pos, reset=True)
-        si.assign_cache_loc(page_assignments)
-        si.nest_sequences(input_ids)
-
+        self.cache_seq_interface.info.nest_sequences(
+            input_ids,
+            input_pos=input_pos,
+            page_assignments=page_assignments,
+            **extra_args,
+        )
+        # scatter the new tokens into the input_ids tensor if provided
         if new_tokens is not None:
-            si.update_input_ids_with_new_tokens(new_tokens, previous_batch_indices)
+            self.cache_seq_interface.info.rescatter_input_ids(
+                ungathered_input_ids=new_tokens.flatten(),  # ensure it's flattened
+                gather_idx=flat_gather_idx,
+                scatter_ref=dummy_token,
+            )
+
         return last_logit_only
 
     @nvtx_range("ad_compute_logits")

@@ -494,7 +494,8 @@ class ModelConfig(Generic[TConfig]):
                 architectures = self.pretrained_config.architectures
                 if len(architectures
                        ) == 1 and architectures[0] == "DeciLMForCausalLM":
-                    mlp_hidden_size = self._infer_nemotron_ffn_mult()
+                    mlp_hidden_size = self._infer_nemotron_ffn_mult(
+                    ) // self.mapping.tp_size
                 else:
                     raise ValueError(
                         f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"

@@ -138,25 +138,23 @@ def pre_comm_embedding_ops(
     padding_size: int,
 ):
     # Generate the mask for the input if needed.
-    if tp_size > 1:
-        if tp_mode == TensorParallelMode.COLUMN:
-            input_, input_mask = get_masked_input_and_mask(
-                input_,
-                vocab_start_index,
-                vocab_end_index,
-            )
+    if tp_mode == TensorParallelMode.COLUMN:
+        input_, input_mask = get_masked_input_and_mask(
+            input_,
+            vocab_start_index,
+            vocab_end_index,
+        )
 
     # Get the embeddings.
     output = F.embedding(input_, weight)
 
     # Mask or pad the output if needed.
-    if tp_size > 1:
-        if tp_mode == TensorParallelMode.COLUMN:
-            output.masked_fill_(input_mask, 0)
-        elif tp_mode == TensorParallelMode.ROW:
-            if gather_output:
-                if tp_rank == tp_size - 1 and padding_size > 0:
-                    output = F.pad(output, (0, padding_size))
+    if tp_mode == TensorParallelMode.COLUMN:
+        output.masked_fill_(input_mask, 0)
+    elif tp_mode == TensorParallelMode.ROW:
+        if gather_output:
+            if tp_rank == tp_size - 1 and padding_size > 0:
+                output = F.pad(output, (0, padding_size))
 
     return output
 
@@ -205,12 +203,16 @@ class Embedding(LMHead):
             self.vocab_end_index = num_embeddings
 
     def forward(self, input):
-        # Run the ops before all_reduce/all_gather.
-        # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
-        embedding_ops_func = torch.compile(
-            pre_comm_embedding_ops,
-            options={"max-autotune": True},
-            disable=not self.enable_torch_compile_for_embedding)
+        if self.tp_size > 1:
+            # Run the ops before all_reduce/all_gather.
+            # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
+            embedding_ops_func = torch.compile(
+                pre_comm_embedding_ops,
+                options={"max-autotune": True},
+                disable=not self.enable_torch_compile_for_embedding)
+        else:
+            # Skip torch.compile when TP size is 1 to avoid unnecessary host overhead
+            embedding_ops_func = pre_comm_embedding_ops
         output = embedding_ops_func(input, self.weight, self.tp_size,
                                     self.tp_rank, self.tp_mode,
                                     self.vocab_start_index,
