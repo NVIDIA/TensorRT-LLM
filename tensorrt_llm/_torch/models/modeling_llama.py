@@ -1281,7 +1281,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 ]
 
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                     input_ids, mm_embeds)
+                                                     input_ids, mm_embeds,
+                                                     **kwargs)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

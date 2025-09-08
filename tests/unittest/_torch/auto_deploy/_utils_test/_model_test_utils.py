@@ -400,9 +400,6 @@ _SMALL_MODEL_CONFIGS = {
             },
             "vision_config": {
                 "num_hidden_layers": 1,
-                "hidden_size": 64,
-                "intermediate_size": 64,
-                "num_attention_heads": 2,
             },
         },
     },

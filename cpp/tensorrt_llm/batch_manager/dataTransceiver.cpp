@@ -204,6 +204,34 @@ private:
         }
     }
 
+    void sendResponse(std::vector<size_t> const& blockHashes, std::map<RequestIdType, Response>::iterator it)
+    {
+        auto reqId = mCurrentRequest.value();
+        auto count = --mRemainSendCount[reqId];
+        TLLM_CHECK(count >= 0);
+        if (count == 0)
+        {
+            mRemainSendCount.erase(reqId);
+
+            // TODO(zhengd): pass the hashes directly instead of update llmRequest
+            auto llmRequest = it->second.mRequest;
+            llmRequest->setRequestedBlockHashes(std::move(blockHashes));
+
+            if (common::getEnvParallelCacheSend())
+            {
+                // TODO: Use a thread pool and check for thread safety.
+                std::thread(&DataResponder::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second))
+                    .detach();
+            }
+            else
+            {
+                DataResponder::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
+            }
+            removeResponse(it);
+        }
+        mCurrentRequest = std::nullopt;
+    }
+
     void response() noexcept
     {
         try
@@ -237,40 +265,22 @@ private:
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
                 {
-                    auto reqId = mCurrentRequest.value();
-                    auto count = --mRemainSendCount[reqId];
-                    TLLM_CHECK(count >= 0);
-                    if (count == 0)
-                    {
-                        mRemainSendCount.erase(reqId);
-
-                        // TODO(zhengd): pass the hashes directly instead of update llmRequest
-                        auto llmRequest = it->second.mRequest;
-                        llmRequest->setRequestedBlockHashes(std::move(blockHashes));
-
-                        if (common::getEnvParallelCacheSend())
-                        {
-                            // TODO: Use a thread pool and check for thread safety.
-                            std::thread(
-                                &DataResponder::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second))
-                                .detach();
-                        }
-                        else
-                        {
-                            DataResponder::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
-                        }
-                        removeResponse(it);
-                    }
-                    mCurrentRequest = std::nullopt;
+                    sendResponse(blockHashes, it);
                 }
                 else
                 {
-                    TLLM_CHECK_WITH_INFO(!mCurrentRequest.has_value(),
-                        "This executor does not have a prepared KV cache for request ID: %zu, and the "
-                        "mReadyResponses size is: %zu. mpi rank :%d     ",
-                        mCurrentRequest.value(), mReadyResponses.size(), mpi::MpiComm::world().getRank());
-                    std::unique_lock lk(mCondMutex);
-                    mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                    auto it = getCurrentResponse();
+                    while (it == mReadyResponses.end())
+                    {
+                        std::unique_lock lk(mCondMutex);
+                        mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                        if (mTerminate)
+                        {
+                            break;
+                        }
+                        it = getCurrentResponse();
+                    }
+                    sendResponse(blockHashes, it);
                 }
             }
         }
