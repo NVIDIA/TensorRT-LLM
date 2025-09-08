@@ -110,8 +110,8 @@ void initConfigBindings(nb::module_& m)
     {
         return nb::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
-            self.getOnboardBlocks(), self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(),
-            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm(),
+            self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(), self.getEventBufferMaxSize(),
+            self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm(),
             self.getAttentionDpEventsGatherPeriodMs(), self.getMaxGpuTotalBytes());
     };
     auto kvCacheConfigSetstate = [](tle::KvCacheConfig& self, nb::tuple const& state)
@@ -151,7 +151,6 @@ void initConfigBindings(nb::module_& m)
         .def_prop_rw("free_gpu_memory_fraction", &tle::KvCacheConfig::getFreeGpuMemoryFraction,
             &tle::KvCacheConfig::setFreeGpuMemoryFraction)
         .def_prop_rw("host_cache_size", &tle::KvCacheConfig::getHostCacheSize, &tle::KvCacheConfig::setHostCacheSize)
-        .def_prop_rw("onboard_blocks", &tle::KvCacheConfig::getOnboardBlocks, &tle::KvCacheConfig::setOnboardBlocks)
         .def_prop_rw("cross_kv_cache_fraction", &tle::KvCacheConfig::getCrossKvCacheFraction,
             &tle::KvCacheConfig::setCrossKvCacheFraction)
         .def_prop_rw("secondary_offload_min_priority", &tle::KvCacheConfig::getSecondaryOffloadMinPriority,

@@ -182,12 +182,6 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     auto const& kvCacheConfig = executorConfig.getKvCacheConfig();
 
-    if (!kvCacheConfig.getOnboardBlocks())
-    {
-        TLLM_CHECK_WITH_INFO(
-            !mModelConfig.getPagedContextFMHA(), "KV cache blocks need to be onboarded if context FMHA.");
-    }
-
     if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
     {
         TLLM_CHECK_WITH_INFO(kvCacheConfig.getEnableBlockReuse(),
@@ -688,8 +682,8 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
         blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
-        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
-        kvCacheConfig.getOnboardBlocks(), kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
+        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse, kvCacheType,
+        kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
