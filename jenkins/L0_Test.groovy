@@ -328,20 +328,26 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
         "--group ${splitId}"
     ]
 
-    def shardTestList = ""
+    def shardTestList = []
     try {
-        shardTestList = sh(
-            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')} | grep '::'",
+        // First execute the pytest command and check if it succeeds
+        def pytestOutput = sh(
+            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
             returnStdout: true
         ).trim()
+
+        // If pytest succeeds, filter the output to get only test lines with '::'
+        shardTestList = pytestOutput.split('\n').findAll { line ->
+            line.contains('::')
+        }
     } catch (Exception e) {
-        echo "Warning: Could not list tests in shard: ${e.getMessage()}"
-        shardTestList = ""
+        echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
+        error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
     }
 
     if (shardTestList) {
         echo "Tests in current shard:"
-        shardTestList.split('\n').each { test ->
+        shardTestList.each { test ->
             if (test.trim()) {
                 echo "  - ${test.trim()}"
             }
@@ -359,7 +365,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
             line.replaceAll(' ISOLATE', '').trim()
         }
 
-        shardTestList.split('\n').each { test ->
+        shardTestList.each { test ->
             def trimmedTest = test.trim()
             if (trimmedTest) {
                 // Process test_unittests.py::test_unittests_v2[xxxx] pattern
