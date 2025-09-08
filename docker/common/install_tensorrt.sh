@@ -66,7 +66,7 @@ install_ubuntu_requirements() {
     apt-get install -y --no-install-recommends \
         libcudnn9-cuda-12=${CUDNN_VER} \
         libcudnn9-dev-cuda-12=${CUDNN_VER} \
-	libcudnn9-headers-cuda-12=${CUDNN_VER} \
+        libcudnn9-headers-cuda-12=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
         libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
@@ -94,7 +94,7 @@ install_rockylinux_requirements() {
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
-        wget -q --timeout=180 --tries=3 "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
+        wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
     # Remove old packages
@@ -131,7 +131,7 @@ install_tensorrt() {
         RELEASE_URL_TRT="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/${TRT_VER_SHORT}/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz"
     fi
 
-    wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
+    wget --retry-connrefused --timeout=180 --tries=10 --continue ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/
     mv /usr/local/TensorRT-${TRT_VER} /usr/local/tensorrt
     pip3 install --no-cache-dir /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl

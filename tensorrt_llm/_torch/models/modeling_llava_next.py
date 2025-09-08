@@ -302,7 +302,8 @@ class LlavaNextVisionModel(nn.Module):
                     logger.warning_once(
                         "Image feature shape does not line up with the provided patch size. "
                         "You may be using the `default` vision_feature_select_strategy with a"
-                        " visual encoder that does not have CLS.")
+                        " visual encoder that does not have CLS.",
+                        key="llava_next_vision_model_pack_image_features")
 
                 image_feature = image_feature.view(num_patch_height,
                                                    num_patch_width, height,
@@ -474,7 +475,7 @@ class LlavaNextModel(PreTrainedModel):
                     for multimodal_param in multimodal_params
                 ]
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embeds)
+            self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs)
 
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
