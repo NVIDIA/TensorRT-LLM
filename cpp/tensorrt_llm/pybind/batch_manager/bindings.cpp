@@ -363,7 +363,8 @@ void initBindings(pybind11::module_& m)
             py::arg("eagle_config") = std::nullopt, py::arg("skip_cross_attn_blocks") = std::nullopt,
             py::arg("return_perf_metrics") = false, py::arg("guided_decoding_params") = std::nullopt,
             py::arg("language_adapter_uid") = std::nullopt, py::arg("allotted_time_ms") = std::nullopt,
-            py::arg("context_phase_params") = std::nullopt, py::arg("cache_salt_id") = std::nullopt, py::arg("arrival_time") = std::nullopt)
+            py::arg("context_phase_params") = std::nullopt, py::arg("cache_salt_id") = std::nullopt,
+            py::arg("arrival_time") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, py::arg("vocab_size"))
         .def(py::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),

@@ -331,8 +331,8 @@ void initBindings(nb::module_& m)
                     encoder_input_tokens, return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
                     encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
-                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params,
-                    cache_salt_id, arrival_time};
+                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
+                    arrival_time};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
@@ -357,7 +357,8 @@ void initBindings(nb::module_& m)
             nb::arg("eagle_config") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
-            nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt, nb::arg("arrival_time") = std::nullopt)
+            nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
+            nb::arg("arrival_time") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
