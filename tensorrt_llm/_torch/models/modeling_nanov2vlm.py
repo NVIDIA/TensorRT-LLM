@@ -7,7 +7,6 @@ import torch.nn as nn
 import transformers
 from PIL import Image
 
-from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -30,6 +29,7 @@ def _is_disagg() -> bool:
     return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
 
+# TODO: update the reference config path once Nano v2 VLM is released.
 IMAGE_TOKEN_ID = 131072
 
 
@@ -63,7 +63,6 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         super().__init__(config)
         self.image_size = config.force_image_size
         self.patch_size = config.patch_size
-        # self.template = config.template
         self.num_image_token = int((self.image_size // self.patch_size)**2 *
                                    (config.downsample_ratio**2))
         self.downsample_ratio = config.downsample_ratio
@@ -85,18 +84,25 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         self.mlp1 = self.mlp1.to(config.torch_dtype)
 
         # Construct the vision encoder.
-        self.with_hf_codes = os.getenv("WITH_HF_CODES", "0") == "1"
-        if self.with_hf_codes:
-            self.vision_model = transformers.AutoModel.from_config(
-                config.vision_config, trust_remote_code=True)
-            # set input_condition as Identity module.
-            self.vision_model.radio_model.make_preprocessor_external()
-            self.vision_model.to(config.torch_dtype)
-        else:
-            vision_model_config = copy.deepcopy(model_config)
-            vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
-            self.vision_model = RADIOVisionModel(vision_model_config)
-            self.vision_model.to(config.torch_dtype)
+        vision_model_config = copy.deepcopy(model_config)
+        vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
+        self.vision_model = RADIOVisionModel(vision_model_config)
+        self.vision_model.to(config.torch_dtype)
+
+    def load_weights(self, weights):
+        # Load mlp1 weights.
+        mlp1_weights = {
+            k.replace('mlp1.', ''): v
+            for k, v in weights.items() if k.startswith('mlp1.')
+        }
+        self.mlp1.load_state_dict(mlp1_weights, strict=True)
+
+        # Load vision encoder weights.
+        vision_encoder_weights = {
+            k.replace('vision_model.', ''): v
+            for k, v in weights.items() if k.startswith('vision_model.')
+        }
+        self.vision_model.load_weights(vision_encoder_weights)
 
     @torch.compile
     def pixel_shuffle(self, x, scale_factor=0.5):
@@ -117,10 +123,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         return x
 
     def extract_feature(self, pixel_values):
-        if self.with_hf_codes:
-            vit_embeds = self.vision_model(pixel_values).features
-        else:
-            vit_embeds = self.vision_model(pixel_values)
+        vit_embeds = self.vision_model(pixel_values)
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
         # Down-sampling and projection.
         h = w = int(vit_embeds.shape[1]**0.5)
@@ -134,40 +137,28 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
 
     def forward(self, multimodal_params: List[MultimodalParams]):
         mm_embedding = []
-
-        BATCH_INFERENCE = True
-        if BATCH_INFERENCE:
-            # Batch data.
-            batched_pixel_values = torch.cat([
-                multimodal_param.multimodal_data["pixel_values"]
-                for multimodal_param in multimodal_params
-            ],
-                                             dim=0)
-            # -> [num_patches, channel, height, width]
-            batched_num_patches = torch.cat([
-                multimodal_param.multimodal_data["num_patches"]
-                for multimodal_param in multimodal_params
-            ],
-                                            dim=0).tolist()
-            # -> list of[num_patches1, num_patches2, ...]
-            batched_image_embeds = self.extract_feature(batched_pixel_values)
-            # -> [num_patches, num_image_token, hidden_size]
-            mm_embedding = torch.split(batched_image_embeds,
-                                       batched_num_patches,
-                                       dim=0)
-            mm_embedding = [
-                m.reshape(-1, self.llm_hidden_size) for m in mm_embedding
-            ]
-            # -> list of [num_patches*num_image_token, hidden_size]
-        else:
-            # Inference per sample.
-            for multimodal_param in multimodal_params:
-                pixel_values = multimodal_param.multimodal_data["pixel_values"]
-                image_embeds = self.extract_feature(pixel_values)
-                # -> [num_patches, num_image_token, hidden_size]
-                image_embeds = image_embeds.reshape(-1, self.llm_hidden_size)
-                # -> [num_patches*num_image_token, hidden_size]
-                mm_embedding.append(image_embeds)
+        # Batch data.
+        batched_pixel_values = torch.cat([
+            multimodal_param.multimodal_data["pixel_values"]
+            for multimodal_param in multimodal_params
+        ],
+                                         dim=0)
+        # -> [num_patches, channel, height, width]
+        batched_num_patches = torch.cat([
+            multimodal_param.multimodal_data["num_patches"]
+            for multimodal_param in multimodal_params
+        ],
+                                        dim=0).tolist()
+        # -> list of[num_patches1, num_patches2, ...]
+        batched_image_embeds = self.extract_feature(batched_pixel_values)
+        # -> [num_patches, num_image_token, hidden_size]
+        mm_embedding = torch.split(batched_image_embeds,
+                                   batched_num_patches,
+                                   dim=0)
+        mm_embedding = [
+            m.reshape(-1, self.llm_hidden_size) for m in mm_embedding
+        ]
+        # -> list of [num_patches*num_image_token, hidden_size]
         return mm_embedding
 
 
@@ -361,63 +352,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.is_loaded = True
 
     def load_weights(self, weights):
-        # TODO: move vision encoder weights loading to vision encoder class.
-
-        # Load vision encoder weights for pytorch modules.
-        filter_weights = {
-            k: v
-            for k, v in weights.items()
-            if k.startswith('vision') or k.startswith('mlp1')
-        }
-        missing_keys, unexpected_keys = self.vision_encoder.load_state_dict(
-            filter_weights, strict=False)
-        try:
-            missing_keys.remove("vision_model.radio_model.summary_idxs")
-        except ValueError:
-            pass
-
-        unexpected_keys.remove(
-            "vision_model.radio_model.input_conditioner.norm_mean")
-        unexpected_keys.remove(
-            "vision_model.radio_model.input_conditioner.norm_std")
-        for m in missing_keys:
-            if not m.startswith('vision_model.radio_model.model.blocks.'):
-                raise ValueError(f"Missing key: {m}")
-        for u in unexpected_keys:
-            if not u.startswith('vision_model.radio_model.model.blocks.'):
-                raise ValueError(f"Unexpected key: {u}")
-
-        if len(unexpected_keys) > 0 or len(missing_keys) > 0:
-            # Load weights for vision transformer module.
-            model_weights = {
-                k.replace('vision_model.radio_model.model.', ''): v
-                for k, v in weights.items()
-                if k.startswith('vision_model.radio_model.model.')
-            }
-            converted_weights = dict()
-            for name in model_weights:
-                # Handle with weights and bias for vision transformer's qkv projection.
-                if "attn.qkv." in name:
-                    q_name = name.replace("attn.qkv.", "attn.q_proj.")
-                    k_name = name.replace("attn.qkv.", "attn.k_proj.")
-                    v_name = name.replace("attn.qkv.", "attn.v_proj.")
-                    dim_shape = model_weights[name].shape[0] // 3
-                    converted_weights[q_name] = model_weights[name][:dim_shape]
-                    converted_weights[k_name] = model_weights[name][
-                        dim_shape:2 * dim_shape]
-                    converted_weights[v_name] = model_weights[name][2 *
-                                                                    dim_shape:]
-                else:
-                    converted_weights[name] = model_weights[name]
-            pattern_mapping = {
-                r'(.*?)attn.proj.(.*)': r'\1attn.o_proj.\2',
-                r'(.*?)mlp.fc1.(.*)': r'\1mlp.up_proj.\2',
-                r'(.*?)mlp.fc2.(.*)': r'\1mlp.down_proj.\2',
-            }
-            modeling_utils._load_weights_impl(
-                self.vision_encoder.vision_model.radio_model.model,
-                converted_weights,
-                params_map=pattern_mapping)
+        # Load vision encoder weights.
+        self.vision_encoder.load_weights(weights)
 
         # Load language model weights.
         filtered_weights = {
