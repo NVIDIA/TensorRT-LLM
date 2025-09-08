@@ -295,10 +295,10 @@ class PyTorchModelEngine(ModelEngine):
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
         self.pytorch_backend_config = pytorch_backend_config
-        if spec_config is not None:
-            self.original_max_draft_len = spec_config.max_draft_len
-        else:
-            self.original_max_draft_len = 0
+        self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
+
+        # The draft model won't have any draft tokens attached to
+        # generation requests when we invoke it autoregressively
         if spec_config is not None and is_draft_model:
             spec_config.max_draft_len = 0
         self.spec_config = spec_config

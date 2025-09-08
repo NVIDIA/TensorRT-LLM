@@ -143,7 +143,7 @@ class ModelDrafter(Drafter):
         Create a chunked context request for accepted tokens.
         Only applicable if the draft model needs to recompute KV cache for accepted tokens (e.g. eagle 3)
         """
-        #pad input_tokens to max_draft_tokens
+        # Pad input_tokens to max_draft_tokens
         input_tokens.extend(
             0 for _ in range(self.max_draft_tokens - num_accepted_tokens))
         new_request = self._create_draft_request(request, input_tokens)
@@ -167,6 +167,8 @@ class ModelDrafter(Drafter):
             # the newly decoded one - this is the convention for EAGLE 2 and 3.
             assert num_draft_tokens == 0
             return self._create_context_request(request, input_tokens)
+
+        # For TRTLLM attention backend, we need to create a generation request for both no tokens accepted and tokens accepted
         elif issubclass(self.draft_model_engine.attn_backend, TrtllmAttention):
             return self._create_accepted_tokens_request_for_trtllm_attn(
                 request, input_tokens, num_accepted_tokens)
@@ -177,6 +179,7 @@ class ModelDrafter(Drafter):
         ):
             return self._create_generation_request(request, input_tokens)
 
+        # Tokens accepted - chunked context request
         else:
             return self._create_accepted_tokens_request(request, input_tokens,
                                                         num_accepted_tokens)
@@ -265,10 +268,12 @@ class ModelDrafter(Drafter):
             return False
         if self.use_static_draft_loop:
             return False
-        if self.spec_config.spec_dec_mode.needs_kv_cache_recompute(
-        ) and issubclass(self.draft_model_engine.attn_backend, TrtllmAttention):
+        needs_kv_cache_recompute = self.spec_config.spec_dec_mode.needs_kv_cache_recompute(
+        )
+        if needs_kv_cache_recompute and issubclass(
+                self.draft_model_engine.attn_backend, TrtllmAttention):
             return False
-        return self.spec_config.spec_dec_mode.needs_kv_cache_recompute()
+        return needs_kv_cache_recompute
 
     def _forward_draft_model(
             self,

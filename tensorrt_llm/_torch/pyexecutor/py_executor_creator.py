@@ -265,8 +265,6 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
-            
-            
             use_chain_drafter = (
                 executor_config.guided_decoding_config is None
                 and not pytorch_backend_config.enable_mixed_sampler

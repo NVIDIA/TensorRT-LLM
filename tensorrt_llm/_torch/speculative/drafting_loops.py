@@ -64,12 +64,13 @@ def prepare_for_generation(attn_metadata: AttentionMetadata,
                            position_ids: torch.Tensor) -> torch.Tensor:
     batch_size = attn_metadata.num_seqs
     # using attn_metadata.seq_lens_cuda[:batch_size] to get the max_draft_len + 1
-    accepted_draft_tokens = spec_metadata.num_accepted_draft_tokens[:batch_size]
+    num_accepted_draft_tokens = spec_metadata.num_accepted_draft_tokens[:
+                                                                        batch_size]
     attn_metadata.kv_lens_cuda[:
                                batch_size] -= attn_metadata.seq_lens_cuda[:
-                                                                          batch_size] - accepted_draft_tokens - 1
+                                                                          batch_size] - num_accepted_draft_tokens - 1
 
-    last_tokens_idx = torch.cumsum(accepted_draft_tokens,
+    last_tokens_idx = torch.cumsum(num_accepted_draft_tokens,
                                    dim=0,
                                    dtype=torch.long)
     new_position_ids = position_ids[0, last_tokens_idx] + 1
@@ -77,7 +78,6 @@ def prepare_for_generation(attn_metadata: AttentionMetadata,
     attn_metadata._seq_lens[:batch_size].fill_(1)
     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
     attn_metadata.on_update()
-
     attn_metadata.kv_lens_cuda[:batch_size] += 1
 
     attn_metadata.host_request_types[:attn_metadata.num_contexts].fill_(1)
