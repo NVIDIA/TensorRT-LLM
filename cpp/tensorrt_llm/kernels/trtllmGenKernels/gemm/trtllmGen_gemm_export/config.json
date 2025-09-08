@@ -1,6 +1,8 @@
 {
     "templates": {
         "GemmFp4LowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e2m1",
             "dtypeC": "e2m1",
             "mmaM": 128,
@@ -32,6 +34,8 @@
             "usePdl": true
         },
         "GemmFp4Throughput": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e2m1",
             "dtypeC": "e2m1",
             "mmaM": 128,
@@ -64,6 +68,8 @@
             "usePdl": true
         },
         "GemmFp8DeepSeekLowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 64,
@@ -94,6 +100,8 @@
 
         },
         "GemmPerTensorScalingFp8Throughput": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 128,
@@ -124,6 +132,8 @@
             "usePdl": true
         },
         "GemmPerTensorScalingFp8LowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 128,
@@ -153,6 +163,8 @@
             "usePdl": true
         },
         "GemmDeepSeekFp8LowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 64,
@@ -185,6 +197,8 @@
             "usePdl": true
         },
         "GemmDeepSeekFp8Throughput": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e4m3",
             "dtypeC": "e4m3",
             "mmaM": 64,
@@ -218,6 +232,8 @@
             "gridWaitForPrimaryB": false
         },
         "GemmMxE2m1MxE4m3LowLatency": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "mxe2m1",
             "dtypeB": "mxe4m3",
             "dtypeC": "mxe4m3",
@@ -250,6 +266,8 @@
             "usePdl": true
         },
         "GemmFp4xFp8": {
+            "smVersion": "100f",
+            "patchF2fp": false,
             "dtypeA": "e2m1",
             "dtypeMmaA": "e4m3",
             "dtypeB": "e4m3",

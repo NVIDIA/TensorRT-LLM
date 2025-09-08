@@ -105,7 +105,7 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200"]
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
-COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=60 -o ServerAliveCountMax=5"
 
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
@@ -307,7 +307,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                 Utils.exec(pipeline, script: "chmod +x ${jenkinsSetupPath}", returnStdout: true)
 
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3,)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3)
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
 
@@ -318,7 +318,8 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                         remote,
                         "\"${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}\""
                     ),
-                    returnStdout: true
+                    returnStdout: true,
+                    numRetries: 3
                 )
 
                 def jobIDs = slurmSubmitOutput
@@ -348,13 +349,24 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         }
 
         stage('Checking if the Node is Online') {
-            def counter = 0
-            // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
-            // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
-            while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
-                // Wait 10 minutes to check status of the node again
-                sleep(time: 10, unit: 'MINUTES')
-                counter++
+            withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                def remote = [
+                        ip           : cluster.ip,
+                        host         : cluster.host,
+                        user         : "${pipeline.USERNAME}",
+                        passwd       : "${pipeline.PASSWORD}",
+                        allowAnyHosts: true,
+                ]
+                def counter = 0
+                // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
+                // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
+                while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
+                    // Wait 10 minutes to check status of the node again
+                    sleep(time: 10, unit: 'MINUTES')
+                    // Avoid the node being stuck in the held state.
+                    Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""), numRetries: 3)
+                    counter++
+                }
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
@@ -482,7 +494,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
 
             stage('Prepare Testing') {
                 // Create Job Workspace folder in Frontend Node
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host} 'mkdir -p ${jobWorkspace}'", numRetries: 3,)
+                Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
                 // Download and Unzip Tar File
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
@@ -492,12 +504,12 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
 
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}", numRetries: 3,)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}", numRetries: 3)
                 Utils.exec(pipeline, script: "cat ${scriptRunLocalPath}")
 
                 // Upload waives.txt to Frontend node
                 def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}", numRetries: 3,)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}", numRetries: 3)
 
                 // Generate Test List and Upload to Frontend Node
                 def makoArgs = getMakoArgsFromStageName(stageName, true)
@@ -506,7 +518,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 def testListPath = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${testListPath} ${remote.user}@${remote.host}:${testListPathNode}", numRetries: 3,)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${testListPath} ${remote.user}@${remote.host}:${testListPathNode}", numRetries: 3)
 
                 // Generate Multi Node Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
@@ -550,7 +562,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 """.stripIndent()
                 pipeline.writeFile(file: scriptLaunchDestPath, text: scriptContent)
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}", numRetries: 3,)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}", numRetries: 3)
                 Utils.exec(pipeline, script: "cat ${scriptLaunchDestPath}")
             }
 
@@ -561,7 +573,8 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     script: Utils.sshUserCmd(
                         remote,
                         "\"bash ${scriptLaunch}\""
-                    )
+                    ),
+                    numRetries: 3
                 )
             }
 
@@ -1128,7 +1141,7 @@ def transformMakoArgsToJson(optList) {
 
 def getMakoOpts(getMakoScript, makoArgs=[]) {
     // We want to save a map for the Mako opts
-    def turtleOutput = ""
+    def makoOutput = ""
 
     // Echo the command
     // NOTE: We redirect stderr to stdout so that we can capture
@@ -1152,17 +1165,17 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
 
         // Capture the mako output, add timeout in case any hang
         timeout(time: 30, unit: 'MINUTES'){
-            turtleOutput = sh(label: "Capture Mako Parameters", script: listMakoCmd, returnStdout: true)
+            makoOutput = sh(label: "Capture Mako Parameters", script: listMakoCmd, returnStdout: true)
         }
     }
 
     // Validate output
-    assert turtleOutput: "Mako opts not found - could not construct test db test list."
+    assert makoOutput: "Mako opts not found - could not construct test db test list."
 
-    // Split each line of turtle output into a list
-    def turtleOutList = turtleOutput.split("\n")
+    // Split each line of mako output into a list
+    def outputList = makoOutput.split("\n")
 
-    def makoOptsJson = transformMakoArgsToJson(turtleOutList)
+    def makoOptsJson = transformMakoArgsToJson(outputList)
 
     return makoOptsJson
 }
@@ -1792,7 +1805,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
     }
-    buildArgs = "--clean"
+    buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90-real;100-real;120-real'"
     }
@@ -2027,9 +2040,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
-        "RTXPro6000-Pytorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        "RTXPro6000-4_GPUs-Pytorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
-        "RTXPro6000-4_GPUs-Pytorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
