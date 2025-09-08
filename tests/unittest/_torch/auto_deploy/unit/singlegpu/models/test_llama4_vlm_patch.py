@@ -1,4 +1,3 @@
-import pytest
 import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig
@@ -9,7 +8,7 @@ from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_e
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5505835")
+# @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5505835")
 def test_build_run_llama4_vlm():
     atol = 1e-3
     rtol = 1e-3

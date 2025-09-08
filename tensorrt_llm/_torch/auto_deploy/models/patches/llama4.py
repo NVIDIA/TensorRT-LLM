@@ -104,7 +104,7 @@ def _forward_with_cond(
         return inputs_embeds
 
     def _no_vision_branch(inputs_embeds, pixel_values, input_ids):
-        return inputs_embeds
+        return inputs_embeds.clone()
 
     # decide by whether there is any non-zero pixel_values
     has_image: torch.Tensor = torch.any(pixel_values != 0)
