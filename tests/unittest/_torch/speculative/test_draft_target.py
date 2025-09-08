@@ -14,8 +14,9 @@ from utils.llm_data import llm_models_root
 from utils.util import similar
 
 
-@pytest.mark.parametrize("use_cuda_graph,attn_backend",
-                         [[False, "TRTLLM"], [True, "TRTLLM"]])
+@pytest.mark.parametrize(
+    "use_cuda_graph,attn_backend, use_greedy_sampling",
+    [[False, "TRTLLM", True], [True, "TRTLLM", True], [True, "TRTLLM", False]])
 @pytest.mark.high_cuda_memory
 def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -52,7 +53,10 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
         "The capital of France is",
         "The president of the United States is",
     ]
-    sampling_params = SamplingParams(max_tokens=32)
+    if use_greedy_sampling:
+        sampling_params = SamplingParams(max_tokens=32)
+    else:
+        sampling_params = SamplingParams(max_tokens=32, top_p=0.9)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     results_spec = llm_spec.generate(prompts, sampling_params)
