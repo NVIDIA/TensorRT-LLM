@@ -5,9 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import (AutoConfig, AutoProcessor, AutoTokenizer,
-                          PretrainedConfig, PreTrainedModel,
-                          Qwen2_5_VLForConditionalGeneration,
-                          Qwen2VLForConditionalGeneration)
+                          PretrainedConfig, PreTrainedModel)
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
     Qwen2_5_VisionTransformerPretrainedModel
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
@@ -640,7 +638,7 @@ class Qwen2VLModelBase(PreTrainedModel):
 
 
 @register_vision_encoder(Qwen2VisionModelBase,
-                         vlm_base_model=Qwen2VLForConditionalGeneration)
+                         vlm_base_model=Qwen2VisionTransformerPretrainedModel)
 @register_auto_model("Qwen2VLForConditionalGeneration")
 @register_input_processor(
     Qwen2VLInputProcessorBase,
@@ -662,8 +660,9 @@ class Qwen2VLModel(Qwen2VLModelBase):
                 model_config, Qwen2VisionTransformerPretrainedModel)
 
 
-@register_vision_encoder(Qwen2VisionModelBase,
-                         vlm_base_model=Qwen2_5_VLForConditionalGeneration)
+@register_vision_encoder(
+    Qwen2VisionModelBase,
+    vlm_base_model=Qwen2_5_VisionTransformerPretrainedModel)
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
 @register_input_processor(
     Qwen2VLInputProcessorBase,
