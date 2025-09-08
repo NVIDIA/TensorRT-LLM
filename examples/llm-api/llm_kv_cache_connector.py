@@ -33,8 +33,8 @@ class PersistentKvCacheConnectorMetadata:
 
 class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
-    def __init__(self, llm_args: TorchLlmArgs, tokens_per_block: int):
-        super().__init__(llm_args, tokens_per_block)
+    def __init__(self, llm_args: TorchLlmArgs):
+        super().__init__(llm_args)
 
         self.kv_cache_tensor = None
 
@@ -80,10 +80,10 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
 class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
-    def __init__(self, llm_args: TorchLlmArgs, tokens_per_block: int):
-        super().__init__(llm_args, tokens_per_block)
+    def __init__(self, llm_args: TorchLlmArgs):
+        super().__init__(llm_args)
 
-        self.block_size = self._tokens_per_block
+        self.block_size = self._llm_args.kv_cache_config.tokens_per_block
         self.pending_loads = {}
 
         self.cache_folder = os.environ.get(CONNECTOR_CACHE_FOLDER_KEY,

@@ -81,9 +81,8 @@ class SchedulerOutput:
 
 class KvCacheConnectorWorker(ABC):
 
-    def __init__(self, llm_args: TorchLlmArgs, tokens_per_block: int):
+    def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
-        self._tokens_per_block = tokens_per_block
         self._metadata = None
         super().__init__()
 
@@ -163,9 +162,8 @@ class KvCacheConnectorWorker(ABC):
 
 class KvCacheConnectorScheduler(ABC):
 
-    def __init__(self, llm_args: TorchLlmArgs, tokens_per_block: int):
+    def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
-        self._tokens_per_block = tokens_per_block
         super().__init__()
 
     @abstractmethod
