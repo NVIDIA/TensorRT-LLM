@@ -294,6 +294,11 @@ class Attention(nn.Module):
         # which could be modified after __init__
         self.attn.update_quant_config(self.quant_config)
 
+        self.o_proj.create_weights()
+        self.has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
+                                or self.o_proj.has_fp8_block_scales
+                                or self.o_proj.has_fp8_rowwise)
+
     def split_qkv(self, q, k=None, v=None):
         if k is None and v is None:
             q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -313,10 +318,7 @@ class Attention(nn.Module):
         out_dtype = q.dtype
 
         if self.attn_backend == "TRTLLM":
-            has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
-                               or self.o_proj.has_fp8_block_scales
-                               or self.o_proj.has_fp8_rowwise)
-            if has_quant_scale and self.attn.has_fp8_kv_cache:
+            if self.has_quant_scale and self.attn.has_fp8_kv_cache:
                 out_dtype = torch.float8_e4m3fn
         output = q.new_empty([num_tokens, hidden_size], dtype=out_dtype)
         return output
@@ -353,10 +355,7 @@ class Attention(nn.Module):
 
         out_scale = None
         out_scale_sf = None
-        has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
-                           or self.o_proj.has_fp8_block_scales
-                           or self.o_proj.has_fp8_rowwise)
-        if has_quant_scale:
+        if self.has_quant_scale:
             out_scale = self.o_proj.inv_input_scale
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output:
             out_scale_sf = self.o_proj.input_scale
@@ -840,6 +839,9 @@ class MLA(nn.Module):
         self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
 
+        # Although we use FP8 MLA for context/generation phase, the output is still in BF16
+        self.out_scale = None
+
         # k_b_proj_trans's dtype must be consistent with self.kv_b_proj,
         # which can be modified after __init__
         has_fp8_block_scales = (
@@ -1045,9 +1047,6 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Currently we use BF16 MHA for context phase
-
         attn_output = self.mha.forward(
             q,
             k,
@@ -1055,7 +1054,7 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=latent_cache,
-            out_scale=out_scale,
+            out_scale=self.out_scale,
             output=output,
         )
 
@@ -1110,9 +1109,6 @@ class MLA(nn.Module):
         full_kv = None
         full_k_nope = None
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Currently we use BF16 MHA for context phase
-
         # latent_cache must be None to differentiate from normal context phase,
         # so that we can skip applying RoPE and appending KV cache inside attention op
         attn_output = self.mha.forward(
@@ -1122,7 +1118,7 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=None,
-            out_scale=out_scale,
+            out_scale=self.out_scale,
             output=output,
         )
 
@@ -1212,7 +1208,6 @@ class MLA(nn.Module):
                 loop_idx]
             attn_metadata.host_total_kv_lens[0] = total_ctx_chunked_tokens
 
-            out_scale = None
             # do not apply mask for attention within loop
             # latent_cache must be None to differentiate from normal context phase,
             # so that we can skip applying RoPE and appending KV cache inside attention op
@@ -1223,7 +1218,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=None,
-                out_scale=out_scale,
+                out_scale=self.out_scale,
                 attention_mask=PredefinedAttentionMask.FULL,
                 softmax_stats_tensor=self.temp_softmax_stats_tensor,
                 output=temp_attn_output,
@@ -1262,9 +1257,6 @@ class MLA(nn.Module):
                                                        num_contexts].sum().item(
                                                        )
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Currently we use BF16 MHA for context phase
-
         # latent_cache must be None to differentiate from normal context phase,
         # so that we can skip applying RoPE and appending KV cache inside attention op
         temp_attn_output = self.mha.forward(
@@ -1274,7 +1266,7 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=None,
-            out_scale=out_scale,
+            out_scale=self.out_scale,
             softmax_stats_tensor=self.temp_softmax_stats_tensor,
             output=temp_attn_output,
         )
@@ -1370,16 +1362,13 @@ class MLA(nn.Module):
             self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
         ])
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
-
         attn_out_latent = self.mqa.forward(
             fused_q,
             None,
             None,
             attn_metadata,
             attention_input_type=AttentionInputType.generation_only,
-            out_scale=out_scale,
+            out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
         )
