@@ -42,7 +42,7 @@ from tensorrt_llm.serve.scripts.backend_request_func import (
 from tensorrt_llm.serve.scripts.benchmark_dataset import (
     AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
     HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
-    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
+    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset, vllmCustomDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
 # isort: on
@@ -699,6 +699,14 @@ def main(args: argparse.Namespace):
                                            tokenizer=tokenizer,
                                        )
 
+    elif args.dataset_name == "vllm_custom":
+        dataset = vllmCustomDataset(dataset_path=args.dataset_path)
+        input_requests = dataset.sample(
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            output_len=1, # TODO: fix this
+        )
+
     else:
 
         def create_dataset_and_sample(dataset_name: str):
@@ -908,7 +916,7 @@ if __name__ == "__main__":
         default="sharegpt",
         choices=[
             "sharegpt", "burstgpt", "sonnet", "random", "random_image", "hf",
-            "trtllm_custom"
+            "trtllm_custom", "vllm_custom"
         ],
         help="Name of the dataset to benchmark on.",
     )
