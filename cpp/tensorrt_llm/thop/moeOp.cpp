@@ -200,6 +200,21 @@ public:
             }
             switch (mActivationDtype)
             {
+#ifdef ENABLE_FP8
+            case c10::ScalarType::Float8_e4m3fn:
+            {
+                if (isInt4Quant() and mUseW4GroupScaling)
+                {
+                    mKernelRunner = std::make_unique<
+                        kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_fp8_e4m3>>();
+                }
+                else
+                {
+                    C10_THROW_ERROR_FORMATTED(Error, "FP8 activation type is not supported for non-W4A8 quantization");
+                }
+                break;
+            }
+#endif
             case c10::ScalarType::Half: mKernelRunner = create_weight_quant_runner<half>(); break;
             case c10::ScalarType::BFloat16: mKernelRunner = create_weight_quant_runner<__nv_bfloat16>(); break;
             default: C10_THROW_ERROR_FORMATTED(Error, "Unsupported activation type for int-type weight");
