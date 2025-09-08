@@ -2,77 +2,67 @@
 
 import types
 from functools import partial
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple, Type
 
 import torch
 import torch.fx as fx
+from pydantic import Field
 from torch.fx import GraphModule
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...custom_ops.attention_interface import AttentionRegistry
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
-def cached_mha_for_hf(
-    module: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    scaling: Optional[float] = None,
-    **kwargs,
+def hf_cached_attn_wrapper(
+    ad_cached_attn_op: Callable,
 ):
     """
-    A wrapper that accept HF attn inputs and outputs but calls flashinfer operator.
-    Used to patch attn_interface in transformers.
+    Returns the cached attn operator that can be called with HF attn inputs and outputs.
+
     Args:
-        *args: same as HF attention_interface.
-        **kwargs: need to contain metadata, all_layers_kv_cache, and buffers from cm.
+        ad_cached_attn_op: the cached attn operator to call.
     Returns:
-        attn_output: same as HF attention_interface.
-        attn_weights: set to None.
+        cached_attn: the cached attn operator that can be called with HF attn inputs and outputs.
     """
 
-    # First we extract cached attn inputs from kwargs
-    try:
-        metadata = kwargs["metadata"]
-        all_layers_kv_cache = kwargs["all_layers_kv_cache"]
-        buffers = kwargs["buffers"]
-    except KeyError as e:
-        raise KeyError(f"Missing required kwarg: {e.args[0]}")
+    def cached_attn(
+        module: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        **kwargs,
+    ):
+        attn_output = ad_cached_attn_op(
+            # QKV in blhd layout
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            # metadata
+            *(kwargs.get("metadata")),
+            # caches
+            *(kwargs.get("all_layers_kv_cache")[module._layer_idx]),
+            # buffers
+            *(kwargs.get("buffers")),
+            # constants, harded coded for flashinfer.
+            *(kwargs.get("all_layers_attn_constants")[module._layer_idx]),
+        )
 
-    # reshape to flashinfer input format
-    # TODO:(hg) might want to optimize this later.
-    query = torch.einsum("bhld->blhd", query)
-    key = torch.einsum("bhld->blhd", key)
-    value = torch.einsum("bhld->blhd", value)
+        # Cached attn ops does not return attn weights in general
+        attn_weights = None
 
-    # Get the current layer's kv cache.
-    layer_kv_cache = all_layers_kv_cache[module._layer_idx]
+        return attn_output, attn_weights
 
-    attn_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
-        # QKV
-        query,
-        key,
-        value,
-        # metadata
-        *metadata,
-        # caches
-        *layer_kv_cache,
-        # buffers
-        *buffers,
-        # constants, harded coded for flashinfer.
-        scaling,
-        k_scale=1,
-        v_scale=1,
-    )
-
-    attn_weights = None
-
-    return attn_output, attn_weights
+    return cached_attn
 
 
 def forward_cached(module: torch.nn.Module, *cm_args):
@@ -91,14 +81,18 @@ def forward_cached(module: torch.nn.Module, *cm_args):
     # e.g. [[k_cache_0, v_cache_0], [k_cache_1, v_cache_1], ...]
     all_layers_kv_cache = [cm_args[slice] for slice in args_map["kvcache_args"]]
 
-    # buffers: (workspace_buffer,)
-    buffers = cm_args[args_map["buffer_args"]]
+    # buffers: e.g. (workspace_buffer,)
+    buffers = cm_args[args_map["buffer_args"]] if "buffer_args" in args_map else ()
+
+    # get attention constants
+    all_layers_attn_constants = module.attention_constants
 
     # pass additional inputs with kwargs
     hf_input_kwargs = {
         "metadata": metadata,
         "all_layers_kv_cache": all_layers_kv_cache,
         "buffers": buffers,
+        "all_layers_attn_constants": all_layers_attn_constants,
     }
 
     return module.original_forward(
@@ -112,66 +106,84 @@ def fake_profiler_mha(
     key: torch.Tensor,
     value: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    scaling: Optional[float] = None,
     **kwargs,
 ):
-    """Fake attn to count number of attn calls and record per-rank kv shape of each layer."""
+    """Fake attn to populated attention nodes of each layer."""
+    # Set layer idx to current attention module
+    module._layer_idx = len(kwargs["source_attn_nodes"])
 
-    # Set layer idx to current attention module, so it can fetch its kv cache from cm input args later.
-    module._layer_idx = len(kwargs["kv_cache_shapes"])
+    # logic adopted from
+    # https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/sdpa_attention.py#L73
+    if "is_causal" in kwargs:
+        is_causal = kwargs["is_causal"]
+    else:
+        is_causal = (
+            query.shape[2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
+        )
 
-    # Record kv cache shape for this layer, for initializing kv cache.
-    kwargs["kv_cache_shapes"].append(
-        {
-            "n_q_heads": query.shape[1],
-            "n_kv_heads": key.shape[1],
-            "head_dim": key.shape[-1],
-        }
+    # Append new attn node detected at current layer
+    kwargs["source_attn_nodes"].append(
+        _get_fake_attn_node(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            module.config.torch_dtype,
+            node_kwargs={
+                "attn_mask": attention_mask,
+                "dropout_p": kwargs.get("dropout"),
+                "is_causal": is_causal,
+                "scale": kwargs.get("scaling"),
+            },
+        )
     )
 
-    # Return fake outputs.
-    attn_output = torch.empty_like(torch.einsum("bhld->blhd", query).contiguous())
+    # Return fake outputs
+    attn_output = torch.empty_like(query.transpose(1, 2).contiguous())
     attn_weights = None
 
     return attn_output, attn_weights
 
 
-def _get_fake_attn_node(num_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype):
-    """Return a fake attn node with correct shape info for the cache initializers."""
-    q_fake = fx.Node(
-        graph=fx.Graph(),
-        name="q_fake",
-        op="call_function",
-        target=lambda x: x,
-        args=(1,),
-        kwargs={},
-    )
-    q_fake.meta["val"] = torch.empty(1, 1, num_heads, head_dim, device="meta", dtype=dtype)
-    k_fake = fx.Node(
-        graph=fx.Graph(),
-        name="k_fake",
-        op="call_function",
-        target=lambda x: x,
-        args=(1,),
-        kwargs={},
-    )
-    k_fake.meta["val"] = torch.empty(1, 1, num_kv_heads, head_dim, device="meta", dtype=dtype)
+def _get_fake_attn_node(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dtype: torch.dtype,
+    node_kwargs: dict = {},
+):
+    """Return a standard attention node with correct info for the cache initializations."""
 
-    dummpy_node = fx.Node(
-        graph=fx.Graph(),
-        name="dummy",
-        op="call_function",
-        target=lambda x: x,
-        args=(q_fake, k_fake),
-        kwargs={},
+    fake_graph = fx.Graph()
+    q_fake = fake_graph.placeholder(name="q_fake")
+    q_fake.meta["val"] = torch.empty_like(query, device="meta", dtype=dtype)
+    k_fake = fake_graph.placeholder(name="k_fake")
+    k_fake.meta["val"] = torch.empty_like(key, device="meta", dtype=dtype)
+    v_fake = fake_graph.placeholder(name="v_fake")
+    v_fake.meta["val"] = torch.empty_like(value, device="meta", dtype=dtype)
+
+    dummy_node = fake_graph.call_function(
+        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
+        args=(q_fake, k_fake, v_fake),
+        kwargs=node_kwargs,
     )
-    return dummpy_node
+    return dummy_node
+
+
+class HFReplaceCachedAttnConfig(TransformConfig):
+    """Configuration for the transformers cached attention transform."""
+
+    attn_backend: Optional[str] = Field(default=None, description="The attention backend to use.")
 
 
 @TransformRegistry.register("transformers_replace_cached_attn")
 class HFReplaceCachedAttn(BaseTransform):
     """Replace cached attention for the factory model, update inputs and outputs, and patch the gm forward."""
+
+    config: HFReplaceCachedAttnConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return HFReplaceCachedAttnConfig
 
     def _apply(
         self,
@@ -180,8 +192,7 @@ class HFReplaceCachedAttn(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # TODO:(hg) Hard-coded attn_backend=flashinfer now.
-        attn_descriptor = AttentionRegistry.get("flashinfer")
+        attn_descriptor = AttentionRegistry.get(self.config.attn_backend)
         model = gm.factory_model
         cache_config = factory.get_cache_config()
 
@@ -192,19 +203,17 @@ class HFReplaceCachedAttn(BaseTransform):
         ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", fake_profiler_mha)
         model.config._attn_implementation = "ad_cached_mha"
 
-        # Add an empty list as attribute for profiler to write to.
-        kv_cache_shapes = []
-
-        # Run forward with fake attn and dummy inputs.
+        # Create an empty list of source attn nodes and populate with profiling forward run
+        source_attn_nodes = []
         dummy_input_ids = model.dummy_inputs["input_ids"].to(model.device)
-        model.original_forward(input_ids=dummy_input_ids, kv_cache_shapes=kv_cache_shapes)
-        num_layers = len(kv_cache_shapes)
+        model.original_forward(input_ids=dummy_input_ids, source_attn_nodes=source_attn_nodes)
 
         # Ends profiling, switch back to real attn operator.
-        ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", cached_mha_for_hf)
+        ALL_ATTENTION_FUNCTIONS.register(
+            "ad_cached_mha", hf_cached_attn_wrapper(attn_descriptor.get_cached_attention_op())
+        )
 
-        # Next, we gradually add cm args and build an index_map along the way, to
-        # let each attention layer find their inputs from all cm args.
+        # Next, add cm args and build an index_map for positional args
         cm_args_index_map = {}
 
         # Cm has 2 inputs to start with, input_ids and position_ids.
@@ -218,19 +227,10 @@ class HFReplaceCachedAttn(BaseTransform):
         )
         num_cm_args += num_cached_attn_args
 
-        # We record kv cache index as a list of slices, one per layer.
+        # Record kv cache index as a list of slices, one per layer.
         per_layer_kvcache_slice = []
-        for layer_idx in range(num_layers):
-            # Allowing each layer to have potentially different kv cache shapes.
-            dummy_attn_node = _get_fake_attn_node(
-                kv_cache_shapes[layer_idx]["n_q_heads"],
-                kv_cache_shapes[layer_idx]["n_kv_heads"],
-                kv_cache_shapes[layer_idx]["head_dim"],
-                model.dtype,
-            )
-            cache_initializers = attn_descriptor.get_cache_initializers(
-                dummy_attn_node, cache_config
-            )
+        for layer_idx, attn_node in enumerate(source_attn_nodes):
+            cache_initializers = attn_descriptor.get_cache_initializers(attn_node, cache_config)
             for k_or_v, get_cache in cache_initializers.items():
                 cm.add_cache(f"{k_or_v}_{layer_idx}", get_cache)
             per_layer_kvcache_slice.append(
@@ -241,16 +241,20 @@ class HFReplaceCachedAttn(BaseTransform):
 
         # Add buffer and update map
         existing_buffers = set()
-        for layer_idx in range(num_layers):
-            for k, get_buffer in attn_descriptor.get_global_buffer_initializers(
-                dummy_attn_node
-            ).items():
+        for attn_node in source_attn_nodes:
+            for k, get_buffer in attn_descriptor.get_global_buffer_initializers(attn_node).items():
                 if k in existing_buffers:
                     continue
                 cm.add_cache(k, get_buffer)
                 existing_buffers.add(k)
                 cm_args_index_map["buffer_args"] = slice(num_cm_args, num_cm_args + 1)
                 num_cm_args += 1
+
+        # Add constants as model attributes
+        model.attention_constants = []
+        for attn_node in source_attn_nodes:
+            constants = attn_descriptor.get_constants(attn_node)
+            model.attention_constants.append(constants)
 
         # prepare get_metadata function
         get_metadata, _ = attn_descriptor.get_prepare_metadata_op()
