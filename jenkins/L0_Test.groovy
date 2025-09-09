@@ -931,12 +931,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         """
     }
 
-    if (type.contains("b100-ts2")) {
+    if (type.contains("l40s")) {
         expression = """
                               - key: "kubernetes.io/hostname"
                                 operator: In
                                 values:
-                                - "4u4g-gen-0077.ipp4a1.colossus"
+                                - "a4u8g-0111.ipp2u2.colossus"
         """
     } else {
         expression = """
