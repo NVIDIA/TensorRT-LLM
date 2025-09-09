@@ -272,8 +272,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = modelConfig.getNumKvHeadsPerLayerLocalRange(
                 worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank(), isCrossAttention);
             auto numKvHeadsPerLayer = std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd);
-            auto windowSizeLayers
-                = BaseKVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, modelConfig.getNbLayers());
+            auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
+            auto const windowSizeLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
             std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
             for (auto const& [windowSize, managedLayers] : windowSizeLayers)
             {
