@@ -84,8 +84,11 @@ def pad_up(x, pad_size):
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536), (128, 2112, 7168), (128, 4096, 7168), (128, 7168, 2048)])
+@pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536),
+                                 (128, 2112, 7168), (128, 4096, 7168),
+                                 (128, 7168, 2048)])
 def test_fp4_linear_cute_dsl(dtype, mnk):
+
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 

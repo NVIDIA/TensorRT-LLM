@@ -24,6 +24,7 @@ from ..utils import (fp4_scale_infer_shape,
                      last_positive_power_of_2)
 from .cute_dsl_kernels.blackwell.utils import make_ptr
 
+
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
 def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
@@ -1220,9 +1221,8 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             compiled_gemm = CuteDSLNVFP4BlackwellLinear.kernel_dict[cache_key]
 
         # launch gemm kernel
-        compiled_gemm(m, n, real_k, sf_m // 128, sf_n // 128, sf_k // 4,
-                      a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha,
-                      stream)
+        compiled_gemm(m, n, real_k, sf_m // 128, sf_n // 128, sf_k // 4, a_ptr,
+                      b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha, stream)
         return c_tensor
 
 
