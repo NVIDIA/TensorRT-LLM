@@ -24,6 +24,7 @@
 
 #include "cute/tensor.hpp"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmException.h"
 
 namespace tensorrt_llm
 {
@@ -425,7 +426,7 @@ struct CutlassGemmConfig
         , sm_version(sm_version)
         , is_tma_warp_specialized(true)
     {
-        assert(sm_version >= 100 && sm_version < 120 && "Expected SM 10x version");
+        TLLM_CHECK_WITH_INFO(sm_version >= 100 && sm_version < 120, "Expected SM 10x version");
     }
 
     CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120, MainloopScheduleType mainloop_schedule,
