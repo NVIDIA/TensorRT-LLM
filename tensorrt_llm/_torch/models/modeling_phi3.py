@@ -217,45 +217,45 @@ class Phi3ForCausalLM(DecoderModelForCausalLM[Phi3Model, Phi3Config]):
                     if "self_attn.qkv_proj" in name:
                         # The weights need to be split correctly before sharding to support tp_size >1.
                         qkv_weight = module_weights['weight'][:]
-                        q_weight = qkv_weight[:hidden_size, :]
-                        k_weight = qkv_weight[hidden_size:hidden_size +
-                                              num_kv_heads * head_dim, :]
-                        v_weight = qkv_weight[hidden_size +
-                                              num_kv_heads * head_dim:, :]
+                        qk_split_index = hidden_size
+                        kv_split_index = hidden_size + num_kv_heads * head_dim
+
+                        q_dict = {'weight': qkv_weight[:qk_split_index, :]}
+                        k_dict = {
+                            'weight':
+                            qkv_weight[qk_split_index:kv_split_index, :]
+                        }
+                        v_dict = {'weight': qkv_weight[kv_split_index:, :]}
 
                         # Get the scale factor for the fused QKV projection
                         qkv_scale = module_weights.get('weight_scale', None)
+
+                        if qkv_scale is not None:
+                            if qkv_scale.shape[0] == qkv_weight.shape[0]:
+                                q_dict[
+                                    'weight_scale'] = qkv_scale[:
+                                                                qk_split_index, :]
+                                k_dict['weight_scale'] = qkv_scale[
+                                    qk_split_index:kv_split_index, :]
+                                v_dict['weight_scale'] = qkv_scale[
+                                    kv_split_index:, :]
+                            else:  # use same scale
+                                q_dict['weight_scale'] = qkv_scale
+                                k_dict['weight_scale'] = qkv_scale
+                                v_dict['weight_scale'] = qkv_scale
+
                         input_scale = module_weights.get('input_scale', None)
+                        if input_scale is not None:
+                            q_dict['input_scale'] = input_scale
+                            k_dict['input_scale'] = input_scale
+                            v_dict['input_scale'] = input_scale
+
                         weight_scale_2 = module_weights.get(
                             'weight_scale_2', None)
-
-                        q_dict = {'weight': q_weight}
-                        if qkv_scale is not None:
-                            q_dict['weight_scale'] = qkv_scale[:hidden_size, :]
-                            if input_scale is not None:
-                                q_dict['input_scale'] = input_scale
-                            if weight_scale_2 is not None:
-                                q_dict['weight_scale_2'] = weight_scale_2
-
-                        k_dict = {'weight': k_weight}
-                        if qkv_scale is not None:
-                            k_dict['weight_scale'] = qkv_scale[
-                                hidden_size:hidden_size +
-                                num_kv_heads * head_dim, :]
-                            if input_scale is not None:
-                                k_dict['input_scale'] = input_scale
-                            if weight_scale_2 is not None:
-                                k_dict['weight_scale_2'] = weight_scale_2
-
-                        v_dict = {'weight': v_weight}
-                        if qkv_scale is not None:
-                            v_dict['weight_scale'] = qkv_scale[hidden_size +
-                                                               num_kv_heads *
-                                                               head_dim:, :]
-                            if input_scale is not None:
-                                v_dict['input_scale'] = input_scale
-                            if weight_scale_2 is not None:
-                                v_dict['weight_scale_2'] = weight_scale_2
+                        if weight_scale_2 is not None:
+                            q_dict['weight_scale_2'] = weight_scale_2
+                            k_dict['weight_scale_2'] = weight_scale_2
+                            v_dict['weight_scale_2'] = weight_scale_2
 
                         module.load_weights(weights=[q_dict, k_dict, v_dict])
                     elif "mlp.gate_up_proj" in name:
@@ -265,30 +265,33 @@ class Phi3ForCausalLM(DecoderModelForCausalLM[Phi3Model, Phi3Config]):
                         gate_weight = gate_up_weight[:intermediate_size, :]
                         up_weight = gate_up_weight[intermediate_size:, :]
 
+                        gate_dict = {'weight': gate_weight}
+                        up_dict = {'weight': up_weight}
+
                         # Get the scale factors if they exist
                         gate_up_scale = module_weights.get('weight_scale', None)
+                        if gate_up_scale is not None:
+                            if gate_up_scale.shape[0] == gate_up_weight.shape[
+                                    0]:
+                                gate_dict[
+                                    'weight_scale'] = gate_up_scale[:
+                                                                    intermediate_size, :]
+                                up_dict['weight_scale'] = gate_up_scale[
+                                    intermediate_size:, :]
+                            else:  # use same scale
+                                gate_dict['weight_scale'] = gate_up_scale
+                                up_dict['weight_scale'] = gate_up_scale
+
                         input_scale = module_weights.get('input_scale', None)
+                        if input_scale is not None:
+                            gate_dict['input_scale'] = input_scale
+                            up_dict['input_scale'] = input_scale
+
                         weight_scale_2 = module_weights.get(
                             'weight_scale_2', None)
-
-                        gate_dict = {'weight': gate_weight}
-                        if gate_up_scale is not None:
-                            gate_dict[
-                                'weight_scale'] = gate_up_scale[:
-                                                                intermediate_size, :]
-                            if input_scale is not None:
-                                gate_dict['input_scale'] = input_scale
-                            if weight_scale_2 is not None:
-                                gate_dict['weight_scale_2'] = weight_scale_2
-
-                        up_dict = {'weight': up_weight}
-                        if gate_up_scale is not None:
-                            up_dict['weight_scale'] = gate_up_scale[
-                                intermediate_size:, :]
-                            if input_scale is not None:
-                                up_dict['input_scale'] = input_scale
-                            if weight_scale_2 is not None:
-                                up_dict['weight_scale_2'] = weight_scale_2
+                        if weight_scale_2 is not None:
+                            gate_dict['weight_scale_2'] = weight_scale_2
+                            up_dict['weight_scale_2'] = weight_scale_2
 
                         module.load_weights(weights=[gate_dict, up_dict])
                     else:

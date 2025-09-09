@@ -8,7 +8,6 @@
 import copy
 import importlib
 import os
-import re
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -404,7 +403,6 @@ class Phi4MMInputProcessor(InputProcessor):
 
         self.tokenizer = tokenizer
         self.use_fast = True
-        model_path = "microsoft/Phi-4-multimodal-instruct"
         if self.tokenizer is None:
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_path,
@@ -516,17 +514,13 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         # Load weights into HFPhi4MultimodalEncoder.
         if not _is_disagg():
             filtered_weights = {}
-            pattern = r"(audio_embed.encoder.encoders..*.conv.glu.b[12]|image_embed.glb_GN|image_embed.img_processor.head.probe)"
             for k, v in weights.items():
                 if k.startswith("model.embed_tokens."):
                     new_k = k.replace("model.embed_tokens.", "embed_tokens.")
                     filtered_weights[new_k] = v
                 elif k.startswith("model.embed_tokens_extend."):
-                    new_k = k.replace("model.embed_tokeqns_extend.", "")
-                    if re.match(pattern, new_k):
-                        filtered_weights[new_k] = v.unsqueeze(0)
-                    else:
-                        filtered_weights[new_k] = v
+                    new_k = k.replace("model.embed_tokens_extend.", "")
+                    filtered_weights[new_k] = v
             self.hf_phi4mm_model.load_state_dict(filtered_weights, strict=True)
 
         # Filter out non-language model weights.
@@ -540,21 +534,16 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         weights = {k: v for k, v in weights.items() if '.lora_' not in k}
         # Rename base layer weights.
         updated_weights = {}
+        base_layers = [
+            'weight', 'input_scale', 'weight_scale', 'weight_scale_2'
+        ]
         for k in weights.keys():
-            if 'base_layer.weight' in k:
-                new_k = k.replace('base_layer.weight', 'weight')
-                updated_weights[new_k] = weights[k]
-            elif 'base_layer.input_scale' in k:
-                new_k = k.replace('base_layer.input_scale', 'input_scale')
-                updated_weights[new_k] = weights[k]
-            elif 'base_layer.weight_scale' in k:
-                new_k = k.replace('base_layer.weight_scale', 'weight_scale')
-                updated_weights[new_k] = weights[k]
-            elif 'base_layer.weight_scale_2' in k:
-                new_k = k.replace('base_layer.weight_scale_2', 'weight_scale_2')
-                updated_weights[new_k] = weights[k]
-            else:
-                updated_weights[k] = weights[k]
+            new_k = k
+            for layer in base_layers:
+                if f'base_layer.{layer}' in k:
+                    new_k = k.replace(f'base_layer.{layer}', layer)
+                    break
+            updated_weights[new_k] = weights[k]
         weights = updated_weights
         self.llm.load_weights(weights)
 
