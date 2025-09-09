@@ -1400,6 +1400,11 @@ class BaseLlmArgs(StrictBaseModel):
                                       description="Return perf metrics.",
                                       status="prototype")
 
+    num_server_threads: int = Field(
+        default=1,
+        description="The number of threads used for trtllm-serve process.",
+        status="prototype")
+
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)

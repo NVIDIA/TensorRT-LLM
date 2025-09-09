@@ -3,6 +3,7 @@ import asyncio
 import os
 import re
 import signal
+import threading
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -64,6 +65,32 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
+class MultiThreadServer(uvicorn.Server):
+    def run(self, sockets=None):
+        try:
+            import uvloop
+            asyncio.set_event_loop(uvloop.new_event_loop())
+        except ImportError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # When running in a thread, we'll not have an eventloop yet.
+            loop = asyncio.new_event_loop()
+        loop.run_until_complete(self.serve(sockets=sockets))
+
+    def run_in_thread(self, sockets=None):
+        self.thread = threading.Thread(target=self.run,
+                                       name="UvicornThread",
+                                       args=(sockets, ))
+        self.thread.start()
+        while not self.started:
+            time.sleep(1e-3)
+
+    def shutdown(self):
+        self.should_exit = True
+        self.thread.join()
 
 class OpenAIServer:
 
@@ -171,6 +198,10 @@ class OpenAIServer:
     @property
     def postproc_worker_enabled(self) -> bool:
         return True if self.llm.args.num_postprocess_workers > 0 else False
+
+    @property
+    def server_threads(self) -> int:
+        return self.llm.args.num_server_threads
 
     @staticmethod
     def create_error_response(
@@ -895,9 +926,25 @@ class OpenAIServer:
     async def __call__(self, host, port):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
-        config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve()
+        if self.server_threads > 1:
+            config = uvicorn.Config(self.app,
+                                    host=host,
+                                    port=port,
+                                    log_level="info",
+                                    timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+            sockets = [config.bind_socket()]
+            servers = [MultiThreadServer(config=config) for _ in range(self.server_threads)]
+
+            for s in servers:
+                s.run_in_thread(sockets=sockets)
+
+            while not all([s.should_exit for s in servers]):
+                await asyncio.sleep(1.0)
+
+        else:
+            config = uvicorn.Config(self.app,
+                                    host=host,
+                                    port=port,
+                                    log_level="info",
+                                    timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+            await uvicorn.Server(config).serve()
