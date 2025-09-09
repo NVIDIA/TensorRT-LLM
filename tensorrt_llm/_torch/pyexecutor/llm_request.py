@@ -160,15 +160,17 @@ class LogProbStorage:
 class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
 
-    def __init__(self,
-                 prompt_len: int,
-                 max_new_tokens: int,
-                 use_device_memory=True,
-                 streaming=False,
-                 return_log_probs: bool = False,
-                 return_context_logits: bool = False,
-                 return_generation_logits: bool = False,
-                 exclude_last_generation_logits: bool = False):
+    def __init__(
+            self,
+            prompt_len: int,
+            max_new_tokens: int,
+            use_device_memory=True,
+            streaming=False,
+            return_log_probs: bool = False,
+            return_context_logits: bool = False,
+            return_generation_logits: bool = False,
+            exclude_last_generation_logits: bool = False,
+            additional_outputs: Optional[List[AdditionalModelOutput]] = None):
         self._streaming = streaming
         self._context_logits = LogitsStorage(
             prompt_len, use_device_memory) if return_context_logits else None
@@ -177,6 +179,14 @@ class PyResult:
         ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings = None
+        self._additional_context_outputs = {
+            output.name: []
+            for output in additional_outputs if output.gather_context
+        } if additional_outputs else None
+        self._additional_generation_outputs = {
+            output.name: []
+            for output in additional_outputs
+        } if additional_outputs else None
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -195,6 +205,16 @@ class PyResult:
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
         self._mm_embeddings = SharedTensorContainer.from_tensor(
             mm_embeddings).dump_to_dict()
+
+    def append_additional_context_outputs(
+            self, name: str, additional_context_outputs: torch.Tensor):
+        self._additional_context_outputs[name].append(
+            additional_context_outputs)
+
+    def append_additional_generation_outputs(
+            self, name: str, additional_generation_outputs: torch.Tensor):
+        self._additional_generation_outputs[name].append(
+            additional_generation_outputs)
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -237,12 +257,29 @@ class PyResult:
     def mm_embedding_handle(self) -> Dict[str, Any] | None:
         return self._mm_embeddings
 
+    @property
+    def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
+        outputs = {}
+        for name, output_list in self._additional_context_outputs.items():
+            outputs[name] = torch.cat(
+                output_list, dim=0) if len(output_list) > 1 else output_list[0]
+        return outputs
+
+    @property
+    def additional_generation_outputs(self) -> Dict[str, torch.Tensor] | None:
+        outputs = {}
+        for name, output_list in self._additional_generation_outputs.items():
+            outputs[name] = torch.cat(
+                output_list, dim=0) if len(output_list) > 1 else output_list[0]
+        return outputs
+
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handle'))
+         'mm_embedding_handle', 'additional_context_outputs',
+         'additional_generation_outputs'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
