@@ -1,13 +1,11 @@
 """A simple wrapper transform to build a model via the model factory."""
 
-import types
 from typing import Tuple, Type
 
 from pydantic import Field
 from torch.fx import GraphModule
-from transformers import AutoModelForCausalLM
 
-from ...models.factory import ModelFactory
+from ...models import ModelFactory, hf
 from ...shim.interface import CachedSequenceInterface
 from ..interface import (
     BaseTransform,
@@ -65,16 +63,14 @@ class BuildAndLoadFactoryModel(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         # load model with auto sharding
-        model = AutoModelForCausalLM.from_pretrained(
+        assert isinstance(factory, hf.AutoModelFactory)
+        model = factory.automodel_cls.from_pretrained(
             factory.model,
             trust_remote_code=True,
             tp_plan="auto",
             torch_dtype="auto",
         )
-
-        # patch forward method
-        model.original_forward = model.forward
-        model.forward = types.MethodType(factory._simple_forward, model)
+        factory._set_simple_forward(model)
         model.eval()
 
         # as wrapper to satisfy the interface we will register the model as a submodule

@@ -11,7 +11,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
 from .models import ModelFactory, ModelFactoryRegistry
-from .transform.interface import TransformConfig
 from .utils._config import DynamicYamlMixInForSettings
 
 PathLike = Union[str, Path]
@@ -191,7 +190,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         "or transformers-only cached attention optimization.",
     )
 
-    transforms: Dict[str, TransformConfig] = Field(
+    transforms: Dict[str, Any] = Field(
         default_factory=dict,
         description="A dictionary of transform configurations. The key is the transform name and "
         "the value is the transform configuration.",

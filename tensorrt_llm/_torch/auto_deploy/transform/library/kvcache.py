@@ -7,7 +7,7 @@ import torch
 from pydantic import Field
 from torch.fx import Graph, GraphModule, Node
 
-from ...custom_ops.attention_interface import AttentionRegistry
+from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegistry
 from ...distributed.common import all_gather_object, get_world_size
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -81,6 +81,10 @@ class InsertCachedAttention(BaseTransform):
     def get_config_class(cls) -> Type[TransformConfig]:
         return InsertCachedAttentionConfig
 
+    @property
+    def attn_descriptor(self) -> Type[AttentionDescriptor]:
+        return AttentionRegistry.get(self.config.attn_backend)
+
     def _apply(
         self,
         gm: GraphModule,
@@ -89,7 +93,7 @@ class InsertCachedAttention(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Replace uncached source attention node with corresponding cached attn node."""
-        attn_descriptor = AttentionRegistry.get(self.config.attn_backend)
+        attn_descriptor = self.attn_descriptor
 
         cache_config = factory.get_cache_config()
 
@@ -226,16 +230,16 @@ class ResizeKVCache(BaseTransform):
             return free_mem // 1024**2, total_mem // 1024**2
 
         free_mem, total_mem = _get_mem_info_in_mb()
-        ad_logger.info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
+        self._log_info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
         current_cache_size = cm.current_cache_size_bytes()
         current_num_pages = cm.info.num_pages
-        ad_logger.info(
+        self._log_info(
             f"Current cache size (MB): {current_cache_size // 1024 // 1024}, "
             f"Current num pages (MB): {current_num_pages}"
         )
 
         if free_mem_ratio == 0.0:
-            ad_logger.info(f"Skipping cache resize for {free_mem_ratio=}")
+            self._log_info(f"Skipping cache resize for {free_mem_ratio=}")
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -244,15 +248,15 @@ class ResizeKVCache(BaseTransform):
             # Let's run a forward pass to get the memory usage
             cm.info.set_max_num_tokens_sample()
             free_mem_pre, _ = _get_mem_info_in_mb()
-            ad_logger.info(f"Free memory before forward pass (MB): {free_mem_pre}")
+            self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
 
             gm(*cm.args)
 
             free_mem_post, _ = _get_mem_info_in_mb()
-            ad_logger.info(f"Free memory after forward pass (MB): {free_mem_post}")
+            self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")
 
             memory_for_forward_pass = free_mem_pre - free_mem_post
-            ad_logger.info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
+            self._log_info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
 
             new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
             new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
@@ -261,7 +265,7 @@ class ResizeKVCache(BaseTransform):
             gathered_num_pages = [None] * get_world_size()
             all_gather_object(gathered_num_pages, new_num_pages)
             new_num_pages = min(gathered_num_pages)
-            ad_logger.info(f"After all_gather - new_num_pages: {new_num_pages}")
+            self._log_info(f"After all_gather - new_num_pages: {new_num_pages}")
 
             cm.resize_cache(new_num_pages)
         except Exception as e:
@@ -291,8 +295,11 @@ class InitializeCache(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        cm.initialize_caches()
+        num_caches = cm.initialize_caches()
+        self._log_info(f"Initialized {num_caches} caches for cached attention")
 
-        info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
+        info = TransformInfo(
+            skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True
+        )
 
         return gm, info

@@ -1,26 +1,23 @@
 # Additional default args for AutoDeployConfig/LlmArgs in _torch/auto_deploy/llm_args.py
-#In transformers mode are playing with gm.factory_module, which is a dead module.
-#Need to always ensure not cleaning graph.
+
 transforms:
+  ############################################################################################
+  # BUILD MODEL, LOAD WEIGHTS, AND WRAP IT INTO FAKE GRAPH MODULE
+  ############################################################################################
   build_and_load_factory_model:
     stage: factory
-    device: meta
-    run_graph_cleanup: false
-    requires_clean_graph: false
-
-  transformers_replace_cached_attn:
-    stage: factory
-    run_graph_cleanup: false
-    requires_clean_graph: false
-    attn_backend: flashinfer
-
+  ############################################################################################
+  # MOVE ARGUMENTS TO DEVICE
+  ############################################################################################
   move_cm_to_device:
     stage: weight_load
-    run_graph_cleanup: false
-    requires_clean_graph: false
-
+  ############################################################################################
+  # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
+  ############################################################################################
+  transformers_replace_cached_attn:
+    stage: cache_init
+    attn_backend: flashinfer
   initialize_cache:
     stage: cache_init
-
   resize_kv_cache:
     stage: cache_init

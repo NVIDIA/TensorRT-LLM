@@ -274,13 +274,11 @@ class BaseTransform(ABC):
 
         # log the result of the transform
         log_msgs = [
-            f"stage={self.config.stage.value}",
-            f"transform={t_name}",
             "skipped=True" if info.skipped else f"num_matches={info.num_matches}",
             f"is_clean={info.is_clean}",
             f"has_valid_shapes={info.has_valid_shapes}",
         ]
-        ad_logger.info(", ".join(log_msgs))
+        self._log_info(", ".join(log_msgs))
         ad_logger.debug(f"Graph after {t_name}: {gm}")
 
         # update + store new meta data
@@ -293,6 +291,12 @@ class BaseTransform(ABC):
 
         # return the graph module
         return gm
+
+    @final
+    def _log_info(self, *args: any):
+        """Log a message with the transform key."""
+        prefix = f"[stage={self.config.stage.value}, transform={self.get_transform_key()}]"
+        ad_logger.info(f"{prefix} " + " ".join(map(str, args)))
 
     @final
     def _get_autodeploy_meta(self, gm: GraphModule) -> AutodeployMeta:
@@ -326,12 +330,14 @@ class BaseTransform(ABC):
 
         # check if run cleanup depending on the config and info
         if self.config.requires_shape_prop and not has_valid_shapes:
+            self._log_info("running pre-cleanup with shape_prop")
             canonicalize_graph(gm)
             with lift_to_meta(gm):
                 run_shape_prop(gm)
             is_clean = True
             has_valid_shapes = True
         elif self.config.requires_clean_graph and not is_clean:
+            self._log_info("running pre-cleanup (no shape_prop)")
             canonicalize_graph(gm)
             is_clean = True
 
@@ -352,10 +358,12 @@ class BaseTransform(ABC):
 
         # check if run cleanup depending on the config and info
         if self.config.run_shape_prop and not (info.is_clean and info.has_valid_shapes):
+            self._log_info("running post-cleanup with shape_prop")
             canonicalize_graph(gm)
             with lift_to_meta(gm):
                 run_shape_prop(gm)
         elif self.config.run_graph_cleanup and not info.is_clean:
+            self._log_info("running post-cleanup (no shape_prop)")
             canonicalize_graph(gm)
 
         # create new info object with updated cleanup status

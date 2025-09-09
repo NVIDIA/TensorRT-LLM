@@ -1,5 +1,8 @@
 # Additional default args for AutoDeployConfig/LlmArgs in _torch/auto_deploy/llm_args.py
 transforms:
+  ############################################################################################
+  # BUILD MODEL, EXPORT TO GRAPH MODULE, AND CLEAN UP
+  ############################################################################################
   build_model:
     stage: factory
     device: meta
@@ -65,6 +68,8 @@ transforms:
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
   load_weights:
+    stage: weight_load
+  move_cm_to_device:
     stage: weight_load
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS

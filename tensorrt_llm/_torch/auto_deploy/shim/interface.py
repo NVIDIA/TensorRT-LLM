@@ -5,7 +5,6 @@ import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
 from ..custom_ops.attention_interface import GetCacheCallable, SequenceInfo
-from ..utils.logger import ad_logger
 
 
 @final
@@ -40,14 +39,14 @@ class CachedSequenceInterface:
         """Add a cache initializer to the cache interface."""
         self._cache_initializers[name] = get_cache
 
-    def initialize_caches(self) -> None:
+    def initialize_caches(self) -> int:
         """Initialize caches using the cache initializers."""
         assert not self._caches, "Caches already initialized."
         self.info.to(self.device)
         self._caches = {
             name: get_cache(self.info) for name, get_cache in self._cache_initializers.items()
         }
-        ad_logger.info(f"Initialized {len(self._caches)} caches for cached attention")
+        return len(self._caches)
 
     def current_cache_size_bytes(self) -> int:
         """Calculate and return the total size of all caches in bytes."""

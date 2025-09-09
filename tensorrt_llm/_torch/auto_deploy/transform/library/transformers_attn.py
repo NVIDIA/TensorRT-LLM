@@ -1,7 +1,6 @@
 """A simple wrapper transform to build a model via the model factory."""
 
 import types
-from functools import partial
 from typing import Callable, Optional, Tuple, Type
 
 import torch
@@ -65,17 +64,23 @@ def hf_cached_attn_wrapper(
     return cached_attn
 
 
-def forward_cached(module: torch.nn.Module, *cm_args):
+def forward_cached(gm: GraphModule, *cm_args):
     """
     Run transformers module with cm inputs and cached attn.
     Used to patch the original HFCausalLM.forward method.
     """
-    args_map = module.cm_args_index_map
-    input_ids, position_ids = cm_args[args_map["ids_and_position_ids"]]
+    # TODO: differentiate between standard args and extra args instead of hard-coding them here.
+    args_map = gm.cm_args_index_map
+    input_ids, position_ids, *extra_args = cm_args[args_map["ids_and_position_ids"]]
 
     # cached_attn_args: seq_len, input_pos, cache_loc, pages_per_seq
     cached_attn_args = cm_args[args_map["cached_attn_args"]]
-    metadata = module.get_attn_metadata(input_ids, position_ids, *cached_attn_args)
+    metadata = gm.get_metadata(
+        input_ids,
+        position_ids,
+        *cached_attn_args,
+        *gm.const_args_for_prepare_metadata,
+    )
 
     # organize kv cache into one list per layer,
     # e.g. [[k_cache_0, v_cache_0], [k_cache_1, v_cache_1], ...]
@@ -85,7 +90,7 @@ def forward_cached(module: torch.nn.Module, *cm_args):
     buffers = cm_args[args_map["buffer_args"]] if "buffer_args" in args_map else ()
 
     # get attention constants
-    all_layers_attn_constants = module.attention_constants
+    all_layers_attn_constants = gm.attention_constants
 
     # pass additional inputs with kwargs
     hf_input_kwargs = {
@@ -95,9 +100,7 @@ def forward_cached(module: torch.nn.Module, *cm_args):
         "all_layers_attn_constants": all_layers_attn_constants,
     }
 
-    return module.original_forward(
-        input_ids=input_ids, position_ids=position_ids, **hf_input_kwargs
-    )
+    return gm.factory_model.forward(input_ids, position_ids, *extra_args, **hf_input_kwargs)
 
 
 def fake_profiler_mha(
@@ -203,10 +206,13 @@ class HFReplaceCachedAttn(BaseTransform):
         ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", fake_profiler_mha)
         model.config._attn_implementation = "ad_cached_mha"
 
+        # we set the standard example sequence WITHOUT extra_args to set them to None so that
+        # only the text portion of the model gets called.
+        cm.info.set_example_sequence()
+
         # Create an empty list of source attn nodes and populate with profiling forward run
         source_attn_nodes = []
-        dummy_input_ids = model.dummy_inputs["input_ids"].to(model.device)
-        model.original_forward(input_ids=dummy_input_ids, source_attn_nodes=source_attn_nodes)
+        model.forward(*cm.args, source_attn_nodes=source_attn_nodes)
 
         # Ends profiling, switch back to real attn operator.
         ALL_ATTENTION_FUNCTIONS.register(
@@ -216,6 +222,7 @@ class HFReplaceCachedAttn(BaseTransform):
         # Next, add cm args and build an index_map for positional args
         cm_args_index_map = {}
 
+        # TODO: differentiate between standard args and extra args
         # Cm has 2 inputs to start with, input_ids and position_ids.
         num_cm_args = len(cm.args)
         cm_args_index_map["ids_and_position_ids"] = slice(0, num_cm_args)
@@ -251,23 +258,28 @@ class HFReplaceCachedAttn(BaseTransform):
                 num_cm_args += 1
 
         # Add constants as model attributes
-        model.attention_constants = []
+        gm.attention_constants = []
         for attn_node in source_attn_nodes:
             constants = attn_descriptor.get_constants(attn_node)
-            model.attention_constants.append(constants)
+            gm.attention_constants.append(constants)
 
         # prepare get_metadata function
         get_metadata, _ = attn_descriptor.get_prepare_metadata_op()
-        model.get_attn_metadata = partial(get_metadata, page_size=cm.info.page_size)
+        gm.get_metadata = get_metadata
+        gm.const_args_for_prepare_metadata = cm.info.const_args_for_prepare_metadata
 
         # Save index map for the module to fetch args from cm input
-        model.cm_args_index_map = cm_args_index_map
+        gm.cm_args_index_map = cm_args_index_map
 
-        # Finally, we patch the forward method of facotry_model and the whole gm.
-        model.forward = types.MethodType(forward_cached, model)
-        gm.forward = model.forward
+        # Finally, we patch the forward method of the gm.
+        gm.forward = types.MethodType(forward_cached, gm)
 
         # by convention, we say this fake graph module is always clean
-        info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
+        info = TransformInfo(
+            skipped=False,
+            num_matches=len(source_attn_nodes),
+            is_clean=True,
+            has_valid_shapes=True,
+        )
 
         return gm, info

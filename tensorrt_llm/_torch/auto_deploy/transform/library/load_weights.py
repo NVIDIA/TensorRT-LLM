@@ -48,7 +48,6 @@ class LoadWeightsToDevice(BaseTransform):
             device=self.config.adconfig_checkpoint_device or self.config.device,
         )
         move_to_device(gm, self.config.device)
-        cm.to(self.config.device)
 
         info = TransformInfo(skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True)
 
