@@ -6,20 +6,20 @@ def main():
 
     prompt_a = (
         "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
-        "The following excerpt is from a pamphlet.\nYou will do me the justice to remember, "
-        "that I have always strenuously supported the Right of every man to his own opinion"
+        "The following excerpt is from a pamphlet. You will do me the justice to remember, "
     )
 
     prompt_b = (
         "Question: This question refers to the following information. Read the following excerpt."
         "The revolutionary seed had penetrated into every country and spread more or less. "
-        "It was greatly developed under")
+    )
 
     kv_cache_max_tokens = 256
     kv_cache_page_size = 16
     kv_cache_host_size_in_bytes = 1024**3
 
     # Offloading Off
+    print("\n === Offloading Off === \n")
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=1,
               max_seq_len=256,
@@ -48,6 +48,7 @@ def main():
     llm.shutdown()
 
     # Offloading On
+    print("\n === Offloading On === \n")
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=1,
               max_seq_len=256,
