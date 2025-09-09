@@ -84,6 +84,15 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             attn_backend="triton",
             compile_backend="torch-compile",
         ),
+        pytest.param(
+            get_small_model_config(
+                "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+                attn_backend="flashinfer",
+                compile_backend="torch-simple",
+            ),
+            # Human readable name for readability / easier selection with `-k`.
+            id="mistral-small-3.1-24b",
+        ),
     ],
 )
 def test_build_ad(experiment_config: Dict):
