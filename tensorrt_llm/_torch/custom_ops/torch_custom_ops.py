@@ -1183,7 +1183,8 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
     # 128, 4096, 7168	256x64x256_0_tnn_align32_o_vs16_2sm_bias_bf16_relu 2x1	10.29	(256, 128) (2, 4), 2
     # 128, 7168, 2048	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x4	6.924	(256, 128), (2, 4), 1
     def get_tactic_for_deepseek_r1(self, m, n, k):
-        if m == 128:
+        # TODO:
+        if m <= 128:
             if n == 7168 and k == 16384:
                 return ((256, 128), (2, 4), True, 7)
             elif n == 24576 and k == 1536:
@@ -1195,13 +1196,15 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             elif n == 7168 and k == 2048:
                 return ((256, 128), (2, 4), True, 1)
             else:
-                raise ValueError(
-                    f"Invalid input: m = {m}, n = {n}, k = {k}, no matching tactic found"
-                )
+                return None
+                # raise ValueError(
+                #     f"Invalid input: m = {m}, n = {n}, k = {k}, no matching tactic found"
+                # )
         else:
-            raise ValueError(
-                f"Invalid input: m = {m}, no matching tactic found (we only have predefined tactics for m = 128)"
-            )
+            # raise ValueError(
+            #     f"Invalid input: m = {m}, no matching tactic found (we only have predefined tactics for m = 128)"
+            # )
+            return None
 
     def forward(
         self,
@@ -1248,8 +1251,9 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         sf_k = pad_up(real_k // sf_vec_size, 4)
         sf_n = pad_up(n, 128)
 
-        mma_tiler_mn, cluster_shape_mn, use_prefetch, prefetch_dist = self.get_tactic_for_deepseek_r1(
-            m, n, real_k)
+        rewrite_tactic = self.get_tactic_for_deepseek_r1(m, n, real_k)
+        if rewrite_tactic is not None:
+            mma_tiler_mn, cluster_shape_mn, use_prefetch, prefetch_dist = rewrite_tactic
         # print(f"limin: m = {m}, real_k = {real_k}, n = {n}")
         # print(f"limin: sf_m = {sf_m}, sf_k = {sf_k}, sf_n = {sf_n}")
         # print(
@@ -1406,7 +1410,7 @@ def cute_dsl_nvfp4_gemm_blackwell(
         CuteDSLNVFP4BlackwellLinear.tuning_config,
         [input, weight, input_scale, weight_scale, alpha, output_dtype],
     )
-    print(f"limin: best_tactic = {best_tactic}")
+    # print(f"limin: best_tactic = {best_tactic}")
     return cute_dsl_nvfp4_gemm_blackwell_runner(
         inputs=[input, weight, input_scale, weight_scale, alpha, output_dtype],
         tactic=best_tactic,

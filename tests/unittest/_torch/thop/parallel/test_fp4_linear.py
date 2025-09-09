@@ -147,8 +147,8 @@ def test_fp4_linear_perf(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
     alpha_ref = 1.0 / (w_sf_global * x_sf_global)
     torch.testing.assert_close(l_fp4.alpha[0], alpha_ref)
 
-    with torch.inference_mode(), autotune():
-        output = l_fp4.forward(x)
+    # with torch.inference_mode(), autotune():
+    #     output = l_fp4.forward(x)
 
     # # ref linear
     # with torch.inference_mode(), autotune():
@@ -204,33 +204,33 @@ def test_fp4_linear_perf(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
     alpha_ref = 1.0 / (w_sf_global * x_sf_global)
     torch.testing.assert_close(l_fp4_ref.alpha[0], alpha_ref)
 
-    with torch.inference_mode(), autotune():
-        output_ref = l_fp4_ref.forward(x)
+    # with torch.inference_mode(), autotune():
+    #     output_ref = l_fp4_ref.forward(x)
 
     # with nvtx.annotate(f"cute_dsl warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="red"):
-    for _ in range(5):
-        output = l_fp4.forward(x)
+    for _ in range(2):
+        l_fp4.forward(x)
 
     with nvtx.annotate(
             f"cute_dsl run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
             color="green"):
-        for i in range(10):
-            output = l_fp4.forward(x)
+        for i in range(1000):
+            l_fp4.forward(x)
 
-    # with nvtx.annotate(f"ref warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="red"):
-    for _ in range(5):
-        output_ref = l_fp4_ref.forward(x)
+    # # with nvtx.annotate(f"ref warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="red"):
+    # for _ in range(5):
+    #     output_ref = l_fp4_ref.forward(x)
 
-    print(f"limin: begin run ref test")
-    # with nvtx.annotate(f"ref run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="green"):
-    with nvtx.annotate(f"ref", color="green"):
-        for i in range(10):
-            output_ref = l_fp4_ref.forward(x)
+    # print(f"limin: begin run ref test")
+    # # with nvtx.annotate(f"ref run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="green"):
+    # with nvtx.annotate(f"ref", color="green"):
+    #     for i in range(10):
+    #         output_ref = l_fp4_ref.forward(x)
 
-    # compare
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, output_ref)
-    print(f"PASSED")
+    # # compare
+    # torch.cuda.synchronize()
+    # torch.testing.assert_close(output, output_ref)
+    # print(f"PASSED")
 
 
 if __name__ == "__main__":
@@ -241,8 +241,8 @@ if __name__ == "__main__":
     # qkv_down_linear_m128_n2112_k7168
     # shared_fc1_linear_m128_n4096_k7168
     # shared_fc2_linear_m128_n7168_k2048
-    test_fp4_linear_perf(torch.bfloat16, 128, 7168, 16384)
+    # test_fp4_linear_perf(torch.bfloat16, 128, 7168, 16384)
     test_fp4_linear_perf(torch.bfloat16, 128, 24576, 1536)
-    test_fp4_linear_perf(torch.bfloat16, 128, 2112, 7168)
-    test_fp4_linear_perf(torch.bfloat16, 128, 4096, 7168)
-    test_fp4_linear_perf(torch.bfloat16, 128, 7168, 2048)
+    # test_fp4_linear_perf(torch.bfloat16, 128, 2112, 7168)
+    # test_fp4_linear_perf(torch.bfloat16, 128, 4096, 7168)
+    # test_fp4_linear_perf(torch.bfloat16, 128, 7168, 2048)

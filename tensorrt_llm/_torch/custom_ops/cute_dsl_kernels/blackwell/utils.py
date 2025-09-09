@@ -22,7 +22,7 @@ from cutlass._mlir import ir
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
 
-# WAR for CuTeDSL make_ptr implementation for flashinfer
+# WAR for CuTeDSL make_ptr implementation
 class _Pointer(Pointer):
     """Runtime representation of a pointer that can inter-operate with
     various data structures, including numpy arrays and device memory.

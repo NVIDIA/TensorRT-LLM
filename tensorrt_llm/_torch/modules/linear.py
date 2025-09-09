@@ -784,6 +784,16 @@ class NVFP4LinearMethod(LinearMethodBase):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
+
+        # print(f"limin: nvfp4_linear, input.shape = {input.shape}, module.weight.shape = {module.weight.shape} ")
+        # with nvtx.annotate(f"nvfp4_gemm, input.shape = {input.shape}, module.weight.shape = {module.weight.shape}", color="green"):
+        #     output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
+        #                                           module.weight_scale,
+        #                                           module.alpha, module.dtype)
+        # with nvtx.annotate(f"cute_dsl_nvfp4_gemm, input.shape = {input.shape}, module.weight.shape = {module.weight.shape}", color="green"):
+        #     output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+        #         act_fp4, module.weight, act_sf, module.weight_scale,
+        #         module.scalar_alpha, module.dtype)
         if bias is not None:
             output = output + bias
         return output

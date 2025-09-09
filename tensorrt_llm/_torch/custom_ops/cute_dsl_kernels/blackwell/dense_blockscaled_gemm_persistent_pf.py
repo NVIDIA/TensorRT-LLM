@@ -392,6 +392,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.occupancy,
             self.use_tma_store,
         )
+        print(
+            f"limin: num_acc_stage = {self.num_acc_stage}, num_ab_stage = {self.num_ab_stage}, num_c_stage = {self.num_c_stage}"
+        )
 
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -2970,17 +2973,17 @@ def run(
         a_tensor.mark_compact_shape_dynamic(
             mode=1 if a_major == "k" else 0,
             stride_order=(2, 0, 1) if a_major == "k" else (2, 1, 0),
-            divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+            divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
         )
         b_tensor.mark_compact_shape_dynamic(
             mode=1 if b_major == "k" else 0,
             stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-            divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+            divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
         )
         c_tensor.mark_compact_shape_dynamic(
             mode=1 if c_major == "n" else 0,
             stride_order=(2, 0, 1) if c_major == "n" else (2, 1, 0),
-            divisibility=2 if c_dtype == cutlass.Float4E2M1FN else 1,
+            divisibility=32 if c_dtype == cutlass.Float4E2M1FN else 16,
         )
 
         _, sfa_tensor, _ = create_scale_factor_tensor(l, m, k, sf_vec_size,
@@ -2988,7 +2991,8 @@ def run(
         _, sfb_tensor, _ = create_scale_factor_tensor(l, n, k, sf_vec_size,
                                                       sf_dtype)
         return cute.testing.JitArguments(a_tensor, b_tensor, sfa_tensor,
-                                         sfb_tensor, c_tensor, 1.0, stream)
+                                         sfb_tensor, c_tensor, 1.0,
+                                         current_stream)
 
     workspace_count = 1
     if use_cold_l2:
@@ -3033,6 +3037,8 @@ def run(
         print(f"CUDA graph executed successfully with {iterations} iterations")
         print(f"Graph execution time: {exec_time:.2f} microseconds")
     else:
+        workspace_count = workspace_count + 1
+        print(f"limin: workspace_count = {workspace_count}")
         exec_time = cute.testing.benchmark(
             compiled_gemm,
             workspace_generator=generate_tensors,
@@ -3067,7 +3073,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mma_tiler_mn",
         type=parse_comma_separated_ints,
-        default=(128, 256),
+        default=(128, 128),
         help="Mma tile shape (comma-separated)",
     )
     parser.add_argument(
