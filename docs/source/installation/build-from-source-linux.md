@@ -158,7 +158,7 @@ example:
 python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real"
 ```
 
-To use the C++ benchmark scripts under [benchmark/cpp](/benchmarks/cpp/), for example `gptManagerBenchmark.cpp`, add the `--benchmarks` option:
+To use the C++ benchmark scripts under [benchmark/cpp](source:benchmarks/cpp/), for example `gptManagerBenchmark.cpp`, add the `--benchmarks` option:
 
 ```bash
 python3 ./scripts/build_wheel.py --benchmarks
@@ -180,6 +180,7 @@ relevant classes. The associated unit tests should also be consulted for underst
 
 This feature will not be enabled when [`building only the C++ runtime`](#link-with-the-tensorrt-llm-c++-runtime).
 
+(link-with-the-tensorrt-llm-c++-runtime)=
 #### Linking with the TensorRT LLM C++ Runtime
 
 The `build_wheel.py` script will also compile the library containing the C++ runtime of TensorRT LLM. If Python support and `torch` modules are not required, the script provides the option `--cpp_only` which restricts the build to the C++ runtime only.

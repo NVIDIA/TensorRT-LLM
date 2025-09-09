@@ -135,7 +135,7 @@ Overall, the max batch size and max num tokens limits play a key role in determi
 
 ## Revisiting Paged Context Attention and Context Chunking
 
-[Previously](./useful-build-time-flags.md#paged-context-attention) we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Now that we understand the TensorRT LLM scheduler, we can explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
+Previously we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Now that we understand the TensorRT LLM scheduler, we can explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
 
 The [visualization](#the-schedulers) of the TensorRT LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However, with context chunking, this is no longer the case, and the first chunk of Request 3 can be scheduled.
 
