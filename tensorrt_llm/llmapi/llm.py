@@ -963,9 +963,10 @@ class _TorchLLM(BaseLLM):
                          backend=backend,
                          **kwargs)
 
+    @set_api_status("prototype")
     def collective_rpc(self,
                        method: str,
-                       args: tuple = (),
+                       args: tuple[Any, ...] = (),
                        kwargs: Optional[dict] = None,
                        non_block: bool = False,
                        unique_reply_rank: Optional[int] = None) -> list[Any]:
@@ -973,14 +974,14 @@ class _TorchLLM(BaseLLM):
         Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
 
         Args:
-            method: The name of the worker method to execute.
-            args: Positional arguments to pass to the worker method.
-            kwargs: Keyword arguments to pass to the worker method.
-            non_block: Whether to block until all workers have completed the RPC call.
-            unique_reply_rank: The rank of the worker that will be used to send the reply.
+            method (str): The name of the worker method to execute.
+            args (tuple[Any, ...]): Positional arguments to pass to the worker method. Defaults to ().
+            kwargs (dict, optional): Keyword arguments to pass to the worker method. Defaults to None.
+            non_block (bool): Whether to block until all workers have completed the RPC call. Defaults to False.
+            unique_reply_rank (int, optional): The rank of the worker that will be used to send the reply. Defaults to None.
 
         Returns:
-            A list of results from each worker.
+            list[Any]: A list of results from each worker.
         """
         if hasattr(self._executor, 'collective_rpc'):
             return self._executor.collective_rpc(method, args, kwargs,
