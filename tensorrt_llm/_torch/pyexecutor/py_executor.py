@@ -42,6 +42,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
+from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
@@ -1819,13 +1820,18 @@ class PyExecutor:
                     prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
                     num_context_logits_prefix_sum.append(prefix_sum)
 
+                beam_width = self.sampler.beam_width(
+                    scheduled_batch.all_requests())
+
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
-                               batch_outputs["logits"],
-                               self.sampler.beam_width(
-                                   scheduled_batch.all_requests()),
+                               batch_outputs["logits"], beam_width,
                                num_context_logits_prefix_sum,
                                self.sampler.is_generation_model())
+
+                HandleAdditionalOutputs()(scheduled_batch.context_requests,
+                                          scheduled_batch.generation_requests,
+                                          batch_outputs, beam_width)
 
                 return self.sampler.sample_async(scheduled_batch, batch_outputs,
                                                  num_context_logits_prefix_sum)
