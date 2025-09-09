@@ -1,12 +1,15 @@
+import weakref
 from abc import abstractmethod
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union, final
 
 import torch
 from torch import nn
 
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
+from ...utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+                      is_torch_compiling)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -17,6 +20,82 @@ class MoEWeightLoadingMode(Enum):
     FUSED_GATE_UP_PROJ = 1
     # Custom W4A8 weights from examples/quantization/quantize_mixed_precision_moe.py
     W4A8_CUSTOM = 2
+
+
+def extract_extra_attrs(layer_idx: str):
+    extra_attrs = get_model_extra_attrs()
+    assert extra_attrs is not None, "Model extra attrs are not set"
+
+    moe_layers = extra_attrs.get("moe_layers", None)
+    assert moe_layers is not None, "No MoE layers registered"
+    moe_layer_ref = moe_layers.get(layer_idx)
+    assert moe_layer_ref is not None, f"Cannot find MoE layer for layer_idx={layer_idx}"
+    moe_layer = moe_layer_ref() if callable(moe_layer_ref) else None
+    assert moe_layer is not None, f"MoE layer for layer_idx={layer_idx!r} is no longer alive"
+
+    return moe_layer
+
+
+@torch.library.custom_op("trtllm::moe_custom_op", mutates_args=())
+def moe_custom_op(
+    layer_idx: str,
+    x: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
+    is_swizzled: bool,
+    router_logits: torch.Tensor,
+    do_finalize: bool,
+    output_dtype: Optional[torch.dtype],
+    all_rank_num_tokens: Optional[List[int]],
+    use_dp_padding: Optional[bool],
+) -> List[torch.Tensor]:
+    moe_layer = extract_extra_attrs(layer_idx)
+
+    hidden_states = x if x_sf is None else Fp4QuantizedTensor(
+        x, x_sf, is_swizzled)
+
+    res = moe_layer.forward_impl(
+        hidden_states,
+        router_logits,
+        do_finalize=do_finalize,
+        output_dtype=output_dtype,
+        all_rank_num_tokens=all_rank_num_tokens,
+        use_dp_padding=use_dp_padding,
+    )
+
+    if do_finalize:
+        return [res]
+    else:
+        return res
+
+
+@moe_custom_op.register_fake
+def _(
+    layer_idx,
+    x,
+    x_sf,
+    is_swizzled,
+    router_logits,
+    do_finalize,
+    output_dtype,
+    all_rank_num_tokens,
+    use_dp_padding,
+):
+    moe_layer = extract_extra_attrs(layer_idx)
+    hidden_states = x if x_sf is None else Fp4QuantizedTensor(
+        x, x_sf, is_swizzled)
+    res = moe_layer.forward_fake(
+        hidden_states,
+        router_logits,
+        do_finalize=do_finalize,
+        output_dtype=output_dtype,
+        all_rank_num_tokens=all_rank_num_tokens,
+        use_dp_padding=use_dp_padding,
+    )
+
+    if do_finalize:
+        return [res]
+    else:
+        return res
 
 
 class MoE(nn.Module):
@@ -49,6 +128,7 @@ class MoE(nn.Module):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,
     ):
         from ...distributed import AllReduce
 
@@ -64,6 +144,10 @@ class MoE(nn.Module):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.layer_idx = layer_idx
+        self.layer_idx_str = str(layer_idx) if layer_idx is not None else None
+
+        self._register_layer(model_config)
 
         # could be modified later
         self.quant_config = model_config.quant_config
@@ -92,6 +176,17 @@ class MoE(nn.Module):
                                     strategy=model_config.allreduce_strategy,
                                     dtype=self.dtype)
 
+    def _register_layer(self, model_config: ModelConfig):
+        self.register_to_config = False
+        if model_config is not None and self.layer_idx_str is not None:
+            if "moe_layers" not in model_config.extra_attrs:
+                model_config.extra_attrs["moe_layers"] = {}
+            assert self.layer_idx_str not in model_config.extra_attrs["moe_layers"], \
+                f"Duplicate MoE layer for layer_idx={self.layer_idx_str}"
+            model_config.extra_attrs["moe_layers"][
+                self.layer_idx_str] = weakref.ref(self)
+            self.register_to_config = True
+
     @abstractmethod
     def create_weights(self):
         raise NotImplementedError
@@ -101,14 +196,82 @@ class MoE(nn.Module):
         raise NotImplementedError
 
     @abstractmethod
+    def forward_impl(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        raise NotImplementedError
+
+    def forward_fake(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
+        assert do_finalize, "Default forward_fake does not support do_finalize=False"
+        data_type = output_dtype if is_nvfp4_input else x.dtype
+        num_tokens = all_rank_num_tokens[
+            self.tp_rank] if all_rank_num_tokens else x.shape[0]
+        hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
+        return x.new_empty((num_tokens, hidden_size), dtype=data_type)
+
+    # Sub class is not allowed to override forward.
+    # This is universal interface for all MoE backends
+    @final
     def forward(
         self,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        raise NotImplementedError
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        if self.register_to_config and is_torch_compiling():
+            hidden_states = x.fp4_tensor if isinstance(
+                x, Fp4QuantizedTensor) else x
+            x_sf = x.scaling_factor if isinstance(x,
+                                                  Fp4QuantizedTensor) else None
+            is_swizzled = x.is_sf_swizzled if isinstance(
+                x, Fp4QuantizedTensor) else False
+
+            res = moe_custom_op(
+                self.layer_idx_str,
+                hidden_states,
+                x_sf,
+                is_swizzled,
+                router_logits,
+                do_finalize,
+                output_dtype,
+                all_rank_num_tokens,
+                use_dp_padding,
+            )
+            if do_finalize:
+                return res[0]
+            else:
+                return res
+        else:
+            return self.forward_impl(
+                x,
+                router_logits,
+                do_finalize=do_finalize,
+                output_dtype=output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=use_dp_padding,
+            )
 
     @property
     def has_any_quant(self):
