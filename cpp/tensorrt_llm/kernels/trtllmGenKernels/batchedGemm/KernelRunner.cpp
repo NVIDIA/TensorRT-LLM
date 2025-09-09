@@ -110,12 +110,6 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
             && tileSize == mOptions.tileSize)
         {
-            // FIXME: Disable split-k for now.
-            if (options.mClusterDimZ != 1)
-            {
-                continue;
-            }
-
             if (options.mFusedAct)
             {
                 if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType))
@@ -124,11 +118,11 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
                 }
             }
 
-            // FIXME: Disables a singular static scheduler kernel that appears to have issue during autotune; only
-            // happens after commit e257cb3533; still under investigation. Offending kernel name:
+            // FIXME: Disables a few static scheduler kernels that appears to have issue during autotune; only
+            // happens after commit e257cb3533; still under investigation. Offending kernels:
             // bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_s6_et128x64_m128x64x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100a
+            // bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_s3_et128x64_m128x64x32_cga1x1x1_16dp256b_TN_transOut_schedS_biasM_bN_ldgsts_tmaOpt_clmp_swiGlu_dynBatch_sm100f
             if (options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt == true && options.mTileN == 64
-                && options.mDtypeA == Dtype::E2m1 && options.mDtypeC == Dtype::E2m1
                 && options.mRouteImpl == RouteImpl::Ldgsts)
             {
                 continue;
