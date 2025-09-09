@@ -104,6 +104,7 @@ def _forward_with_cond(
         return inputs_embeds
 
     def _no_vision_branch(inputs_embeds, pixel_values, input_ids):
+        # https://github.com/pytorch/pytorch/issues/158375
         return inputs_embeds.clone()
 
     # decide by whether there is any non-zero pixel_values
