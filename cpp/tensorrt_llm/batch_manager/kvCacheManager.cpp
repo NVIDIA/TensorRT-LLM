@@ -1523,11 +1523,14 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
     }
 
     // store new block once; when it first fills.
+    // to know if block has filled we need to know how many unique tokens there are.
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
+    // last token is not in kv cache, so we subtract that from usable size.
     auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
     if (usableSize % mTokensPerBlock != 0)
     {
+        // have not crossed block boundary yet; do nothing
         return;
     }
 

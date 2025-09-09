@@ -600,8 +600,6 @@ public:
     //! \brief Get the ids of all newly allocated (not reused) blocks for the sequence.
     std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
 
-    void storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
-
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
     //! \brief Release blocks of the sequence.
