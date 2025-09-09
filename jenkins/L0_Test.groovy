@@ -274,13 +274,10 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     echo "Found ${preprocessedLists.isolateCount} isolated tests to run"
-    sh "cat ${isolateTestList}"
     def isolateTestLines = readFile(file: isolateTestList).readLines()
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
-        echo "Running isolated test ${i+1}/${isolateTestLines.size()}: ${isolateTestName}"
-
         // Create a temporary file for this single isolated test
         def singleTestFile = "${isolateTestList}_isolated_${i}.txt"
         sh "echo '${isolateTestName}' > ${singleTestFile}"
@@ -296,6 +293,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
         isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
         isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+        isolateTestCmdLine += ["--cov-append"]  // Append coverage data to avoid overwriting previous data
 
         try {
             sh """
@@ -346,13 +344,6 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
     }
 
     if (shardTestList) {
-        echo "Tests in current shard:"
-        shardTestList.each { test ->
-            if (test.trim()) {
-                echo "  - ${test.trim()}"
-            }
-        }
-
         // Split the shard test list into regular and isolate tests
         def shardRegularTests = []
         def shardIsolateTests = []
@@ -382,16 +373,6 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
                     shardRegularTests.add(trimmedTest)
                 }
             }
-        }
-
-        echo "Regular tests in shard: ${shardRegularTests.size()}"
-        shardRegularTests.each { test ->
-            echo "  - ${test}"
-        }
-
-        echo "Isolate tests in shard: ${shardIsolateTests.size()}"
-        shardIsolateTests.each { test ->
-            echo "  - ${test}"
         }
 
         // Define file paths for regular and isolate tests
