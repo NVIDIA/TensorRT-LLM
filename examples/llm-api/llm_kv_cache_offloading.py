@@ -16,6 +16,7 @@ def main():
         # "The revolutionary seed had penetrated into every country and spread more or less. "
     )
 
+    kv_cache_free_gpu_memory_fraction = 0.001
     kv_cache_page_size = 16
     kv_cache_host_size_in_bytes = 1024**3
 
@@ -26,7 +27,7 @@ def main():
               max_seq_len=256,
               kv_cache_config=KvCacheConfig(
                   enable_block_reuse=True,
-                  free_gpu_memory_fraction=0.01,
+                  free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
                   tokens_per_block=kv_cache_page_size))
     # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
@@ -64,7 +65,7 @@ def main():
               max_seq_len=256,
               kv_cache_config=KvCacheConfig(
                   enable_block_reuse=True,
-                  free_gpu_memory_fraction=0.01,
+                  free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
                   tokens_per_block=kv_cache_page_size,
                   host_cache_size=kv_cache_host_size_in_bytes))
     # prompt_a occupies kv cache pool
