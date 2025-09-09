@@ -20,8 +20,8 @@
 #include <future>
 #include <map>
 #include <string>
+#include <vector>
 
-#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -29,18 +29,82 @@
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
-namespace tensorrt_llm::batch_manager
+namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+class BaseCacheFormatter;
 
 // TODO: unify the following class into a namespace like tensorrt_llm::transmission
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;
 using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
-using TransferSession = kv_cache_manager::TransferSession;
+
+class TransferSession
+{
+public:
+    struct Measure
+    {
+        double delay;     // from last token (ctx) or arrival time (gen), in ms
+        double duration;  // in ms
+        double bandwidth; // in Gbps
+    };
+
+    TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
+        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
+        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
+        : mConnections(std::move(connections))
+        , mDataContext(dataContext)
+        , mSelfState(&selfState)
+        , mOtherState(std::move(otherState))
+        , mBufferManager(&bufferManager)
+        , mRequest(llmRequest)
+        , mRecordMeasure(recordMeasure)
+    {
+        TLLM_CHECK(!mConnections.empty());
+    }
+
+    [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
+
+    // should be called only during the initialization of the TransferSession
+    void setConnection(size_t idx, Connection const* conn);
+
+    [[nodiscard]] DataContext const& getDataContext() const;
+
+    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const;
+
+    [[nodiscard]] executor::DataTransceiverState const& getOtherState() const;
+
+    [[nodiscard]] runtime::BufferManager const& getBufferManager() const;
+
+    void send(size_t idx, void const* data, size_t size);
+
+    void recv(size_t idx, void* data, size_t size);
+
+    [[nodiscard]] LlmRequest const& getLlmRequest() const;
+
+    // in CacheSender, the LlmRequest is not available until the sendSync is called
+    void setLlmRequest(LlmRequest const& llmRequest);
+
+    void appendMeasure(double delay, double duration, size_t size);
+
+    // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
+    void exportMeasure(std::ofstream& outFile, bool isContext) const;
+
+private:
+    std::vector<Connection const*> mConnections;
+    DataContext mDataContext;
+    executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
+    executor::DataTransceiverState mOtherState;
+    runtime::BufferManager const* mBufferManager;
+    LlmRequest const* mRequest;
+    std::vector<Measure> mMeasures;
+    bool mRecordMeasure{false};
+};
 
 struct TransceiverTag
 {
@@ -55,7 +119,7 @@ struct TransceiverTag
     static constexpr int32_t kINFO_TAG{32};
 };
 
-using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
+using BaseCacheFormatter = BaseCacheFormatter;
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
 // executor smoothly receives the data.
@@ -79,10 +143,7 @@ public:
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
 
-    [[nodiscard]] std::vector<size_t> const& getBlockHashes() const noexcept
-    {
-        return mBlockHashes;
-    }
+    [[nodiscard]] std::vector<size_t> const& getBlockHashes() const noexcept;
 
     /// @brief Return the state of the data transceiver.
     /// @return The state of the data transceiver.
@@ -111,7 +172,6 @@ private:
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;
 };
-
 
 class CacheSender
 {
@@ -182,4 +242,4 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
