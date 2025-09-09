@@ -12,6 +12,18 @@ NVCC_VERSION_OUTPUT=$(nvcc --version)
 OLD_CUDA_VER=$(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1)
 echo "The version of pre-installed CUDA is ${OLD_CUDA_VER}."
 
+check_cuda_version() {
+    if [ -n "$CUDA_VERSION" ] && [ -n "$CUDA_DRIVER_VERSION" ]; then
+        CUDA_VERSION_SHORT=$(echo "$CUDA_VERSION" | cut -d'.' -f1-3)
+        ENV_CUDA_VER="${CUDA_VERSION_SHORT}_${CUDA_DRIVER_VERSION}"
+        if [ "$ENV_CUDA_VER" = "$CUDA_VER" ]; then
+            echo "CUDA version matches ($ENV_CUDA_VER), skipping reinstallation"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 reinstall_rockylinux_cuda() {
     dnf -y install epel-release
     dnf remove -y "cuda*" "*cublas*" "*cufft*" "*cufile*" "*curand*" "*cusolver*" "*cusparse*" "*gds-tools*" "*npp*" "*nvjpeg*" "nsight*" "*nvvm*"
@@ -25,6 +37,10 @@ reinstall_rockylinux_cuda() {
 ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 case "$ID" in
   rocky)
+    if check_cuda_version; then
+        echo "CUDA version matches ($CUDA_VER), skipping reinstallation"
+        exit 0
+    fi
     echo "Reinstall CUDA for RockyLinux 8..."
     reinstall_rockylinux_cuda
     ;;
