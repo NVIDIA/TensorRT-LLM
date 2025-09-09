@@ -26,12 +26,6 @@ SHELL ["/bin/bash", "-c"]
 
 FROM base AS devel
 
-ARG TRT_VER
-ARG CUDA_VER
-ARG CUDNN_VER
-ARG NCCL_VER
-ARG CUBLAS_VER
-
 #
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
@@ -52,6 +46,12 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --ccache
 COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
 RUN bash ./install.sh --cuda_toolkit
 
+
+ARG TRT_VER
+ARG CUDA_VER
+ARG CUDNN_VER
+ARG NCCL_VER
+ARG CUBLAS_VER
 COPY docker/common/install_tensorrt.sh install_tensorrt.sh
 RUN TRT_VER=${TRT_VER} \
     CUDA_VER=${CUDA_VER} \
