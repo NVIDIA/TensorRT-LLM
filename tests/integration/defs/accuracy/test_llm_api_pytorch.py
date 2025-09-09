@@ -1884,10 +1884,21 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          32,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         True,
+                         True,
+                         True,
+                         True,
+                         8,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
         ],
         ids=[
             "latency", "latency_trtllmgen", "throughput", "throughput_tp8",
-            "throughput_tp4", "throughput_mtp"
+            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
@@ -1925,6 +1936,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            # This covers the case with relatively large seqlen in the generation phase.
+            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             # Commented out because GPQA takes too long to run
             # task = GPQADiamond(self.MODEL_NAME)

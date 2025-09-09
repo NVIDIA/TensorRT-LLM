@@ -346,8 +346,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndNoneTransSize)
         auto bufferManager = tensorrt_llm::runtime::BufferManager{std::make_shared<CudaStream>()};
         auto targetNum = 2;
         auto targetSize = 1024;
+        std::vector<size_t> targetSizeVec = std::vector<size_t>(targetNum, targetSize);
         auto [sendBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
-            = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSize, bufferManager);
+            = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSizeVec, bufferManager);
         EXPECT_EQ(sendBuffers.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum, targetNum);
         EXPECT_EQ(onlyUseDynamicBuffer, true);
@@ -393,8 +394,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         auto bufferManager = tensorrt_llm::runtime::BufferManager{std::make_shared<CudaStream>()};
         auto targetNum = 2;
         auto targetSize = 1024;
+        std::vector<size_t> targetSizeVec = std::vector<size_t>(targetNum, targetSize);
         auto [sendBuffers, bufferCoverTargetNum, onlyUseDynamicBuffer]
-            = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSize, bufferManager);
+            = mTransBufferManager->getOrAllocateSendBuffers(bufferId3, targetNum, targetSizeVec, bufferManager);
         EXPECT_EQ(sendBuffers.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum, targetNum);
         EXPECT_EQ(onlyUseDynamicBuffer, false);
@@ -407,8 +409,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         auto bufferId4 = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId4.has_value());
         EXPECT_EQ(bufferId4.value(), 0);
+        targetSizeVec = std::vector<size_t>(targetNum, targetSize);
         auto [sendBuffers2, bufferCoverTargetNum2, onlyUseDynamicBuffer2]
-            = mTransBufferManager->getOrAllocateSendBuffers(bufferId4, targetNum, targetSize, bufferManager);
+            = mTransBufferManager->getOrAllocateSendBuffers(bufferId4, targetNum, targetSizeVec, bufferManager);
         EXPECT_EQ(sendBuffers2.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum2, targetNum / 2);
         EXPECT_EQ(onlyUseDynamicBuffer2, false);
@@ -418,8 +421,9 @@ TEST_F(CacheTransBufferTest, TestForNullOptAndDefaultTransSize)
         auto bufferId5 = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId5.has_value());
         EXPECT_EQ(bufferId5.value(), 0);
+        targetSizeVec = std::vector<size_t>(targetNum, targetSize);
         auto [sendBuffers3, bufferCoverTargetNum3, onlyUseDynamicBuffer3]
-            = mTransBufferManager->getOrAllocateSendBuffers(bufferId5, targetNum, targetSize, bufferManager);
+            = mTransBufferManager->getOrAllocateSendBuffers(bufferId5, targetNum, targetSizeVec, bufferManager);
         EXPECT_EQ(sendBuffers3.size(), targetNum);
         EXPECT_EQ(bufferCoverTargetNum3, targetNum);
         EXPECT_EQ(onlyUseDynamicBuffer3, false);
