@@ -218,8 +218,9 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 {out_tag}*, int, int, int, const int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig, char*, size_t, cudaStream_t, int*
 );"""
     elif operation.gemm_kind == GemmKind.Grouped:
-        if operation.act_type != operation.weight_type and not (
-                (operation.act_type == DataType.e4m3) and (operation.weight_type == e2m1)):
+        if operation.act_type != operation.weight_type and (
+                operation.act_type != DataType.e4m3
+                or operation.weight_type != e2m1):
             # Mixed MoE GEMM
             weight_tag = CudaTypeName[operation.weight_type]
             instantiation = f"""
@@ -880,8 +881,9 @@ if __name__ == "__main__":
             return False
         # Only w4a8fp8 and not wfp4afp8
         return (op.act_type != op.weight_type) and (
-            op.gemm_kind == GemmKind.Grouped) and not ((op.act_type == DataType.e4m3) and (op.weight_type == e2m1))
-
+            op.gemm_kind == GemmKind.Grouped) and (op.act_type != DataType.e4m3
+                                                   or op.weight_type != e2m1)
+                             
     # Fix OOM error in CI. If len(operations) is more than GROUP_SIZE, it will be split into multiple sub groups.
     GROUP_SIZE = 8
     op_groups = dict()
