@@ -148,7 +148,7 @@ class TritonPythonModel:
                     hf_model_path['string_value'])
                 self.text_hidden_size = model_config.text_config.hidden_size
 
-            if self.model_type == "qwen2_vl":
+            if self.model_type == "qwen2_vl" or self.model_type == "qwen2_5_vl":
                 from multimodal_utils import Qwen2VLUtils
                 from transformers import AutoConfig
                 hf_model_path = model_config['parameters'].get(
@@ -281,7 +281,7 @@ class TritonPythonModel:
                 img_tensor = torch.cat(img_list, dim=0).contiguous()
                 input_tensors['input'].append(img_tensor)
 
-        elif self.model_type == 'qwen2_vl':
+        elif self.model_type == 'qwen2_vl' or self.model_type == 'qwen2_5_vl':
             image_grid_thw = from_dlpack(
                 pb_utils.get_input_tensor_by_name(
                     request,
@@ -514,7 +514,7 @@ class TritonPythonModel:
                 inference_response = pb_utils.InferenceResponse(
                     output_tensors=response_tensors)
                 responses.append(inference_response)
-        elif self.model_type == 'qwen2_vl':
+        elif self.model_type == 'qwen2_vl' or self.model_type == 'qwen2_5_vl':
             image_grid_thw = other_vision_input_tensors.get('image_grid_thw')
             attention_mask = other_vision_input_tensors.get('attention_mask')
             total_num_image = [i * j for i, j in zip(batch_sizes, num_images)]
@@ -844,7 +844,40 @@ class TritonPythonModel:
                     vit_input['rotary_pos_emb'] = rotary_pos_emb.to('cuda')
                     vit_input['attention_mask'] = attention_mask_vit.to(
                         str_dtype_to_torch(self.vision_dtype_str)).to('cuda')
+                if self.model_type == 'qwen2_5_vl':
+                    import torch.nn.functional as F
+                    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
+                        Qwen2_5_VisionRotaryEmbedding
 
+                    from tensorrt_llm.tools.multimodal_builder import \
+                        compute_rotary_pos_emb_qwen2_5_vl
+                    img_tensor = vit_input.get('input')
+                    image_grid_thw = vit_input.get('image_grid_thw')
+                    vit_input.pop('image_grid_thw')
+                    other_vision_input_tensors[
+                        'image_grid_thw'] = image_grid_thw
+                    attention_mask = vit_input.get('attention_mask_llm')
+                    other_vision_input_tensors[
+                        'attention_mask'] = attention_mask
+                    vit_input.pop('attention_mask_llm')
+                    cu_seqlens = torch.repeat_interleave(
+                        image_grid_thw[:, 1] * image_grid_thw[:, 2],
+                        image_grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
+                    cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+                    seq_length = img_tensor.shape[0]
+                    attention_mask_vit = torch.full([1, seq_length, seq_length],
+                                                    torch.finfo(
+                                                        torch.float16).min,
+                                                    dtype=img_tensor.dtype)
+                    for i in range(1, len(cu_seqlens)):
+                        attention_mask_vit[..., cu_seqlens[i - 1]:cu_seqlens[i],
+                                           cu_seqlens[i - 1]:cu_seqlens[i]] = 0
+                    rotary_pos_emb = compute_rotary_pos_emb_qwen2_5_vl(
+                        image_grid_thw, self.config,
+                        Qwen2_5_VisionRotaryEmbedding).to("cuda")
+                    vit_input['rotary_pos_emb'] = rotary_pos_emb.to('cuda')
+                    vit_input['attention_mask'] = attention_mask_vit.to(
+                        str_dtype_to_torch(self.vision_dtype_str)).to('cuda')
                 embeddings = self.run_vision_encoder(vit_input)
 
             # Post process output and save in responses

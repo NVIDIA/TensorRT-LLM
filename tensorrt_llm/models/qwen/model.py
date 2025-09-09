@@ -358,7 +358,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "q_layernorm": "q_norm",
                     "k_layernorm": "k_norm",
                 }
-            elif config.qwen_type in {"qwen2", "qwen2_vl"
+            elif config.qwen_type in {"qwen2", "qwen2_vl", "qwen2_5_vl"
                                       } and config.tie_word_embeddings:
                 custom_dict = {"lm_head": "model.embed_tokens"}
             elif config.architecture == "Qwen2ForSequenceClassification":

@@ -630,8 +630,8 @@ def main():
                 'monitor_memory':
                 args.monitor_memory,
                 'use_mrope':
-                (True if model_config.qwen_type == "qwen2_vl" else False)
-                if hasattr(model_config, "qwen_type") else False
+                (True if model_config.qwen_type in ["qwen2_vl", "qwen2_5_vl"]
+                 else False) if hasattr(model_config, "qwen_type") else False
             },
             plugin_config=plugin_config)
 

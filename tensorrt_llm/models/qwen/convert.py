@@ -103,10 +103,13 @@ def smooth_qwen2_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
+            Qwen2_5_VLDecoderLayer
         from transformers.models.qwen2_vl.modeling_qwen2_vl import \
             Qwen2VLDecoderLayer
         if not isinstance(module, Qwen2DecoderLayer) and not isinstance(
-                module, Qwen2VLDecoderLayer):
+                module, Qwen2VLDecoderLayer) and not isinstance(
+                    module, Qwen2_5_VLDecoderLayer):
             continue
         # qkv_proj
         layer_name_q = name + ".self_attn.q_proj"
@@ -1100,7 +1103,8 @@ def load_weights_from_hf_gptq_model(hf_model, config: QWenConfig):
 
     model_params = {k: v for k, v in hf_model.state_dict().items()}
     torch.cuda.empty_cache()
-    valid_types = ('qwen', 'qwen2', 'qwen2_vl', 'qwen3', 'qwen3_moe')
+    valid_types = ('qwen', 'qwen2', 'qwen2_vl', 'qwen2_5_vl', 'qwen3',
+                   'qwen3_moe')
     assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are supported for GPTQ."
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)

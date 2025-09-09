@@ -22,7 +22,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [Nougat](#nougat)
 - [Phi-3-vision](#phi-3-vision)
 - [Phi-4-multimodal](#phi-4-multimodal)
-- [Qwen2-VL](#qwen2-vl)
+- [Qwen2-VL/Qwen2.5-VL](#qwen2-vl)
 - [Video NeVA](#video-neva)
 - [Dataset Evaluation](#dataset-evaluation)
 - [Enabling Tensor Parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)

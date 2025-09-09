@@ -268,7 +268,8 @@ if __name__ == "__main__":
                         required=True,
                         choices=[
                             'blip2', 'llava', 'vila', 'mllama',
-                            'llava_onevision', 'qwen2_vl', 'pixtral'
+                            'llava_onevision', 'qwen2_vl', 'qwen2_5_vl',
+                            'pixtral'
                         ],
                         help="Model type")
     parser.add_argument("--hf_model_dir",
@@ -350,6 +351,10 @@ if __name__ == "__main__":
             image_data = np.array([[raw_image]])
             image_input_name = "image_bytes_input"
     elif FLAGS.model_type == 'qwen2_vl':
+        raw_image = raw_image.resize((504, 504))
+        image_data = np.array([[raw_image]])
+        image_input_name = "image_bytes_input"
+    elif FLAGS.model_type == 'qwen2_5_vl':
         raw_image = raw_image.resize((504, 504))
         image_data = np.array([[raw_image]])
         image_input_name = "image_bytes_input"
