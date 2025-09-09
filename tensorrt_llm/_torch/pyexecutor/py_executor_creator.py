@@ -209,6 +209,19 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     return mapping
 
 
+def update_sampler_max_seq_len(max_seq_len, sampler):
+    # Originally, TRTLLMSampler is constructed with executor_config, but
+    # _create_kv_cache_manager (via build_managers) may later overwrite executor_config.max_seq_len.
+    # Because TRTLLMSampler.sample_async still needs the updated limit and executor_config is
+    # deprecated inside TRTLLMSampler, keep TRTLLMSampler.max_seq_len updated with
+    # with executor_config.max_seq_len.
+    from .sampler import TRTLLMSampler
+
+    if isinstance(sampler, TRTLLMSampler):
+        assert hasattr(sampler, "max_seq_len")
+        sampler.max_seq_len = max_seq_len
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: str = None,
@@ -415,8 +428,17 @@ def create_py_executor(
                     )
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
-        sampler = instantiate_sampler(model_engine, executor_config,
-                                      pytorch_backend_config, mapping)
+        sampler = instantiate_sampler(
+            model_engine,
+            pytorch_backend_config,
+            mapping,
+            max_batch_size=executor_config.max_batch_size,
+            max_beam_width=executor_config.max_beam_width,
+            max_seq_len=executor_config.max_seq_len,
+            mm_encoder_only=executor_config.mm_encoder_only,
+            speculative_config=executor_config.speculative_config,
+            decoding_config=executor_config.decoding_config,
+            kv_cache_config=executor_config.kv_cache_config)
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     if kv_connector_config is not None:
@@ -482,6 +504,7 @@ def create_py_executor(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
+            update_sampler_max_seq_len(executor_config.max_seq_len, sampler)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -545,6 +568,7 @@ def create_py_executor(
             # the original value before creating the final KV cache.
             executor_config.max_seq_len = max_seq_len
             kv_cache_creator.build_managers(resources, False)
+            update_sampler_max_seq_len(executor_config.max_seq_len, sampler)
 
             for eng in [model_engine, draft_model_engine]:
                 if eng is None:
