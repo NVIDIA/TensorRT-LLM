@@ -339,6 +339,16 @@ def main():
             if args.logprobs:
                 print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
 
+            if args.additional_model_outputs:
+                for output_name in args.additional_model_outputs:
+                    if sequence.additional_context_outputs:
+                        print(
+                            f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
+                        )
+                    print(
+                        f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                    )
+
 
 if __name__ == '__main__':
     main()
