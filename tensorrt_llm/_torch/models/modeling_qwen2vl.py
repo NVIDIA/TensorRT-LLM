@@ -43,11 +43,11 @@ from .modeling_utils import register_auto_model, register_vision_encoder
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-def process_vision_weights(weights: Dict,
-                           prefix: str = "visual",
-                           weight_name_mapping: Dict[str, str] = None) -> Dict:
+def process_weights(weights: Dict,
+                    prefix: str = "visual",
+                    weight_name_mapping: Dict[str, str] = None) -> Dict:
     """
-    Filter and transform vision encoder weights in a single modular function.
+    Filter and transform weights in a single modular function.
 
     Args:
         weights: Dictionary of all model weights
@@ -368,7 +368,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
 class Qwen2VisionModelBase(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 model_class: Union[PreTrainedModel, torch.nn.Module]):
+                 model_class: Union[type[PreTrainedModel],
+                                    type[torch.nn.Module]]):
         super().__init__()
         config = model_config.pretrained_config.vision_config
         config.torch_dtype = model_config.pretrained_config.torch_dtype
@@ -378,6 +379,7 @@ class Qwen2VisionModelBase(nn.Module):
                 Qwen2VisionTransformerPretrainedModel,
                 Qwen2_5_VisionTransformerPretrainedModel
         ]:
+            # NOTE: For Qwen2VL, we use flash_attention_2 for attention implementation to avoid OOM issue.
             config._attn_implementation = 'flash_attention_2'
             self.visual = model_class(config).to(self.model_dtype).eval()
         elif model_class == Qwen2_5_VisionModel:
@@ -520,10 +522,10 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         super().__init__()
         config = model_config.pretrained_config.vision_config
         self.norm1 = RMSNorm(hidden_size=config.hidden_size,
-                             eps=1e-6,
+                             eps=model_config.pretrained_config.rms_norm_eps,
                              dtype=model_config.pretrained_config.torch_dtype)
         self.norm2 = RMSNorm(hidden_size=config.hidden_size,
-                             eps=1e-6,
+                             eps=model_config.pretrained_config.rms_norm_eps,
                              dtype=model_config.pretrained_config.torch_dtype)
         self.attn = Qwen2_5_VLVisionAttention(model_config, layer_idx)
         self.mlp = Qwen2_5_VLMLP(config, bias=True)
@@ -558,7 +560,7 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         context_dim = config.hidden_size
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = RMSNorm(hidden_size=context_dim,
-                            eps=1e-6,
+                            eps=model_config.pretrained_config.rms_norm_eps,
                             dtype=model_config.pretrained_config.torch_dtype)
         self.mlp = torch.nn.Sequential(
             Linear(in_features=self.hidden_size,
@@ -979,7 +981,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if not DISAGG:
-            vision_encoder_weights = process_vision_weights("visual", weights)
+            vision_encoder_weights = process_weights("visual", weights)
             self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
 
         self.llm.load_weights(weights, weight_mapper)
@@ -1025,8 +1027,8 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
                 "attn.qkv.weight": "attn.qkv_proj.weight",
                 "attn.qkv.bias": "attn.qkv_proj.bias"
             }
-            vision_weights = process_vision_weights(weights, "visual",
-                                                    weight_name_mapping)
+            vision_weights = process_weights(weights, "visual",
+                                             weight_name_mapping)
             self.mm_encoder.load_state_dict(vision_weights, strict=True)
 
         self.llm.load_weights(weights, weight_mapper)

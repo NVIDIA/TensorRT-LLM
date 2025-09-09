@@ -12,9 +12,10 @@ class Qwen2VLHfWeightMapper(HfWeightMapper):
 
     def filter_weights(self, prefix: str, weights: dict) -> dict:
         transformed_weights = {}
+        language_model_prefix = "model.language_model."
         for key, value in weights.items():
-            if key.startswith("model.language_model."):
-                new_key = "model." + key[len("model.language_model."):]
+            if key.startswith(language_model_prefix):
+                new_key = "model." + key[len(language_model_prefix):]
                 transformed_weights[new_key] = value
             else:
                 transformed_weights[key] = value
