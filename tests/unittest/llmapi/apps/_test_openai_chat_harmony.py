@@ -14,10 +14,18 @@ def model():
     return "gpt_oss/gpt-oss-20b/"
 
 
+@pytest.fixture(scope="module",
+                params=[0, 2],
+                ids=["disable_processpool", "enable_processpool"])
+def num_postprocess_workers(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model: str):
+def server(model: str, num_postprocess_workers: int):
     model_path = get_model_path(model)
-    with RemoteOpenAIServer(model_path) as remote_server:
+    args = ["--num_postprocess_workers", f"{num_postprocess_workers}"]
+    with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
 
@@ -147,6 +155,10 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
     collected_chunks = []
     collected_messages = []
     async for chunk in response:
+        # Last streaming response will only contains usage info
+        if len(chunk.choices) <= 0:
+            continue
+
         collected_chunks.append(chunk)
         collected_messages.append(chunk.choices[0].delta)
 
@@ -198,6 +210,10 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
     reasoning_chunks: list[str] = []
     tool_arg_chunks: list[str] = []
     async for chunk in response:
+        # Last streaming response will only contains usage info
+        if len(chunk.choices) <= 0:
+            continue
+
         delta = chunk.choices[0].delta
         if hasattr(delta, "tool_calls") and delta.tool_calls:
             function = delta.tool_calls[0].function
