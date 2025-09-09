@@ -120,7 +120,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
         self.worker_init_status_queue = IpcQueue(
-            is_server=True, name="worker_init_status_queue")
+            is_server=True,
+            socket_type=zmq.PULL,
+            name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -320,6 +322,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         while True:
             if self.worker_init_status_queue.poll(1):
                 ready_signal, error_trace = self.worker_init_status_queue.get()
+                # send ACK to the worker
+                self.worker_init_status_queue.put("ACK")
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")

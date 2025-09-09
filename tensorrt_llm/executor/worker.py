@@ -11,6 +11,7 @@ from queue import Queue
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import zmq
 
 from tensorrt_llm.logger import logger
 
@@ -708,6 +709,40 @@ class GenerationExecutorWorker(GenerationExecutor):
         self.shutdown()
 
 
+def notify_proxy_with_retry(queue, message, max_retries=5, timeout=1):
+    """
+    Notify proxy via REQ/REP socket with automatic retry on failure
+
+    Args:
+        queue: IpcQueue with REQ socket type
+        message: Message to send to proxy
+        max_retries: Maximum retry attempts (default: 5)
+        timeout: Timeout in seconds for each attempt (default: 1)
+
+    Returns:
+        bool: True if proxy confirmed receipt, False if failed after all retries
+    """
+    retry_count = 0
+
+    while retry_count < max_retries:
+        try:
+            queue.put(message)
+            # Wait for ACK with timeout
+            if queue.poll(timeout):
+                queue.get()
+                return True
+            else:
+                retry_count += 1
+
+        except Exception as error:
+            logger.warn(
+                f"Failed to send/receive {message} (attempt {retry_count + 1}): {error}"
+            )
+            retry_count += 1
+
+    return False
+
+
 @print_traceback_on_error
 def worker_main(
     engine: Path | Engine,
@@ -766,9 +801,11 @@ def worker_main(
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
                                  name="worker_request_queue")
+        # Use REQ socket for request-response pattern with confirmation
         worker_init_status_queue = IpcQueue(
             worker_queues.worker_init_status_queue_addr,
             is_server=False,
+            socket_type=zmq.REQ,
             name="worker_init_status_queue")
         mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
                                        is_server=False,
@@ -808,6 +845,17 @@ def worker_main(
         # Signal the stats thread in the proxy to quit
         mp_stats_queue.put(None)
         kv_cache_events_queue.put(None)
+
+    def close_queues():
+        if result_queue is not None:
+            result_queue.close()
+        if result_queues is not None:
+            for q in result_queues:
+                q.close()
+        if is_leader:
+            mp_stats_queue.close()
+            kv_cache_events_queue.close()
+            worker_init_status_queue.close()
 
     postprocess_worker_futures = []
     if is_leader and postproc_worker_config.enabled:
@@ -862,7 +910,10 @@ def worker_main(
         logger.error(traceback.format_exc())
         print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
-            worker_init_status_queue.put((e, traceback.format_exc()))
+            # Send error message with confirmation
+            error_msg = (e, traceback.format_exc())
+            if not notify_proxy_with_retry(worker_init_status_queue, error_msg):
+                logger.error("Failed to deliver error message to proxy")
         return
 
     with worker:
@@ -880,7 +931,13 @@ def worker_main(
                                                    mp_stats_queue)
                 worker._set_iteration_result_queue(worker.kv_events_queues,
                                                    kv_cache_events_queue)
-                worker_init_status_queue.put((ready_signal, None))
+                # Send ready signal with confirmation
+                ready_msg = (ready_signal, None)
+                if not notify_proxy_with_retry(worker_init_status_queue,
+                                               ready_msg):
+                    logger.warning(
+                        "Failed to deliver ready signal to proxy, continuing anyway"
+                    )
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
@@ -895,6 +952,7 @@ def worker_main(
                         raise ValueError(f"Unknown request type: {type(req)}")
 
                 notify_proxy_threads_to_quit()
+                close_queues()
 
         except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.
@@ -903,6 +961,7 @@ def worker_main(
         except Exception as e:  # other critical errors
             if is_leader:
                 notify_proxy_threads_to_quit()
+                close_queues()
             logger.error(traceback.format_exc())
             # This will be captured by mpi4py and handled by future.done_callback
             raise e
