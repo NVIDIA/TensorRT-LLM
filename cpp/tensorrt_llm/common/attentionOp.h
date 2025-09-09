@@ -411,6 +411,7 @@ public:
     bool mPosShiftEnabled = false;
     bool mPagedContextFMHA = false;
     bool mFP8ContextFMHA = false;
+    bool mFP8AttenOutput = false;
     bool mFP8ContextMLA = false;
     bool mFP8GenerationMLA = false;
     bool mDenseContextFMHA = false;

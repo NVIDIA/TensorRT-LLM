@@ -281,9 +281,8 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
-    xqaParams.is_fp8_output = mFP8ContextFMHA;
-    xqaParams.fp8_out_scale
-        = ((mFP8ContextFMHA || mFP8ContextMLA) ? generationsParams.attention_output_orig_quant : nullptr);
+    xqaParams.is_fp8_output = mFP8AttenOutput;
+    xqaParams.fp8_out_scale = ((mFP8AttenOutput) ? generationsParams.attention_output_orig_quant : nullptr);
     // Parameters required for FP4 output.
     xqaParams.output_sf = generationsParams.context_buf_sf;
     xqaParams.fp4_out_sf_scale = generationsParams.attention_output_sf_scale;
@@ -379,7 +378,7 @@ int AttentionOp::ulyssesContextPostprocess(T* input, T* output, T* buffer, Enque
     }
 
     // transpose_2_reverse
-    if (mFP8ContextFMHA)
+    if (mFP8AttenOutput)
     {
         invokeCpTransposeToSeqMajor2(reinterpret_cast<__nv_fp8_e4m3*>(buffer),
             reinterpret_cast<__nv_fp8_e4m3 const*>(input), params.context_lengths, cu_q_seqlens, cu_cp_partial_seqlens,
@@ -399,7 +398,7 @@ int AttentionOp::ulyssesContextPostprocess(T* input, T* output, T* buffer, Enque
     {
         if (cpIdx != mCpRank)
         {
-            if (mFP8ContextFMHA)
+            if (mFP8AttenOutput)
             {
                 NCCLCHECK(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(buffer) + cpIdx * elementNum, elementNum, ncclInt8,
                     cpIdx, *mCpNcclComm, stream));
@@ -419,7 +418,7 @@ int AttentionOp::ulyssesContextPostprocess(T* input, T* output, T* buffer, Enque
 #endif // ENABLE_MULTI_DEVICE
 
     // transpose_1_reverse + view
-    if (mFP8ContextFMHA)
+    if (mFP8AttenOutput)
     {
         invokeCpTransposeToSeqMajor<__nv_fp8_e4m3>(reinterpret_cast<__nv_fp8_e4m3*>(output),
             reinterpret_cast<__nv_fp8_e4m3 const*>(buffer), reinterpret_cast<__nv_fp8_e4m3 const*>(input),
@@ -502,7 +501,7 @@ int AttentionOp::ulyssesGenerationPostprocess(T* input, T* output, T* buffer, in
     {
         if (cpIdx != mCpRank)
         {
-            if (mFP8ContextFMHA)
+            if (mFP8AttenOutput)
             {
                 NCCLCHECK(ncclSend(reinterpret_cast<__nv_fp8_e4m3*>(input) + cpIdx * elementNum, elementNum, ncclInt8,
                     cpIdx, *mCpNcclComm, stream));
@@ -522,7 +521,7 @@ int AttentionOp::ulyssesGenerationPostprocess(T* input, T* output, T* buffer, in
 #endif // ENABLE_MULTI_DEVICE
 
     // do transpose_1_reverse
-    if (mFP8ContextFMHA)
+    if (mFP8AttenOutput)
     {
         invokeCpTransposeToSeqMajor<__nv_fp8_e4m3>(reinterpret_cast<__nv_fp8_e4m3*>(output),
             reinterpret_cast<__nv_fp8_e4m3 const*>(input), reinterpret_cast<__nv_fp8_e4m3 const*>(buffer),
@@ -2594,6 +2593,9 @@ int AttentionOp::initialize() noexcept
 
     if (mEnableContextFMHA)
     {
+        // Construct the fmha runner.
+        MHARunnerFixedParams fmhaParams{};
+
         // Pre-checked during constructing.
         Data_type data_type;
         if (mType == nvinfer1::DataType::kHALF)
@@ -2608,6 +2610,8 @@ int AttentionOp::initialize() noexcept
         {
             TLLM_CHECK_WITH_INFO(false, "GPTAttentionPlugin received wrong data type.");
         }
+        // The output dtype.
+        fmhaParams.dataTypeOut = mFP8AttenOutput ? DATA_TYPE_E4M3 : data_type;
 
         // FP8 FMHA should be used with fp8 workflow together.
         if (mFP8ContextFMHA || mFP8ContextMLA)
@@ -2615,8 +2619,6 @@ int AttentionOp::initialize() noexcept
             data_type = DATA_TYPE_E4M3;
         }
 
-        // Construct the fmha runner.
-        MHARunnerFixedParams fmhaParams{};
         // The input dtype.
         fmhaParams.dataType = data_type;
         // The KV input data type. The default is same as dataType.
@@ -2633,8 +2635,6 @@ int AttentionOp::initialize() noexcept
                 fmhaParams.dataTypeKv = DATA_TYPE_E2M1;
             }
         }
-        // The output dtype.
-        fmhaParams.dataTypeOut = data_type;
         if (mFuseFp4Quant)
         {
             // If FP4 quantization workflow is enabled, set output type to FP4.
@@ -2856,8 +2856,7 @@ int AttentionOp::initialize() noexcept
         {
             fixedParams.outputDataType = DATA_TYPE_E2M1;
         }
-        // If FP8 context FMHA is enable, FP8 output is expected.
-        else if (mFP8ContextFMHA)
+        else if (mFP8AttenOutput)
         {
             fixedParams.outputDataType = DATA_TYPE_E4M3;
         }
@@ -2975,6 +2974,7 @@ std::string AttentionOp::toString() const
     ss << "mPosShiftEnabled: " << std::boolalpha << mPosShiftEnabled << std::endl;
     ss << "mPagedContextFMHA: " << std::boolalpha << mPagedContextFMHA << std::endl;
     ss << "mFP8ContextFMHA: " << std::boolalpha << mFP8ContextFMHA << std::endl;
+    ss << "mFP8AttenOutput: " << std::boolalpha << mFP8AttenOutput << std::endl;
     ss << "mFP8ContextMLA: " << std::boolalpha << mFP8ContextMLA << std::endl;
     ss << "mDenseContextFMHA: " << std::boolalpha << mDenseContextFMHA << std::endl;
     ss << "mEnableContextFMHA: " << std::boolalpha << mEnableContextFMHA << std::endl;
