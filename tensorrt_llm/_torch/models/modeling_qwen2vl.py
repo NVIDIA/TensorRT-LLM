@@ -2,7 +2,6 @@ import copy
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import nvtx
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -451,7 +450,8 @@ class Qwen2VisionModelBase(nn.Module):
         embeds = []
         if pixel_values is not None:
             pixel_values = pixel_values.to(self.model_dtype)
-            embeds.append(self.visual(pixel_values, grid_thw=image_grid_thw))
+            embed = self.visual(pixel_values, grid_thw=image_grid_thw)
+            embeds.append(embed)
 
         if pixel_values_videos is not None:
             pixel_values_videos = pixel_values_videos.to(self.model_dtype)
@@ -496,7 +496,6 @@ class Qwen2_5_VLVisionAttention(Attention):
 
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
         q, k, v = q.reshape(seq_length,
                             -1), k.reshape(seq_length,
                                            -1), v.reshape(seq_length, -1)
@@ -510,9 +509,7 @@ class Qwen2_5_VLVisionAttention(Attention):
                                    attention_mask_data=None,
                                    mrope_config=None,
                                    attention_sinks=None)
-
         attn_output = self.o_proj(output, layer_idx=self.layer_idx)
-
         return attn_output
 
 
@@ -630,7 +627,12 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
 
-        self.attn_metadata = self.metadata_cls(
+        self.full_attn_metadata = self.metadata_cls(
+            max_num_requests=8192,  # TODO: Make this dynamic
+            max_num_tokens=8192,  # TODO: Make this dynamic
+            kv_cache_manager=None,
+        )
+        self.window_attn_metadata = self.metadata_cls(
             max_num_requests=8192,  # TODO: Make this dynamic
             max_num_tokens=8192,  # TODO: Make this dynamic
             kv_cache_manager=None,
@@ -710,28 +712,17 @@ class Qwen2_5_VisionModel(torch.nn.Module):
 
         return window_index, seq_lens
 
-    def prepare_attn_metadata(self, seq_lens):
+    def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
         # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
         batch_size = len(seq_lens)
         prompt_lens = seq_lens
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int)
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
         request_ids = list(range(1, batch_size + 1))
 
-        if self.attn_metadata is not None:
-            attn_metadata = self.attn_metadata
-        else:
-
-            attn_metadata = self.metadata_cls(
-                max_num_requests=8192,
-                max_num_tokens=8192,
-                kv_cache_manager=None,
-            )
-            self.attn_metadata = attn_metadata
-
+        attn_metadata.num_contexts = batch_size
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lens
         attn_metadata.seq_lens = seq_lens
-        attn_metadata.num_contexts = batch_size
         attn_metadata.max_seq_len = seq_lens.max().item()
         attn_metadata.prepare()
         return attn_metadata
@@ -740,74 +731,48 @@ class Qwen2_5_VisionModel(torch.nn.Module):
     @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor,
                 **kwargs) -> torch.Tensor:
-        seq_lens = (grid_thw[:, 1] * grid_thw[:, 2]).tolist()
-        with nvtx.annotate("Qwen2.5-VL get_window_index",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            window_index, window_seq_lens = self.get_window_index(grid_thw)
-            window_index = window_index.to(hidden_states.device)
-            reverse_indices = torch.argsort(window_index)
+        window_index, window_seq_lens = self.get_window_index(grid_thw)
+        seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
+                                           grid_thw[:, 0]).tolist()
+        reverse_indices = torch.argsort(window_index)
 
-        with nvtx.annotate("Qwen2.5-VL prepare_attn_metadata",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            full_attn_metadata = self.prepare_attn_metadata(seq_lens)
-            window_attn_metadata = self.prepare_attn_metadata(window_seq_lens)
+        # Getting positional embedding
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        with nvtx.annotate("Qwen2.5-VL rot_pos_emb forward",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            # Getting positional embedding
-            rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        full_attn_metadata = self.prepare_attn_metadata(seq_lens,
+                                                        self.full_attn_metadata)
+        window_attn_metadata = self.prepare_attn_metadata(
+            window_seq_lens, self.window_attn_metadata)
 
-        # ------- FROM THIS POINT, pure GPU operations -------
-        with nvtx.annotate("Qwen2.5-VL patch_embed",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            hidden_states = self.patch_embed(hidden_states)
+        # From this point, pure GPU operation
+        hidden_states = self.patch_embed(hidden_states)
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
 
-        with nvtx.annotate("Qwen2.5-VL reshape",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            seq_len, _ = hidden_states.size()
-            hidden_states = hidden_states.reshape(
-                seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
-            hidden_states = hidden_states[window_index, :, :]
-            hidden_states = hidden_states.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
 
-        with nvtx.annotate("Qwen2.5-VL reshape",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            rotary_pos_emb = rotary_pos_emb.reshape(
-                seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
-            rotary_pos_emb = rotary_pos_emb[window_index, :, :]
-            rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-            position_embeddings = (emb.cos(), emb.sin())
+        for layer_num, blk in enumerate(self.blocks):
 
-        with nvtx.annotate("Qwen2.5-VL forward",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            for layer_num, blk in enumerate(self.blocks):
-                if layer_num in self.fullatt_block_indexes:
-                    attn_metadata = full_attn_metadata
-                else:
-                    attn_metadata = window_attn_metadata
-                hidden_states = blk(
-                    hidden_states,
-                    attn_metadata=attn_metadata,
-                    position_embeddings=position_embeddings,
-                )
+            if layer_num in self.fullatt_block_indexes:
+                attn_metadata = full_attn_metadata
+            else:
+                attn_metadata = window_attn_metadata
 
-        with nvtx.annotate("Qwen2.5-VL merger",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            hidden_states = self.merger(hidden_states)
-
-        with nvtx.annotate("Qwen2.5-VL reverse_indices",
-                           color="grey",
-                           domain="TensorRT-LLM"):
-            hidden_states = hidden_states[reverse_indices, :]
+            hidden_states = blk(
+                hidden_states,
+                attn_metadata=attn_metadata,
+                position_embeddings=position_embeddings,
+            )
+        hidden_states = self.merger(hidden_states)
+        hidden_states = hidden_states[reverse_indices, :]
 
         return hidden_states
 
@@ -1000,7 +965,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
-        # NOTE: Since Qwen2-VL is outdated model, we live it as HF implementation.
+        # NOTE: Since Qwen2-VL is outdated model, we leave it as HF implementation.
         kwargs['vision_model_class'] = Qwen2VisionTransformerPretrainedModel
         super().__init__(model_config, *args, **kwargs)
 
@@ -1040,7 +1005,8 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
         kwargs['vision_model_class'] = Qwen2_5_VisionModel
-        kwargs['disable_fuse_rope'] = False
+        kwargs[
+            'disable_fuse_rope'] = False  # TODO: Make this ModelConfig's argument
         super().__init__(model_config, *args, **kwargs)
 
     @property
@@ -1052,7 +1018,7 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if not DISAGG:
-            # Process vision encoder weights (filter and transform in one step)
+            # Process vision encoder weights
             weight_name_mapping = {
                 "attn.proj.weight": "attn.o_proj.weight",
                 "attn.proj.bias": "attn.o_proj.bias",
