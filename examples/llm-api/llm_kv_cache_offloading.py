@@ -3,30 +3,71 @@ from tensorrt_llm.llmapi import KvCacheConfig
 
 
 def main():
-    print("\n=== KV Cache Configuration Example ===")
-    print("\n1. KV Cache Configuration:")
 
-    llm_advanced = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                       max_batch_size=1,
-                       max_seq_len=1024,
-                       kv_cache_config=KvCacheConfig(
-                           free_gpu_memory_fraction=0.5,
-                           enable_block_reuse=True,
-                           max_tokens=1024,
-                           host_cache_size=1 * 1024 * 1024 * 1024,
-                           tokens_per_block=32))
+    prompt_a = (
+        "Given the following question and four candidate answers (A, B, C and D), choose the best answer.\n"
+        "The following excerpt is from a pamphlet.\nYou will do me the justice to remember, "
+        "that I have always strenuously supported the Right of every man to his own opinion"
+    )
 
-    prompts = [
-        "Hello, my name is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
+    prompt_b = (
+        "Question: This question refers to the following information.\nRead the following excerpt."
+        "\nThe revolutionary seed had penetrated into every country and spread more or less. "
+        "It was greatly developed under")
 
-    outputs = llm_advanced.generate(prompts)
-    for i, output in enumerate(outputs):
-        print(f"Query {i+1}: {output.prompt}")
-        print(f"Answer: {output.outputs[0].text[:100]}...")
-        print()
+    # Offloading Off
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+              max_batch_size=1,
+              max_seq_len=256,
+              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                            max_tokens=256,
+                                            tokens_per_block=16))
+    # prompt_a occupies kv cache
+    output_a = llm.generate(prompt_a)
+    print(output_a.prompt)
+
+    # since max_batch_size=1, prompt_b clears and update kv cache
+    output_b = llm.generate(prompt_b)
+    print(output_b.prompt)
+
+    # prompt_a clears and update kv cache again
+    output_a = llm.generate(prompt_a)
+    print(output_a.prompt)
+
+    # prompt_b clears and update kv cache again
+    output_b = llm.generate(prompt_b)
+    print(output_b.prompt)
+
+    llm.shutdown()
+
+    # Offloading On
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+              max_batch_size=1,
+              max_seq_len=256,
+              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                            max_tokens=256,
+                                            tokens_per_block=16,
+                                            host_cache_size=1024**3))
+    # prompt_a occupies kv cache
+    output_a = llm.generate(prompt_a)
+    print(output_a.prompt)
+
+    # since max_batch_size=1, and offloading is enabled, kv cache of prompt_a will be offloaded to host memory.
+    # kv cache of prompt_b keeps in device memory.
+    output_b = llm.generate(prompt_b)
+    print(output_b.prompt)
+
+    # kv cache of prompt_a will be onboarded to device memory, kv cache of prompt_b will be offloaded to host memory.
+    # kv cache of prompt_a will be reused.
+    output_a = llm.generate(prompt_a)
+    print(output_a.prompt)
+
+    # kv cache of prompt_b will be onboarded to device memory, kv cache of prompt_a will be offloaded to host memory.
+    # kv cache of prompt_b will be reused.
+    output_b = llm.generate(prompt_b)
+    print(output_b.prompt)
+
+    llm.shutdown()
 
 
 if __name__ == "__main__":
