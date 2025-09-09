@@ -6,12 +6,12 @@ def main():
 
     prompt_a = (
         "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
-        "The following excerpt is from a pamphlet. You will do me the justice to remember, "
+        # "The following excerpt is from a pamphlet. You will do me the justice to remember, "
     )
 
     prompt_b = (
         "Question: This question refers to the following information. Read the following excerpt."
-        "The revolutionary seed had penetrated into every country and spread more or less. "
+        # "The revolutionary seed had penetrated into every country and spread more or less. "
     )
 
     kv_cache_max_tokens = 256
