@@ -123,7 +123,7 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
                 auto penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + step];
                 if (penaltyIndex < vocabSize)
                 {
-                    atomicAdd(&penaltyWorkspace[penaltyIndex], 1);
+                    penaltyWorkspace[penaltyIndex] = -1;
                 }
             }
         }
@@ -145,7 +145,7 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
                 auto penaltyIndex = outputIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 1];
                 if (penaltyIndex < vocabSize)
                 {
-                    penaltyWorkspace[penaltyIndex] += 1;
+                    penaltyWorkspace[penaltyIndex] = max(0, penaltyWorkspace[penaltyIndex]) + 1;
                 }
             }
         }
@@ -175,13 +175,16 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
             if (accumulateVocab)
             {
                 SizeType32 numOccurences = penaltyWorkspace[index];
-                if (numOccurences > 0)
+                if (numOccurences != 0)
                 {
                     // Repetition
                     if (repetitionPenalties != nullptr)
                     {
                         logit = logit < 0.0f ? logit * repetitionPenalty : logit / repetitionPenalty;
                     }
+                }
+                if (numOccurences > 0)
+                {
                     // Presence
                     if (presencePenalties != nullptr)
                     {
