@@ -21,7 +21,7 @@ from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
@@ -417,7 +417,8 @@ class GenerationExecutor(ABC):
         if lora_config:
             worker_kwargs["lora_config"] = lora_config
 
-        orchestrator_type = None if llm_args is None else llm_args.orchestrator_type
+        orchestrator_type = None if not isinstance(
+            llm_args, TorchLlmArgs) else llm_args.orchestrator_type
         if orchestrator_type == "ray":
             return GenerationExecutor._create_ray_executor(
                 worker_kwargs,
