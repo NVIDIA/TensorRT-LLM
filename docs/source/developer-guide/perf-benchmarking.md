@@ -8,7 +8,7 @@ Expect breaking API changes.
 ```
 
 TensorRT LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
-easier for users to reproduce our officially published [performance overiew](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
+easier for users to reproduce our officially published [performance overview](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
 
 - A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.
 - An entirely Python workflow for benchmarking.

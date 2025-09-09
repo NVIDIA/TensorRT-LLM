@@ -18,7 +18,7 @@ TensorRT LLM is designed to be modular and easy to modify. Its PyTorch-native ar
 
 TensorRT LLM delivers breakthrough performance on the latest NVIDIA GPUs:
 
-- **DeepSeek R1**: [World-record inference performance on Blackwell GPUs](.https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/)
+- **DeepSeek R1**: [World-record inference performance on Blackwell GPUs](https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/)
 - **Llama 4 Maverick**: [Breaks the 1,000 TPS/User Barrier on B200 GPUs](https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick/)
 
 ### 🎯 **Comprehensive Model Support**
