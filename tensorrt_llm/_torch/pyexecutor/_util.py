@@ -9,6 +9,8 @@ from transformers import AutoTokenizer
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import \
+    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.inputs.registry import (create_input_processor,
@@ -56,14 +58,8 @@ class KvCacheCreator:
         self._draft_model_engine = draft_model_engine
         self._mapping = mapping
         self._max_kv_tokens_in = self._executor_config.kv_cache_config.max_tokens
-        self._is_multimodal = getattr(self._model_engine.model, "is_multimodal",
-                                      False)
-        if self._is_multimodal:
-            self._dummy_reqs = self._create_dummy_mm_context_request(
-                net_max_seq_len - 1)
-        else:
-            self._dummy_reqs = self._create_dummy_context_requests(
-                net_max_seq_len - 1)
+        self._dummy_reqs = self._create_dummy_context_requests(net_max_seq_len -
+                                                               1)
         self._kv_connector_manager = kv_connector_manager
 
     @staticmethod
@@ -142,6 +138,7 @@ class KvCacheCreator:
 
     def _create_dummy_mm_context_request(
             self, input_seq_len: int) -> List[trtllm.Request]:
+        requests = []
         self._model_name_or_path = getattr(self._model_engine.model,
                                            "name_or_path", None)
         self._tokenizer = AutoTokenizer.from_pretrained(
@@ -152,7 +149,7 @@ class KvCacheCreator:
             logger.warning("The input processor of the model does not have the method [get_prompt_for_profiling] implemented." \
             "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
             "ViT's encoder")
-            return self._create_dummy_context_requests(input_seq_len)
+            return requests
         text_prompt = input_processor.get_prompt_for_profiling()
         max_beam_width = self._executor_config.max_beam_width
         input_processor_with_hash = create_input_processor_with_hash(
@@ -162,7 +159,6 @@ class KvCacheCreator:
         multimodal_input = extra_processed_inputs.get('multimodal_input')
         multimodal_data = extra_processed_inputs.get('multimodal_data')
 
-        requests = []
         max_num_tokens = len(prompt_token_ids)
         remaining_tokens = max(max_num_tokens, input_seq_len)
         # add +1 to max_num_tokens to avoid assert in line 772 of tensorrt_llm/_torch/attention_backend/trtllm.py
@@ -195,11 +191,18 @@ class KvCacheCreator:
 
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
+        requests = []
+        if MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                self._model_engine.model.original_arch, None):
+            requests = self._create_dummy_mm_context_request(input_seq_len)
+        # if succeed profiling with multimodal requests then return, otherwise profile
+        # with default case
+        if requests:
+            return requests
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
         max_num_tokens = self._executor_config.max_num_tokens
         max_beam_width = self._executor_config.max_beam_width
 
-        requests = []
         input_seq_len = min(max_num_tokens, input_seq_len)
         remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
