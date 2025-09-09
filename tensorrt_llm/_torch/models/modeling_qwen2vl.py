@@ -277,6 +277,27 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
+    def get_prompt_for_profiling(self):
+        "Send prompt with largest image resolution for profiling the worst case"
+        max_width = 9999999
+        max_height = 9999999
+        resized_height, resized_width = smart_resize(
+            height=max_height,
+            width=max_width,
+            factor=self.model_config.vision_config.patch_size *
+            self.model_config.vision_config.spatial_merge_size,
+            min_pixels=self.processor.image_processor.min_pixels,
+            max_pixels=self.processor.image_processor.max_pixels,
+        )
+        img_tensor = torch.rand([3, resized_width, resized_height],
+                                device="cpu")
+        mm_data = {"image": [img_tensor]}
+
+        text_prompt = TextPrompt(
+            prompt="<|vision_start|><|image_pad|><|vision_end|>",
+            multi_modal_data=mm_data)
+        return text_prompt
+
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")
