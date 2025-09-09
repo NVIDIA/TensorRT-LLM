@@ -1,6 +1,7 @@
 """Interface to initialize and load HF models."""
 
 import os
+import re
 import types
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -99,6 +100,11 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # set sharding config source to huggingface
         self._sharding_config["source"] = ShardingConfigSource.HUGGINGFACE
 
+        # Some models' transformers implementation has changed in between when safetensors were produced
+        # and / or uploaded to HuggingFace hub. When building the model, we will try to determine whether
+        # a mapping of the parameter names exists and hold that information in this attribute.
+        self._checkpoint_conversion_mapping: Optional[Dict[str, str]] = None
+
     @property
     def autoconfig_from_pretrained(self):
         return AutoConfig.from_pretrained
@@ -168,6 +174,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # if present, initialize sharding config. We need head_dim for colwise sharding.
         self._set_sharding_config(model.config)
+        self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
@@ -326,15 +333,30 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """Load the checkpoint into the model."""
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
+
+        load_handle = model.register_load_state_dict_pre_hook(self._remap_param_names_load_hook)
+        # Ensure it's the first one.
+        model._load_state_dict_pre_hooks.move_to_end(key=load_handle.id, last=False)
+
+        get_handle = model.register_state_dict_post_hook(
+            _StateDictParamNameConverter(self._checkpoint_conversion_mapping)
+        )
+        # Ensure it's the first one.
+        model._state_dict_hooks.move_to_end(key=get_handle.id, last=False)
+
         # reuse the load checkpoint utility from accelerate
-        with hf_load_state_dict_with_device(device):
-            # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
-            # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
-            # which collects local model params, syncs weights from checkpoint, and applies them via
-            # model.load_state_dict.
-            # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
-            # model-transformed weights,leading to unexpected key mismatches or format issues.
-            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+        try:
+            with hf_load_state_dict_with_device(device):
+                # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
+                # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
+                # which collects local model params, syncs weights from checkpoint, and applies them via
+                # model.load_state_dict.
+                # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
+                # model-transformed weights,leading to unexpected key mismatches or format issues.
+                load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+        finally:
+            load_handle.remove()
+            get_handle.remove()
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
@@ -350,6 +372,63 @@ class AutoModelForCausalLMFactory(ModelFactory):
         if reader is not None:
             self._quant_config_reader = reader
             self.model_kwargs = deep_merge_dicts(self.model_kwargs, extra_model_kwargs)
+
+    def _remap_param_names_load_hook(self, model, state_dict, *args, **kwargs) -> None:
+        """Hook to handle potential param name conversions.
+
+        Some models' transformers implementation can change in between when safetensors were produced
+        and / or uploaded to HuggingFace hub. This hook applies the mapping (when present) to reflect
+        these differences.
+        """
+        conversion_mapping = self._checkpoint_conversion_mapping
+        if conversion_mapping:
+            keys_to_process = list(state_dict.keys())
+            for key in keys_to_process:
+                new_key = key
+                for pattern, replacement in conversion_mapping.items():
+                    new_key = re.sub(pattern, replacement, new_key)
+
+                if new_key != key:
+                    state_dict[new_key] = state_dict.pop(key)
+
+
+class _StateDictParamNameConverter:
+    """Helper class for applying param name conversions to a state dict.
+
+    The reason this is a class instead of a method of factory like `_remap_param_names_load_hook`
+    is because PyTorch tries to set an `_from_public_api` attribute on hooks, and bound instance
+    methods cannot have attributes set on them without major hacks.
+    """
+
+    def __init__(self, conversion_mapping: Optional[Dict[str, str]]):
+        conversion_mapping = conversion_mapping or {}
+
+        # NOTE: most of the code in this class is forked from `PreTrainedModel.save_pretrained`.
+        reverse_key_mapping = {v: k for k, v in conversion_mapping.items()}
+        self._mapping = reverse_key_mapping
+
+    def __call__(self, module, state_dict, *args, **kwargs) -> None:
+        """Hook to handle potential param name conversions.
+
+        For the same reasons as the `load` hook, we define one to for `state_dict`. This is to silence
+        potentially misleading warnings about certain parameter names not being used, because the
+        `accelerate` library's logic for determining which keys are unexpected bases it on the keys
+        in the `module.state_dict()` return value, not on what `module.load_state_dict()` returns.
+        """
+        if self._mapping:
+            keys_to_process = list(state_dict.keys())
+            for key in keys_to_process:
+                new_key = key
+                for pattern, replacement in self._mapping.items():
+                    replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
+                    replacement = re.sub(r"\(.*\)", "", replacement)
+                    new_key, n_replace = re.subn(pattern, replacement, key)
+                    # Early exit of the loop
+                    if n_replace > 0:
+                        break
+
+                if new_key != key:
+                    state_dict[new_key] = state_dict.pop(key)
 
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
@@ -426,17 +505,19 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                 }
             ]
 
-        # Create a batch of conversations (batch_size = 2)
+        # Create a batch of conversations (batch_size = 2).
+        # Note that we explicitly use 2 images in the examples to avoid potential shape specialization(s)
+        # in `torch.compile` / `torch.export`.
         batch_messages = [
             _prep_seq(
                 "Describe what you see in the two images and their differences.",
-                Image.new("RGB", (16, 16), color=(128, 128, 128)),
-                Image.new("RGB", (16, 16), color=(64, 64, 64)),
+                Image.new("RGB", self._example_image_dims, color=(128, 128, 128)),
+                Image.new("RGB", self._example_image_dims, color=(64, 64, 64)),
             ),
             _prep_seq(
                 "What are the main differences between these two images?",
-                Image.new("RGB", (16, 16), color=(255, 0, 0)),
-                Image.new("RGB", (16, 16), color=(0, 255, 0)),
+                Image.new("RGB", self._example_image_dims, color=(255, 0, 0)),
+                Image.new("RGB", self._example_image_dims, color=(0, 255, 0)),
             ),
         ]
 
@@ -451,10 +532,15 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return_attention_mask=False,
         )
 
-        return {
-            "input_ids": inputs["input_ids"],
-            "pixel_values": inputs["pixel_values"],
-        }
+        # We should have no need for the attention mask, and it can actually cause issues in
+        # downstream code.
+        inputs.pop("attention_mask", None)
+
+        # NOTES:
+        # 1. `inputs` is dict-like, but not a dict (hence the dict unpacking below).
+        # 2. Although `get_extra_inputs` allows implementations to specify "extra inputs", the example
+        #    values still need to be returned by `get_example_inputs`.
+        return {**inputs}
 
     def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
         """Return a dictionary of extra inputs for the model.
@@ -476,3 +562,10 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
 
         none_pixel_values = torch.zeros(0, 3, 336, 336)
         return {"pixel_values": (none_pixel_values, _get_dynamic_shape)}
+
+    @property
+    def _example_image_dims(self) -> Tuple[int, int]:
+        # Some specializations (children) of this class may override this if their models have
+        # assumptions on the image dimensions. For example, they may have a lower bound due to
+        # the patch size they use.
+        return (16, 16)
