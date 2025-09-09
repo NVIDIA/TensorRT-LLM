@@ -1,4 +1,5 @@
 import contextlib
+import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -7,6 +8,7 @@ from typing import Dict, List
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 
@@ -284,3 +286,19 @@ def set_per_request_piecewise_cuda_graph_flag(enable: bool):
 
 def get_per_request_piecewise_cuda_graph_flag() -> bool:
     return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
+
+
+def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
+    lm_head_tp_size = int(os.getenv('LM_HEAD_TP_SIZE', 2))
+    assert mapping.tp_size % lm_head_tp_size == 0
+    lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
+
+    return Mapping(
+        world_size=lm_head_tp_size * lm_head_pp_size,
+        rank=mapping.rank,
+        gpus_per_node=mapping.gpus_per_node,
+        tp_size=lm_head_tp_size,
+        pp_size=lm_head_pp_size,
+        enable_attention_dp=mapping.enable_attention_dp,
+        enable_lm_head_tp_in_adp=mapping.enable_lm_head_tp_in_adp,
+    )
