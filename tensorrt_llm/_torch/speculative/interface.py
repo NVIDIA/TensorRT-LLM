@@ -5,6 +5,7 @@ from typing import List, Optional, Type
 
 import torch
 
+from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..pyexecutor.resource_manager import BaseResourceManager
 
@@ -100,7 +101,8 @@ class SpeculativeDecodingMode(IntEnum):
         if self.use_one_engine():
             # 1-model has separate logic for handling draft tokens
             return False
-        return not issubclass(attention_backend, TrtllmAttention)
+        return not issubclass(attention_backend,
+                              TrtllmAttention) or get_sm_version() != 100
 
     def attention_need_spec_dec_mode(self,
                                      spec_resource_manager: BaseResourceManager,

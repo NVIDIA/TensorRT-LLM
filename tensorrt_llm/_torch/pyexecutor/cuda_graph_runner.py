@@ -95,7 +95,7 @@ class CUDAGraphRunner:
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft)
         else:
             draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
-            key = (batch_size, draft_len, True)
+            key = (batch_size, draft_len, False)
         return key
 
     @property
@@ -215,6 +215,17 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
+        def wrap_forward_fn(key: Tuple[int, int, int], forward_fn: Callable,
+                            capture_inputs: Dict[str, Any]):
+            engine = self._get_engine()
+            # for the first inference of draft model, we need to set the use_spec_decoding to True when capture the graph for multiple runs.
+            is_first_draft = key[2]
+            needs_kv_cache_recompute = True if engine.enable_spec_decode and engine.spec_config.spec_dec_mode.needs_kv_cache_recompute(
+            ) else False
+            if is_first_draft and engine.is_draft_model and needs_kv_cache_recompute:
+                capture_inputs['attn_metadata'].use_spec_decoding = True
+            return forward_fn(capture_inputs)
+
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
@@ -222,9 +233,9 @@ class CUDAGraphRunner:
         graph = torch.cuda.CUDAGraph()
         with with_multi_stream(True), piecewise_cuda_graph(False):
             for _ in range(self.WARMUP_STEPS):
-                forward_fn(capture_inputs, key)
+                wrap_forward_fn(key, forward_fn, capture_inputs)
             with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = forward_fn(capture_inputs, key)
+                output = wrap_forward_fn(key, forward_fn, capture_inputs)
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)

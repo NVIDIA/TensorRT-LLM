@@ -270,10 +270,8 @@ class ModelDrafter(Drafter):
             return False
         needs_kv_cache_recompute = self.spec_config.spec_dec_mode.needs_kv_cache_recompute(
         )
-        if needs_kv_cache_recompute and issubclass(
-                self.draft_model_engine.attn_backend, TrtllmAttention):
-            return False
-        return needs_kv_cache_recompute
+        return needs_kv_cache_recompute and not issubclass(
+            self.draft_model_engine.attn_backend, TrtllmAttention)
 
     def _forward_draft_model(
             self,

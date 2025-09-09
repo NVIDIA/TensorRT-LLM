@@ -2348,14 +2348,7 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 if self.cuda_graph_runner.needs_capture(key):
 
-                    def capture_forward_fn(inputs: Dict[str, Any],
-                                           key: Tuple[int, int, int]):
-                        # for the first inference of draft model, we need to set the use_spec_decoding to True when capture the graph for multiple runs.
-                        is_first_draft = key[2]
-                        needs_kv_cache_recompute = True if self.enable_spec_decode and self.spec_config.spec_dec_mode.needs_kv_cache_recompute(
-                        ) else False
-                        if is_first_draft and self.is_draft_model and needs_kv_cache_recompute:
-                            inputs['attn_metadata'].use_spec_decoding = True
+                    def capture_forward_fn(inputs: Dict[str, Any]):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
                             return self._forward_step(
                                 inputs,
