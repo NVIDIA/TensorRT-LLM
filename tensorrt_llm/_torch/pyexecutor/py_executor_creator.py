@@ -28,7 +28,8 @@ from ..distributed import MPIDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla)
+                    create_py_executor_instance, instantiate_sampler, is_mla,
+                    validate_feature_combination)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -177,14 +178,6 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
         )
         executor_config.enable_chunked_context = False
 
-    spec_config = executor_config.speculative_config
-    if not executor_config.pytorch_backend_config.disable_overlap_scheduler and spec_config is not None:
-        if not spec_config.spec_dec_mode.support_overlap_scheduler():
-            logger.warning(
-                f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
-            )
-            executor_config.pytorch_backend_config.disable_overlap_scheduler = True
-
     if executor_config.mm_encoder_only:
         from tensorrt_llm.llmapi.llm_args import LoadFormat
         pytorch_backend_config.mm_encoder_only = True
@@ -273,6 +266,9 @@ def create_py_executor(
             lora_config=lora_config,
             checkpoint_loader=executor_config.checkpoint_loader,
         )
+
+    validate_feature_combination(llm_args, model_engine,
+                                 pytorch_backend_config.sampler_type)
 
     if has_draft_model_engine:
         with mem_monitor.observe_creation_stage(

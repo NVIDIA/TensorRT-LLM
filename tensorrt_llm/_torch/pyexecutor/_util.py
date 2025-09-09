@@ -10,8 +10,10 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.llmapi.llm_args import (PeftCacheConfig, SamplerType,
-                                          SpeculativeConfig)
+from tensorrt_llm.llmapi.llm_args import (EagleDecodingConfig,
+                                          MTPDecodingConfig, PeftCacheConfig,
+                                          SamplerType, SpeculativeConfig,
+                                          TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -837,3 +839,96 @@ def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
         f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
     )
     torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
+
+
+def validate_feature_combination(llm_args, model_engine, sampler_type):
+    # Validate the flags for features' combination
+    def init_feature_status(llm_args) -> Dict[str, bool]:
+        assert isinstance(
+            llm_args, TorchLlmArgs
+        ), "Expect TorchLlmArgs used for feature status validation."
+        feature_list = [
+            "overlap_scheduler",
+            "cuda_graph",
+            "attention_dp",
+            "disaggregated_serving",
+            "chunked_prefill",
+            "mtp",
+            "eagle3_one_model",
+            "eagle3_two_model",
+            "torch_sampler",
+            "trtllm_sampler",
+            "kv_cache_reuse",
+            "slide_window_attention",
+            "guided_decoding",
+        ]
+        feature_status: Dict[str, bool] = dict.fromkeys(feature_list)
+        feature_status[
+            "overlap_scheduler"] = not llm_args.disable_overlap_scheduler
+        feature_status["cuda_graph"] = llm_args.cuda_graph_config is not None
+        feature_status["attention_dp"] = llm_args.enable_attention_dp
+        feature_status[
+            "disaggregated_serving"] = llm_args.cache_transceiver_config is not None
+        feature_status["chunked_prefill"] = llm_args.enable_chunked_prefill
+        feature_status["mtp"] = (
+            isinstance(llm_args.speculative_config, MTPDecodingConfig)
+            and llm_args.speculative_config.num_nextn_predict_layers > 0)
+        feature_status["eagle3_one_model"] = (
+            isinstance(llm_args.speculative_config, EagleDecodingConfig)
+            and llm_args.speculative_config.eagle3_one_model)
+        feature_status["eagle3_two_model"] = (
+            isinstance(llm_args.speculative_config, EagleDecodingConfig)
+            and not llm_args.speculative_config.eagle3_one_model)
+        feature_status[
+            "torch_sampler"] = sampler_type == SamplerType.TorchSampler
+        feature_status[
+            "trtllm_sampler"] = sampler_type == SamplerType.TRTLLMSampler
+
+        feature_status[
+            "kv_cache_reuse"] = llm_args.kv_cache_config is not None and llm_args.kv_cache_config.enable_block_reuse
+        feature_status["slide_window_attention"] = (
+            hasattr(model_engine.model.model_config.pretrained_config,
+                    "layer_types") and "sliding_attention"
+            in model_engine.model.model_config.pretrained_config.layer_types)
+        feature_status[
+            "guided_decoding"] = llm_args.guided_decoding_backend is not None
+        assert all(v is not None for v in feature_status.values()
+                   ), "feature status has not been fully initialized."
+        assert all(
+            k in feature_list for k in
+            feature_status.keys()), "unexpected feature type in feature_status."
+        return feature_status
+
+    feature_status: Dict[str, bool] = init_feature_status(llm_args)
+
+    ERR_MSG_TMPL = "{feature1} and {feature2} enabled together is not supported yet."
+
+    if feature_status["mtp"] and feature_status["slide_window_attention"]:
+        raise ValueError(
+            ERR_MSG_TMPL.format(feature1="mtp",
+                                feature2="slide_window_attention"))
+
+    # Some combinations of features are unsupported; the implementation may,
+    # however, implicitly cast arguments to make them appear compatible.
+    # Now, forces an explicit error instead.
+    if feature_status["overlap_scheduler"] and feature_status[
+            "eagle3_two_model"]:
+        # Overlap scheduler with eagle-3 two models is not supported.
+        # Previously we will disable overlap scheduler with a warning
+        # https://github.com/NVIDIA/TensorRT-LLM/blob/fe7dda834d6d49a9b654ba70a4f1a8a6aaf9c715/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py#L174-L179
+        # Prefer a explicitly error msg here:
+        raise ValueError(
+            ERR_MSG_TMPL.format(feature1="overlap_scheduler",
+                                feature2="eagle3_two_model") +
+            " Please disable overlap_scheduler explicitly.")
+    if feature_status["trtllm_sampler"]:
+        if (feature_status["mtp"] or feature_status["eagle3_one_model"]
+                or feature_status["eagle3_two_model"]):
+            # Mtp with trtllm_sampler is not supported.
+            # Previously we will use torch_sampler implicitly
+            # https://github.com/NVIDIA/TensorRT-LLM/blob/70e352a6f784f1cfd2affc074ac8d83e430abd9a/tensorrt_llm/_torch/pyexecutor/_util.py#L599
+            # Prefer a explicitly error msg here:
+            raise ValueError(
+                ERR_MSG_TMPL.format(feature1="trtllm_sampler",
+                                    feature2="speculative decoding") +
+                " Please use sampler type auto instead.")
