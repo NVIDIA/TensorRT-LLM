@@ -425,7 +425,7 @@ struct CutlassGemmConfig
         , sm_version(sm_version)
         , is_tma_warp_specialized(true)
     {
-        TLLM_CHECK_WITH_INFO(sm_version >= 100 && sm_version < 120 && "Expected SM 10x version");
+        assert(sm_version >= 100 && sm_version < 120 && "Expected SM 10x version");
     }
 
     CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120, MainloopScheduleType mainloop_schedule,
