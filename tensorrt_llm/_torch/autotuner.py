@@ -87,10 +87,12 @@ class TuningConfig:
             any value is provided to the choose_one function, the input tensor will be saturated
             with the provided value.
             If not provided, the autotuner will not consider the max num tokens.
+        use_cold_l2_cache (bool): If true, use cold L2 cache for profiling.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     tune_max_num_tokens: int = None
+    use_cold_l2_cache: bool = False
 
 
 @dataclass(unsafe_hash=True)
@@ -467,7 +469,7 @@ class AutoTuner:
             for tac in valid_tactics:
                 try:
                     time_measured = self._profile_single_kernel(
-                        runner, input_tensors, tac, **kwargs)
+                        runner, input_tensors, tac, tuning_config, **kwargs)
                 except Exception as e:
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
@@ -509,6 +511,7 @@ class AutoTuner:
         runner: TunableRunner,
         inputs: List[torch.Tensor],
         tactic: Any,
+        tuning_config: TuningConfig,
         **kwargs,
     ) -> float:
         """Profile a single kernel implementation for performance measurement.
@@ -526,25 +529,17 @@ class AutoTuner:
             to get an average execution time. Stream synchronization and delays
             are used to ensure accurate timing.
         """
-
-        use_cold_l2 = True
-
-        if use_cold_l2:
-            tensor_lists, num_buffers = self._prepare_input_tensors_with_batches(
-                inputs)
-            buffer_idx = 0
-        else:
-            tensor_lists = [inputs]
-            num_buffers = 1
-            buffer_idx = 0
+        input_tensor_baches = self._prepare_input_tensors_with_batches(
+            inputs, tuning_config)
 
         stream = torch.cuda.current_stream()
         # warm up, no timing
         for _ in range(self.warmup):
-            runner(tensor_lists[buffer_idx % num_buffers],
-                   tactic=tactic,
-                   **kwargs)
-            buffer_idx += 1
+            runner(
+                input_tensor_baches[-1],
+                tactic=tactic,
+                **kwargs,
+            )
         stream.synchronize()
 
         # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
@@ -555,17 +550,18 @@ class AutoTuner:
         end = torch.cuda.Event(enable_timing=True)
 
         start.record(stream=stream)
-        for _ in range(self.repeat):
-            runner(tensor_lists[buffer_idx % num_buffers],
-                   tactic=tactic,
-                   **kwargs)
-            buffer_idx += 1
+        for r in range(self.repeat):
+            runner(
+                input_tensor_baches[r % len(input_tensor_baches)],
+                tactic=tactic,
+                **kwargs,
+            )
         end.record(stream=stream)
         stream.synchronize()
 
         avg_time = start.elapsed_time(end) / self.repeat
 
-        shapes = self._get_input_sizes(tensor_lists[-1])
+        shapes = self._get_input_sizes(input_tensor_baches[-1])
         logger.debug(
             f"[Autotuner] Profiled runner={runner}, tactic={tactic}, shapes={shapes}: {avg_time:.6f}ms."
         )
@@ -755,31 +751,35 @@ class AutoTuner:
     def _prepare_input_tensors_with_batches(
         self,
         inputs: List[torch.Tensor],
-    ) -> Tuple[List[List[torch.Tensor]], int]:
+        tuning_config: TuningConfig,
+    ) -> List[List[torch.Tensor]]:
+        if not tuning_config.use_cold_l2_cache:
+            return [inputs]
+
         one_buffer_bytes = sum(
             input.numel() *
             input.element_size() if isinstance(input, torch.Tensor) else 0
             for input in inputs)
         if one_buffer_bytes <= 0:
-            logger.debug(
+            logger.info(
                 "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
             )
-            return [inputs], 1
-        num_buffers = (self._get_l2_cache_size_in_bytes() *
-                       3) // one_buffer_bytes + 1
-        num_iterations = self.warmup + self.repeat
-        num_buffers = num_iterations if num_iterations < num_buffers else num_buffers
+            return [inputs]
+
+        num_buffers = self._get_l2_cache_size_in_bytes(
+        ) * 3 // one_buffer_bytes + 1
+        num_buffers = min(num_buffers, self.repeat + 1)
 
         inputs_list = [inputs]
         for _ in range(num_buffers - 1):
             inputs_list.append(
-                list(t.clone() if isinstance(t, torch.Tensor) else t
+                list(t.clone() if isinstance(t, torch.Tensor) else tå
                      for t in inputs))
 
-        logger.debug(
-            f"[Autotuner] To cold L2 cache, use {num_buffers} different tensors for profiling"
+        logger.info(
+            f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
         )
-        return inputs_list, num_buffers
+        return inputs_list
 
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
