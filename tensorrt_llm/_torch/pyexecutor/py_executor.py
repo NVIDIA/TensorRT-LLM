@@ -1862,6 +1862,7 @@ class PyExecutor:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
+                    response.result.cached_tokens = self._fetch_cached_tokens(req_id)
                     new_responses.append((req_id, response))
 
             if request_done:
@@ -1877,6 +1878,15 @@ class PyExecutor:
         for request in requests_to_terminate:
             self._terminate_request(request)
         return requests_to_terminate
+
+    def _fetch_cached_tokens(self, req_id: int):
+        try:
+            idx = self.model_engine.attn_metadata.request_ids.index(req_id)
+            return self.model_engine.attn_metadata.kv_cache_params.num_cached_tokens_per_seq[idx]
+        except Exception as e:
+            logger.warning(f"Error in fetch_cached_tokens: {e}")
+            logger.warning(traceback.format_exc())
+            return 0
 
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
