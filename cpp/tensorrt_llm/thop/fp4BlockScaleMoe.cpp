@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -38,8 +39,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
     int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
     int64_t const routing_method_type, bool const do_finalize, MoeRunnerType& moe_runner, int64_t const moeConfigIndex)
 {
-    auto const sm = tensorrt_llm::common::getSMFamily();
-    TORCH_CHECK(sm == 100, "Only SM100f is supported by FP4 block scale MOE");
+    TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
     TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64,
         "tile_tokens_dim must be 8, 16, 32, 64");
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
