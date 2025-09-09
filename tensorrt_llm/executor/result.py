@@ -244,10 +244,16 @@ class GenerationResultBase:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
         if logprobs_result:
-            output.prompt_logprobs = logprobs_result.prompt
+            output.prompt_logprobs = logprobs_result.prompt  # both backends
+            # this line only matters for TRT backend, where generation logprobs are
+            # calculated outside engine in logprobs_result.generation.
+            # for pytorch backend, generation logprobs are calculated in sampler,
+            # and are provided by response_tensors.log_probs in the following lines.
             output.logprobs = logprobs_result.generation
 
         if response_tensors.log_probs is not None:
+            # response_tensors.log_probs has per-token generation logprobs
+            # that are coupled to the sampling strategy, hence is provided by sampler.
             output._last_logprobs_len = len(
                 output.logprobs) if output.logprobs is not None else 0
             output.logprobs = response_tensors.log_probs[src_idx]
@@ -699,12 +705,12 @@ def compute_logprobs(
     output_token_ids: Optional[list[int]],
 ) -> LogProbsResult:
     """
-    Compute top-K logprobs and ranks for each token position.
+    Compute top-K logprobs from logits when engine doesn't provide them directly.
 
-    Returns:
-        LogProbsResult, a NamedTuple containing:
-            - prompt: Optional[List[Dict[token_id, Logprob]]] logprobs for prompt tokens.
-            - generation: Optional[List[Dict[token_id, Logprob]]] logprobs for generated tokens.
+    Used for post-processing logits into logprobs.
+    - Prompt logprobs (from context_logits): always used.
+    - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
+    - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
     """
 
     def _topk_logprobs(logits: torch.Tensor, top_k: int,
