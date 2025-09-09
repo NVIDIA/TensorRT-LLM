@@ -357,12 +357,12 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
         def shardRegularTests = []
         def shardIsolateTests = []
 
-        // Read the original test list to check for ISOLATE markers
+        // Read the original test list to check for ISOLATION markers
         def originalTestLines = readFile(file: testDBList).readLines()
         def isolateMarkerTests = originalTestLines.findAll { line ->
-            line.trim() && line.contains(' ISOLATE')
+            line.trim() && line.contains(' ISOLATION')
         }.collect { line ->
-            line.replaceAll(' ISOLATE', '').trim()
+            line.replaceAll(' ISOLATION', '').trim()
         }
 
         shardTestList.each { test ->
