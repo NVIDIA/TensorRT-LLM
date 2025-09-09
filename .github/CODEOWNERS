@@ -156,3 +156,9 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 # of the NVIDIA/trt-llm-release-branch-approval team, regardless of who else approves the PR.
 # Without approval from a member of this team, PRs cannot be merged to release branches.
 * @NVIDIA/trt-llm-release-branch-approval
+
+# The following rule should only be uncommented on NIM-specific release branches (e.g., release/xxx-NIM).
+# The rule below requires that any PR to release/**-NIM/* branches must be approved by at least one member
+# of the NVIDIA/trt-llm-release-nim-branch-approval AND/OR @NVIDIA/trt-llm-release-branch-approval team, regardless of who else approves the PR.
+# Without approval from a member of this team, PRs cannot be merged to release branches.
+* @NVIDIA/trt-llm-release-branch-approval @NVIDIA/trt-llm-release-branch-approval
