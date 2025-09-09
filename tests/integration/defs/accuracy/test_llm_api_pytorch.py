@@ -1918,18 +1918,25 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
-        [(8, 1, 4, 3, False, False, True, True, 1),
-         (8, 1, 8, 0, True, True, True, True, 24),
-         (8, 1, 8, 1, True, True, True, True, 24)],
-        ids=["latency", "throughput", "throughput_mtp"])
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        [(8, 1, 4, 3, False, False, True, True, 1, "_DEFAULT"),
+         (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
+         (8, 1, 8, 1, True, True, True, True, 24, "_DEFAULT"),
+         (8, 1, 8, 1, True, True, True, True, 24, "TRTLLM")],
+        ids=[
+            "latency", "throughput", "throughput_mtp", "throughput_mtp_trtllm"
+        ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            max_batch_size):
+                            max_batch_size, moe_backend):
+
         if get_sm_version() == 100:
-            moe_config = MoeConfig(backend="TRTLLM", max_num_tokens=16384)
+            moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
+            moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
+            if moe_backend != "_DEFAULT":
+                pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
 
