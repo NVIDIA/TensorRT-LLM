@@ -64,6 +64,7 @@ using TokenIdType = tensorrt_llm::runtime::TokenIdType;
 using VecTokens = std::vector<TokenIdType>;
 using BeamTokens = std::vector<VecTokens>;
 using BlockPtr = std::shared_ptr<KVCacheBlock>;
+using LookupNodePtr = std::shared_ptr<KVCachePromptLookupNode>;
 using FreeBlocksQueue = std::list<BlockPtr>;
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
@@ -197,7 +198,8 @@ struct KvCacheStats
     std::size_t allocatedBytes{};
 };
 
-
+// Implement an object that represents a given prompt prefix in search structure.
+// The node contains pointers to all reusable state for the prompt prefix.
 class KVCachePromptLookupNode
 {
 public:
@@ -233,16 +235,12 @@ public:
 private:
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
     BlockKey mBlockKey;
-
     // Flag indicating if block is full
     bool mIsFull;
-
     // Previous block in reuse tree, or nullptr if not reusing
     BlockPtr mPrevBlock;
-
     // Next node(s) in sequence(s)
     NextNodeMap mNextNodes;
-
     // Pointers to blocks holding KV state for this prompt prefix
     std::unordered_map<SizeType32, BlockPtr> mBlocks;
 };
@@ -250,12 +248,17 @@ private:
 class KVCachePromptLookup
 {
 public:
-    explicit KVCachePromptLookup();
+    explicit KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock);
 
-    
+    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::lookup(LlmRequest& llmRequest, bool enablePartialReuse, bool createNodes);
 
 private:
+    // Root of search structure
     LookupNodePtr mRoot;
+    // KV cache type (self or cross)
+    CacheType mCacheType;
+    // Number of tokens per one block
+    SizeType32 mTokensPerBlock;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -583,7 +586,7 @@ public:
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
     void addSequence(
-        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
+        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& matchedPromptNodes);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numContextBlocks, bool isShareLastContextBlock);
@@ -759,7 +762,7 @@ public:
     //! \brief Store blocks in cached blocks.
     //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
-    void storeBlocks(std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds);
+    void storeBlocks(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds);
 
     [[nodiscard]] bool verifyQueueIntegrity();
 
@@ -792,7 +795,7 @@ private:
     //! \param blockKeys Key of each block.
     //! \param sequence Sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
+    SizeType32 loadOrAllocateBlocks(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& matchedPromptNodes, SizeType32 numContextBlocks,
         GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions);
 
     //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
@@ -952,10 +955,10 @@ public:
     //! \details Does nothing if block is already in secondary memory.
     void offloadBlock(BlockPtr const& block, SizeType32 windowSize);
 
-    void storeBlocks(std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
+    void storeBlocks(std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> const& lookupNodes, std::vector<KVCacheBlock::IdType> const& blockIds,
         SizeType32 windowSize)
     {
-        mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds);
+        mWindowBlockManagers.at(windowSize).storeBlocks(lookupNodes, blockIds);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize);
