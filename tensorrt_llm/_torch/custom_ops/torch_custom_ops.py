@@ -1075,7 +1075,10 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
         **kwargs,
-    ) -> List[int]:
+    ) -> List[Tuple[int, int]]:
+        assert inputs[0].dim() == 2
+        assert inputs[1].dim() == 2
+
         m = inputs[0].shape[0]
         n = inputs[1].shape[0]
         k = inputs[0].shape[1]
