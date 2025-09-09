@@ -766,17 +766,14 @@ class NVFP4LinearMethod(LinearMethodBase):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
-        # if module.use_cute_dsl_nvfp4_blockscaling_mm:
-        #     output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-        #         act_fp4, module.weight, act_sf, module.weight_scale, module.scalar_alpha,
-        #         module.dtype)
-        # else:
-        #     output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
-        #                                          module.weight_scale, module.alpha,
-        #                                          module.dtype)
-        output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                act_fp4, module.weight, act_sf, module.weight_scale, module.scalar_alpha,
-                module.dtype)
+        if module.use_cute_dsl_nvfp4_blockscaling_mm:
+            output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                act_fp4, module.weight, act_sf, module.weight_scale,
+                module.scalar_alpha, module.dtype)
+        else:
+            output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
+                                                 module.weight_scale,
+                                                 module.alpha, module.dtype)
         if bias is not None:
             output = output + bias
         return output
