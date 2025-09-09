@@ -1,3 +1,5 @@
+import time
+
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 
@@ -14,18 +16,17 @@ def main():
         # "The revolutionary seed had penetrated into every country and spread more or less. "
     )
 
-    kv_cache_max_tokens = 256
     kv_cache_page_size = 16
     kv_cache_host_size_in_bytes = 1024**3
 
     # Offloading Off
-    print("\n === Offloading Off === \n")
+    print("\n ======  Offloading Off ======  \n")
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=1,
               max_seq_len=256,
               kv_cache_config=KvCacheConfig(
                   enable_block_reuse=True,
-                  max_tokens=kv_cache_max_tokens,
+                  free_gpu_memory_fraction=0.01,
                   tokens_per_block=kv_cache_page_size))
     # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
@@ -54,15 +55,16 @@ def main():
     )
 
     llm.shutdown()
+    time.sleep(5)
 
     # Offloading On
-    print("\n === Offloading On === \n")
+    print("\n ======  Offloading On ======  \n")
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=1,
               max_seq_len=256,
               kv_cache_config=KvCacheConfig(
                   enable_block_reuse=True,
-                  max_tokens=kv_cache_max_tokens,
+                  free_gpu_memory_fraction=0.01,
                   tokens_per_block=kv_cache_page_size,
                   host_cache_size=kv_cache_host_size_in_bytes))
     # prompt_a occupies kv cache pool
@@ -71,21 +73,24 @@ def main():
         f"Prompt: {output_a.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
     )
 
-    # since max_batch_size=1, and offloading is enabled, kv cache of prompt_a will be offloaded to host memory.
+    # since max_batch_size=1, and offloading is enabled,
+    # kv cache of prompt_a will be offloaded to host memory.
     # kv cache of prompt_b keeps in device memory.
     output_b = llm.generate(prompt_b)
     print(
         f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
     )
 
-    # kv cache of prompt_a will be onboarded to device memory, kv cache of prompt_b will be offloaded to host memory.
+    # kv cache of prompt_a will be onboarded to device memory,
+    # kv cache of prompt_b will be offloaded to host memory.
     # kv cache of prompt_a will be reused.
     output_a = llm.generate(prompt_a)
     print(
         f"Prompt: {output_a.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
     )
 
-    # kv cache of prompt_b will be onboarded to device memory, kv cache of prompt_a will be offloaded to host memory.
+    # kv cache of prompt_b will be onboarded to device memory,
+    # kv cache of prompt_a will be offloaded to host memory.
     # kv cache of prompt_b will be reused.
     output_b = llm.generate(prompt_b)
     print(
