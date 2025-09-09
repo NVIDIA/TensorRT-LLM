@@ -6,7 +6,7 @@ The PyTorch backend supports most of the sampling features that are supported on
 To use the feature:
 
 1. Enable the `enable_trtllm_sampler` option in the `LLM` class
-2. Pass a [`SamplingParams`](../../../../tensorrt_llm/sampling_params.py#L125) object with the desired options to the `generate()` function
+2. Pass a [`SamplingParams`](source:tensorrt_llm/sampling_params.py#L125) object with the desired options to the `generate()` function
 
 The following example prepares two identical prompts which will give different results due to the sampling parameters chosen:
 
@@ -74,7 +74,7 @@ The PyTorch backend supports guided decoding with the XGrammar and Low-level Gui
 To enable guided decoding, you must:
 
 1. Set the `guided_decoding_backend` parameter to `'xgrammar'` or `'llguidance'` in the `LLM` class
-2. Create a [`GuidedDecodingParams`](../../../../tensorrt_llm/sampling_params.py#L14) object with the desired format specification
+2. Create a [`GuidedDecodingParams`](source:tensorrt_llm/sampling_params.py#L14) object with the desired format specification
     * Note: Depending on the type of format, a different parameter needs to be chosen to construct the object (`json`, `regex`, `grammar`, `structural_tag`).
 3. Pass the `GuidedDecodingParams` object to the `guided_decoding` parameter of the `SamplingParams` object
 
@@ -94,7 +94,7 @@ sampling_params = SamplingParams(
 llm.generate("Generate a JSON response", sampling_params)
 ```
 
-You can find a more detailed example on guided decoding [here](../../../../examples/llm-api/llm_guided_decoding.py).
+You can find a more detailed example on guided decoding [here](source:examples/llm-api/llm_guided_decoding.py).
 
 ## Logits processor
 
@@ -102,7 +102,7 @@ Logits processors allow you to modify the logits produced by the network before 
 
 To use a custom logits processor:
 
-1. Create a custom class that inherits from [`LogitsProcessor`](../../../../tensorrt_llm/sampling_params.py#L48) and implements the `__call__` method
+1. Create a custom class that inherits from [`LogitsProcessor`](source:tensorrt_llm/sampling_params.py#L48) and implements the `__call__` method
 2. Pass an instance of this class to the `logits_processor` parameter of `SamplingParams`
 
 The following example demonstrates logits processing:
@@ -132,4 +132,4 @@ sampling_params = SamplingParams(
 llm.generate(["Hello, my name is"], sampling_params)
 ```
 
-You can find a more detailed example on logits processors [here](../../../../examples/llm-api/llm_logits_processor.py).
+You can find a more detailed example on logits processors [here](source:examples/llm-api/llm_logits_processor.py).
