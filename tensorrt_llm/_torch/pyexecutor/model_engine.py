@@ -141,6 +141,7 @@ class PyTorchModelEngine(ModelEngine):
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
+        model: Optional[torch.nn.Module] = None,
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
@@ -163,19 +164,24 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
 
-        attn_backend = pytorch_backend_config.attn_backend
-        loader = ModelLoader(
-            pytorch_backend_config=pytorch_backend_config,
-            mapping=self.mapping,
-            spec_config=self.spec_config,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-            lora_config=lora_config,
-        )
-        self.model = loader.load(checkpoint_dir=model_path,
-                                 checkpoint_loader=checkpoint_loader,
-                                 drafting_loop_wrapper=drafting_loop_wrapper)
-        self.model_is_wrapped = loader.model_is_wrapped
+        if model is None:
+            loader = ModelLoader(
+                pytorch_backend_config=pytorch_backend_config,
+                mapping=self.mapping,
+                spec_config=self.spec_config,
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+                lora_config=lora_config,
+            )
+            self.model = loader.load(checkpoint_dir=model_path,
+                                     checkpoint_loader=checkpoint_loader)
+        else:
+            self.model = model
+        if drafting_loop_wrapper is not None:
+            self.model = drafting_loop_wrapper(self.model)
+            self.model_is_wrapped = True
+        else:
+            self.model_is_wrapped = False
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
@@ -246,7 +252,8 @@ class PyTorchModelEngine(ModelEngine):
 
         self.is_warmup = False
 
-        self.attn_backend = get_attention_backend(attn_backend)
+        self.attn_backend = get_attention_backend(
+            pytorch_backend_config.attn_backend)
 
         if self.is_spec_decode:
             self.spec_metadata = None

@@ -187,8 +187,6 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-        drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
-                                                 torch.nn.Module]] = None,
     ) -> DecoderModelForCausalLM:
         """
         Loads the model, its weights, and applies necessary configurations.
@@ -196,7 +194,6 @@ class ModelLoader:
         Args:
             checkpoint_dir: The directory of the model checkpoint.
             checkpoint_loader: The loader object for model checkpoints.
-            drafting_loop_wrapper: An optional wrapper for speculative decoding models.
 
         Returns:
             The loaded and initialized PyTorch model.
@@ -280,12 +277,6 @@ class ModelLoader:
                 logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
-
-        if drafting_loop_wrapper is not None:
-            model = drafting_loop_wrapper(model)
-            self.model_is_wrapped = True
-        else:
-            self.model_is_wrapped = False
 
         return model
 
