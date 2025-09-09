@@ -848,15 +848,20 @@ class PyTorchModelEngine(ModelEngine):
                         f"Run generation only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
                     )
                     self.enable_spec_decode = draft_len > 0 or self.is_draft_model
+
+                    def _update_spec_resource_manager(is_first_draft):
+                        if self.is_draft_model and isinstance(
+                                spec_resource_manager, Eagle3ResourceManager):
+                            spec_resource_manager.is_first_draft = is_first_draft
+
+                    _update_spec_resource_manager(draft_len > 0)
                     if self.pytorch_backend_config.enable_autotuner:
                         with self.no_cuda_graph(), autotune():
                             self.forward(batch,
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
                         torch.cuda.synchronize()
-                    if self.is_draft_model and isinstance(
-                            spec_resource_manager, Eagle3ResourceManager):
-                        spec_resource_manager.is_first_draft = draft_len > 0
+                    _update_spec_resource_manager(draft_len > 0)
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
