@@ -57,7 +57,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="The path to the model checkpoint or the model name from the Hugging Face Hub."
     )
 
-    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
+    model_factory: str = Field(
         default="AutoModelForCausalLM",
         description="The model factory to use for loading the model.",
     )
@@ -153,23 +153,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="The fraction of available memory to allocate for cache.",
     )
 
-    simple_shard_only: bool = Field(
-        default=False,
-        description="If True, force simple sharding (all_gather) in tensor parallelism. "
-        "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
-    )
-
-    use_sharding_from_factory: bool = Field(
-        default=False,
-        description="If True, use sharding from the model factory. If False, use sharding from the "
-        "AutoDeployConfig.",
-    )
-
-    sharding_dims: List[str] = Field(
-        default=["tp", "ep", "dp"],
-        description="The sharding methods to apply by the heuristic sharding stage.",
-    )
-
     compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
         Field(
             default="torch-compile",
@@ -210,6 +193,17 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         if self.attn_backend == "triton" or self.attn_backend == "torch":
             self.attn_page_size = self.max_seq_len
         return self
+
+    @field_validator("model_factory", mode="after")
+    @classmethod
+    def model_factory_exists(cls, value: str) -> str:
+        if not ModelFactoryRegistry.has(value):
+            raise ValueError(
+                f"'{value}' does not exist in the model factory registry. Available values: "
+                f"{ModelFactoryRegistry.entries()}."
+            )
+
+        return value
 
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:

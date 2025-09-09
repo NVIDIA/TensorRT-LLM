@@ -56,7 +56,8 @@ transforms:
     stage: sharding
     simple_shard_only: false
     use_sharding_from_factory: false
-    sharding_dims: ['tp', 'ep', 'dp']
+    support_partial_config: false
+    sharding_dims: ['tp', 'ep', 'bmm']
   # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding
