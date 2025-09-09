@@ -448,10 +448,10 @@ class DeepseekV3MTPHead(nn.Module):
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
-        if not (self.model_config.mapping.enable_attention_dp):
+        if not self.model_config.mapping.enable_attention_dp:
             lm_head.gather_output = False
         logits = lm_head(hidden_states)
-        if not (self.model_config.mapping.enable_attention_dp):
+        if not self.model_config.mapping.enable_attention_dp:
             lm_head.gather_output = True
         return logits
 
@@ -567,16 +567,17 @@ class Deepseekv3RoutingImpl():
         self.routed_scaling_factor = routed_scaling_factor
         self.is_fused = is_fused
 
+    @staticmethod
     @torch.compile(options={"max-autotune": True})
-    def get_scores(self, logits, e_score_correction_bias):
+    def get_scores(logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias
         return scores, scores_with_bias
 
     def noaux_tc(self, logits, e_score_correction_bias):
         n_group = self.n_group
-        scores, scores_with_bias = self.get_scores(logits,
-                                                   e_score_correction_bias)
+        scores, scores_with_bias = Deepseekv3RoutingImpl.get_scores(
+            logits, e_score_correction_bias)
         scores_shape = list(scores_with_bias.shape)
 
         if enable_llm_debug():
