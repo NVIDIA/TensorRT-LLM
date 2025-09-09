@@ -64,6 +64,7 @@ def test_register_fake(custom_ops):
         "trtllm::mtp_prepare_drafter_inputs_op",
         "trtllm::selective_scan",
         "trtllm::reducescatter_list",
+        "trtllm::reducescatter_list_pg",
         "trtllm::fp8_per_tensor_scale_moe_runner",
         "trtllm::migrate_to_host_accessible",
         "trtllm::mnnvl_moe_alltoallv_prepare_without_allgather",
