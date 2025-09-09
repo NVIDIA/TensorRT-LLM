@@ -17,6 +17,7 @@
 
 #include "dataTransceiver.h"
 
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
@@ -31,10 +32,120 @@
 #include <memory>
 #include <unordered_map>
 
-namespace tensorrt_llm::batch_manager
+namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-using kv_cache_manager::BlockRange;
+using BlockRange = tensorrt_llm::batch_manager::kv_cache_manager::BlockRange;
+
+std::vector<Connection const*> const& TransferSession::getConnections() const
+{
+    return mConnections;
+}
+
+void TransferSession::setConnection(size_t idx, Connection const* conn)
+{
+    mConnections.at(idx) = conn;
+}
+
+DataContext const& TransferSession::getDataContext() const
+{
+    return mDataContext;
+}
+
+executor::DataTransceiverState const& TransferSession::getSelfState() const
+{
+    return *mSelfState;
+}
+
+executor::DataTransceiverState const& TransferSession::getOtherState() const
+{
+    return mOtherState;
+}
+
+runtime::BufferManager const& TransferSession::getBufferManager() const
+{
+    return *mBufferManager;
+}
+
+void TransferSession::send(size_t idx, void const* data, size_t size)
+{
+    try
+    {
+        mConnections.at(idx)->send(mDataContext, data, size);
+    }
+    catch (std::exception const& e)
+    {
+        throw common::RequestSpecificException(
+            __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
+    }
+}
+
+void TransferSession::recv(size_t idx, void* data, size_t size)
+{
+    try
+    {
+        mConnections.at(idx)->recv(mDataContext, data, size);
+    }
+    catch (std::exception const& e)
+    {
+        throw common::RequestSpecificException(
+            __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
+    }
+}
+
+LlmRequest const& TransferSession::getLlmRequest() const
+{
+    TLLM_CHECK(mRequest != nullptr);
+    return *mRequest;
+}
+
+void TransferSession::setLlmRequest(LlmRequest const& llmRequest)
+{
+    mRequest = &llmRequest;
+}
+
+void TransferSession::appendMeasure(double delay, double duration, size_t size)
+{
+    if (!mRecordMeasure)
+    {
+        return;
+    }
+    auto bandwidth = size * 8 / (duration / 1000) / 1e9; // byte, ms => Gbps
+    mMeasures.emplace_back(Measure{delay, duration, bandwidth});
+}
+
+void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) const
+{
+    if (mMeasures.empty())
+    {
+        return;
+    }
+    // write header if not exist
+    if (outFile.tellp() == 0)
+    {
+        outFile << "RequestID";
+        for (size_t i = 0; i < mMeasures.size(); i++)
+        {
+            outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
+        }
+        outFile << '\n';
+    }
+    // write measures
+    TLLM_CHECK(isContext || mRequest->getContextPhaseParams().has_value());
+    auto reqId = isContext ? mRequest->mRequestId : mRequest->getContextPhaseParams().value().getReqId();
+    outFile << reqId;
+    for (auto const& measure : mMeasures)
+    {
+        outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
+    }
+    outFile << '\n' << std::flush;
+}
+
+std::vector<size_t> const& RequestInfo::getBlockHashes() const noexcept
+{
+    return mBlockHashes;
+}
+
 using runtime::SizeType32;
 using AgentConnectionManager = tensorrt_llm::executor::kv_cache::AgentConnectionManager;
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
@@ -71,7 +182,7 @@ RequestInfo::RequestInfo(
 {
 }
 
-bool RequestInfo::operator==(RequestInfo const& rhs) const
+bool kv_cache_manager::RequestInfo::operator==(RequestInfo const& rhs) const
 {
     return mRequestId == rhs.mRequestId && mBlockHashes == rhs.mBlockHashes && mTransState == rhs.mTransState;
 }
@@ -758,4 +869,4 @@ std::future<void> CacheReceiver::receiveAsync(LlmRequest& llmRequest) const
 
 CacheReceiver::~CacheReceiver() = default;
 
-} // namespace tensorrt_llm::batch_manager
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager

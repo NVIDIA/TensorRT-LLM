@@ -38,6 +38,8 @@
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
+#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -115,7 +117,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     : mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
     , mCacheTransceiverConfig{cacheTransceiverConfig}
 {
-    using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (worldConfig.isPipelineParallel())
     {
         mMpiGroupPipeParaComm = std::make_shared<tensorrt_llm::mpi::MpiComm>(
@@ -199,13 +200,13 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_THROW("Unsupported cache transceiver backend type ");
     }
 
-    using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
     auto makeFormatter = [cacheManager, isMLA, this]()
     { return createCacheFormatter(cacheManager, mCacheTransBufferManager.get(), isMLA); };
 
-    mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
-    mCacheReceiver
-        = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
+    mCacheSender = std::make_unique<kv_cache_manager::CacheSender>(
+        mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
+    mCacheReceiver = std::make_unique<kv_cache_manager::CacheReceiver>(
+        mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
 
     initializeCommState();
 }

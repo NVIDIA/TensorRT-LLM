@@ -114,8 +114,8 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
     std::future<void> future = promise.get_future();
     auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
 
-    uint64_t tag
-        = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | static_cast<uint64_t>(batch_manager::TransceiverTag::kID_TAG);
+    uint64_t tag = ((mSendTagPrefix & 0xFFFFFFFF) << 32)
+        | static_cast<uint64_t>(tensorrt_llm::batch_manager::kv_cache_manager::TransceiverTag::kID_TAG);
     std::vector<char> buffer(size + sizeof(mConnectionId));
     memcpy(buffer.data(), data, size);
     memcpy(buffer.data() + size, &mConnectionIdInPeer, sizeof(mConnectionIdInPeer));
@@ -133,7 +133,7 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
 
 void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
-    if (ctx.getTag() == batch_manager::TransceiverTag::kID_TAG)
+    if (ctx.getTag() == tensorrt_llm::batch_manager::kv_cache_manager::TransceiverTag::kID_TAG)
     {
         sendConnectionId(ctx, data, size);
         return;
