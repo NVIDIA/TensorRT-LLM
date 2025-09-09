@@ -1,10 +1,10 @@
-import time
+import argparse
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 
 
-def main():
+def main(args):
 
     prompt_a = (
         "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
@@ -20,79 +20,52 @@ def main():
 
     kv_cache_max_tokens = 256
     kv_cache_page_size = 16
+    kv_cache_host_size = 1024**3 if args.enable_offloading else 0
 
-    # Offloading Off
-    print("\n ======  Offloading Off ======  \n")
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=max_batch_size,
               max_seq_len=max_seq_len,
               kv_cache_config=KvCacheConfig(enable_block_reuse=True,
                                             max_tokens=kv_cache_max_tokens,
                                             tokens_per_block=kv_cache_page_size,
-                                            host_cache_size=0))
+                                            host_cache_size=kv_cache_host_size))
     # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
     print(
         f"Prompt: {output_a.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
     )
-
-    # since max_batch_size=1, prompt_b clears and update kv cache
+    '''
+    since max_batch_size=1,
+    if enable_offloading=False:
+        prompt_b clears and update kv cache
+    if enable_offloading=True:
+        kv cache of prompt_a will be offloaded to host memory.
+        kv cache of prompt_b keeps in device memory.
+    '''
     output_b = llm.generate(prompt_b)
     print(
         f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
     )
-
-    # prompt_a clears and update kv cache again
-    # no kv cache reuse happens
+    '''
+    if not enable_offloading:
+        prompt_a clears and update kv cache again, no kv cache reuse happens
+    else:
+        kv cache of prompt_a will be onboarded to device memory, and be reused.
+        kv cache of prompt_b will be offloaded to host memory.
+    '''
     output_a = llm.generate(prompt_a)
     print(
         f"Prompt: {output_a.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
     )
-
-    # prompt_b clears and update kv cache again
-    # no kv cache reuse happens
-    output_b = llm.generate(prompt_b)
-    print(
-        f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
-    )
-
-    llm.shutdown()
-    time.sleep(5)
-
-    # Offloading On
-    print("\n ======  Offloading On ======  \n")
-    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-              max_batch_size=max_batch_size,
-              max_seq_len=max_seq_len,
-              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
-                                            max_tokens=kv_cache_max_tokens,
-                                            tokens_per_block=kv_cache_page_size,
-                                            host_cache_size=1024**3))
-    # prompt_a occupies kv cache pool
-    output_a = llm.generate(prompt_a)
-    print(
-        f"Prompt: {output_a.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
-    )
-
-    # since max_batch_size=1, and offloading is enabled,
-    # kv cache of prompt_a will be offloaded to host memory.
-    # kv cache of prompt_b keeps in device memory.
-    output_b = llm.generate(prompt_b)
-    print(
-        f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
-    )
-
-    # kv cache of prompt_a will be onboarded to device memory,
-    # kv cache of prompt_b will be offloaded to host memory.
-    # kv cache of prompt_a will be reused.
-    output_a = llm.generate(prompt_a)
-    print(
-        f"Prompt: {output_a.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
-    )
-
-    # kv cache of prompt_b will be onboarded to device memory,
-    # kv cache of prompt_a will be offloaded to host memory.
-    # kv cache of prompt_b will be reused.
+    '''
+    if not enable_offloading:
+        prompt_b clears and update kv cache again, no kv cache reuse happens
+    else:
+        kv cache of prompt_b will be onboarded to device memory, and be reused.
+        kv cache of prompt_a will be offloaded to host memory.
+    '''
+    #
+    #
     output_b = llm.generate(prompt_b)
     print(
         f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
@@ -102,4 +75,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--enable_offloading',
+                        default=False,
+                        action='store_true')
+    args = parser.parse_args()
+    main(args)
