@@ -72,10 +72,18 @@ class CUDAGraphRunner:
                         dtype=torch.int32),
         }
         if engine.use_mrope:
-            self.shared_static_tensors["mrope_position_deltas"] = torch.zeros(
-                (self.max_supported_batch_size, 1),
-                device="cuda",
-                dtype=torch.int32)
+            self.shared_static_tensors["position_ids"] = torch.zeros(
+                (3, 1, max_total_tokens), device="cuda", dtype=torch.int32)
+            self.shared_static_tensors["multimodal_params"] = [
+                MultimodalParams(
+                    multimodal_data={
+                        "mrope_config": {
+                            "mrope_position_deltas":
+                            torch.zeros(
+                                (1, 1), device="cuda", dtype=torch.int32)
+                        }
+                    }) for _ in range(max_total_tokens)
+            ]
 
     @property
     def enable_spec_decode(self):
@@ -171,6 +179,7 @@ class CUDAGraphRunner:
                 initial_inputs: Dict[str, Any],
                 postprocess_fn: Optional[Callable] = None):
         """Captures the forward pass for a given batch size."""
+        engine = self._get_engine()
         key = (batch_size, self.draft_len)
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -187,22 +196,11 @@ class CUDAGraphRunner:
             [:, :num_tokens_for_capture],
         }
         if engine.use_mrope:
-            static_tensors["position_ids"] = torch.zeros(
-                (3, 1, batch_size * self.max_beam_width * token_per_request),
-                device="cuda",
-                dtype=torch.int32)
-            static_tensors["multimodal_params"] = [
-                MultimodalParams(
-                    multimodal_data={
-                        "mrope_config": {
-                            "mrope_position_deltas":
-                            torch.zeros(
-                                (1, 1), device="cuda", dtype=torch.int32)
-                        }
-                    }) for _ in range(batch_size)
-            ]
-
-        self.static_inputs[key] = static_tensors
+            sliced_static_tensors["position_ids"] = self.shared_static_tensors[
+                "position_ids"][:, :, :num_tokens_for_capture],
+            sliced_static_tensors[
+                "multimodal_params"] = self.shared_static_tensors[
+                    "multimodal_params"][:batch_size * self.max_beam_width]
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
@@ -249,6 +247,7 @@ class CUDAGraphRunner:
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
+        print(f"[TRT-LLM DEBUG] position_ids.shape: {position_ids.shape}")
         if engine.use_mrope and current_inputs.get(
                 'multimodal_params') is not None:
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
