@@ -59,7 +59,6 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
     {
         mFreeBlockIterators.reserve(mFreeBlockIterators.size() + sizes[cacheLevel]);
         mFreeQueues.emplace_back(std::vector<FreeBlocksQueue>(kMaxPriority - kMinPriority + 1));
-        mReleasedBlocks.emplace_back(std::unordered_set<SizeType32>());
 
         auto& freeQueue = mFreeQueues[cacheLevel][defaultPriorityIdx];
 
@@ -67,7 +66,6 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
         {
             // Initialize all blocks to be the default priority level
             mFreeBlockIterators.emplace_back(freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]));
-            mReleasedBlocks[cacheLevel].insert(startIdx + blockId);
         }
 
         startIdx += sizes[cacheLevel];
@@ -134,35 +132,14 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
-    mReleasedBlocks[cacheLevel].insert(id);
-
-    // It's possible that this block is the child of a matched block that's in mFreeQueues. If this happens, we need to
-    // remove the parent from mFreeQueues, since it's no longer a released leaf block.
-    auto parent = block->getPrevBlock();
-    if (parent != nullptr)
+    auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
+    if (toFront)
     {
-        auto const parentId = parent->getBlockId();
-        if (parentId != KVCacheBlock::kCachedBlocksRootId && mFreeBlockIterators[parent->getBlockId()] != std::nullopt
-            && !isReleasedLeafBlock(parent))
-        {
-            mFreeQueues[getCacheLevel(parent)][getPriorityIdx(parent->getPriority())].erase(
-                *mFreeBlockIterators[parentId]);
-            mFreeBlockIterators[parentId] = std::nullopt;
-        }
+        mFreeBlockIterators[id] = q.insert(q.begin(), block);
     }
-
-    if (mFreeBlockIterators[block->getBlockId()] == std::nullopt && isReleasedLeafBlock(block))
+    else
     {
-        // If there are no children, this is a leaf block. Insert into a queue.
-        auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
-        if (toFront)
-        {
-            mFreeBlockIterators[id] = q.insert(q.begin(), block);
-        }
-        else
-        {
-            mFreeBlockIterators[id] = q.insert(q.end(), block);
-        }
+        mFreeBlockIterators[id] = q.insert(q.end(), block);
     }
 
     mNumFreeBlocksPerLevel[cacheLevel]++;
@@ -192,24 +169,10 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
     SizeType32 const id = block->getBlockId();
     SizeType32 const cacheLevel = getCacheLevel(block);
 
-    if (mReleasedBlocks[cacheLevel].find(id) != mReleasedBlocks[cacheLevel].end())
-    {
-        mNumFreeBlocksPerLevel[cacheLevel] -= 1;
-        mReleasedBlocks[cacheLevel].erase(id);
-    }
-
     if (mFreeBlockIterators[id] != std::nullopt)
     {
         mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
-
-        BlockPtr const parent = block->getPrevBlock();
-
-        if (parent.get() != nullptr && parent->getBlockId() != KVCacheBlock::kCachedBlocksRootId
-            && mFreeBlockIterators[parent->getBlockId()] == std::nullopt && isReleasedLeafBlock(parent))
-        {
-            auto& q = mFreeQueues[getCacheLevel(parent)][getPriorityIdx(parent->getPriority())];
-            mFreeBlockIterators[parent->getBlockId()] = q.insert(q.end(), parent);
-        }
+        mNumFreeBlocksPerLevel[cacheLevel] -= 1;
     }
 
     mFreeBlockIterators[id] = std::nullopt;
@@ -221,28 +184,6 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
 
     mExpiringBlockHeap.erase(block);
     block->setDurationMs(durationMs);
-}
-
-bool LRUEvictionPolicy::isReleasedLeafBlock(BlockPtr const& block)
-{
-    SizeType32 const blockCacheLevel = getCacheLevel(block);
-
-    if (mReleasedBlocks[blockCacheLevel].find(block->getBlockId()) == mReleasedBlocks[blockCacheLevel].end())
-    {
-        return false;
-    }
-
-    for (auto const& p : block->getNextBlocks())
-    {
-        SizeType32 const childCacheLevel = getCacheLevel(p.second);
-        if (mReleasedBlocks[childCacheLevel].find(p.second->getBlockId()) != mReleasedBlocks[childCacheLevel].end()
-            && childCacheLevel <= blockCacheLevel)
-        {
-            return false;
-        }
-    }
-
-    return true;
 }
 
 std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() const
