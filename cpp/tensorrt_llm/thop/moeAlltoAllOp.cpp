@@ -482,6 +482,11 @@ torch::Tensor moeA2AInitializeOp(
     moe_a2a_metainfo[COMPLETION_FLAGS_OFFSET_INDEX] = static_cast<int64_t>(offsets.completion_flags_offset);
     moe_a2a_metainfo[SEND_INDICES_OFFSET_INDEX] = static_cast<int64_t>(offsets.sendIndices_offset);
     moe_a2a_metainfo[PAYLOAD_DATA_OFFSET_INDEX] = static_cast<int64_t>(offsets.payload_data_offset);
+
+    // Memset workspace to 0 and synchronize among ranks
+    workspace[epRank].zero_();
+    cudaDeviceSynchronize();
+    tensorrt_llm::mpi::MpiComm::world().barrier();
     
     return moe_a2a_metainfo;
 }
