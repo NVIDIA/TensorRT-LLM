@@ -141,6 +141,9 @@ class SequenceInfo:
         # indicator if extra args are activated that are needed for cached attention backends
         self._is_cached_attn = False
 
+        # indicator how to handle the "None" input for extra args
+        self._use_tensors_for_none_inputs = True
+
         # container for dynamic shapes
         self._dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
 
@@ -166,7 +169,7 @@ class SequenceInfo:
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
-        self._extra_args: Dict[str, torch.Tensor] = {}
+        self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
         self._extra_none_inputs: Dict[str, torch.Tensor] = {}
         self._extra_dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
         self._extra_dynamic_shapes_callbacks: Dict[str, DynamicShapeCallback] = {}
@@ -178,6 +181,20 @@ class SequenceInfo:
     @property
     def device(self) -> torch.device:
         return self._args_device["input_ids"].device
+
+    @property
+    def use_none_tensors(self) -> bool:
+        return self._use_tensors_for_none_inputs
+
+    @use_none_tensors.setter
+    def use_none_tensors(self, use_tensors: bool) -> None:
+        """Set the none mode for the extra arguments.
+
+        Args:
+            use_tensors: Whether to use tensors for the none inputs. If False, we will pass None
+                instead of the none input tensor.
+        """
+        self._use_tensors_for_none_inputs = use_tensors
 
     def _shape_for_forward(self, tnsr: torch.Tensor) -> torch.Tensor:
         """Shape the tensor for the forward pass based on the current attention mode.
@@ -209,7 +226,11 @@ class SequenceInfo:
 
         # check other args to include
         if include_extra_args:
-            args.update(self._extra_args)
+            for k, v in self._extra_args.items():
+                if v is None and self._use_tensors_for_none_inputs:
+                    args[k] = self._extra_none_inputs[k]
+                else:
+                    args[k] = v
 
         if include_cached_args:
             args.update({k: self._args_device[k] for k in self._cached_arg_names})
@@ -458,7 +479,8 @@ class SequenceInfo:
     def to(self, *args, **kwargs) -> None:
         def _move_dict(d: Dict[str, torch.Tensor]) -> None:
             for k, v in d.items():
-                d[k] = v.to(*args, **kwargs)
+                if v is not None:
+                    d[k] = v.to(*args, **kwargs)
 
         _move_dict(self._args_device)
         _move_dict(self._extra_args)
@@ -558,7 +580,7 @@ class SequenceInfo:
                         tnsr_like = tnsr_like[0]
                 self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
             else:
-                self._extra_args[name] = self._extra_none_inputs[name]
+                self._extra_args[name] = None
 
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(
@@ -669,7 +691,7 @@ class SequenceInfo:
         """
         assert name not in self._named_args().keys(), f"Extra argument {name} already exists"
 
-        self._extra_args[name] = none_input.to(self.device)
+        self._extra_args[name] = None
         self._extra_none_inputs[name] = none_input.to(self.device)
 
         if dynamic_shape_callback is None:

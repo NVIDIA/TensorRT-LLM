@@ -64,9 +64,11 @@ class BuildAndLoadFactoryModel(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         # load model with auto sharding
         assert isinstance(factory, hf.AutoModelFactory)
+        # TODO: figure out correct device map, tp_plan argument here???
         model = factory.automodel_cls.from_pretrained(
             factory.model,
             trust_remote_code=True,
+            # device_map="cuda",
             tp_plan="auto",
             torch_dtype="auto",
         )
@@ -79,6 +81,9 @@ class BuildAndLoadFactoryModel(BaseTransform):
         # we set the standard example sequence WITHOUT extra_args to set them to None so that
         # only the text portion of the model gets called.
         cm.info.set_example_sequence()
+
+        # this ensures that extra_args are passed is None instead of the None tensor.
+        cm.info.use_none_tensors = False
 
         # by convention, we say this fake graph module is always clean
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
