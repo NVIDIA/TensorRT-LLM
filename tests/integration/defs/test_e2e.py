@@ -1881,8 +1881,8 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                 "--spec_decode_algo",
                 "MTP",
                 "--model_dir",
-                "--use_one_model",
                 f"{llm_models_root()}/{model_path}",
+                "--use_one_model",
             ],
             stdout=running_log)
         _check_mem_usage(running_log, [54.60, 0, 0, 0])
