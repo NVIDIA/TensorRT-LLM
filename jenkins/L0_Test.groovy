@@ -1215,8 +1215,12 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-Triton-", add "backend=triton" to makoArgs
         // At this point, only tests with backend=triton or unspecified backend will be run
         makoArgs += ["backend=triton"]
+    } else if (stageName.contains("-FMHA-")) {
+        // If stageName contains "-FMHA-", add "backend=fmha" to makoArgs
+        // At this point, only tests with backend=fmha or unspecified backend will be run
+        makoArgs += ["backend=fmha"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", or "-Triton-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", or "-FMHA-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -1963,6 +1967,7 @@ def launchTestJobs(pipeline, testFilter)
     x86TestConfigs = [
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
@@ -2000,6 +2005,7 @@ def launchTestJobs(pipeline, testFilter)
         "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
         "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 2],
         "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 2],
+        "A10-FMHA-Post-Merge-1": ["a10", "l0_a10", 1, 1],
         "A30-TensorRT-Post-Merge-1": ["a30", "l0_a30", 1, 6],
         "A30-TensorRT-Post-Merge-2": ["a30", "l0_a30", 2, 6],
         "A30-TensorRT-Post-Merge-3": ["a30", "l0_a30", 3, 6],
@@ -2017,11 +2023,13 @@ def launchTestJobs(pipeline, testFilter)
         "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
         "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
         "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
+        "A100X-FMHA-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
         "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
         "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
         "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
         "L40S-TensorRT-Post-Merge-4": ["l40s", "l0_l40s", 4, 5],
         "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
+        "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "H100_PCIe-PyTorch-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
@@ -2029,6 +2037,7 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-TensorRT-Post-Merge-3": ["h100-cr", "l0_h100", 3, 5],
         "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
         "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
+        "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
         "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
         "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
@@ -2345,9 +2354,9 @@ def launchTestJobs(pipeline, testFilter)
         }, {}, true)
     }]}
 
-    multiGpuJobs = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
+    multiGpuJobs = parallelJobs.findAll{(it.key.contains("2_GPUs") || it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
     println multiGpuJobs.keySet()
-    multiGpuJobsPostMerge = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && it.key.contains("Post-Merge")}
+    multiGpuJobsPostMerge = parallelJobs.findAll{(it.key.contains("2_GPUs") || it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && it.key.contains("Post-Merge")}
 
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
@@ -2422,6 +2431,7 @@ def launchTestJobs(pipeline, testFilter)
             "pytorch": "-PyTorch-",
             "tensorrt": "-TensorRT-",
             "cpp": "-CPP-",
+            "fmha": "-FMHA-",
         ]
         def backendModeList = backendMode.collect { changeMap.get(it) }.flatten()
         def parallelJobsNoBackend = parallelJobsFiltered.findAll { key, _ ->
@@ -2445,8 +2455,9 @@ def launchTestJobs(pipeline, testFilter)
         } else {
             echo "ONLY_ONE_GROUP_CHANGED mode is true. The group is: ${testFilter[(ONLY_ONE_GROUP_CHANGED)]}."
             def excludedBackends = new HashMap()
-            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-Triton-"]
-            excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-"]
+            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-Triton-", "-FMHA-"]
+            excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-", "-FMHA-"]
+            excludedBackends["FMHA"] = ["-PyTorch-", "-CPP-", "-TensorRT-", "-Triton-"]
             def group = testFilter[(ONLY_ONE_GROUP_CHANGED)]
             if (excludedBackends.containsKey(group)) {
                 parallelJobsFiltered = parallelJobsFiltered.findAll { key, value ->

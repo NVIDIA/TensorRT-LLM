@@ -61,6 +61,8 @@ def getSMVersion():
 def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
     verbose = 0
     sm_version = getSMVersion()
+    if flag == "-use-attention-sinks" and sm_version != 90:
+        pytest.skip("use-attention-sinks is only supported on sm90 currently.")
     if sm_version == 90 and tiled_kernel == "-force-non-tiled":
         pytest.skip(
             "Tiled/non-tiled flags only make a difference to ampere-style kernels."
