@@ -86,10 +86,6 @@ class _Pointer(Pointer):
         raise NotImplementedError("align is not supported in runtime")
 
     def verify(self, expected_py_type):
-        # if expected_py_type is Pointer:
-        #     return True
-        # elif isinstance(expected_py_type, ir.Value) and expected_py_type.ty is Pointer:
-        #     return True
         if expected_py_type is Pointer or (isinstance(
                 expected_py_type, ir.Value) and expected_py_type.ty is Pointer):
             return True
