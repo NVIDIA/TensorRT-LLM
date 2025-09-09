@@ -244,13 +244,16 @@ class GenerationResultBase:
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
-        if logprobs_result:
+        # prompt logprobs handling
+        if logprobs_result and logprobs_result.prompt is not None: # both backends
+            output.prompt_logprobs = logprobs_result.prompt
+        # generation logprobs handling (provenance varies by backend)
+        if logprobs_result and logprobs_result.generation is not None: # TRT backend
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
             output._last_logprobs_len = len(output.logprobs)
-            output.prompt_logprobs = logprobs_result.prompt
             output.logprobs += logprobs_result.generation
-        elif response_tensors.log_probs is not None:
-            # handle logprobs directly from response tensors
+        elif response_tensors.log_probs is not None: # PyTorch backend
+            # handle logprobs directly from response tensors given by sampler
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs = response_tensors.log_probs[src_idx]
             # overcome some WAR in the cpp executor
@@ -701,12 +704,12 @@ def compute_logprobs(
     output_token_ids: Optional[list[int]],
 ) -> LogProbsResult:
     """
-    Compute top-K logprobs and ranks for each token position.
+    Compute top-K logprobs from logits when engine doesn't provide them directly.
 
-    Returns:
-        LogProbsResult, a NamedTuple containing:
-            - prompt: Optional[List[Dict[token_id, Logprob]]] logprobs for prompt tokens.
-            - generation: Optional[List[Dict[token_id, Logprob]]] logprobs for generated tokens.
+    Used for post-processing logits into logprobs.
+    - Prompt logprobs (from context_logits): always used.
+    - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
+    - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
     """
 
     def _topk_logprobs(logits: torch.Tensor, top_k: int,

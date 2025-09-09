@@ -574,12 +574,6 @@ class BaseLLM:
                          is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
-            # TODO: remove these checks after PyTorch backend
-            # fully support TopK prompt and generation logprobs.
-            # if sampling_params.prompt_logprobs:
-            #     raise ValueError(
-            #         f"`prompt_logprobs` in sampling_params is not supported in the PyTorch backend yet. Received `prompt_logprobs={sampling_params.prompt_logprobs}`. Please unset this field."
-            #     )
             if sampling_params.logprobs and sampling_params.logprobs > 1:
                 raise ValueError(
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."

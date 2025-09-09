@@ -1061,7 +1061,11 @@ def _get_params_for_first_rsp(
 def _get_logprobs(worker,
                   response: Union[tllm.Response, LlmResponse],
                   is_pytorch_backend=False) -> Optional[LogProbsResult]:
-    """Compute logprob and prompt logprob and clear out logits if applicable.
+    """Compute logprobs from response logits when needed.
+
+    Logprobs provenance varies by backend:
+    - PyTorch: Generation logprobs computed in sampler, only prompt logprobs computed here
+    - TRT: Both prompt and generation logprobs computed here from logits
     """
 
     logprobs_result = None
@@ -1074,10 +1078,14 @@ def _get_logprobs(worker,
     if logprob_params:
         if is_pytorch_backend:
             if not logprob_params.prompt_logprobs:
-                # generation logprobs are already calculated in PyTorch backend sampler
+                # PyTorch: generation logprobs computed in sampler, no post-processing needed
                 return
             else:
-                # Fallback: compute from context_logits if available
+                # PyTorch: compute only prompt logprobs from context logits
+                # This can be done as a postprocessing step instead of coupling it to the
+                # pytorch engine, because prompt_logprobs calculation is not complicated by
+                # generation sampling strategies. Therefore it is simpler to do it here than
+                # doing it in the pytorch engine and plumbing it through the response.
                 logprobs_result = compute_logprobs(
                     logprob_params.prompt_logprobs, None,
                     response.result.context_logits, None, None)
@@ -1087,7 +1095,7 @@ def _get_logprobs(worker,
                     response.clear_context_logits()
                 return logprobs_result
 
-        # trt backend
+        # TRT backend: compute both prompt and generation logprobs from logits
         logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
                                            logprob_params.logprobs,
                                            response.result.context_logits,
