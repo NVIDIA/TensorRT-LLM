@@ -22,7 +22,7 @@ def main():
               kv_cache_config=KvCacheConfig(enable_block_reuse=True,
                                             max_tokens=256,
                                             tokens_per_block=16))
-    # prompt_a occupies kv cache
+    # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
     print(output_a.prompt)
 
@@ -31,10 +31,12 @@ def main():
     print(output_b.prompt)
 
     # prompt_a clears and update kv cache again
+    # no kv cache reuse happens
     output_a = llm.generate(prompt_a)
     print(output_a.prompt)
 
     # prompt_b clears and update kv cache again
+    # no kv cache reuse happens
     output_b = llm.generate(prompt_b)
     print(output_b.prompt)
 
@@ -48,7 +50,7 @@ def main():
                                             max_tokens=256,
                                             tokens_per_block=16,
                                             host_cache_size=1024**3))
-    # prompt_a occupies kv cache
+    # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
     print(output_a.prompt)
 
