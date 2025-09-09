@@ -38,8 +38,7 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, std::option
     int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
     int64_t const routing_method_type, MoeRunnerType& moe_runner, int64_t moeConfigIndex)
 {
-    auto const sm = tensorrt_llm::common::getSMVersion();
-    TORCH_CHECK(sm == 100 || sm == 103, "Only SM100f is supported by FP8 block scale MOE");
+    TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP8 block scale MOE");
     TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
     TORCH_CHECK(routing_logits.sizes()[0] == hidden_states.sizes()[0],

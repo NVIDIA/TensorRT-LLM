@@ -16,14 +16,14 @@
 import pytest
 import torch
 from _torch.helpers import calc_diff
-from utils.util import getSMVersion
+from utils.util import getSMVersion, isSM100Family
 
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 
 
 @pytest.mark.skipif(
-    getSMVersion() < 100 or getSMVersion() >= 110,
+    not isSM100Family(),
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(

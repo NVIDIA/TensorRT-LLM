@@ -62,6 +62,7 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <math.h>
+#include <mutex>
 #include <sstream>
 
 namespace tensorrt_llm::kernels::cutlass_kernels_oss
@@ -140,14 +141,14 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
     // #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability == 103)
     {
-        static bool first_time = true;
-        if (first_time)
-        {
-            TLLM_LOG_WARNING(
+        static std::once_flag flag;
+        std::call_once(flag,
+            []()
+            {
+                TLLM_LOG_WARNING(
                 "Falling back to sm100f version due to a bug in cutlass." /*"For best performance please recompile with support for blackwell by "
                 "passing 103-real as an arch to build_wheel.py."*/);
-            first_time = false;
-        }
+            });
         return dispatchMoeGemmFinalDispatchTmaWarpSpecialized<cutlass::arch::Sm100, T, WeightType, OutputType,
             EpilogueTag, FUSION, TileShape, ClusterShape>(
             hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy, workspace_size);

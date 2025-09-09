@@ -23,6 +23,7 @@
 #include <type_traits>
 
 #include "cute/tensor.hpp"
+#include "tensorrt_llm/common/assert.h"
 
 namespace tensorrt_llm
 {
@@ -155,6 +156,7 @@ enum class CutlassTileConfigSM100 : int
     CtaShape128x256x256B = shape_tuple_to_enum(128, 256, 256),
 };
 
+// An alias to make the SHAPE_CASE macro work
 using CutlassTileConfigSM103 = CutlassTileConfigSM100;
 
 enum class CutlassTileConfigSM120 : int
@@ -423,7 +425,7 @@ struct CutlassGemmConfig
         , sm_version(sm_version)
         , is_tma_warp_specialized(true)
     {
-        assert(sm_version >= 100 && sm_version < 120 && "Expected SM 10x version");
+        TLLM_CHECK_WITH_INFO(sm_version >= 100 && sm_version < 120 && "Expected SM 10x version");
     }
 
     CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120, MainloopScheduleType mainloop_schedule,

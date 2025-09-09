@@ -867,9 +867,7 @@ def main(*,
 
         # Modify requirements.txt for wheel build based on CUDA version
         def modify_requirements_for_cuda():
-            requirements_file = project_dir / ("requirements-windows.txt"
-                                               if on_windows else
-                                               "requirements.txt")
+            requirements_file = project_dir / "requirements.txt"
             if os.environ.get("CUDA_VERSION", "").startswith("12."):
                 print(
                     "Detected CUDA 12 environment, modifying requirements.txt for wheel build..."
