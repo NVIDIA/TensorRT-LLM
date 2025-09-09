@@ -293,7 +293,7 @@ public:
 
     [[nodiscard]] bool hasSchedulingRefs() const;
 
-    // Thor J: This info is duplicated in KVCacheBlock and KVCachePromptLookupNode
+    // This info is duplicated in KVCacheBlock and KVCachePromptLookupNode
     // because it is needed by the former when KVCacheBlock might not be stored
     // in lookup structure and therefore cannot get this value from there
     void setBlockKey(BlockKey const& blockKey, bool isFull);
