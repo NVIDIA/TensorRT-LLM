@@ -36,7 +36,7 @@ def main():
     # since max_batch_size=1, prompt_b clears and update kv cache
     output_b = llm.generate(prompt_b)
     print(
-        f"Prompt: {output_b.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
+        f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
     )
 
     # prompt_a clears and update kv cache again
@@ -50,7 +50,7 @@ def main():
     # no kv cache reuse happens
     output_b = llm.generate(prompt_b)
     print(
-        f"Prompt: {output_b.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
+        f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
     )
 
     llm.shutdown()
@@ -75,7 +75,7 @@ def main():
     # kv cache of prompt_b keeps in device memory.
     output_b = llm.generate(prompt_b)
     print(
-        f"Prompt: {output_b.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
+        f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
     )
 
     # kv cache of prompt_a will be onboarded to device memory, kv cache of prompt_b will be offloaded to host memory.
@@ -89,7 +89,7 @@ def main():
     # kv cache of prompt_b will be reused.
     output_b = llm.generate(prompt_b)
     print(
-        f"Prompt: {output_b.prompt!r}, Generated text: {output_a.outputs[0].text!r}"
+        f"Prompt: {output_b.prompt!r}, Generated text: {output_b.outputs[0].text!r}"
     )
 
     llm.shutdown()
