@@ -66,11 +66,14 @@ class StreamOptions(OpenAIBaseModel):
     include_usage: Optional[bool] = True
     continuous_usage_stats: Optional[bool] = True
 
+class PromptTokensDetails(OpenAIBaseModel):
+    cached_tokens: int = 0
 
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
 
 
 class ModelCard(OpenAIBaseModel):
