@@ -14,7 +14,7 @@ transforms:
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ############################################################################################
-  transformers_replace_cached_attn:
+  transformers_replace_cached_attn2:
     stage: cache_init
     attn_backend: flashinfer
   initialize_cache:

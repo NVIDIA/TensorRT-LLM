@@ -76,6 +76,10 @@ class BuildAndLoadFactoryModel(BaseTransform):
         # as wrapper to satisfy the interface we will register the model as a submodule
         gm.add_module("factory_model", model)
 
+        # we set the standard example sequence WITHOUT extra_args to set them to None so that
+        # only the text portion of the model gets called.
+        cm.info.set_example_sequence()
+
         # by convention, we say this fake graph module is always clean
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
 

@@ -1,11 +1,11 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
 import operator
-from typing import Dict, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 from pydantic import Field
-from torch.fx import Graph, GraphModule, Node
+from torch.fx import GraphModule, Node
 
 from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegistry
 from ...distributed.common import all_gather_object, get_world_size
@@ -85,6 +85,50 @@ class InsertCachedAttention(BaseTransform):
     def attn_descriptor(self) -> Type[AttentionDescriptor]:
         return AttentionRegistry.get(self.config.attn_backend)
 
+    def _process_get_metadata(
+        self, gm: GraphModule, m_args: List[str], const_args: List[Any]
+    ) -> List[Node]:
+        """Process the get_metadata function into an op and return node references."""
+        # retrieve input nodes
+        input_nodes, _ = get_all_input_output_nodes(gm.graph)
+        input_nodes_mapping = {n.target: n for n in input_nodes}
+
+        # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
+        inputs_from_info = [input_nodes_mapping[k] for k in m_args]
+
+        # insert metadata computation and extract each argument as a node
+        get_metadata, num_metadata = self.attn_descriptor.get_prepare_metadata_op()
+        with gm.graph.inserting_before(input_nodes[-1].next):
+            ret_node = gm.graph.call_function(get_metadata, args=(*inputs_from_info, *const_args))
+            metadata_nodes = [
+                gm.graph.call_function(operator.getitem, args=(ret_node, idx))
+                for idx in range(num_metadata)
+            ]
+        return metadata_nodes
+
+    def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
+        """Process the cache nodes by inserting a cached attention replacement op."""
+        return add_graph_input(gm, cache_name)
+
+    def _insert_cached_attn_node(
+        self,
+        gm: GraphModule,
+        attn_node: Node,
+        qkv_nodes: List[Node],
+        meta_nodes: List[Node],
+        cache_nodes: List[Node],
+        buffer_nodes: List[Node],
+        constants: List[Any],
+    ):
+        """Insert a cached attention node into the graph."""
+        with gm.graph.inserting_before(attn_node):
+            cached_attn_node = gm.graph.call_function(
+                self.attn_descriptor.get_cached_attention_op(),
+                args=(*qkv_nodes, *meta_nodes, *cache_nodes, *buffer_nodes, *constants),
+            )
+        attn_node.replace_all_uses_with(cached_attn_node)
+        gm.graph.erase_node(attn_node)
+
     def _apply(
         self,
         gm: GraphModule,
@@ -100,11 +144,8 @@ class InsertCachedAttention(BaseTransform):
         # Get all attention nodes and their info objects
         source_op = attn_descriptor.get_source_attention_op()
 
-        # pick up graph
-        graph: Graph = gm.graph
-
         # look for relevant source attention nodes
-        source_attn_nodes = [n for n in graph.nodes if is_op(n, source_op)]
+        source_attn_nodes = [n for n in gm.graph.nodes if is_op(n, source_op)]
 
         if not source_attn_nodes:
             # If there are no nodes for kv cache insertion found, return current graph
@@ -116,24 +157,12 @@ class InsertCachedAttention(BaseTransform):
         if cm.info.is_paged:
             assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
 
-        # retrieve input nodes
-        input_nodes, _ = get_all_input_output_nodes(gm.graph)
-        input_nodes_mapping = {n.target: n for n in input_nodes}
-
         # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
-        inputs_from_info = [input_nodes_mapping[k] for k in cm.info.named_standard_args.keys()]
-        constants_from_info = cm.info.const_args_for_prepare_metadata
+        m_arg_keys = list(cm.info.named_standard_args.keys())
+        m_const_args = cm.info.const_args_for_prepare_metadata
 
         # insert metadata computation and extract each argument as a node
-        get_metadata, num_metadata = attn_descriptor.get_prepare_metadata_op()
-        with graph.inserting_before(input_nodes[-1].next):
-            ret_node = graph.call_function(
-                get_metadata, args=(*inputs_from_info, *constants_from_info)
-            )
-            metadata_nodes = [
-                graph.call_function(operator.getitem, args=(ret_node, idx))
-                for idx in range(num_metadata)
-            ]
+        metadata_nodes = self._process_get_metadata(gm, m_arg_keys, m_const_args)
 
         buffer_in_lookup: Dict[str, Node] = {}
 
@@ -150,7 +179,7 @@ class InsertCachedAttention(BaseTransform):
             ).items():
                 k_indexed = f"{k}_{idx}"
                 cm.add_cache(k_indexed, get_cache)
-                cache_in_nodes.append(add_graph_input(gm, k_indexed))
+                cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
 
             # setup + store global buffer initializers and buffers as input nodes
             # NOTE: we have to check against existing keys to make sure nothing is registered twice...
@@ -158,20 +187,16 @@ class InsertCachedAttention(BaseTransform):
             for k, get_buffer in attn_descriptor.get_global_buffer_initializers(attn_node).items():
                 if k not in buffer_in_lookup:
                     cm.add_cache(k, get_buffer)
-                    buffer_in_lookup[k] = add_graph_input(gm, k)
+                    buffer_in_lookup[k] = self._process_cache_node(gm, k)
                 buffer_in_nodes.append(buffer_in_lookup[k])  # store buffer nodes for this op
 
             # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
 
             # insert cached attention replacement op
-            with graph.inserting_before(attn_node):
-                cached_attn_node = graph.call_function(
-                    attn_descriptor.get_cached_attention_op(),
-                    args=(*qkv, *metadata_nodes, *cache_in_nodes, *buffer_in_nodes, *constants),
-                )
-            attn_node.replace_all_uses_with(cached_attn_node)
-            graph.erase_node(attn_node)
+            self._insert_cached_attn_node(
+                gm, attn_node, qkv, metadata_nodes, cache_in_nodes, buffer_in_nodes, constants
+            )
             num_cached_attn_replacements += 1
 
         info = TransformInfo(
