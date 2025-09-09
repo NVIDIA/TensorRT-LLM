@@ -90,12 +90,12 @@ Follow the linked catalog entry to enter a new container based on the pre-built 
 
 If you wish to use enroot instead of docker, then you can build a sqsh file that has the identical environment as the development image `tensorrt_llm/devel:latest` as follows.
 
-1. Allocate compute nodes:
+1. Allocate a compute node:
     ```bash
     salloc --nodes=1
     ```
 
-2. Create a sqsh file with essential TRTLLM dependencies installed
+2. Create a sqsh file with essential TensorRT-LLM dependencies installed
     ```bash
     # Using default sqsh filename (enroot/tensorrt_llm.devel.sqsh)
     make -C enroot build_sqsh
@@ -104,7 +104,7 @@ If you wish to use enroot instead of docker, then you can build a sqsh file that
     make -C enroot build_sqsh SQSH_PATH=/path/to/dev_trtllm_image.sqsh
     ```
 
-3. Once this squash file is ready, the steps under [Build TensorRT-LLM](#build-tensorrt-llm) may be followed from within an enroot sandbox started from `dev_trtllm_image.sqsh`. To do this:
+3. Once this squash file is ready, you can follow the steps under [Build TensorRT-LLM](#build-tensorrt-llm)by launching an enroot sandbox from `dev_trtllm_image.sqsh`. To do this, proceed as follows:
     ```bash
     export SQSH_PATH=/path/to/dev_trtllm_image.sqsh
 
