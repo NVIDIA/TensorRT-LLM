@@ -104,7 +104,7 @@ If you wish to use enroot instead of docker, then you can build a sqsh file that
     make -C enroot build_sqsh SQSH_PATH=/path/to/dev_trtllm_image.sqsh
     ```
 
-3. Once this squash file is ready, you can follow the steps under [Build TensorRT-LLM](#build-tensorrt-llm)by launching an enroot sandbox from `dev_trtllm_image.sqsh`. To do this, proceed as follows:
+3. Once this squash file is ready, you can follow the steps under [Build TensorRT LLM](#build-tensorrt-llm)by launching an enroot sandbox from `dev_trtllm_image.sqsh`. To do this, proceed as follows:
     ```bash
     export SQSH_PATH=/path/to/dev_trtllm_image.sqsh
 
