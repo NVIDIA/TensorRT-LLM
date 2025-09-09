@@ -48,6 +48,32 @@ public:
         return BlockRange(cacheManager, blockIds, requestId);
     }
 
+    static BlockRange fromReuseTree(
+        BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
+    {
+        auto const windowSize = firstWindowSize(cacheManager);
+        // Find the last block in the reuse tree for the provided full sequence of block keys
+        auto lastBlock = *cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
+        // TODO: handle the case where the last block is not found
+        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
+        int32_t const numBlocksToCollect = indexFromEnd + 1;
+
+        std::vector<SizeType32> blockIds;
+        blockIds.reserve(numBlocksToCollect);
+        for (int32_t i = 0; i < numBlocksToCollect; ++i)
+        {
+            blockIds.push_back(lastBlock->getBlockId());
+            if (i + 1 < numBlocksToCollect)
+            {
+                lastBlock = lastBlock->getPrevBlock();
+                TLLM_CHECK_WITH_INFO(lastBlock, "Previous block not found while traversing reuse tree");
+            }
+        }
+        // Reverse to chronological order: oldest to newest
+        std::reverse(blockIds.begin(), blockIds.end());
+        return BlockRange(cacheManager, blockIds, 0);
+    }
+
     BlockRange(runtime::ITensor::SharedPtr pool, std::vector<SizeType32> const& blockIds) // Only used in tests
         : mManager{nullptr}
         , mPool{std::move(pool)}
@@ -78,19 +104,6 @@ public:
     void setBlockIds(std::vector<SizeType32> blockIds)
     {
         mBlockIds = std::move(blockIds);
-    }
-
-    [[nodiscard]] std::vector<size_t> getBlockHashes() const
-    {
-        TLLM_CHECK(mManager);
-        std::vector<size_t> blockHashes;
-        blockHashes.reserve(mBlockIds.size());
-        auto& blockManager = mManager->getBlockManager();
-        for (auto id : mBlockIds)
-        {
-            blockHashes.emplace_back(blockManager.getBlockById(id, mWindowSize)->getHash());
-        }
-        return blockHashes;
     }
 
     void updatePoolIdx(SizeType32 poolIdx)
