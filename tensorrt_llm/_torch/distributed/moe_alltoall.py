@@ -7,7 +7,6 @@ with proper workspace management and synchronization.
 
 import torch
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
 
 
@@ -43,7 +42,14 @@ class MoeAlltoAll:
             cls.SEND_INDICES_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_SEND_INDICES_OFFSET_INDEX()
             cls.PAYLOAD_DATA_OFFSET_INDEX = torch.ops.trtllm.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX()
     
-    def __init__(self, mapping: Mapping, max_num_tokens_per_rank: int, workspace_size_per_rank: int = 256 * 1024 * 1024):
+    def __init__(
+        self,
+        mapping: Mapping,
+        max_num_tokens_per_rank: int,
+        top_k: int,
+        num_experts: int,
+        workspace_size_per_rank: int = 256 * 1024 * 1024,
+    ):
         """
         Initialize MoeAlltoAll with workspace allocation.
         
@@ -59,6 +65,12 @@ class MoeAlltoAll:
         self.ep_size = mapping.moe_ep_size  # Expert parallel size
         self.ep_rank = mapping.moe_ep_rank
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
+        self.top_k = top_k
+        self.num_experts = num_experts
+        if not isinstance(self.top_k, int) or self.top_k <= 0:
+            raise ValueError("top_k must be a positive int")
+        if not isinstance(self.num_experts, int) or self.num_experts <= 0:
+            raise ValueError("num_experts must be a positive int")
         self.workspace_size_per_rank = workspace_size_per_rank
         
         # Initialize MNNVL memory
@@ -77,55 +89,63 @@ class MoeAlltoAll:
             self.ep_size,
             self.max_num_tokens_per_rank
         )
+        # Internal state and aux data
+        self._last_send_indices: torch.Tensor | None = None
+        self._last_send_counters: torch.Tensor | None = None
+        self._state: str = "idle"  # idle | dispatched
             
-    def dispatch(self, token_selected_experts, input_payloads, max_tokens_per_rank, top_k, num_experts):
+    def dispatch(self, token_selected_experts, input_payloads):
         """
         Perform MoE all-to-all dispatch operation.
         
         Args:
             token_selected_experts: [local_num_tokens, top_k] tensor of expert indices
-            input_payloads: List of tensors to dispatch
-            max_tokens_per_rank: Maximum tokens per rank
-            top_k: Number of experts per token
-            num_experts: Total number of experts
+            input_payloads: List of tensors to dispatch, each has shape [local_num_tokens, payload_num_elements_per_token]
             
         Returns:
-            tuple: (recv_buffers, send_counters, send_indices)
+            recv_buffers: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
         """
-        # The C++ implementation already handles auxiliary data allocation
-        # based on the workspace layout we defined. Just call the operation.
-        return torch.ops.trtllm.moe_a2a_dispatch(
+        if self._state == "dispatched":
+            raise RuntimeError("dispatch called twice without an intervening combine")
+
+        recv_buffers, send_counters, send_indices = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             self.workspace,
-            max_tokens_per_rank,
+            self.max_num_tokens_per_rank,
             self.ep_rank,
             self.ep_size,
-            top_k,
-            num_experts
+            self.top_k,
+            self.num_experts
         )
+        self._state = "dispatched"
+        self._last_send_indices = send_indices
+        self._last_send_counters = send_counters
+        return recv_buffers
         
-    def combine(self, send_indices, payload, max_tokens_per_rank, top_k):
+    def combine(self, payload):
         """
         Perform MoE all-to-all combine operation.
         
         Args:
-            send_indices: [local_num_tokens, ep_size] tensor from dispatch
-            payload: [ep_size, max_tokens_per_rank, elements] tensor to combine
-            max_tokens_per_rank: Maximum tokens per rank
-            top_k: Number of experts per token
+            payload: [ep_size, max_tokens_per_rank, num_elements_per_token] tensor to combine. The dtype must be float32, bfloat16 or float16.
             
         Returns:
-            Combined output tensor
+            combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
         """
-        # The C++ implementation handles counter resets and synchronization
-        return torch.ops.trtllm.moe_a2a_combine(
-            send_indices,
+        if self._state != "dispatched" or self._last_send_indices is None:
+            raise RuntimeError("combine called before a successful dispatch")
+
+        output = torch.ops.trtllm.moe_a2a_combine(
+            self._last_send_indices,
             payload,
             self.workspace,
-            max_tokens_per_rank,
+            self.max_num_tokens_per_rank,
             self.ep_rank,
             self.ep_size,
-            top_k
+            self.top_k
         )
-        
+        # Reset state for next round
+        self._last_send_indices = None
+        self._state = "idle"
+        return output

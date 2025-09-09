@@ -226,7 +226,7 @@ def make_bfloat16_payloads(local_num_tokens: int, hidden_size: int, top_k: int,
                                     dtype=torch.bfloat16,
                                     device='cuda')
 
-    # Optional: Add debug info like in nvfp4
+    # Optional: Construct the data that is easier to debug
     # token_final_scales[:, 0] = rank
     # token_final_scales[:, 1] = torch.linspace(0, local_num_tokens - 1, local_num_tokens, dtype=torch.bfloat16, device='cuda')
 
@@ -252,7 +252,7 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
         )
 
         # Create MoeAlltoAll manager
-        moe_a2a = MoeAlltoAll(mapping, max_tokens_per_rank, workspace_size_per_rank)
+        moe_a2a = MoeAlltoAll(mapping, max_tokens_per_rank, top_k, ep_size * num_experts_per_rank, workspace_size_per_rank)
 
         # Get the number of tokens for this specific rank (same as single-GPU)
         rank_local_tokens = all_num_tokens[rank]
@@ -263,11 +263,7 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
         payloads = make_nvfp4_payloads(rank_local_tokens, hidden_size, top_k,
                                        rank, token_selected_experts)
 
-        # Execute dispatch using wrapper to avoid pickle issues
-        num_experts = ep_size * num_experts_per_rank
-        recv_buffers, send_counters, send_indices = moe_a2a.dispatch(
-            token_selected_experts, payloads, max_tokens_per_rank,
-            top_k, num_experts)
+        recv_buffers = moe_a2a.dispatch(token_selected_experts, payloads)
 
         # TODO: remove this after synchronization is okay.
         # sync()
@@ -290,8 +286,8 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
 
         # Return results to be collected (move to CPU for MPI transfer)
         return (token_selected_experts.cpu(), [p.cpu() for p in payloads],
-                [rb.cpu() for rb in recv_buffers], send_counters.cpu(),
-                send_indices.cpu())
+                [rb.cpu() for rb in recv_buffers], moe_a2a._last_send_counters.cpu(),
+                moe_a2a._last_send_indices.cpu())
     except Exception:
         traceback.print_exc()
         raise
@@ -591,7 +587,7 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
                           world_size=ep_size)
 
         # Create MoeAlltoAll manager
-        moe_a2a = MoeAlltoAll(mapping, max_tokens_per_rank, workspace_size_per_rank)
+        moe_a2a = MoeAlltoAll(mapping, max_tokens_per_rank, top_k, ep_size * num_experts_per_rank, workspace_size_per_rank)
 
         rank_local_tokens = all_num_tokens[rank]
 
@@ -603,10 +599,7 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
                                           rank, token_selected_experts)
 
         # Run dispatch
-        num_experts = ep_size * num_experts_per_rank
-        recv_buffers, send_counters, send_indices = moe_a2a.dispatch(
-            token_selected_experts, payloads, max_tokens_per_rank,
-            top_k, num_experts)
+        recv_buffers = moe_a2a.dispatch(token_selected_experts, payloads)
 
         # TODO: remove this
         # sync()  # commented out: combine kernel handles readiness
@@ -639,10 +632,8 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
         # sync()  # commented out: combine kernel handles readiness
 
         # Run combine on the received data
-        combined_output = moe_a2a.combine(send_indices,
-                                          hidden_states_recv,
-                                          max_tokens_per_rank,
-                                          top_k)
+        send_indices = moe_a2a._last_send_indices
+        combined_output = moe_a2a.combine(hidden_states_recv)
 
         # TODO: remove this
         # sync()  # commented out: not needed after in-kernel sync
