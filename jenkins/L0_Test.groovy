@@ -656,7 +656,7 @@ def testFilter = [
     (ONLY_ONE_GROUP_CHANGED): "",
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
-    (DETAILED_LOG): false,
+    (DETAILED_LOG): true,
 ]
 
 @Field
@@ -1632,6 +1632,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             extraInternalEnv,
             "pytest",
             "-v",
+            "-s",
             testFilter[(DETAILED_LOG)] ? "-s" : "",
             "--timeout-method=thread",
             "--apply-test-list-correction",
@@ -1995,8 +1996,7 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
-        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 1],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
