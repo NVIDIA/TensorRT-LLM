@@ -17,17 +17,16 @@
 #pragma once
 
 #include "cuda_runtime_api.h"
-#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include "cubin/kernelMetaInfo.h"
+#include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
@@ -274,6 +273,10 @@ public:
             }
 
             TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
+
+            // Run the separate reduction kernel if needed.
+            runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
+
             // Break the while op.
             break;
         }
@@ -484,6 +487,11 @@ private:
             {
                 // Otherwise, we use the high-throughput kernel.
                 kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+                // Always use the separate reduction kernel.
+                if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode))
+                {
+                    selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+                }
                 // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
                 if (params.mNumHeadsQPerKv == 128)
                 {

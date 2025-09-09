@@ -37,4 +37,7 @@ if(NIXL_ROOT)
   # Link against all NIXL libraries
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 
+  # Link against CUDA
+  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+
 endif()
