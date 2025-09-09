@@ -467,11 +467,11 @@ def create_py_executor(
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
             # To deal with cases like this, we instantiate them both concurrently.
             with ThreadPoolExecutor(max_workers=2) as executor:
-                connector_worker_task = executor.submit(worker_cls)
+                connector_worker_task = executor.submit(worker_cls, llm_args)
 
                 if scheduler_cls is not None and rank == 0:
                     connector_scheduler_task = executor.submit(
-                        scheduler_cls, executor_config.tokens_per_block)
+                        scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
                 else:
                     connector_scheduler = None

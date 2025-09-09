@@ -548,8 +548,7 @@ class Deepseekv3MoE(nn.Module):
             f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config)
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, all_rank_max_num_tokens,
-                              do_finalize):
+                              all_rank_num_tokens, do_finalize):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
@@ -568,7 +567,6 @@ class Deepseekv3MoE(nn.Module):
             do_finalize=do_finalize,
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
         )
 
@@ -579,7 +577,6 @@ class Deepseekv3MoE(nn.Module):
         hidden_states: torch.Tensor,
         hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
         all_rank_num_tokens: Optional[list[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
     ) -> torch.Tensor:
@@ -598,7 +595,6 @@ class Deepseekv3MoE(nn.Module):
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
-                                                       all_rank_max_num_tokens,
                                                        do_finalize)
             return routed_output
 
@@ -840,7 +836,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states,
                 hidden_states_fp4,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-                all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
@@ -1028,7 +1023,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -1087,7 +1081,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.mlp(
             hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),

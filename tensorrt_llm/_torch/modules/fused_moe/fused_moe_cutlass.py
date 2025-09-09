@@ -85,6 +85,7 @@ class CutlassFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            layer_idx=layer_idx,
         )
 
         # Store original hidden size before any potential padding
@@ -95,8 +96,6 @@ class CutlassFusedMoE(MoE):
             self.hidden_size = ((self.hidden_size + 127) // 128) * 128
             self.intermediate_size_per_partition = (
                 (self.intermediate_size_per_partition + 127) // 128) * 128
-
-        self.layer_idx = layer_idx
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -450,15 +449,16 @@ class CutlassFusedMoE(MoE):
             split_num_chunks - val_mod)
         return split_chunk_size_list
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
         if self.use_dp and self.parallel_size > 1:
@@ -473,7 +473,7 @@ class CutlassFusedMoE(MoE):
                       1) // self.moe_max_num_tokens
 
         if use_dp_padding:
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
                                           ] * len(all_rank_num_tokens)
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
