@@ -8,13 +8,15 @@ def main():
 
     prompt_a = (
         "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
-        # "The following excerpt is from a pamphlet. You will do me the justice to remember, "
+        "The following excerpt is from a pamphlet. You will do me the justice to remember, "
     )
 
     prompt_b = (
         "Question: This question refers to the following information. Read the following excerpt."
-        # "The revolutionary seed had penetrated into every country and spread more or less. "
+        "The revolutionary seed had penetrated into every country and spread more or less. "
     )
+    max_batch_size = 1
+    max_seq_len = 512
 
     kv_cache_free_gpu_memory_fraction = 0.001
     kv_cache_page_size = 16
@@ -23,8 +25,8 @@ def main():
     # Offloading Off
     print("\n ======  Offloading Off ======  \n")
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-              max_batch_size=1,
-              max_seq_len=256,
+              max_batch_size=max_batch_size,
+              max_seq_len=max_seq_len,
               kv_cache_config=KvCacheConfig(
                   enable_block_reuse=True,
                   free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
@@ -61,8 +63,8 @@ def main():
     # Offloading On
     print("\n ======  Offloading On ======  \n")
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-              max_batch_size=1,
-              max_seq_len=256,
+              max_batch_size=max_batch_size,
+              max_seq_len=max_seq_len,
               kv_cache_config=KvCacheConfig(
                   enable_block_reuse=True,
                   free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
