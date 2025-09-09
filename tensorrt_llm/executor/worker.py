@@ -734,10 +734,7 @@ def notify_proxy_with_retry(queue, message, max_retries=5, timeout=1):
             else:
                 retry_count += 1
 
-        except Exception as error:
-            logger.warn(
-                f"Failed to send/receive {message} (attempt {retry_count + 1}): {error}"
-            )
+        except Exception:
             retry_count += 1
 
     return False
@@ -801,7 +798,6 @@ def worker_main(
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
                                  name="worker_request_queue")
-        # Use REQ socket for request-response pattern with confirmation
         worker_init_status_queue = IpcQueue(
             worker_queues.worker_init_status_queue_addr,
             is_server=False,
@@ -847,11 +843,6 @@ def worker_main(
         kv_cache_events_queue.put(None)
 
     def close_queues():
-        if result_queue is not None:
-            result_queue.close()
-        if result_queues is not None:
-            for q in result_queues:
-                q.close()
         if is_leader:
             mp_stats_queue.close()
             kv_cache_events_queue.close()

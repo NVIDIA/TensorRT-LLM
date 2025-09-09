@@ -121,7 +121,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                                       name="proxy_request_queue")
         self.worker_init_status_queue = IpcQueue(
             is_server=True,
-            socket_type=zmq.PULL,
+            socket_type=zmq.REP,
             name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
