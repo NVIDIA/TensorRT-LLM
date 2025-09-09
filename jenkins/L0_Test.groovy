@@ -950,10 +950,10 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     if (type == "gh200") {
         hostnameMatch = """
                               - key: "kubernetes.io/hostname"
-                                operator: In
+                                operator: NotIn
                                 values:
-                                - "lego-cg1-qct-066.ipp3a2.colossus"
-                                - "lego-cg1-qct-069.ipp3a2.colossus\""""
+                                - "lego-cg1-qct-070.ipp3a2.colossus"
+                                - "lego-cg1-qct-079.ipp3a2.colossus\""""
     }
 
     def podConfig = [
@@ -2015,7 +2015,7 @@ def launchTestJobs(pipeline, testFilter)
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-PyTorch-CU12-1": ["h100-cr", "l0_h100", 1, 3],
+        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
