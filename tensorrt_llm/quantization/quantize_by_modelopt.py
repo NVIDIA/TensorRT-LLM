@@ -147,6 +147,7 @@ MODEL_NAME_PATTERN_MAP = {
     "ChatGLM": "chatglm",
     "QWen": "qwen",
     "Qwen2VLForConditionalGeneration": "qwen2_vl",
+    "Qwen2_5_VLForConditionalGeneration": "qwen2_5_vl",
     "RecurrentGemma": "recurrentgemma",
     "Gemma3": "gemma3",
     "Gemma2": "gemma2",
@@ -221,7 +222,7 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
             # qwen use token id 151643 as pad and eos tokens
             tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
             tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
-        elif model_type and model_type == "qwen2_vl":
+        elif model_type and model_type in ["qwen2_vl", "qwen2_5_vl"]:
             # qwen use token id 151643 as pad and 151643 and 151645 as eos tokens
             tokenizer.eos_token = [
                 tokenizer.convert_ids_to_tokens(151643),
@@ -319,7 +320,9 @@ def get_model(ckpt_path: str,
     elif hf_config.model_type == 'qwen2_vl':
         from transformers import Qwen2VLForConditionalGeneration
         model_cls = Qwen2VLForConditionalGeneration
-
+    elif hf_config.model_type == 'qwen2_5_vl':
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        model_cls = Qwen2_5_VLForConditionalGeneration
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
     elif "llava-onevision-qwen2" in ckpt_path:
@@ -345,7 +348,7 @@ def get_model(ckpt_path: str,
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
-        elif hf_config.model_type == "qwen2_vl":
+        elif hf_config.model_type == "qwen2_vl" or hf_config.model_type == "qwen2_5_vl":
             #WAR for Qwen2-VL because its lm_head is outside of LLM
             lm_head = model.lm_head
             model = model.model
@@ -873,7 +876,7 @@ def quantize_and_export(*,
                     json.dump(tensorrt_llm_config, f, indent=4)
 
             # Workaround for qwen version
-            if model_type == 'qwen' or model_type == 'qwen2_vl':
+            if model_type == 'qwen' or model_type == 'qwen2_vl' or model_type == 'qwen2_5_vl':
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
                 qwen_config = AutoConfig.from_pretrained(model_dir,

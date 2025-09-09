@@ -401,7 +401,7 @@ class MultimodalModelRunner:
                 self.args.hf_model_dir).text_config._name_or_path
         if 'internlm' in self.model_type:
             self.args.lora_task_uids = ['0'] * args.batch_size
-        if self.model_type == "qwen2_vl":
+        if self.model_type == "qwen2_vl" or self.model_type == "qwen2_5_vl":
             hf_config = AutoConfig.from_pretrained(self.args.hf_model_dir)
             self.vision_start_token_id = hf_config.vision_start_token_id
             self.vision_end_token_id = hf_config.vision_end_token_id
@@ -480,6 +480,13 @@ class MultimodalModelRunner:
                 if self.args.session != "cpp_llm_only":
                     logger.warning(
                         "Qwen2-vl only support C++ session for now, fallback to C++ session."
+                    )
+                    self.args.session = "cpp_llm_only"
+
+            if self.model_type == 'qwen2_5_vl':
+                if self.args.session != "cpp_llm_only":
+                    logger.warning(
+                        "Qwen2.5-vl only support C++ session for now, fallback to C++ session."
                     )
                     self.args.session = "cpp_llm_only"
 
@@ -623,7 +630,7 @@ class MultimodalModelRunner:
 
         elif self.model_type in [
                 'phi-3-vision', 'pix2struct', 'llava_next', 'llava', 'fuyu',
-                'kosmos-2', 'mllama', 'llava_onevision', 'qwen2_vl',
+                'kosmos-2', 'mllama', 'llava_onevision', 'qwen2_vl', 'qwen2_5_vl',
                 'phi-4-multimodal'
         ]:
             self.processor = AutoProcessor.from_pretrained(
@@ -951,7 +958,7 @@ class MultimodalModelRunner:
             image = input['pixel_values']
             image = image[0]
             image_size = input['image_sizes'][0].cpu()
-        elif self.model_type == "qwen2_vl":
+        elif self.model_type == "qwen2_vl" or self.model_type == "qwen2_5_vl":
             input = image
             image = input['image']
             input_ids = input['input_ids']
@@ -1060,7 +1067,14 @@ class MultimodalModelRunner:
                 visual_features, input_ids, image_grid_thw, attention_mask,
                 input_lengths)
             return input_ids, input_lengths, ptuning_args, visual_features, mrope_args
-
+        elif self.model_type == 'qwen2_5_vl':
+            length = input_ids.shape[1]
+            input_lengths = torch.IntTensor([length] * self.args.batch_size).to(
+                torch.int32)
+            input_ids, ptuning_args, mrope_args = self.setup_fake_prompts_qwen2_5_vl(
+                visual_features, input_ids, image_grid_thw, attention_mask,
+                input_lengths)
+            return input_ids, input_lengths, ptuning_args, visual_features, mrope_args
         elif self.model_type == 'kosmos-2':
             visual_features = visual_features.squeeze(
             ) if visual_features is not None else None
@@ -1397,6 +1411,14 @@ class MultimodalModelRunner:
                 mrope_rotary_cos_sin=mrope_args[0],
                 mrope_position_deltas=mrope_args[1],
             )
+        elif 'qwen2_5_vl' in self.model_type:
+            input_ids, input_lengths, ptuning_args, visual_features, mrope_args = self.preprocess(
+                pre_prompt, post_prompt, image, other_vision_inputs,
+                other_audio_inputs)
+            mrope_params = MropeParams(
+                mrope_rotary_cos_sin=mrope_args[0],
+                mrope_position_deltas=mrope_args[1],
+            )
         else:
             input_ids, input_lengths, ptuning_args, visual_features, model_runner_input = self.preprocess(
                 pre_prompt, post_prompt, image, other_vision_inputs,
@@ -1436,7 +1458,7 @@ class MultimodalModelRunner:
                 input_position_ids=input_position_ids
                 if self.model_type == 'cogvlm' else None,
                 mrope_params=mrope_params
-                if self.model_type == 'qwen2_vl' else None,
+                if self.model_type in ['qwen2_vl', 'qwen2_5_vl'] else None,
                 encoder_input_features=model_runner_input
                 if self.cpp_e2e else None,
                 sampling_config=None,
@@ -1615,7 +1637,7 @@ class MultimodalModelRunner:
             self.vision_input_names[0]:
             image.to(str_dtype_to_torch(self.vision_precision)),
         }
-        if self.model_type == "qwen2_vl":
+        if self.model_type == "qwen2_vl" or self.model_type == "qwen2_5_vl":
             other_vision_inputs['attention_mask'] = other_vision_inputs[
                 'attention_mask'].to(str_dtype_to_torch(self.vision_precision))
         for key, tensor in other_vision_inputs.items():
@@ -2036,6 +2058,76 @@ class MultimodalModelRunner:
 
         mrope_args = [concat_cos_sin, mrope_position_deltas]
         return input_ids, ptuning_args, mrope_args
+    
+    def setup_fake_prompts_qwen2_5_vl(self, visual_features, input_ids,
+                                   vision_grid_thws, attention_mask,
+                                   input_lengths):
+
+        visual_features = torch.unsqueeze(visual_features, 0)
+
+        # Get the rope index
+        # From HF's preprocess code
+        mrope_position_ids, mrope_position_deltas = self.get_rope_index(
+            input_ids,
+            image_grid_thw=vision_grid_thws,
+            video_grid_thw=None,
+            attention_mask=attention_mask,
+        )
+
+        # This is where we convert input_ids of image features into fake_prompt_ids mapping for TRT-LLM engine.
+        masks = (input_ids == self.image_token_id) | (
+            input_ids == self.vision_token_id) | (input_ids
+                                                  == self.video_token_id)
+        cumulative_counts = masks.cumsum(dim=1)
+        values = (self.model_config.vocab_size - 1) + cumulative_counts
+        input_ids[masks] = values[masks]
+
+        if self.decoder_llm or self.runtime_mapping.is_first_pp_rank():
+            ptuning_args = self.ptuning_setup(visual_features, input_ids,
+                                              input_lengths)
+        else:
+            ptuning_args = [None, None, None]
+
+        # This does not have dependency on input.
+        # Switch to attributes to use across iterations.
+        if not hasattr(self, 'rotary_cos_sin'):
+            inv_freq, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                num_pos=self.max_position_embeddings,
+                dim=int(self.hidden_size / self.num_attention_heads),
+                theta=float(self.rope_theta),
+                scale_type=RotaryScalingType.mrope)
+            self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin).to(
+                visual_features.device)
+            self.rotary_cos_sin = self.rotary_cos_sin.reshape(
+                self.max_position_embeddings,
+                int(self.hidden_size / self.num_attention_heads / 2), 2)
+            self.cos_ori = self.rotary_cos_sin[:, :, 0]
+            self.sin_ori = self.rotary_cos_sin[:, :, 1]
+
+        mrope_position_ids = mrope_position_ids.transpose(1, 0)
+        mrope_position_ids_padding = torch.zeros(
+            mrope_position_ids.shape[:-1] + (self.max_position_embeddings, ),
+            dtype=torch.int32,
+            device=visual_features.device)
+        mrope_position_ids_padding[:, :, :mrope_position_ids.
+                                   shape[-1]] = mrope_position_ids
+        cos = self.cos_ori[mrope_position_ids_padding]
+        sin = self.sin_ori[mrope_position_ids_padding]
+
+        mrope_section = [16, 24, 24]
+        cos = torch.cat([
+            m[:, i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))
+        ],
+                        dim=-1).unsqueeze(-1)
+        sin = torch.cat([
+            m[:, i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))
+        ],
+                        dim=-1).unsqueeze(-1)
+        concat_cos_sin = torch.concatenate((cos, sin), axis=-1)
+        concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
+
+        mrope_args = [concat_cos_sin, mrope_position_deltas]
+        return input_ids, ptuning_args, mrope_args
 
     def ptuning_setup_fuyu(self, input_ids, image_patches_indices):
         res_input_ids = []
@@ -2265,7 +2357,7 @@ class MultimodalModelRunner:
                                  timeout=5).raw).convert('RGB')
             else:
                 images = Image.open(image_path).convert('RGB')
-        elif "qwen2_vl" in self.model_type:
+        elif "qwen2_vl" in self.model_type or "qwen2.5_vl" in self.model_type:
             images = []
             if self.args.image_path is None:
                 img_url = 'https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg'
@@ -2333,10 +2425,11 @@ class MultimodalModelRunner:
 
     def setup_inputs(self, input_text, raw_image, raw_audio=None):
         from ..tools.multimodal_builder import compute_rotary_pos_emb
+        from ..tools.multimodal_builder import compute_rotary_pos_emb_qwen2_5_vl
         other_vision_inputs = {}
         other_audio_inputs = {}
         other_decoder_inputs = {}
-        if self.model_type not in ['qwen2_vl', 'vila', 'llava']:
+        if self.model_type not in ['qwen2_vl', 'qwen2_5_vl', 'vila', 'llava']:
             input_text = input_text[0] if isinstance(input_text,
                                                      list) else input_text
 
@@ -2432,6 +2525,83 @@ class MultimodalModelRunner:
             }
             rotary_pos_emb = compute_rotary_pos_emb(
                 image_grid_thw, hf_config, VisionRotaryEmbedding).to("cuda")
+            other_vision_inputs['attention_mask_llm'] = attention_mask
+            other_vision_inputs['image_grid_thw'] = image_grid_thw
+            other_vision_inputs['attention_mask'] = attention_mask_vit
+            other_vision_inputs['rotary_pos_emb'] = rotary_pos_emb
+            return input_text, pre_prompt, post_prompt, images_qwenvl, decoder_input_ids, other_vision_inputs, other_audio_inputs, other_decoder_inputs
+        elif 'qwen2_5_vl' in self.model_type:
+            from qwen_vl_utils import process_vision_info
+            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
+                Qwen2_5_VisionRotaryEmbedding
+            hf_config = AutoConfig.from_pretrained(self.args.hf_model_dir)
+            if input_text is None:
+                input_text = ["Question: Describe this image. Answer:"
+                              ] * self.args.batch_size
+            messages = [[{
+                "role":
+                "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": raw_image[idx],
+                    },
+                    {
+                        "type": "text",
+                        "text": input_text[idx],
+                    },
+                ],
+            }] for idx in range(self.args.batch_size)]
+
+            texts = [
+                self.processor.apply_chat_template(msg,
+                                                   tokenize=False,
+                                                   add_generation_prompt=True)
+                for msg in messages
+            ]
+            image_inputs, video_inputs = process_vision_info(messages)
+            inputs = self.processor(
+                text=texts,
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(self.device)
+            image = inputs['pixel_values']
+            image_grid_thw = inputs['image_grid_thw']
+            input_ids = inputs['input_ids']
+            attention_mask = inputs['attention_mask']
+            cu_seqlens = torch.repeat_interleave(
+                image_grid_thw[:, 1] * image_grid_thw[:, 2],
+                image_grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+            seq_length = image.shape[0]
+            # Create block indices using bucketing
+            block_indices = torch.bucketize(torch.arange(seq_length,
+                                                         device=image.device),
+                                            cu_seqlens,
+                                            right=True) - 1
+
+            # Generate block diagonal mask using matrix expansion
+            attention_mask_vit = torch.where(
+                block_indices.view(-1, 1) == block_indices.view(1, -1),
+                torch.zeros((), device=image.device, dtype=image.dtype),
+                torch.full((),
+                           torch.finfo(torch.float16).min,
+                           device=image.device,
+                           dtype=image.dtype)).unsqueeze(0)
+
+            decoder_input_ids = None
+            post_prompt = None
+            pre_prompt = None
+            images_qwenvl = {
+                "image": image,
+                "input_ids": input_ids,
+            }
+            rotary_pos_emb = compute_rotary_pos_emb_qwen2_5_vl(
+                image_grid_thw, hf_config, Qwen2_5_VisionRotaryEmbedding).to("cuda")
             other_vision_inputs['attention_mask_llm'] = attention_mask
             other_vision_inputs['image_grid_thw'] = image_grid_thw
             other_vision_inputs['attention_mask'] = attention_mask_vit

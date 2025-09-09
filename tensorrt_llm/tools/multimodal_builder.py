@@ -40,7 +40,7 @@ def add_multimodal_arguments(parser):
             'blip2', 'llava', 'llava_next', 'llava_onevision',
             'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm', 'fuyu',
             'pix2struct', 'neva', 'kosmos-2', 'video-neva', 'phi-3-vision',
-            'phi-4-multimodal', 'mllama', 'internvl', 'qwen2_vl',
+            'phi-4-multimodal', 'mllama', 'internvl', 'qwen2_vl', 'qwen2_5_vl',
             'internlm-xcomposer2', 'qwen2_audio', 'pixtral', 'eclair'
         ],
         help="Model type")
@@ -140,6 +140,8 @@ class MultimodalEngineBuilder:
             build_internvl_engine(args)
         elif args.model_type == 'qwen2_vl':
             build_qwen2_vl_engine(args)
+        elif args.model_type == 'qwen2_5_vl':
+            build_qwen2_5_vl_engine(args)
         elif args.model_type == 'qwen2_audio':
             build_qwen2_audio_engine(args)
         elif args.model_type == "pixtral":
@@ -268,6 +270,37 @@ def build_trt_engine(model_type,
                           [1, multi_size_min, multi_size_min],
                           [1, multi_size_opt, multi_size_opt],
                           [1, multi_size_max, multi_size_max])
+    elif model_type == "qwen2_5_vl":
+        input_images = network.get_input(0)
+        inputT = network.get_input(1)
+        attenstion_mask = network.get_input(2)
+
+        qwen2_5_vl_dim = model_params.get('qwen2_5_vl_dim', 0)
+        min_hw_dims = model_params.get('min_hw_dims', 0)
+        max_hw_dims = model_params.get('max_hw_dims', 0)
+
+        assert min_hw_dims > 0, "min_hw_dims must be positive for qwen2_5_vl"
+        assert max_hw_dims > 0, "max_hw_dims must be positive for qwen2_5_vl"
+
+        multi_size_min = min_hw_dims
+        multi_size_max = max_hw_dims * max_batch_size
+        multi_size_opt = max(multi_size_min, int(multi_size_max / 2))
+
+        inputT.shape = [-1, *input_sizes]
+        profile.set_shape(inputT.name, [multi_size_min, *input_sizes],
+                          [multi_size_opt, *input_sizes],
+                          [multi_size_max, *input_sizes])
+
+        input_images.shape = [-1, qwen2_5_vl_dim]
+        profile.set_shape(input_images.name, [multi_size_min, qwen2_5_vl_dim],
+                          [multi_size_opt, qwen2_5_vl_dim],
+                          [multi_size_max, qwen2_5_vl_dim])
+
+        attenstion_mask.shape = [1, -1, -1]
+        profile.set_shape(attenstion_mask.name,
+                          [1, multi_size_min, multi_size_min],
+                          [1, multi_size_opt, multi_size_opt],
+                          [1, multi_size_max, multi_size_max])  
     elif model_type == "qwen2_audio":
         inputT = network.get_input(0)
         mask = network.get_input(1)
@@ -1332,6 +1365,44 @@ def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
     rotary_pos_emb = rot_pos_emb(grid_thw, rotary_pos_emb_func)
     return rotary_pos_emb
 
+def compute_rotary_pos_emb_qwen2_5_vl(grid_thw, hf_config, Qwen2_5_VisionRotaryEmbedding):
+    head_dim = hf_config.vision_config.hidden_size // hf_config.vision_config.num_heads
+    rotary_pos_emb_func = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+    hf_config.vision_config.spatial_merge_size
+
+    def rot_pos_emb(grid_thw, rotary_pos_emb_func):
+        pos_ids = []
+        for t, h, w in grid_thw:
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+                w // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+            hpos_ids = hpos_ids.flatten()
+
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+                w // hf_config.vision_config.spatial_merge_size,
+                hf_config.vision_config.spatial_merge_size,
+            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+            wpos_ids = wpos_ids.flatten()
+            pos_ids.append(
+                torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = rotary_pos_emb_func(max_grid_size)
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        return rotary_pos_emb
+
+    rotary_pos_emb = rot_pos_emb(grid_thw, rotary_pos_emb_func)
+    print(f"Rotary pos emb shape: {rotary_pos_emb.shape}")
+    return rotary_pos_emb
 
 def build_qwen2_vl_engine(args):
     import transformers
@@ -1539,6 +1610,208 @@ def build_qwen2_vl_engine(args):
                          'max_hw_dims': args.max_hw_dims
                      })
 
+
+def build_qwen2_5_vl_engine(args):
+    from qwen_vl_utils import process_vision_info
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        Qwen2_5_VisionTransformerPretrainedModel, Qwen2_5_VLVisionBlock,
+        Qwen2_5_VLVisionAttention, Qwen2_5_VisionRotaryEmbedding)
+
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.float32,
+        device_map="cpu",
+        attn_implementation="eager")
+    hf_config = AutoConfig.from_pretrained(args.model_path)
+    print(vars(hf_config))
+    qwen2_5_vl_dim = hf_config.vision_config.in_chans * hf_config.vision_config.patch_size * hf_config.vision_config.patch_size * hf_config.vision_config.temporal_patch_size
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type":
+                "image",
+                "image":
+                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+            },
+            {
+                "type": "text",
+                "text": "Describe this picture?"
+            },
+        ],
+    }]
+    text = processor.apply_chat_template(messages,
+                                         tokenize=False,
+                                         add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    for i in range(len(image_inputs)):
+        image_inputs[i] = image_inputs[i].resize(
+            (image_inputs[i].size[0] // 2, image_inputs[i].size[1] // 2))
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs
+    image = inputs['pixel_values'].to(torch.float16)
+    image_grid_thw = inputs['image_grid_thw']
+    cu_seqlens = torch.repeat_interleave(
+        image_grid_thw[:, 1] * image_grid_thw[:, 2],
+        image_grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
+    cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+    seq_length = image.shape[0]
+    attention_mask = torch.full([1, seq_length, seq_length],
+                                torch.finfo(image.dtype).min,
+                                device=image.device,
+                                dtype=image.dtype)
+    for i in range(1, len(cu_seqlens)):
+        attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i],
+                       cu_seqlens[i - 1]:cu_seqlens[i]] = 0
+    rotary_pos_emb = compute_rotary_pos_emb_qwen2_5_vl(image_grid_thw, hf_config,
+                                            Qwen2_5_VisionRotaryEmbedding)
+    class VisionAttentionOpt(Qwen2_5_VLVisionAttention):
+
+        def __init__(self, dim: int, num_heads: int = 16):
+            super().__init__(dim, num_heads)
+            self.head_dim = dim / num_heads
+
+        def forward(self,
+                    hidden_states: torch.Tensor,
+                    attention_mask: torch.Tensor,
+                    rotary_pos_emb: torch.Tensor = None) -> torch.Tensor:
+            seq_length = hidden_states.shape[0]
+            q, k, v = self.qkv(hidden_states).reshape(seq_length, 3,
+                                                      self.num_heads,
+                                                      -1).permute(1, 0, 2,
+                                                                  3).unbind(0)
+
+            # Copied from transformers.models.llama.modeling_qwen2_vl in v4.48
+            def rotate_half(x):
+                x1 = x[..., :x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2:]
+                return torch.cat((-x2, x1), dim=-1)
+
+            def apply_rotary_pos_emb_vision(
+                    tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+                orig_dtype = tensor.dtype
+                tensor = tensor.float()
+                cos = freqs.cos()
+                sin = freqs.sin()
+                cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+                sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+                output = (tensor * cos) + (rotate_half(tensor) * sin)
+                output = output.to(orig_dtype)
+                return output
+
+            q = apply_rotary_pos_emb_vision(q.unsqueeze(0),
+			                                rotary_pos_emb).squeeze(0)
+            k = apply_rotary_pos_emb_vision(k.unsqueeze(0),
+                                            rotary_pos_emb).squeeze(0)
+            q = q.transpose(0, 1)
+            k = k.transpose(0, 1)
+            v = v.transpose(0, 1)
+            attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
+                self.head_dim)
+            attn_weights = attn_weights + attention_mask
+            attn_weights = nn.functional.softmax(attn_weights,
+                                                 dim=-1,
+                                                 dtype=torch.float32).to(
+                                                     q.dtype)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(0, 1)
+            attn_output = attn_output.reshape(seq_length, -1)
+            attn_output = self.proj(attn_output)
+            return attn_output
+
+    class Qwen2_5_VLVisionBlockOpt(Qwen2_5_VLVisionBlock):
+
+        def __init__(self, config, attn_implementation: str = "eager") -> None:
+            super().__init__(config)
+            self.attn = VisionAttentionOpt(config.hidden_size,
+                                           num_heads=config.num_heads)
+
+        def forward(self, hidden_states, attention_mask,
+                    rotary_pos_emb) -> torch.Tensor:
+            hidden_states = hidden_states + self.attn(
+                self.norm1(hidden_states),
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb)
+            hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+            return hidden_states
+
+    class Qwen2VisionTransformerPretrainedModelOpt(
+            Qwen2_5_VisionTransformerPretrainedModel):
+
+        def __init__(self, config) -> None:
+            super().__init__(config)
+            self.blocks = nn.ModuleList([
+                Qwen2_5_VLVisionBlockOpt(config, config._attn_implementation)
+                for _ in range(config.depth)
+            ])
+
+        def forward(self, hidden_states: torch.Tensor,
+                    rotary_pos_emb: torch.Tensor,
+                    attention_mask: torch.Tensor) -> torch.Tensor:
+            hidden_states = self.patch_embed(hidden_states)
+            for blk in self.blocks:
+                hidden_states = blk(hidden_states,
+                                    attention_mask=attention_mask,
+                                    rotary_pos_emb=rotary_pos_emb)
+            res = self.merger(hidden_states)
+            return res
+
+    class VisionEncoderWrapper(torch.nn.Module):
+
+        def __init__(self, model):
+            super().__init__()
+            self.visual = Qwen2VisionTransformerPretrainedModelOpt._from_config(
+                model.config.vision_config,
+                torch_dtype=torch.float32,
+            )
+            self.visual.load_state_dict(model.visual.state_dict())
+
+        def forward(self, images, rotary_pos_emb, attention_mask):
+            img_features = self.visual(images, rotary_pos_emb, attention_mask)
+            return img_features
+
+    wrapper = VisionEncoderWrapper(model)
+    dynamic_axes = {
+        'input': {
+            0: 'hw'
+        },
+        'rotary_pos_emb': {
+            0: 'hw'
+        },
+        'attention_mask': {
+            1: 'hw',
+            2: 'hw'
+        }
+    }
+    export_onnx(wrapper, (image, rotary_pos_emb, attention_mask),
+                f'{args.output_dir}/onnx',
+                input_names=['input', 'rotary_pos_emb', 'attention_mask'],
+                output_names=['encoder_output'],
+                dynamic_axes=dynamic_axes)
+    print("VISION CONFIG")
+    print(vars(hf_config.vision_config))
+    rotary_pos_emb_dim = hf_config.vision_config.hidden_size // hf_config.vision_config.num_heads // 2
+    print(rotary_pos_emb_dim)
+    print("VL DIM")
+    print(qwen2_5_vl_dim)
+    build_trt_engine(args.model_type, [rotary_pos_emb_dim],
+                     f'{args.output_dir}/onnx',
+                     args.output_dir,
+                     args.max_batch_size,
+                     model_params={
+                         'qwen2_5_vl_dim': qwen2_5_vl_dim,
+                         'min_hw_dims': args.min_hw_dims,
+                         'max_hw_dims': args.max_hw_dims
+                     })
 
 def build_qwen2_audio_engine(args):
     from transformers import Qwen2AudioForConditionalGeneration

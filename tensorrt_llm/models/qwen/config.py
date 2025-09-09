@@ -111,7 +111,7 @@ class QWenConfig(PretrainedConfig):
             hf_config.architectures = ['Qwen2ForCausalLM']
 
         valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision',
-                       'qwen2_vl', 'qwen2_audio', 'qwen3', 'qwen3_moe')
+                       'qwen2_vl', 'qwen2_5_vl', 'qwen2_audio', 'qwen3', 'qwen3_moe')
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -163,7 +163,7 @@ class QWenConfig(PretrainedConfig):
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
         tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
-        if qwen_type == 'qwen2_vl':
+        if qwen_type == 'qwen2_vl' or qwen_type == 'qwen2_5_vl':
             pe_type = 'mrope'
             rotary_embedding_percentage = getattr(hf_config, 'rotary_pct', 1.0)
             rotary_embedding_dim = getattr(
