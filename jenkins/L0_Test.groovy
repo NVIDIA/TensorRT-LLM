@@ -2217,7 +2217,7 @@ def launchTestJobs(pipeline, testFilter)
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
-            "A10",
+            "B200_PCIe",
             X86_64_TRIPLE,
             false,
             "dlfw/",

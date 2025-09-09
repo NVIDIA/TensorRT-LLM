@@ -108,8 +108,6 @@ COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
 COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
 COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
 COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
-# WAR for the datacenter-gpu-manager 4.4.0 is not available in the apt repository
-COPY --from=triton /usr/lib/*-linux-gnu/libdcgm.so* /tmp/
 COPY docker/common/install_triton.sh install_triton.sh
 RUN bash ./install_triton.sh && rm install_triton.sh
 

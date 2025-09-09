@@ -21,17 +21,10 @@ install_triton_deps() {
       python3-build \
       libb64-dev \
       libarchive-dev \
+      datacenter-gpu-manager=1:4.4.0 \
     && install_boost \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-  # Copy /tmp/libdcgm.so* files back to /usr/lib/<arch>-linux-gnu/
-  if [ -d /usr/lib/x86_64-linux-gnu ]; then
-    cp -f /tmp/libdcgm.so* /usr/lib/x86_64-linux-gnu/ || true
-  elif [ -d /usr/lib/aarch64-linux-gnu ]; then
-    cp -f /tmp/libdcgm.so* /usr/lib/aarch64-linux-gnu/ || true
-  else
-    echo "Target /usr/lib directory for architecture not found, skipping libdcgm.so* copy"
-  fi
 }
 
 # Install Triton only if base image is Ubuntu
