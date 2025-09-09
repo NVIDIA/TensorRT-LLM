@@ -480,7 +480,17 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     write_interval: int = 20
     file_prefix: str = "data"
     eagle3_layers_to_capture: Optional[Set[int]] = None
-    save_last_layer_post_norm: bool = True
+
+    def __post_init__(self):
+        self._last_hidden_in_save = True
+        if self.eagle3_layers_to_capture is None:
+            self._last_hidden_in_save = False
+            self.eagle3_layers_to_capture = {
+                1, self.num_layers // 2 - 1, self.num_layers - 4, -1
+            }
+        if -1 not in self.eagle3_layers_to_capture:
+            self._last_hidden_in_save = False
+            self.eagle3_layers_to_capture.add(-1)
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -506,9 +516,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
         If eagle3_layers_to_capture is not None, return the length of the set.
         Otherwise, assume Eagle3 base set and return 3.
         """
-        if self.eagle3_layers_to_capture is not None:
-            return len(self.eagle3_layers_to_capture)
-        return 3
+        return len(self.eagle3_layers_to_capture)
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
@@ -1807,6 +1815,9 @@ class BaseLlmArgs(StrictBaseModel):
             elif isinstance(self.speculative_config,
                             SaveHiddenStatesDecodingConfig):
                 assert self.backend in ['pytorch']
+                logger.warning(
+                    "SaveHiddenStatesDecodingConfig is active, setting max_batch_size to 1, disabling overlap scheduler, and setting cuda_graph_config to None"
+                )
                 self.build_config.max_batch_size = 1
                 self.max_batch_size = 1
                 self.disable_overlap_scheduler = True

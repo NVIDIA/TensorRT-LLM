@@ -11,9 +11,7 @@ from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
-from .save_hidden_state import (SaveHiddenStatesDrafter,
-                                SaveHiddenStatesResourceManager,
-                                SaveHiddenStatesSpecMetadata)
+from .save_hidden_state import SaveHiddenStatesDrafter
 
 
 def get_spec_metadata(spec_config,
@@ -54,7 +52,7 @@ def get_spec_metadata(spec_config,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
-        return SaveHiddenStatesSpecMetadata(
+        return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
@@ -65,7 +63,6 @@ def get_spec_metadata(spec_config,
             is_draft_model=is_draft_model,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
-            save_last_layer_post_norm=spec_config.save_last_layer_post_norm,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
@@ -115,7 +112,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_tokens,
         )
     if spec_dec_mode.is_save_hidden_states():
-        return SaveHiddenStatesResourceManager(
+        return Eagle3ResourceManager(
             spec_config,
             model_engine.model.config.torch_dtype,
             model_config.hidden_size,

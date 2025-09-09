@@ -1,5 +1,4 @@
 import os
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -10,38 +9,6 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
-from .eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
-
-
-@dataclass
-class SaveHiddenStatesSpecMetadata(Eagle3SpecMetadata):
-    save_last_layer_post_norm: bool = False
-
-    def is_final_output_capture(self):
-        return self.save_last_layer_post_norm
-
-    def maybe_capture_final_hidden_states(self,
-                                          hidden_states: torch.Tensor) -> None:
-        if self.save_last_layer_post_norm:
-            # Assume no chunking, BS=1
-            eagle3_hidden_states = self.eagle3_resource_manager.last_hidden_states
-            eagle3_hidden_states[:hidden_states.shape[0], :].copy_(
-                hidden_states)
-
-
-class SaveHiddenStatesResourceManager(Eagle3ResourceManager):
-
-    def __init__(self, config: "SaveHiddenStatesDecodingConfig",
-                 dtype: torch.dtype, hidden_size: int, max_num_requests: int,
-                 max_seq_len: int, max_num_tokens: int):
-        super().__init__(config, dtype, hidden_size, max_num_requests,
-                         max_seq_len, max_num_tokens)
-        self.last_hidden_states = None
-        if config.save_last_layer_post_norm:
-            self.last_hidden_states = torch.empty(
-                (max_num_tokens, self.hidden_size),
-                dtype=self.dtype,
-                device='cuda')
 
 
 class SaveHiddenStatesDrafter(Drafter):
@@ -72,25 +39,27 @@ class SaveHiddenStatesDrafter(Drafter):
                                      device='cpu')
             hidden_size = resource_manager.hidden_size
             num_tokens = input_ids.shape[0]
-            if self.spec_config.save_last_layer_post_norm:
-                hidden_states = resource_manager.last_hidden_states[:
-                                                                    num_tokens, :].cpu(
-                                                                    ).clone()
-            else:
-                hidden_states = resource_manager.hidden_states[:num_tokens,
-                                                               -hidden_size:].cpu(
-                                                               ).clone()
+            hidden_states = resource_manager.hidden_states[:num_tokens,
+                                                           -hidden_size:].cpu(
+                                                           ).clone()
 
             out_dict = {
-                "id":
-                self._iter,
-                "input_ids":
-                input_ids,
-                "hidden_state_features":
-                resource_manager.hidden_states[:num_tokens, :].cpu().clone(),
-                "hidden_state":
-                hidden_states,
+                "id": self._iter,
+                "input_ids": input_ids,
+                "hidden_state": hidden_states,
             }
+            if len(self.spec_config.eagle3_layers_to_capture) > 1:
+                if self.spec_config._last_hidden_in_save:
+                    out_dict[
+                        "hidden_state_features"] = resource_manager.hidden_states[:num_tokens, :].cpu(
+                        ).clone()
+                else:
+                    out_dict[
+                        "hidden_state_features"] = resource_manager.hidden_states[:
+                                                                                  num_tokens, :
+                                                                                  -hidden_size].cpu(
+                                                                                  ).clone(
+                                                                                  )
 
             self._saved_state.append(out_dict)
 
@@ -112,11 +81,8 @@ class SaveHiddenStatesDrafter(Drafter):
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
             request.py_max_new_tokens = 1
-            # Pad length to `self.max_draft_len`
-            draft_tokens = [0] * self.max_draft_len
-            request.py_draft_tokens = draft_tokens
 
-    def prepare_draft_tokens_post(
+    def run_drafter_post(
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
@@ -133,11 +99,3 @@ class SaveHiddenStatesDrafter(Drafter):
             if self._iter % self._write_interval == 0:
                 self._write_to_file()
             self._iter += 1
-
-    def needs_draft_forward_post(self) -> bool:
-        """
-        If draft forward needs to be run directly after the target model forward,
-        this method can be overridden to do that.
-        Used in SaveHiddenStatesDrafter (to ensure correct input_ids)
-        """
-        return False

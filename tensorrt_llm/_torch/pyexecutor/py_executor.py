@@ -1083,10 +1083,10 @@ class PyExecutor:
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
-                    if self.drafter is not None and self.draft_forward_post_needed:
-                        self.drafter.prepare_draft_tokens_post(
-                            scheduled_batch, self.resource_manager,
-                            self.is_warmup)
+                    if self.drafter is not None:
+                        self.drafter.run_drafter_post(scheduled_batch,
+                                                      self.resource_manager,
+                                                      self.is_warmup)
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state)

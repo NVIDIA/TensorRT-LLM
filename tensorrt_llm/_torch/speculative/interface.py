@@ -202,23 +202,9 @@ class SpecMetadata:
         """
         return False
 
-    def is_final_output_capture(self):
-        """
-        Whether the layer should be captured (eg for Eagle3).
-        Captured after layer norm in modeling_speculative.
-        """
-        return False
-
     def maybe_capture_hidden_states(self, layer_id: int,
                                     hidden_states: torch.Tensor,
                                     residual: torch.Tensor) -> None:
-        """
-        Some spec decode algorithms require hidden states from the target
-        model. Use this method to record them. By default, does nothing.
-        """
-
-    def maybe_capture_final_hidden_states(self,
-                                          hidden_states: torch.Tensor) -> None:
         """
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.

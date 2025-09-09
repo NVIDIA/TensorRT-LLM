@@ -37,10 +37,14 @@ class Drafter(ABC):
             return len(requests) <= self.max_concurrency
         return True
 
-    def needs_draft_forward_post(self) -> bool:
+    def run_drafter_post(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
+        is_warmup: bool = False,
+    ) -> None:
         """
         If draft forward needs to be run directly after the target model forward,
         this method can be overridden to do that.
         Used in SaveHiddenStatesDrafter (to ensure correct input_ids)
         """
-        return False
