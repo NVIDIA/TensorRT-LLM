@@ -5,7 +5,6 @@ import itertools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
-from math import ceil
 from typing import Any, Callable, Dict, List, Set, Tuple, Union
 
 import torch
@@ -766,9 +765,10 @@ class AutoTuner:
                 "[Autotuner] No tensor inputs or zero-sized tensors; falling back to single-batch profiling."
             )
             return [inputs], 1
-        num_buffers = ceil(self._get_l2_cache_size_in_bytes() /
-                           one_buffer_bytes)
-        num_buffers = min(num_buffers, self.repeat)
+        num_buffers = (self._get_l2_cache_size_in_bytes() *
+                       3) // one_buffer_bytes + 1
+        num_iterations = self.warmup + self.repeat
+        num_buffers = num_iterations if num_iterations < num_buffers else num_buffers
 
         inputs_list = [inputs]
         for _ in range(num_buffers - 1):
