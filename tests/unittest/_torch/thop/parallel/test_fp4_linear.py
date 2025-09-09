@@ -98,11 +98,9 @@ def test_fp4_linear_cute_dsl(dtype, mnk):
 
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
     x_sf_global = (448 * 6) / x.abs().max().float()
-    # x_sf_global = torch.tensor(1.0).cuda()
 
     w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
     w_sf_global = (448 * 6) / w.abs().max().float()
-    # w_sf_global = torch.tensor(1.0).cuda()
     w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
                                                       scaling_vector_size,
                                                       False)
@@ -242,21 +240,15 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
     with torch.inference_mode(), autotune():
         output_ref = l_fp4_ref.forward(x)
 
-    # with nvtx.annotate(f"cute_dsl warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="red"):
     for _ in range(5):
         output = l_fp4.forward(x)
 
-    # with nvtx.annotate(
-    #         f"cute_dsl run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
-    #         color="green"):
     for i in range(10):
         output = l_fp4.forward(x)
 
-    # with nvtx.annotate(f"ref warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="red"):
     for _ in range(5):
         output_ref = l_fp4_ref.forward(x)
 
-    # with nvtx.annotate(f"ref run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="green"):
     for i in range(10):
         output_ref = l_fp4_ref.forward(x)
 
