@@ -167,6 +167,7 @@ class PyExecutor:
                  peft_cache_config: Optional[PeftCacheConfig] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
+        self.global_rank = dist.rank
 
         self.peft_cache_config = peft_cache_config
 
