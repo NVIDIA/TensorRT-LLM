@@ -136,6 +136,8 @@ if [ $opencv -eq 1 ]; then
     pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
 fi
 
+# WARs against security issues inherited from pytorch:25.06
+# * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
 if [ $protobuf -eq 1 ]; then
     pip3 install --upgrade --no-cache-dir \
     "protobuf>=4.25.8"
