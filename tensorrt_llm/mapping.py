@@ -17,7 +17,7 @@ from typing import List
 
 import torch
 
-from tensorrt_llm._torch.device_mesh import DeviceMeshTopology
+from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._utils import mpi_disabled
 
 
@@ -33,7 +33,11 @@ class CpType(IntEnum):
 
 
 class MappingBase:
-    '''Base class for distributed mapping configurations'''
+    """Base class for distributed mapping configurations"""
+
+    tp_rank: int
+    pp_rank: int
+    cp_rank: int
 
     def __init__(
             self,
@@ -335,16 +339,172 @@ class MappingBase:
         }
 
 
-class MpiTopology:
+class Mapping(MappingBase):
+    """
+    A node with 8 GPUs, tp_size = 4, cp_size = 1, pp_size = 2
+
+    2 tp groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+
+    4 pp groups:
+
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    A node with 8 GPUs, tp_size = 4, cp_size = 2, pp_size = 1
+
+    2 tp groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+
+    4 cp groups:
+
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    A node with 8 GPUs, moe_tp_size = 2, moe_ep_size = 4
+
+    4 moe_tp groups:
+
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    2 moe_ep groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+
+    2 nodes with 16 GPUs, moe_tp_size = 2, moe_ep_size = 4, pp_size = 2
+
+    8 moe_tp groups:
+
+    - [0 4]
+    - [1 5]
+    - [2 6]
+    - [3 7]
+    - [8 12]
+    - [9 13]
+    - [10 14]
+    - [11 15]
+
+    4 moe_ep groups:
+
+    - [0, 1, 2, 3]
+    - [4, 5, 6, 7]
+    - [8, 9, 10, 11]
+    - [12, 13, 14, 15]
+
+    8 pp groups:
+
+    - [0 8]
+    - [1 9]
+    - [2 10]
+    - [3 11]
+    - [4 12]
+    - [5 13]
+    - [6 14]
+    - [7 15]
+
+    2 nodes with 8 GPUs, tp_size 2, pp_size 2, cp_size 2
+
+    4 tp groups:
+    - [0, 1]
+    - [2, 3]
+    - [4, 5]
+    - [6, 7]
+
+    4 pp groups:
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    4 cp groups:
+    - [0, 2]
+    - [1, 3]
+    - [4, 6]
+    - [5, 7]
+    """
+
+    def __new__(cls, *args, **kwargs):
+        if mpi_disabled():
+            return super().__new__(DeviceMeshTopology)
+        else:
+            return super().__new__(MpiTopology)
+
+    # Intentionally repeated for type hints
+    def __init__(
+            self,
+            world_size=1,
+            rank=0,
+            gpus_per_node=8,
+            *,
+            cp_size=1,
+            cp_config=None,
+            tp_size=1,
+            pp_size=1,
+            moe_cluster_size=-1,  # -1 means no moe
+            moe_tp_size=-1,  # -1 means no moe
+            moe_ep_size=-1,  # -1 means no moe
+            attn_tp_size=-1,
+            attn_cp_size=-1,
+            auto_parallel=False,
+            enable_attention_dp=False):
+        super().__init__(world_size=world_size,
+                         rank=rank,
+                         gpus_per_node=gpus_per_node,
+                         cp_size=cp_size,
+                         cp_config=cp_config,
+                         tp_size=tp_size,
+                         pp_size=pp_size,
+                         moe_cluster_size=moe_cluster_size,
+                         moe_tp_size=moe_tp_size,
+                         moe_ep_size=moe_ep_size,
+                         attn_tp_size=attn_tp_size,
+                         attn_cp_size=attn_cp_size,
+                         auto_parallel=auto_parallel,
+                         enable_attention_dp=enable_attention_dp)
+
+    # DeviceMesh specific methods
+    @property
+    def tp_group_pg(self):
+        raise NotImplementedError("tp_group_pg is not implemented.")
+
+    @property
+    def pp_group_pg(self):
+        raise NotImplementedError("pp_group_pg is not implemented.")
+
+    @property
+    def cp_group_pg(self):
+        raise NotImplementedError("cp_group_pg is not implemented.")
+
+    @property
+    def moe_tp_group_pg(self):
+        raise NotImplementedError("moe_tp_group_pg is not implemented.")
+
+    @property
+    def moe_ep_group_pg(self):
+        raise NotImplementedError("moe_ep_group_pg is not implemented.")
+
+    def build_mesh(self):
+        raise NotImplementedError("build_mesh is not implemented.")
+
+
+class MpiTopology(Mapping):
     '''MPI-based mapping implementation'''
 
-    def __init__(self, mapping: 'MappingBase'):
-        self.mapping = mapping
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self._init_parallel_groups()
-
-    def __getattr__(self, name):
-        mapping = object.__getattribute__(self, "mapping")
-        return getattr(mapping, name)
 
     @property
     def tp_rank(self) -> int:
@@ -444,184 +604,11 @@ class MpiTopology:
                     self.moe_ep_groups.append(list(ranks))
 
 
-class Mapping(MappingBase):
-    '''
-    A node with 8 GPUs, tp_size = 4, cp_size = 1, pp_size = 2
-
-    2 tp groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-
-    4 pp groups:
-
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
-
-    A node with 8 GPUs, tp_size = 4, cp_size = 2, pp_size = 1
-
-    2 tp groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-
-    4 cp groups:
-
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
-
-    A node with 8 GPUs, moe_tp_size = 2, moe_ep_size = 4
-
-    4 moe_tp groups:
-
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
-
-    2 moe_ep groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-
-    2 nodes with 16 GPUs, moe_tp_size = 2, moe_ep_size = 4, pp_size = 2
-
-    8 moe_tp groups:
-
-    - [0 4]
-    - [1 5]
-    - [2 6]
-    - [3 7]
-    - [8 12]
-    - [9 13]
-    - [10 14]
-    - [11 15]
-
-    4 moe_ep groups:
-
-    - [0, 1, 2, 3]
-    - [4, 5, 6, 7]
-    - [8, 9, 10, 11]
-    - [12, 13, 14, 15]
-
-    8 pp groups:
-
-    - [0 8]
-    - [1 9]
-    - [2 10]
-    - [3 11]
-    - [4 12]
-    - [5 13]
-    - [6 14]
-    - [7 15]
-
-    2 nodes with 8 GPUs, tp_size 2, pp_size 2, cp_size 2
-
-    4 tp groups:
-    - [0, 1]
-    - [2, 3]
-    - [4, 5]
-    - [6, 7]
-
-    4 pp groups:
-    - [0, 4]
-    - [1, 5]
-    - [2, 6]
-    - [3, 7]
-
-    4 cp groups:
-    - [0, 2]
-    - [1, 3]
-    - [4, 6]
-    - [5, 7]
-    '''
+class DeviceMeshTopology(DeviceMeshTopologyImpl, Mapping):
+    """PyTorch DeviceMesh-based mapping implementation"""
 
     def __init__(self, *args, **kwargs):
+        assert mpi_disabled(
+        ), "DeviceMeshTopology is only available in Ray orchestrator mode."
+
         super().__init__(*args, **kwargs)
-
-        if mpi_disabled():
-            self._impl = DeviceMeshTopology(self)
-        else:
-            self._impl = MpiTopology(self)
-
-    @property
-    def tp_rank(self) -> int:
-        return self._impl.tp_rank
-
-    @property
-    def pp_rank(self) -> int:
-        return self._impl.pp_rank
-
-    @property
-    def cp_rank(self) -> int:
-        return self._impl.cp_rank
-
-    @property
-    def tp_group(self) -> List[int]:
-        return self._impl.tp_group
-
-    @property
-    def pp_group(self) -> List[int]:
-        return self._impl.pp_group
-
-    @property
-    def cp_group(self) -> List[int]:
-        return self._impl.cp_group
-
-    @property
-    def moe_tp_group(self) -> List[int]:
-        return self._impl.moe_tp_group
-
-    @property
-    def moe_ep_group(self) -> List[int]:
-        return self._impl.moe_ep_group
-
-    @property
-    def moe_cluster_group(self) -> List[int]:
-        return self._impl.moe_cluster_group
-
-    # DeviceMesh specific methods
-    @property
-    def tp_group_pg(self):
-        if not mpi_disabled():
-            raise RuntimeError(
-                "tp_group_pg() is only available in Ray orchestrator mode.")
-        return self._impl.tp_group_pg
-
-    @property
-    def pp_group_pg(self):
-        if not mpi_disabled():
-            raise RuntimeError(
-                "pp_group_pg() is only available in Ray orchestrator mode.")
-        return self._impl.pp_group_pg
-
-    @property
-    def cp_group_pg(self):
-        if not mpi_disabled():
-            raise RuntimeError(
-                "cp_group_pg() is only available in Ray orchestrator mode.")
-        return self._impl.cp_group_pg
-
-    @property
-    def moe_tp_group_pg(self):
-        if not mpi_disabled():
-            raise RuntimeError(
-                "moe_tp_group_pg() is only available in Ray orchestrator mode.")
-        return self._impl.moe_tp_group_pg
-
-    @property
-    def moe_ep_group_pg(self):
-        if not mpi_disabled():
-            raise RuntimeError(
-                "moe_ep_group_pg() is only available in Ray orchestrator mode.")
-        return self._impl.moe_ep_group_pg
-
-    def build_mesh(self):
-        if not mpi_disabled():
-            raise RuntimeError(
-                "build_mesh() is only available in Ray orchestrator mode.")
-        return self._impl.build_mesh()
