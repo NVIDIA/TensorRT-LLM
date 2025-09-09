@@ -773,7 +773,7 @@ class AutoTuner:
         inputs_list = [inputs]
         for _ in range(num_buffers - 1):
             inputs_list.append(
-                list(t.clone() if isinstance(t, torch.Tensor) else tå
+                list(t.clone() if isinstance(t, torch.Tensor) else t
                      for t in inputs))
 
         logger.info(
