@@ -979,7 +979,8 @@ class PyExecutor:
                 # Generation logits are hard to deal with and distinguish between EOS and length
                 # Currently, last logits are skipped with overlap, but then we splinter cases based on stopping conditions.
                 # For now, just treat req with gen logits like before and let them overschedule.
-                if req.py_return_generation_logits or req.py_decoding_iter + 1 < req.py_max_new_tokens:
+                # Does not account for draft tokens (py_decoding only every goes up by 1)
+                if req.is_dummy or req.py_return_generation_logits or req.py_decoding_iter + 1 < req.py_max_new_tokens:
                     new_generation_requests.append(req)
             scheduled_batch.generation_requests = new_generation_requests
 
