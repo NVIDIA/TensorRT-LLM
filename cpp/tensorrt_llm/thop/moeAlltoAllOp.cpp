@@ -248,9 +248,9 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor> moeA2ADispa
     for (int rank = 0; rank < epSize; rank++)
     {
         uint8_t* rank_base = workspace_ptr + rank * workspace.stride(0);
-        params.completion_ptrs.completion_flags[rank] = reinterpret_cast<uint32_t*>(rank_base + offsets.completion_flags_offset);
+        params.completion_flags[rank] = reinterpret_cast<uint32_t*>(rank_base + offsets.completion_flags_offset);
     }
-    params.completion_ptrs.flag_val = reinterpret_cast<uint32_t*>(rank_workspace + offsets.flag_val_offset);
+    params.flag_val = reinterpret_cast<uint32_t*>(rank_workspace + offsets.flag_val_offset);
     
     // Calculate and store recv buffer pointers directly in params
     for (int target_rank = 0; target_rank < epSize; target_rank++)
@@ -418,9 +418,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
     for (int rank = 0; rank < epSize; rank++)
     {
         uint8_t* rank_base = workspace_ptr + rank * workspace.stride(0);
-        params.completion_ptrs.completion_flags[rank] = reinterpret_cast<uint32_t*>(rank_base + offsets.completion_flags_offset);
+        params.completion_flags[rank] = reinterpret_cast<uint32_t*>(rank_base + offsets.completion_flags_offset);
     }
-    params.completion_ptrs.flag_val = reinterpret_cast<uint32_t*>(current_rank_workspace + offsets.flag_val_offset);
+    params.flag_val = reinterpret_cast<uint32_t*>(current_rank_workspace + offsets.flag_val_offset);
     
     // Calculate and store recv buffer pointers
     for (int target_rank = 0; target_rank < epSize; target_rank++)

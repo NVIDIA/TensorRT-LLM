@@ -90,6 +90,31 @@ __device__ void warp_vectorized_copy(void* dst, void const* src, int size, int l
     }
 }
 
+
+__global__ void moeA2APrepareDispatchKernel(int* send_counters, int* send_indices,
+    int* local_token_counter, int ep_size, int local_num_tokens, uint32_t* flag_val_ptr)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // Zero send_counters
+    if (idx < ep_size)
+    {
+        send_counters[idx] = 0;
+    }
+    // Zero local_token_counter and increment flag_val
+    if (idx == 0)
+    {
+        *local_token_counter = 0;
+        // Increment flag_val for this dispatch round
+        *flag_val_ptr = *flag_val_ptr + 1;
+    }
+    // Fill send_indices with -1
+    int total = local_num_tokens * ep_size;
+    if (idx < total)
+    {
+        send_indices[idx] = -1;
+    }
+}
+
 // ============================================================================
 // Generic Dispatch Kernel Implementation
 // One warp per token design:
@@ -102,9 +127,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
-    int* send_counters,       // [ep_size] atomic counters - each rank tracks its own
-    int* send_indices,        // [local_num_tokens, ep_size] send index tensor
-    int* local_token_counter, // Atomic counter for completed tokens on this rank
     int local_num_tokens, int rank_id, int ep_size, int top_k, int num_experts_per_rank)
 {
     // Constants
@@ -136,9 +158,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         int dst_token_idx;
         if (lane_id == 0)
         {
-            dst_token_idx = atomicAdd(&send_counters[target_rank], 1);
+            dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
 
-            send_indices[local_token_idx * ep_size + target_rank] = dst_token_idx;
+            ptrs.send_indices[local_token_idx * ep_size + target_rank] = dst_token_idx;
         }
         // Broadcast the index to all threads in the warp
         dst_token_idx = __shfl_sync(0xffffffff, dst_token_idx, 0);
@@ -170,25 +192,25 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         // (B) .release guarantees: If increment of local_token_counter is visible, then lane0's sent data are visible
         asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
                      : "=r"(cnt) 
-                     : "l"(local_token_counter), "r"(1));
+                     : "l"(ptrs.local_token_counter), "r"(1));
         
         if (cnt + 1 == local_num_tokens)  // The last token dispatched
         {
             // Signal to each target rank that this source rank has completed sending
             for (int target_rank = 0; target_rank < ep_size; target_rank++)
             {
-                uint32_t* flag_addr = &ptrs.completion_ptrs.completion_flags[target_rank][rank_id];
-                uint32_t flag_value = *ptrs.completion_ptrs.flag_val;
+                uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
+                uint32_t flag_value = *ptrs.flag_val;
                 // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
                 printf("$$$Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
                 asm volatile("st.release.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
             }
 
             // Busy wait until all source ranks targeting this rank have completed sending
-            uint32_t expected_value = *ptrs.completion_ptrs.flag_val;
+            uint32_t expected_value = *ptrs.flag_val;
             for (int source_rank = 0; source_rank < ep_size; source_rank++)
             {
-                uint32_t* flag_ptr = &ptrs.completion_ptrs.completion_flags[rank_id][source_rank];
+                uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][source_rank];
                 uint32_t flag_value;
                 do
                 {
@@ -202,33 +224,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     }
 }
 
-// ============================================================================
-// Prepare Kernels
-// ============================================================================
-
-__global__ void moeA2APrepareDispatchKernel(int* send_counters, int* send_indices,
-    int* local_token_counter, int ep_size, int local_num_tokens, uint32_t* flag_val_ptr)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Zero send_counters
-    if (idx < ep_size)
-    {
-        send_counters[idx] = 0;
-    }
-    // Zero local_token_counter and increment flag_val
-    if (idx == 0)
-    {
-        *local_token_counter = 0;
-        // Increment flag_val for this dispatch round
-        *flag_val_ptr = *flag_val_ptr + 1;
-    }
-    // Fill send_indices with -1
-    int total = local_num_tokens * ep_size;
-    if (idx < total)
-    {
-        send_indices[idx] = -1;
-    }
-}
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 {
@@ -237,7 +232,7 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
     int grid = ceilDiv(n, kBlockSize);
     moeA2APrepareDispatchKernel<<<grid, kBlockSize, 0, params.stream>>>(
         params.send_counters, params.send_indices, params.local_token_counter,
-        params.ep_size, params.local_num_tokens, params.completion_ptrs.flag_val);
+        params.ep_size, params.local_num_tokens, params.flag_val);
 }
 
 // ============================================================================
@@ -279,11 +274,20 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     }
     
     // Copy completion flag pointers
-    kernel_ptrs.completion_ptrs = params.completion_ptrs;
+    for (int i = 0; i < params.ep_size; i++)
+    {
+        kernel_ptrs.completion_flags[i] = params.completion_flags[i];
+    }
+    kernel_ptrs.flag_val = params.flag_val;
+    
+    // Copy communication tracking pointers
+    kernel_ptrs.send_counters = params.send_counters;
+    kernel_ptrs.send_indices = params.send_indices;
+    kernel_ptrs.local_token_counter = params.local_token_counter;
 
     moeA2ADispatchKernel<<<grid_size, kBlockSize, 0, params.stream>>>(params.token_selected_experts, kernel_ptrs,
-        params.num_payloads, params.max_tokens_per_rank, params.send_counters, params.send_indices,
-        params.local_token_counter, params.local_num_tokens, params.ep_rank, params.ep_size, params.top_k, params.num_experts_per_rank);
+        params.num_payloads, params.max_tokens_per_rank,
+        params.local_num_tokens, params.ep_rank, params.ep_size, params.top_k, params.num_experts_per_rank);
 }
 
 // ============================================================================
@@ -401,107 +405,6 @@ __device__ void warp_vectorized_fill(void* dst, T value, int size, int lane_id)
     }
 }
 
-// ============================================================================
-// Generic Combine Kernel Implementation (Templated by data type)
-// ============================================================================
-
-template <typename T>
-__global__ void moeA2ACombineKernel(int const* send_indices, // [local_num_tokens, ep_size]
-    const CombineKernelPointers ptrs,                        // Combine-specific struct, src_data_ptrs[0] is output
-    int* local_token_counter,                                // Atomic counter for completed tokens
-    int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
-{
-    // Constants
-    constexpr int WARPS_PER_BLOCK = 8;
-    constexpr int WARP_SIZE = 32;
-
-    // One warp per token
-    int warp_id_in_block = threadIdx.x / WARP_SIZE;
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id_in_block;
-    int local_token_idx = global_warp_id;
-    int const size_per_token = elements_per_token * sizeof(T);
-
-    if (local_token_idx >= local_num_tokens)
-    {
-        return;
-    }
-
-    // In-kernel readiness synchronization at start of combine:
-    // - Block 0, thread 0 signals readiness to all peers with current flag_val.
-    // - Thread 0 of each block waits for all peers' readiness (equality), then __syncthreads.
-    if (blockIdx.x == 0 && threadIdx.x == 0)
-    {
-        uint32_t cur_val = *ptrs.completion_ptrs.flag_val;
-        for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
-        {
-            uint32_t* flag_addr = &ptrs.completion_ptrs.completion_flags[peer_rank][rank_id];
-            asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(cur_val));
-        }
-    }
-
-    if (threadIdx.x == 0)
-    {
-        uint32_t expected_value = *ptrs.completion_ptrs.flag_val;
-        for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
-        {
-            uint32_t* flag_ptr = &ptrs.completion_ptrs.completion_flags[rank_id][peer_rank];
-            uint32_t flag_value;
-            do
-            {
-                // Acquire load to ensure visibility of peer's release-store
-                asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-            } while (flag_value != expected_value);
-        }
-    }
-    __syncthreads();
-
-    // Get output location for this token (using src_data_ptrs[0] as output)
-    T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-
-    // Zero initialize output using vectorized fill
-    warp_vectorized_fill(token_output, T(0), size_per_token, lane_id);
-    
-
-    // For each possible target rank, check if this token was sent there
-    for (int target_rank = 0; target_rank < ep_size; target_rank++)
-    {
-        // Check if this token was sent to target_rank
-        int dst_idx = send_indices[local_token_idx * ep_size + target_rank];
-        if (dst_idx < 0)
-            continue; // Wasn't sent to this rank
-
-        // Get received data location from target rank's buffer
-        // Using payload 0 (the only payload for combine)
-        uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
-        uint8_t const* recv_ptr = recv_buffer + (rank_id * max_tokens_per_rank + dst_idx) * size_per_token;
-
-        if (lane_id == 0)
-        {
-            // Fused print: print all 5 values in one printf
-            float vals[5];
-            for (int i = 0; i < 5; ++i)
-            {
-                uint16_t bf16_val = *(reinterpret_cast<uint16_t const*>(recv_ptr) + i);
-                vals[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 const*>(&bf16_val));
-            }
-            int send_indices_vals[4];
-            for (int i = 0; i < 4; ++i)
-            {
-                send_indices_vals[i] = send_indices[local_token_idx * ep_size + i];
-            }
-            printf(
-                "Rank %d token %d retrieved from rank %d, recv_ptr[0..4]=[%f, %f, %f, %f, %f] send_indices[0...3]=[%d, "
-                "%d, %d, %d]\n",
-                rank_id, local_token_idx, target_rank, vals[0], vals[1], vals[2], vals[3], vals[4],
-                send_indices_vals[0], send_indices_vals[1], send_indices_vals[2], send_indices_vals[3]);
-        }
-
-        // Sum into output (distributed across warp)
-        warp_vectorized_sum<T>(token_output, reinterpret_cast<T const*>(recv_ptr), size_per_token, lane_id);
-        
-    }
-}
 
 // Copy payload to recv buffer using warp-based vectorized copy (one warp per token)
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uint8_t* payload_bytes, 
@@ -531,6 +434,107 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uin
     {
         // Increment flag_val for this combine round
         *flag_val_ptr = *flag_val_ptr + 1;
+    }
+}
+
+// ============================================================================
+// Generic Combine Kernel Implementation (Templated by data type)
+// ============================================================================
+
+template <typename T>
+__global__ void moeA2ACombineKernel(
+    const CombineKernelPointers ptrs,                        // Combine-specific struct, src_data_ptrs[0] is output
+    int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
+{
+    // Constants
+    constexpr int WARPS_PER_BLOCK = 8;
+    constexpr int WARP_SIZE = 32;
+
+    // One warp per token
+    int warp_id_in_block = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id_in_block;
+    int local_token_idx = global_warp_id;
+    int const size_per_token = elements_per_token * sizeof(T);
+
+    if (local_token_idx >= local_num_tokens)
+    {
+        return;
+    }
+
+    // In-kernel readiness synchronization at start of combine:
+    // - Block 0, thread 0 signals readiness to all peers with current flag_val.
+    // - Thread 0 of each block waits for all peers' readiness (equality), then __syncthreads.
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        uint32_t cur_val = *ptrs.flag_val;
+        for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
+        {
+            uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
+            asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(cur_val));
+        }
+    }
+
+    if (threadIdx.x == 0)
+    {
+        uint32_t expected_value = *ptrs.flag_val;
+        for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
+        {
+            uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+            uint32_t flag_value;
+            do
+            {
+                // Acquire load to ensure visibility of peer's release-store
+                asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+            } while (flag_value != expected_value);
+        }
+    }
+    __syncthreads();
+
+    // Get output location for this token (using src_data_ptrs[0] as output)
+    T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
+
+    // Zero initialize output using vectorized fill
+    warp_vectorized_fill(token_output, T(0), size_per_token, lane_id);
+    
+
+    // For each possible target rank, check if this token was sent there
+    for (int target_rank = 0; target_rank < ep_size; target_rank++)
+    {
+        // Check if this token was sent to target_rank
+        int dst_idx = ptrs.send_indices[local_token_idx * ep_size + target_rank];
+        if (dst_idx < 0)
+            continue; // Wasn't sent to this rank
+
+        // Get received data location from target rank's buffer
+        // Using payload 0 (the only payload for combine)
+        uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+        uint8_t const* recv_ptr = recv_buffer + (rank_id * max_tokens_per_rank + dst_idx) * size_per_token;
+
+        if (lane_id == 0)
+        {
+            // Fused print: print all 5 values in one printf
+            float vals[5];
+            for (int i = 0; i < 5; ++i)
+            {
+                uint16_t bf16_val = *(reinterpret_cast<uint16_t const*>(recv_ptr) + i);
+                vals[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 const*>(&bf16_val));
+            }
+            int send_indices_vals[4];
+            for (int i = 0; i < 4; ++i)
+            {
+                send_indices_vals[i] = ptrs.send_indices[local_token_idx * ep_size + i];
+            }
+            printf(
+                "Rank %d token %d retrieved from rank %d, recv_ptr[0..4]=[%f, %f, %f, %f, %f] send_indices[0...3]=[%d, "
+                "%d, %d, %d]\n",
+                rank_id, local_token_idx, target_rank, vals[0], vals[1], vals[2], vals[3], vals[4],
+                send_indices_vals[0], send_indices_vals[1], send_indices_vals[2], send_indices_vals[3]);
+        }
+
+        // Sum into output (distributed across warp)
+        warp_vectorized_sum<T>(token_output, reinterpret_cast<T const*>(recv_ptr), size_per_token, lane_id);
+        
     }
 }
 
@@ -567,7 +571,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
         bytes_per_token,
         params.ep_size,
         params.max_tokens_per_rank,
-        params.completion_ptrs.flag_val);
+        params.flag_val);
 }
 
 
@@ -601,26 +605,34 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     }
     
     // Copy completion flag pointers
-    kernel_ptrs.completion_ptrs = params.completion_ptrs;
+    for (int i = 0; i < params.ep_size; i++)
+    {
+        kernel_ptrs.completion_flags[i] = params.completion_flags[i];
+    }
+    kernel_ptrs.flag_val = params.flag_val;
+    
+    // Copy communication tracking pointers
+    kernel_ptrs.send_indices = params.send_indices;
+    kernel_ptrs.local_token_counter = params.local_token_counter;
 
     // Launch appropriate kernel based on data type
     switch (params.dtype)
     {
     case nvinfer1::DataType::kHALF:
-        moeA2ACombineKernel<half><<<grid_size, kBlockSize, 0, params.stream>>>(params.send_indices, kernel_ptrs,
-            params.local_token_counter, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+        moeA2ACombineKernel<half><<<grid_size, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+            params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
             params.ep_rank, params.ep_size);
         break;
 
     case nvinfer1::DataType::kBF16:
-        moeA2ACombineKernel<__nv_bfloat16><<<grid_size, kBlockSize, 0, params.stream>>>(params.send_indices,
-            kernel_ptrs, params.local_token_counter, params.max_tokens_per_rank, params.elements_per_token,
-            params.local_num_tokens, params.ep_rank, params.ep_size);
+        moeA2ACombineKernel<__nv_bfloat16><<<grid_size, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+            params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+            params.ep_rank, params.ep_size);
         break;
 
     case nvinfer1::DataType::kFLOAT:
-        moeA2ACombineKernel<float><<<grid_size, kBlockSize, 0, params.stream>>>(params.send_indices, kernel_ptrs,
-            params.local_token_counter, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+        moeA2ACombineKernel<float><<<grid_size, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+            params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
             params.ep_rank, params.ep_size);
         break;
 
