@@ -201,7 +201,7 @@ UcxConnectionManager::UcxConnectionManager()
     {
         if (useMPI())
         {
-            mRank = mpi::MpiComm::world().getRank();
+            mRank = mpi::MpiComm::session().getRank();
             mWorldSize = mpi::MpiComm::session().getSize();
         }
         else
