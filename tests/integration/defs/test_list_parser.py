@@ -18,7 +18,7 @@ from .trt_test_alternative import print_info, print_warning
 
 # from misc.reorder_venv_tests import reorder_tests
 
-kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT", "ISOLATE"]
+kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT", "ISOLATION"]
 record_invalid_tests = True
 
 kSTRIP_PARENS_PAT = re.compile(r'\((.*?)\)')
