@@ -51,6 +51,9 @@ class InferenceOptimizer:
             )
             self.ad_config.transforms["load_weights"]["device"] = cm.device
 
+        if "build_and_load_factory_model" in self.ad_config.transforms:
+            self.ad_config.transforms["build_and_load_factory_model"]["device"] = cm.device
+
         if "move_cm_to_device" in self.ad_config.transforms:
             self.ad_config.transforms["move_cm_to_device"]["checkpoint_device"] = (
                 self.ad_config.checkpoint_device

@@ -63,17 +63,10 @@ class BuildAndLoadFactoryModel(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         # load model with auto sharding
-        assert isinstance(factory, hf.AutoModelFactory)
-        # TODO: figure out correct device map, tp_plan argument here???
-        model = factory.automodel_cls.from_pretrained(
-            factory.model,
-            trust_remote_code=True,
-            # device_map="cuda",
-            tp_plan="auto",
-            torch_dtype="auto",
-        )
-        factory._set_simple_forward(model)
-        model.eval()
+        assert isinstance(factory, hf.AutoModelFactory), "Only HF models are supported."
+
+        # build and load the model
+        model = factory.build_and_load_model(self.config.device)
 
         # as wrapper to satisfy the interface we will register the model as a submodule
         gm.add_module("factory_model", model)

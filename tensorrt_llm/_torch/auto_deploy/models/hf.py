@@ -120,11 +120,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # set sharding config source to huggingface
         self._sharding_config["source"] = ShardingConfigSource.HUGGINGFACE
 
-    # TODO (@lucaslie): Do we ever want to switch to from_pretrained?
-    @property
-    def automodel_from_config(self):
-        return AutoModelForCausalLM.from_config
-
     @property
     def automodel_cls(self) -> Type[_BaseAutoModelClass]:
         return AutoModelForCausalLM
@@ -141,7 +136,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """
         return type(model).forward(model, input_ids=input_ids, position_ids=position_ids, **kwargs)
 
-    def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
+    def _recursive_update_config(
+        self, config: PretrainedConfig, update_dict: Dict[str, Any]
+    ) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         """
         Deep-merge a PretrainedConfig object with values from update_dict.
 
@@ -150,11 +147,15 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             update_dict: Dictionary with values to update in the config
 
         Returns:
-            The updated PretrainedConfig object
+            A tuple of (updated_config, nested_unused_kwargs) where nested_unused_kwargs captures
+            any keys from update_dict that could not be applied to config, preserving nesting.
         """
+        nested_unused_kwargs: Dict[str, Any] = {}
+
         for key, value_new in update_dict.items():
             # Check if the key exists in config
             if not hasattr(config, key):
+                nested_unused_kwargs[key] = value_new
                 continue
 
             target_value = getattr(config, key)
@@ -162,29 +163,46 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             # Handle nested PretrainedConfig objects...
             if isinstance(value_new, dict) and isinstance(target_value, PretrainedConfig):
                 # Recursively update nested configs
-                updated_value = self._recursive_update_config(target_value, value_new)
+                updated_value, child_unused = self._recursive_update_config(target_value, value_new)
                 setattr(config, key, updated_value)
+                if child_unused:
+                    nested_unused_kwargs[key] = child_unused
             else:
                 # Direct update for simple values
                 setattr(config, key, value_new)
 
-        return config
+        return config, nested_unused_kwargs
 
     def _set_simple_forward(self, model: nn.Module):
         """Set the simple forward method for the model."""
         model.forward = types.MethodType(self._simple_forward, model)
 
-    def _build_model(self, device: DeviceLikeType) -> nn.Module:
-        """Build the model on the desired device."""
-
+    def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.
-        model_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
-        model_config = self._recursive_update_config(model_config, self.model_kwargs)
+        model_config, unused_kwargs = AutoConfig.from_pretrained(
+            self.model, return_unused_kwargs=True, trust_remote_code=True
+        )
+        model_config, nested_unused_kwargs = self._recursive_update_config(
+            model_config, self.model_kwargs
+        )
+        # merge nested unused kwargs into HF's unused kwargs (preserve nesting)
+        merged_unused = deep_merge_dicts(unused_kwargs, nested_unused_kwargs)
+        return model_config, merged_unused
+
+    def _build_model(self, device: DeviceLikeType) -> nn.Module:
+        """Build the model on the desired device."""
+        model_config, unused_kwargs = self._get_model_config()
 
         with (init_empty_weights if device == "meta" else nullcontext)():
-            model = self.automodel_cls.from_config(model_config, trust_remote_code=True)
+            model = self.automodel_cls.from_config(
+                model_config,
+                **{
+                    "trust_remote_code": True,
+                    **unused_kwargs,
+                },
+            )
         if device == "meta":
             # post-init --> this must be called explicitly for HF models the way we initialize them
             # since this "gets lost" with the init_empty_weights context manager.
@@ -241,6 +259,41 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         if self.tokenizer is None:
             return None
         return AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+
+    def build_and_load_model(self, device: DeviceLikeType) -> nn.Module:
+        """Automatically build the model from_pretrained and load the weights.
+
+        Args:
+            device: The device to build the model on.
+
+        Returns:
+            The built model.
+
+        If we skip weight loading, we will fall back to the build_model+load_or_random_init methods.
+        NOTE that there is NO sharding when skip_loading_weights is True.
+        """
+        # only this way can we skip downloading/loading weights
+        if self.skip_loading_weights or "cuda" not in str(device):
+            ad_logger.info("Falling back to build_model+load_or_random_init methods.")
+            model = self.build_model(device)
+            self.load_or_random_init(model, device)
+            return model
+
+        # full joint loading of weights and model
+        self.prefetch_checkpoint(force=True)  # ensuring weights are downloaded
+        model_config, unused_kwargs = self._get_model_config()
+        model = self.automodel_cls.from_pretrained(
+            self.model,
+            config=model_config,
+            **{
+                "trust_remote_code": True,
+                **unused_kwargs,
+                "torch_dtype": "auto",  # takes precedence over unused_kwargs!
+            },
+        )
+        self._set_simple_forward(model)
+        model.eval()
+        return model
 
     @staticmethod
     def _get_ignore_patterns(repo_id: str, skip_prefetch_weights: bool) -> List[str]:

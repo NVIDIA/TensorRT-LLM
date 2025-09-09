@@ -211,6 +211,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     ### VALIDATION #################################################################################
     @model_validator(mode="after")
+    # TODO: discuss what to do with this once we fully transition to the new inference optimizer
     def update_attn_page_size(self):
         # NOTE force attn_page_size to equal max_seq_len for triton backend
         if self.attn_backend == "triton" or self.attn_backend == "torch":
