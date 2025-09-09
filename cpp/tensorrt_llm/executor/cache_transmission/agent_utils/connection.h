@@ -175,7 +175,7 @@ public:
     void recv(DataContext const& ctx, void* data, size_t size) const override;
     void sendRequestAndBufferInfo(
         batch_manager::RequestInfo& requestInfo, std::optional<size_t> cacheBufferId, int validConnectionIdx);
-    void setSenderState(MemoryDesc mReceiverBufferDesc, int valideSegmentIdx);
+    void setSenderState(MemoryDesc mReceiverBufferDesc, int valideSegmentIdx, std::pair<size_t, size_t> offsetRatio);
     [[nodiscard]] std::optional<size_t> getCacheBufferId() const;
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
@@ -188,6 +188,7 @@ private:
     {
         MemoryDesc mReceiverBufferDesc{nullptr, 0, 0};
         int validSegmentIdx{0};
+        std::pair<size_t, size_t> mOffsetRatio;
         SenderState() = default;
     };
 
@@ -203,7 +204,8 @@ private:
 class AgentConnectionManager : public ConnectionManager
 {
 public:
-    AgentConnectionManager(batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager);
+    AgentConnectionManager(
+        batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, CacheState cacheState);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
@@ -222,6 +224,7 @@ private:
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
     CommState mCommState;
+    CacheState mCacheState;
     batch_manager::kv_cache_manager::CacheTransBufferManager* mCacheTransBufferManager;
     std::mutex mNotificationMutex;
     std::unordered_map<std::string, std::list<std::string>> mUnhandledNotifications;

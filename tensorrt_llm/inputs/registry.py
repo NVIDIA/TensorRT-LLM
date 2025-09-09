@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
                     TypeVar)
 
+from PIL import Image
 from torch import Tensor, nn
 
 from .._utils import nvtx_range_debug
@@ -114,8 +115,7 @@ class BaseMultimodalInputProcessor:
     def get_num_tokens_per_image(
         self,
         *,
-        image_width: int,
-        image_height: int,
+        image: Image.Image,
         **kwargs,
     ):
         """
@@ -126,6 +126,8 @@ class BaseMultimodalInputProcessor:
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
+        image_height = image.height
+        image_width = image.width
         image_size = (image_height, image_width)
         return self.get_num_multimodal_tokens([image_size],
                                               **kwargs)["num_image_tokens"][0]
@@ -133,9 +135,7 @@ class BaseMultimodalInputProcessor:
     def get_num_tokens_per_video(
         self,
         *,
-        video_width: int,
-        video_height: int,
-        num_frames: int,
+        video: List[Image.Image],
         **kwargs,
     ):
         """
@@ -146,6 +146,9 @@ class BaseMultimodalInputProcessor:
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
+        video_width = video[0].width
+        video_height = video[0].height
+        num_frames = len(video)
         video_size = (num_frames, video_height, video_width)
         try:
             num_video_tokens = self.get_num_multimodal_tokens(
@@ -153,8 +156,8 @@ class BaseMultimodalInputProcessor:
             return num_video_tokens
         except Exception:
             # Fallback: treat video as sequence of frames
-            num_tokens_per_frame = self.get_num_tokens_per_image(
-                image_width=video_width, image_height=video_height, **kwargs)
+            num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
+                                                                 **kwargs)
             temporal_patch_size = self.temporal_patch_size if hasattr(
                 self, 'temporal_patch_size') else 1
             return num_tokens_per_frame * num_frames // temporal_patch_size

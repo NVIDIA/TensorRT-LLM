@@ -364,7 +364,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     // Wait 10 minutes to check status of the node again
                     sleep(time: 10, unit: 'MINUTES')
                     // Avoid the node being stuck in the held state.
-                    Utils.exec(pipeline, Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""))
+                    Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""), numRetries: 3)
                     counter++
                 }
             }
@@ -404,6 +404,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 def dockerArgs = "${dockerGPUOption} " +
                     "--cap-add=SYS_ADMIN " +
                     "--ipc=host " +
+                    "--entrypoint=\"\" " +
                     "--security-opt seccomp=unconfined " +
                     "-u root:root " +
                     "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
@@ -2040,9 +2041,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
-        //"RTXPro6000-Pytorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        //"RTXPro6000-4_GPUs-Pytorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
-        //"RTXPro6000-4_GPUs-Pytorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {

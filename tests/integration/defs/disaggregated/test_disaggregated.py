@@ -87,6 +87,8 @@ def get_test_config(test_desc, example_dir, test_root):
         (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
         "ctxpp4_genpp4":
         (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
+        "ctxpp4_gentp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
@@ -148,6 +150,10 @@ def get_test_config(test_desc, example_dir, test_root):
         "deepseek_v3_lite_fp8_tp1_two_mtp":
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml"
+         ),
+        "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml"
          ),
     }
 
@@ -776,6 +782,27 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+#tiny llama pp4 will have uneven layer per pp. pp4
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp4_gentp4",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -838,6 +865,29 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1_mtp",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    #add one mtp layer, pp rank0 will have 15 layer, pp rank 1 will have 16 layers.
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 

@@ -15,7 +15,7 @@ from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
-                                            ExecutorConfig, FinishReason)
+                                            FinishReason, KvCacheConfig)
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (
     DecoderInputBuffers, add_new_tokens_to_requests, make_decoding_batch_input)
@@ -1006,12 +1006,16 @@ class TRTLLMSampler(Sampler):
 
     def __init__(
         self,
-        executor_config: ExecutorConfig,
         model,
         model_dtype,
         mapping: Mapping,
         decoding_mode: DecodingMode,
         disable_overlap_scheduler: bool,
+        max_seq_len: int,
+        max_batch_size: int,
+        max_beam_width: int,
+        decoding_config: Optional[DecodingConfig] = None,
+        kv_cache_config: Optional[KvCacheConfig] = None,
     ):
 
         vocab_size = model.config.vocab_size
@@ -1022,14 +1026,15 @@ class TRTLLMSampler(Sampler):
         self.model_datatype = torch_dtype_to_binding(model_dtype)
         self.logits_datatype = DataType.FLOAT
         self.decoding_mode = decoding_mode
-        self.executor_config = executor_config
-        self.decoding_config = self.executor_config.decoding_config if self.executor_config.decoding_config else DecodingConfig(
+        self.decoding_config = decoding_config if decoding_config else DecodingConfig(
             decoding_mode)
-        max_attn_window = self.executor_config.kv_cache_config.max_attention_window
+        max_attn_window = kv_cache_config.max_attention_window
+        self.max_seq_len = max_seq_len
         self.max_attention_window = max(
-            max_attn_window
-        ) if max_attn_window is not None else executor_config.max_seq_len
-        self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
+            max_attn_window) if max_attn_window is not None else max_seq_len
+        self.max_batch_size = max_batch_size
+        self.max_beam_width = max_beam_width
+        self.max_num_sequences = mapping.pp_size * max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
         self.num_micro_batches = mapping.pp_size if mapping.pp_size > 1 else (
@@ -1058,14 +1063,14 @@ class TRTLLMSampler(Sampler):
             "buffer_manager":
             buffer_manager,
             "decoder_input_buffers": [
-                DecoderInputBuffers(self.executor_config.max_batch_size,
+                DecoderInputBuffers(self.max_batch_size,
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
             "sequence_lengths_host":
             torch.empty((
                 self.max_num_sequences,
-                self.executor_config.max_beam_width,
+                self.max_beam_width,
             ),
                         dtype=torch.int),
             "decoder_state":
@@ -1075,10 +1080,10 @@ class TRTLLMSampler(Sampler):
 
         self.store["decoder_state"].setup(
             max_num_sequences=self.max_num_sequences,
-            max_beam_width=self.executor_config.max_beam_width,
+            max_beam_width=self.max_beam_width,
             max_attention_window=self.max_attention_window,
             sink_token_length=0,
-            max_sequence_length=self.executor_config.max_seq_len,
+            max_sequence_length=self.max_seq_len,
             dtype=self.logits_datatype,
             model_config=self.model_config,
             world_config=self.world_config,
@@ -1091,10 +1096,11 @@ class TRTLLMSampler(Sampler):
         self.algs.decoder.setup(
             mode=self.decoding_mode,
             max_num_sequences=self.max_num_sequences,
-            max_beam_width=self.executor_config.max_beam_width,
+            max_beam_width=self.max_beam_width,
             dtype=self.logits_datatype,
             model_config=self.model_config,
-            world_config=self.world_config)
+            world_config=self.world_config,
+        )
         self.algs.create_new_decoder_requests = CreateNewDecoderRequests(
             speculative_decoding_fast_logits=False,
             is_leader_in_orch_mode=False,
@@ -1110,7 +1116,7 @@ class TRTLLMSampler(Sampler):
             requests.context_requests, self.logits_datatype,
             self.store["decoder_input_buffers"][self.micro_batch_idx],
             self.store["decoder_state"], self.store["cuda_stream"],
-            self.algs.decoder.decoder_stream, self.executor_config.max_seq_len,
+            self.algs.decoder.decoder_stream, self.max_seq_len,
             self.beam_width(requests.context_requests))
 
         local_batch_size = len(batch_slots)
