@@ -131,8 +131,8 @@ fi
 
 if [ $opencv -eq 1 ]; then
     echo "Installing OpenCV..."
-    pip3 uninstall -y opencv && \
-    rm -rf /usr/local/lib/python3*/dist-packages/cv2/ && \
+    pip3 uninstall -y opencv
+    rm -rf /usr/local/lib/python3*/dist-packages/cv2/
     pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
 fi
 
