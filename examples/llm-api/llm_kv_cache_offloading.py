@@ -5,23 +5,28 @@ from tensorrt_llm.llmapi import KvCacheConfig
 def main():
 
     prompt_a = (
-        "Given the following question and four candidate answers (A, B, C and D), choose the best answer.\n"
+        "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
         "The following excerpt is from a pamphlet.\nYou will do me the justice to remember, "
         "that I have always strenuously supported the Right of every man to his own opinion"
     )
 
     prompt_b = (
-        "Question: This question refers to the following information.\nRead the following excerpt."
-        "\nThe revolutionary seed had penetrated into every country and spread more or less. "
+        "Question: This question refers to the following information. Read the following excerpt."
+        "The revolutionary seed had penetrated into every country and spread more or less. "
         "It was greatly developed under")
+
+    kv_cache_max_tokens = 256
+    kv_cache_page_size = 16
+    kv_cache_host_size_in_bytes = 1024**3
 
     # Offloading Off
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=1,
               max_seq_len=256,
-              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
-                                            max_tokens=256,
-                                            tokens_per_block=16))
+              kv_cache_config=KvCacheConfig(
+                  enable_block_reuse=True,
+                  max_tokens=kv_cache_max_tokens,
+                  tokens_per_block=kv_cache_page_size))
     # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
     print(output_a.prompt)
@@ -46,10 +51,11 @@ def main():
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=1,
               max_seq_len=256,
-              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
-                                            max_tokens=256,
-                                            tokens_per_block=16,
-                                            host_cache_size=1024**3))
+              kv_cache_config=KvCacheConfig(
+                  enable_block_reuse=True,
+                  max_tokens=kv_cache_max_tokens,
+                  tokens_per_block=kv_cache_page_size,
+                  host_cache_size=kv_cache_host_size_in_bytes))
     # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
     print(output_a.prompt)
