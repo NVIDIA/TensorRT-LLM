@@ -55,14 +55,6 @@ def setup_test():
 #     completion_flags_size = ep_size * 4  # int32, one flag per rank
 #     return packed_tokens_size + sf_size + experts_size + final_scales_size + completion_flags_size
 
-# Before we correctly implement sync in kernel, we have to manually sync (GPU + all hosts MPI)
-def sync():
-    torch.cuda.synchronize()
-
-    comm = MPI.COMM_WORLD
-    comm.Barrier()
-
-
 
 def compute_target_rank_id(expert_id, num_experts_per_rank):
     """Compute the rank that owns a given expert using contiguous partitioning.
@@ -265,9 +257,6 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
 
         recv_buffers = moe_a2a.dispatch(token_selected_experts, payloads)
 
-        # TODO: remove this after synchronization is okay.
-        # sync()
-
         # Verify completion flags after dispatch
         completion_flags_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.COMPLETION_FLAGS_OFFSET_INDEX].item()
         completion_flags = moe_a2a.workspace[
@@ -286,15 +275,15 @@ def run_moe_a2a_dispatch_single_rank(ep_size, all_num_tokens, top_k,
 
         # Return results to be collected (move to CPU for MPI transfer)
         return (token_selected_experts.cpu(), [p.cpu() for p in payloads],
-                [rb.cpu() for rb in recv_buffers], moe_a2a._last_send_counters.cpu(),
-                moe_a2a._last_send_indices.cpu())
+                [rb.cpu() for rb in recv_buffers], moe_a2a.send_counters.cpu(),
+                moe_a2a.send_indices.cpu(), moe_a2a.recv_counters.cpu())
     except Exception:
         traceback.print_exc()
         raise
 
 
 def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
-                    all_send_counters, all_send_indices, ep_size,
+                    all_send_counters, all_send_indices, all_recv_counters, ep_size,
                     all_num_tokens, top_k, max_tokens_per_rank, num_experts_per_rank):
     """Verify dispatch results including actual content verification"""
 
@@ -349,6 +338,11 @@ def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
         assert send_indices.shape[
             1] == ep_size, "send_indices.shape[1] should be ep_size"
         assert send_indices.dtype == torch.int32, "send_indices.dtype should be torch.int32"
+        
+        recv_counters = all_recv_counters[send_rank]
+        assert len(recv_counters.shape) == 1, "recv_counters should be a 1D tensor"
+        assert recv_counters.shape[0] == ep_size, "recv_counters.shape[0] should be ep_size"
+        assert recv_counters.dtype == torch.int32, "recv_counters.dtype should be torch.int32"
 
     # Verify send_counters
     for send_rank in range(ep_size):
@@ -379,6 +373,17 @@ def verify_dispatch(all_token_selected_experts, all_payloads, all_recv_buffers,
             assert actual_to_rank == expected_to_rank, \
                 f"Rank {send_rank} sent {actual_to_rank} tokens to rank {target_rank}, " \
                 f"expected {expected_to_rank}"
+    
+    # Verify recv_counters
+    for recv_rank in range(ep_size):
+        recv_counters = all_recv_counters[recv_rank]
+        
+        for send_rank in range(ep_size):
+            expected_recv = all_send_counters[send_rank][recv_rank].item()
+            actual_recv = recv_counters[send_rank].item()
+            assert actual_recv == expected_recv, \
+                f"Rank {recv_rank} received {actual_recv} tokens from rank {send_rank}, " \
+                f"expected {expected_recv} (based on send_counters)"
 
     # Verify payloads using send_indices
     for send_rank in range(ep_size):
@@ -499,10 +504,12 @@ class TestMoEAlltoAll:
         all_recv_buffers = [r[2] for r in all_results]
         all_send_counters = [r[3] for r in all_results]
         all_send_indices = [r[4] for r in all_results]
+        all_recv_counters = [r[5] for r in all_results]
 
         # Verify dispatch results with content verification
         verify_dispatch(all_token_selected_experts, all_payloads,
                         all_recv_buffers, all_send_counters, all_send_indices,
+                        all_recv_counters,
                         ep_size, all_num_tokens, top_k, max_tokens_per_rank, num_experts_per_rank)
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2,
@@ -601,9 +608,6 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
         # Run dispatch
         recv_buffers = moe_a2a.dispatch(token_selected_experts, payloads)
 
-        # TODO: remove this
-        # sync()  # commented out: combine kernel handles readiness
-
 
         hidden_states_recv = recv_buffers[
             0]  # [ep_size, max_tokens_per_rank, hidden_size]
@@ -628,15 +632,9 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             ep_rank=rank,
             num_experts_per_rank=num_experts_per_rank).view(ep_size, max_tokens_per_rank, hidden_states_recv.shape[-1])
 
-        # TODO: remove this
-        # sync()  # commented out: combine kernel handles readiness
-
         # Run combine on the received data
-        send_indices = moe_a2a._last_send_indices
+        send_indices = moe_a2a.send_indices
         combined_output = moe_a2a.combine(hidden_states_recv)
-
-        # TODO: remove this
-        # sync()  # commented out: not needed after in-kernel sync
 
         # Verify completion flags after combine
         completion_flags_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.COMPLETION_FLAGS_OFFSET_INDEX].item()

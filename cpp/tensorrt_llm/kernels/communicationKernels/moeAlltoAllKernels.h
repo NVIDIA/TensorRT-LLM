@@ -40,7 +40,7 @@ struct PayloadDescriptor
 // Dispatch kernel pointers - const source data
 struct DispatchKernelPointers
 {
-    // Distributed pointers
+    // Payload pointers
     void const* src_data_ptrs[kMaxPayloads];     // Array of source data pointers
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers
     int payload_bytes_per_token[kMaxPayloads];   // Bytes per token for each payload
@@ -49,16 +49,17 @@ struct DispatchKernelPointers
     uint32_t* completion_flags[kMaxRanks];  // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
     uint32_t* flag_val;                     // The value of the flag for this round (stored on the local rank)
     
-    // Local pointers
-    int* send_counters;       // [ep_size] atomic counters
+    // Local aux data pointers
+    int* send_counters;       // [ep_size] How many tokens have been sent to each target rank
     int* send_indices;        // [local_num_tokens, ep_size] send index tensor
+    int* recv_counters[kMaxRanks];       // How many tokens have been received from each source rank. Each rank has [ep_size] counters
     int* local_token_counter; // Atomic counter for completed tokens
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
 struct CombineKernelPointers
 {
-    // Distributed pointers
+    // Payload pointers
     void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
     void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
     
@@ -66,9 +67,8 @@ struct CombineKernelPointers
     uint32_t* completion_flags[kMaxRanks];  // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
     uint32_t* flag_val;                     // The value of the flag for this round (stored on the local rank)
     
-    // Local pointers
+    // Local aux data pointers
     int const* send_indices;  // [local_num_tokens, ep_size] from dispatch
-    int* local_token_counter; // Atomic counter for completed tokens (optional)
 };
 
 // Dispatch phase parameters
@@ -100,6 +100,7 @@ struct MoeA2ADispatchParams
 
     // Communication tracking
     int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
+    int* recv_counters[kMaxRanks];       // tracks tokens received from each source rank. Each rank has [ep_size] counters
     int* send_indices;        // [local_num_tokens, ep_size] send index tensor
     int* local_token_counter; // Atomic counter for completed tokens on this rank
 
@@ -125,6 +126,7 @@ struct MoeA2ACombineParams
 
     // Expert routing information
     int const* send_indices; // [local_num_tokens, ep_size] from dispatch
+    int const* recv_counters; // [ep_size] number of valid tokens per source rank for this target
 
     // Single payload information
     void const* recv_buffers[kMaxRanks]; // Per-rank receive buffers (only for single payload)
@@ -135,9 +137,6 @@ struct MoeA2ACombineParams
     // Synchronization
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source rank has signaled the target rank
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
-
-    // Communication tracking
-    int* local_token_counter;              // Atomic counter for completed tokens
 
     cudaStream_t stream;
     // Prepare-only field: original payload tensor pointer used to stage into workspace

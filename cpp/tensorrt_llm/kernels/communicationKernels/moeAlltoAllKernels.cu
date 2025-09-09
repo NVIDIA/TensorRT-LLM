@@ -199,10 +199,16 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             // Signal to each target rank that this source rank has completed sending
             for (int target_rank = 0; target_rank < ep_size; target_rank++)
             {
+                // Store the number of tokens sent by this rank to the recv_counters of the target rank
+                // TODO: Are acquire and release necessary here?
+                int send_count;
+                asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(send_count) : "l"(&ptrs.send_counters[target_rank]));
+                asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(&ptrs.recv_counters[target_rank][rank_id]), "r"(send_count));
+                
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
                 uint32_t flag_value = *ptrs.flag_val;
                 // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
-                printf("$$$Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
+                printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
                 asm volatile("st.release.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
             }
 
@@ -216,9 +222,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 {
                     // Acquire load to ensure visibility of peer's release-store
                     asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-                    // printf("###Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
+                    // printf("---Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
                 } while (flag_value != expected_value);
-                printf("###Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
+                printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
             }
         }
     }
@@ -265,11 +271,12 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     }
 
     // Fill receive buffer pointers
-    for (int rank = 0; rank < params.ep_size; rank++)
+    for (int target_rank = 0; target_rank < params.ep_size; target_rank++)
     {
+        kernel_ptrs.recv_counters[target_rank] = params.recv_counters[target_rank];
         for (int payload = 0; payload < params.num_payloads; payload++)
         {
-            kernel_ptrs.recv_buffers[rank][payload] = params.recv_buffers[rank][payload];
+            kernel_ptrs.recv_buffers[target_rank][payload] = params.recv_buffers[target_rank][payload];
         }
     }
     
@@ -408,7 +415,7 @@ __device__ void warp_vectorized_fill(void* dst, T value, int size, int lane_id)
 
 // Copy payload to recv buffer using warp-based vectorized copy (one warp per token)
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uint8_t* payload_bytes, 
-    int bytes_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr)
+    int bytes_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, const int* recv_counters)
 {
     // One warp per token design
     constexpr int WARP_SIZE = 32;
@@ -417,9 +424,23 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uin
     int warp_id_in_block = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
     int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id_in_block;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        // Increment flag_val for this combine round
+        *flag_val_ptr = *flag_val_ptr + 1;
+    }
     
     int total_tokens = ep_size * max_tokens_per_rank;
     if (global_warp_id >= total_tokens)
+        return;
+    
+    // Map global token to (source_rank, token_idx)
+    int source_rank = global_warp_id / max_tokens_per_rank;
+    int token_idx   = global_warp_id % max_tokens_per_rank;
+    
+    // Skip invalid tokens beyond per-source recv count
+    if (token_idx >= recv_counters[source_rank])
         return;
     
     // Calculate source and destination pointers for this token
@@ -429,12 +450,6 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uin
     
     // Copy one token's data using vectorized copy
     warp_vectorized_copy(dst_ptr, src_ptr, bytes_per_token, lane_id);
-    
-    if (blockIdx.x == 0 && threadIdx.x == 0)
-    {
-        // Increment flag_val for this combine round
-        *flag_val_ptr = *flag_val_ptr + 1;
-    }
 }
 
 // ============================================================================
@@ -472,6 +487,7 @@ __global__ void moeA2ACombineKernel(
         {
             uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
             asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(cur_val));
+            printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, cur_val, peer_rank);
         }
     }
 
@@ -487,6 +503,7 @@ __global__ void moeA2ACombineKernel(
                 // Acquire load to ensure visibility of peer's release-store
                 asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
             } while (flag_value != expected_value);
+            printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][peer_rank]: %d address: %p\n", rank_id, peer_rank, flag_value, *flag_ptr, flag_ptr);
         }
     }
     __syncthreads();
@@ -571,7 +588,8 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
         bytes_per_token,
         params.ep_size,
         params.max_tokens_per_rank,
-        params.flag_val);
+        params.flag_val,
+        params.recv_counters);
 }
 
 
@@ -613,7 +631,6 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     
     // Copy communication tracking pointers
     kernel_ptrs.send_indices = params.send_indices;
-    kernel_ptrs.local_token_counter = params.local_token_counter;
 
     // Launch appropriate kernel based on data type
     switch (params.dtype)

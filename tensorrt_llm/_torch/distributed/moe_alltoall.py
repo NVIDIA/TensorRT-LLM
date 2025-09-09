@@ -90,8 +90,9 @@ class MoeAlltoAll:
             self.max_num_tokens_per_rank
         )
         # Internal state and aux data
-        self._last_send_indices: torch.Tensor | None = None
-        self._last_send_counters: torch.Tensor | None = None
+        self.send_indices: torch.Tensor | None = None
+        self.send_counters: torch.Tensor | None = None
+        self.recv_counters: torch.Tensor | None = None
         self._state: str = "idle"  # idle | dispatched
             
     def dispatch(self, token_selected_experts, input_payloads):
@@ -108,7 +109,7 @@ class MoeAlltoAll:
         if self._state == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
 
-        recv_buffers, send_counters, send_indices = torch.ops.trtllm.moe_a2a_dispatch(
+        recv_buffers, send_counters, send_indices, recv_counters = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             self.workspace,
@@ -119,8 +120,9 @@ class MoeAlltoAll:
             self.num_experts
         )
         self._state = "dispatched"
-        self._last_send_indices = send_indices
-        self._last_send_counters = send_counters
+        self.send_indices = send_indices
+        self.send_counters = send_counters
+        self.recv_counters = recv_counters
         return recv_buffers
         
     def combine(self, payload):
@@ -133,11 +135,11 @@ class MoeAlltoAll:
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
         """
-        if self._state != "dispatched" or self._last_send_indices is None:
+        if self._state != "dispatched" or self.send_indices is None:
             raise RuntimeError("combine called before a successful dispatch")
 
         output = torch.ops.trtllm.moe_a2a_combine(
-            self._last_send_indices,
+            self.send_indices,
             payload,
             self.workspace,
             self.max_num_tokens_per_rank,
@@ -146,6 +148,6 @@ class MoeAlltoAll:
             self.top_k
         )
         # Reset state for next round
-        self._last_send_indices = None
+        self.send_indices = None
         self._state = "idle"
         return output
