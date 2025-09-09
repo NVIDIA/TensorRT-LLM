@@ -1,10 +1,10 @@
-# Disaggregated Serving in TensorRT-LLM
+# Disaggregated Serving in TensorRT LLM
 
-By NVIDIA TensorRT-LLM Team
+By NVIDIA TensorRT LLM Team
 
-- [Disaggregated Serving in TensorRT-LLM](#disaggregated-serving-in-tensorrt-llm)
+- [Disaggregated Serving in TensorRT LLM](#disaggregated-serving-in-tensorrt-llm)
   - [Motivation](#motivation)
-  - [Disaggregated Serving in TensorRT-LLM](#disaggregated-serving-in-tensorrt-llm-1)
+  - [Disaggregated Serving in TensorRT LLM](#disaggregated-serving-in-tensorrt-llm-1)
     - [trtllm-serve](#trtllm-serve)
     - [Dynamo](#dynamo)
     - [Triton Inference Server](#triton-inference-server)
@@ -24,7 +24,7 @@ By NVIDIA TensorRT-LLM Team
   - [Future Work](#future-work)
   - [Acknowledgement](#acknowledgement)
 
-In the past tech blogs, we have introduced optimization specifically for [low-latency](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) and [throughput](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md) oriented optimizations. For production deployment, users also care about per GPU throughput satisfying certain latency constraints. In this tech blog, we will introduce the design concept and usage of the TensorRT-LLM disaggregated serving which directly targets throughput@latency performance scenarios, together with performance study results.
+In the past tech blogs, we have introduced optimization specifically for [low-latency](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) and [throughput](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md) oriented optimizations. For production deployment, users also care about per GPU throughput satisfying certain latency constraints. In this tech blog, we will introduce the design concept and usage of the TensorRT LLM disaggregated serving which directly targets throughput@latency performance scenarios, together with performance study results.
 
 ## Motivation
 
@@ -55,15 +55,15 @@ Disaggregated serving resolves these challenges by decoupling the two phases, al
 
 You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rational and design considerations of disaggregated serving.
 
-## Disaggregated Serving in TensorRT-LLM
+## Disaggregated Serving in TensorRT LLM
 
-There are three different approaches to do disaggregation LLM inference with TensorRT-LLM, where each approach offers distinct architectural and operational characteristics suited to different deployment scenarios.
+There are three different approaches to do disaggregation LLM inference with TensorRT LLM, where each approach offers distinct architectural and operational characteristics suited to different deployment scenarios.
 
 ### trtllm-serve
 
-[`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html) is a command-line utility that facilitates the deployment of an OpenAI-compatible server for TensorRT-LLM instances.
+[`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html) is a command-line utility that facilitates the deployment of an OpenAI-compatible server for TensorRT LLM instances.
 
-The first approach to do disaggregated LLM inference with TensorRT-LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 3 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 3). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
+The first approach to do disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 3 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 3). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
 
 <div align="center">
 <figure>
@@ -124,11 +124,11 @@ In the Dynamo workflow, requests are initially processed by pre- and post-proces
 
 Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
 
-For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/examples/trtllm.html).
+For more information on how to use Dynamo with TensorRT LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/examples/trtllm.html).
 
 ### Triton Inference Server
 
-The third approach to do disaggregated LLM inference with TensorRT-LLM utilizes the Triton Inference Server. With this approach a Triton ensemble model is employed, comprising a preprocessor, an orchestrator implemented as [a Python business logic scripting (BLS) backend](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/bls.html), and a post-processor. The orchestrator is responsible for routing client requests to context and generation instances, managing the flow of prompt tokens, and handling the return of generated tokens. This approach is illustrated in Figure 5. The Triton Inference Server approach relies on the Triton TensorRT-LLM backend and the Executor API, which is supported only for the TensorRT backend. For more information on how to use this approach, please refer to [this documentation](https://github.com/NVIDIA/TensorRT-LLM/tree/main/triton_backend/all_models/disaggregated_serving#running-disaggregated-serving-with-triton-tensorrt-llm-backend).
+The third approach to do disaggregated LLM inference with TensorRT LLM utilizes the Triton Inference Server. With this approach a Triton ensemble model is employed, comprising a preprocessor, an orchestrator implemented as [a Python business logic scripting (BLS) backend](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/bls.html), and a post-processor. The orchestrator is responsible for routing client requests to context and generation instances, managing the flow of prompt tokens, and handling the return of generated tokens. This approach is illustrated in Figure 5. The Triton Inference Server approach relies on the Triton TensorRT LLM backend and the Executor API, which is supported only for the TensorRT backend. For more information on how to use this approach, please refer to [this documentation](https://github.com/NVIDIA/TensorRT-LLM/tree/main/triton_backend/all_models/disaggregated_serving#running-disaggregated-serving-with-triton-tensorrt-llm-backend).
 
 <div align="center">
 <figure>
@@ -141,7 +141,7 @@ The third approach to do disaggregated LLM inference with TensorRT-LLM utilizes 
 
 ### Multi-backend Support
 
-In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache manager and the underlying communication libraries, as shown in Figure 6. The KV cache exchange module is responsible for efficient transmission and reception of the cache, promptly releasing cache space, and performing cache layout conversions during the exchange process. Currently, mainstream communication protocols—MPI, UCX, and NIXL—are all supported by TensorRT-LLM, and the underlying communication protocols utilize RDMA / NVLink. Currently, we recommend using UCX and NIXL backends, as we are adding a dynamic scaling mechanism on top of them—specifically, dynamic node joining and leaving. This allows customers to adjust the load based on traffic demands or switch roles between context and generation dynamically.
+In TensorRT LLM, the KV cache exchange is modularly decoupled from the KV cache manager and the underlying communication libraries, as shown in Figure 6. The KV cache exchange module is responsible for efficient transmission and reception of the cache, promptly releasing cache space, and performing cache layout conversions during the exchange process. Currently, mainstream communication protocols—MPI, UCX, and NIXL—are all supported by TensorRT LLM, and the underlying communication protocols utilize RDMA / NVLink. Currently, we recommend using UCX and NIXL backends, as we are adding a dynamic scaling mechanism on top of them—specifically, dynamic node joining and leaving. This allows customers to adjust the load based on traffic demands or switch roles between context and generation dynamically.
 
 <div align="center">
 <figure>
@@ -152,7 +152,7 @@ In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache 
 
 ### Overlap Optimization
 
-To optimize the overall performance of disaggregated serving, TensorRT-LLM overlaps the KV cache transmission with computation for multiple independent requests. While one request is sending or receiving its KV cache blocks, other requests can proceed with computation, as illustrated in Figure 7. Furthermore, if context and generation instances are using multiple GPUs per instance, KV cache transmission between different sets of GPUs can occur in parallel.
+To optimize the overall performance of disaggregated serving, TensorRT LLM overlaps the KV cache transmission with computation for multiple independent requests. While one request is sending or receiving its KV cache blocks, other requests can proceed with computation, as illustrated in Figure 7. Furthermore, if context and generation instances are using multiple GPUs per instance, KV cache transmission between different sets of GPUs can occur in parallel.
 
 <div align="center">
 <figure>
@@ -163,7 +163,7 @@ To optimize the overall performance of disaggregated serving, TensorRT-LLM overl
 
 ### Cache Layout Transformation
 
-To minimize KV cache transmission latency, TensorRT-LLM currently uses direct transmission between device memories for cache transfer. The KV cache transmission supports using different parallel strategies for the context and generation phases. In such cases, careful orchestration of KV cache block mapping is required. Figure 8 illustrates this using the example of context phase with TP2 and generation phase with PP2.
+To minimize KV cache transmission latency, TensorRT LLM currently uses direct transmission between device memories for cache transfer. The KV cache transmission supports using different parallel strategies for the context and generation phases. In such cases, careful orchestration of KV cache block mapping is required. Figure 8 illustrates this using the example of context phase with TP2 and generation phase with PP2.
 
 <div align="center">
 <figure>
@@ -172,7 +172,7 @@ To minimize KV cache transmission latency, TensorRT-LLM currently uses direct tr
 </div>
 <p align="center"><sub><em>Figure 8. KV cache layout conversion</em></sub></p>
 
-The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT-LLM provides a set of environment variables for selection in different environments. Please refer to [this document](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/advanced/disaggregated-service.md) for details.
+The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to [this document](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md) for details.
 
 ## Performance Studies
 
@@ -281,7 +281,7 @@ We provide a set of scripts to reproduce the performance data presented in this 
 
 ## Future Work
 
-Although we can already demonstrate the performance benefits of doing disaggregated LLM inference with TensorRT-LLM, there is still work to be done to further improve the performance and ease of use. Among other things, we plan to:
+Although we can already demonstrate the performance benefits of doing disaggregated LLM inference with TensorRT LLM, there is still work to be done to further improve the performance and ease of use. Among other things, we plan to:
 
 * Provide detailed steps and scripts to automate the generation of throughput-latency performance curves comparing aggregated with disaggregated.
 * Continue to improve performance at larger scales (large-scale EP for example).
@@ -290,4 +290,4 @@ Although we can already demonstrate the performance benefits of doing disaggrega
 
 ## Acknowledgement
 
-Adding support for disaggregated serving in TensorRT-LLM is a typical one-team effort requiring close collaboration spanning kernel-level optimizations, runtime enhancements, and systematic performance analysis and tuning. While we cannot individually acknowledge every contributor, we are proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in terms of performance in TensorRT-LLM. Through this collaborative endeavor, we have developed valuable insights to allow us to improve GPU utilization for large language model inference. We hope that the techniques and the experience shared in this blog will help the developer community better leverage NVIDIA GPU capabilities in their mission-critical LLM inference applications.
+Adding support for disaggregated serving in TensorRT LLM is a typical one-team effort requiring close collaboration spanning kernel-level optimizations, runtime enhancements, and systematic performance analysis and tuning. While we cannot individually acknowledge every contributor, we are proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in terms of performance in TensorRT LLM. Through this collaborative endeavor, we have developed valuable insights to allow us to improve GPU utilization for large language model inference. We hope that the techniques and the experience shared in this blog will help the developer community better leverage NVIDIA GPU capabilities in their mission-critical LLM inference applications.
