@@ -7,6 +7,7 @@ import torch.nn as nn
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -221,6 +222,27 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         mrope_position_deltas = torch.tensor(
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
+
+    def get_prompt_for_profiling(self):
+        "Send prompt with largest image resolution for profiling the worst case"
+        max_width = 9999999
+        max_height = 9999999
+        resized_height, resized_width = smart_resize(
+            height=max_height,
+            width=max_width,
+            factor=self.model_config.vision_config.patch_size *
+            self.model_config.vision_config.spatial_merge_size,
+            min_pixels=self.processor.image_processor.min_pixels,
+            max_pixels=self.processor.image_processor.max_pixels,
+        )
+        img_tensor = torch.rand([3, resized_width, resized_height],
+                                device="cpu")
+        mm_data = {"image": [img_tensor]}
+
+        text_prompt = TextPrompt(
+            prompt="<|vision_start|><|image_pad|><|vision_end|>",
+            multi_modal_data=mm_data)
+        return text_prompt
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
@@ -437,7 +459,7 @@ class Qwen2VLModelBase(PreTrainedModel):
     ) -> None:
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
-
+        self.original_arch = model_config.pretrained_config.architectures[0]
         assert model_config.attn_backend == 'TRTLLM', "Qwen2/2.5-VL only supports TRTLLM backend now"
         super().__init__(config)
 
@@ -644,7 +666,6 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
-        self.is_multimodal = True  # variable used during profiling
         super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
@@ -666,7 +687,6 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
-        self.is_multimodal = True  # variable used during profiling
         super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
