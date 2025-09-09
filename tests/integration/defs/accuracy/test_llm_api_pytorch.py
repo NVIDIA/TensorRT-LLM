@@ -2958,7 +2958,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   tensor_parallel_size=1,
                   pipeline_parallel_size=1,
                   moe_expert_parallel_size=1,
-                  kv_cache_config=kv_cache_config**pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  **pytorch_config,
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
