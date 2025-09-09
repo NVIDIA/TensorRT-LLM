@@ -1,3 +1,4 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import copy
 import os
 from typing import List, Optional, Tuple
@@ -279,6 +280,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                     Image.fromarray((image.permute(1, 2, 0) * 255).to(
                         torch.uint8).cpu().numpy()) for image in images
                 ]
+        else:
+            input_ids = self.tokenizer.encode(text_prompt,
+                                              add_special_tokens=False,
+                                              return_tensors="pt")
+            return input_ids[0].to(torch.int32).tolist(), {}
 
         # Processing for multimodal data.
         processed_images = self.processor(images=images,
