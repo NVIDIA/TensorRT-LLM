@@ -35,20 +35,16 @@ COPY docker/common/install.sh install.sh
 COPY docker/common/install_base.sh install_base.sh
 RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
-    bash ./install.sh --base
-RUN rm install_base.sh
+    bash ./install.sh --base && rm install_base.sh
 
 COPY docker/common/install_cmake.sh install_cmake.sh
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --cmake
-RUN rm install_cmake.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --cmake && rm install_cmake.sh
 
 COPY docker/common/install_ccache.sh install_ccache.sh
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --ccache
-RUN rm install_ccache.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --ccache && rm install_ccache.sh
 
 COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
-RUN bash ./install.sh --cuda_toolkit
-RUN rm install_cuda_toolkit.sh
+RUN bash ./install.sh --cuda_toolkit && rm install_cuda_toolkit.sh
 
 ARG TRT_VER
 ARG CUDA_VER
@@ -61,26 +57,19 @@ RUN TRT_VER=${TRT_VER} \
     CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} \
     CUBLAS_VER=${CUBLAS_VER} \
-    bash ./install.sh --tensorrt
-RUN rm install_tensorrt.sh
+    bash ./install.sh --tensorrt && rm install_tensorrt.sh
 
 COPY docker/common/install_polygraphy.sh install_polygraphy.sh
-RUN bash ./install.sh --polygraphy
-RUN rm install_polygraphy.sh
+RUN bash ./install.sh --polygraphy && rm install_polygraphy.sh
 
 COPY docker/common/install_mpi4py.sh install_mpi4py.sh
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --mpi4py
-RUN install_mpi4py.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --mpi4py && install_mpi4py.sh
 
 ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
-RUN TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} bash ./install.sh --pytorch
-RUN rm install_pytorch.sh
+RUN TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} bash ./install.sh --pytorch && rm install_pytorch.sh
 
-RUN bash ./install.sh --opencv
-RUN bash ./install.sh --protobuf
-
-RUN rm install.sh
+RUN bash ./install.sh --opencv && bash ./install.sh --protobuf && rm install.sh
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
