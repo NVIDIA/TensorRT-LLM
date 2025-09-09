@@ -5,8 +5,9 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import logger
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...distributed import AllReduce, allgather, reducescatter
@@ -16,7 +17,9 @@ from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
+from .ops import MoEOp, MoEOpSelector
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CutlassFusedMoEMethod,
                            UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
@@ -89,6 +92,9 @@ class WideEPMoE(MoE):
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.layer_idx = layer_idx
+
+        # Store original hidden size before any potential padding
+        self.unpadded_hidden_size = self.hidden_size
 
         moe_load_balancer = get_moe_load_balancer()
         self.layer_load_balancer = None
@@ -189,9 +195,8 @@ class WideEPMoE(MoE):
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
-            self.use_low_precision_combine = (os.environ.get(
-                "TRTLLM_MOE_USE_LOW_PRECISION_COMBINE", "0")
-                                              == "1") and qm.has_nvfp4()
+            self.use_low_precision_combine = model_config.use_low_precision_moe_combine and qm.has_nvfp4(
+            )
 
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 MnnvlMemory.initialize()
@@ -226,6 +231,9 @@ class WideEPMoE(MoE):
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+
+        # MoE op will be lazily initialized when first accessed (see moe_op_impl property)
+        self._moe_op_impl = None
 
     def _check_configs(self):
         assert self._weights_created
@@ -316,7 +324,10 @@ class WideEPMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
+                if get_sm_version() == 100:
+                    return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+                else:
+                    return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
@@ -338,6 +349,19 @@ class WideEPMoE(MoE):
 
         self._weights_created = True
         self._check_configs()
+
+    @property
+    def moe_op_impl(self) -> MoEOp:
+        """
+        Lazily initialize and return the MoE op.
+
+        The op is selected based on hardware capabilities and quantization
+        configuration, which are only available after weights are created.
+        """
+        if self._moe_op_impl is None:
+            assert self._weights_created, "Weights must be created before accessing moe_op"
+            self._moe_op_impl = MoEOpSelector.select_op(self)
+        return self._moe_op_impl
 
     def dummy_allreduce(self):
         """
@@ -393,8 +417,6 @@ class WideEPMoE(MoE):
         if not use_all_to_all or self.alltoall_method_type != AlltoallMethodType.MNNVL:
             alltoall_result_do_sum = True
 
-        use_deepseek_fp8_block_scale = False
-        use_w4_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
@@ -548,9 +570,8 @@ class WideEPMoE(MoE):
                     x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
-                use_deepseek_fp8_block_scale = True
+                pass
             elif self.has_w4afp8:
-                use_w4_group_scaling = True
                 weight_dtype = torch.quint4x2
             else:
                 raise ValueError(
@@ -573,12 +594,8 @@ class WideEPMoE(MoE):
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
 
-        ep_size = self.ep_size
-        ep_rank = self.ep_rank
         w3_w1_weight = self.w3_w1_weight
         w2_weight = self.w2_weight
-        cluster_size = self.cluster_size
-        cluster_rank = self.cluster_rank
         quant_scales = self.quant_scales
 
         if self.alltoall_method_type == AlltoallMethodType.MNNVL:
@@ -644,7 +661,8 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        final_hidden_states = torch.ops.trtllm.fused_moe(
+        final_hidden_states = self.moe_op_impl.run_moe(
+            self,
             x,
             token_selected_slots,
             token_final_scales,
@@ -656,17 +674,8 @@ class WideEPMoE(MoE):
             quant_scales=quant_scales,
             input_sf=x_sf,
             swizzled_input_sf=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            enable_alltoall=use_all_to_all,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=use_w4_group_scaling,
             min_latency_mode=False,
-            tune_max_num_tokens=self.tune_max_num_tokens,
+            use_fused_finalize=True,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
         )

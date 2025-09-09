@@ -191,6 +191,12 @@ class MoeConfig(StrictBaseModel):
         "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
     )
 
+    use_low_precision_moe_combine: bool = Field(
+        default=False,
+        description=
+        "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
+    )
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -2586,6 +2592,8 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
+            use_low_precision_moe_combine=self.moe_config.
+            use_low_precision_moe_combine,
             enable_mixed_sampler=self.enable_mixed_sampler,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
