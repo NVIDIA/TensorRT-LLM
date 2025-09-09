@@ -84,11 +84,9 @@ def pad_up(x, pad_size):
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("SEQ_LEN", [128, 256, 512])
-@pytest.mark.parametrize("HIDDEN_SIZE", [7680])
-@pytest.mark.parametrize("OUTPUT_SIZE", [1536, 3072])
-# TODO: Do we need float32 test case? fp4_quantize only supports fp16, bf16, fp8_e4m3
-def test_fp4_linear_cute_dsl(dtype, SEQ_LEN, HIDDEN_SIZE, OUTPUT_SIZE):
+@pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536), (128, 2112, 7168), (128, 4096, 7168), (128, 7168, 2048)])
+def test_fp4_linear_cute_dsl(dtype, mnk):
+    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
@@ -101,10 +99,6 @@ def test_fp4_linear_cute_dsl(dtype, SEQ_LEN, HIDDEN_SIZE, OUTPUT_SIZE):
     w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
                                                       scaling_vector_size,
                                                       False)
-    print(f"limin: w_fp4.shape = {w_fp4.shape}")
-    print(f"limin: w_fp4.dtype = {w_fp4.dtype}")
-    print(f"limin: w_sf_block.shape = {w_sf_block.shape}")
-    print(f"limin: w_sf_block.dtype = {w_sf_block.dtype}")
 
     qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     l_fp4 = Linear(in_features=HIDDEN_SIZE,
@@ -118,8 +112,7 @@ def test_fp4_linear_cute_dsl(dtype, SEQ_LEN, HIDDEN_SIZE, OUTPUT_SIZE):
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
 
     w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
-        w_sf_block.cpu().view(OUTPUT_SIZE, -1)))
-    print(f"limin: w_sf_block_unswizzled.shape = {w_sf_block_unswizzled.shape}")
+        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1)))
 
     l_fp4.load_weights([{
         'input_scale':
@@ -139,7 +132,6 @@ def test_fp4_linear_cute_dsl(dtype, SEQ_LEN, HIDDEN_SIZE, OUTPUT_SIZE):
     torch.testing.assert_close(l_fp4.weight_scale, w_sf_block)
     alpha_ref = 1.0 / (w_sf_global * x_sf_global)
     torch.testing.assert_close(l_fp4.alpha[0], alpha_ref)
-    print(f"limin: alpha_ref = {alpha_ref}")
 
     with torch.inference_mode(), autotune():
         output = l_fp4.forward(x)
@@ -165,17 +157,12 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
 
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
     x_sf_global = (448 * 6) / x.abs().max().float()
-    # x_sf_global = torch.tensor(1.0).cuda()
 
     w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
     w_sf_global = (448 * 6) / w.abs().max().float()
     w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
                                                       scaling_vector_size,
                                                       False)
-    print(f"limin: w_fp4.shape = {w_fp4.shape}")
-    print(f"limin: w_fp4.dtype = {w_fp4.dtype}")
-    print(f"limin: w_sf_block.shape = {w_sf_block.shape}")
-    print(f"limin: w_sf_block.dtype = {w_sf_block.dtype}")
 
     qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     l_fp4 = Linear(in_features=HIDDEN_SIZE,
@@ -190,7 +177,6 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
 
     w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
         w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1)))
-    print(f"limin: w_sf_block_unswizzled.shape = {w_sf_block_unswizzled.shape}")
 
     l_fp4.load_weights([{
         'input_scale':
@@ -226,7 +212,6 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
 
     w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
         w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1)))
-    print(f"limin: w_sf_block_unswizzled.shape = {w_sf_block_unswizzled.shape}")
 
     l_fp4_ref.load_weights([{
         'input_scale':
@@ -254,21 +239,19 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
     for _ in range(5):
         output = l_fp4.forward(x)
 
-    with nvtx.annotate(
-            f"cute_dsl run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
-            color="green"):
-        for i in range(10):
-            output = l_fp4.forward(x)
+    # with nvtx.annotate(
+    #         f"cute_dsl run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+    #         color="green"):
+    for i in range(10):
+        output = l_fp4.forward(x)
 
     # with nvtx.annotate(f"ref warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="red"):
     for _ in range(5):
         output_ref = l_fp4_ref.forward(x)
 
-    print(f"limin: begin run ref test")
     # with nvtx.annotate(f"ref run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="green"):
-    with nvtx.annotate(f"ref", color="green"):
-        for i in range(10):
-            output_ref = l_fp4_ref.forward(x)
+    for i in range(10):
+        output_ref = l_fp4_ref.forward(x)
 
     # compare
     torch.cuda.synchronize()

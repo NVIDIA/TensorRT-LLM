@@ -2487,7 +2487,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cluster_shape_mn",
         type=parse_comma_separated_ints,
-        default=(1, 1),
+        default=(1, 4),
         help="Cluster shape (comma-separated)",
     )
     parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)

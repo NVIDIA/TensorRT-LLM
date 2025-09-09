@@ -10,7 +10,7 @@ from cuda import cuda
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent_pf import (
+from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import (
     Sm100BlockScaledPersistentDenseGemmKernel,
     Sm100BlockScaledPersistentDenseGemmKernelWrapper)
 from tensorrt_llm._utils import get_sm_version
@@ -1089,7 +1089,6 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             for cluster_shape_mn in cluster_shape_mn_candi
             if Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
                 cutlass.Float4E2M1FN,  # ab_dtype,
-                # cutlass.Float8E8M0FNU,  # sf_dtype
                 cutlass.Float8E4M3FN,  # sf_dtype
                 sf_vec_size,  # sf_vec_size,
                 cutlass.BFloat16,  # c_dtype,
@@ -1104,33 +1103,6 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
                 c_major,
             )
         ]
-
-    # # m, n, k	config	time	cuda_dsl config
-    # # 128, 7168, 16384	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x1	19.72	(256, 128), (2, 4), 7
-    # # 128, 24576, 1536	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x4	9.721	(128, 128), (1, 4), 0
-    # # 128, 2112, 7168	256x64x256_0_tnn_align32_o_vs16_2sm_bias_bf16_relu 2x1	9.468	(256, 64), (2, 4), 2
-    # # 128, 4096, 7168	256x64x256_0_tnn_align32_o_vs16_2sm_bias_bf16_relu 2x1	10.29	(256, 128) (2, 4), 2
-    # # 128, 7168, 2048	128x64x256_0_tnn_align32_o_vs16_1sm_bias_bf16_relu 1x4	6.924	(256, 128), (2, 4), 1
-    # def get_tactic_for_deepseek_r1(self, m, n, k):
-    #     if m == 128:
-    #         if n == 7168 and k == 16384:
-    #             return ((256, 128), (2, 4), True, 7)
-    #         elif n == 24576 and k == 1536:
-    #             return ((128, 128), (1, 4), False, 0)
-    #         elif n == 2112 and k == 7168:
-    #             return ((256, 64), (2, 4), True, 2)
-    #         elif n == 4096 and k == 7168:
-    #             return ((256, 128), (2, 4), True, 2)
-    #         elif n == 7168 and k == 2048:
-    #             return ((256, 128), (2, 4), True, 1)
-    #         else:
-    #             raise ValueError(
-    #                 f"Invalid input: m = {m}, n = {n}, k = {k}, no matching tactic found"
-    #             )
-    #     else:
-    #         raise ValueError(
-    #             f"Invalid input: m = {m}, no matching tactic found (we only have predefined tactics for m = 128)"
-    #         )
 
     def forward(
         self,
@@ -1156,8 +1128,8 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         else:
             # fallback to default tactic
             mma_tiler_mn, cluster_shape_mn = [
-                (128, 64),
-                (1, 4),
+                (128, 128),
+                (1, 1),
             ]
 
         a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha, output_dtype = inputs
@@ -1170,21 +1142,8 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         sf_k = pad_up(real_k // sf_vec_size, 4)
         sf_n = pad_up(n, 128)
 
-        # mma_tiler_mn, cluster_shape_mn, use_prefetch, prefetch_dist = self.get_tactic_for_deepseek_r1(
-        #     m, n, real_k)
-        # print(f"limin: m = {m}, real_k = {real_k}, n = {n}")
-        # print(f"limin: sf_m = {sf_m}, sf_k = {sf_k}, sf_n = {sf_n}")
-        # print(
-        #     f"limin: a_tensor.shape = {a_tensor.shape}, b_tensor.shape = {b_tensor.shape}"
-        # )
-        # print(
-        #     f"limin: a_sf_tensor.shape = {a_sf_tensor.shape}, b_sf_tensor.shape = {b_sf_tensor.shape}"
-        # )
-        # print(f"limin: alpha = {alpha}")
-
         a_ptr = make_ptr(
             # cutlass type
-            # self._ab_dtype,
             cutlass.Float4E2M1FN,
             a_tensor.data_ptr(),
             cute.AddressSpace.gmem,
@@ -1197,14 +1156,12 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             assumed_align=32,
         )
         a_sf_ptr = make_ptr(
-            # cutlass.Float8E8M0FNU,
             cutlass.Float8E4M3FN,
             a_sf_tensor.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
         b_sf_ptr = make_ptr(
-            # cutlass.Float8E8M0FNU,
             cutlass.Float8E4M3FN,
             b_sf_tensor.data_ptr(),
             cute.AddressSpace.gmem,
@@ -1238,9 +1195,7 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             max_active_clusters = hardware_info.get_max_active_clusters(
                 cluster_shape_mn[0] * cluster_shape_mn[1])
             hardware_info.get_l2_cache_size_in_bytes()
-            # print(f"limin: l2_cache_size = {l2_cache_size}")
 
-            # print(f"limin: begin compile gemm")
             compiled_gemm = cute.compile(
                 gemm,
                 m,
@@ -1261,7 +1216,6 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             )
 
             CuteDSLNVFP4BlackwellLinear.kernel_dict[cache_key] = compiled_gemm
-            # print(f"limin: compiled_gemm = {compiled_gemm}")
         else:
             compiled_gemm = CuteDSLNVFP4BlackwellLinear.kernel_dict[cache_key]
 
@@ -1293,7 +1247,6 @@ def cute_dsl_nvfp4_gemm_blackwell(
         CuteDSLNVFP4BlackwellLinear.tuning_config,
         [input, weight, input_scale, weight_scale, alpha, output_dtype],
     )
-    print(f"limin: best_tactic = {best_tactic}")
     return cute_dsl_nvfp4_gemm_blackwell_runner(
         inputs=[input, weight, input_scale, weight_scale, alpha, output_dtype],
         tactic=best_tactic,

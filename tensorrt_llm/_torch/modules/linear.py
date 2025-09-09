@@ -1797,7 +1797,7 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
-        use_cute_dsl_fp4_mm: bool = False,
+        use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
     ):
         from ..distributed import AllReduce
 
