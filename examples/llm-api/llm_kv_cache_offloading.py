@@ -16,21 +16,20 @@ def main():
         "The revolutionary seed had penetrated into every country and spread more or less. "
     )
     max_batch_size = 1
-    max_seq_len = 512
+    max_seq_len = 256
 
-    kv_cache_free_gpu_memory_fraction = 0.001
+    kv_cache_max_tokens = 256
     kv_cache_page_size = 16
-    kv_cache_host_size_in_bytes = 1024**3
 
     # Offloading Off
     print("\n ======  Offloading Off ======  \n")
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=max_batch_size,
               max_seq_len=max_seq_len,
-              kv_cache_config=KvCacheConfig(
-                  enable_block_reuse=True,
-                  free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
-                  tokens_per_block=kv_cache_page_size))
+              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                            max_tokens=kv_cache_max_tokens,
+                                            tokens_per_block=kv_cache_page_size,
+                                            host_cache_size=0))
     # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
     print(
@@ -65,11 +64,10 @@ def main():
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               max_batch_size=max_batch_size,
               max_seq_len=max_seq_len,
-              kv_cache_config=KvCacheConfig(
-                  enable_block_reuse=True,
-                  free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
-                  tokens_per_block=kv_cache_page_size,
-                  host_cache_size=kv_cache_host_size_in_bytes))
+              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                            max_tokens=kv_cache_max_tokens,
+                                            tokens_per_block=kv_cache_page_size,
+                                            host_cache_size=1024**3))
     # prompt_a occupies kv cache pool
     output_a = llm.generate(prompt_a)
     print(
