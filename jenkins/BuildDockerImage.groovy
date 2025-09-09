@@ -94,6 +94,26 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         """
     }
 
+    if (arch == "amd64") {
+        // For x86_64, we block some nodes to avoid unstable network access.
+        selectors += """
+                affinity:
+                    nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                            nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: "kubernetes.io/hostname"
+                                      operator: NotIn
+                                      values:
+                                        - "sc-ipp-blossom-prod-k8w-105"
+                                        - "sc-ipp-blossom-prod-k8w-114"
+                                        - "sc-ipp-blossom-prod-k8w-115"
+                                        - "sc-ipp-blossom-prod-k8w-121"
+                                        - "sc-ipp-blossom-prod-k8w-123"
+                                        - "sc-ipp-blossom-prod-k8w-124"
+        """
+    }
+
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
@@ -295,8 +315,8 @@ def buildImage(config, imageKeyToTag)
 
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
-                def randomSleep = (Math.random() * 300 + 300).toInteger()
-                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, shortCommondRunTimeMax: 7200)
+                def randomSleep = (Math.random() * 600 + 600).toInteger()
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 trtllm_utils.llmExecStepWithRetry(this, script: """
                 cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
                 BASE_IMAGE=${BASE_IMAGE} \
@@ -305,7 +325,7 @@ def buildImage(config, imageKeyToTag)
                 IMAGE_WITH_TAG=${dependentImageWithTag} \
                 STAGE=${dependent.dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-                """, sleepInSecs: randomSleep, numRetries: 3, shortCommondRunTimeMax: 7200)
+                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 args += " DEVEL_IMAGE=${dependentImageWithTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
@@ -324,8 +344,8 @@ def buildImage(config, imageKeyToTag)
         }
         stage ("make ${target}_${action} (${arch})") {
             sh "env | sort"
-            def randomSleep = (Math.random() * 300 + 300).toInteger()
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, shortCommondRunTimeMax: 7200)
+            def randomSleep = (Math.random() * 600 + 600).toInteger()
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             trtllm_utils.llmExecStepWithRetry(this, script: """
             cd ${LLM_ROOT} && make -C docker ${target}_${action} \
             BASE_IMAGE=${BASE_IMAGE} \
@@ -334,7 +354,7 @@ def buildImage(config, imageKeyToTag)
             IMAGE_WITH_TAG=${imageWithTag} \
             STAGE=${dockerfileStage} \
             BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-            """, sleepInSecs: randomSleep, numRetries: 3, shortCommondRunTimeMax: 7200)
+            """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             if (target == "ngc-release") {
                 imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
             }
@@ -663,7 +683,7 @@ pipeline {
                     container("python3") {
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                         trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                        def nspect_commit = "58ee430c8c3bd36bee2073405a547d3f8bc1932f"
+                        def nspect_commit = "0e46042381ae25cb7af2f1d45853dfd8e1d54e2d"
                         withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
                             trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                         }
@@ -686,7 +706,7 @@ pipeline {
                         }
                         cmd += imageKeyToTag.values().join(" ")
                         withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
-                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 3, shortCommondRunTimeMax: 7200)
+                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, numRetries: 6, shortCommondRunTimeMax: 7200)
                         }
                     }
                 }

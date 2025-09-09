@@ -10,7 +10,8 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, SamplerType
+from tensorrt_llm.llmapi.llm_args import (PeftCacheConfig, SamplerType,
+                                          SpeculativeConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -504,7 +505,6 @@ def create_py_executor_instance(
     resources,
     mapping,
     pytorch_backend_config,
-    executor_config,
     ctx_chunk_config,
     model_engine,
     start_worker,
@@ -515,13 +515,19 @@ def create_py_executor_instance(
     garbage_collection_gen0_threshold: Optional[int] = None,
     kv_connector_manager: Optional[KvCacheConnectorManager] = None,
     max_seq_len: Optional[int] = None,
+    max_batch_size: Optional[int] = None,
+    max_beam_width: Optional[int] = None,
+    max_num_tokens: Optional[int] = None,
+    peft_cache_config: Optional[trtllm.PeftCacheConfig] = None,
+    scheduler_config: Optional[trtllm.SchedulerConfig] = None,
+    cache_transceiver_config: Optional[trtllm.CacheTransceiverConfig] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     spec_config = model_engine.spec_config
 
     logger.info(
-        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}, max_batch_size={executor_config.max_batch_size}"
+        f"max_seq_len={max_seq_len}, max_num_requests={max_batch_size}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
 
     for key, value in pytorch_backend_config.extra_resource_managers.items():
@@ -578,16 +584,15 @@ def create_py_executor_instance(
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
         peft_cache_config_model = PeftCacheConfig.from_pybind(
-            executor_config.peft_cache_config
-        ) if executor_config.peft_cache_config is not None else PeftCacheConfig(
-        )
+            peft_cache_config
+        ) if peft_cache_config is not None else PeftCacheConfig()
         if lora_config.max_loras is not None:
             peft_cache_config_model.num_device_module_layer = \
                 max_lora_rank * num_lora_modules * lora_config.max_loras
         if lora_config.max_cpu_loras is not None:
             peft_cache_config_model.num_host_module_layer = \
                 max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
-        executor_config.peft_cache_config = peft_cache_config_model._to_pybind()
+        peft_cache_config = peft_cache_config_model._to_pybind()
 
         from tensorrt_llm.bindings import WorldConfig
         world_config = WorldConfig(
@@ -598,7 +603,7 @@ def create_py_executor_instance(
             gpus_per_node=dist.mapping.gpus_per_node,
         )
         peft_cache_manager = PeftCacheManager(
-            peft_cache_config=executor_config.peft_cache_config,
+            peft_cache_config=peft_cache_config,
             lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
@@ -609,7 +614,7 @@ def create_py_executor_instance(
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
 
-    max_num_sequences = executor_config.max_batch_size * mapping.pp_size
+    max_num_sequences = max_batch_size * mapping.pp_size
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
@@ -632,19 +637,18 @@ def create_py_executor_instance(
         scheduler_capacity,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         peft_cache_manager.impl if peft_cache_manager is not None else None,
-        executor_config.scheduler_config.capacity_scheduler_policy,
+        scheduler_config.capacity_scheduler_policy,
         two_step_lookahead=mapping.has_pp())
-    mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
-                                           executor_config.max_num_tokens,
+    mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
-    cache_transceiver_config = executor_config.cache_transceiver_config
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, kv_cache_manager, attention_type, cache_transceiver_config)
+        mapping, dist, kv_cache_manager, attention_type,
+        cache_transceiver_config)
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -655,8 +659,8 @@ def create_py_executor_instance(
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=pytorch_backend_config.
         disable_overlap_scheduler,
-        max_batch_size=executor_config.max_batch_size,
-        max_beam_width=executor_config.max_beam_width,
+        max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
@@ -664,33 +668,42 @@ def create_py_executor_instance(
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=kv_connector_manager,
-        max_seq_len=max_seq_len)
+        max_seq_len=max_seq_len,
+        peft_cache_config=peft_cache_config)
 
 
-def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
-                              *, max_seq_len: int, enable_mixed_sampler: bool):
-    max_num_sequences = executor_config.max_batch_size * mapping.pp_size
-    max_draft_len = (0 if executor_config.speculative_config is None else
-                     executor_config.speculative_config.max_draft_len)
+def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
+                              enable_mixed_sampler: bool, max_batch_size: int,
+                              speculative_config: SpeculativeConfig,
+                              max_beam_width: int):
+    max_num_sequences = max_batch_size * mapping.pp_size
+    max_draft_len = (0 if speculative_config is None else
+                     speculative_config.max_draft_len)
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
         max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
-        max_beam_width=executor_config.max_beam_width,
+        max_beam_width=max_beam_width,
         enable_mixed_sampler=enable_mixed_sampler,
     )
 
 
 def instantiate_sampler(engine: PyTorchModelEngine,
-                        executor_config: ExecutorConfig,
-                        pytorch_backend_config: PyTorchConfig,
-                        mapping: Mapping):
+                        pytorch_backend_config: PyTorchConfig, mapping: Mapping,
+                        max_batch_size: int, max_beam_width: int,
+                        max_seq_len: int, mm_encoder_only: bool,
+                        speculative_config: SpeculativeConfig,
+                        decoding_config: trtllm.DecodingConfig,
+                        kv_cache_config: trtllm.KvCacheConfig):
     sampler_args = create_torch_sampler_args(
-        executor_config,
         mapping,
         max_seq_len=engine.max_seq_len,
-        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
-    decoding_mode = get_decoding_mode(executor_config)
+        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler,
+        max_batch_size=max_batch_size,
+        speculative_config=speculative_config,
+        max_beam_width=max_beam_width)
+    decoding_mode = get_decoding_mode(decoding_config=decoding_config,
+                                      max_beam_width=max_beam_width)
     if mapping.cp_config.get('cp_type') == CpType.STAR:
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)
@@ -698,35 +711,44 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
 
-    if executor_config.mm_encoder_only:
+    if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine
         return EarlyStopWithMMResult()
     if pytorch_backend_config.sampler_type == SamplerType.TRTLLMSampler or (
             pytorch_backend_config.sampler_type == SamplerType.auto
             and decoding_mode.isBeamSearch()):
         logger.debug(f"DecodingMode: {decoding_mode.name}")
-        return TRTLLMSampler(executor_config, engine.model, engine.dtype,
-                             mapping, decoding_mode,
-                             pytorch_backend_config.disable_overlap_scheduler)
+        return TRTLLMSampler(engine.model,
+                             engine.dtype,
+                             mapping,
+                             decoding_mode,
+                             pytorch_backend_config.disable_overlap_scheduler,
+                             max_seq_len=max_seq_len,
+                             max_batch_size=max_batch_size,
+                             max_beam_width=max_beam_width,
+                             decoding_config=decoding_config,
+                             kv_cache_config=kv_cache_config)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
     return TorchSampler(sampler_args)
 
 
-def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
+def get_decoding_mode(
+    decoding_config: trtllm.DecodingConfig,
+    max_beam_width: int,
+) -> DecodingMode:
     '''This implementation is based off trtGptModelInflightBatching.cpp getDecodingMode().'''
-
-    if executor_config.decoding_config and executor_config.decoding_config.decoding_mode and not executor_config.decoding_config.decoding_mode.isAuto(
+    if decoding_config and decoding_config.decoding_mode and not decoding_config.decoding_mode.isAuto(
     ):
-        decoding_mode = executor_config.decoding_config.decoding_mode
-    elif executor_config.max_beam_width == 1:
+        decoding_mode = decoding_config.decoding_mode
+    elif max_beam_width == 1:
         decoding_mode = DecodingMode.TopKTopP()
     else:
         decoding_mode = DecodingMode.BeamSearch()
 
     # Override decoding mode when beam width is one
-    if executor_config.max_beam_width == 1 and decoding_mode.isBeamSearch():
+    if max_beam_width == 1 and decoding_mode.isBeamSearch():
         logger.warning(
             "Beam width is set to 1, but decoding mode is BeamSearch. Overwriting decoding mode to TopKTopP."
         )
