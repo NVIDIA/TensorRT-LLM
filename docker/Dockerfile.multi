@@ -32,6 +32,8 @@ ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
 
+#
+# NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
 COPY docker/common/install.sh install.sh
