@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import asyncio
+import gc
 import os
 import re
 import signal
@@ -49,7 +50,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
 
-from .._utils import nvtx_mark, set_prometheus_multiproc_dir
+from .._utils import gc_scheduler_async, nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, handle_non_streaming_response,
                               handle_streaming_response,
                               maybe_transform_reasoning_effort)
@@ -748,7 +749,15 @@ class OpenAIServer:
             logger.debug("Error details: %s", traceback.format_exc())
             return self.create_error_response(message=str(e), err_type="internal_error")
 
+
     async def __call__(self, host, port):
+        # If TLLM_GC_SCHEDULE_INTERVAL is specified, disable gc and manually schedule it every TLLM_GC_SCHEDULE_INTERVAL seconds
+        if (gc_schedule_interval := int(os.environ.get("TLLM_GC_SCHEDULE_INTERVAL", "0"))) != 0:
+            gc.disable()
+            logger.info(f"Setting gc_schedule_interval: {gc_schedule_interval}")
+
+            asyncio.create_task(gc_scheduler_async(gc_schedule_interval))
+
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         config = uvicorn.Config(self.app,

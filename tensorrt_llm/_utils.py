@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import copy
 import gc
 import inspect
@@ -833,6 +834,18 @@ def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
             logger.debug(
                 f'Reset Python GC thresholds to default value: {PYTHON_DEFAULT_GC_THRESHOLDS}'
             )
+
+
+async def gc_scheduler_async(gc_schedule_interval: int):
+    while True:
+        await asyncio.sleep(gc_schedule_interval)
+
+        # Manually trigger the garbage collection
+        logger.debug(f"Running manual garbage collection...")
+        collected_count = gc.collect()
+        logger.debug(
+            f"Garbage collection finished. Collected {collected_count} objects."
+        )
 
 
 @contextmanager
