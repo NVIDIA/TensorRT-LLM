@@ -1,8 +1,23 @@
+import sys
 from functools import lru_cache
 from typing import List, Mapping, Optional, Tuple
 
-import cutlass
-import cutlass.cute as cute
+try:
+    if sys.version_info >= (3, 12):
+        HAS_CUTLASS_DSL = True
+        import cutlass
+        import cutlass.cute as cute
+
+        from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import (
+            Sm100BlockScaledPersistentDenseGemmKernel,
+            Sm100BlockScaledPersistentDenseGemmKernelWrapper)
+
+        from .cute_dsl_kernels.blackwell.utils import make_ptr
+    else:
+        HAS_CUTLASS_DSL = False
+except ImportError:
+    HAS_CUTLASS_DSL = False
+
 import torch
 import triton  # type: ignore[import]
 from cuda import cuda
@@ -10,9 +25,6 @@ from cuda import cuda
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import (
-    Sm100BlockScaledPersistentDenseGemmKernel,
-    Sm100BlockScaledPersistentDenseGemmKernelWrapper)
 from tensorrt_llm._utils import get_sm_version
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -22,7 +34,6 @@ from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
-from .cute_dsl_kernels.blackwell.utils import make_ptr
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -1238,6 +1249,10 @@ def cute_dsl_nvfp4_gemm_blackwell(
     alpha: float,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
+
+    if not HAS_CUTLASS_DSL:
+        raise RuntimeError("nvidia-cutlass-dsl 4.1.0 requires Python >=3.12")
+
     tuner = AutoTuner.get()
 
     cute_dsl_nvfp4_gemm_blackwell_runner = CuteDSLNVFP4BlackwellLinear()

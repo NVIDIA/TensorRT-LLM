@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from utils.util import skip_pre_blackwell
@@ -82,6 +84,8 @@ def pad_up(x, pad_size):
     return (x + pad_size - 1) // pad_size * pad_size
 
 
+@pytest.mark.skipif(sys.version_info < (3, 12),
+                    reason="cutlass-dsl 4.1.0 requires Python 3.12+")
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536),
