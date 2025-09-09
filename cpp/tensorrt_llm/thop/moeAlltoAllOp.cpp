@@ -504,6 +504,30 @@ torch::Tensor moeA2AInitializeOp(
     return moe_a2a_metainfo;
 }
 
+// Op: moe_a2a_sanitize_expert_ids
+void moeA2ASanitizeExpertIdsOp(torch::Tensor expert_ids, torch::Tensor recv_counters, int64_t invalid_expert_id)
+{
+    CHECK_INPUT(expert_ids, torch::kInt32);
+    CHECK_INPUT(recv_counters, torch::kInt32);
+    TORCH_CHECK(expert_ids.dim() == 3, "expert_ids must be [ep_size, max_tokens_per_rank, top_k]");
+    TORCH_CHECK(recv_counters.dim() == 1, "recv_counters must be [ep_size]");
+    TORCH_CHECK(expert_ids.size(0) == recv_counters.size(0), "expert_ids and recv_counters must have the same ep_size");
+
+    int ep_size = static_cast<int>(expert_ids.size(0));
+    int max_tokens_per_rank = static_cast<int>(expert_ids.size(1));
+    int top_k = static_cast<int>(expert_ids.size(2));
+
+    tensorrt_llm::kernels::moe_a2a::moe_a2a_sanitize_expert_ids_launch(
+        expert_ids.data_ptr<int32_t>(),
+        recv_counters.data_ptr<int32_t>(),
+        static_cast<int32_t>(invalid_expert_id),
+        ep_size,
+        max_tokens_per_rank,
+        top_k,
+        at::cuda::getCurrentCUDAStream());
+}
+
+
 } // anonymous namespace
 
 } // namespace torch_ext
@@ -529,6 +553,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int max_tokens_per_rank, int ep_rank, int ep_size, int top_k) -> Tensor");
     module.def(
         "moe_a2a_initialize(Tensor workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank) -> Tensor");
+    module.def(
+        "moe_a2a_sanitize_expert_ids(Tensor expert_ids, Tensor recv_counters, int invalid_expert_id) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
@@ -536,4 +562,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl("moe_a2a_dispatch", &torch_ext::moeA2ADispatchOp);
     module.impl("moe_a2a_combine", &torch_ext::moeA2ACombineOp);
     module.impl("moe_a2a_initialize", &torch_ext::moeA2AInitializeOp);
+    module.impl("moe_a2a_sanitize_expert_ids", &torch_ext::moeA2ASanitizeExpertIdsOp);
 }

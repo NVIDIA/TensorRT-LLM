@@ -5,6 +5,7 @@ This module provides a high-level interface for MoE all-to-all dispatch and comb
 with proper workspace management and synchronization.
 """
 
+from typing import Optional
 import torch
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.mapping import Mapping
@@ -95,13 +96,18 @@ class MoeAlltoAll:
         self.recv_counters: torch.Tensor | None = None
         self._state: str = "idle"  # idle | dispatched
             
-    def dispatch(self, token_selected_experts, input_payloads):
+    def dispatch(self, token_selected_experts: torch.Tensor, 
+                    input_payloads: list[torch.Tensor], 
+                    invalid_token_expert_id: Optional[int]=None, 
+                    expert_id_payload_index: Optional[int]=None):
         """
         Perform MoE all-to-all dispatch operation.
         
         Args:
             token_selected_experts: [local_num_tokens, top_k] tensor of expert indices
             input_payloads: List of tensors to dispatch, each has shape [local_num_tokens, payload_num_elements_per_token]
+            invalid_token_expert_id: If not None, set the token_selected_experts of the invalid tokens to this expert id. This is used to notify the MoE to skip these tokens for GroupGEMM.
+            expert_id_payload_index: The index of token_selected_experts in the input_payloads. Must be provided if invalid_token_expert_id is not None.
             
         Returns:
             recv_buffers: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
@@ -123,6 +129,17 @@ class MoeAlltoAll:
         self.send_indices = send_indices
         self.send_counters = send_counters
         self.recv_counters = recv_counters
+
+        if invalid_token_expert_id is not None:
+            assert expert_id_payload_index is not None, "expert_id_payload_index must be provided if invalid_token_expert_id is not None"
+            # Sanitize expert IDs for invalid tokens directly on the recv buffer payload
+            recv_token_selected_experts = recv_buffers[expert_id_payload_index]
+            torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
+                recv_token_selected_experts,
+                self.recv_counters,
+                int(invalid_token_expert_id),
+            )
+
         return recv_buffers
         
     def combine(self, payload):

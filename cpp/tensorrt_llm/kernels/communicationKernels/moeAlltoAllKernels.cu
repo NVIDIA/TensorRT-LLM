@@ -657,4 +657,42 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     }
 }
 
+// Kernel to sanitize expert ids for invalid tokens
+__global__ void moeA2ASanitizeExpertIdsKernel(
+    int32_t* expert_ids_ptr,
+    const int32_t* recv_counters_ptr,
+    int ep_size,
+    int max_tokens_per_rank,
+    int top_k,
+    int32_t invalid_id)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_tokens = ep_size * max_tokens_per_rank;
+    if (tid >= total_tokens)
+        return;
+
+    int source_rank = tid / max_tokens_per_rank;
+    int token_idx   = tid % max_tokens_per_rank;
+
+    if (token_idx >= recv_counters_ptr[source_rank])
+    {
+        int32_t* token_expert_ids = expert_ids_ptr + tid * top_k;
+        for (int k = 0; k < top_k; ++k)
+        {
+            token_expert_ids[k] = invalid_id;
+        }
+    }
+}
+
+void moe_a2a_sanitize_expert_ids_launch(
+    int32_t* expert_ids, const int32_t* recv_counters, int32_t invalid_id,
+    int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream)
+{
+    constexpr int kBlockSize = 256;
+    int total_tokens = ep_size * max_tokens_per_rank;
+    int grid = ceilDiv(total_tokens, kBlockSize);
+    moeA2ASanitizeExpertIdsKernel<<<grid, kBlockSize, 0, stream>>>(
+        expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
+}
+
 } // namespace tensorrt_llm::kernels::moe_a2a

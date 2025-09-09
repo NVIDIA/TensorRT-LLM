@@ -148,4 +148,12 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 
+// Sanitize expert IDs for invalid tokens
+// expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)
+// recv_counters: [ep_size] (int32), number of valid tokens per source
+// invalid_id: value to fill for invalid tokens' expert ids
+void moe_a2a_sanitize_expert_ids_launch(
+    int32_t* expert_ids, const int32_t* recv_counters, int32_t invalid_id,
+    int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
+
 } // namespace tensorrt_llm::kernels::moe_a2a
