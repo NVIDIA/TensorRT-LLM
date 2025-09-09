@@ -161,10 +161,6 @@ def _register_fake():
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input).to(torch.float8_e4m3fn), scale
 
-    @torch.library.register_fake("trtllm::logits_bitmask")
-    def _(logits: List[torch.Tensor], bitmask: List[torch.Tensor]):
-        pass
-
     @torch.library.register_fake("trtllm::fp4_quantize")
     def _(
         input: torch.Tensor,

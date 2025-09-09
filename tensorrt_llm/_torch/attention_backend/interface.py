@@ -3,8 +3,8 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
-                    Union)
+from typing import (Dict, Generic, List, Optional, Protocol, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -140,6 +140,10 @@ class AttentionMetadata:
 
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
+    cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
+
+    _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
+                                                    default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -285,7 +289,8 @@ class AttentionMetadata:
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0) -> Self:
+                                   max_draft_tokens: int = 0,
+                                   buffers=None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
@@ -297,6 +302,7 @@ class AttentionMetadata:
 
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
+        cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)
@@ -323,6 +329,19 @@ class AttentionMetadata:
         cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
+
+    def prepare_for_spec_dec(self, *fields) -> None:
+        assert len(self._saved_tensors) == 0
+        for f in fields:
+            v = getattr(self, f)
+            assert isinstance(v, torch.Tensor)
+            self._saved_tensors[f] = v
+            setattr(self, f, v.clone())
+
+    def restore_from_spec_dec(self) -> None:
+        for f, v in self._saved_tensors.items():
+            setattr(self, f, v)
+        self._saved_tensors.clear()
 
     def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
                               is_spec_dec_dynamic_tree, max_draft_tokens):
