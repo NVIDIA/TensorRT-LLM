@@ -192,6 +192,7 @@ struct KvCacheStats
     SizeType32 reusedBlocks;
     // Number of blocks that were not matched and not reused.
     SizeType32 missedBlocks;
+    // Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
     // Number of free blocks for every configured attention-window size.
     std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;

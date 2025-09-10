@@ -359,6 +359,15 @@ VecUniqueTokens const& KVCacheBlock::getUniqueTokens() const
     return mBlockKey.uniqueTokens;
 }
 
+BlockPtr KVCacheBlock::getPrevBlock() const
+{
+    if (mLookupNode != nullptr)
+    {
+        return mLookupNode->getBlock(mWindowSize);
+    }
+    return nullptr;
+}
+
 BlockPtr const& KVCacheBlock::getPrevBlockInSeq() const
 {
     return mPrevBlockInSeq;
@@ -367,15 +376,6 @@ BlockPtr const& KVCacheBlock::getPrevBlockInSeq() const
 void KVCacheBlock::setPrevBlockInSeq(BlockPtr prevBlock)
 {
     mPrevBlockInSeq = std::move(prevBlock);
-}
-
-BlockPtr KVCacheBlock::getPrevBlock() const
-{
-    if (mLookupNode != nullptr)
-    {
-        return mLookupNode->getBlock(mWindowSize);
-    }
-    return nullptr;
 }
 
 bool KVCacheBlock::isFull() const
