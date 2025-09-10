@@ -2,6 +2,8 @@
 
 set -ex
 
+CUDA_VER="13"
+
 install_boost() {
   # Install boost version >= 1.78 for boost::span
   # Current libboost-dev apt packages are < 1.78, so install from tar.gz
@@ -21,7 +23,7 @@ install_triton_deps() {
       python3-build \
       libb64-dev \
       libarchive-dev \
-      datacenter-gpu-manager=1:4.4.0 \
+      datacenter-gpu-manager-4-cuda${CUDA_VER}=1:4.4.0-1 \
     && install_boost \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
