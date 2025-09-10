@@ -184,6 +184,7 @@ class MultimodalParams:
                 "video_height": torch.Tensor | List[int],
                 "video_width": torch.Tensor | List[int],
             },
+            "special_token_offsets": List[int],          # List of starting positions of special tokens in the union of all multimodal token chunks, if available
             # ... other modalities
         }
     """
@@ -531,10 +532,12 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
 
 
 def find_mm_token_positions(
-        input_ids: Union[torch.Tensor, List[int], np.ndarray],
-        num_mm_tokens: List[int],
-        vocab_size: Optional[int] = None,
-        mm_token_ids: Optional[torch.Tensor] = None) -> List[int]:
+    input_ids: Union[torch.Tensor, List[int], np.ndarray],
+    num_mm_tokens: List[int],
+    vocab_size: Optional[int] = None,
+    mm_token_ids: Optional[torch.Tensor] = None,
+    mm_special_token_ids: Optional[torch.Tensor] = None
+) -> Tuple[List[int], List[int]]:
     """Get starting positions of contiguous multimodal token chunks using known lengths.
 
     This function finds multimodal tokens (with IDs > vocab_size or matching mm_token_ids)
@@ -552,6 +555,7 @@ def find_mm_token_positions(
 
     Returns:
         List of starting positions for each contiguous multimodal token chunk
+        (Optional) List of starting positions of special tokens in the union of all multimodal token chunks
     """
     if mm_token_ids is None and vocab_size is None:
         raise ValueError(
@@ -600,7 +604,15 @@ def find_mm_token_positions(
             # Move to the next chunk
             current_position += length
 
-    return start_positions
+    start_special_token_positions = []
+    if mm_special_token_ids is not None:
+        mm_token_ids = input_ids[mm_positions]
+        special_token_mask_in_mm = torch.isin(mm_token_ids,
+                                              mm_special_token_ids)
+        start_special_token_positions = torch.where(
+            special_token_mask_in_mm)[0].tolist()
+
+    return start_positions, start_special_token_positions
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
