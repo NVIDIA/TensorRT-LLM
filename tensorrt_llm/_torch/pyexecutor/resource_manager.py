@@ -517,7 +517,7 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(max_num_draft_tokens):
                         self.impl.add_token(req_id)
 
-            # NOTE: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
+            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
             if use_mrope:
                 dummy_mrope_position_ids = torch.arange(
                     0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()

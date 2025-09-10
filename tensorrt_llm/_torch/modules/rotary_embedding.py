@@ -172,7 +172,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         q_or_k = targets[0]
         remove_input_padding = (len(q_or_k.size()) == 2)
 
-        # TODO: Re-visit this to achieve cos_sin caching
+        # TODO(yechank-nvidia): Re-visit this to achieve cos_sin caching
         cos, sin = self.get_cos_sin(position_ids)
         cos, sin = cos.to(dtype=q_or_k.dtype), sin.to(dtype=q_or_k.dtype)
         if remove_input_padding:
