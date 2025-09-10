@@ -231,7 +231,8 @@ class Phi3ForCausalLM(DecoderModelForCausalLM[Phi3Model, Phi3Config]):
                         qkv_scale = module_weights.get('weight_scale', None)
 
                         if qkv_scale is not None:
-                            if qkv_scale.shape[0] == qkv_weight.shape[0]:
+                            if qkv_scale.shape and qkv_scale.shape[
+                                    0] == qkv_weight.shape[0]:
                                 q_dict[
                                     'weight_scale'] = qkv_scale[:
                                                                 qk_split_index, :]
@@ -271,8 +272,8 @@ class Phi3ForCausalLM(DecoderModelForCausalLM[Phi3Model, Phi3Config]):
                         # Get the scale factors if they exist
                         gate_up_scale = module_weights.get('weight_scale', None)
                         if gate_up_scale is not None:
-                            if gate_up_scale.shape[0] == gate_up_weight.shape[
-                                    0]:
+                            if gate_up_scale.shape and gate_up_scale.shape[
+                                    0] == gate_up_weight.shape[0]:
                                 gate_dict[
                                     'weight_scale'] = gate_up_scale[:
                                                                     intermediate_size, :]
