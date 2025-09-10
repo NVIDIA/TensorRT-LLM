@@ -44,9 +44,10 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
-    ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
-    chat_stream_post_processor, completion_response_post_processor,
-    completion_stream_post_processor)
+    ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
+    chat_harmony_post_processor, chat_harmony_streaming_post_processor,
+    chat_response_post_processor, chat_stream_post_processor,
+    completion_response_post_processor, completion_stream_post_processor)
 from tensorrt_llm.serve.responses_utils import ConversationHistoryStore
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
@@ -57,8 +58,7 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
-from .harmony_adapter import (HarmonyAdapter, handle_non_streaming_response,
-                              handle_streaming_response,
+from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
                               maybe_transform_reasoning_effort)
 
 # yapf: enale
@@ -117,7 +117,11 @@ class OpenAIServer:
 
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
-        self.use_harmony = self.model_config.model_type == "gpt_oss"
+        disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
+        if disable_harmony:
+            self.use_harmony = False
+        else:
+            self.use_harmony = (self.model_config.model_type == "gpt_oss")
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -382,15 +386,19 @@ class OpenAIServer:
 
         async def chat_stream_generator(
                 promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            if not self.postproc_worker_enabled:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-            async for res in promise:
-                pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                await self._extract_metrics(res)
-                for pp_res in pp_results:
-                    yield pp_res
-            yield "data: [DONE]\n\n"
-            nvtx_mark("generation ends")
+            try:
+                if not self.postproc_worker_enabled:
+                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                async for res in promise:
+                    pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                    await self._extract_metrics(res)
+                    for pp_res in pp_results:
+                        yield pp_res
+                yield "data: [DONE]\n\n"
+                nvtx_mark("generation ends")
+            except:
+                logger.error(traceback.format_exc())
+                raise
 
         async def create_chat_response(
                 promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
@@ -462,7 +470,8 @@ class OpenAIServer:
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
                 lora_request=request.lora_request,
-                disaggregated_params=disaggregated_params
+                disaggregated_params=disaggregated_params,
+                cache_salt=request.cache_salt,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -603,15 +612,20 @@ class OpenAIServer:
             return merged_rsp
 
         async def completion_generator(promise: RequestOutput, params: Optional[PostprocParams]):
-            async for output in promise:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = params.post_processor, params.postproc_args
-                    pp_result = post_processor(output, args)
-                else:
-                    pp_result = output.outputs[0]._postprocess_result
-                await self._extract_metrics(output)
-                for pp_res in pp_result:
-                    yield pp_res
+            try:
+                async for output in promise:
+                    if not self.postproc_worker_enabled:
+                        post_processor, args = params.post_processor, params.postproc_args
+                        pp_result = post_processor(output, args)
+                    else:
+                        pp_result = output.outputs[0]._postprocess_result
+                    await self._extract_metrics(output)
+                    for pp_res in pp_result:
+                        yield pp_res
+            except:
+                logger.error(traceback.format_exc())
+                raise
+
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -703,11 +717,35 @@ class OpenAIServer:
         Chat Completion API with harmony format support.
         Supports both streaming and non-streaming modes.
         """
+
+        async def create_harmony_response(
+                promise: RequestOutput, postproc_params: PostprocParams) -> ChatCompletionResponse:
+            await promise.aresult()
+            if self.postproc_worker_enabled:
+                chat_response =promise.outputs[0]._postprocess_result
+            else:
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                chat_response = post_processor(promise, args)
+
+            return chat_response
+
+        async def create_streaming_generator(promise: RequestOutput, postproc_params: PostprocParams):
+            if not self.postproc_worker_enabled:
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+
+            async for res in promise:
+                pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                # await self._extract_metrics(res)
+                for pp_res in pp_results:
+                    yield pp_res
+
+            yield "data: [DONE]\n\n"
+
         try:
             # Initialize HarmonyAdapter
             # NOTE: WAR for Disagg failure, may affect perf if no warmup
             if not self.harmony_adapter:
-                self.harmony_adapter = HarmonyAdapter()
+                self.harmony_adapter = get_harmony_adapter()
             # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
             tools_dict = None
             if request.tools:
@@ -742,27 +780,37 @@ class OpenAIServer:
                 vocab_size=self.tokenizer.tokenizer.vocab_size)
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
 
+            postproc_args = ChatCompletionPostprocArgs.from_request(request)
+            postproc_params = PostprocParams(
+                post_processor=chat_harmony_streaming_post_processor
+                if request.stream else chat_harmony_post_processor,
+                postproc_args=postproc_args,
+            )
+
             # Generate
             promise = self.llm.generate_async(
                 inputs=harmony_tokens,
                 sampling_params=sampling_params,
+                _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=bool(request.stream),
                 lora_request=request.lora_request,
             )
+            postproc_args.request_id = promise.request_id
+
+            if not self.postproc_worker_enabled:
+                postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
+
             # Disconnect cancellation
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             # Handle streaming
             if request.stream:
                 return StreamingResponse(
-                    handle_streaming_response(
-                        self.harmony_adapter, promise,
-                        str(promise.request_id), request,
-                    ),
+                    content=create_streaming_generator(promise, postproc_params),
                     media_type="text/event-stream"
                 )
             else:
-                response = await handle_non_streaming_response(self.harmony_adapter, promise, request)
+                response = await create_harmony_response(promise, postproc_params)
                 return JSONResponse(response.model_dump())
 
         except Exception as e:

@@ -7,6 +7,7 @@ __pycache__/
 *.npy
 .VSCodeCounter
 cpp/build*
+cpp/Release
 build
 !tensorrt_llm/bench/build
 !builders/
@@ -75,3 +76,6 @@ compile_commands.json
 .dir-locals.el
 .devcontainer/devcontainer.env.user
 .devcontainer/docker-compose.override.yml
+
+# Enroot sqsh files
+enroot/tensorrt_llm.devel.sqsh
