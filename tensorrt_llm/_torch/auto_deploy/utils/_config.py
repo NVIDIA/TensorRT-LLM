@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from omegaconf import DictConfig, OmegaConf
 from pydantic import Field, field_validator, model_validator
@@ -78,8 +78,11 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
         if not default_file and "yaml_default" in self.current_state:
             default_file = self.current_state["yaml_default"]
         if not default_file:
-            default_mode = settings_cls.model_fields["mode"].get_default()
-            default_file = settings_cls._get_yaml_default_from_mode(default_mode)
+            # Only attempt to use default mode if the class defines a mode field
+            if "mode" in settings_cls.model_fields:
+                default_mode = settings_cls.model_fields["mode"].get_default()
+                if default_mode:
+                    default_file = settings_cls._get_yaml_default_from_mode(default_mode)
         if not default_file:
             default_file = settings_cls.model_fields["yaml_default"].get_default()
 
@@ -135,18 +138,16 @@ class DynamicYamlMixInForSettings:
         - last argument of ``yaml_extra``
     """
 
+    # should be set as field by the child class! mode is a simple switch to control the default
+    # config via the yaml_default field. It can be set by the child class to provide a
+    # convenient, user-facing config to switch between different default configs.
+    # mode: str
+
     # should be overwritten by the child class!
     @classmethod
     def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
         """Get the default yaml file from the mode or return None if no default yaml is found."""
         return None
-
-    mode: Literal[""] = Field(
-        default="",
-        description="Mode is a simple switch to control the default config via the yaml_default "
-        "field. It can be overwritten by the child class to provide a convenient, user-facing "
-        "config to switch between different default configs.",
-    )
 
     yaml_default: str = Field(
         default="",

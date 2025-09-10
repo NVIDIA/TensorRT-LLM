@@ -435,9 +435,8 @@ def test_missing_yaml_file(temp_dir):
     """Test handling of missing yaml file."""
     missing_file = temp_dir / "missing.yaml"
 
-    # Should not raise error for missing file (gracefully ignored)
-    with pytest.raises(ValidationError):
-        # But should still fail validation for missing required fields
+    # Should raise error for missing file
+    with pytest.raises(ValueError):
         BasicSettings(yaml_extra=[missing_file])
 
 

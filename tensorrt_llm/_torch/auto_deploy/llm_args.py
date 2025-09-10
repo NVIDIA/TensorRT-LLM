@@ -182,7 +182,6 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
     visualize: bool = Field(default=False, description="Whether to visualize the model graph.")
 
     ### NEW INFERENCE OPTIMIZER CONFIG #############################################################
-    # NOTE: needs explicit setting in LlmArgs below as well due to mix-in inheritance structure
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
@@ -276,14 +275,6 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
     """
 
     model_config = _get_config_dict()
-
-    # NOTE: redeclare mode field from AutoDeployConfig to ensure correct default+validation
-    mode: Literal["graph", "transformers"] = Field(
-        default="graph",
-        description="The mode to use for the inference optimizer. Currently, we "
-        "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
-        "or transformers-only cached attention optimization.",
-    )
 
     build_config: Optional[object] = Field(
         default_factory=lambda: BuildConfig(),
