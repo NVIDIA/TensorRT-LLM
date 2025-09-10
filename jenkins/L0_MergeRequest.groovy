@@ -366,7 +366,8 @@ def mergeWaiveList(pipeline, globalVars)
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "Merge waive list failed. Error: ${e.toString()}"
+        echo "Merge test waive list failed. Error: ${e.toString()}"
+        echo "Fallback to use the default test waive list from the PR"
     }
 }
 
