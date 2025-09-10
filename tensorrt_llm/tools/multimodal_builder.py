@@ -1801,12 +1801,7 @@ def build_qwen2_5_vl_engine(args):
                 input_names=['input', 'rotary_pos_emb', 'attention_mask'],
                 output_names=['encoder_output'],
                 dynamic_axes=dynamic_axes)
-    print("VISION CONFIG")
-    print(vars(hf_config.vision_config))
     rotary_pos_emb_dim = hf_config.vision_config.hidden_size // hf_config.vision_config.num_heads // 2
-    print(rotary_pos_emb_dim)
-    print("VL DIM")
-    print(qwen2_5_vl_dim)
     build_trt_engine(args.model_type, [rotary_pos_emb_dim],
                      f'{args.output_dir}/onnx',
                      args.output_dir,
