@@ -173,7 +173,6 @@ class SamplingParams:
 
         logprobs (int, optional): Number of log probabilities to return per output token. Defaults to None.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
-        top_logprobs (int, optional): Number of top log probabilities to return per output token. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
@@ -242,7 +241,6 @@ class SamplingParams:
     # Keep the below fields in sync with tllme.OutputConfig
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
-    top_logprobs: Optional[int] = None
     return_context_logits: bool = False
     return_generation_logits: bool = False
     exclude_input_from_output: bool = True
@@ -325,25 +323,18 @@ class SamplingParams:
         self.logprobs = self.logprobs and int(self.logprobs)
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
-        if self.top_logprobs is not None:
-            if not self.logprobs:
-                raise ValueError("You need to set logprobs to True to use top_logprobs.")
-            if self.top_logprobs < 1:
-                raise ValueError(f"top_logprobs must be >= 1, got {self.top_logprobs}")
-
-            if self._greedy_decoding:
+        if self.logprobs is not None:
+            if self._greedy_decoding and self.logprobs > 0:
                 # check for greedy sampling
                 raise ValueError(
-                    "top_logprobs must not be specified for greedy sampling, "
-                    "as it provides the same output as logprobs in this case."
+                    "logprobs > 0 must not be specified for greedy sampling, "
+                    "as it provides the same output as logprobs = 0 in this case."
                 )
-            elif self.top_k is not None and self.top_k < self.top_logprobs:
+            elif self.top_k is not None and self.top_k < self.logprobs:
                 # check for top-k sampling
-                raise ValueError(
-                    f"top_logprobs {self.top_logprobs} must not exceed top_k {self.top_k}"
-                )
+                raise ValueError(f"logprobs {self.logprobs} must not exceed top_k {self.top_k}")
             if self.use_beam_search:
-                raise ValueError("top_logprobs + beam search is not supported")
+                raise ValueError("logprobs > 0 + beam search is not supported")
 
     @property
     def _greedy_decoding(self) -> bool:
@@ -471,6 +462,7 @@ class SamplingParams:
 
         if is_pytorch_backend:
             config_kwargs["return_log_probs"] = bool(self.logprobs)
+            config_kwargs["top_logprobs"] = self.logprobs
         else:
             config_kwargs["return_log_probs"] = self._return_log_probs
 

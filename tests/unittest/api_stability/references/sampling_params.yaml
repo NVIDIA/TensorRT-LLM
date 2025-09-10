@@ -11,8 +11,5 @@ methods:
       beam_width_array:
         annotation: Optional[List[int]]
         default: null
-      top_logprobs:
-        annotation: Optional[int]
-        default: null
     return_annotation: None
 properties: {}
