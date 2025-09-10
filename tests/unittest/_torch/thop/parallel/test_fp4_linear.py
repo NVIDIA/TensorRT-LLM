@@ -2,17 +2,18 @@ import sys
 
 import pytest
 import torch
-from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
+# from utils.util import skip_pre_blackwell
+
 scaling_vector_size = 16
 
 
-@skip_pre_blackwell
+# @skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16]
 )  # TODO: Do we need float32 test case? fp4_quantize only supports fp16, bf16, fp8_e4m3
@@ -86,7 +87,7 @@ def pad_up(x, pad_size):
 
 @pytest.mark.skipif(sys.version_info < (3, 12),
                     reason="cutlass-dsl 4.1.0 requires Python 3.12+")
-@skip_pre_blackwell
+# @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536),
                                  (128, 2112, 7168), (128, 4096, 7168),
