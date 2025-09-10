@@ -154,7 +154,6 @@ def parse_arguments():
     parser = add_lora_args(parser)
     args = parser.parse_args()
 
-    args.disable_kv_cache_reuse = True  # kv cache reuse does not work for multimodal, force overwrite
     if args.kv_cache_fraction is None:
         args.kv_cache_fraction = 0.6  # lower the default kv cache fraction for multimodal
 

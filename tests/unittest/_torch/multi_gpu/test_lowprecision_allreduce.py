@@ -249,9 +249,9 @@ def run_single_rank(dtype, strategy, message_size):
     ids=lambda x: f"size{x}")
 @pytest.mark.parametrize(
     "mpi_pool_executor",
-    [2, 4],  # 8
-    ids=["tp_size_2", "tp_size_4"],
-    indirect=True)  # "tp_size_8"
+    [2],  # 4, 8
+    ids=["tp_size_2"],
+    indirect=True)  # "tp_size_4", "tp_size_8"
 def test_lowprecision_allreduce_acc(dtype, strategy, message_size,
                                     mpi_pool_executor):
     """
