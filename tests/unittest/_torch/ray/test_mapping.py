@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tensorrt_llm._torch.device_mesh import DeviceMeshTopology
+from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
 
@@ -113,7 +113,7 @@ class TestMapping(unittest.TestCase):
             mapping_device_mesh.build_mesh()
 
             properties = []
-            for dim in mapping_device_mesh._impl.device_mesh.mesh_dim_names:
+            for dim in mapping_device_mesh.device_mesh.mesh_dim_names:
                 properties.append(f"{dim}_rank")
                 properties.append(f"{dim}_group")
 
@@ -133,11 +133,11 @@ class TestMapping(unittest.TestCase):
 
             tp_group = mapping.tp_group
             print(f"tp_group: {tp_group}")
-            assert DeviceMeshTopology.device_mesh is not None
+            assert DeviceMeshTopologyImpl.device_mesh is not None
             mapping_copy = copy.deepcopy(mapping)
 
             # check static mesh still exists
-            assert mapping_copy._impl.device_mesh is not None
+            assert mapping_copy.device_mesh is not None
             print(f"tp_group after deepcopy: {mapping.tp_group}")
             assert mapping.tp_group == mapping_copy.tp_group
 

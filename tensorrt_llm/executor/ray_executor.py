@@ -251,33 +251,32 @@ class RayExecutor(GenerationExecutor):
          - When tp_size >  GPUs per node, allow a TP group span nodes.
          - rank 0 must be put on the driver node
         """
-        # check whether a placement group exists
-        pg = get_current_placement_group()
         bundle_indices = os.getenv("TRTLLM_RAY_BUNDLE_INDICES", None)
 
-        if pg is not None and bundle_indices:
-            bundle_indices = list(map(int, bundle_indices.split(",")))
-            assert len(bundle_indices) == self.world_size, (
-                f"Need {self.world_size} bundle indices for world_size, got {bundle_indices=}"
-            )
-            assert len(set(bundle_indices)) == len(bundle_indices), \
-                f"TRTLLM_RAY_BUNDLE_INDICES cannot have duplicate values, but got {bundle_indices=}."
+        if bundle_indices:
+            pg = get_current_placement_group()
+            if pg is not None:
+                bundle_indices = list(map(int, bundle_indices.split(",")))
+                assert len(bundle_indices) == self.world_size, (
+                    f"Need {self.world_size} bundle indices for world_size, got {bundle_indices=}"
+                )
+                assert len(set(bundle_indices)) == len(bundle_indices), \
+                    f"TRTLLM_RAY_BUNDLE_INDICES cannot have duplicate values, but got {bundle_indices=}."
 
-            assert max(bundle_indices) < len(pg.bundle_specs), \
-                f"{bundle_indices=} out of range for PG with {len(pg.bundle_specs)} bundles"
+                assert max(bundle_indices) < len(pg.bundle_specs), \
+                    f"{bundle_indices=} out of range for PG with {len(pg.bundle_specs)} bundles"
 
-            logger.info(
-                f"Found existing placement group {pg.bundle_specs=}. {bundle_indices=}"
-            )
+                logger.info(
+                    f"Found existing placement group {pg.bundle_specs=}. {bundle_indices=}"
+                )
 
-            # TODO: need to ping TP group onto the same node for RL FW integration case
+                # TODO: need to ping TP group onto the same node for RL FW integration case
 
-            return pg, bundle_indices
-
-        if bundle_indices is not None:
-            logger.warning(
-                f"Ignoring TRTLLM_RAY_BUNDLE_INDICES={bundle_indices} because no global placement group is found."
-            )
+                return pg, bundle_indices
+            else:
+                logger.warning(
+                    f"Ignoring TRTLLM_RAY_BUNDLE_INDICES={bundle_indices} because no global placement group is found."
+                )
 
         if self.world_size % tp_size:
             raise ValueError("world_size must be a multiple of tp_size")
@@ -307,7 +306,5 @@ class RayExecutor(GenerationExecutor):
             f"[Strategy={strategy}] Bundles: {bundles} for tp_size: {tp_size} and world_size: {self.world_size}"
         )
         pg = placement_group(bundles, strategy=strategy)
-        ray.get(pg.ready())  # blocks until reserved
-        logger.debug(f"Placement group ready.")
 
         return pg, bundle_indices
