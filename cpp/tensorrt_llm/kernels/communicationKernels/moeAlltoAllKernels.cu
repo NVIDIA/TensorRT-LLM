@@ -24,6 +24,8 @@
 namespace tensorrt_llm::kernels::moe_a2a
 {
 
+#define ENABLE_DEBUG_PRINT 0
+
 // ============================================================================
 // Helper Functions for Expert-to-Rank Mapping
 // ============================================================================
@@ -208,8 +210,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
                 uint32_t flag_value = *ptrs.flag_val;
                 // (C) .release guarantees: If flag setting is visible, then increment of local_token_counter is visible
-                printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
                 asm volatile("st.release.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(flag_value));
+
+                #if ENABLE_DEBUG_PRINT
+                printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, flag_value, target_rank);
+                #endif
             }
 
             // Busy wait until all source ranks targeting this rank have completed sending
@@ -224,7 +229,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                     asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
                     // printf("---Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
                 } while (flag_value != expected_value);
+                #if ENABLE_DEBUG_PRINT
                 printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
+                #endif
             }
         }
     }
@@ -487,7 +494,9 @@ __global__ void moeA2ACombineKernel(
         {
             uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
             asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(flag_addr), "r"(cur_val));
+            #if ENABLE_DEBUG_PRINT
             printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, cur_val, peer_rank);
+            #endif
         }
     }
 
@@ -503,7 +512,9 @@ __global__ void moeA2ACombineKernel(
                 // Acquire load to ensure visibility of peer's release-store
                 asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
             } while (flag_value != expected_value);
+            #if ENABLE_DEBUG_PRINT
             printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][peer_rank]: %d address: %p\n", rank_id, peer_rank, flag_value, *flag_ptr, flag_ptr);
+            #endif
         }
     }
     __syncthreads();
@@ -528,9 +539,9 @@ __global__ void moeA2ACombineKernel(
         uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
         uint8_t const* recv_ptr = recv_buffer + (rank_id * max_tokens_per_rank + dst_idx) * size_per_token;
 
+        #if ENABLE_DEBUG_PRINT
         if (lane_id == 0)
         {
-            // Fused print: print all 5 values in one printf
             float vals[5];
             for (int i = 0; i < 5; ++i)
             {
@@ -548,6 +559,7 @@ __global__ void moeA2ACombineKernel(
                 rank_id, local_token_idx, target_rank, vals[0], vals[1], vals[2], vals[3], vals[4],
                 send_indices_vals[0], send_indices_vals[1], send_indices_vals[2], send_indices_vals[3]);
         }
+        #endif
 
         // Sum into output (distributed across warp)
         warp_vectorized_sum<T>(token_output, reinterpret_cast<T const*>(recv_ptr), size_per_token, lane_id);
