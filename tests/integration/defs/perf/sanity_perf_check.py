@@ -49,6 +49,29 @@ class SanityPerfCheck():
                     f'b/tests/integration/defs/perf/{base_perf_filename}'):
                 f.write(diff_line)
 
+    def _check_autodeploy_failures(self, full_diff: pd.DataFrame,
+                                   base_perf: pd.DataFrame,
+                                   current_perf: pd.DataFrame) -> bool:
+        """
+        Check if any of the performance regressions are from autodeploy tests.
+        Returns True if there are autodeploy failures, False otherwise.
+        """
+        # Create a mapping from perf_case_name to network_name for both base and current
+        base_mapping = dict(
+            zip(base_perf['perf_case_name'], base_perf['network_name']))
+        current_mapping = dict(
+            zip(current_perf['perf_case_name'], current_perf['network_name']))
+
+        # Check each failed test
+        for idx, row in full_diff.iterrows():
+            # Look up network_name from either base or current (they should be the same)
+            network_name = base_mapping.get(idx) or current_mapping.get(idx)
+
+            if network_name and "_autodeploy" in str(network_name):
+                return True
+
+        return False
+
     def __call__(self, *args, **kwargs):
         # Check if the base_perf_csv file exists
         if not self.base_perf_csv.exists():
@@ -71,7 +94,20 @@ class SanityPerfCheck():
             print(
                 "You can download the file and update base_perf.csv by `git apply <patch file>`"
             )
-            print("Sanity perf check failed, but it has been disabled")
+
+            # Check if any of the failed tests are autodeploy tests
+            autodeploy_failures = self._check_autodeploy_failures(
+                full_diff, base_perf, current_perf)
+
+            if autodeploy_failures:
+                print(
+                    "Sanity perf check failed for autodeploy tests - failing the build"
+                )
+                return 1
+            else:
+                print(
+                    "Sanity perf check failed, but it has been disabled for non-autodeploy tests"
+                )
         return 0
 
 
