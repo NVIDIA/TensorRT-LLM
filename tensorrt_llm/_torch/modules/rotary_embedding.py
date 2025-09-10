@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 
 import torch
 from torch import nn
@@ -140,7 +140,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         super().__init__(rope_params, head_dim=head_dim, is_neox=is_neox)
         self.mrope_section = mrope_section
 
-    def get_cos_sin(self, position_ids: torch.Tensor):
+    def get_cos_sin(
+            self,
+            position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if position_ids.ndim == 3:
             cos_sin = self.rotary_cos_sin[position_ids.view(3, -1)]
             cos, sin = cos_sin[:, :, 0, :], cos_sin[:, :, 1, :]
