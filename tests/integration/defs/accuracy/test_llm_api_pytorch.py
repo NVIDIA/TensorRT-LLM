@@ -970,6 +970,8 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
+@skip_post_blackwell
+@skip_pre_hopper
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
