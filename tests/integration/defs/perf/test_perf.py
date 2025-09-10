@@ -22,6 +22,7 @@ import sys
 from typing import Dict, List, NamedTuple
 
 import pytest
+import yaml
 from defs.common import convert_weights, get_cpp_benchmark, quantize_data
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
@@ -29,7 +30,8 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 from ..conftest import get_llm_root, llm_models_root, trt_environment
 from .pytorch_model_config import get_model_yaml_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
-                    PerfMetricType, PerfScriptTestCmds, generate_test_nodes)
+                    PerfDisaggScriptTestCmds, PerfMetricType,
+                    PerfScriptTestCmds, generate_test_nodes)
 
 if not hasattr(re, "Pattern"):
     re.Pattern = type(re.compile(""))
@@ -252,6 +254,10 @@ PERF_METRIC_LOG_QUERIES = {
     re.compile(r".*Allocated ([\d\.]+) MiB for execution context memory.*"),
     PerfMetricType.KV_CACHE_SIZE:
     re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
+    PerfMetricType.DISAGG_SERVER_E2EL:
+    re.compile(r"Median E2EL \(ms\):\s*(\d+\.?\d*)"),
+    PerfMetricType.DISAGG_SERVER_TTFT:
+    re.compile(r"Median TTFT \(ms\):\s*(\d+\.?\d*)"),
 }
 BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.BUILD_TIME:
@@ -268,6 +274,12 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.KV_CACHE_SIZE:
     re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
+}
+DISAGG_SERVER_METRICS_LOG_QUERIES = {
+    PerfMetricType.DISAGG_SERVER_E2EL:
+    re.compile(r"Median E2EL \(ms\):\s*(\d+\.?\d*)"),
+    PerfMetricType.DISAGG_SERVER_TTFT:
+    re.compile(r"Median TTFT \(ms\):\s*(\d+\.?\d*)"),
 }
 # (Relative threshold, Absolute threshold) for all metric types
 PERF_METRIC_THRESHOLD = {
@@ -296,6 +308,10 @@ PERF_METRIC_THRESHOLD = {
     PerfMetricType.CONTEXT_GPU_MEMORY:
     (0.1, 50),  # Ignore context GPU memory < 50MiB
     PerfMetricType.KV_CACHE_SIZE: (-0.1, 50),  # Ignore value < 50MiB
+    PerfMetricType.DISAGG_SERVER_E2EL: (0.1,
+                                        50),  # Ignore E2EL regression < 50ms
+    PerfMetricType.DISAGG_SERVER_TTFT: (0.1,
+                                        50),  # Ignore TTFT regression < 50ms
 }
 
 BUILDER_METRICS = [
@@ -328,6 +344,11 @@ BENCH_INFERENCE_METRICS = [
     PerfMetricType.TOKEN_THROUGHPUT,
     PerfMetricType.SEQ_THROUGHPUT,
     PerfMetricType.KV_CACHE_SIZE,
+]
+
+DISAGG_SERVER_METRICS = [
+    PerfMetricType.DISAGG_SERVER_E2EL,
+    PerfMetricType.DISAGG_SERVER_TTFT,
 ]
 
 
@@ -442,6 +463,27 @@ class PerfTestConfig:
         # Just build engines
         self.build_only = False
 
+        # Whether to run disaggregated server perf test.
+        self.is_disagg_server = False
+        self.ctx_server_workers = 0
+        self.gen_server_workers = 0
+
+    def _to_string_disagg(self, entries: List[str]):
+        entries.append(f"disagg_server")
+        if self.ctx_tp_size > 1:
+            entries.append(f"ctx_tp:{self.ctx_tp_size}")
+        if self.ctx_dp_size > 1:
+            entries.append(f"ctx_dp:{self.ctx_dp_size}")
+        if self.ctx_pp_size > 1:
+            entries.append(f"ctx_pp:{self.ctx_pp_size}")
+        if self.gen_tp_size > 1:
+            entries.append(f"gen_tp:{self.gen_tp_size}")
+        if self.gen_dp_size > 1:
+            entries.append(f"gen_dp:{self.gen_dp_size}")
+        if self.gen_pp_size > 1:
+            entries.append(f"gen_pp:{self.gen_pp_size}")
+        return "-".join(entries)
+
     def to_string(self,
                   custom_bs: int = None,
                   custom_input_len: int = None,
@@ -466,6 +508,9 @@ class PerfTestConfig:
                 entries.append(f"pytorch")
             if self.streaming == "streaming":
                 entries.append(f"streaming")
+        elif self.runtime == "disagg_server":  # trtllm-serve
+            entries.append(f"disagg_server")
+            return self._to_string_disagg(entries)
 
         # Add mode and dtype.
         if self.runtime != "bench":
@@ -564,6 +609,37 @@ class PerfTestConfig:
     def __str__(self) -> str:
         return self.to_string()
 
+    def _load_from_str_disagg(self, labels: List[str]) -> None:
+        self.ctx_tp_size = 1
+        self.ctx_dp_size = 1
+        self.ctx_pp_size = 1
+        self.gen_tp_size = 1
+        self.gen_dp_size = 1
+        self.gen_pp_size = 1
+
+        if labels[0].startswith("ctx_tp:"):
+            self.ctx_tp_size = int(labels.pop(0).replace("ctx_tp:", ""))
+        elif labels[0].startswith("ctx_dp:"):
+            self.ctx_dp_size = int(labels.pop(0).replace("ctx_dp:", ""))
+        elif labels[0].startswith("ctx_pp:"):
+            self.ctx_pp_size = int(labels.pop(0).replace("ctx_pp:", ""))
+        else:
+            raise RuntimeError(f"Wrong label for ctx config: {labels[0]}!")
+
+        if labels[0].startswith("gen_tp:"):
+            self.gen_tp_size = int(labels.pop(0).replace("gen_tp:", ""))
+        elif labels[0].startswith("gen_dp:"):
+            self.gen_dp_size = int(labels.pop(0).replace("gen_dp:", ""))
+        elif labels[0].startswith("gen_pp:"):
+            self.gen_pp_size = int(labels.pop(0).replace("gen_pp:", ""))
+        else:
+            raise RuntimeError(f"Wrong label for gen config: {labels[0]}!")
+
+        self.ctx_server_workers = self.ctx_tp_size * self.ctx_dp_size * self.ctx_pp_size
+        self.gen_server_workers = self.gen_tp_size * self.gen_dp_size * self.gen_pp_size
+
+        self.validate()
+
     def load_from_str(self, test_param_labels) -> None:
         """
         Populate the config properties given the test param string.
@@ -573,9 +649,13 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         self.model_name = labels.pop(0)
-        assert labels[0] in ["cpp", "cppmanager", "bench"], \
+        assert labels[0] in ["cpp", "cppmanager", "bench", "disagg_server"], \
             f"Invalid runtime {labels[0]}!"
         self.runtime = labels.pop(0)
+
+        if self.runtime == "disagg_server":
+            return self._load_from_str_disagg(labels)
+
         self.api = labels.pop(0) if labels[0] == "exe" else ""
         self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
@@ -680,7 +760,6 @@ class PerfTestConfig:
         """
         Validate if the config makes sense.
         """
-
         # Validate model name.
         assert len(self.model_name) > 0, "model_name must not be empty!"
         assert "-" not in self.model_name, "model_name must not contain '-' character!"
@@ -691,8 +770,12 @@ class PerfTestConfig:
             assert self.model_name in allowed_models, f"model_name {self.model_name} is not in allowed_models!"
 
         # Validate runtime type.
-        VALID_RUNTIMES = ["cpp", "cppmanager", "bench"]
+        VALID_RUNTIMES = ["cpp", "cppmanager", "bench", "disagg_server"]
         assert self.runtime in VALID_RUNTIMES, f"Invalid runtime {self.runtime}!"
+
+        if self.runtime == "disagg_server":
+            # TODO: validate disaggregated server config
+            return
 
         # Validate plugin mode.
         VALID_MODES = ["plugin", "ootb", "ootb_except_mha"]
@@ -878,6 +961,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                                  llm_root)
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
+        elif self._config.runtime == "disagg_server":
+            benchmark_script = None
         else:
             raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
         allowed_configs = import_allowed_perf_config()
@@ -1365,6 +1450,17 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         # Whether this is python or cpp runtime perf test.
         is_python = self._config.runtime == "python"
         num_gpus = self._config.num_gpus
+        is_disagg = self._config.runtime == "disagg_server"
+
+        if is_disagg:
+            ctx_cmd, gen_cmd = self._get_disagg_worker_deploy_command()
+            server_cmd = self._get_disagg_server_deploy_command()
+            client_cmd = self._get_disagg_client_command()
+            benchmark_cmd = self._get_disagg_benchmark_command()
+
+            return PerfDisaggScriptTestCmds(ctx_cmd, gen_cmd, server_cmd,
+                                            client_cmd, benchmark_cmd)
+
         if is_python and num_gpus > 1:
             # TODO: Fix https://nvbugs/4449875
             pytest.skip(
@@ -1473,6 +1569,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             metric.metric_regex.search(line)
             for line in outputs[cmd_idx].split("\n")
         ]
+        print_info(outputs[cmd_idx].split("\n"))
         metric_values = [
             float(match.group(1)) for match in regex_matches if match
         ]
@@ -1652,6 +1749,21 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         """
 
         metrics = []
+        if self._config.runtime == "disagg_server":
+            for metric_type in DISAGG_SERVER_METRICS:
+                metrics.append(
+                    PerfTestMetric(
+                        original_test_name=self._full_test_name,
+                        metric_name=self._get_metric_name(metric_type),
+                        metric_type=metric_type,
+                        metric_regex=self._get_metric_regex(metric_type),
+                        metric_threshold=self._get_metric_threshold(
+                            metric_type),
+                        metric_abs_threshold=self._get_metric_abs_threshold(
+                            metric_type),
+                        cmd_idx=0,
+                    ))
+            return metrics
 
         # Build command is the first command.
         cmd_idx = 0 if self._config.runtime != "bench" else 1
@@ -1785,6 +1897,158 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             raise ValueError(f"Unexpected metric_type: {metric_type}")
 
         return PERF_METRIC_THRESHOLD[metric_type][1]
+
+    def _gen_disagg_worker_config(self):
+        ctx_config = {
+            'max_batch_size': 32,
+            'max_num_tokens': 4096,
+            'max_seq_len': 4096,
+            'tensor_parallel_size': self._config.ctx_tp_size,
+            'enable_attention_dp': self._config.ctx_dp_size > 1,
+            'print_iter_log': True,
+            'disable_overlap_scheduler': True,
+            'kv_cache_config': {
+                'enable_block_reuse': False,
+                # 'free_gpu_memory_fraction': ctx_free_gpu_memory_fraction,
+                'free_gpu_memory_fraction': 0.5,
+                'dtype': 'fp8',
+            },
+            'disable_overlap_scheduler': True,
+            'cache_transceiver_config': {
+                # 'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
+                'max_tokens_in_buffer': 4096,
+                'backend': 'DEFAULT',
+            },
+        }
+
+        gen_config = {
+            'tensor_parallel_size': self._config.gen_tp_size,
+            'enable_attention_dp': self._config.gen_dp_size > 1,
+            'pipeline_parallel_size': self._config.gen_pp_size,
+            'max_batch_size': 32,
+            'max_num_tokens': 4096,
+            'max_seq_len': 4096,
+            'cuda_graph_config': {
+                'enable_padding': True,
+                'batch_sizes': [1, 2, 4, 8, 16, 32],
+            },
+            'print_iter_log': True,
+            'kv_cache_config': {
+                'enable_block_reuse': False,
+                'free_gpu_memory_fraction': 0.5,
+                'dtype': 'fp8',
+            },
+            'cache_transceiver_config': {
+                'max_tokens_in_buffer': 4096,
+                'backend': 'DEFAULT',
+            },
+        }
+        return ctx_config, gen_config
+
+    def _gen_disagg_server_config(self):
+        server_config = {
+            'hostname': 'localhost',
+            'port': 8000,
+            'backend': 'pytorch',
+            'context_servers': {
+                'num_instances': 1,
+                'urls': ['localhost:8001']
+            },
+            'generation_servers': {
+                'num_instances': 1,
+                'urls': ['localhost:8002']
+            }
+        }
+        return server_config
+
+    def _get_disagg_worker_deploy_command(self):
+        ctx_config, gen_config = self._gen_disagg_worker_config()
+        ctx_config_path = os.path.join(self._working_dir, "ctx_config.yaml")
+        gen_config_path = os.path.join(self._working_dir, "gen_config.yaml")
+        with open(ctx_config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(ctx_config, f)
+        with open(gen_config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(gen_config, f)
+
+        print_info(f"ctx_server_config: {ctx_config}")
+        print_info(f"gen_server_config: {gen_config}")
+
+        model_path = MODEL_PATH_DICT[self._config.model_name]
+        model_dir = os.path.join(llm_models_root(), model_path)
+
+        ctx_gpu_list = ",".join(
+            [str(i) for i in range(self._config.ctx_server_workers)])
+
+        gen_gpu_list = ",".join([
+            str(i) for i in range(
+                self._config.ctx_server_workers,
+                self._config.ctx_server_workers +
+                self._config.gen_server_workers)
+        ])
+
+        ctx_cmd = f'CUDA_VISIBLE_DEVICES={ctx_gpu_list} trtllm-serve {model_dir} --host localhost --port 8001 --extra_llm_api_options {ctx_config_path}'
+        gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} trtllm-serve {model_dir} --host localhost --port 8002 --extra_llm_api_options {gen_config_path}'
+        return ctx_cmd, gen_cmd
+
+    def _get_disagg_server_deploy_command(self):
+        server_config = self._gen_disagg_server_config()
+        server_config_path = os.path.join(self._working_dir,
+                                          "server_config.yaml")
+        with open(server_config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(server_config, f)
+        return f'trtllm-serve disaggregated -c {server_config_path} -t 3600 -r 3600'
+
+    def _get_disagg_client_command(self):
+        client_dir = os.path.join(self._llm_root,
+                                  "examples/disaggregated/clients")
+        client_cmd = [
+            'python3', f'{client_dir}/disagg_client.py', '-c',
+            f'{self._working_dir}/server_config.yaml', '-p',
+            f'{client_dir}/prompts.json', '--ignore-eos',
+            '--server-start-timeout',
+            str(1800)
+        ]
+        return client_cmd
+
+    def _get_disagg_benchmark_command(self):
+        benchmark_script = os.path.join(self._llm_root, "tensorrt_llm", "serve",
+                                        "scripts", "benchmark_serving.py")
+        model_path = MODEL_PATH_DICT[self._config.model_name]
+        model_dir = os.path.join(llm_models_root(), model_path)
+        shared_gpt_path = os.path.join(
+            llm_models_root(), "datasets",
+            "ShareGPT_V3_unfiltered_cleaned_split.json")
+        benchmark_cmd = [
+            'python3',
+            benchmark_script,
+            '--model',
+            model_dir,
+            '--tokenizer',
+            model_dir,
+            '--dataset-name',
+            'random',
+            '--dataset-path',
+            shared_gpt_path,
+            '--random-input-len',
+            '1024',
+            '--random-output-len',
+            '1024',
+            '--random-prefix-len',
+            '0',
+            '--num-prompts',
+            '320',
+            '--max-concurrency',
+            '32',
+            '--host',
+            'localhost',
+            '--port',
+            '8000',
+            '--ignore-eos',
+            '--no-test-input',
+            '--percentile-metrics',
+            'e2el,ttft',
+        ]
+        return benchmark_cmd
 
 
 def run_perf_test(perf_case_name, trt_performance_cache_fpath,
