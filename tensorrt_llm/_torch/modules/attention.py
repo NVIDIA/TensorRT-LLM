@@ -5,7 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_family
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -568,7 +568,7 @@ def fp8_block_scaling_bmm_out(
     out: torch.Tensor,
     mat2_dequant: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    sm_version = get_sm_family()
+    sm_version = get_sm_version()
     if sm_version == 90 or sm_version == 89:
         mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
             mat1)
@@ -579,7 +579,7 @@ def fp8_block_scaling_bmm_out(
                                                    output)
         out.copy_(output)
 
-    elif sm_version == 100:
+    elif is_sm_100f(sm_version):
         torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
@@ -894,7 +894,7 @@ class MLA(nn.Module):
                 ),
                 requires_grad=False,
             )
-            if get_sm_family() == 100:
+            if is_sm_100f():
                 assert self.dtype == torch.bfloat16
                 self.k_b_proj_trans_dequant = nn.Parameter(
                     torch.empty(

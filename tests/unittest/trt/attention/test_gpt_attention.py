@@ -439,7 +439,8 @@ class TestFunctional(unittest.TestCase):
         skip_blackwell_for_fmha_tests(context_fmha_type, head_size)
 
         # Skip custom mask tests for Blackwell
-        if (getSMVersion() == 100 or getSMVersion == 103) and custom_mask_input:
+        if (getSMVersion() == 100
+                or getSMVersion() == 103) and custom_mask_input:
             pytest.skip("Custom masked is not supported by TRTLLM-GEN for now.")
 
         if num_kv_heads == 0:
