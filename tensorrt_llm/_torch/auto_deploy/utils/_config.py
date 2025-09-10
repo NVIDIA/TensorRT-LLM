@@ -61,7 +61,7 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
         """Call additional config files based on current state.
 
         This function also takes care of identifying the correct default yaml file based on the
-        following precedence order:
+        following precedence order (highest -> lowest priority):
         1. provided mode
         2. provided yaml_default
         3. yaml_default from default mode
@@ -102,7 +102,7 @@ class DynamicYamlMixInForSettings:
     NOTE: This class must come FIRST in the MRO such that `yaml_extra` can be processed before
     since otherwise we cannot load default values from the `yaml_extra` first.
 
-    This mix-in enforces the following precedence order:
+    This mix-in enforces the following precedence order (highest -> lowest priority):
     - init settings
     - env settings
     - dotenv settings
@@ -129,13 +129,13 @@ class DynamicYamlMixInForSettings:
 
 
     You can also provide multiple yaml config files to load. In this case, the files are deep merged
-    together in the order they are provided. Hence, the following order (decreasing precedence) for
-    multiple yaml config files is:
+    together in the order they are provided. Hence, the following order (lowest -> highest priority)
+    for multiple yaml config files is:
         - default yaml provided as ``yaml_default`` field (or yaml retrieved from the mode)
         - argument 0 of ``yaml_extra``
         - argument 1 of ``yaml_extra``
         - ...
-        - last argument of ``yaml_extra``
+        - last argument of ``yaml_extra`` (highest priority, last yaml getting merged into config)
     """
 
     # should be set as field by the child class! mode is a simple switch to control the default
