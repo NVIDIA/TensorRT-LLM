@@ -54,23 +54,90 @@ class SanityPerfCheck():
                                    current_perf: pd.DataFrame) -> bool:
         """
         Check if any of the performance regressions are from autodeploy tests.
-        Returns True if there are autodeploy failures, False otherwise.
+        Only considers actual regressions (worse performance), not improvements.
+        Returns True if there are autodeploy regressions, False otherwise.
         """
-        # Create a mapping from perf_case_name to network_name for both base and current
-        base_mapping = dict(
+        # Create mappings for network_name, threshold, absolute_threshold, and metric_type
+        base_network_mapping = dict(
             zip(base_perf['perf_case_name'], base_perf['network_name']))
-        current_mapping = dict(
+        current_network_mapping = dict(
             zip(current_perf['perf_case_name'], current_perf['network_name']))
+        base_threshold_mapping = dict(
+            zip(base_perf['perf_case_name'], base_perf['threshold']))
+        base_abs_threshold_mapping = dict(
+            zip(base_perf['perf_case_name'], base_perf['absolute_threshold']))
+        base_metric_type_mapping = dict(
+            zip(base_perf['perf_case_name'], base_perf['metric_type']))
 
-        # Check each failed test
+        # Check each performance difference
         for idx, row in full_diff.iterrows():
             # Look up network_name from either base or current (they should be the same)
-            network_name = base_mapping.get(idx) or current_mapping.get(idx)
+            network_name = base_network_mapping.get(
+                idx) or current_network_mapping.get(idx)
 
+            # Only check autodeploy tests
             if network_name and "_autodeploy" in str(network_name):
-                return True
+                # Check if this is actually a regression (worse performance)
+                if hasattr(row, 'perf_metric_base') and hasattr(
+                        row, 'perf_metric_target'):
+                    base_value = row.perf_metric_base
+                    target_value = row.perf_metric_target
+                    threshold = base_threshold_mapping.get(idx, 0)
+                    abs_threshold = base_abs_threshold_mapping.get(idx, 50)
+                    metric_type = base_metric_type_mapping.get(idx, '')
+
+                    # Skip if we don't have the necessary data
+                    if pd.isna(base_value) or pd.isna(target_value):
+                        continue
+
+                    # Determine if this is a regression based on metric type and threshold sign
+                    is_regression = self._is_performance_regression(
+                        base_value, target_value, threshold, abs_threshold,
+                        metric_type)
+
+                    if is_regression:
+                        return True
 
         return False
+
+    def _is_performance_regression(self, base_value: float, target_value: float,
+                                   threshold: float, abs_threshold: float,
+                                   metric_type: str) -> bool:
+        """
+        Determine if a performance change represents a regression (worse performance)
+        that exceeds the acceptable threshold.
+
+        Args:
+            base_value: Baseline performance value
+            target_value: Current performance value
+            threshold: Performance threshold (sign indicates better direction)
+            abs_threshold: Absolute threshold for tolerance calculation
+            metric_type: Type of metric (for context)
+
+        Returns:
+            True if target_value represents worse performance than base_value
+            AND the change exceeds the threshold
+        """
+        import numpy as np
+
+        # First check if the change exceeds the threshold (same logic as diff_tools.py)
+        # Use absolute value of threshold for relative tolerance calculation
+        rel_threshold = abs(threshold)
+
+        # If values are within threshold tolerance, no significant change
+        if np.isclose(base_value,
+                      target_value,
+                      rtol=rel_threshold,
+                      atol=abs(abs_threshold)):
+            return False
+
+        # Now check if it's a regression (worse performance) in the expected direction
+        if threshold > 0:
+            # Positive threshold: lower is better - regression if target > base
+            return target_value > base_value
+        else:
+            # Negative threshold: higher is better - regression if target < base
+            return target_value < base_value
 
     def __call__(self, *args, **kwargs):
         # Check if the base_perf_csv file exists
@@ -112,4 +179,5 @@ class SanityPerfCheck():
 
 
 if __name__ == '__main__':
-    SanityPerfCheck(sys.argv[1], sys.argv[2])()
+    exit_code = SanityPerfCheck(sys.argv[1], sys.argv[2])()
+    sys.exit(exit_code)
