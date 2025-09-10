@@ -96,6 +96,7 @@ class MultimodalRuntimeData:
         num_cached_tokens: Total number of cached tokens for this sequence
         mm_token_lengths: Length of each multimodal token chunk
         mm_token_positions: Starting positions of each multimodal token chunk
+        special_token_offsets: Starting positions of special tokens in the union of all multimodal token chunks (optional, depending on the model)
         prompt_tokens: Current iteration of prompt tokens for this sequence (optional). Need it for chunk prefill if enabled (#TODO)
         num_cached_mm_tokens: Number of multimodal tokens that are cached in this iteration (computed)
         total_mm_tokens: Total number of multimodal tokens in this sequence (computed)
@@ -103,6 +104,7 @@ class MultimodalRuntimeData:
     num_cached_tokens: int
     mm_token_lengths: List[int]
     mm_token_positions: List[int]
+    special_token_offsets: List[int]
 
     # TODO: support chunk prefill for multimodal
     # When chunk prefill is enabled, we need to pass the prompt tokens for current chunk and mask to find the included mm tokens
@@ -110,6 +112,10 @@ class MultimodalRuntimeData:
 
     num_cached_mm_tokens: Optional[int] = None
     total_mm_tokens: Optional[int] = None
+
+    num_cached_special_tokens: Optional[int] = 0
+    num_special_tokens_in_chunk: Optional[int] = 0
+    total_special_tokens: Optional[int] = 0
 
     def __post_init__(self):
         # Validate input data
@@ -149,6 +155,16 @@ class MultimodalRuntimeData:
                 f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to "
                 f"num_cached_tokens ({self.num_cached_tokens})")
         self.total_mm_tokens = sum(self.mm_token_lengths)
+
+        if len(self.special_token_offsets) > 0:
+            self.num_cached_special_tokens = sum(
+                1 for offset in self.special_token_offsets
+                if offset < self.num_cached_mm_tokens)
+            # reserved for chunked prefill
+            self.num_special_tokens_in_chunk = sum(
+                1 for offset in self.special_token_offsets
+                if self.num_cached_mm_tokens <= offset < self.total_mm_tokens)
+            self.total_special_tokens = len(self.special_token_offsets)
 
 
 @dataclass

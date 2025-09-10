@@ -30,37 +30,6 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
 
-def _map_to_mm_embed_bound(start_pos, end_pos, special_token_offsets):
-    """
-    Map positions in the token sequence (which includes special tokens) to positions
-    in the mm_embeds (which excludes special tokens).
-
-    Args:
-        start_pos: Start position in the token sequence
-        end_pos: End position in the token sequence
-        special_token_offsets: torch.Tensor of special token positions
-
-    Returns:
-        Tuple of (adjusted_start_pos, adjusted_end_pos) in mm_embeds coordinates
-    """
-    # Count special tokens before start_pos
-    special_tokens_before_start = sum(1 for offset in special_token_offsets
-                                      if offset < start_pos)
-
-    # Count special tokens within the range [start_pos, end_pos)
-    special_tokens_within_range = sum(1 for offset in special_token_offsets
-                                      if start_pos <= offset < end_pos)
-
-    # Calculate the original chunk size
-    chunk_size = end_pos - start_pos
-
-    # Adjust positions by removing special token counts
-    adjusted_start_pos = start_pos - special_tokens_before_start
-    adjusted_end_pos = adjusted_start_pos + chunk_size - special_tokens_within_range
-
-    return adjusted_start_pos, adjusted_end_pos
-
-
 def find_uncached_mm_embeds(
         mm_embeds: List[torch.Tensor],
         multimodal_params: List[MultimodalParams]) -> torch.Tensor:
@@ -114,12 +83,8 @@ def find_uncached_mm_embeds(
 
     for param in multimodal_params:
         runtime = param.multimodal_runtime
-        local_start_pos = runtime.num_cached_mm_tokens
-        local_end_pos = runtime.total_mm_tokens
-        if 'special_token_offsets' in param.multimodal_data:
-            local_start_pos, local_end_pos = _map_to_mm_embed_bound(
-                local_start_pos, local_end_pos,
-                param.multimodal_data['special_token_offsets'])
+        local_start_pos = runtime.num_cached_mm_tokens - runtime.num_cached_special_tokens
+        local_end_pos = runtime.total_mm_tokens - runtime.total_special_tokens
 
         start_pos = current_pos + local_start_pos
         end_pos = current_pos + local_end_pos
@@ -127,9 +92,7 @@ def find_uncached_mm_embeds(
         if len(mm_embeds
                ) == 1:  # pre-concatenated mm_embeds, need global offset
             current_pos += runtime.total_mm_tokens
-            if 'special_token_offsets' in param.multimodal_data:
-                current_pos -= len(
-                    param.multimodal_data['special_token_offsets'])
+            current_pos -= runtime.total_special_tokens
 
     sliced_mm_embeds = []
     if len(mm_embeds) == 1:
