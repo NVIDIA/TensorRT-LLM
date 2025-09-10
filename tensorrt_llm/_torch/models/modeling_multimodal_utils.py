@@ -74,7 +74,8 @@ def _cache_multimodal_embeddings(
 
     # Collect embedding lengths for each parameter
     embed_lengths = [
-        param.multimodal_runtime.total_mm_tokens_in_request
+        param.multimodal_runtime.total_mm_tokens_in_request -
+        param.multimodal_runtime.total_special_tokens_in_request
         for param in multimodal_params
     ]
 
@@ -191,7 +192,8 @@ def find_input_mm_embeds(
 
     # Calculate total tokens that need processing (both cached and current chunk)
     total_mm_tokens = sum([
-        param.multimodal_runtime.num_mm_tokens_in_chunk
+        param.multimodal_runtime.num_mm_tokens_in_chunk -
+        param.multimodal_runtime.num_special_tokens_in_chunk
         for param in multimodal_params
     ])
 
@@ -209,12 +211,14 @@ def find_input_mm_embeds(
     slices = []
     for param in multimodal_params:
         runtime = param.multimodal_runtime
+        local_start_pos = runtime.num_unseen_mm_tokens - runtime.num_unseen_special_tokens
+        local_end_pos = local_start_pos + runtime.num_mm_tokens_in_chunk - runtime.num_special_tokens_in_chunk
         slices.append(
-            (current_pos + runtime.num_unseen_mm_tokens, current_pos +
-             runtime.num_unseen_mm_tokens + runtime.num_mm_tokens_in_chunk))
+            (current_pos + local_start_pos, current_pos + local_end_pos))
         if len(mm_embeds
                ) == 1:  # pre-concatenated mm_embeds, need global offset
             current_pos += runtime.total_mm_tokens_in_request
+            current_pos -= runtime.total_special_tokens_in_request
 
     sliced_mm_embeds = []
     if len(mm_embeds) == 1:
