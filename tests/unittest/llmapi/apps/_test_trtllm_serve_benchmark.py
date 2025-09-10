@@ -12,8 +12,8 @@ from test_llm import get_model_path
 
 
 @pytest.fixture(scope="module")
-def model_name():
-    return "llama-3.1-model/Meta-Llama-3.1-8B"
+def model_name(request):
+    return request.param
 
 
 @pytest.fixture(scope="module")
@@ -23,8 +23,10 @@ def model_path(model_name: str):
 
 @pytest.fixture(scope="module")
 def server(model_path: str):
+    args = ["--kv_cache_free_gpu_memory_fraction", "0.8"]
     # fix port to facilitate concise trtllm-serve examples
-    with RemoteOpenAIServer(model_path, port=8000) as remote_server:
+    with RemoteOpenAIServer(model_path, cli_args=args,
+                            port=8000) as remote_server:
         yield remote_server
 
 
@@ -43,18 +45,24 @@ def dataset_path(dataset_name: str):
 
 
 @skip_gpu_memory_less_than_80gb
+@pytest.mark.parametrize(
+    "model_name", ["llama-3.1-model/Meta-Llama-3.1-8B", "gpt_oss/gpt-oss-20b"],
+    indirect=True)
 def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
                                 model_path: str):
+    model_name = model_path.split("/")[-1]
     client_script = os.path.join(benchmark_root, "benchmark_serving.py")
     dataset = dataset_path("sharegpt")
     benchmark_cmd = [
         "python3", client_script, "--dataset-name", "sharegpt", "--model",
-        "llama", "--dataset-path", dataset, "--tokenizer", model_path
+        model_name, "--dataset-path", dataset, "--tokenizer", model_path
     ]
 
     # CalledProcessError will be raised if any errors occur
-    subprocess.run(benchmark_cmd,
-                   stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE,
-                   text=True,
-                   check=True)
+    result = subprocess.run(benchmark_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            check=True)
+    assert result.returncode == 0
+    assert "Serving Benchmark Result" in result.stdout
