@@ -1330,6 +1330,8 @@ class PyTorchModelEngine(ModelEngine):
                 mm_token_positions=request.multimodal_positions,
                 past_seen_token_num=past_seen_token_num,
                 chunk_end_pos=end_compute,
+                special_token_offsets=request.py_multimodal_data.get(
+                    'special_token_offsets', []),
             ) if request.multimodal_hashes is not None else None
 
             multimodal_params = MultimodalParams(
