@@ -178,8 +178,8 @@ class ModelDrafter(Drafter):
         else:
             draft_batch.context_requests.append(draft_request)
 
-    @nvtx_range("prepare_draft_batch")
-    def prepare_draft_batch(
+    @nvtx_range("_prepare_draft_batch")
+    def _prepare_draft_batch(
             self, scheduled_requests: ScheduledRequests) -> ScheduledRequests:
         """
         Prepares a batch for the draft model engine. Draft tokens are only produced
@@ -238,7 +238,7 @@ class ModelDrafter(Drafter):
             return draft_batch
 
         except Exception as e:
-            logger.error(f"Error in prepare_draft_batch: {str(e)}")
+            logger.error(f"Error in _prepare_draft_batch: {str(e)}")
             traceback.print_exc()
             raise e
 
@@ -461,7 +461,7 @@ class ModelDrafter(Drafter):
         if guided_decoder is not None:
             guided_decoder.rollback_rejected_tokens(scheduled_batch)
 
-        draft_batch = self.prepare_draft_batch(scheduled_batch)
+        draft_batch = self._prepare_draft_batch(scheduled_batch)
         if draft_batch.batch_size == 0:
             return None, None
 
@@ -482,7 +482,7 @@ class ModelDrafter(Drafter):
         Args:
             outputs: The outputs from the draft model
             draft_batch: The draft batch that was processed
-            req_id_to_old_request: Mapping from request ID to original request
+            req_id_to_old_request: Mapping from draft request ID to original request
         """
         outputs_host = outputs.cpu()
         for token_idx in range(self.max_draft_tokens):
@@ -500,6 +500,16 @@ class ModelDrafter(Drafter):
         for req in draft_batch.all_requests():
             self.draft_seq_slot_manager.free_resources(req)
 
+    def process_dynamic_draft_outputs(
+            self, outputs: Any,
+            req_id_to_old_request: Dict[int, LlmRequest]) -> None:
+        """
+        Process outputs from dynamic draft loop, update target requests, and clean up resources.
+        """
+        self.update_requests(outputs)
+        self.process_decoded_tokens(outputs.scheduled_requests,
+                                    req_id_to_old_request)
+
     def _execute_draft_iteration(
         self,
         draft_batch: ScheduledRequests,
@@ -507,18 +517,7 @@ class ModelDrafter(Drafter):
         previous_draft_state: Optional[SampleState],
         guided_decoder: Optional[GuidedDecoder] = None
     ) -> Tuple[Any, Optional[SampleState]]:
-        """
-        Execute a single draft iteration.
-
-        Args:
-            draft_batch: The draft batch to process
-            resource_manager: The resource manager
-            previous_draft_state: The previous draft state
-            guided_decoder: The guided decoder
-
-        Returns:
-            Tuple of (outputs, new_sample_state)
-        """
+        """Forward pass through the draft model."""
         outputs = self.forward_draft_model(
             draft_batch,
             resource_manager,
@@ -586,7 +585,7 @@ class ModelDrafter(Drafter):
                 self._update_target_inputs_with_draft_tokens(
                     target_inputs,
                     draft_tensors,
-                    i + 1,
+                    draft_position=i + 1,
                     draft_length=1,
                     num_draft_reqs=num_draft_reqs)
 
@@ -659,7 +658,7 @@ class ModelDrafter(Drafter):
             self._update_target_inputs_with_draft_tokens(
                 target_inputs,
                 outputs,
-                0,
+                draft_position=0,
                 draft_length=self.max_draft_tokens,
                 num_draft_reqs=num_draft_reqs)
             return target_inputs, outputs, draft_batch
@@ -677,7 +676,7 @@ class ModelDrafter(Drafter):
         self._update_target_inputs_with_draft_tokens(
             target_inputs,
             draft_tensors,
-            0,
+            draft_position=0,
             draft_length=1,
             num_draft_reqs=num_draft_reqs)
 
@@ -726,7 +725,6 @@ class ModelDrafter(Drafter):
                                                   req_id_to_old_request)
                 return
 
-            # Handle guided decoder and sampling for non-static loop
             if self.guided_decoder is not None:
                 self.guided_decoder.add_batch(draft_batch)
                 self.guided_decoder.execute(outputs['logits'],
@@ -741,10 +739,8 @@ class ModelDrafter(Drafter):
 
             # Final cleanup
             if previous_draft_state is not None:
-                self.update_requests(previous_draft_state)
-                self.process_decoded_tokens(
-                    previous_draft_state.scheduled_requests,
-                    req_id_to_old_request)
+                self.process_dynamic_draft_outputs(previous_draft_state,
+                                                   req_id_to_old_request)
 
         except Exception as e:
             traceback.print_exc()
