@@ -5,10 +5,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import List
+from typing import List, Optional
 
 import openai
 import requests
+import yaml
 
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 
@@ -22,19 +23,31 @@ class RemoteOpenAIServer:
                  cli_args: List[str] = None,
                  llmapi_launch: bool = False,
                  port: int = None,
-                 host: str = "localhost") -> None:
+                 host: str = "localhost",
+                 env: Optional[dict] = None,
+                 rank: int = -1,
+                 extra_config: Optional[dict] = None) -> None:
         self.host = host
         self.port = port if port is not None else find_free_port()
-        self.rank = os.environ.get("SLURM_PROCID", 0)
-
+        self.rank = rank if rank != -1 else os.environ.get("SLURM_PROCID", 0)
         args = ["--host", f"{self.host}", "--port", f"{self.port}"]
         if cli_args:
             args += cli_args
+        if extra_config:
+            with tempfile.NamedTemporaryFile(mode="w+",
+                                             delete=False,
+                                             delete_on_close=False) as f:
+                f.write(yaml.dump(extra_config))
+                self.extra_config_file = f.name
+            args += ["--extra_llm_api_options", self.extra_config_file]
         launch_cmd = ["trtllm-serve"] + [model] + args
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes
             launch_cmd = ["trtllm-llmapi-launch"] + launch_cmd
+        if not env:
+            env = os.environ.copy()
         self.proc = subprocess.Popen(launch_cmd,
+                                     env=env,
                                      stdout=sys.stdout,
                                      stderr=sys.stderr)
         self._wait_for_server(url=self.url_for("health"),
@@ -59,6 +72,8 @@ class RemoteOpenAIServer:
                 if self.rank == 0:
                     if requests.get(url).status_code == 200:
                         break
+                    else:
+                        time.sleep(0.5)
                 else:
                     time.sleep(timeout)
                     break
@@ -96,36 +111,40 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 port: int = None,
+                 port: int = -1,
+                 env: Optional[dict] = None,
                  llmapi_launch: bool = False) -> None:
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.host = "localhost"
         self.port = port if port is not None else find_free_port()
-        self.extra_config_file = self._get_extra_config_file()
-
-        launch_cmd = [
-            "trtllm-serve", "disaggregated", "--host", f"{self.host}", "--port",
-            f"{self.port}", "--extra-config", self.extra_config_file.name
-        ]
+        self.rank = 0  # rank is always 0 since there is only one disagg server
+        self.config = self._get_extra_config()
+        with tempfile.NamedTemporaryFile(mode="w+",
+                                         delete=False,
+                                         delete_on_close=False) as f:
+            self.config_file = f.name
+            f.write(self.config)
+        launch_cmd = ["trtllm-serve", "disaggregated", "-c", self.config_file]
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes
             launch_cmd = ["trtllm-llmapi-launch"] + launch_cmd
-        with tempfile.NamedTemporaryFile() as f:
-            f.write(self._get_extra_config())
-            self.proc = subprocess.Popen(launch_cmd,
-                                         stdout=sys.stdout,
-                                         stderr=sys.stderr)
+        if not env:
+            env = os.environ.copy()
+        self.proc = subprocess.Popen(launch_cmd,
+                                     env=env,
+                                     stdout=sys.stdout,
+                                     stderr=sys.stderr)
         self._wait_for_server(url=self.url_for("health"),
                               timeout=self.MAX_SERVER_START_WAIT_S)
 
     def _get_extra_config(self):
         return yaml.dump({
-            "ctx_servers": {
+            "context_servers": {
                 "num_instances": len(self.ctx_servers),
                 "urls": self.ctx_servers
             },
-            "gen_servers": {
+            "generation_servers": {
                 "num_instances": len(self.gen_servers),
                 "urls": self.gen_servers
             },
