@@ -1830,6 +1830,7 @@ class PyExecutor:
                             req_id] is not None:
                         self.result_wait_queues[req_id].put_response.remote(
                             resp.client_id, resp)
+                        self.result_wait_queues.pop(req_id, None)
                 self.response_cv.notify_all()
 
     @nvtx_range("_handle_first_token_response")

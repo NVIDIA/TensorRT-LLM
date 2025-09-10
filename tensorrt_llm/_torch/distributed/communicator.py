@@ -485,6 +485,64 @@ class TorchDist(Distributed):
                 device=torch.device("cpu"))
             return ret[0]
 
+    @log_op
+    def pp_allgather(self, obj):
+        if isinstance(obj, torch.Tensor):
+            output_list = [
+                torch.empty_like(obj)
+                for _ in range(self.mapping.pp_group_pg.size())
+            ]
+            dist.all_gather(output_list, obj, group=self.mapping.pp_group_pg)
+            return output_list
+        else:
+            output_list = [None] * self.mapping.pp_group_pg.size()
+            dist.all_gather_object(output_list,
+                                   obj,
+                                   group=self.mapping.pp_group_pg)
+            return output_list
+
+    @log_op
+    def pp_gather(self, obj, dst=0):
+        global_rank = torch.distributed.get_rank()
+        if isinstance(obj, torch.Tensor):
+            if global_rank == dst:
+                output_list = [
+                    torch.empty_like(obj)
+                    for _ in range(self.mapping.pp_group_pg.size())
+                ]
+            else:
+                output_list = None
+            dist.gather(obj,
+                        output_list,
+                        dst=dst,
+                        group=self.mapping.pp_group_pg)
+            return output_list
+        else:
+            output_list = [None] * self.mapping.pp_group_pg.size()
+            if global_rank == dst:
+                output_list = [None] * self.mapping.pp_group_pg.size()
+            else:
+                output_list = None
+            dist.gather_object(obj,
+                               output_list,
+                               dst=dst,
+                               group=self.mapping.pp_group_pg)
+            return output_list
+
+    @log_op
+    def pp_broadcast(self, obj, root=0):
+        if isinstance(obj, torch.Tensor):
+            dist.broadcast(obj, src=root, group=self.mapping.pp_group_pg)
+            return obj
+        else:
+            ret = [obj]
+            torch.distributed.broadcast_object_list(
+                ret,
+                src=root,
+                group=self.mapping.pp_group_pg,
+                device=torch.device("cpu"))
+            return ret[0]
+
 
 # TODO: rename to PPCommNCCL
 class PPComm:
