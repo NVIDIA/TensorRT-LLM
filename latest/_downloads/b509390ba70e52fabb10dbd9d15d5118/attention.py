@@ -216,6 +216,7 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization)
+
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
@@ -315,7 +316,8 @@ class Attention(nn.Module):
         if self.attn_backend == "TRTLLM":
             has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                                or self.o_proj.has_fp8_block_scales
-                               or self.o_proj.has_fp8_rowwise)
+                               or self.o_proj.has_fp8_rowwise
+                               or self.o_proj.has_w4a8_nvfp4_fp8)
             if has_quant_scale and (self.attn.has_fp8_kv_cache
                                     or self.attn.has_fp4_kv_cache):
                 out_dtype = torch.float8_e4m3fn
@@ -338,25 +340,20 @@ class Attention(nn.Module):
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
     ):
-
-        padded_num_tokens = attn_metadata.padded_num_tokens
         num_tokens = attn_metadata.num_tokens
 
-        if padded_num_tokens is not None:
-            assert q.shape[0] == padded_num_tokens
-            q = q[:num_tokens, :]
-            if k is not None:
-                assert k.shape[0] == padded_num_tokens
-                k = k[:num_tokens, :]
-            if v is not None:
-                assert v.shape[0] == padded_num_tokens
-                v = v[:num_tokens, :]
+        q = q[:num_tokens, :]
+        if k is not None:
+            k = k[:num_tokens, :]
+        if v is not None:
+            v = v[:num_tokens, :]
 
         out_scale = None
         out_scale_sf = None
         has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                            or self.o_proj.has_fp8_block_scales
-                           or self.o_proj.has_fp8_rowwise)
+                           or self.o_proj.has_fp8_rowwise
+                           or self.o_proj.has_w4a8_nvfp4_fp8)
         if has_quant_scale:
             out_scale = self.o_proj.inv_input_scale
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output:
@@ -954,12 +951,10 @@ class MLA(nn.Module):
         num_generations = attn_metadata.num_generations
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_tokens = attn_metadata.num_tokens
-        padded_num_tokens = attn_metadata.padded_num_tokens
 
-        if padded_num_tokens is not None:
-            hidden_states = hidden_states[:num_tokens, ...]
-            if position_ids is not None:
-                position_ids = position_ids[:num_tokens, ...]
+        hidden_states = hidden_states[:num_tokens, ...]
+        if position_ids is not None:
+            position_ids = position_ids[..., :num_tokens]
 
         if self.is_lite:
             compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(

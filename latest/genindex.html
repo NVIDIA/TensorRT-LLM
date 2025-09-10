@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc4';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc3" />
+  <meta name="docsearch:version" content="1.1.0rc4" />
 
 
   </head>
@@ -313,34 +313,15 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quick-start-guide.html">Quick Start Guide</a></li>
-<li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
-<li class="toctree-l1"><a class="reference internal" href="torch.html">PyTorch Backend</a></li>
-<li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="installation/containers.html">Pre-built release container images on NGC</a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
-</ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="llm-api/reference.html">API Reference</a></li>
-</ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1 has-children"><a class="reference internal" href="examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
-</ul>
-</details></li>
-<li class="toctree-l1"><a class="reference internal" href="examples/customization.html">LLM Common Customizations</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_inference.html">Generate text</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_inference_async.html">Generate text asynchronously</a></li>
@@ -372,97 +353,86 @@
 <li class="toctree-l2"><a class="reference internal" href="examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1"><a class="reference internal" href="examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="commands/trtllm-bench.html">trtllm-bench</a></li>
 
-<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-eval.html">trtllm-eval</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
 <li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </details></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="architecture/overview.html">TensorRT-LLM Architecture</a></li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/core-concepts.html">Model Definition</a></li>
-
-
-
-<li class="toctree-l1"><a class="reference internal" href="architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/add-model.html">Adding a Model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api/reference.html">API Reference</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/executor.html">Executor API</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-reuse.html">KV cache reuse</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
-</ul>
-</details></li>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-analysis.html">Performance Analysis</a></li>
-</ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="reference/troubleshooting.html">Troubleshooting</a></li>
-<li class="toctree-l1"><a class="reference internal" href="reference/support-matrix.html">Support Matrix</a></li>
-<li class="toctree-l1"><a class="reference internal" href="reference/precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="reference/ci-overview.html">Continuous Integration Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="reference/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/dev-containers.html">Using Dev Containers</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT-LLM server</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT‑LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)</a></li>
-<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
 <ul class="nav bd-sidenav">
@@ -531,12 +501,38 @@
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li>
+    --accuracy_threshold
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-accuracy_threshold">trtllm-eval-mmlu command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --apply_chat_template
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-apply_chat_template">trtllm-eval-cnn_dailymail command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-apply_chat_template">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-apply_chat_template">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-apply_chat_template">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-apply_chat_template">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-apply_chat_template">trtllm-eval-mmlu command line option</a>
+</li>
+      </ul></li>
+      <li>
     --backend
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-backend">trtllm-bench-latency command line option</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-backend">trtllm-bench-throughput command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-backend">trtllm-eval command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-backend">trtllm-serve-serve command line option</a>
 </li>
@@ -548,6 +544,13 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-beam_width">trtllm-bench-latency command line option</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-beam_width">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --check_accuracy
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-check_accuracy">trtllm-eval-mmlu command line option</a>
 </li>
       </ul></li>
       <li>
@@ -603,6 +606,27 @@
 </li>
       </ul></li>
       <li>
+    --dataset_path
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-dataset_path">trtllm-eval-cnn_dailymail command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-dataset_path">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-dataset_path">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-dataset_path">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-dataset_path">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-dataset_path">trtllm-eval-json_mode_eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-dataset_path">trtllm-eval-mmlu command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-dataset_path">trtllm-eval-mmmu command line option</a>
+</li>
+      </ul></li>
+      <li>
     --disable_chunked_context
 
       <ul>
@@ -645,6 +669,8 @@
     --ep_size
 
       <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-ep_size">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-ep_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
@@ -663,6 +689,8 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-extra_llm_api_options">trtllm-bench-throughput command line option</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-extra_llm_api_options">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-extra_llm_api_options">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
@@ -674,9 +702,18 @@
 </li>
       </ul></li>
       <li>
+    --fewshot_as_multiturn
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-fewshot_as_multiturn">trtllm-eval-gsm8k command line option</a>
+</li>
+      </ul></li>
+      <li>
     --gpus_per_node
 
       <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpus_per_node">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-mm_embedding_serve-gpus_per_node">trtllm-serve-mm_embedding_serve command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">trtllm-serve-serve command line option</a>
@@ -720,6 +757,8 @@
     --kv_cache_free_gpu_memory_fraction
 
       <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-kv_cache_free_gpu_memory_fraction">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
@@ -728,6 +767,8 @@
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-log_level">trtllm-bench command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-log_level">trtllm-eval command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">trtllm-serve-disaggregated command line option</a>
 </li>
@@ -746,6 +787,8 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-max_batch_size">trtllm-bench-throughput command line option</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-max_batch_size">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-mm_embedding_serve-max_batch_size">trtllm-serve-mm_embedding_serve command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_batch_size">trtllm-serve-serve command line option</a>
@@ -755,6 +798,8 @@
     --max_beam_width
 
       <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-max_beam_width">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_beam_width">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
@@ -768,6 +813,27 @@
 </li>
       </ul></li>
       <li>
+    --max_input_length
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-max_input_length">trtllm-eval-cnn_dailymail command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-max_input_length">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-max_input_length">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-max_input_length">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-max_input_length">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-max_input_length">trtllm-eval-json_mode_eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-max_input_length">trtllm-eval-mmlu command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-max_input_length">trtllm-eval-mmmu command line option</a>
+</li>
+      </ul></li>
+      <li>
     --max_num_tokens
 
       <ul>
@@ -775,9 +841,32 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-max_num_tokens">trtllm-bench-throughput command line option</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-max_num_tokens">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-mm_embedding_serve-max_num_tokens">trtllm-serve-mm_embedding_serve command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_num_tokens">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --max_output_length
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-max_output_length">trtllm-eval-cnn_dailymail command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-max_output_length">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-max_output_length">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-max_output_length">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-max_output_length">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-max_output_length">trtllm-eval-json_mode_eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-max_output_length">trtllm-eval-mmlu command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-max_output_length">trtllm-eval-mmmu command line option</a>
 </li>
       </ul></li>
       <li>
@@ -790,9 +879,13 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-max_seq_len">trtllm-bench-throughput command line option</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-max_seq_len">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_seq_len">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --medusa_choices
 
@@ -811,8 +904,6 @@
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-metadata_server_config_file">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --metrics-log-interval
 
@@ -834,6 +925,8 @@
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-m">trtllm-bench command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-model">trtllm-eval command line option</a>
 </li>
       </ul></li>
       <li>
@@ -858,6 +951,13 @@
 </li>
       </ul></li>
       <li>
+    --num_fewshot
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-num_fewshot">trtllm-eval-mmlu command line option</a>
+</li>
+      </ul></li>
+      <li>
     --num_postprocess_workers
 
       <ul>
@@ -871,6 +971,27 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-num_requests">trtllm-bench-latency command line option</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-num_requests">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --num_samples
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-num_samples">trtllm-eval-cnn_dailymail command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-num_samples">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-num_samples">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-num_samples">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-num_samples">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-num_samples">trtllm-eval-json_mode_eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-num_samples">trtllm-eval-mmlu command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-num_samples">trtllm-eval-mmmu command line option</a>
 </li>
       </ul></li>
       <li>
@@ -904,6 +1025,8 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-build-pp">trtllm-bench-build command line option</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-pp_size">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pp_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
@@ -912,6 +1035,27 @@
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-build-q">trtllm-bench-build command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --random_seed
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-random_seed">trtllm-eval-cnn_dailymail command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-random_seed">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-random_seed">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-random_seed">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-random_seed">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-random_seed">trtllm-eval-json_mode_eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-random_seed">trtllm-eval-mmlu command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-random_seed">trtllm-eval-mmmu command line option</a>
 </li>
       </ul></li>
       <li>
@@ -942,6 +1086,13 @@
 
       <ul>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">trtllm-serve-disaggregated command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --rouge_path
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-rouge_path">trtllm-eval-cnn_dailymail command line option</a>
 </li>
       </ul></li>
       <li>
@@ -982,6 +1133,27 @@
 </li>
       </ul></li>
       <li>
+    --system_prompt
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-system_prompt">trtllm-eval-cnn_dailymail command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-system_prompt">trtllm-eval-gpqa_diamond command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-system_prompt">trtllm-eval-gpqa_extended command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-system_prompt">trtllm-eval-gpqa_main command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-system_prompt">trtllm-eval-gsm8k command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-system_prompt">trtllm-eval-json_mode_eval command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-system_prompt">trtllm-eval-mmlu command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-system_prompt">trtllm-eval-mmmu command line option</a>
+</li>
+      </ul></li>
+      <li>
     --target_input_len
 
       <ul>
@@ -1003,6 +1175,8 @@
     --tokenizer
 
       <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-tokenizer">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tokenizer">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
@@ -1021,6 +1195,8 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-build-tp">trtllm-bench-build command line option</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-tp_size">trtllm-eval command line option</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tp_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
@@ -1029,6 +1205,8 @@
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-build-trust_remote_code">trtllm-bench-build command line option</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-trust_remote_code">trtllm-eval command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-mm_embedding_serve-trust_remote_code">trtllm-serve-mm_embedding_serve command line option</a>
 </li>
@@ -1171,6 +1349,8 @@
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.__init__">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.__init__">(tensorrt_llm.llmapi.LoRARequest method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.__init__">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.__init__">(tensorrt_llm.llmapi.MoeConfig method)</a>
@@ -1238,6 +1418,8 @@
 </li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.normalization.AdaLayerNormZeroSingle">AdaLayerNormZeroSingle (class in tensorrt_llm.layers.normalization)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.adapter_id">adapter_id (tensorrt_llm.llmapi.LoRARequest property)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.add">add() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Conditional.add_input">add_input() (tensorrt_llm.functional.Conditional method)</a>
@@ -1274,10 +1456,10 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb">apply_rotary_pos_emb() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
-      <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm">apply_rotary_pos_emb_chatglm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm">apply_rotary_pos_emb_chatglm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_cogvlm">apply_rotary_pos_emb_cogvlm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.arange">arange() (in module tensorrt_llm.functional)</a>
@@ -1554,6 +1736,8 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.chunk">chunk() (in module tensorrt_llm.functional)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.ckpt_source">ckpt_source (tensorrt_llm.llmapi.LoRARequest property)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.clamp_val">clamp_val (tensorrt_llm.llmapi.QuantConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.clear_logprob_params">clear_logprob_params() (tensorrt_llm.llmapi.RequestOutput method)</a>
@@ -1640,6 +1824,8 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.constants_to_tensors_">constants_to_tensors_() (in module tensorrt_llm.functional)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.construct">construct() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
@@ -1678,8 +1864,6 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.construct">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.Session.context">context (tensorrt_llm.runtime.Session property)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulerConfig.context_chunking_policy">context_chunking_policy (tensorrt_llm.llmapi.SchedulerConfig attribute)</a>
@@ -3562,6 +3746,8 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.Config">LookaheadDecodingConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.lora_ckpt_source">lora_ckpt_source (tensorrt_llm.llmapi.LoRARequest attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.lora_config">lora_config (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 
       <ul>
@@ -3570,11 +3756,19 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.lora_config">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.lora_int_id">lora_int_id (tensorrt_llm.llmapi.LoRARequest attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.lora_name">lora_name (tensorrt_llm.llmapi.LoRARequest attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.lora_path">lora_path (tensorrt_llm.llmapi.LoRARequest attribute)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.lora_plugin">lora_plugin (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.lora_plugin">lora_plugin() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.lora_target_modules">lora_target_modules (tensorrt_llm.runtime.ModelConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest">LoRARequest (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.low_latency_gemm">low_latency_gemm() (in module tensorrt_llm.functional)</a>
 </li>
@@ -4691,6 +4885,8 @@
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.name">name (tensorrt_llm.functional.Tensor property)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.name">(tensorrt_llm.llmapi.LoRARequest property)</a>
+</li>
         <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.TensorInfo.name">(tensorrt_llm.runtime.TensorInfo attribute)</a>
 </li>
       </ul></li>
@@ -4736,10 +4932,10 @@
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.num_beams">num_beams (tensorrt_llm.runtime.SamplingConfig attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_capture_layers">num_capture_layers (tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_capture_layers">num_capture_layers (tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_draft_tokens">num_draft_tokens (tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_eagle_layers">num_eagle_layers (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
@@ -4994,6 +5190,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.partition">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.path">path (tensorrt_llm.llmapi.LoRARequest property)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.peft_cache_config">peft_cache_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 
       <ul>
@@ -6149,6 +6347,8 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor10BufferViewE">tensorrt_llm::executor::BufferView (C++ type)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15CacheSaltIDTypeE">tensorrt_llm::executor::CacheSaltIDType (C++ type)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfigE">tensorrt_llm::executor::CacheTransceiverConfig (C++ class)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig11BackendTypeE">tensorrt_llm::executor::CacheTransceiverConfig::BackendType (C++ enum)</a>
@@ -7085,7 +7285,15 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig5mNameE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::mName (C++ member)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig11multiThreadE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::multiThread (C++ member)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache15BaseAgentConfig13useProgThreadE">tensorrt_llm::executor::kv_cache::BaseAgentConfig::useProgThread (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache17BaseLoopbackAgentE">tensorrt_llm::executor::kv_cache::BaseLoopbackAgent (C++ class)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache17BaseLoopbackAgent22executeLoopbackRequestERK11MemoryDescsRK9FileDescsb">tensorrt_llm::executor::kv_cache::BaseLoopbackAgent::executeLoopbackRequest (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache17BaseLoopbackAgentD0Ev">tensorrt_llm::executor::kv_cache::BaseLoopbackAgent::~BaseLoopbackAgent (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache17BaseTransferAgentE">tensorrt_llm::executor::kv_cache::BaseTransferAgent (C++ class)</a>
 </li>
@@ -7131,7 +7339,7 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState13AttentionType4kMLAE">tensorrt_llm::executor::kv_cache::CacheState::AttentionType::kMLA (C++ enumerator)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32N8nvinfer18DataTypeE13AttentionTypeibii">tensorrt_llm::executor::kv_cache::CacheState::CacheState (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE11ModelConfigRKN7runtime11WorldConfigEN8nvinfer18DataTypeE13AttentionTypei">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateENSt6vectorI10SizeType32EE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32N8nvinfer18DataTypeE13AttentionTypeibii">[2]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN8nvinfer18DataTypeE13AttentionTypeibii">tensorrt_llm::executor::kv_cache::CacheState::CacheState (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE11ModelConfigRKN7runtime11WorldConfigERKNSt6vectorI10SizeType32EEN8nvinfer18DataTypeE13AttentionTypei">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateENSt6vectorI10SizeType32EE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN8nvinfer18DataTypeE13AttentionTypeibii">[2]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState18getAttentionConfigEv">tensorrt_llm::executor::kv_cache::CacheState::getAttentionConfig (C++ function)</a>
 </li>
@@ -7162,6 +7370,8 @@
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheStateeqERKN8kv_cache10CacheStateE">tensorrt_llm::executor::kv_cache::CacheState::operator== (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14ParallelConfigE">tensorrt_llm::executor::kv_cache::CacheState::ParallelConfig (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14ParallelConfig23mAttentionLayerNumPerPPE">tensorrt_llm::executor::kv_cache::CacheState::ParallelConfig::mAttentionLayerNumPerPP (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState14ParallelConfig19mContextParallelismE">tensorrt_llm::executor::kv_cache::CacheState::ParallelConfig::mContextParallelism (C++ member)</a>
 </li>
@@ -7254,6 +7464,32 @@
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache12DynLibLoaderaSERK12DynLibLoader">tensorrt_llm::executor::kv_cache::DynLibLoader::operator= (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache12DynLibLoaderD0Ev">tensorrt_llm::executor::kv_cache::DynLibLoader::~DynLibLoader (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDescE">tensorrt_llm::executor::kv_cache::FileDesc (C++ class)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDesc2fdE">tensorrt_llm::executor::kv_cache::FileDesc::fd (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDesc8FileDescERK8FileDesc">tensorrt_llm::executor::kv_cache::FileDesc::FileDesc (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDesc8FileDescERKNSt6stringEi6mode_t6size_t">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDesc8FileDescERR8FileDesc">[2]</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache8FileDesc5getFdEv">tensorrt_llm::executor::kv_cache::FileDesc::getFd (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache8FileDesc6getLenEv">tensorrt_llm::executor::kv_cache::FileDesc::getLen (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDesc4mLenE">tensorrt_llm::executor::kv_cache::FileDesc::mLen (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDescaSERK8FileDesc">tensorrt_llm::executor::kv_cache::FileDesc::operator= (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDescaSERR8FileDesc">[1]</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache8FileDescD0Ev">tensorrt_llm::executor::kv_cache::FileDesc::~FileDesc (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache9FileDescsE">tensorrt_llm::executor::kv_cache::FileDescs (C++ class)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache9FileDescs9FileDescsERRNSt6vectorI8FileDescEE">tensorrt_llm::executor::kv_cache::FileDescs::FileDescs (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache9FileDescs8getDescsEv">tensorrt_llm::executor::kv_cache::FileDescs::getDescs (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache9FileDescs6mDescsE">tensorrt_llm::executor::kv_cache::FileDescs::mDescs (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4IDpEN12tensorrt_llm8executor8kv_cache17makeLoopbackAgentENSt10shared_ptrI17BaseLoopbackAgentEERKNSt6stringEDpRR4Args">tensorrt_llm::executor::kv_cache::makeLoopbackAgent (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4IDpEN12tensorrt_llm8executor8kv_cache17makeTransferAgentENSt10unique_ptrI17BaseTransferAgentEERKNSt6stringEDpRR4Args">tensorrt_llm::executor::kv_cache::makeTransferAgent (C++ function)</a>
 </li>
@@ -7519,7 +7755,7 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KvCacheRetentionConfig21kMinRetentionPriorityE">tensorrt_llm::executor::KvCacheRetentionConfig::kMinRetentionPriority (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KvCacheRetentionConfig22KvCacheRetentionConfigERKNSt6vectorI25TokenRangeRetentionConfigEE17RetentionPriorityNSt8optionalINSt6chrono12millisecondsEEE19KvCacheTransferModeNSt8optionalINSt6stringEEE">tensorrt_llm::executor::KvCacheRetentionConfig::KvCacheRetentionConfig (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KvCacheRetentionConfig22KvCacheRetentionConfigEv">[1]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KvCacheRetentionConfig22KvCacheRetentionConfigERKNSt6vectorI25TokenRangeRetentionConfigEE17RetentionPriorityNSt8optionalINSt6chrono12millisecondsEEE19KvCacheTransferModeRKNSt6stringE">tensorrt_llm::executor::KvCacheRetentionConfig::KvCacheRetentionConfig (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KvCacheRetentionConfig22KvCacheRetentionConfigEv">[1]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KvCacheRetentionConfig17mDecodeDurationMsE">tensorrt_llm::executor::KvCacheRetentionConfig::mDecodeDurationMs (C++ member)</a>
 </li>
@@ -7915,6 +8151,8 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request11getBadWordsEv">tensorrt_llm::executor::Request::getBadWords (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request14getCacheSaltIDEv">tensorrt_llm::executor::Request::getCacheSaltID (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request11getClientIdEv">tensorrt_llm::executor::Request::getClientId (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request21getContextPhaseParamsEv">tensorrt_llm::executor::Request::getContextPhaseParams (C++ function)</a>
@@ -7991,11 +8229,13 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7RequestaSERK7Request">tensorrt_llm::executor::Request::operator= (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7RequestaSERR7Request">[1]</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestE9VecTokens10SizeType32bRK14SamplingConfigRK12OutputConfigRKNSt8optionalI10SizeType32EERKNSt8optionalI10SizeType32EENSt8optionalINSt6vectorI10SizeType32EEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalI6TensorEENSt8optionalI25ExternalDraftTokensConfigEENSt8optionalI18PromptTuningConfigEENSt8optionalI15MultimodalInputEENSt8optionalI6TensorEENSt8optionalI11MropeConfigEENSt8optionalI10LoraConfigEENSt8optionalI23LookaheadDecodingConfigEENSt8optionalI22KvCacheRetentionConfigEENSt8optionalINSt6stringEEENSt8optionalI19LogitsPostProcessorEENSt8optionalI9VecTokensEENSt8optionalI6IdTypeEEb12PriorityType11RequestTypeNSt8optionalI18ContextPhaseParamsEENSt8optionalI6TensorEENSt8optionalI10SizeType32EENSt8optionalI6TensorEE10SizeType32NSt8optionalI11EagleConfigEENSt8optionalI6TensorEENSt8optionalI20GuidedDecodingParamsEENSt8optionalI10SizeType32EENSt8optionalI16MillisecondsTypeEE">tensorrt_llm::executor::Request::Request (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERK7Request">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERR7Request">[2]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestE9VecTokens10SizeType32bRK14SamplingConfigRK12OutputConfigRKNSt8optionalI10SizeType32EERKNSt8optionalI10SizeType32EENSt8optionalINSt6vectorI10SizeType32EEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalI6TensorEENSt8optionalI25ExternalDraftTokensConfigEENSt8optionalI18PromptTuningConfigEENSt8optionalI15MultimodalInputEENSt8optionalI6TensorEENSt8optionalI11MropeConfigEENSt8optionalI10LoraConfigEENSt8optionalI23LookaheadDecodingConfigEENSt8optionalI22KvCacheRetentionConfigEENSt8optionalINSt6stringEEENSt8optionalI19LogitsPostProcessorEENSt8optionalI9VecTokensEENSt8optionalI6IdTypeEEb12PriorityType11RequestTypeNSt8optionalI18ContextPhaseParamsEENSt8optionalI6TensorEENSt8optionalI10SizeType32EENSt8optionalI6TensorEE10SizeType32NSt8optionalI11EagleConfigEENSt8optionalI6TensorEENSt8optionalI20GuidedDecodingParamsEENSt8optionalI10SizeType32EENSt8optionalI16MillisecondsTypeEENSt8optionalI15CacheSaltIDTypeEE">tensorrt_llm::executor::Request::Request (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERK7Request">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERR7Request">[2]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request17setAllottedTimeMsE16MillisecondsType">tensorrt_llm::executor::Request::setAllottedTimeMs (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request11setBadWordsERKNSt4listI9VecTokensEE">tensorrt_llm::executor::Request::setBadWords (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request14setCacheSaltIDE15CacheSaltIDType">tensorrt_llm::executor::Request::setCacheSaltID (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request11setClientIdE6IdType">tensorrt_llm::executor::Request::setClientId (C++ function)</a>
 </li>
@@ -8823,6 +9063,8 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I0_NSt11enable_if_tINSt10is_const_vI1UEEbEEEN12tensorrt_llm7runtime11BufferRange11BufferRangeERK7IBuffer">tensorrt_llm::runtime::BufferRange::BufferRange (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0_NSt11enable_if_tIXntNSt10is_const_vI1UEEEbEEEN12tensorrt_llm7runtime11BufferRange11BufferRangeER7IBuffer">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11BufferRange11BufferRangeEP1T9size_type">[2]</a>
 </li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15CacheSaltIDTypeE">tensorrt_llm::runtime::CacheSaltIDType (C++ type)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13canAccessPeerERK11WorldConfig">tensorrt_llm::runtime::canAccessPeer (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime27clearVirtualMemoryAllocatorEv">tensorrt_llm::runtime::clearVirtualMemoryAllocator (C++ function)</a>
@@ -8993,8 +9235,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6Status12MATERIALIZEDE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Status::MATERIALIZED (C++ enumerator)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6Status8RELEASEDE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Status::RELEASED (C++ enumerator)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunkD0Ev">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::~CUDAVirtualMemoryChunk (C++ function)</a>
@@ -9057,6 +9297,8 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kFLOATEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kFLOAT&gt;::size (C++ member)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kFLOATEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kFLOAT&gt;::type (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt; (C++ struct)</a>
@@ -11643,9 +11885,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.tokenizer_revision">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       </ul></li>
-      <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.tokens_per_block">tokens_per_block (tensorrt_llm.runtime.GenerationSession property)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.tokens_per_block">tokens_per_block (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 
       <ul>
+        <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.tokens_per_block">(tensorrt_llm.runtime.GenerationSession property)</a>
+</li>
         <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.tokens_per_block">(tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       </ul></li>
@@ -11881,6 +12125,199 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-tp">--tp</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-warmup">--warmup</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-backend">--backend</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-ep_size">--ep_size</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-extra_llm_api_options">--extra_llm_api_options</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpus_per_node">--gpus_per_node</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-kv_cache_free_gpu_memory_fraction">--kv_cache_free_gpu_memory_fraction</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-log_level">--log_level</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-max_batch_size">--max_batch_size</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-max_beam_width">--max_beam_width</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-max_num_tokens">--max_num_tokens</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-max_seq_len">--max_seq_len</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-model">--model</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-pp_size">--pp_size</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-tokenizer">--tokenizer</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-tp_size">--tp_size</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-trust_remote_code">--trust_remote_code</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval-cnn_dailymail command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-apply_chat_template">--apply_chat_template</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-dataset_path">--dataset_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-max_output_length">--max_output_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-random_seed">--random_seed</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-rouge_path">--rouge_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-cnn_dailymail-system_prompt">--system_prompt</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval-gpqa_diamond command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-apply_chat_template">--apply_chat_template</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-dataset_path">--dataset_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-max_output_length">--max_output_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-random_seed">--random_seed</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_diamond-system_prompt">--system_prompt</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval-gpqa_extended command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-apply_chat_template">--apply_chat_template</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-dataset_path">--dataset_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-max_output_length">--max_output_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-random_seed">--random_seed</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_extended-system_prompt">--system_prompt</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval-gpqa_main command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-apply_chat_template">--apply_chat_template</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-dataset_path">--dataset_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-max_output_length">--max_output_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-random_seed">--random_seed</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gpqa_main-system_prompt">--system_prompt</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval-gsm8k command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-apply_chat_template">--apply_chat_template</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-dataset_path">--dataset_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-fewshot_as_multiturn">--fewshot_as_multiturn</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-max_output_length">--max_output_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-random_seed">--random_seed</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-gsm8k-system_prompt">--system_prompt</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval-json_mode_eval command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-dataset_path">--dataset_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-max_output_length">--max_output_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-random_seed">--random_seed</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-json_mode_eval-system_prompt">--system_prompt</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval-mmlu command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-accuracy_threshold">--accuracy_threshold</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-apply_chat_template">--apply_chat_template</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-check_accuracy">--check_accuracy</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-dataset_path">--dataset_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-max_output_length">--max_output_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-num_fewshot">--num_fewshot</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-random_seed">--random_seed</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmlu-system_prompt">--system_prompt</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-eval-mmmu command line option
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-dataset_path">--dataset_path</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-max_input_length">--max_input_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-max_output_length">--max_output_length</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-num_samples">--num_samples</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-random_seed">--random_seed</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-system_prompt">--system_prompt</a>
 </li>
       </ul></li>
       <li>
@@ -12365,6 +12802,8 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A8_MXFP4_MXFP8">W4A8_MXFP4_MXFP8 (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A8_NVFP4_FP8">W4A8_NVFP4_FP8 (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A8_QSERVE_PER_CHANNEL">W4A8_QSERVE_PER_CHANNEL (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A8_QSERVE_PER_GROUP">W4A8_QSERVE_PER_GROUP (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
@@ -12377,10 +12816,10 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN">W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN">W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN">W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN">W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN">W8A8_SQ_PER_TENSOR_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
@@ -12555,9 +12994,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 02, 2025.</p>
+  <p>Last updated on September 09, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/e81c50d">e81c50d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/62b564a">62b564a</a>.</p>
   
 </div></div>
       
