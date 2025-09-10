@@ -20,7 +20,11 @@ except ImportError:
 
 import torch
 import triton  # type: ignore[import]
-from cuda import cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
