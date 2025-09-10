@@ -365,9 +365,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     3. moe_finalize_scale_op: finalize the scale of the output tensor.
     """
 
-    # To reuse pytorch memory segments allocated during graph capture.
-    buffer = GetMemoryBuffer()
-
     def __init__(
         self,
         *,
@@ -398,6 +395,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 model_config.moe_max_num_tokens = default_moe_max_num_tokens
                 model_config._frozen = True
 
+        # To reuse pytorch memory segments allocated during graph capture.
+        self.buffer = get_memory_buffer()
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -420,12 +419,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         # create workspace
         fp8_dim = max(hidden_size, intermediate_size)
-        workspace_0 = DeepGemmFusedMoE.buffer.get_buffer(
-            (num_experts * m_max * fp8_dim, ),
-            dtype=torch.float8_e4m3fn,
-            buffer_name='workspace_0',
-            pin_memory=capture_graph)
-        workspace_1 = DeepGemmFusedMoE.buffer.get_buffer(
+        workspace_0 = self.buffer.get_buffer((num_experts * m_max * fp8_dim, ),
+                                             dtype=torch.float8_e4m3fn,
+                                             buffer_name='workspace_0',
+                                             pin_memory=capture_graph)
+        workspace_1 = self.buffer.get_buffer(
             (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
             dtype=torch.bfloat16,
             buffer_name='workspace_1',
@@ -436,7 +434,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         scale_k = fp8_utils.ceil_div(fp8_dim, group_size)
         scale_k_padded = fp8_utils.align(scale_k, 4)
 
-        workspace_sf = DeepGemmFusedMoE.buffer.get_buffer(
+        workspace_sf = self.buffer.get_buffer(
             (num_experts * (scale_k_padded // 4) * m_padded, ),
             dtype=torch.int32,
             buffer_name='workspace_sf',

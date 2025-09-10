@@ -1,7 +1,15 @@
 import math
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+
+@dataclass
+class BufferBlock:
+    buffer: torch.Tensor = None
+    pin_memory: bool = False
+
 
 # Intention to have this buffer is to reuse buffer tensors across graph and non-graph
 # situation (across layer/round).
@@ -14,91 +22,77 @@ import torch
 #   [t0] start cudagraph capture
 #   [t1] A = torch.zeros(....) -> allocate buffer A and put into graph pool
 #   [t2] end cudagraph capture
-
-
 #   [t3] in non-graph forward
 #   [t4] A = torch.zeros(....) -> allocate buffer A in allocator but not use memory in cudagraph pool
 #        OOM may happen
-# NOTE: it requires all tensors with the same identifier (buffer_name here) have the same dtype. Will
-#       upgrade this.
 class Buffers:
-    """
-+    Manages CUDA memory buffers for reuse between graph and non-graph contexts.
-+
-+    This buffer manager maintains two separate caches:
-+    - allocated_buffer_in_graph_pool: Buffers allocated during CUDA graph capture
-+    - allocated_buffer_in_runtime: Buffers allocated during regular runtime
-+
-+    Note: This implementation is not thread-safe. If used in multi-threaded contexts,
-+    external synchronization is required.
-+
-+    Attributes:
-+        allocated_buffer_in_graph_pool: Dict mapping buffer names to lists of graph-captured tensors
-+        allocated_buffer_in_runtime: Dict mapping buffer names to single runtime tensors
-+    """
 
     def __init__(self):
-        self.allocated_buffer_in_graph_pool: dict[str, list[torch.Tensor]] = {}
-        self.allocated_buffer_in_runtime: dict[str, torch.Tensor] = {}
+        self.buffers: dict[str, list[BufferBlock]] = {}
 
     def get_buffer(self, tensor_shape: list[int], dtype: torch.dtype,
                    buffer_name: str, pin_memory: bool):
 
         def select_buffer_with_more_elements(
-            graph_buffer: Optional[torch.Tensor],
+            pinned_buffer: Optional[torch.Tensor],
             runtime_buffer: Optional[torch.Tensor]
-        ) -> tuple[Optional[torch.Tensor], bool]:
-            if graph_buffer is None:
-                return runtime_buffer, False
+        ) -> tuple[Optional[torch.Tensor]]:
+            if pinned_buffer is None:
+                return runtime_buffer
             if runtime_buffer is None:
-                return graph_buffer, True
-            use_runtime = runtime_buffer.numel() > graph_buffer.numel()
-            return (runtime_buffer if use_runtime else graph_buffer,
-                    not use_runtime)
+                return pinned_buffer
 
-        capture_graph = pin_memory
-        numel_like = math.prod(tensor_shape)
-        runtime_buffer = None
-        if buffer_name in self.allocated_buffer_in_runtime:
-            buffer = self.allocated_buffer_in_runtime[buffer_name]
-            numel_buffer = buffer.numel()
-            runtime_buffer = buffer if numel_buffer >= numel_like else runtime_buffer
+            return runtime_buffer if runtime_buffer.buffer.numel(
+            ) > pinned_buffer.buffer.numel() else pinned_buffer
 
-        graph_buffer = None
-        # Safely get the list of candidates. Defaults to an empty list if key is missing.
-        candidate_buffers = self.allocated_buffer_in_graph_pool.get(
-            buffer_name, [])
+        def view_to(buffer: torch.Tensor, dtype: torch.dtype,
+                    tensor_shape: list[int]) -> torch.Tensor:
+            return buffer[0:math.prod(tensor_shape) *
+                          dtype.itemsize].view(dtype).view(tensor_shape)
+
+        # all buffers are allocated with 1 byte element size
+        element_size = dtype.itemsize
+        required_memory_size = math.prod(tensor_shape) * element_size
+        candidate_buffers = self.buffers.get(buffer_name, [])
+        pinned_buffer = None
+        free_buffer = None
         for buffer in candidate_buffers:
-            numel_buffer = buffer.numel()
-            # buffer just needs to be large enough.
-            if numel_buffer >= numel_like:
-                graph_buffer = buffer
+            buffer_size = buffer.buffer.numel()
+            if buffer_size >= required_memory_size:
+                if buffer.pin_memory:
+                    pinned_buffer = buffer
+                else:
+                    free_buffer = buffer
+
+            if free_buffer is not None and pinned_buffer is not None:
                 break
 
-        if capture_graph and graph_buffer is not None:
-            return graph_buffer[0:numel_like].view(tensor_shape)
+        if pin_memory and pinned_buffer is not None:
+            return view_to(pinned_buffer.buffer, dtype, tensor_shape)
         else:
-            buffer, use_graph = select_buffer_with_more_elements(
-                graph_buffer, runtime_buffer)
+            buffer = select_buffer_with_more_elements(pinned_buffer,
+                                                      free_buffer)
             if buffer is not None:
-                if not use_graph and capture_graph:
-                    self.allocated_buffer_in_graph_pool.setdefault(
-                        buffer_name, []).append(buffer)
-                    del self.allocated_buffer_in_runtime[buffer_name]
-                return buffer[0:numel_like].view(tensor_shape)
+                buffer.pin_memory = True if pin_memory else buffer.pin_memory
+                return view_to(buffer.buffer, dtype, tensor_shape)
 
-        # Reach here, no buffer is found. Then, we will use a new buffer to replace the small one. Release the memory first.
-        if buffer_name in self.allocated_buffer_in_runtime:
-            del self.allocated_buffer_in_runtime[buffer_name]
+        if buffer_name in self.buffers:
+            candidate_buffers = self.buffers.get(buffer_name, [])
+            remove_idx = []
+            for idx, buffer in enumerate(candidate_buffers):
+                if buffer.pin_memory == False:
+                    remove_idx.append(idx)
 
-        # If we get here, no suitable buffer was found in the cache. Create a new one.
-        new_buffer = torch.zeros(tensor_shape, device='cuda', dtype=dtype)
-        if capture_graph:
-            self.allocated_buffer_in_graph_pool.setdefault(
-                buffer_name, []).append(new_buffer)
-        else:
-            self.allocated_buffer_in_runtime[buffer_name] = new_buffer
-        return new_buffer
+            for idx in remove_idx[::-1]:
+                removed = candidate_buffers.pop(idx)
+                del removed.buffer
+
+        new_buffer = torch.zeros((required_memory_size, ),
+                                 device='cuda',
+                                 dtype=torch.uint8)
+        self.buffers.setdefault(buffer_name, []).append(
+            BufferBlock(buffer=new_buffer, pin_memory=pin_memory))
+        return view_to(new_buffer, dtype, tensor_shape)
 
 
 _buffer = Buffers()
