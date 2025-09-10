@@ -30,6 +30,7 @@ class RemoteOpenAIServer:
         self.host = host
         self.port = port if port is not None else find_free_port()
         self.rank = rank if rank != -1 else os.environ.get("SLURM_PROCID", 0)
+        self.extra_config_file = None
         args = ["--host", f"{self.host}", "--port", f"{self.port}"]
         if cli_args:
             args += cli_args
@@ -57,12 +58,23 @@ class RemoteOpenAIServer:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self.terminate()
+
+    def terminate(self):
+        if self.proc is None:
+            return
         self.proc.terminate()
         try:
             self.proc.wait(timeout=30)
         except subprocess.TimeoutExpired as e:
             self.proc.kill()
             self.proc.wait(timeout=30)
+        try:
+            if self.extra_config_file:
+                os.remove(self.extra_config_file)
+        except Exception as e:
+            print(f"Error removing extra config file: {e}")
+        self.proc = None
 
     def _wait_for_server(self, *, url: str, timeout: float):
         # run health check on the first rank only.
@@ -119,13 +131,15 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
         self.host = "localhost"
         self.port = port if port is not None else find_free_port()
         self.rank = 0  # rank is always 0 since there is only one disagg server
-        self.config = self._get_extra_config()
         with tempfile.NamedTemporaryFile(mode="w+",
                                          delete=False,
                                          delete_on_close=False) as f:
-            self.config_file = f.name
-            f.write(self.config)
-        launch_cmd = ["trtllm-serve", "disaggregated", "-c", self.config_file]
+            f.write(self._get_extra_config())
+            f.flush()
+            self.extra_config_file = f.name
+        launch_cmd = [
+            "trtllm-serve", "disaggregated", "-c", self.extra_config_file
+        ]
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes
             launch_cmd = ["trtllm-llmapi-launch"] + launch_cmd
