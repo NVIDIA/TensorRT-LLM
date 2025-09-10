@@ -65,11 +65,11 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             compile_backend="torch-simple",
         ),
         # disabled due to https://nvbugspro.nvidia.com/bug/5505835
-        # get_small_model_config(
-        #     "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-        #     attn_backend="flashinfer",
-        #     compile_backend="torch-simple",
-        # ),
+        get_small_model_config(
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            attn_backend="flashinfer",
+            compile_backend="torch-simple",
+        ),
         get_small_model_config(
             "deepseek-ai/DeepSeek-V3",
             attn_backend="triton",
@@ -97,6 +97,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     ],
 )
 def test_build_ad(experiment_config: Dict):
+    if "Llama-4" in experiment_config["args"]["model"]:
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5505835")
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
     experiment_config = ExperimentConfig(**experiment_config)

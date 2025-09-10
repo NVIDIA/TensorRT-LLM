@@ -573,8 +573,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         "Build TRT-LLM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
         // Disable CUDA12 build for too slow to build (cost > 5 hours on SBSA)
-        // "Build TRT-LLM CUDA12": [LLM_DOCKER_IMAGE_CU12] + prepareLLMBuild(
-        //     pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_CU12 : CONFIG_LINUX_X86_64_VANILLA_CU12),
+        "Build TRT-LLM CUDA12": [LLM_DOCKER_IMAGE_CU12] + prepareLLMBuild(
+            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_CU12 : CONFIG_LINUX_X86_64_VANILLA_CU12),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
         "Build TRT-LLM Pybind": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
