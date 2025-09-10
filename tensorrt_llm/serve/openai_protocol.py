@@ -642,7 +642,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
             # TODO: migrate to use logprobs and prompt_logprobs
             _return_log_probs=bool(self.logprobs),
-        )
+            logprobs=bool(self.logprobs))
         return sampling_params
 
     @model_validator(mode='before')
