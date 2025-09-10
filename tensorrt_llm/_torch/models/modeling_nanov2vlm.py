@@ -40,21 +40,6 @@ class SquaredReLU(nn.Module):
         return torch.pow(torch.nn.functional.relu(x), 2)
 
 
-class RMSNorm(nn.Module):
-
-    def __init__(self, hidden_size, eps=1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        return (self.weight.to(torch.float32) * hidden_states).to(input_dtype)
-
-
 class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
                             transformers.generation.GenerationMixin):
 
@@ -74,8 +59,8 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         self.vision_projection_hidden_size = config.projector_hidden_size
         self.llm_hidden_size = config.llm_config.hidden_size
         self.mlp1 = nn.Sequential(
-            RMSNorm(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
-                    eps=1e-5),
+            nn.RMSNorm(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
+                       eps=config.llm_config.rms_norm_eps),
             nn.Linear(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
                       self.vision_projection_hidden_size,
                       bias=False), SquaredReLU(),
@@ -204,8 +189,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
     def get_num_tokens_per_image(
         self,
         *,
-        image_width: int,
-        image_height: int,
+        image: Image.Image,
         **kwargs,
     ):
 
@@ -256,6 +240,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
             return blocks
 
+        image_height = image.height
+        image_width = image.width
         target_ratios = get_internvl_target_ratios(1,
                                                    self.processor.max_num_tiles)
         blocks = calculate_targets(image_width, image_height, target_ratios,

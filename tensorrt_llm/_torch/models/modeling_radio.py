@@ -14,6 +14,7 @@ from einops import rearrange
 from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch import model_config as model_config_lib
+from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
@@ -540,9 +541,8 @@ class VisionTransformer(nn.Module):
         act_layer = nn.GELU
 
         self.model_config = model_config
-        if self.model_config is not None:
-            self.config = model_config.pretrained_config
-            self.config.num_key_value_heads = num_heads
+        self.config = model_config.pretrained_config
+        self.config.num_key_value_heads = num_heads
 
         self.num_classes = num_classes
         self.global_pool = global_pool
@@ -622,28 +622,31 @@ class VisionTransformer(nn.Module):
         self.patch_size = patch_size
         self.num_cls_tokens = num_cls_tokens
         self.num_registers = self.patch_generator.num_registers
-        if self.model_config is not None:
-            self.metadata_cls = attention_utils.get_attention_backend(
-                model_config.attn_backend).Metadata
-        else:
-            self.metadata_cls = None
 
-    def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int]):
+        self.metadata_cls = attention_utils.get_attention_backend(
+            model_config.attn_backend).Metadata
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=8192,  # TODO: Make this dynamic
+            max_num_tokens=model_config.max_num_tokens,
+            kv_cache_manager=None,
+        )
+
+    def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
+                              attn_metadata: AttentionMetadata):
         """
         To simplify the usage of the model, this function aims to fill the metadata for Attention
         Call this function before forward pass
         """
+        prompt_lens = seq_lengths
+        seq_lens = torch.tensor(seq_lengths, dtype=torch.int, pin_memory=True)
         request_ids = list(range(1, batch_size + 1))
-        attn_metadata = self.metadata_cls(
-            seq_lens=torch.tensor(seq_lengths, dtype=torch.int),
-            num_contexts=batch_size,
-            max_num_requests=batch_size,
-            max_num_tokens=sum(seq_lengths),
-            kv_cache_manager=None,
-            request_ids=request_ids,
-            prompt_lens=seq_lengths,
-        )
-        attn_metadata.max_seq_len = max(seq_lengths)
+
+        attn_metadata.seq_lens = seq_lens
+        attn_metadata.num_contexts = batch_size
+        attn_metadata.request_ids = request_ids
+        attn_metadata.prompt_lens = prompt_lens
+        attn_metadata.max_seq_len = seq_lens.max().item()
+
         attn_metadata.prepare()
         return attn_metadata
 
@@ -652,13 +655,11 @@ class VisionTransformer(nn.Module):
         x = self.patch_generator(x)
 
         batch_size, seq_len, hidden_size = x.shape
-        if self.model_config is not None:
-            seq_lengths = [seq_len] * batch_size
-            attn_metadata = self.prepare_attn_metadata(batch_size, seq_lengths)
-            # Need flatten batch/seq_len for trtllm attention.
-            x = x.reshape(batch_size * seq_len, hidden_size)
-        else:
-            attn_metadata = None
+        seq_lengths = [seq_len] * batch_size
+        attn_metadata = self.prepare_attn_metadata(batch_size, seq_lengths,
+                                                   self.attn_metadata)
+        # Need flatten batch/seq_len for trtllm attention.
+        x = x.reshape(batch_size * seq_len, hidden_size)
         for block in self.blocks:
             x = block(x, attn_metadata=attn_metadata)
         x = x.reshape(batch_size, seq_len, hidden_size)
