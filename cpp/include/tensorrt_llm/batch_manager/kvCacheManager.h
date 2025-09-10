@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
@@ -171,7 +172,7 @@ struct BlockKeyHasher
     }
 };
 
-using NextBlockMap = std::unordered_map<BlockKey, BlockPtr, BlockKeyHasher>;
+using NextNodeMap = std::unordered_map<BlockKey, LookupNodePtr, BlockKeyHasher>;
 
 struct KvCacheStats
 {
@@ -213,11 +214,11 @@ public:
 
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
-    NodePtr const& getPrevNode() const;
+    LookupNodePtr const& getPrevNode() const;
 
-    void setPrevNode(NodePtr prevNode);
+    void setPrevNode(LookupNodePtr prevNode);
 
-    void addNextNode(BlockKey const& blockKey, NodePtr block);
+    void addNextNode(BlockKey const& blockKey, LookupNodePtr block);
 
     void removeNextNode(BlockKey const& blockKey);
 
@@ -225,12 +226,12 @@ public:
     //! blockKey.
     //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
     //! matched.
-    [[nodiscard]] std::tuple<bool, SizeType32, NodePtr> findMatchingNode(
+    [[nodiscard]] std::tuple<bool, SizeType32, LookupNodePtr> findMatchingNode(
         BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const;
 
     void setBlock(SizeType32 windowSize, BlockPtr block);
 
-    [[nodiscard]] getBlock(SizeType32 windowSize) const;
+    [[nodiscard]] BlockPtr getBlock(SizeType32 windowSize) const;
 
 private:
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
@@ -250,7 +251,7 @@ class KVCachePromptLookup
 public:
     explicit KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock);
 
-    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::lookup(LlmRequest& llmRequest, bool enablePartialReuse, bool createNodes);
+    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest& llmRequest, bool enablePartialReuse, bool createNodes);
 
 private:
     // Root of search structure

@@ -1342,9 +1342,9 @@ void WindowBlockManager::storeBlocks(
     TLLM_LOG_DEBUG(
         "%s::storeBlocks - %zu blockKeys, %zu blockIds", mLogPrefix.c_str(), blockKeys.size(), blockIds.size());
 
-    auto numBlocks = lookupNodes.size();
-    TLLM_CHECK_WITH_INFO(numBlocks <= blockIds.size());
-    for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
+    auto numNodes = lookupNodes.size();
+    TLLM_CHECK_WITH_INFO(numNodes <= blockIds.size(), "BlockIds not provided for all lookup nodes");
+    for (std::size_t blockCnt = 0; blockCnt < numNodes; ++blockCnt)
     {
         auto const bid = blockIds[blockCnt];
         TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
