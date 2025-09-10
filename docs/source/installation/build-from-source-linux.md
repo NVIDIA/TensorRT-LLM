@@ -95,7 +95,7 @@ If you wish to use enroot instead of docker, then you can build a sqsh file that
     salloc --nodes=1
     ```
 
-2. Create a sqsh file with essential TensorRT-LLM dependencies installed
+2. Create a sqsh file with essential TensorRT LLM dependencies installed
     ```bash
     # Using default sqsh filename (enroot/tensorrt_llm.devel.sqsh)
     make -C enroot build_sqsh
