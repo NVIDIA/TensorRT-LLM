@@ -116,6 +116,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
+        disable_deep_gemm: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -134,6 +135,7 @@ class Attention(nn.Module):
             config (Optional[ModelConfig]): The model configuration.
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
+            disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -215,7 +217,9 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            disable_deep_gemm=disable_deep_gemm,
+        )
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -231,7 +235,9 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.o_lora,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            disable_deep_gemm=disable_deep_gemm,
+        )
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend

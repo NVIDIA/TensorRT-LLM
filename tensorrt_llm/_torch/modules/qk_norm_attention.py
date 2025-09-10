@@ -155,6 +155,7 @@ class QKNormRoPEAttention(Attention):
         dense_bias: Optional[bool] = None,
         config: ModelConfig,
         q_scaling: float = 1.0,
+        disable_deep_gemm: bool = False,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -178,6 +179,7 @@ class QKNormRoPEAttention(Attention):
             dense_bias=dense_bias,
             config=config,
             q_scaling=q_scaling,
+            disable_deep_gemm=disable_deep_gemm,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
