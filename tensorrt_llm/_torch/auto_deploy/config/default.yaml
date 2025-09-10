@@ -45,11 +45,19 @@ transforms:
   # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
   optimize_rope:
     stage: pattern_matcher
-  quantize_from_config:
+  quantize_fp8_linear_from_config:
     stage: pattern_matcher
-  quantize_from_graph:
+  quantize_nvfp4_linear_from_config:
     stage: pattern_matcher
-  quantize_moe:
+  quantize_fp8_bmm_from_config:
+    stage: pattern_matcher
+  quantize_fp8_from_graph:
+    stage: pattern_matcher
+  quantize_nvfp4_from_graph:
+    stage: pattern_matcher
+  quantize_fp8_moe:
+    stage: pattern_matcher
+  quantize_nvfp4_moe:
     stage: pattern_matcher
   # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
   detect_sharding:
@@ -70,10 +78,21 @@ transforms:
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
   # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-  # fuse_moe:
-  #   stage: post_load_fusion
   # fuse_gemms:
   #   stage: post_load_fusion
+  # fuse_fp4_gemms:
+  #   stage: post_load_fusion
+  # fuse_fp8_gemms:
+  #   stage: post_load_fusion
+  fuse_fp8_linear:
+    stage: post_load_fusion
+    backend: torch
+  fuse_nvfp4_linear:
+    stage: post_load_fusion
+    backend: trtllm
+  # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_moe:
+    stage: post_load_fusion
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   fuse_collectives:

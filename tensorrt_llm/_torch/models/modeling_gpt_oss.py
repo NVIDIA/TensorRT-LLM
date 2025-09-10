@@ -258,7 +258,6 @@ class MLPBlock(torch.nn.Module):
 
         # Get attention_dp parameters
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
 
         if self.mapping.tp_size > 1 and all_rank_num_tokens is not None:
             if (isinstance(self.experts, (TRTLLMGenFusedMoE, TritonFusedMoE))):
@@ -276,12 +275,10 @@ class MLPBlock(torch.nn.Module):
 
         # Let CutlassFusedMoE handle allgather internally
         # Pass the normalized tensor (t) as input to experts, not x
-        expert_output = self.experts(
-            x=t,
-            router_logits=g,
-            all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=False)
+        expert_output = self.experts(x=t,
+                                     router_logits=g,
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=False)
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
