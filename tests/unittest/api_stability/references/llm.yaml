@@ -171,6 +171,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConnectorConfig]
         default: null
         status: prototype
+      max_top_logprobs:
+        annotation: int
+        default: 0
+        status: prototype
     return_annotation: None
   generate:
     parameters:

@@ -56,7 +56,7 @@ class TestSamplingParams(ApiStabilityTestHarness):
             "return_log_probs", "return_context_logits",
             "return_generation_logits", "exclude_input_from_output",
             "return_encoder_output", "return_perf_metrics",
-            "additional_model_outputs"
+            "additional_model_outputs", "top_logprobs"
         }
         found_fields = {
             f

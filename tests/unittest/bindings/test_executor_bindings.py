@@ -889,10 +889,11 @@ def test_output_config():
     assert config.return_encoder_output == False
     assert config.return_perf_metrics == False
     assert config.additional_model_outputs is None
+    assert config.top_logprobs is None
 
     config = trtllm.OutputConfig(
         True, False, True, False, True, False,
-        list([trtllm.AdditionalModelOutput("topKLogits", True)]))
+        list([trtllm.AdditionalModelOutput("topKLogits", True)]), 10)
     assert config.return_log_probs == True
     assert config.return_context_logits == False
     assert config.return_generation_logits == True
@@ -903,12 +904,13 @@ def test_output_config():
     additional_model_output = config.additional_model_outputs[0]
     assert additional_model_output.name == "topKLogits"
     assert additional_model_output.gather_context == True
+    assert config.top_logprobs == 10
 
 
 def test_output_config_pickle():
     config = trtllm.OutputConfig(
         True, False, True, False, True, False,
-        list([trtllm.AdditionalModelOutput("topKLogits", True)]))
+        list([trtllm.AdditionalModelOutput("topKLogits", True)]), 10)
     config_copy = pickle.loads(pickle.dumps(config))
     assert config_copy.return_log_probs == True
     assert config_copy.return_context_logits == False
@@ -920,6 +922,7 @@ def test_output_config_pickle():
     additional_model_output = config_copy.additional_model_outputs[0]
     assert additional_model_output.name == "topKLogits"
     assert additional_model_output.gather_context == True
+    assert config_copy.top_logprobs == 10
 
 
 def test_external_draft_tokens_config():

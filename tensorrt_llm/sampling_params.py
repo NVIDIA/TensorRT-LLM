@@ -323,6 +323,19 @@ class SamplingParams:
         self.logprobs = self.logprobs and int(self.logprobs)
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
+        if self.logprobs is not None:
+            if self._greedy_decoding and self.logprobs > 0:
+                # check for greedy sampling
+                raise ValueError(
+                    "logprobs > 0 must not be specified for greedy sampling, "
+                    "as it provides the same output as logprobs = 0 in this case."
+                )
+            elif self.top_k is not None and self.top_k < self.logprobs:
+                # check for top-k sampling
+                raise ValueError(f"logprobs {self.logprobs} must not exceed top_k {self.top_k}")
+            if self.use_beam_search:
+                raise ValueError("logprobs > 0 + beam search is not supported")
+
     @property
     def _greedy_decoding(self) -> bool:
         return (
@@ -449,6 +462,7 @@ class SamplingParams:
 
         if is_pytorch_backend:
             config_kwargs["return_log_probs"] = bool(self.logprobs)
+            config_kwargs["top_logprobs"] = self.logprobs
         else:
             config_kwargs["return_log_probs"] = self._return_log_probs
 
