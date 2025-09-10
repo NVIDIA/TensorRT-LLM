@@ -25,6 +25,22 @@ class BufferBlock:
 #   [t3] in non-graph forward
 #   [t4] A = torch.zeros(....) -> allocate buffer A in allocator but not use memory in cudagraph pool
 #        OOM may happen
+# TODO:
+# The final resolution to this problem shall be supported in pytorch that to allocate memory
+#    from a give pool, it's the graph pool here.
+# It will be like
+#    try:
+#        with torch.cuda.use_mem_pool(graphpool):
+#            allocate_memory_here
+#    except exception as ex:
+#        allocate_memory_outside of graphpool
+# Need some archeteture change:
+#    1. a. set a thread local graphpool context object when cudagraphRunner start a fn
+#       b. check and get the thread local graphpool
+#       b. allocate memory
+#    2. aggregate workspaces in the same OP to be a big one in graph pool
+#       allocate memory for the big workspace and slice them into small ones.
+#       However, in non-graph mode, allocate workspace one by one
 class Buffers:
 
     def __init__(self):
