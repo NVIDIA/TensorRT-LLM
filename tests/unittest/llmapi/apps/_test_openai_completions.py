@@ -1,13 +1,10 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_completion.py
 
-import os
-import tempfile
 from typing import List
 
 import openai
 import pytest
-import yaml
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -35,31 +32,19 @@ def num_postprocess_workers(request):
 @pytest.fixture(scope="module",
                 params=[1, 2],
                 ids=["disable_multi_threading", "enable_multi_threading"])
-def temp_extra_llm_api_options_file(request):
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
-    try:
-        extra_llm_api_options_dict = {"num_server_threads": request.param}
-
-        with open(temp_file_path, 'w') as f:
-            yaml.dump(extra_llm_api_options_dict, f)
-
-        yield temp_file_path
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+def num_server_threads(request):
+    return request.param
 
 
 @pytest.fixture(scope="module")
 def server(model_name: str, backend: str, num_postprocess_workers: int,
-           temp_extra_llm_api_options_file: str):
+           num_server_threads: str):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
     if backend == "trt":
         args.extend(["--max_beam_width", "4"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
-    args.extend(
-        ["--extra_llm_api_options", f"{temp_extra_llm_api_options_file}"])
+    args.extend(["--num_server_threads", f"{num_server_threads}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 

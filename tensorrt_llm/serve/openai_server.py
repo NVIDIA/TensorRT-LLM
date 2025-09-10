@@ -4,6 +4,7 @@ import os
 import re
 import signal
 import threading
+import time
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -98,12 +99,14 @@ class OpenAIServer:
                  llm: Union[LLM, MultimodalEncoder],
                  model: str,
                  server_role: Optional[ServerRole],
-                 metadata_server_cfg: MetadataServerConfig):
+                 metadata_server_cfg: MetadataServerConfig,
+                 num_server_threads: int):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.server_role = server_role
         self.binding_addr = None  # Will be set in __call__
+        self.num_server_threads = num_server_threads
         hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
         trust_remote_code = llm.args.trust_remote_code
         try:
@@ -198,10 +201,6 @@ class OpenAIServer:
     @property
     def postproc_worker_enabled(self) -> bool:
         return True if self.llm.args.num_postprocess_workers > 0 else False
-
-    @property
-    def server_threads(self) -> int:
-        return self.llm.args.num_server_threads
 
     @staticmethod
     def create_error_response(
@@ -931,9 +930,9 @@ class OpenAIServer:
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        if self.server_threads > 1:
+        if self.num_server_threads > 1:
             sockets = [config.bind_socket()]
-            servers = [MultiThreadServer(config=config) for _ in range(self.server_threads)]
+            servers = [MultiThreadServer(config=config) for _ in range(self.num_server_threads)]
 
             for s in servers:
                 s.run_in_thread(sockets=sockets)
