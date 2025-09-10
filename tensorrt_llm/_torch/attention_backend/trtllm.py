@@ -190,8 +190,10 @@ class TrtllmAttentionWrapper:
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
-        all_sparse_indices: Optional[torch.Tensor] = None,
-        sparse_batch_offsets: Optional[torch.Tensor] = None,
+        sparse_kv_indices: Optional[torch.Tensor] = None,
+        sparse_kv_offsets: Optional[torch.Tensor] = None,
+        sparse_attn_indices: Optional[torch.Tensor] = None,
+        sparse_attn_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -270,8 +272,10 @@ class TrtllmAttentionWrapper:
         self.softmax_stats_tensor = softmax_stats_tensor
         self.helix_position_offsets = helix_position_offsets
         self.attention_sinks = attention_sinks
-        self.all_sparse_indices = all_sparse_indices
-        self.sparse_batch_offsets = sparse_batch_offsets
+        self.sparse_kv_indices = sparse_kv_indices
+        self.sparse_kv_offsets = sparse_kv_offsets
+        self.sparse_attn_indices = sparse_attn_indices
+        self.sparse_attn_offsets = sparse_attn_offsets
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
@@ -440,6 +444,12 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
         mla_tensor_params = [self.helix_position_offsets]
+        sparse_attention_params = [
+            self.sparse_kv_indices,
+            self.sparse_kv_offsets,
+            self.sparse_attn_indices,
+            self.sparse_attn_offsets,
+        ]
 
         thop.attention(
             q,
@@ -494,8 +504,7 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
-            self.sparse_batch_offsets,
-            self.all_sparse_indices,
+            sparse_attention_params,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -536,6 +545,82 @@ class TrtllmAttentionWrapper:
             use_paged_context_fmha,
             is_mla_enable,
         )
+
+
+@torch.compile(dynamic=True)
+def convert_token_to_page_sparse_indices(
+        sparse_attn_indices: torch.Tensor, sparse_attn_offsets: torch.Tensor,
+        metadata: 'TrtllmAttentionMetadata'
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert token-based sparse attention indices to page-based sparse attention indices.
+
+    Args:
+        sparse_attn_indices: Token-based indices with shape [num_tokens, num_kv_heads]
+        sparse_attn_offsets: Offsets with shape [batch_size+1] indicating token boundaries for each batch
+        metadata: Attention metadata containing tokens_per_block (page_size)
+
+    Returns:
+        Tuple of (page_indices, page_offsets):
+        - page_indices: Page-based indices with shape [num_pages, num_kv_heads]
+        - page_offsets: Updated offsets with shape [batch_size+1] indicating page boundaries for each batch
+
+    Example:
+        If sparse_attn_indices first dimension is [1, 30, 67] and page_size=32,
+        the result will be [0, 2] (token 1 -> page 0, token 30 -> page 0, token 67 -> page 2)
+    """
+    page_size = metadata.tokens_per_block
+    batch_size = sparse_attn_offsets.size(0) - 1
+    num_kv_heads = sparse_attn_indices.size(1)
+
+    # Convert token indices to page indices
+    page_indices = sparse_attn_indices // page_size
+
+    # Process each batch and each kv_head separately to remove duplicates
+    new_page_indices_list = []
+    new_offsets = torch.zeros_like(sparse_attn_offsets)
+
+    current_offset = 0
+    for batch_idx in range(batch_size):
+        start_idx = sparse_attn_offsets[batch_idx]
+        end_idx = sparse_attn_offsets[batch_idx + 1]
+
+        if start_idx >= end_idx:
+            # Empty batch
+            new_offsets[batch_idx + 1] = current_offset
+            continue
+
+        batch_page_indices = page_indices[
+            start_idx:end_idx]  # [num_tokens_in_batch, num_kv_heads]
+
+        # For each kv_head, remove duplicates while preserving order
+        batch_unique_pages = []
+        for head_idx in range(num_kv_heads):
+            head_pages = batch_page_indices[:, head_idx]
+            unique_pages = torch.unique(head_pages, sorted=False)
+            batch_unique_pages.append(unique_pages)
+
+        # Find the maximum length among all heads for this batch
+        max_len = max(pages.size(0) for pages in batch_unique_pages)
+
+        if max_len > 0:
+            batch_result = torch.full((max_len, num_kv_heads),
+                                      fill_value=-1,
+                                      dtype=page_indices.dtype,
+                                      device=page_indices.device)
+
+            for head_idx in range(num_kv_heads):
+                unique_pages = batch_unique_pages[head_idx]
+                batch_result[:unique_pages.size(0), head_idx] = unique_pages
+
+            new_page_indices_list.append(batch_result)
+            current_offset += max_len
+
+        new_offsets[batch_idx + 1] = current_offset
+
+    new_page_indices = torch.cat(new_page_indices_list, dim=0)
+
+    return new_page_indices, new_offsets
 
 
 @dataclass(kw_only=True)
@@ -1245,10 +1330,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 is_mla_enable=self.is_mla_enable,
             )
 
-        all_sparse_indices, sparse_batch_offsets = None, None
+        sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
         if self.sparse_attention_config is not None:
-            all_sparse_indices, sparse_batch_offsets = self.sparse_attention_predict(
+            sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = self.sparse_attention_predict(
                 q, k, metadata)
+            if sparse_attn_indices is not None:
+                sparse_attn_indices, sparse_attn_offsets = convert_token_to_page_sparse_indices(
+                    sparse_attn_indices, sparse_attn_offsets, metadata)
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
@@ -1298,8 +1386,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_generation_lengths,
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
-            all_sparse_indices=all_sparse_indices,
-            sparse_batch_offsets=sparse_batch_offsets,
+            sparse_kv_indices=sparse_kv_indices,
+            sparse_kv_offsets=sparse_kv_offsets,
+            sparse_attn_indices=sparse_attn_indices,
+            sparse_attn_offsets=sparse_attn_offsets,
         )
         out_dtype = None
         if out_scale is not None:

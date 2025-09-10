@@ -42,8 +42,11 @@ struct SparseAttentionParams
     }
 };
 
-void invokeGatherKvPageOffsets(int* output_kv_page_offsets, int* output_seq_lengths, int const* kv_page_offsets,
-    int const* seq_lengths, SparseAttentionParams const& sparse_params, cudaStream_t stream);
+void invokeGatherKvPageOffsets(int32_t* output_kv_page_offsets, // [num_head_kv, batch_size, 2, max_num_pages_per_seq]
+    int32_t* output_seq_lengths,                                // [num_head_kv, batch_size]
+    int32_t const* kv_page_offsets,                             // [batch_size, 2, max_num_pages_per_seq]
+    int32_t const* seq_lengths,                                 // [batch_size]
+    SparseAttentionParams sparse_params, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -291,6 +291,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Parameters for sparse attention
     xqaParams.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
     xqaParams.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
+    xqaParams.use_sparse_attention = useSparseAttention();
 
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
@@ -900,29 +901,28 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     size_t const cpMaxPaddedSequenceLength = (batch_beam + mCpSize - 1) / mCpSize * mCpSize;
     size_t const cpWorkspaceSize
         = mCpSize == 1 ? 0 : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
-    // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
-    size_t const sparse_attn_cache_size = (mUseSparseAttention && mEnableXQA)
-        ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence * mNumKVHeads)
-        : 0;
 
-    int const NUM_BUFFERS = 6;
+    int const NUM_BUFFERS = 5;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = partial_out_size;
     workspaces[1] = partial_sum_size;
     workspaces[2] = partial_max_size;
     workspaces[3] = shift_k_cache_size;
     workspaces[4] = cpWorkspaceSize;
-    workspaces[5] = sparse_attn_cache_size;
     generation_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     size_t xqa_workspace_size = 0;
     if (mEnableXQA)
     {
-        int const XQA_NUM_BUFFERS = 7;
+        int const XQA_NUM_BUFFERS = 8;
         size_t xqa_workspaces[XQA_NUM_BUFFERS];
         size_t const cu_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const cu_kv_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
+        // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
+        size_t const sparse_attn_cache_size = useSparseAttention()
+            ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence) * mNumKVHeads
+            : 0;
         xqa_workspaces[0] = cu_seqlens_size;
         xqa_workspaces[1] = cu_kv_seqlens_size;
         xqa_workspaces[2] = rotary_inv_freq_size;
@@ -931,7 +931,8 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         // Scales used for trtllm-gen kernels.
         xqa_workspaces[4] = sizeof(float) * 2;
         xqa_workspaces[5] = sizeof(float);
-        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(
+        xqa_workspaces[6] = sparse_attn_cache_size;
+        xqa_workspaces[7] = mXqaDispatcher->getWorkspaceSize(
             std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
@@ -2278,17 +2279,6 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             {
                 xqaParams.output = mhaOutput;
                 xqaParams.qkv = attention_input;
-            }
-            if (mUseSparseAttention && std::is_same_v<KVCacheBuffer, KVBlockArray>)
-            {
-                size_t kv_block_offsets_size = batch_beam * 2 * params.max_blocks_per_sequence * mNumKVHeads;
-                size_t seq_lengths_size = batch_beam;
-                int* sparse_kv_block_offsets
-                    = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, kv_block_offsets_size));
-                int* sparse_seq_lengths
-                    = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, seq_lengths_size));
-                xqaParams.sparse_kv_block_offsets = sparse_kv_block_offsets;
-                xqaParams.sparse_seq_lengths = sparse_seq_lengths;
             }
             mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
             if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)

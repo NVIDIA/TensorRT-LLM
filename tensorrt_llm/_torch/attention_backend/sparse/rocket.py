@@ -132,8 +132,10 @@ class RocketTrtllmAttention(TrtllmAttention):
         seq_lens_kv = metadata.seq_lens_kv if metadata.seq_lens_kv is not None else seq_lens
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
 
-        all_sparse_indices = []
-        batch_sparse_offsets = [0]
+        sparse_kv_indices = []
+        sparse_attn_indices = []
+        sparse_kv_offsets = [0]
+        sparse_attn_offsets = [0]
 
         q_offset = 0
         k_offset = 0
@@ -159,41 +161,48 @@ class RocketTrtllmAttention(TrtllmAttention):
 
             if i < num_contexts:
                 # Context phase: SnapKV sparse kv indices
-                sparse_kv_indices = self._get_snapkv_indices(
+                _sparse_kv_indices = self._get_snapkv_indices(
                     single_q, single_k, past_seen_token, kt_cache_slot,
                     metadata)
-                if sparse_kv_indices is not None:
-                    all_sparse_indices.append(
-                        sparse_kv_indices.squeeze(0))  # [budget, num_kv_heads]
-                    batch_sparse_offsets.append(batch_sparse_offsets[-1] +
-                                                sparse_kv_indices.size(1))
+                if _sparse_kv_indices is not None:
+                    sparse_kv_indices.append(
+                        _sparse_kv_indices.squeeze(0))  # [budget, num_kv_heads]
+                    sparse_kv_offsets.append(sparse_kv_offsets[-1] +
+                                             _sparse_kv_indices.size(1))
                 else:
-                    batch_sparse_offsets.append(batch_sparse_offsets[-1])
+                    sparse_kv_offsets.append(sparse_kv_offsets[-1])
             else:
                 # Generation phase: RocketKV sparse attention indices
-                sparse_attn_indices = self._rocketkv_selection(
+                _sparse_attn_indices = self._rocketkv_selection(
                     single_q, single_k, past_seen_token, kt_cache_slot,
                     metadata)
-                if sparse_attn_indices is not None:
-                    all_sparse_indices.append(
-                        sparse_attn_indices.squeeze(0))  # [topk, num_kv_heads]
-                    batch_sparse_offsets.append(batch_sparse_offsets[-1] +
-                                                sparse_attn_indices.size(1))
+                if _sparse_attn_indices is not None:
+                    sparse_attn_indices.append(
+                        _sparse_attn_indices.squeeze(0))  # [topk, num_kv_heads]
+                    sparse_attn_offsets.append(sparse_attn_offsets[-1] +
+                                               _sparse_attn_indices.size(1))
                 else:
-                    batch_sparse_offsets.append(batch_sparse_offsets[-1])
+                    sparse_attn_offsets.append(sparse_attn_offsets[-1])
 
             q_offset += seq_len
             k_offset += seq_len_kv
 
-        if len(all_sparse_indices) == 0:
-            return None, None
+        if len(sparse_kv_indices) == 0:
+            sparse_kv_indices, sparse_kv_offsets = None, None
+        else:
+            sparse_kv_indices = torch.cat(sparse_kv_indices,
+                                          dim=0).to(torch.int32)
+            sparse_kv_offsets = torch.tensor(sparse_kv_offsets,
+                                             dtype=torch.int32).to(q.device)
+        if len(sparse_attn_indices) == 0:
+            sparse_attn_indices, sparse_attn_offsets = None, None
+        else:
+            sparse_attn_indices = torch.cat(sparse_attn_indices,
+                                            dim=0).to(torch.int32)
+            sparse_attn_offsets = torch.tensor(sparse_attn_offsets,
+                                               dtype=torch.int32).to(q.device)
 
-        all_sparse_indices = torch.cat(all_sparse_indices,
-                                       dim=0).to(torch.int32)
-        batch_sparse_offsets = torch.tensor(batch_sparse_offsets,
-                                            dtype=torch.int32).to(q.device)
-
-        return all_sparse_indices, batch_sparse_offsets
+        return sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets
 
     def _get_snapkv_indices(
             self, q: Tensor, k: Tensor, past_seen_token: int,
@@ -260,7 +269,7 @@ class RocketTrtllmAttention(TrtllmAttention):
             device=k.device).unsqueeze(0).unsqueeze(0).expand(
                 bsz, self.num_kv_heads, -1)
         selected_indices = torch.cat([selected_prefix_indices, window_indices],
-                                     dim=-1)
+                                     dim=-1).transpose(1, 2)
 
         k = k.reshape(1, -1, self.num_kv_heads, self.head_dim)
         k_snap = triton_index_gather(k, selected_indices)
@@ -276,7 +285,7 @@ class RocketTrtllmAttention(TrtllmAttention):
                                              target_seq_len, kt_cache_slot,
                                              kt_cache_position)
 
-        return selected_indices.transpose(1, 2)
+        return selected_indices
 
     def _rocketkv_selection(self, q: Tensor, k: Tensor, past_seen_token: int,
                             kt_cache_slot: int,

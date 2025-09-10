@@ -112,8 +112,7 @@ struct XQAParams
     // sparse attention parameters
     int32_t* sparse_attn_indices = nullptr;
     int32_t* sparse_attn_offsets = nullptr;
-    int* sparse_seq_lengths = nullptr;
-    int* sparse_kv_block_offsets = nullptr;
+    bool use_sparse_attention = false;
 
     cudaStream_t stream = 0;
 
@@ -187,6 +186,7 @@ struct XQAParams
            << "encoder_input_lengths: " << encoder_input_lengths << std::endl
            << "sparse_attn_indices :" << sparse_attn_indices << std ::endl
            << "sparse_attn_offsets :" << sparse_attn_offsets << std ::endl
+           << "use_sparse_attention :" << (use_sparse_attention ? "true" : "false") << std ::endl
            << "stream :" << stream;
 
         return ss.str();

@@ -572,7 +572,6 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
         = isCrossAttention() ? cross_kv_length : (useKVCache() ? inputs[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
     int const max_num_tokens
         = mRemovePadding ? inputs[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] : max_num_seq * max_context_length;
-    auto const& kvCacheBlockOffsetsShape = inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)].dims;
     int const max_blocks_per_sequence
         = (useKVCache() && mPagedKVCache) ? inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)].dims.d[3] : 0;
 
