@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import array
+import fcntl
+import re
+import socket
+import struct
 from pathlib import Path
 from typing import Any, Callable
 
@@ -173,3 +178,103 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
             yield remote_server
 
     return server_with_custom_sampler
+
+
+def get_local_ip(test_ip):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect((test_ip, 80))
+    return s.getsockname()[0]
+
+
+# TODO: integrate this into disagg-serving
+def get_local_interfaces():
+    """ Returns a dictionary of name:ip key value pairs. """
+    MAX_BYTES = 4096
+    FILL_CHAR = b'\0'
+    SIOCGIFCONF = 0x8912
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    names = array.array('B', MAX_BYTES * FILL_CHAR)
+    names_address, names_length = names.buffer_info()
+    mutable_byte_buffer = struct.pack('iL', MAX_BYTES, names_address)
+    mutated_byte_buffer = fcntl.ioctl(sock.fileno(), SIOCGIFCONF,
+                                      mutable_byte_buffer)
+    max_bytes_out, names_address_out = struct.unpack('iL', mutated_byte_buffer)
+    namestr = names.tobytes()
+    namestr[:max_bytes_out]
+    bytes_out = namestr[:max_bytes_out]
+    ip_dict = {}
+    for i in range(0, max_bytes_out, 40):
+        name = namestr[i:i + 16].split(FILL_CHAR, 1)[0]
+        name = name.decode('utf-8')
+        ip_bytes = namestr[i + 20:i + 24]
+        full_addr = []
+        for netaddr in ip_bytes:
+            if isinstance(netaddr, int):
+                full_addr.append(str(netaddr))
+            elif isinstance(netaddr, str):
+                full_addr.append(str(ord(netaddr)))
+        ip_dict[name] = '.'.join(full_addr)
+
+    return ip_dict
+
+
+def expand_slurm_nodelist(nodelist_str):
+    """
+    Expand SLURM nodelist format into individual node names.
+    An equivalent of scontrol show hostname $SLURM_JOB_NODELIST, but
+    scontrol is not available in the container.
+    """
+
+    # Handle empty or None input
+    if not nodelist_str or nodelist_str.strip() == "":
+        return []
+
+    # Split by comma for multiple node groups
+    #node_groups = [group.strip() for group in nodelist_str.split(',')]
+    expanded_nodes = []
+
+    # Check if this group has bracket notation
+    bracket_match = re.match(r'^(.+?)\[(.+?)\]$', nodelist_str)
+    print(f"nodelist_str: {nodelist_str}, bracket_match: {bracket_match}")
+    if bracket_match:
+        prefix = bracket_match.group(1)
+        range_part = bracket_match.group(2)
+
+        # Handle ranges and individual numbers within brackets
+        range_parts = range_part.split(',')
+
+        for part in range_parts:
+            part = part.strip()
+
+            # Check if it's a range (contains dash)
+            if '-' in part:
+                range_match = re.match(r'^(\d+)-(\d+)$', part)
+                if range_match:
+                    start_num = int(range_match.group(1))
+                    end_num = int(range_match.group(2))
+                    # Determine zero-padding width from the original format
+                    start_str = range_match.group(1)
+                    width = len(start_str)
+
+                    # Generate range
+                    for num in range(start_num, end_num + 1):
+                        node_name = f"{prefix}{num:0{width}d}"
+                        expanded_nodes.append(node_name)
+                else:
+                    # Handle non-numeric ranges or invalid format
+                    expanded_nodes.append(part)
+            else:
+                # Individual number
+                if part.isdigit():
+                    # Preserve zero-padding
+                    node_name = f"{prefix}{part}"
+                    expanded_nodes.append(node_name)
+                else:
+                    # Handle non-numeric individual items
+                    node_name = f"{prefix}{part}"
+                    expanded_nodes.append(node_name)
+    else:
+        # No brackets, just add the node as-is
+        expanded_nodes.append(nodelist_str)
+
+    return expanded_nodes
