@@ -400,9 +400,6 @@ _SMALL_MODEL_CONFIGS = {
             },
             "vision_config": {
                 "num_hidden_layers": 1,
-                "hidden_size": 64,
-                "intermediate_size": 64,
-                "num_attention_heads": 2,
             },
         },
     },
@@ -435,6 +432,15 @@ _SMALL_MODEL_CONFIGS = {
         ),
         "model_kwargs": {
             "num_hidden_layers": 2,
+        },
+    },
+    "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
+        "model": f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503",
+        "model_factory": "Mistral3VLM",
+        "compile_backend": "torch-simple",
+        "model_kwargs": {
+            "text_config": {"num_hidden_layers": 2},
+            "vision_config": {"num_hidden_layers": 2},
         },
     },
 }
