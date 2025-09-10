@@ -201,7 +201,7 @@ class MixtralModel(DecoderModel):
 
         if self.use_moe_prefetch:
             cur_stream = torch.cuda.current_stream()
-            self.moe_prefetch_manager.prefetch_weights(cur_stream)
+            self.moe_prefetch_manager.prefetch_initial_weights(cur_stream)
 
         for decoder_layer in self.layers:
             hidden_states, residual = decoder_layer(position_ids=position_ids,
