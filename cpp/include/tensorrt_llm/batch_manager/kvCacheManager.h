@@ -204,9 +204,7 @@ struct KvCacheStats
 class KVCachePromptLookupNode
 {
 public:
-    explicit KVCachePromptLookupNode(BlockKey const& blockKey);
-
-    [[nodiscard]] NextNodeMap getNextNodes() const;
+    explicit KVCachePromptLookupNode(BlockKey const& blockKey, bool isFull);
 
     void setBlockKey(BlockKey const& blockKey, bool isFull);
 
@@ -218,6 +216,8 @@ public:
 
     void setPrevNode(LookupNodePtr prevNode);
 
+    [[nodiscard]] NextNodeMap getNextNodes() const;
+
     void addNextNode(BlockKey const& blockKey, LookupNodePtr block);
 
     void removeNextNode(BlockKey const& blockKey);
@@ -227,7 +227,7 @@ public:
     //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
     //! matched.
     [[nodiscard]] std::tuple<bool, SizeType32, LookupNodePtr> findMatchingNode(
-        BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const;
+        BlockKey const& blockKey, bool enablePartialReuse) const;
 
     void setBlock(SizeType32 windowSize, BlockPtr block);
 
@@ -238,8 +238,8 @@ private:
     BlockKey mBlockKey;
     // Flag indicating if block is full
     bool mIsFull;
-    // Previous block in reuse tree, or nullptr if not reusing
-    BlockPtr mPrevBlock;
+    // Previous node in search structure
+    LookupNodePtr mPrevNode;
     // Next node(s) in sequence(s)
     NextNodeMap mNextNodes;
     // Pointers to blocks holding KV state for this prompt prefix
@@ -251,7 +251,7 @@ class KVCachePromptLookup
 public:
     explicit KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock);
 
-    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest& llmRequest, bool enablePartialReuse, bool createNodes);
+    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest& llmRequest, SizeType32 inputLength, bool enablePartialReuse, bool createNodes);
 
 private:
     // Root of search structure
@@ -304,6 +304,8 @@ public:
     BlockPtr const& getPrevBlockInSeq() const;
     void setPrevBlockInSeq(BlockPtr prevBlock);
 
+    BlockPtr getPrevBlock() const;
+
     [[nodiscard]] bool isFull() const;
 
     [[nodiscard]] bool isShared() const;
@@ -326,6 +328,12 @@ public:
     void setHash();
 
     size_t getHash() const;
+
+    // set lookup node using this block
+    void setLookupNode(LookupNodePtr node, int windowSize);
+
+    // get lookup node using this block. Can be nullptr
+    [[nodiscard]] LookupNodePtr getLookupNode() const;
 
 private:
     // Linear ID of block independent of pool
@@ -361,6 +369,11 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
+
+    // Pointer to search tree lookup node using this block
+    LookupNodePtr mLookupNode;
+    // Window size using this block (0 if not in use)
+    SizeType32 mWindowSize;
 };
 
 class GenerationRequest

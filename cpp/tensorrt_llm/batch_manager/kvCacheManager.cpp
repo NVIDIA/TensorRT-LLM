@@ -230,13 +230,13 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mMemoryPoolBlockIndex{blockIdx}
     , mRefCount(0)
     , mSchedulingRefCount(0)
-    , mPrevBlock(nullptr)
     , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
     , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
     , mDurationMs{std::nullopt}
     , mExpirationTime{std::nullopt}
     , mHash{0}
+    , mLookupNode{nullptr}
 {
 }
 
@@ -248,11 +248,6 @@ void KVCacheBlock::startScheduling()
 KVCacheBlock::IdType KVCacheBlock::getBlockId() const
 {
     return mBlockId;
-}
-
-NextBlockMap KVCacheBlock::getNextBlocks() const
-{
-    return mNextBlocks;
 }
 
 tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
@@ -295,7 +290,7 @@ bool KVCacheBlock::hasRefs() const
 bool KVCacheBlock::isShared() const
 {
     // block is considered shared if ready for reuse
-    return mRefCount > 1 || mPrevBlock != nullptr;
+    return mRefCount > 1 || mLookupNode != nullptr;
 }
 
 bool KVCacheBlock::hasSchedulingRefs() const
@@ -364,16 +359,6 @@ VecUniqueTokens const& KVCacheBlock::getUniqueTokens() const
     return mBlockKey.uniqueTokens;
 }
 
-BlockPtr const& KVCacheBlock::getPrevBlock() const
-{
-    return mPrevBlock;
-}
-
-void KVCacheBlock::setPrevBlock(BlockPtr prevBlock)
-{
-    mPrevBlock = std::move(prevBlock);
-}
-
 BlockPtr const& KVCacheBlock::getPrevBlockInSeq() const
 {
     return mPrevBlockInSeq;
@@ -384,67 +369,13 @@ void KVCacheBlock::setPrevBlockInSeq(BlockPtr prevBlock)
     mPrevBlockInSeq = std::move(prevBlock);
 }
 
-void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
+BlockPtr KVCacheBlock::getPrevBlock() const
 {
-    if (mNextBlocks.find(blockKey) == mNextBlocks.end())
+    if (mLookupNode != nullptr)
     {
-        mNextBlocks[blockKey] = std::move(block);
+        return mLookupNode->getBlock(mWindowSize);
     }
-}
-
-std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
-    BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const
-{
-    if (blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0)
-    {
-        return {false, 0, nullptr};
-    }
-    auto itr = mNextBlocks.find(blockKey);
-    if (itr == mNextBlocks.end())
-    {
-        if (enablePartialReuse)
-        {
-            SizeType32 bestNumMatched{0};
-            BlockPtr bestBlock{nullptr};
-            for (auto const& [key, block] : mNextBlocks)
-            {
-                if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
-                {
-                    SizeType32 numMatched = key.partialMatch(blockKey);
-                    if (numMatched > bestNumMatched)
-                    {
-                        bestNumMatched = numMatched;
-                        bestBlock = block;
-                    }
-                }
-            }
-            if (bestNumMatched > 0)
-            {
-                return {true, bestNumMatched, bestBlock};
-            }
-        }
-        return {false, 0, nullptr};
-    }
-    auto block = itr->second;
-    return {!block->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), block};
-}
-
-void KVCacheBlock::freeLeafBlock()
-{
-    // assure that this is a leaf block
-    TLLM_CHECK(isLeaf());
-
-    // free from previous block
-    if (mPrevBlock != nullptr)
-    {
-        mPrevBlock->removeNextBlock(mBlockKey);
-        mPrevBlock = nullptr;
-    }
-}
-
-void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
-{
-    mNextBlocks.erase(blockKey);
+    return nullptr;
 }
 
 bool KVCacheBlock::isFull() const
@@ -452,9 +383,28 @@ bool KVCacheBlock::isFull() const
     return mIsFull;
 }
 
-bool KVCacheBlock::isLeaf() const
+void KVCacheBlock::setLookupNode(LookupNodePtr lookupNode, SizeType32 windowSize)
 {
-    return mNextBlocks.empty();
+    if (lookupNode != nullptr)
+    {
+        mLookupNode = lookupNode;
+        mWindowSize = windowSize;
+        lookupNode->setBlock(windowSize, std::shared_ptr<KVCacheBlock>(this));
+    }
+    else
+    {
+        if (mLookupNode != nullptr)
+        {
+            mLookupNode->setBlock(windowSize, nullptr);
+        }
+        mLookupNode = nullptr;
+        mWindowSize = 0;
+    }
+}
+
+LookupNodePtr KVCacheBlock::getLookupNode() const
+{
+    return mLookupNode;
 }
 
 KVCachePromptLookup::KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock)
@@ -466,6 +416,7 @@ KVCachePromptLookup::KVCachePromptLookup(CacheType cacheType, SizeType32 tokensP
 
 std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::lookup(LlmRequest& llmRequest, SizeType32 inputLength, bool enablePartialReuse, bool create)
 {
+    auto constexpr beamIdx = 0;
     auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
         ? llmRequest.getUniqueTokens(beamIdx)
         : *(llmRequest.getEncoderUniqueTokens().value());
@@ -485,20 +436,111 @@ std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::look
     auto searchRoot = mRoot;
     for (auto const& blockKey : blockKeys)
     {
-        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr && blockItr != blockKeys.end()
-            ? searchRoot->findMatchingBlock(blockKey, enablePartialReuse)
+        auto [partialMatch, numMatched, matchingNode] = searchRoot != nullptr
+            ? searchRoot->findMatchingNode(blockKey, enablePartialReuse)
             : std::make_tuple(false, 0, nullptr);
-        if (create && matchingBlock == nullptr)
+        if (create && matchingNode == nullptr)
         {
             // No match, create blank prompt node
-            matchingBlock = std::make_shared<KVCachePromptLookupNode>(blockKey);
-            matchingBlock->setPrevNode(searchRoot);
-            searchRoot->addNextNode(blockKey, matchingBlock);
+            matchingNode = std::make_shared<KVCachePromptLookupNode>(blockKey);
+            matchingNode->setPrevNode(searchRoot);
+            searchRoot->addNextNode(blockKey, matchingNode);
         }
-        results.emplace_back(std::make_tuple(partialMatch,numMatched,matchingBlock));
-        searchRoot = matchingBlock;
+        results.emplace_back(std::make_tuple(partialMatch,numMatched,matchingNode));
+        searchRoot = matchingNode;
     }
     return results;
+}
+
+KVCachePromptLookupNode::KVCachePromptLookupNode(BlockKey const& blockKey, bool isFull)
+    : mBlockKey{blockKey}
+    , mIsFull{isFull}
+    , mPrevNode{nullptr}
+{
+}
+
+void KVCachePromptLookupNode::setBlockKey(BlockKey const& blockKey, bool isFull)
+{
+    mBlockKey = blockKey;
+    mIsFull = isFull;
+}
+
+BlockKey KVCachePromptLookupNode::getBlockKey()
+{
+    return mBlockKey;
+}
+
+VecUniqueTokens const& KVCachePromptLookupNode::getUniqueTokens() const
+{
+    return mBlockKey.uniqueTokens;
+}
+
+LookupNodePtr const& KVCachePromptLookupNode::getPrevNode() const
+{
+    return mPrevNode;
+}
+
+void KVCachePromptLookupNode::setPrevNode(LookupNodePtr prevNode)
+{
+    mPrevNode = prevNode;
+}
+
+NextNodeMap KVCachePromptLookupNode::getNextNodes() const
+{
+    return mNextNodes;
+}
+
+void KVCachePromptLookupNode::addNextNode(BlockKey const& blockKey, LookupNodePtr node)
+{
+    mNextNodes[blockKey] = node;
+}
+
+void KVCachePromptLookupNode::removeNextNode(BlockKey const& blockKey)
+{
+    mNextNodes.erase(blockKey);
+}
+
+std::tuple<bool, SizeType32, LookupNodePtr> KVCachePromptLookupNode::findMatchingNode(BlockKey const& blockKey, bool enablePartialReuse) const
+{
+    if (blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0)
+    {
+        return {false, 0, nullptr};
+    }
+    auto itr = mNextNodes.find(blockKey);
+    if (itr == mNextNodes.end())
+    {
+        if (enablePartialReuse)
+        {
+            SizeType32 bestNumMatched{0};
+            LookupNodePtr bestNode{nullptr};
+            for (auto const& [key, node] : mNextNodes)
+            {
+                SizeType32 numMatched = key.partialMatch(blockKey);
+                if (numMatched > bestNumMatched)
+                {
+                    bestNumMatched = numMatched;
+                    bestNode = node;
+                }
+            }
+            if (bestNumMatched > 0)
+            {
+                return {true, bestNumMatched, bestNode};
+            }
+        }
+        return {false, 0, nullptr};
+    }
+    auto node = itr->second;
+    return {!node->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), node};
+}
+
+void KVCachePromptLookupNode::setBlock(SizeType32 windowSize, BlockPtr block)
+{
+    mBlocks[windowSize] = block;
+}
+
+BlockPtr KVCachePromptLookupNode::getBlock(SizeType32 windowSize) const
+{
+    return mBlocks[windowSize];
 }
 
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
@@ -1358,6 +1400,7 @@ void WindowBlockManager::storeBlocks(
             block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
             block->setPrevBlockInSeq(prevBlock);
             block->setHash(); // TODO: Why this is necessary? Can it be replaced with hash from matchedNode?
+            block->setLookupNode(matchedNode, mWindowSize);
             matchedNode->setBlock(mWindowSize, block);
         }
     }

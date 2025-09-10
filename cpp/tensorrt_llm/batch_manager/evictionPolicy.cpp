@@ -129,6 +129,8 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 {
+    block->setLookupNode(nullptr, 0); // detach from search structure
+
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
