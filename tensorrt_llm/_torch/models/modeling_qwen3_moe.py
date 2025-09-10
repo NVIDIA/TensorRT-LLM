@@ -78,7 +78,7 @@ class Qwen3MoE(nn.Module):
     def __init__(
         self,
         model_config: ModelConfig[Qwen3MoeConfig],
-        aux_stream: torch.cuda.Stream,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         layer_idx: Optional[int] = None,
     ):
         super().__init__()
@@ -108,10 +108,7 @@ class Qwen3MoE(nn.Module):
             routing_method=self.gate.routing_method,
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
-            aux_stream_dict={
-                AuxStreamType.MoeChunkingOverlap: aux_stream,
-                AuxStreamType.MoeBalancer: torch.cuda.Stream(device=aux_stream.device),
-            },
+            aux_stream_dict=aux_stream_dict,
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
@@ -165,7 +162,7 @@ class Qwen3MoE(nn.Module):
 class Qwen3MoEDecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[Qwen3MoeConfig],
-                 layer_idx: int, aux_stream: torch.cuda.Stream):
+                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream]):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
@@ -176,7 +173,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp = Qwen3MoE(model_config, aux_stream, layer_idx=layer_idx)
+        self.mlp = Qwen3MoE(model_config, aux_stream_dict, layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -307,7 +304,10 @@ class Qwen3MoEModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen3MoeConfig]):
         super().__init__(model_config)
         config = self.model_config
-        self.aux_stream = torch.cuda.Stream()
+        self.aux_stream_dict = {
+            AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
+            AuxStreamType.MoeBalancer: torch.cuda.Stream(),
+        }
         self.preload_weight_modules = []
         if config.moe_backend == "TRTLLM":
             self.preload_weight_modules = [
@@ -337,7 +337,7 @@ class Qwen3MoEModel(DecoderModel):
             Qwen3MoEDecoderLayer(
                 model_config,
                 layer_idx,
-                self.aux_stream,
+                self.aux_stream_dict,
             ) for layer_idx in range(config.pretrained_config.num_hidden_layers)
         ])
         self.norm = RMSNorm(
