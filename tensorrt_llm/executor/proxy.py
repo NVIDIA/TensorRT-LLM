@@ -7,6 +7,7 @@ from typing import Dict, Optional, Union
 
 import torch
 import zmq
+import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
