@@ -258,7 +258,6 @@ def expand_slurm_nodelist(nodelist_str):
     for group in groups:
         # Check if this group has bracket notation
         bracket_match = re.match(r'^(.+?)\[(.+?)\]$', group)
-        print(f"nodelist_str: {nodelist_str}, bracket_match: {bracket_match}")
         if bracket_match:
             prefix = bracket_match.group(1)
             range_part = bracket_match.group(2)

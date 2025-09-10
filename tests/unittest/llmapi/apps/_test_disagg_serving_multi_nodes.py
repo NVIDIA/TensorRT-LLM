@@ -57,10 +57,12 @@ def find_nic():
     print(f"test_ip: {test_ip} for the other host {get_the_other_host()}")
     try:
         # iproute2 may not be installed
-        result = subprocess.check_output(
-            f"ip route get {test_ip} | sed -E 's/.*?dev (\\S+) .*/\\1/;t;d'",
-            shell=True)
-        nic_name = result.decode('utf-8').strip()
+        proc = subprocess.run(f"ip route get {test_ip}",
+                              capture_output=True,
+                              text=True,
+                              shell=True,
+                              check=True)
+        nic_name = proc.stdout.split()[4]
         print(f"get NIC name from ip route, result: {nic_name}")
         return nic_name
     except Exception as e:
@@ -69,7 +71,8 @@ def find_nic():
             # Establish a socket to the test ip, then get the local ip from the socket,
             # enumerate the local interfaces and find the one with the local ip
             local_ip = get_local_ip(test_ip)
-            for nic_name, ip in get_local_interfaces().items():
+            local_ip_dict = get_local_interfaces()
+            for nic_name, ip in local_ip_dict.items():
                 if ip == local_ip:
                     return nic_name
         except OSError as e:
@@ -89,7 +92,10 @@ def env():
     if nic:
         # TODO: integrate this into disagg-serving
         # setting TRTLLM_UCX_INTERFACE manually if possible because the interfaces found automatically by TRTLLM can have the same ip across nodes, then cache transceiver may fail to send/receive kv cache
+        print(f"setting TRTLLM_UCX_INTERFACE to {nic}")
         new_env["TRTLLM_UCX_INTERFACE"] = nic
+    else:
+        print(f"Failed to find NIC, will use default UCX interface")
     return new_env
 
 
@@ -164,15 +170,40 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
         yield None
 
 
+def wait_for_endpoint_ready(url: str, timeout: int = 300):
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        try:
+            time.sleep(1)
+            if requests.get(url).status_code == 200:
+                print(f"endpoint {url} is ready")
+                return
+        except Exception as err:
+            print(f"endpoint {url} is not ready, with exception: {err}")
+
+
+def wait_for_endpoint_down(url: str, timeout: int = 300):
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        try:
+            if requests.get(url).status_code >= 100:
+                print(
+                    f"endpoint {url} returned status code {requests.get(url).status_code}"
+                )
+                time.sleep(1)
+        except Exception as err:
+            print(f"endpoint {url} is down, with exception: {err}")
+            return
+
+
 @pytest.fixture(scope="module")
 def disagg_server(worker: RemoteOpenAIServer):
     if is_disagg_node():
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
         ctx_url = f"localhost:8001"  # Use localhost since the ctx server is on the same node
-        # TODO: Hopefully the NODE_LIST is ordered by NODE_RANK, this test is only tested with 2 nodes now
-        # We need to test with 4 nodes or more
+        # TODO: Hopefully the NODE_LIST is ordered by NODE_RANK, this test is only expected to run with 2 nodes now
+        # We need to test with 4 nodes or more in the future, which should be easier with service discovery
         gen_url = f"{get_the_other_host(0)}:8002"
-        print(f"ctx_url: {ctx_url} gen_url: {gen_url}")
         with RemoteDisaggOpenAIServer(ctx_servers=[ctx_url],
                                       gen_servers=[gen_url],
                                       port=DISAGG_SERVER_PORT,
@@ -181,6 +212,8 @@ def disagg_server(worker: RemoteOpenAIServer):
             yield server
     else:
         print(f"skipping disagg_server for rank {RANK} node rank {NODE_RANK}")
+        url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
+        wait_for_endpoint_ready(url, 60)
         yield None
 
 
@@ -193,30 +226,8 @@ def client(disagg_server: RemoteDisaggOpenAIServer):
         return None
 
 
-def wait_for_endpoint_ready(url: str, timeout: int = 300):
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            time.sleep(1)
-            if requests.get(url).status_code == 200:
-                print(f"endpoint {url} is ready")
-                return
-        except Exception:
-            pass
-
-
-def wait_for_endpoint_down(url: str, timeout: int = 300):
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            if requests.get(url).status_code >= 100:
-                time.sleep(1)
-        except Exception as err:
-            print(f"endpoint {url} is down, with exception: {err}")
-            return
-
-
-def test_completion(client: openai.OpenAI, model_name: str):
+def test_completion(client: openai.OpenAI,
+                    disagg_server: RemoteDisaggOpenAIServer, model_name: str):
     if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
         prompt = "What is the result of 1+1? Answer in one word: "
@@ -226,16 +237,16 @@ def test_completion(client: openai.OpenAI, model_name: str):
             max_tokens=10,
             temperature=0.0,
         )
-        print(f"Completion: {completion}")
         print(f"Output: {completion.choices[0].text}")
         assert completion.id is not None
         message = completion.choices[0].text
         assert message.startswith('2.')
+        disagg_server.terminate()
+
     elif is_gen_node():
         # keep gen workers alive until the test ends, again we hope the NODE_LIST is ordered by NODE_RANK
         url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
-        wait_for_endpoint_ready(url)
-        wait_for_endpoint_down(url)
+        wait_for_endpoint_down(url, 60)
         assert True
     else:
         assert True
