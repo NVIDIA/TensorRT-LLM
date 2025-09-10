@@ -4,7 +4,8 @@ import time
 import pytest
 
 from tensorrt_llm.executor.rpc import (RPCCancelled, RPCClient, RPCError,
-                                       RPCServer, RPCStreamingError, RPCTimeout)
+                                       RPCParams, RPCServer, RPCStreamingError,
+                                       RPCTimeout)
 
 
 class RpcServerWrapper(RPCServer):
@@ -126,7 +127,7 @@ class TestRpcBasics:
         with RpcServerWrapper(App(),
                               addr="ipc:///tmp/rpc_test_no_wait") as server:
             with RPCClient("ipc:///tmp/rpc_test_no_wait") as client:
-                client.send_task(__rpc_need_response=False)
+                client.send_task(__rpc_params=RPCParams(need_response=False))
                 time.sleep(
                     0.1
                 )  # wait for some time to make sure the task is submitted
@@ -209,7 +210,8 @@ class TestRpcError:
         with RPCClient(addr) as client:
             client.shutdown_server()
             pending_futures = [
-                client.task(__rpc_mode="future") for _ in range(10)
+                client.task(__rpc_params=RPCParams(mode="future"))
+                for _ in range(10)
             ]
 
             for future in pending_futures:
@@ -238,7 +240,7 @@ class TestRpcError:
             with RPCClient("ipc:///tmp/rpc_test_timeout",
                            timeout=0.5) as client:
                 with pytest.raises(RPCError) as exc_info:
-                    client.slow_method(__rpc_timeout=0.5)
+                    client.slow_method(__rpc_params=RPCParams(timeout=0.5))
 
                     error = exc_info.value
                     # Should be either a timeout error or RPC error indicating timeout
@@ -306,14 +308,14 @@ def test_rpc_without_response_performance():
         with RPCClient("ipc:///tmp/rpc_test_no_wait") as client:
             time_start = time.time()
             for i in range(100):
-                client.send_task(__rpc_need_response=False)
+                client.send_task(__rpc_params=RPCParams(need_response=False))
             time_end = time.time()
 
             no_wait_time = time_end - time_start
 
             time_start = time.time()
             for i in range(100):
-                client.send_task(__rpc_need_response=True)
+                client.send_task(__rpc_params=RPCParams(need_response=True))
             time_end = time.time()
             wait_time = time_end - time_start
 
@@ -340,7 +342,8 @@ def test_rpc_benchmark(async_run_task: bool, use_ipc_addr: bool):
 
             time_start = time.time()
             for i in range(100):
-                ret = client.cal(i, __rpc_timeout=10)  # sync call
+                ret = client.cal(
+                    i, __rpc_params=RPCParams(timeout=10))  # sync call
                 assert ret == i * 2, f"{ret} != {i * 2}"
             time_end = time.time()
             print(
@@ -378,7 +381,7 @@ class TestRpcTimeout:
 
     def run_sync_timeout_test(self):
         with pytest.raises(RPCTimeout) as exc_info:
-            self.client.slow_operation(2.0, __rpc_timeout=0.1)
+            self.client.slow_operation(2.0, __rpc_params=RPCParams(timeout=0.1))
         assert "timed out" in str(
             exc_info.value), f"Timeout message not found: {exc_info.value}"
 
@@ -387,16 +390,16 @@ class TestRpcTimeout:
 
         async def async_timeout():
             with pytest.raises(RPCTimeout) as exc_info:
-                await self.client.call_async('slow_operation',
-                                             2.0,
-                                             __rpc_timeout=0.1)
+                await self.client.call_async(
+                    'slow_operation', 2.0, __rpc_params=RPCParams(timeout=0.1))
             assert "timed out" in str(
                 exc_info.value), f"Timeout message not found: {exc_info.value}"
 
         asyncio.run(async_timeout())
 
     def run_sync_success_test(self):
-        result = self.client.slow_operation(0.1, __rpc_timeout=10.0)
+        result = self.client.slow_operation(
+            0.1, __rpc_params=RPCParams(timeout=10.0))
         assert result == "completed"
         print(f"final result: {result}")
 
@@ -404,9 +407,8 @@ class TestRpcTimeout:
         import asyncio
 
         async def async_success():
-            result = await self.client.call_async('slow_operation',
-                                                  0.1,
-                                                  __rpc_timeout=10.0)
+            result = await self.client.call_async(
+                'slow_operation', 0.1, __rpc_params=RPCParams(timeout=10.0))
             assert result == "completed"
             print(f"final result: {result}")
             return result
@@ -457,7 +459,8 @@ class TestRpcShutdown:
         time.sleep(0.1)
         with RPCClient("ipc:///tmp/rpc_test_shutdown") as client:
             # This task should be continued after server shutdown
-            res = client.foo(10, __rpc_timeout=12, __rpc_mode="future")
+            res = client.foo(10,
+                             __rpc_params=RPCParams(timeout=12, mode="future"))
 
             # The shutdown will block until all pending requests are finished
             server.shutdown()
@@ -589,7 +592,7 @@ class TestRpcStreaming:
         # Set short timeout
         with pytest.raises(RPCTimeout):
             async for value in client.streaming_timeout.call_streaming(
-                    delay=2.0, __rpc_timeout=0.5):
+                    delay=2.0, __rpc_params=RPCParams(timeout=0.5)):
                 pass  # Should timeout before first yield
 
     @pytest.mark.asyncio

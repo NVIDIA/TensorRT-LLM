@@ -2,11 +2,11 @@ import asyncio
 import concurrent.futures
 import threading
 import uuid
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, Optional
 
 from ...logger import logger
 from ..ipc import ZeroMqQueue
-from .rpc_common import (RPCCancelled, RPCRequest, RPCResponse,
+from .rpc_common import (RPCCancelled, RPCParams, RPCRequest, RPCResponse,
                          RPCStreamingError, RPCTimeout)
 
 
@@ -18,7 +18,7 @@ class RPCClient:
     def __init__(self,
                  address: str,
                  hmac_key=None,
-                 timeout: float = 10,
+                 timeout: Optional[float] = None,
                  num_workers: int = 4):
         '''
         Args:
@@ -164,33 +164,32 @@ class RPCClient:
             # Store the concurrent.futures.Future
             self._reader_task = future
 
-    async def _call_async(self, __rpc_method_name, *args, **kwargs):
+    async def _call_async(self, method_name, *args, **kwargs):
         """Async version of RPC call.
         Args:
-            __rpc_method_name: Method name to call
+            method_name: Method name to call
             *args: Positional arguments
             **kwargs: Keyword arguments
-            __rpc_timeout: The timeout (seconds) for the RPC call.
-            __rpc_need_response: Whether the RPC call needs a response.
-                If set to False, the remote call will return immediately.
+            __rpc_params: RPCParams object containing RPC parameters.
 
         Returns:
             The result of the remote method call
         """
         logger.debug(
-            f"RPC client calling method: {__rpc_method_name} with args: {args} and kwargs: {kwargs}"
+            f"RPC client calling method: {method_name} with args: {args} and kwargs: {kwargs}"
         )
         if self._server_stopped:
             raise RPCCancelled("Server is shutting down, request cancelled")
 
         self._start_response_reader_lazily()
-        need_response = kwargs.pop("__rpc_need_response", True)
-        timeout = kwargs.pop("__rpc_timeout", self._timeout)
+        rpc_params = kwargs.pop("__rpc_params", RPCParams())
+        need_response = rpc_params.need_response
+        timeout = rpc_params.timeout if rpc_params.timeout is not None else self._timeout
 
         request_id = uuid.uuid4().hex
         logger.debug(f"RPC client sending request: {request_id}")
         request = RPCRequest(request_id,
-                             __rpc_method_name,
+                             method_name,
                              args,
                              kwargs,
                              need_response,
@@ -209,14 +208,17 @@ class RPCClient:
             # If timeout, the remote call should return a timeout error timely,
             # so we add 1 second to the timeout to ensure the client can get
             # that result.
-            res = await asyncio.wait_for(future, timeout + 1)
+            if timeout is None:
+                res = await future
+            else:
+                res = await asyncio.wait_for(future, timeout + 1)
             return res
         except RPCCancelled:
             self._server_stopped = True
             raise
         except asyncio.TimeoutError:
             raise RPCTimeout(
-                f"Request '{__rpc_method_name}' timed out after {timeout}s")
+                f"Request '{method_name}' timed out after {timeout}s")
         except Exception as e:
             raise e
         finally:
@@ -241,11 +243,11 @@ class RPCClient:
             import time
             time.sleep(0.1)
 
-    def _call_sync(self, __rpc_method_name, *args, **kwargs):
+    def _call_sync(self, method_name, *args, **kwargs):
         """Synchronous version of RPC call."""
         self._ensure_event_loop()
         future = asyncio.run_coroutine_threadsafe(
-            self._call_async(__rpc_method_name, *args, **kwargs), self._loop)
+            self._call_async(method_name, *args, **kwargs), self._loop)
         return future.result()
 
     def call_async(self, name: str, *args, **kwargs):
@@ -263,7 +265,9 @@ class RPCClient:
         Example:
             result = await client.call_async('remote_method', arg1, arg2, key=value)
         """
-        return self._call_async(name, *args, **kwargs, __rpc_need_response=True)
+        if "__rpc_params" not in kwargs:
+            kwargs["__rpc_params"] = RPCParams(need_response=True)
+        return self._call_async(name, *args, **kwargs)
 
     def call_future(self, name: str, *args,
                     **kwargs) -> concurrent.futures.Future:
@@ -331,7 +335,8 @@ class RPCClient:
             raise RPCCancelled("Server is shutting down, request cancelled")
 
         self._start_response_reader_lazily()
-        timeout = kwargs.pop("__rpc_timeout", self._timeout)
+        rpc_params = kwargs.pop("__rpc_params", RPCParams())
+        timeout = rpc_params.timeout if rpc_params.timeout is not None else self._timeout
 
         request_id = uuid.uuid4().hex
         queue = asyncio.Queue()
@@ -350,8 +355,11 @@ class RPCClient:
 
             # Read streaming responses
             while True:
-                response = await asyncio.wait_for(queue.get(),
-                                                  timeout=timeout + 1)
+                if timeout is None:
+                    response = await queue.get()
+                else:
+                    response = await asyncio.wait_for(queue.get(),
+                                                      timeout=timeout + 1)
 
                 if response.stream_status == 'start':
                     # Start of stream
@@ -379,7 +387,9 @@ class RPCClient:
     def get_server_attr(self, name: str):
         """ Get the attribute of the RPC server.
         This is mainly used for testing. """
-        return self._call_sync("__rpc_get_attr", name, __rpc_timeout=10)
+        return self._call_sync("__rpc_get_attr",
+                               name,
+                               __rpc_params=RPCParams(timeout=10))
 
     def __getattr__(self, name):
         """
@@ -395,7 +405,8 @@ class RPCClient:
 
             def __call__(self, *args, **kwargs):
                 """Default synchronous call"""
-                mode = kwargs.pop("__rpc_mode", "sync")
+                rpc_params = kwargs.get("__rpc_params", RPCParams())
+                mode = rpc_params.mode
                 if mode == "sync":
                     return self.client._call_sync(self.method_name, *args,
                                                   **kwargs)
