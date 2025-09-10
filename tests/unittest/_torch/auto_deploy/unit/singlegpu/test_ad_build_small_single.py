@@ -88,6 +88,13 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     ],
 )
 def test_build_ad(experiment_config: Dict, mode: str):
+    if (
+        experiment_config["args"]["model"]
+        in ["microsoft/Phi-3-mini-4k-instruct", "deepseek-ai/DeepSeek-V3"]
+        and mode == "transformers"
+    ):
+        pytest.skip(f"{experiment_config['args']['model']} is not supported in transformers mode")
+
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
     experiment_config["args"]["mode"] = mode

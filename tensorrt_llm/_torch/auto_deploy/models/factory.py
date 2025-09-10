@@ -109,7 +109,7 @@ class ModelFactory(ABC):
     def _set_strict_forward(self, model: nn.Module):
         """Set the strict (args-only) forward method for the model.
 
-        For some factories, the regular method is sufficient. For others, this needs to be set.
+        For some factories, the regular forward is sufficient. For others, this needs to be set.
         The strict forward method should precisely define a fixed args-only, tensor-only signature
         compatible with the model's forward method AND the export behavior, which requires fixed
         tensor-only positional arguments.
@@ -117,7 +117,22 @@ class ModelFactory(ABC):
         The function should overwrite the `model.forward` method.
 
         The overwritten forward should have `input_ids` and `position_ids` as initial positional
-        arguments as defined by the sequence interface.
+        arguments as defined by the sequence interface. Hence the signature should be something like
+
+        .. code-block:: python
+
+            def _strict_forward(
+                self, input_ids: torch.Tensor, position_ids: torch.Tensor, *extra_args: torch.Tensor
+            ) -> Sequence[torch.Tensor]: ...
+
+        where `extra_args` are the extra arguments that are defined by the factory and should also
+        be defined in the `get_extra_inputs` + `get_example_inputs` methods. The actual
+        `_strict_forward` method should not use `*args` or `**kwargs` but instead use the defined
+        extra arguments in the order they are defined.
+
+        This is necessary as graph export is going to flatten arguments into a list of tensors and
+        by using a strict forward convention we simplify the export behavior and subsequent handling
+        of the arguments in the graph module.
         """
 
     def get_quant_config(self) -> Dict:

@@ -262,7 +262,7 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
         config: ExperimentConfig = CliApp.run(ExperimentConfig)
-    ad_logger.info(f"AD EXPERIMENT CONFIG:\n{yaml.dump(config.model_dump())}")
+    ad_logger.info(f"AutoDeploy Experiment Config:\n{yaml.dump(config.model_dump())}")
 
     if config.dry_run:
         return

@@ -1,4 +1,5 @@
-# Additional default args for AutoDeployConfig/LlmArgs in _torch/auto_deploy/llm_args.py
+# This is the set of transforms running in "transformers" mode. In this mode, we hook into the
+# HF attention mechanism and replace it with our custom cached attention mechanism.
 transforms:
   ############################################################################################
   # BUILD MODEL, LOAD WEIGHTS, AND WRAP IT INTO FAKE GRAPH MODULE
@@ -9,7 +10,7 @@ transforms:
   ############################################################################################
   # MOVE ARGUMENTS TO DEVICE
   ############################################################################################
-  move_cm_to_device:
+  move_inputs_to_device:
     stage: weight_load
   ############################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES

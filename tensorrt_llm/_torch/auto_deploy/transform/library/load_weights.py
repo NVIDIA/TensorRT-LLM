@@ -17,8 +17,8 @@ from ..interface import (
 )
 
 
-class LoadWeightsToDeviceConfig(TransformConfig):
-    """Configuration for the load weights transform."""
+class MoveDeviceConfig(TransformConfig):
+    """Configuration for the moving inputs/arguments to the device transform."""
 
     device: str = Field(default="meta", description="The device to load the weights on.")
     adconfig_checkpoint_device: Optional[str] = Field(
@@ -30,11 +30,11 @@ class LoadWeightsToDeviceConfig(TransformConfig):
 class LoadWeightsToDevice(BaseTransform):
     """A simple wrapper transform to load weights into a model."""
 
-    config: LoadWeightsToDeviceConfig
+    config: MoveDeviceConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
-        return LoadWeightsToDeviceConfig
+        return MoveDeviceConfig
 
     def _apply(
         self,
@@ -54,9 +54,15 @@ class LoadWeightsToDevice(BaseTransform):
         return gm, info
 
 
-@TransformRegistry.register("move_cm_to_device")
-class LoadFactoryModelWeights(LoadWeightsToDevice):
-    """Load weights for the factory model in the transformers mode."""
+@TransformRegistry.register("move_inputs_to_device")
+class LoadFactoryModelWeights(BaseTransform):
+    """Wrapper transform to move all inputs/arguments to the device."""
+
+    config: MoveDeviceConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return MoveDeviceConfig
 
     def _apply(
         self,

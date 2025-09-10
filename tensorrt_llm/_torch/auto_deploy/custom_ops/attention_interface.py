@@ -588,6 +588,8 @@ class SequenceInfo:
                     else:
                         tnsr_like = tnsr_like[0]
                 self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
+            elif self.use_strict_args:
+                self._extra_args[name] = self._extra_none_inputs[name]
             else:
                 self._extra_args[name] = None
 

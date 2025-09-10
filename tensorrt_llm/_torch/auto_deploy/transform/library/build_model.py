@@ -29,7 +29,11 @@ class BuildModelConfig(TransformConfig):
 
 @TransformRegistry.register("build_model")
 class BuildModel(BaseTransform):
-    """A simple wrapper transform to build a model via the model factory."""
+    """A simple wrapper transform to build a model via the model factory build_model method.
+
+    This transform will build the model via the ``build_model`` method of the model factory on the
+    meta device (or the set device) and not load the weights.
+    """
 
     config: BuildModelConfig
 
@@ -61,7 +65,14 @@ class BuildModel(BaseTransform):
 
 @TransformRegistry.register("build_and_load_factory_model")
 class BuildAndLoadFactoryModel(BuildModel):
-    """A simple wrapper transform to build a model via the model factory."""
+    """A simple wrapper transform to build AND load a model via the factory's build_and_load API.
+
+    Under the hood, the factory can use a different way to build and load the model at the same time
+    rather than just building the model. For example, the HF factory uses the `.from_pretrained`
+    API to directly build and load the model at the same time.
+
+    We also assume that the `build_and_load_model` method will auto-shard the model appropriately.
+    """
 
     config: BuildModelConfig
 

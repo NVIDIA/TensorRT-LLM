@@ -54,11 +54,11 @@ class InferenceOptimizer:
         if "build_and_load_factory_model" in self.ad_config.transforms:
             self.ad_config.transforms["build_and_load_factory_model"]["device"] = cm.device
 
-        if "move_cm_to_device" in self.ad_config.transforms:
-            self.ad_config.transforms["move_cm_to_device"]["checkpoint_device"] = (
+        if "move_inputs_to_device" in self.ad_config.transforms:
+            self.ad_config.transforms["move_inputs_to_device"]["checkpoint_device"] = (
                 self.ad_config.checkpoint_device
             )
-            self.ad_config.transforms["move_cm_to_device"]["device"] = cm.device
+            self.ad_config.transforms["move_inputs_to_device"]["device"] = cm.device
 
         if "resize_kv_cache" in self.ad_config.transforms:
             self.ad_config.transforms["resize_kv_cache"]["free_mem_ratio"] = (
@@ -71,6 +71,10 @@ class InferenceOptimizer:
         if "insert_cached_mla_attention" in self.ad_config.transforms:
             self.ad_config.transforms["insert_cached_mla_attention"]["attn_backend"] = (
                 self.ad_config.mla_backend
+            )
+        if "transformers_replace_cached_attn" in self.ad_config.transforms:
+            self.ad_config.transforms["transformers_replace_cached_attn"]["attn_backend"] = (
+                self.ad_config.attn_backend
             )
 
         # TODO: (hg)Missing MLA here. Figure out how to add MLA since duplicate transforms are not allowed.

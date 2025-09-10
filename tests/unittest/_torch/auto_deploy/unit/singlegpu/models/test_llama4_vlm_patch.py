@@ -19,6 +19,7 @@ def test_build_run_llama4_vlm():
 
     factory = llm_args.create_factory()
     model = factory.build_model("cuda")
+    factory._set_strict_forward(model)
     processor = factory.init_processor()
 
     img1 = Image.new("RGB", (16, 16), color=(128, 128, 128))
