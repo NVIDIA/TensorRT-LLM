@@ -30,7 +30,7 @@ using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Run
 
 std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
-    torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+    torch::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
     torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
     torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
     torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
@@ -40,6 +40,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     int64_t const routing_method_type, bool const do_finalize, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
 {
+    bool const isFp8Fp4 = !hidden_states_scale.has_value();
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
     TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64,
         "tile_tokens_dim must be 8, 16, 32, 64");
@@ -148,7 +149,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
     args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
     args.hidden_states = hidden_states.data_ptr();
-    args.hidden_states_scale = hidden_states_scale.data_ptr();
+    args.hidden_states_scale = hidden_states_scale.has_value() ? hidden_states_scale.value().data_ptr() : nullptr;
 
     args.topk_weights = topk_weights.has_value() ? topk_weights.value().data_ptr() : nullptr;
     args.topk_ids = topk_ids.has_value() ? static_cast<int32_t*>(topk_ids.value().data_ptr()) : nullptr;
@@ -160,7 +161,14 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     args.num_tokens = hidden_states.sizes()[0];
     args.num_experts = num_experts;
     // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1 into 1 byte.
-    args.hidden_size = hidden_states.sizes()[1] * 2;
+    if (isFp8Fp4)
+    {
+        args.hidden_size = hidden_states.sizes()[1];
+    }
+    else
+    {
+        args.hidden_size = hidden_states.sizes()[1] * 2;
+    }
     args.top_k = top_k;
     args.n_group = n_group.value_or(0);
     args.topk_group = topk_group.value_or(0);
@@ -240,14 +248,17 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     // FC13 (gemm1) + FC2 (gemm2)
     //
 
-    TORCH_CHECK(hidden_states.scalar_type() == FLOAT4_E2M1X2, "hidden_states must be byte.");
-    TORCH_CHECK(hidden_states_scale.scalar_type() == at::ScalarType::Float8_e4m3fn, "hidden_states_scale must be fp8.");
+    if (!isFp8Fp4)
+    {
+        TORCH_CHECK(hidden_states.scalar_type() == FLOAT4_E2M1X2, "hidden_states must be byte.");
+        TORCH_CHECK(hidden_states_scale.value().scalar_type() == at::ScalarType::Float8_e4m3fn,
+            "hidden_states_scale must be fp8.");
 
-    TORCH_CHECK(hidden_states_scale.dim() == 1, "hidden_states_scale must be 1D.");
-    TORCH_CHECK(hidden_states_scale.sizes()[0]
-            == tensorrt_llm::computeLinearLayoutSFSize(args.num_tokens, args.hidden_size / 16),
-        "hidden_states_scale has incorrect size");
-
+        TORCH_CHECK(hidden_states_scale.value().dim() == 1, "hidden_states_scale must be 1D.");
+        TORCH_CHECK(hidden_states_scale.value().sizes()[0]
+                == tensorrt_llm::computeLinearLayoutSFSize(args.num_tokens, args.hidden_size / 16),
+            "hidden_states_scale has incorrect size");
+    }
     TORCH_CHECK(gemm1_weights.scalar_type() == FLOAT4_E2M1X2, "gemm1_weights must be byte.");
 
     TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
@@ -255,7 +266,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     TORCH_CHECK(intermediate_size == gemm1_weights.sizes()[1] / 2, "intermediate_size has incorrect dim 1.");
     // This check passes even though the actual shape of the weights[2] and hidden_states[1] is
     // 2 times larger due to the fact that 2 e2m1 are packed into 1 byte.
-    TORCH_CHECK(gemm1_weights.sizes()[2] == hidden_states.sizes()[1],
+    TORCH_CHECK(gemm1_weights.sizes()[2] * 2 == hidden_states.sizes()[1],
         "the third dimension of weights must be equal to hidden_size.");
 
     TORCH_CHECK(gemm1_weights_scale.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm1_weights_scale must be fp8.");
@@ -264,7 +275,16 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     TORCH_CHECK(gemm1_weights_scale.sizes()[0] == local_num_experts, "gemm1_weights_scale has incorrect dim 0.");
     TORCH_CHECK(intermediate_size % 16 == 0, "the second dimension of weights must be a multiple of 16.");
     TORCH_CHECK(gemm1_weights_scale.sizes()[1] == 2 * intermediate_size, "gemm1_weights_scale has incorrect dim 1.");
-    TORCH_CHECK(gemm1_weights_scale.sizes()[2] == args.hidden_size / 16, "gemm1_weights_scale has incorrect dim 2.");
+    if (isFp8Fp4)
+    {
+        TORCH_CHECK(
+            gemm1_weights_scale.sizes()[2] == args.hidden_size / 32, "gemm1_weights_scale has incorrect dim 2.");
+    }
+    else
+    {
+        TORCH_CHECK(
+            gemm1_weights_scale.sizes()[2] == args.hidden_size / 16, "gemm1_weights_scale has incorrect dim 2.");
+    }
 
     TORCH_CHECK(gemm2_weights.scalar_type() == FLOAT4_E2M1X2, "gemm2_weights must be byte.");
 
@@ -278,7 +298,16 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     TORCH_CHECK(gemm2_weights_scale.dim() == 3, "gemm2_weights_scale must be 3D.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[0] == local_num_experts, "gemm2_weights_scale has incorrect dim 0.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[1] == args.hidden_size, "gemm2_weights_scale has incorrect dim 1.");
-    TORCH_CHECK(gemm2_weights_scale.sizes()[2] == intermediate_size / 16, "gemm2_weights_scale has incorrect dim 2.");
+    if (isFp8Fp4)
+    {
+        TORCH_CHECK(
+            gemm2_weights_scale.sizes()[2] == intermediate_size / 32, "gemm2_weights_scale has incorrect dim 2.");
+    }
+    else
+    {
+        TORCH_CHECK(
+            gemm2_weights_scale.sizes()[2] == intermediate_size / 16, "gemm2_weights_scale has incorrect dim 2.");
+    }
 
     TORCH_CHECK(output1_scales_scalar.scalar_type() == at::ScalarType::Float, "output1_scales_scalar must be float.");
     TORCH_CHECK(output1_scales_scalar.dim() == 1, "output1_scales_scalar must be 1D.");
@@ -405,6 +434,67 @@ private:
     int64_t mTileTokensDim;
 };
 
+// Wrapped the TRTLLM-Gen kernel runner in a Torch custom class to allow
+// use with the torch workflow autotuner class.
+class FP8FP4BlockScaleMoeRunner : public torch::CustomClassHolder
+{
+public:
+    explicit FP8FP4BlockScaleMoeRunner(int64_t tileTokensDim, int64_t actType)
+        : mTileTokensDim(tileTokensDim)
+    {
+        mRunner = std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, mTileTokensDim,
+            static_cast<tensorrt_llm::kernels::ActType>(actType));
+    }
+
+    [[nodiscard]] std::vector<torch::Tensor> run(torch::optional<torch::Tensor> const& routing_logits,
+        torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
+        torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
+        int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+        std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+        int64_t const local_num_experts, std::optional<double> const routed_scaling_factor,
+        int64_t const routing_method_type, bool const do_finalize, int64_t moeConfigIndex,
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+    {
+
+        // Autotuner has requested a default or 'fallback' config index
+        if (moeConfigIndex == -1)
+        {
+            auto const num_tokens = hidden_states.sizes()[0];
+
+            // 2x FP4 per byte element
+            auto const hidden_size = 2 * hidden_states.sizes()[1];
+
+            moeConfigIndex = mRunner->getDefaultValidConfigIndex(
+                top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+        }
+
+        return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states,
+            std::nullopt /*hidden_states_scale*/, gemm1_weights, gemm1_weights_scale, gemm2_weights,
+            gemm2_weights_scale, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar, num_experts,
+            top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
+            routed_scaling_factor, mTileTokensDim, routing_method_type, do_finalize, *mRunner, moeConfigIndex,
+            topk_weights, topk_ids);
+    }
+
+    [[nodiscard]] std::vector<int64_t> getValidConfigs(
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    {
+        return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+    }
+
+private:
+    using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
+
+    std::unique_ptr<RunnerType> mRunner;
+    btg::Dtype mDtypeAct{btg::Dtype::E4m3};
+    btg::Dtype mDtypeWeights{btg::Dtype::E2m1};
+    bool mUseDeepSeekFp8{false};
+    int64_t mTileTokensDim;
+};
+
 torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
 {
     return torch::index_select(matrix, 0, permuteIndices);
@@ -418,6 +508,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def(torch::init<int64_t>())
         .def("get_valid_configs", &torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::FP4BlockScaleMoeRunner::run);
+    m.class_<torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
+        .def(torch::init<int64_t, int64_t>())
+        .def("get_valid_configs", &torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &torch_ext::FP8FP4BlockScaleMoeRunner::run);
 }
 
 // Accepts both CPU and CUDA tensors
