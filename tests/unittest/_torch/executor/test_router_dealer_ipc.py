@@ -9,26 +9,22 @@ import zmq
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
 
-# Helper functions and context managers to reduce code duplication
-
 @contextmanager
-def router_dealer_pair(use_hmac_encryption=False, server_name="test_router", client_name="test_dealer"):
+def router_dealer_pair(use_hmac_encryption=False,
+                       server_name="test_router",
+                       client_name="test_dealer"):
     """Context manager to create and manage a ROUTER-DEALER queue pair."""
-    server_queue = ZeroMqQueue(
-        socket_type=zmq.ROUTER,
-        is_server=True,
-        name=server_name,
-        use_hmac_encryption=use_hmac_encryption
-    )
-    
-    client_queue = ZeroMqQueue(
-        address=server_queue.address,
-        socket_type=zmq.DEALER,
-        is_server=False,
-        name=client_name,
-        use_hmac_encryption=use_hmac_encryption
-    )
-    
+    server_queue = ZeroMqQueue(socket_type=zmq.ROUTER,
+                               is_server=True,
+                               name=server_name,
+                               use_hmac_encryption=use_hmac_encryption)
+
+    client_queue = ZeroMqQueue(address=server_queue.address,
+                               socket_type=zmq.DEALER,
+                               is_server=False,
+                               name=client_name,
+                               use_hmac_encryption=use_hmac_encryption)
+
     try:
         yield server_queue, client_queue
     finally:
@@ -36,24 +32,25 @@ def router_dealer_pair(use_hmac_encryption=False, server_name="test_router", cli
         client_queue.close()
 
 
-def basic_communication_helper(server_queue, client_queue, test_message, expected_reply):
+def basic_communication_helper(server_queue, client_queue, test_message,
+                               expected_reply):
     """Helper function to test basic bidirectional communication."""
     # Send message from client to server
     client_queue.put(test_message)
-    
+
     # Server should receive the message
     assert server_queue.poll(2), "Server should receive message"
     received_message = server_queue.get()
     assert received_message == test_message
-    
+
     # Send reply from server to client
     server_queue.put(expected_reply)
-    
+
     # Client should receive the reply
     assert client_queue.poll(2), "Client should receive reply"
     received_reply = client_queue.get()
     assert received_reply == expected_reply
-    
+
     return received_message, received_reply
 
 
@@ -62,40 +59,41 @@ def multiprocess_runner():
     """Context manager to handle multiprocess execution and cleanup."""
     processes = []
     queues = []
-    
+
     def add_process(target, args, daemon=True):
         proc = multiprocessing.Process(target=target, args=args, daemon=daemon)
         processes.append(proc)
         return proc
-    
+
     def add_queue():
         queue = multiprocessing.Queue()
         queues.append(queue)
         return queue
-    
+
     try:
         yield add_process, add_queue
-        
+
         # Start all processes
         for proc in processes:
             proc.start()
-        
+
         # Wait for all processes to complete
         for proc in processes:
             proc.join(timeout=10)
-            
+
         # Check if any process is still alive and terminate if needed
         for proc in processes:
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=2)
-                
+
         # Verify all processes finished successfully
         for i, proc in enumerate(processes):
             assert not proc.is_alive(), f"Process {i} did not finish in time"
             if proc.exitcode != 0:
-                pytest.fail(f"Process {i} failed with exit code: {proc.exitcode}")
-                
+                pytest.fail(
+                    f"Process {i} failed with exit code: {proc.exitcode}")
+
     except Exception as e:
         # Emergency cleanup
         for proc in processes:
@@ -117,55 +115,63 @@ def collect_process_results(result_queues, timeout=2):
     return results
 
 
-def verify_worker_proxy_results(worker_result, proxy_result, expected_signal=b"READY"):
+def verify_worker_proxy_results(worker_result,
+                                proxy_result,
+                                expected_signal=b"READY"):
     """
     Universal verification function for worker-proxy communication results.
     Works identically for both encrypted and non-encrypted communication.
-    
+
     Args:
         worker_result: Worker process result dictionary
-        proxy_result: Proxy process result dictionary  
+        proxy_result: Proxy process result dictionary
         expected_signal: Expected signal in the message
     """
     # Basic result verification
-    assert worker_result["error"] is None, f"Worker error: {worker_result['error']}"
+    assert worker_result[
+        "error"] is None, f"Worker error: {worker_result['error']}"
     assert worker_result["success"], "Worker should have succeeded"
-    assert proxy_result["error"] is None, f"Proxy error: {proxy_result['error']}"
-    assert proxy_result["message"] is not None, "Proxy should have received message"
-    
+    assert proxy_result[
+        "error"] is None, f"Proxy error: {proxy_result['error']}"
+    assert proxy_result[
+        "message"] is not None, "Proxy should have received message"
+
     # Verify message content - same format regardless of encryption
     ready_signal, error_trace = proxy_result["message"]
     assert ready_signal == expected_signal
     assert error_trace is None
 
 
-def run_worker_proxy_multiprocess_test(use_hmac_encryption=False, ready_signal=b"READY"):
+def run_worker_proxy_multiprocess_test(use_hmac_encryption=False,
+                                       ready_signal=b"READY"):
     """
     Generic multiprocess test for worker-proxy communication.
-    
+
     Args:
         use_hmac_encryption: Whether to use HMAC encryption
         ready_signal: Signal to send from worker to proxy
     """
+
     def proxy_process(address_q, result_q):
         """Generic proxy process."""
         try:
-            proxy_queue = ZeroMqQueue(
-                socket_type=zmq.ROUTER,
-                is_server=True,
-                name="proxy_multiproc",
-                use_hmac_encryption=use_hmac_encryption
-            )
-            
+            proxy_queue = ZeroMqQueue(socket_type=zmq.ROUTER,
+                                      is_server=True,
+                                      name="proxy_multiproc",
+                                      use_hmac_encryption=use_hmac_encryption)
+
             address_q.put(proxy_queue.address)
-            
+
             try:
                 if proxy_queue.poll(5):
                     message = proxy_queue.get()
                     result_q.put({"message": message, "error": None})
                     proxy_queue.put("ACK")
                 else:
-                    result_q.put({"message": None, "error": "Timeout waiting for worker message"})
+                    result_q.put({
+                        "message": None,
+                        "error": "Timeout waiting for worker message"
+                    })
             finally:
                 proxy_queue.close()
         except Exception as e:
@@ -175,19 +181,17 @@ def run_worker_proxy_multiprocess_test(use_hmac_encryption=False, ready_signal=b
         """Generic worker process."""
         try:
             proxy_addr = address_q.get(timeout=5)
-            worker_queue = ZeroMqQueue(
-                socket_type=zmq.DEALER,
-                is_server=False,
-                address=proxy_addr,
-                name="worker_multiproc",
-                use_hmac_encryption=use_hmac_encryption
-            )
-            
+            worker_queue = ZeroMqQueue(socket_type=zmq.DEALER,
+                                       is_server=False,
+                                       address=proxy_addr,
+                                       name="worker_multiproc",
+                                       use_hmac_encryption=use_hmac_encryption)
+
             try:
                 time.sleep(0.1)  # Simulate initialization time
                 ready_message = (ready_signal, None)
                 worker_queue.put(ready_message)
-                
+
                 if worker_queue.poll(3):
                     ack = worker_queue.get()
                     success = ack == "ACK"
@@ -197,7 +201,10 @@ def run_worker_proxy_multiprocess_test(use_hmac_encryption=False, ready_signal=b
                         "ack": ack if success else None
                     })
                 else:
-                    result_q.put({"success": False, "error": "Timeout waiting for ACK"})
+                    result_q.put({
+                        "success": False,
+                        "error": "Timeout waiting for ACK"
+                    })
             finally:
                 worker_queue.close()
         except Exception as e:
@@ -208,16 +215,18 @@ def run_worker_proxy_multiprocess_test(use_hmac_encryption=False, ready_signal=b
         address_queue = add_queue()
         proxy_result_queue = add_queue()
         worker_result_queue = add_queue()
-        
+
         add_process(proxy_process, (address_queue, proxy_result_queue))
         add_process(worker_process, (address_queue, worker_result_queue))
-    
-    # Collect and verify results
-    worker_result, proxy_result = collect_process_results([worker_result_queue, proxy_result_queue])
-    verify_worker_proxy_results(worker_result, proxy_result, expected_signal=ready_signal)
-    
-    return worker_result, proxy_result
 
+    # Collect and verify results
+    worker_result, proxy_result = collect_process_results(
+        [worker_result_queue, proxy_result_queue])
+    verify_worker_proxy_results(worker_result,
+                                proxy_result,
+                                expected_signal=ready_signal)
+
+    return worker_result, proxy_result
 
 
 class TestRouterDealerIPC:
@@ -246,11 +255,12 @@ class TestRouterDealerIPC:
         yield socket
         socket.close()
 
-    def test_basic_router_dealer_communication(self, router_socket, dealer_socket):
+    def test_basic_router_dealer_communication(self, router_socket,
+                                               dealer_socket):
         """Test basic ROUTER-DEALER communication with multipart messages."""
         router, endpoint = router_socket
         dealer = dealer_socket
-        
+
         # Connect dealer to router
         dealer.connect(endpoint)
         time.sleep(0.1)  # Allow connection to establish
@@ -276,7 +286,7 @@ class TestRouterDealerIPC:
         """Test multipart message handling with multiple frames."""
         router, endpoint = router_socket
         dealer = dealer_socket
-        
+
         dealer.connect(endpoint)
         time.sleep(0.1)
 
@@ -288,7 +298,7 @@ class TestRouterDealerIPC:
         frames = router.recv_multipart()
         identity = frames[0]
         received_parts = frames[1:]
-        
+
         assert received_parts == message_parts
         assert len(identity) > 0
 
@@ -304,7 +314,7 @@ class TestRouterDealerIPC:
         """Test sending pickled Python objects through ROUTER-DEALER."""
         router, endpoint = router_socket
         dealer = dealer_socket
-        
+
         dealer.connect(endpoint)
         time.sleep(0.1)
 
@@ -334,9 +344,11 @@ class TestRouterDealerIPC:
         # Same message content regardless of encryption
         test_message = ("READY", "initialization_complete")
         reply_message = "ACK"
-        
-        with router_dealer_pair(use_hmac_encryption=use_hmac) as (server_queue, client_queue):
-            basic_communication_helper(server_queue, client_queue, test_message, reply_message)
+
+        with router_dealer_pair(use_hmac_encryption=use_hmac) as (server_queue,
+                                                                  client_queue):
+            basic_communication_helper(server_queue, client_queue, test_message,
+                                       reply_message)
 
     @pytest.mark.parametrize("use_hmac", [False, True])
     def test_router_dealer_basic(self, use_hmac):
@@ -344,10 +356,12 @@ class TestRouterDealerIPC:
         # Same message content regardless of encryption
         ready_message = (b"READY", None)
         ack_message = "ACK"
-        
-        with router_dealer_pair(use_hmac_encryption=use_hmac) as (proxy_queue, worker_queue):
-            received_message, received_ack = basic_communication_helper(proxy_queue, worker_queue, ready_message, ack_message)
-            
+
+        with router_dealer_pair(use_hmac_encryption=use_hmac) as (proxy_queue,
+                                                                  worker_queue):
+            received_message, received_ack = basic_communication_helper(
+                proxy_queue, worker_queue, ready_message, ack_message)
+
             # Encryption is transparent - same verification for both
             assert received_ack == "ACK"
 
@@ -355,4 +369,5 @@ class TestRouterDealerIPC:
     def test_router_dealer_multiprocess(self, use_hmac):
         """Test router_dealer using separate processes, with and without HMAC encryption."""
         # Same signal regardless of encryption
-        run_worker_proxy_multiprocess_test(use_hmac_encryption=use_hmac, ready_signal=b"READY")
+        run_worker_proxy_multiprocess_test(use_hmac_encryption=use_hmac,
+                                           ready_signal=b"READY")
