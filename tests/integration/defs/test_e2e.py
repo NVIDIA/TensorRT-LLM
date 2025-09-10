@@ -1780,7 +1780,7 @@ def test_openai_disaggregated_serving_multi_nodes(llm_root, llm_venv,
         "-m",
         "pytest",
         str(test_root /
-            f"_test_disagg_serving_multi_nodes.py::test_chat[{ctx_config}-{gen_config}]"
+            f"_test_disagg_serving_multi_nodes.py::test_completion[{ctx_config}-{gen_config}]"
             ),
     ])
 
