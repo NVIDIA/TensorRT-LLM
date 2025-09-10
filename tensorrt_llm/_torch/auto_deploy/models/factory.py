@@ -106,6 +106,20 @@ class ModelFactory(ABC):
         """Factory-specific model building logic."""
         raise NotImplementedError("Subclasses must implement this method.")
 
+    def _set_strict_forward(self, model: nn.Module):
+        """Set the strict (args-only) forward method for the model.
+
+        For some factories, the regular method is sufficient. For others, this needs to be set.
+        The strict forward method should precisely define a fixed args-only, tensor-only signature
+        compatible with the model's forward method AND the export behavior, which requires fixed
+        tensor-only positional arguments.
+
+        The function should overwrite the `model.forward` method.
+
+        The overwritten forward should have `input_ids` and `position_ids` as initial positional
+        arguments as defined by the sequence interface.
+        """
+
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or None if not quantized."""
         return {}

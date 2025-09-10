@@ -6,6 +6,7 @@ transforms:
   build_model:
     stage: factory
     device: meta
+    use_strict_forward: true
     # nothing to clean up
     run_graph_cleanup: false
     requires_clean_graph: false
@@ -107,3 +108,6 @@ transforms:
   ############################################################################################
   compile_model:
     stage: compile
+  forward_with_cached_sequence_interface:
+    stage: compile
+    args_only: true

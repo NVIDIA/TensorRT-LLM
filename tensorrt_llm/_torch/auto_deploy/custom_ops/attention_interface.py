@@ -142,7 +142,7 @@ class SequenceInfo:
         self._is_cached_attn = False
 
         # indicator how to handle the "None" input for extra args
-        self._use_tensors_for_none_inputs = True
+        self._use_strict_args = True
 
         # container for dynamic shapes
         self._dynamic_shapes: Optional[Dict[str, DynamicShape]] = None
@@ -183,18 +183,31 @@ class SequenceInfo:
         return self._args_device["input_ids"].device
 
     @property
-    def use_none_tensors(self) -> bool:
-        return self._use_tensors_for_none_inputs
+    def use_strict_args(self) -> bool:
+        return self._use_strict_args
 
-    @use_none_tensors.setter
-    def use_none_tensors(self, use_tensors: bool) -> None:
-        """Set the none mode for the extra arguments.
+    @use_strict_args.setter
+    def use_strict_args(self, val: bool) -> None:
+        """Configure whether to use strict graph arguments only.
 
         Args:
-            use_tensors: Whether to use tensors for the none inputs. If False, we will pass None
-                instead of the none input tensor.
+            val: strict graph arguments only or not.
+
+        In strict arguments mode,
+            * only stock arguments (like input_ids, position_ids, etc.) or extra
+              arguments that are explicitly added via the ``add_extra_arg`` interface are allowed.
+              Other arguments that are provided in ``nest_sequences`` will be rejected and throw an
+              error.
+            * registered extra arguments that are not provided to ``nest_sequences`` will be added to
+              the argument list automatically using the registered None-like tensor.
+
+        In non-strict argument mode,
+            * all arguments including all **kwargs that are provided to ``nest_sequences`` and will
+              simply be passed to the model in the order received.
+            * registered extra arguments that are not provided to ``nest_sequences`` will be added
+              _not_ be added to the argument list.
         """
-        self._use_tensors_for_none_inputs = use_tensors
+        self._use_strict_args = val
 
     def _shape_for_forward(self, tnsr: torch.Tensor) -> torch.Tensor:
         """Shape the tensor for the forward pass based on the current attention mode.
@@ -226,11 +239,7 @@ class SequenceInfo:
 
         # check other args to include
         if include_extra_args:
-            for k, v in self._extra_args.items():
-                if v is None and self._use_tensors_for_none_inputs:
-                    args[k] = self._extra_none_inputs[k]
-                else:
-                    args[k] = v
+            args.update(self._extra_args)
 
         if include_cached_args:
             args.update({k: self._args_device[k] for k in self._cached_arg_names})
@@ -637,10 +646,16 @@ class SequenceInfo:
         self._store_arg("position_ids", self._flatten(position_ids))
 
         ### UPDATE EXTRA INPUTS ####################################################################
-        # go through all extra tensor arguments and update them
-        for name in self._extra_none_inputs.keys():
-            self._store_extra_arg(name, extra_args.pop(name, None))
-        assert not extra_args, f"Extra arguments {extra_args.keys()} not found"
+        self._extra_args = {}
+        # in strict argument mode, we only accept registered extra arguments
+        if self.use_strict_args:
+            for name in self._extra_none_inputs.keys():
+                self._store_extra_arg(name, extra_args.pop(name, None))
+            assert not extra_args, f"Extra arguments {extra_args.keys()} not found"
+        # otherwise, we simply pass in all extra arguments
+        else:
+            for key, value in extra_args.items():
+                self._store_extra_arg(key, value)
 
     @nvtx_range("ad_rescatter_input_ids")
     def rescatter_input_ids(
@@ -691,8 +706,8 @@ class SequenceInfo:
         """
         assert name not in self._named_args().keys(), f"Extra argument {name} already exists"
 
-        self._extra_args[name] = None
-        self._extra_none_inputs[name] = none_input.to(self.device)
+        self._extra_args[name] = none_input.to(self.device)
+        self._extra_none_inputs[name] = self._extra_args[name]
 
         if dynamic_shape_callback is None:
             self._extra_dynamic_shapes_callbacks[name] = lambda: {}

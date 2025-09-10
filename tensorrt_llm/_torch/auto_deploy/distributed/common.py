@@ -142,7 +142,12 @@ def initialize(rank: int = 0, world_size: int = 1, port: Optional[int] = None) -
     torch.cuda.set_device(local_rank)
 
     # We use nccl backend
-    dist.init_process_group("nccl", world_size=world_size, rank=local_rank)
+    dist.init_process_group(
+        "nccl",
+        world_size=world_size,
+        rank=local_rank,
+        device_id=torch.device(local_rank),
+    )
 
     # Register cleanup function to be called at exit
     atexit.register(cleanup)

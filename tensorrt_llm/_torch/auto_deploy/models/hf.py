@@ -74,14 +74,16 @@ class AutoModelFactory(ModelFactory):
 
     @staticmethod
     @abstractmethod
-    def _simple_forward(
-        model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor, **kwargs
-    ):
-        pass
+    def _strict_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
+        """A strict (args-only) forward method for the model that precisely defines the signature.
 
-    def _set_simple_forward(self, model: nn.Module):
-        """Set the simple forward method for the model."""
-        model.forward = types.MethodType(self._simple_forward, model)
+        The function should contain input_ids and position_ids as positional arguments at a
+        minimum. Other arguments can be added as needed and must follow the correct order.
+        """
+
+    def _set_strict_forward(self, model: nn.Module):
+        """Set the strict (args-only) forward method for the model."""
+        model.forward = types.MethodType(self._strict_forward, model)
 
 
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
@@ -125,16 +127,14 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         return AutoModelForCausalLM
 
     @staticmethod
-    def _simple_forward(
-        model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor, **kwargs
-    ):
-        """A simple forward pass for the model to functionalize the args.
+    def _strict_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
+        """A strict (args-only) forward pass for the model to functionalize the args.
 
         This follows the standard function signature as expected by factory.py. We do _not_ use the
         model.forward method directly to create the patch. Instead we use the type of the model to
         get the forward method to keep the patch composable with other forward patches.
         """
-        return type(model).forward(model, input_ids=input_ids, position_ids=position_ids, **kwargs)
+        return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
@@ -173,10 +173,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         return config, nested_unused_kwargs
 
-    def _set_simple_forward(self, model: nn.Module):
-        """Set the simple forward method for the model."""
-        model.forward = types.MethodType(self._simple_forward, model)
-
     def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
@@ -213,9 +209,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         # if present, initialize sharding config. We need head_dim for colwise sharding.
         self._set_sharding_config(model.config)
-
-        # patch forward method
-        self._set_simple_forward(model)
 
         model.eval()
 
@@ -275,7 +268,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # only this way can we skip downloading/loading weights
         if self.skip_loading_weights or "cuda" not in str(device):
             ad_logger.info("Falling back to build_model+load_or_random_init methods.")
-            model = self.build_model(device)
+            model = self.build_model("meta")
             self.load_or_random_init(model, device)
             return model
 
@@ -287,11 +280,11 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             config=model_config,
             **{
                 "trust_remote_code": True,
+                "tp_plan": "auto",
                 **unused_kwargs,
                 "torch_dtype": "auto",  # takes precedence over unused_kwargs!
             },
         )
-        self._set_simple_forward(model)
         model.eval()
         return model
 
@@ -435,7 +428,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     _model_defaults = {
-        "use_cache": False,
         "text_config": {
             "use_cache": False,
         },
@@ -471,26 +463,26 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return None
         return AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
+    # TODO: in theory the signature could be auto-derived but it would probably require some hefty
+    # meta-programming to progmatically generate the functions and signature from something like the
+    # example inputs. And even with that we would still need to figure out how to automatically
+    # infer the dynamic shapes for the extra inputs.
+    # Alternatively, we could try to directly use the HF forward again but I am not sure whether
+    # this will trigger some kind of kwarg-handling inside the graph which I would want to avoid.
     @staticmethod
-    def _simple_forward(
+    def _strict_forward(
         model: nn.Module,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         pixel_values: torch.Tensor,
-        **kwargs,
     ):
-        """A simple forward pass for the model to functionalize the args.
+        """A strict (args-only) forward pass for the model to functionalize the args.
 
-        This follows the standard function signature as expected by factory.py. We do _not_ use the
-        model.forward method directly to create the patch. Instead we use the type of the model to
-        get the forward method to keep the patch composable with other forward patches.
+        It adds pixel_values as a positional argument as expected by most
+        AutoModelForImageTextToText in addition to the required input_ids and position_ids.
         """
         return type(model).forward(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            pixel_values=pixel_values,
-            **kwargs,
+            model, input_ids=input_ids, position_ids=position_ids, pixel_values=pixel_values
         )
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:

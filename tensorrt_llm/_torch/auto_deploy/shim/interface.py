@@ -25,6 +25,11 @@ class CachedSequenceInterface:
         return (*self.info.args, *self._caches.values())
 
     @property
+    def named_args(self) -> Dict[str, torch.Tensor]:
+        """Return all the named arguments owned by this interface."""
+        return {**self.info.named_args, **self._caches}
+
+    @property
     def all_future_arg_names(self) -> List[str]:
         """Return all the argument names owned by this interface including uninitialized caches."""
         return list(self.info.named_args.keys()) + list(self._cache_initializers.keys())

@@ -1,13 +1,13 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
 import operator
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegistry
+from ...custom_ops.attention_interface import AttentionDescriptor, AttentionRegistry, Constant
 from ...distributed.common import all_gather_object, get_world_size
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -86,7 +86,7 @@ class InsertCachedAttention(BaseTransform):
         return AttentionRegistry.get(self.config.attn_backend)
 
     def _process_get_metadata(
-        self, gm: GraphModule, m_args: List[str], const_args: List[Any]
+        self, gm: GraphModule, m_args: List[str], const_args: List[Constant]
     ) -> List[Node]:
         """Process the get_metadata function into an op and return node references."""
         # retrieve input nodes
@@ -118,7 +118,7 @@ class InsertCachedAttention(BaseTransform):
         meta_nodes: List[Node],
         cache_nodes: List[Node],
         buffer_nodes: List[Node],
-        constants: List[Any],
+        constants: List[Constant],
     ):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
@@ -226,6 +226,10 @@ class ResizeKVCacheConfig(TransformConfig):
     free_mem_ratio: float = Field(
         description="The fraction of available memory to occupy.", default=0.8
     )
+    args_only: bool = Field(
+        description="Use ``*cm.args`` (default) or use ``**cm.named_args`` for the forward pass.",
+        default=True,
+    )
 
 
 @TransformRegistry.register("resize_kv_cache")
@@ -240,6 +244,13 @@ class ResizeKVCache(BaseTransform):
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
         return ResizeKVCacheConfig
+
+    def _run_forward(self, gm: GraphModule, cm: CachedSequenceInterface):
+        """Run a forward pass to get the memory usage."""
+        if self.config.args_only:
+            gm(*cm.args)
+        else:
+            gm(**cm.named_args)
 
     def _apply(
         self,
@@ -275,7 +286,7 @@ class ResizeKVCache(BaseTransform):
             free_mem_pre, _ = _get_mem_info_in_mb()
             self._log_info(f"Free memory before forward pass (MB): {free_mem_pre}")
 
-            gm(*cm.args)
+            self._run_forward(gm, cm)
 
             free_mem_post, _ = _get_mem_info_in_mb()
             self._log_info(f"Free memory after forward pass (MB): {free_mem_post}")

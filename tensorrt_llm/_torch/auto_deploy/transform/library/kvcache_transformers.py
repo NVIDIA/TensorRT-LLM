@@ -1,15 +1,16 @@
 """A simple wrapper transform to build a model via the model factory."""
 
 import types
-from collections import defaultdict
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.fx as fx
 from torch.fx import GraphModule, Node
+from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ...custom_ops.attention_interface import AttentionDescriptor
+from ...custom_ops.attention_interface import AttentionDescriptor, Constant
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
@@ -75,6 +76,28 @@ def fake_profiler_mha(
     return attn_output, attn_weights
 
 
+@contextmanager
+def switch_attn_implementation(config: PretrainedConfig, attn_implementation: str):
+    """Temporarily switch the attn implementation of the model."""
+    # store original attn implementation including from sub_configs
+    attn_implementations: Dict[Optional[str], str] = {}
+    attn_implementations[None] = config._attn_implementation
+    for sub_config_key in config.sub_configs:
+        sub_config = getattr(config, sub_config_key, None)
+        if sub_config is not None:
+            attn_implementations[sub_config_key] = sub_config._attn_implementation
+
+    # override attn implementation for all configs/sub_configs
+    config._attn_implementation = attn_implementation
+
+    yield
+
+    # restore original attn implementation for all configs/sub_configs
+    for sub_config_key, sub_attn_implementation in attn_implementations.items():
+        sub_config = config if sub_config_key is None else getattr(config, sub_config_key)
+        sub_config._attn_implementation = sub_attn_implementation
+
+
 @TransformRegistry.register("detect_hf_attn_layers")
 class DetectHFAttnLayers(BaseTransform):
     """Detect the number of attn layers in the model and store a node-like reference for them.
@@ -93,15 +116,12 @@ class DetectHFAttnLayers(BaseTransform):
 
         # Register profiler attn operator
         ALL_ATTENTION_FUNCTIONS.register("ad_profile_mha", fake_profiler_mha)
-        attn_implementation = model.config._attn_implementation
-        model.config._attn_implementation = "ad_profile_mha"
 
-        # update the graph module with the fake attn nodes during the profiling run
-        profiling_metadata = {"gm": gm, "num_matches": 0}
-        model.forward(*cm.args, profiling_metadata=profiling_metadata)
-
-        # switch back to original attn implementation
-        model.config._attn_implementation = attn_implementation
+        # run the forward pass with the profiling function
+        with switch_attn_implementation(model.config, "ad_profile_mha"):
+            # update the graph module with the fake attn nodes during the profiling run
+            profiling_metadata = {"gm": gm, "num_matches": 0}
+            model.forward(**cm.named_args, profiling_metadata=profiling_metadata)
 
         info = TransformInfo(
             skipped=False,
@@ -147,8 +167,10 @@ def get_cached_attn(
             query,
             key,
             value,
-            # metadata+caches+buffers+constants as constructed in forward_cached
-            *kwargs["cached_attn_args_lookup"][module._node_ref],
+            # metadata+caches+buffers with name lookup set up during kvcache transform
+            *[kwargs[k] for k in module._node_ref.meta["metadata_cache_buffer_keys"]],
+            # constants set up during kvcache transform
+            *module._node_ref.meta["constants"],
         )
 
         # check if we need to transpose the outputs, outgoing layout is bsnd in HF attn interface
@@ -165,26 +187,20 @@ def get_cached_attn(
     return cached_attn
 
 
-def forward_cached(gm: GraphModule, *cm_args):
-    """Pre-process cached arguments for attention and then run regular factory forward."""
-    # retrieve uncached args
-    uncached_args = cm_args[: gm.num_uncached_args]
+def forward_with_prepare_metadata(gm: GraphModule, **cm_kwargs):
+    """Run prepare_metadata as pre-processing step, add to kwargs, and then run regular forward."""
 
-    cached_attn_args_lookup: Dict[Node, List[Any]] = defaultdict(list)
+    if hasattr(gm, "_prepare_metadata_info"):
+        # collect args+constant args
+        args = [cm_kwargs[k] for k in gm._prepare_metadata_info["arg_names"]]
+        const_args = gm._prepare_metadata_info["const_args"]
 
-    # check if there is any cached attn nodes and if yes, compute metadata
-    if gm.node_to_cache_buffer_indices:
-        metadata = gm.get_metadata(
-            *[cm_args[i] for i in gm.prepare_metadata_args_index_map],
-            *gm.prepare_metadata_const_args,
-        )
+        # run prepare_metadata function and add to kwargs
+        metadata = gm._prepare_metadata_info["get_metadata"](*args, *const_args)
+        return_names = gm._prepare_metadata_info["return_names"]
+        cm_kwargs.update({k: v for k, v in zip(return_names, metadata)})
 
-    for node, c_b_indices in gm.node_to_cache_buffer_indices.items():
-        cached_attn_args_lookup[node].extend(metadata)
-        cached_attn_args_lookup[node].extend([cm_args[i] for i in c_b_indices])
-        cached_attn_args_lookup[node].extend(gm.node_to_constants[node])
-
-    return gm.factory_model.forward(*uncached_args, cached_attn_args_lookup=cached_attn_args_lookup)
+    return gm.factory_model.forward(**cm_kwargs)
 
 
 # TODO: how running different kv cache transforms look like? This one below wouldn't work if we
@@ -194,14 +210,17 @@ class HFReplaceCachedAttn(InsertCachedAttention):
     """Replace cached attention for the factory model, update inputs and outputs, and patch the gm forward."""
 
     def _process_get_metadata(
-        self, gm: GraphModule, m_args: List[str], const_args: List[Any]
+        self, gm: GraphModule, m_args: List[str], const_args: List[Constant]
     ) -> List[Node]:
         """Store get metadata function as reference and simply return."""
         get_metadata, num_ret_metadata = self.attn_descriptor.get_prepare_metadata_op()
-        gm.get_metadata = get_metadata
-        gm.prepare_metadata_arg_names = m_args
-        gm.prepare_metadata_const_args = const_args
-        return [f"metadata_{i}" for i in range(num_ret_metadata)]  # we don't need actual nodes...
+        gm._prepare_metadata_info = {
+            "get_metadata": get_metadata,
+            "arg_names": m_args,
+            "const_args": const_args,
+            "return_names": [f"metadata_{i}" for i in range(num_ret_metadata)],
+        }
+        return gm._prepare_metadata_info["return_names"]  # we don't need actual nodes...
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """We don't need to actually do anything here, just return the cache name."""
@@ -215,12 +234,12 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         meta_nodes: List[Node],
         cache_nodes: List[Node],
         buffer_nodes: List[Node],
-        constants: List[Any],
+        constants: List[Constant],
     ):
         """Here we now need to actually do the correct mapping of the cached attn nodes."""
         # store reference to metadata, caches, buffers, and constants for this attn node
-        gm.node_to_cache_buffer_names[attn_node] = (*cache_nodes, *buffer_nodes)
-        gm.node_to_constants[attn_node] = constants
+        attn_node.meta["metadata_cache_buffer_keys"] = (*meta_nodes, *cache_nodes, *buffer_nodes)
+        attn_node.meta["constants"] = constants
 
     def _apply(
         self,
@@ -229,34 +248,21 @@ class HFReplaceCachedAttn(InsertCachedAttention):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # patch gm so we can run the insert cached attn transform
-        gm.node_to_cache_buffer_names: Dict[Node, List[str]] = {}
-        gm.node_to_constants: Dict[Node, List[Any]] = {}
-
-        # switch to to cached inputs now as expected by insert cached attn transform
-        gm.num_uncached_args = len(cm.args)
+        # switch to cached attn inputs from now
         cm.info.switch_to_cached_attn_inputs()
 
         # run actual insert cached attn transform
         gm, info = super()._apply(gm, cm, factory, shared_config)
 
-        # we retrieve a key to index map for cm.args
-        cm_keys_to_index = {k: idx for idx, k in enumerate(cm.all_future_arg_names)}
-
-        # store index map for prepare_metadata relevant args
-        gm.prepare_metadata_args_index_map = [
-            cm_keys_to_index[k] for k in gm.prepare_metadata_arg_names
-        ]
-
-        # store a map from node to cache_buffer indices
-        gm.node_to_cache_buffer_indices: Dict[Node, List[int]] = {}
-        for node, c_b_names in gm.node_to_cache_buffer_names.items():
-            gm.node_to_cache_buffer_indices[node] = [cm_keys_to_index[k] for k in c_b_names]
-
-        # switch to cached forward which requires the above computed index maps
+        # register cached attn operator and switch to cached forward function
         ALL_ATTENTION_FUNCTIONS.register("ad_cached_mha", get_cached_attn(self.attn_descriptor))
-        gm.factory_model.config._attn_implementation = "ad_cached_mha"
-        gm.forward = types.MethodType(forward_cached, gm)
+        gm.forward = types.MethodType(forward_with_prepare_metadata, gm)
+
+        # switch to cached attn implementation but _only_ for modules/configs that have a cached
+        # attn node (we don't want to switch to cached attn implementation for all modules)
+        for mod in gm.factory_model.modules():
+            if hasattr(mod, "_node_ref"):
+                mod.config._attn_implementation = "ad_cached_mha"
 
         # we assume graph is clean again by definition
         info_dict = info.model_dump()

@@ -1,11 +1,11 @@
 # Additional default args for AutoDeployConfig/LlmArgs in _torch/auto_deploy/llm_args.py
-
 transforms:
   ############################################################################################
   # BUILD MODEL, LOAD WEIGHTS, AND WRAP IT INTO FAKE GRAPH MODULE
   ############################################################################################
   build_and_load_factory_model:
     stage: factory
+    use_strict_forward: false
   ############################################################################################
   # MOVE ARGUMENTS TO DEVICE
   ############################################################################################
@@ -23,3 +23,10 @@ transforms:
     stage: cache_init
   resize_kv_cache:
     stage: cache_init
+    args_only: false # use kwargs instead of args
+  ############################################################################################
+  # COMPILE MODEL
+  ############################################################################################
+  forward_with_cached_sequence_interface:
+    stage: compile
+    args_only: false # use kwargs instead of args

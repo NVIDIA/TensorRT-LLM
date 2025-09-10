@@ -52,6 +52,8 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
             file_path = Path(file).expanduser()
             if file_path.is_file():
                 confs.append(OmegaConf.load(file_path))
+            else:
+                raise ValueError(f"File {file} does not exist")
 
         return deep_merge_dicts(*confs)
 
