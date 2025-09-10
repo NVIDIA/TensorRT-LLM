@@ -125,7 +125,12 @@ endif
 CUBIN_CPP = $(patsubst %.cu.cubin, %.cubin.cpp, $(CUBINS))
 CUBIN_OBJ = $(patsubst %.cubin.cpp, %.cubin.o, $(CUBIN_CPP))
 
-GENCODES  = $(GENCODE_SM70)
+GENCODES =
+
+ifdef ENABLE_SM70
+GENCODES += $(GENCODE_SM70)
+endif
+
 GENCODES += $(GENCODE_SM72)
 GENCODES += $(GENCODE_SM75)
 GENCODES += $(GENCODE_SM80)
