@@ -66,5 +66,6 @@ blake3
 soundfile
 triton==3.3.1; platform_machine == "x86_64"
 tiktoken
+timm
 blobfile
 openai-harmony==0.0.4
