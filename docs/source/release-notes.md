@@ -172,7 +172,8 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Known Issues
 - On bare-metal Ubuntu 22.04 or 24.04, please install the `cuda-python==12.9.1` package after installing the TensorRT-LLM wheel. This resolves an incompatibility issue with the default cuda-python 13 of error `ImportError: cannot import name 'cuda' from 'cuda'`.
-- When using disaggregated serving with pipeline parallelism and KV cache reuse, a hang can occur. This will be fixed in a future release. In the meantime, disabling KV cache reuse will fix this issue. 
+- When using disaggregated serving with pipeline parallelism and KV cache reuse, a hang can occur. This will be fixed in a future release. In the meantime, disabling KV cache reuse will fix this issue.
+- Running multi-node cases where each node has just a single GPU is known to fail. This will be addressed in a future release. 
 
 ## TensorRT-LLM Release 0.21.0
 
