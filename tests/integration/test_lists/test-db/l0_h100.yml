@@ -104,7 +104,11 @@ l0_h100:
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-enable_request_rate] # negative test
   - test_e2e.py::test_trtllm_bench_help_sanity[meta-llama/Llama-3.1-8B]
-  - test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-False-image-True]
+  - test_e2e.py::test_openai_chat_harmony
+  - test_e2e.py::test_openai_responses
+  - test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-True] TIMEOUT (90)
+  # ------------- AutoDeploy tests ---------------
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
 - condition:
     ranges:
       system_gpu_count:
@@ -233,8 +237,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_ngram[xgrammar]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_ngram[llguidance]
-  - test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-False-image-True]
-  - test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-False-mixture_text_image-True]
+  - test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-image-True]
+  - test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-mixture_text_image-True]
 - condition:
     ranges:
       system_gpu_count:

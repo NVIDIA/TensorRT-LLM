@@ -21,11 +21,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (
-    find_input_mm_embeds,
-    fuse_input_embeds,
-    get_multimodal_embeddings
-)
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
@@ -598,8 +595,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             if not DISAGG:
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
-                    multimodal_params=multimodal_params[:num_context_requests]
-                )
+                    multimodal_params=multimodal_params[:num_context_requests])
             else:
                 mm_embeds = [
                     multimodal_param.multimodal_data["multimodal_embedding"]
@@ -609,7 +605,8 @@ class Qwen2VLModelBase(PreTrainedModel):
                 multimodal_params, num_context_requests,
                 num_generation_requests)
 
-            mm_embeds = find_input_mm_embeds(mm_embeds, multimodal_params[:num_context_requests])
+            mm_embeds = find_input_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
 
         if 'mrope_position_deltas' in kwargs:
             mrope_config['mrope_position_deltas'] = kwargs[
