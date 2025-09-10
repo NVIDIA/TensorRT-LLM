@@ -175,16 +175,16 @@ class FusedMoEMethodBase(ABC):
         w2_bias_shape: Optional[tuple[int, int]] = None,
     ):
         if module.use_prefetch:
-            w3_w1_weight = nn.Parameter(torch.empty(
-                w3_w1_weight_shape,
-                dtype=weight_dtype,
-                device=torch.device("cpu")).pin_memory(),
+            w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
+                                                    dtype=weight_dtype,
+                                                    device=torch.device("cpu"),
+                                                    pin_memory=True),
                                         requires_grad=False)
-            w2_weight = nn.Parameter(
-                torch.empty(w2_weight_shape,
-                            dtype=weight_dtype,
-                            device=torch.device("cpu")).pin_memory(),
-                requires_grad=False)
+            w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
+                                                 dtype=weight_dtype,
+                                                 device=torch.device("cpu"),
+                                                 pin_memory=True),
+                                     requires_grad=False)
             module.prefetch_proxy.register_weight(w3_w1_weight, w2_weight)
         else:
             # Fused gate_up_proj (column parallel)

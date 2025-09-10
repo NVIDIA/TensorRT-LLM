@@ -66,7 +66,7 @@ class MoeLoadBalancerConfig:
 
 @dataclass
 class MoEPrefetchConfig:
-    prefetch_depth: int = 2
+    prefetch_capacity: int = 2
     prefetch_stride: int = 1
 
 

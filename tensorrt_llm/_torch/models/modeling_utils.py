@@ -86,7 +86,10 @@ class MetaInitMode(TorchDispatchMode):
         if func in self.init_ops:
             if kwargs is None:
                 kwargs = {}
-            kwargs['device'] = torch.device('meta')
+            # respect caller-provided device
+            has_device = ('device' in kwargs and kwargs['device'] is not None)
+            if not has_device:
+                kwargs['device'] = torch.device('meta')
             return func(*args, **kwargs)
         elif func not in self.random_init_ops and self._has_meta_tensor(
                 args, kwargs):
@@ -241,11 +244,17 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.epilogue = []
         self.keep_embed_tokens = False
 
-    def __moe_prefetch_init__(self,
-                              model_config: ModelConfig,
-                              moe_layer_freq: int = 1,
-                              add_moe_layer_offset: bool = False,
-                              first_k_dense_replace: int = 0):
+    # Helper function for moe models to retrieve moe layer patterns
+    @staticmethod
+    def _moe_layer_pattern(_model_config: ModelConfig):
+        # default: all layers' MLP are moe
+        moe_layer_freq = 1
+        first_k_dense_replace = 0
+        moe_layer_offset = 0
+
+        return moe_layer_freq, first_k_dense_replace, moe_layer_offset
+
+    def __moe_prefetch_init__(self, model_config: ModelConfig):
         self.use_moe_prefetch = False
         self.moe_prefetch_manager = None
         self.moe_prefetch_proxy_list = [
@@ -255,10 +264,20 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
 
         if model_config.moe_prefetch_config is not None:
             self.use_moe_prefetch = True
+
+            # calculate moe layer indices
+            moe_layer_freq, first_k_dense_replace, moe_layer_offset = self._moe_layer_pattern(
+                model_config)
+            num_hidden_layers = model_config.pretrained_config.num_hidden_layers
+            moe_layer_indices = [
+                i for i in range(num_hidden_layers)
+                if i >= first_k_dense_replace and (i + moe_layer_offset) %
+                moe_layer_freq == 0
+            ]
+
             self.moe_prefetch_manager = MoEPrefetchManager(
-                model_config.pretrained_config.num_hidden_layers,
-                moe_layer_freq, add_moe_layer_offset, first_k_dense_replace,
-                model_config.moe_prefetch_config.prefetch_depth,
+                moe_layer_indices,
+                model_config.moe_prefetch_config.prefetch_capacity,
                 model_config.moe_prefetch_config.prefetch_stride)
             for layer_idx in self.moe_prefetch_manager.prefetch_layer_indices:
                 self.moe_prefetch_proxy_list[layer_idx] = MoEPrefetchProxy(

@@ -811,11 +811,7 @@ class Llama4Model(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
-        super().__moe_prefetch_init__(
-            model_config=model_config,
-            moe_layer_freq=model_config.pretrained_config.
-            interleave_moe_layer_step,
-            add_moe_layer_offset=True)
+        super().__moe_prefetch_init__(model_config=model_config)
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
@@ -881,7 +877,7 @@ class Llama4Model(DecoderModel):
 
         if self.use_moe_prefetch:
             cur_stream = torch.cuda.current_stream()
-            self.moe_prefetch_manager.prefetch_weights(cur_stream)
+            self.moe_prefetch_manager.prefetch_initial_weights(cur_stream)
 
         for idx, decoder_layer in enumerate(
                 self.layers[:self.num_hidden_layers]):
@@ -895,6 +891,15 @@ class Llama4Model(DecoderModel):
             )
 
         return hidden_states
+
+    @staticmethod
+    def _moe_layer_pattern(model_config: ModelConfig):
+        config = model_config.pretrained_config
+        moe_layer_freq = config.interleave_moe_layer_step
+        first_k_dense_replace = 0
+        moe_layer_offset = 1
+
+        return moe_layer_freq, first_k_dense_replace, moe_layer_offset
 
 
 class LlamaModel(DecoderModel):

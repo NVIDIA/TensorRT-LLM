@@ -301,12 +301,17 @@ class MoeConfig(StrictBaseModel):
     use_moe_prefetch: bool = Field(
         default=False, description="Whether to use MoE prefetching.")
 
-    moe_prefetch_depth: Optional[int] = Field(
+    moe_prefetch_capacity: Optional[int] = Field(
         default=None,
-        description="The depth of MoE prefetching device buffers.")
+        description=
+        "Number of MoE layers (weights) that can be buffered concurrently on device"
+    )
 
     moe_prefetch_stride: Optional[int] = Field(
-        default=None, description="The stride of MoE prefetching layers.")
+        default=None,
+        description=
+        "Stride of MoE prefetching layers -- offload weights for one layer every stride layers"
+    )
 
     moe_prefetch_config: Optional[object] = Field(
         default=None,
@@ -316,14 +321,22 @@ class MoeConfig(StrictBaseModel):
             "Optional[tensorrt_llm._torch.model_config.MoEPrefetchConfig]"
         })
 
-    @field_validator('moe_prefetch_depth', 'moe_prefetch_stride')
+    @field_validator('moe_prefetch_capacity', 'moe_prefetch_stride')
     @classmethod
     def validate_positive_integers(cls, v):
         if v is not None and (not isinstance(v, int) or v <= 0):
             raise ValueError(
-                f"MoE prefetching depth and stride must be positive, but got {v}"
+                f"MoE prefetching capacity and stride must be positive, but got {v}"
             )
         return v
+
+    @model_validator(mode='after')
+    def validate_moe_prefetch_backend(self) -> 'MoeConfig':
+        if self.use_moe_prefetch and self.backend != 'CUTLASS':
+            raise ValueError(
+                f"MoE prefetching is only supported with CUTLASS backend, but got {self.backend}"
+            )
+        return self
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -2722,10 +2735,10 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_moe_prefetch_config(self):
         from .._torch.model_config import MoEPrefetchConfig
         if self.moe_config.use_moe_prefetch and self.moe_config.moe_prefetch_config is None:
-            depth = self.moe_config.moe_prefetch_depth or 2
+            capacity = self.moe_config.moe_prefetch_capacity or 2
             stride = self.moe_config.moe_prefetch_stride or 1
             self.moe_config.moe_prefetch_config = MoEPrefetchConfig(
-                prefetch_depth=depth, prefetch_stride=stride)
+                prefetch_capacity=capacity, prefetch_stride=stride)
         return self
 
     @model_validator(mode='after')
