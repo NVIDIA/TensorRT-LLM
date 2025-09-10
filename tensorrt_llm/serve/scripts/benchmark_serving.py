@@ -609,6 +609,10 @@ def main(args: argparse.Namespace):
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer_mode = args.tokenizer_mode
 
+    if backend == "openai-chat" and args.use_chat_template:
+        raise ValueError(
+            "'--use-chat-template' should not be set when using 'openai-chat'.")
+
     if backend == "openai-chat":
         args.endpoint = "/v1/chat/completions"
 
@@ -724,13 +728,14 @@ def main(args: argparse.Namespace):
                                       dataset_path=args.dataset_path,
                                       download_path=args.download_path,
                                       download_timeout=args.download_timeout,
-                                      random_seed=args.seed).sample(
-                                          tokenizer=tokenizer,
-                                          num_requests=args.num_prompts,
-                                          prefix_len=args.random_prefix_len,
-                                          input_len=args.random_input_len,
-                                          output_len=args.random_output_len,
-                                          range_ratio=args.random_range_ratio),
+                                      random_seed=args.seed).
+                sample(tokenizer=tokenizer,
+                       num_requests=args.num_prompts,
+                       prefix_len=args.random_prefix_len,
+                       input_len=args.random_input_len,
+                       output_len=args.random_output_len,
+                       range_ratio=args.random_range_ratio,
+                       use_chat_template=args.use_chat_template),
                 "random_image":
                 lambda: RandomImageDataset(
                     random_seed=args.seed,
@@ -1157,7 +1162,14 @@ if __name__ == "__main__":
         "--tokenize-on-client",
         action="store_true",
         help=
-        "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same ISL specified by cli.",
+        "Tokenize on client instead of server. This option only takes effect "
+        "with random dataset to let the server run exactly the same ISL "
+        "specified by cli.",
+    )
+    random_group.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        help="Use chat template to format the prompt.",
     )
     random_image_group = parser.add_argument_group(
         "random image dataset options")
