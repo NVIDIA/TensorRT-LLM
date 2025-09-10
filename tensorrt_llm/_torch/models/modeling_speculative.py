@@ -1,13 +1,10 @@
-from typing import Any, Dict, Generic, Optional, Tuple
+from typing import Dict, Generic, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
-    BaseWeightMapper
-from tensorrt_llm.functional import PositionEmbeddingType
-
+from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig, TConfig
@@ -19,7 +16,9 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import SpecMetadata, get_spec_worker
+from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
 
@@ -150,6 +149,7 @@ class Eagle3DraftModel(DecoderModel):
         self.dtype = config.torch_dtype
         self.hidden_size = config.hidden_size
         self.mapping = model_config.mapping
+        self.num_layers = model_config.pretrained_config.num_hidden_layers
 
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size
@@ -163,7 +163,13 @@ class Eagle3DraftModel(DecoderModel):
                              bias=getattr(config, "bias", False),
                              dtype=config.torch_dtype)
 
-        self.midlayer = Eagle3DecoderLayer(model_config, start_layer_idx)
+        if self.num_layers > 1:
+            self.midlayer = nn.ModuleList([
+                Eagle3DecoderLayer(model_config, start_layer_idx + i)
+                for i in range(self.num_layers)
+            ])
+        else:
+            self.midlayer = Eagle3DecoderLayer(model_config, start_layer_idx)
 
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
@@ -171,7 +177,7 @@ class Eagle3DraftModel(DecoderModel):
 
         if config.draft_vocab_size is not None and config.vocab_size != config.draft_vocab_size:
             self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
-                                                dtype=torch.int64),
+                                                dtype=torch.int32),
                                     requires_grad=False)
 
         if self.hidden_size_in != config.hidden_size:
@@ -212,11 +218,22 @@ class Eagle3DraftModel(DecoderModel):
         # we expect that to happen outside the model definition. This helps us
         # avoid data-dependent control flow and gives us better CUDA graph
         # coverage.
-        hidden_states, residual = self.midlayer(position_ids=position_ids,
+        residual = None
+        if self.num_layers > 1:
+            for layer in self.midlayer:
+                if residual is not None:
+                    hidden_states = hidden_states + residual
+                hidden_states, residual = layer(position_ids=position_ids,
                                                 embeds=inputs_embeds,
                                                 hidden_states=hidden_states,
                                                 attn_metadata=attn_metadata,
                                                 spec_metadata=spec_metadata)
+        else:
+            hidden_states, residual = self.midlayer(position_ids=position_ids,
+                                                    embeds=inputs_embeds,
+                                                    hidden_states=hidden_states,
+                                                    attn_metadata=attn_metadata,
+                                                    spec_metadata=spec_metadata)
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
@@ -292,18 +309,6 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
             self.model.embed_tokens = target_model.model.embed_tokens
         if self.load_lm_head_from_target:
             self.lm_head = target_model.lm_head
-
-    # TODO: should input/position IDs be included in this? Keeping it implicit
-    # for now since the shapes/dtypes are the same across all models we have.
-    def get_warmup_extra_inputs(self, batch_size: int,
-                                num_tokens: int) -> Dict[str, Any]:
-
-        hidden_states = torch.empty(batch_size * num_tokens,
-                                    self.model.hidden_size,
-                                    dtype=self.model.dtype,
-                                    device='cuda')
-
-        return {'hidden_states': hidden_states}
 
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -478,3 +483,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.draft_model.load_weights(weights=weights,
                                       weight_mapper=weight_mapper)
         self.draft_model.load_weights_from_target_model(self)
+
+    def set_guided_decoder(self,
+                           guided_decoder: CapturableGuidedDecoder) -> bool:
+        if hasattr(self.spec_worker, "set_guided_decoder"):
+            return self.spec_worker.set_guided_decoder(guided_decoder)
+        return False

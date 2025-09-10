@@ -357,7 +357,7 @@ def test_llm_with_kv_cache_retention_config():
     kv_cache_retention_config = KvCacheRetentionConfig([
         KvCacheRetentionConfig.TokenRangeRetentionConfig(
             0, 2, 30, datetime.timedelta(seconds=30))
-    ], 80)
+    ], 80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
 
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
@@ -594,6 +594,7 @@ def llm_for_sampling_params():
     llm.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/5504095")
 @pytest.mark.part0
 def test_user_specify_workspace():
     user_specified_ws_path = '/tmp/specified_workspace'

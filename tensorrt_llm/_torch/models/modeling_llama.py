@@ -315,23 +315,19 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
-                              all_rank_max_num_tokens,
                               cutlass_min_latency_mode):
         router_logits = self.router(hidden_states)
-        routed_output = self.experts(
-            hidden_states,
-            router_logits,
-            do_finalize=not cutlass_min_latency_mode,
-            all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=False)
+        routed_output = self.experts(hidden_states,
+                                     router_logits,
+                                     do_finalize=not cutlass_min_latency_mode,
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=False)
         return routed_output
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens=None,
-        all_rank_max_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
@@ -339,8 +335,7 @@ class Llama4MoE(nn.Module):
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, all_rank_max_num_tokens,
-            cutlass_min_latency_mode)
+            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if cutlass_min_latency_mode:
@@ -542,7 +537,6 @@ class Llama4DecoderLayer(DecoderLayer):
         hidden_states = self.feed_forward(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_feed_forward_allreduce),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
@@ -1280,7 +1274,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 ]
 
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                     input_ids, mm_embeds)
+                                                     input_ids, mm_embeds,
+                                                     **kwargs)
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

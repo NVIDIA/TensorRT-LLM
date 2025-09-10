@@ -469,6 +469,11 @@ class KVCacheManager(BaseResourceManager):
         max_num_draft_tokens: int = 0,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        # For capturable drafting loops. During normal inference, the draft model always
+        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
+        # we need to make the KV cache manager aware that multiple autoregressive steps will
+        # occur.
+        num_extra_decoding_steps: int = 0,
     ):
         beam_width = max_beam_width
         requests = []
@@ -502,6 +507,10 @@ class KVCacheManager(BaseResourceManager):
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
                 for _ in range(self.num_extra_kv_tokens):
                     self.impl.add_token(req_id)
+
+                for _ in range(num_extra_decoding_steps):
+                    self.impl.add_token(req_id)
+
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
@@ -510,6 +519,7 @@ class KVCacheManager(BaseResourceManager):
                 if prepare_resource:
                     for _ in range(max_num_draft_tokens):
                         self.impl.add_token(req_id)
+
             requests.append(req)
         return requests
 
@@ -1031,6 +1041,13 @@ class SlotManager:
         if request_id in self.slot_mapping:
             slot = self.slot_mapping.pop(request_id)
             self.free_slots.add(slot)
+
+    def shutdown(self):
+        req_ids_list = list(self.slot_mapping.keys())
+        for rid in req_ids_list:
+            self.remove_slot(rid)
+        assert len(self.slot_mapping) == 0 and len(
+            self.free_slots) == self.max_num_requests
 
 
 class ResourceManager:

@@ -1,0 +1,21 @@
+# Enable torch compile optimizations for Qwen3-30B-A3B-FP8
+torch_compile_config:
+  enable_fullgraph: true
+  enable_inductor: false
+  enable_piecewise_cuda_graph: true
+  enable_userbuffers: true
+  max_num_streams: 3
+
+# Server configuration options
+max_batch_size: 1
+max_num_tokens: 4223
+max_seq_len: 4223
+tensor_parallel_size: 1
+num_postprocess_workers: 1
+
+# KV Cache configuration
+kv_cache_config:
+  free_gpu_memory_fraction: 0.8
+
+# Additional performance settings
+print_iter_log: true

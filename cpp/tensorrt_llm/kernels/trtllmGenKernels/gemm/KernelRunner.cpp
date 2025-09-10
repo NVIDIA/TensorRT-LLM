@@ -18,6 +18,8 @@
 
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "trtllmGen_gemm_export/GemmInterface.h"
 #include "trtllmGen_gemm_export/GemmOptions.h"
 #include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
@@ -32,6 +34,23 @@ using namespace gemm::gemm;
 
 static GemmInterface::ModuleCache globalTrtllmGenGemmModuleCache;
 
+constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
+{
+    if (gpuSM == 103)
+    {
+        return kernelSM == SmVersion::Sm103a || kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 100)
+    {
+        return kernelSM == SmVersion::Sm100a || kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 90)
+    {
+        return kernelSM == SmVersion::Sm90a;
+    }
+    return true;
+}
+
 TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& options_)
     : mOptions(options_)
 {
@@ -40,15 +59,17 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
     auto const configs = gemm.getGemmConfigs();
 
     mPassingConfigIndices.clear();
-
+    int gpuNativeSmVersion = tensorrt_llm::common::getSMVersion();
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i)
     {
         auto const options = configs[i].mOptions;
 
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
+        if (options.mDtypeA == mOptions.eltTypeA && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
-            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput)
+            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
+            && (mOptions.eltTypeB == gemm::trtllm::gen::Dtype::Void || options.mDtypeB == mOptions.eltTypeB)
+            && isSMCompatible(gpuNativeSmVersion, configs[i].mSm))
         {
             mPassingConfigIndices.push_back(i);
         }
@@ -113,8 +134,8 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
     // FIXME once we start using all-reduce in the epilogue of the gemm this can be moved elsewhere
     gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = gemm.run(
-        config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount, globalTrtllmGenGemmModuleCache);
+    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+        tensorrt_llm::common::getEnvEnablePDL(), globalTrtllmGenGemmModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }
@@ -141,12 +162,30 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
 
     std::vector<int32_t> sortedIndices = mPassingConfigIndices;
     std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&configs](int32_t idx0, int32_t idx1)
+        [&configs, &gemmData](int32_t idx0, int32_t idx1)
         {
             auto const& optionsA = configs[idx0].mOptions;
             auto const& optionsB = configs[idx1].mOptions;
 
-            // Sort by tileK sizes first
+            // Choose the tileN that is closest to the problem N. Also if one tileN is larger and the other is smaller,
+            // prefer the larger one. This is the batch size dimension for low latency (transposeMmaOutput) case;
+            if (optionsA.mTileN != optionsB.mTileN)
+            {
+                auto const N = gemmData.mProblemDimensions.mN;
+                auto const tileA = optionsA.mTileN;
+                auto const tileB = optionsB.mTileN;
+
+                // If one tile is larger than N and one is smaller, prefer the larger one
+                if ((tileA >= N) != (tileB >= N))
+                {
+                    return tileA > tileB;
+                }
+
+                // Otherwise, choose the closest to N
+                return abs(N - tileA) < abs(N - tileB);
+            }
+
+            // Sort by tileK sizes
             if (optionsA.mTileK != optionsB.mTileK)
             {
                 return optionsA.mTileK > optionsB.mTileK;
@@ -156,6 +195,13 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
             if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma)
             {
                 return optionsA.mUseUnrollLoop2xForMma;
+            }
+
+            // Sort by tileM sizes
+            // This is the batch size dimension for throughput (non-transposeMmaOutput) case;
+            if (optionsA.mTileM != optionsB.mTileM)
+            {
+                return optionsA.mTileM > optionsB.mTileM;
             }
 
             // Then by splitK sizes

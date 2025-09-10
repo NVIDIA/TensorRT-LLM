@@ -108,7 +108,7 @@ you need to manually check `/dev/shm` directory and delete `/dev/shm/moe_shared_
 
 ### Disaggregated serving related issues
 
-Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/advanced/disaggregated-service.md#troubleshooting-and-faq) section of Disaggregated-Service.
+Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md#troubleshooting-and-faq) section of Disaggregated-Service.
 
 ## References
 

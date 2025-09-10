@@ -1,4 +1,4 @@
-# How to get best performance on DeepSeek-R1 in TensorRT-LLM
+# How to get best performance on DeepSeek-R1 in TensorRT LLM
 
 NVIDIA has announced world-record DeepSeek-R1 inference performance at NVIDIA GTC 2025. A single NVIDIA DGX system with eight NVIDIA Blackwell GPUs can achieve over 250 tokens per second per user or a maximum throughput of over 30,000 tokens per second on the massive, state-of-the-art 671 billion parameter DeepSeek-R1 model. [NVIDIA Blackwell Delivers World-Record DeepSeek-R1 Inference Performance](https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/)
 
@@ -6,13 +6,13 @@ In this blog, we share the configurations and procedures about how to reproduce 
 
 ## Table of Contents
 
-- [How to get best performance on DeepSeek-R1 in TensorRT-LLM](#how-to-get-best-performance-on-deepseek-r1-in-tensorrt-llm)
+- [How to get best performance on DeepSeek-R1 in TensorRT LLM](#how-to-get-best-performance-on-deepseek-r1-in-tensorrt-llm)
   - [Table of Contents](#table-of-contents)
-  - [Prerequisites: Install TensorRT-LLM and download models](#prerequisites-install-tensorrt-llm-and-download-models)
-      - [1. Download TensorRT-LLM](#1-download-tensorrt-llm)
+  - [Prerequisites: Install TensorRT LLM and download models](#prerequisites-install-tensorrt-llm-and-download-models)
+      - [1. Download TensorRT LLM](#1-download-tensorrt-llm)
       - [2. Download the DeepSeek R1 models](#2-download-the-deepseek-r1-models)
-      - [3. Build and run TensorRT-LLM container](#3-build-and-run-tensorrt-llm-container)
-      - [4. Compile and Install TensorRT-LLM](#4-compile-and-install-tensorrt-llm)
+      - [3. Build and run TensorRT LLM container](#3-build-and-run-tensorrt-llm-container)
+      - [4. Compile and Install TensorRT LLM](#4-compile-and-install-tensorrt-llm)
       - [5. Optional: Tune GPU clocks](#5-optional-tune-gpu-clocks)
       - [6. Dataset preparation](#6-dataset-preparation)
   - [Reproducing steps](#reproducing-steps)
@@ -34,13 +34,13 @@ In this blog, we share the configurations and procedures about how to reproduce 
     - [Out of memory issues](#out-of-memory-issues)
 
 
-## Prerequisites: Install TensorRT-LLM and download models
+## Prerequisites: Install TensorRT LLM and download models
 
-This section can be skipped if you already have TensorRT-LLM installed and have already downloaded the DeepSeek R1 model checkpoint.
+This section can be skipped if you already have TensorRT LLM installed and have already downloaded the DeepSeek R1 model checkpoint.
 
-#### 1. Download TensorRT-LLM
+#### 1. Download TensorRT LLM
 
-**You can also find more comprehensive instructions to install TensorRT-LLM in this [TensorRT-LLM installation guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html), refer to that guide for common issues if you encounter any here.**
+**You can also find more comprehensive instructions to install TensorRT LLM in this [TensorRT LLM installation guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html), refer to that guide for common issues if you encounter any here.**
 
 ``` bash
 # Prerequisites
@@ -50,7 +50,7 @@ git lfs install
 # Replace with your actual path
 YOUR_WORK_PATH=<YOUR_WORK_PATH>
 
-# Clone the TensorRT-LLM repository
+# Clone the TensorRT LLM repository
 cd $YOUR_WORK_PATH
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
@@ -77,7 +77,7 @@ git clone https://huggingface.co/nvidia/DeepSeek-R1-FP4
 git clone https://huggingface.co/deepseek-ai/DeepSeek-R1
 ```
 
-#### 3. Build and run TensorRT-LLM container
+#### 3. Build and run TensorRT LLM container
 
 ``` bash
 cd TensorRT-LLM
@@ -85,7 +85,7 @@ make -C docker run LOCAL_USER=1 DOCKER_RUN_ARGS="-v $YOUR_MODEL_PATH:$YOUR_MODEL
 ```
 Here we set `LOCAL_USER=1` argument to set up the local user instead of root account inside the container, you can remove it if running as root inside container is fine.
 
-#### 4. Compile and Install TensorRT-LLM
+#### 4. Compile and Install TensorRT LLM
 Here we compile the source inside the container:
 
 ``` bash
@@ -122,11 +122,11 @@ The command to generate synthetic dataset will be attached to the max throughput
 
 This section provides the reproducing steps for NVIDIA Blackwell B200 and H200 GPUs, for both min-latency and max-throughput scenarios.
 
-All the benchmarking is done by the trtllm-bench command line tool provided in the TensorRT-LLM installation, see [TensorRT-LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details of this tool.
+All the benchmarking is done by the trtllm-bench command line tool provided in the TensorRT LLM installation, see [TensorRT LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details of this tool.
 
 For brevity, we only provide the commands to reproduce the perf numbers without detailed explanation of the tools and options in this doc.
 
-All these commands here are assumed to be running inside the container started by `make -C docker run ...` command mentioned in the [Build and run TensorRT-LLM container section](#3-build-and-run-tensorrt-llm-container)
+All these commands here are assumed to be running inside the container started by `make -C docker run ...` command mentioned in the [Build and run TensorRT LLM container section](#3-build-and-run-tensorrt-llm-container)
 
 ### B200 min-latency
 Our benchmark results are based on **Batch = 1, ISL = 1K, OSL = 2K, num_requests = 10 from real dataset**
@@ -158,7 +158,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 ```
 
 Explanation:
-- `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published. See [TensorRT-LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
+- `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published. See [TensorRT LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
 - `--dataset`: Prompt dataset used to benchmark. Our official benchmark dataset has ISL = 1K, OSL = 2K
 - `--num_requests`: Num requests used for the benchmark.
 - `--concurrency`: Total concurrency for the system.
@@ -186,7 +186,7 @@ Average request latency (ms):                     7456.1219
 
 Due to our evaluation found that FP8 KV cache does not introduce obvious accuracy drop compared to BF16 KV cache. See [Precision strategy](./tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md#precision-strategy), the latest [DeepSeek-R1-0528-FP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4) checkpoint had enabled FP8 KV cache by-default.
 
-We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers here. The results are reproduced with TensorRT-LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
+We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers here. The results are reproduced with TensorRT LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
 
 !! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.
 
@@ -239,7 +239,7 @@ Per GPU Output Throughput (tps/gpu):              5393.2755
 ### B200 max-throughput for R1 with FP16 KV cache
 Our benchmark results are based on **Batch = 3072, ISL = 1K, OSL = 2K, num_requests = 49152 from synthetic dataset**.
 
-The results are reproduced with TensorRT-LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
+The results are reproduced with TensorRT LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
 
 !! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.
 
@@ -401,7 +401,7 @@ Average request latency (ms):                     181540.5739
 
 ## Exploring more ISL/OSL combinations
 
-To benchmark TensorRT-LLM on DeepSeek models with more ISL/OSL combinations, you can use `prepare_dataset.py` to generate the dataset and use similar commands mentioned in the previous section. TensorRT-LLM is working on enhancements that can make the benchmark process smoother.
+To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use `prepare_dataset.py` to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
 ### WIP: Enable more features by default
 
 Currently, there are some features that need to be enabled through a user-defined file `extra-llm-api-config.yml`, such as CUDA graph, overlap scheduler and attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
