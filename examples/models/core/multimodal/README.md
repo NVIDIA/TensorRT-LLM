@@ -1084,7 +1084,7 @@ Navigate to the folder `TensorRT-LLM/examples/models/core/multimodal`
         --image_path=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png
         --audio_path=${HF_DIR}/examples/what_is_shown_in_this_image.wav
     ```
-## Qwen2-VL
+## Qwen2-VL/Qwen2.5-VL
 [Qwen2-VL Family](https://github.com/QwenLM/Qwen2-VL): is the latest version of the vision language models in the Qwen model families. Here we show how to deploy Qwen2-VL 2B and 7B in TensorRT-LLM.
 
 Firstly, please install transformers and qwen-vl-utils

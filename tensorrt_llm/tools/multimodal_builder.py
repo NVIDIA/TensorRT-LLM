@@ -1403,7 +1403,6 @@ def compute_rotary_pos_emb_qwen2_5_vl(grid_thw, hf_config,
         return rotary_pos_emb
 
     rotary_pos_emb = rot_pos_emb(grid_thw, rotary_pos_emb_func)
-    print(f"Rotary pos emb shape: {rotary_pos_emb.shape}")
     return rotary_pos_emb
 
 
@@ -1627,7 +1626,6 @@ def build_qwen2_5_vl_engine(args):
         device_map="cpu",
         attn_implementation="eager")
     hf_config = AutoConfig.from_pretrained(args.model_path)
-    print(vars(hf_config))
     qwen2_5_vl_dim = hf_config.vision_config.in_chans * hf_config.vision_config.patch_size * hf_config.vision_config.patch_size * hf_config.vision_config.temporal_patch_size
     processor = AutoProcessor.from_pretrained(args.model_path)
     messages = [{
