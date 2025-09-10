@@ -22,6 +22,7 @@ from .modeling_utils import DecoderModel, register_auto_model
 
 
 class SeedOssAttention(Attention):
+
     def __init__(
         self,
         model_config: ModelConfig[SeedOssConfig],
@@ -29,7 +30,8 @@ class SeedOssAttention(Attention):
     ):
         config = model_config.pretrained_config
         rope_scaling = getattr(config, "rope_scaling", None)
-        if isinstance(rope_scaling, dict) and rope_scaling.get("rope_type") == "default":
+        if isinstance(rope_scaling,
+                      dict) and rope_scaling.get("rope_type") == "default":
             # map transformers 'default' type to trtllm 'none' type
             config.rope_scaling["rope_type"] = "none"
         super().__init__(
@@ -179,7 +181,8 @@ class SeedOssModel(DecoderModel):
 
 
 @register_auto_model("SeedOssForCausalLM")
-class SeedOssForCausalLM(SpecDecOneEngineForCausalLM[SeedOssModel, SeedOssConfig]):
+class SeedOssForCausalLM(SpecDecOneEngineForCausalLM[SeedOssModel,
+                                                     SeedOssConfig]):
 
     def __init__(
         self,

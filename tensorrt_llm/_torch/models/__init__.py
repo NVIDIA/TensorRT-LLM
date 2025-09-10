@@ -30,8 +30,10 @@ from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
+
 try:
-    from .modeling_seedoss import SeedOssForCausalLM  # requires transformers with SeedOssConfig
+    from .modeling_seedoss import \
+        SeedOssForCausalLM  # requires transformers with SeedOssConfig
     _HAS_SEEDOSS = True
 except Exception:
     _HAS_SEEDOSS = False
