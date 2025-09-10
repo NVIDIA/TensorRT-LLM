@@ -62,13 +62,11 @@ class MixtralMoE(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=False)
         return final_hidden_states
 

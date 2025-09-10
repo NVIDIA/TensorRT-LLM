@@ -31,6 +31,7 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     filtered_nodes,
     identify_regions_between_residuals,
+    is_fake_quantized_linear_op,
     is_linear_op,
     is_op,
 )
@@ -109,8 +110,8 @@ def _append_simple_shard(
     for node_group in nodes_linear.values():
         for n in node_group:
             tp_shards.append(
-                TPShardingInfo(
-                    target_node=n.name,
+                TPShardingInfo.from_node(
+                    n,
                     split_dim=SplitDimension.COLUMN,
                     rank=rank,
                     world_size=world_size,
@@ -314,8 +315,8 @@ def detect_sharding_from_factory_config(
                 config = tp_plan[key]
                 if config == "colwise":
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.COLUMN,
                             rank=rank,
                             world_size=world_size,
@@ -325,8 +326,8 @@ def detect_sharding_from_factory_config(
                     )
                 elif config == "rowwise":
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.ROW,
                             rank=rank,
                             world_size=world_size,
@@ -375,8 +376,8 @@ def detect_sharding_from_factory_config(
                 elif "gather" in config:
                     # Simple shard (row + all_gather)
                     sharding_config.tp_transforms.append(
-                        TPShardingInfo(
-                            target_node=lin_node.name,
+                        TPShardingInfo.from_node(
+                            lin_node,
                             split_dim=SplitDimension.COLUMN,
                             rank=rank,
                             world_size=world_size,
@@ -514,7 +515,7 @@ def detect_column_row_shard(
         unaccounted_nodes: Set[Node] = set()
         current_node = n_start
         while current_node != n_end:
-            if is_linear_op(current_node, include_quantization=True):
+            if is_linear_op(current_node) or is_fake_quantized_linear_op(current_node):
                 nodes_linear[current_node.args[0]].append(current_node)
             elif is_op(current_node, shardable_attention_nodes):
                 attention_nodes.add(current_node)
@@ -599,8 +600,8 @@ def detect_column_row_shard(
                 else:
                     dist_op = None
                 sharding_config.tp_transforms.append(
-                    TPShardingInfo(
-                        target_node=n.name,
+                    TPShardingInfo.from_node(
+                        n,
                         split_dim=i,
                         rank=rank,
                         world_size=world_size,
@@ -713,13 +714,13 @@ def detect_ep_shard(gm: GraphModule, sharding_config: ShardingConfig) -> Transfo
             (
                 torch.ops.auto_deploy.torch_moe,
                 torch.ops.auto_deploy.torch_quant_fp8_moe,
-                torch.ops.auto_deploy.torch_quant_fp4_moe,
+                torch.ops.auto_deploy.torch_quant_nvfp4_moe,
             ),
         ):
             continue
         sharding_config.ep_transforms.append(
-            EPShardingInfo(
-                target_node=node.name,
+            EPShardingInfo.from_node(
+                node,
                 rank=rank,
                 world_size=world_size,
             )
