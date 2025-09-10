@@ -466,10 +466,10 @@ class LlavaNextModel(PreTrainedModel):
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=multimodal_params[:num_context_requests])
             else:
-                mm_embeds = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "LlavaNextModel does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
             mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
         input_ids, inputs_embeds = fuse_input_embeds(
