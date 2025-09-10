@@ -2333,8 +2333,8 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                  marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param("gemma-3-27b-it",
                  "gemma/gemma-3-27b-it",
-                 marks=(skip_post_blackwell,
-                        pytest.mark.skip_less_device_memory(80000))),
+                 marks=(pytest.mark.skip_less_device_memory(80000),
+                        skip_post_blackwell)),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
@@ -2729,10 +2729,10 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
-    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
-    ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
     pytest.param(
         "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
+    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
+    ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
 ])
 def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
                                         model_path):
