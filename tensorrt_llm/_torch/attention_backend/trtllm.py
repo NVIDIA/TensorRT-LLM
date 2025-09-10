@@ -1268,7 +1268,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
-            workspace=None,
+            workspace=metadata.
+            workspace,  # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
             cache_indirection=metadata.cache_indirection,
             kv_scale_orig_quant=self.kv_scale_orig_quant,
             kv_scale_quant_orig=self.kv_scale_quant_orig,
