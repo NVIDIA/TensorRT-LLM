@@ -686,8 +686,8 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,
-                              enable_mixed_sampler: bool,
-                              max_top_logprobs: int, max_batch_size: int,
+                              enable_mixed_sampler: bool, max_top_logprobs: int,
+                              max_batch_size: int,
                               speculative_config: SpeculativeConfig,
                               max_beam_width: int):
     max_num_sequences = max_batch_size * mapping.pp_size
@@ -715,7 +715,6 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         max_seq_len=engine.max_seq_len,
         enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler,
         max_top_logprobs=pytorch_backend_config.max_top_logprobs,
-    ,
         max_batch_size=max_batch_size,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width)

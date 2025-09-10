@@ -223,7 +223,6 @@ def setup_llm(args, **kwargs):
         args.top_k is None or args.top_k == 1) and (args.top_p is None
                                                     or args.top_p == 0.0)
 
-
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -270,6 +269,11 @@ def setup_llm(args, **kwargs):
 
     assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be less or equal to n: {args.n}"
 
+    num_logprobs = args.logprobs
+    if args.logprobs is not None:
+        if args.top_logprobs is not None:
+            num_logprobs = args.top_logprobs
+
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -277,8 +281,7 @@ def setup_llm(args, **kwargs):
         top_p=args.top_p,
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
-        logprobs=args.logprobs,
-        top_logprobs=args.top_logprobs,
+        logprobs=num_logprobs,
         n=args.n,
         best_of=best_of,
         use_beam_search=use_beam_search)
@@ -320,10 +323,6 @@ def main():
                 )
             if args.logprobs:
                 print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
-            if args.top_logprobs:
-                print(
-                    f"[{i}]{sequence_id_text} Top logprobs: {sequence.top_logprobs}"
-                )
 
 
 if __name__ == '__main__':

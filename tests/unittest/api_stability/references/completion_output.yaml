@@ -10,9 +10,6 @@ methods:
       request_perf_metrics:
         annotation: Optional[tensorrt_llm.bindings.executor.RequestPerfMetrics]
         default: null
-      top_logprobs:
-        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]]]
-        default: null
     return_annotation: None
 properties:
   length:

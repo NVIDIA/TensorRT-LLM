@@ -93,7 +93,6 @@ class CompletionOutput:
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
         logprobs (TokenLogprobs | List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
         prompt_logprobs (TokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.
-        top_logprobs (TokenLogprobs, optional): The log probabilities of the top probability words at each position if the top_logprobs are requested. Defaults to None.
         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
@@ -113,7 +112,6 @@ class CompletionOutput:
     logprobs: Optional[TokenLogprobs
                        | List[float]] = field(default_factory=list)
     prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
-    top_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
@@ -263,11 +261,9 @@ class GenerationResultBase:
                     output.logprobs = output.logprobs[:output.length]
                 assert len(output.logprobs) == output.length
             if response_tensors.top_log_probs is not None:
-                output.top_logprobs = response_tensors.top_log_probs[src_idx]
-                if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
-                    if len(output.top_logprobs) > output.length:
-                        output.top_logprobs = output.top_logprobs[:output.
-                                                                  length]
+                for logprob_idx in range(len(output.logprobs)):
+                    output.logprobs[logprob_idx].update(
+                        response_tensors.top_log_probs[src_idx][logprob_idx])
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
