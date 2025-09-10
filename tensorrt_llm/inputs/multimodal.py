@@ -24,16 +24,17 @@ class MultimodalInput:
     """
 
     multimodal_positions: List[int]
-    """Starting positions of each multimodal chunk in the token sequence.
+    """Starting positions of each contiguous multimodal token chunk in the token sequence.
 
     Contains only the start position of each chunk, not all positions of multimodal tokens.
     This is different from mm_positions elsewhere which contains all positions.
     """
 
     multimodal_lengths: List[int]
-    """Length (number of tokens) of each multimodal item.
+    """Length of each contiguous multimodal token chunk, including any special tokens.
 
-    Combined with multimodal_positions, this defines the token spans for each multimodal item.
+    Each span is unique to its multimodal item and may include special tokens for some models,
+    (e.g., image_end_token, image_break_token for mistral3) mixed with the actual multimodal tokens.
     """
 
     def __post_init__(self):
@@ -485,7 +486,13 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
 
 def find_mm_token_lengths(mm_data: Dict[str, Any],
                           input_processor: Any) -> List[int]:
-    """Get multimodal token lengths from multimodal data items. """
+    """Get the maximum contiguous multimodal token lengths from multimodal data items.
+
+    Returns the total token count for each multimodal item, including any special tokens
+    (e.g., image_begin, image_end, image_break) that may be mixed with the actual
+    multimodal content tokens. This mm_token_lengths represents the full contiguous chunk from beginning
+    to end, not just pure image/video/audio tokens.
+    """
 
     mm_items = {
         modality: items if isinstance(items, list) else [items]
@@ -528,22 +535,23 @@ def find_mm_token_positions(
         num_mm_tokens: List[int],
         vocab_size: Optional[int] = None,
         mm_token_ids: Optional[torch.Tensor] = None) -> List[int]:
-    """Get multimodal token positions using IDs > vocab_size and known lengths.
+    """Get starting positions of contiguous multimodal token chunks using known lengths.
 
-    This function finds multimodal tokens (with IDs > vocab_size) and uses the
-    provided lengths in num_mm_tokens to identify where each chunk starts.
-    This works even when there are no gaps between different image sequences
-    (e.g., when all images use the same token IDs).
-    Note at least one of vocab_size or mm_token_ids must be provided. If mm_token_ids is provided, vocab_size is ignored.
+    This function finds multimodal tokens (with IDs > vocab_size or matching mm_token_ids)
+    and uses the provided lengths in num_mm_tokens to identify where each contiguous chunk starts.
+    Each chunk in num_mm_tokens is assumed to be a contiguous block of multimodal tokens for each multimodal item, and may include special tokens (e.g., image_begin, image_end, image_break) within the chunk.
+
+    Note: at least one of vocab_size or mm_token_ids must be provided. If mm_token_ids
+    is provided, vocab_size is ignored.
 
     Args:
         input_ids: Token sequence (tensor, list, or numpy array)
-        num_mm_tokens: List of lengths for each multimodal token chunk
-        vocab_size: Size of the model's vocabulary
-        mm_token_ids: Possible token ids for multimodal tokens
+        num_mm_tokens: List of contiguous chunk lengths for each multimodal item
+        vocab_size: Size of the model's vocabulary (used to identify tokens > vocab_size)
+        mm_token_ids: Specific token IDs that represent multimodal tokens
 
     Returns:
-        List of starting positions for each multimodal token chunk
+        List of starting positions for each contiguous multimodal token chunk
     """
     if mm_token_ids is None and vocab_size is None:
         raise ValueError(

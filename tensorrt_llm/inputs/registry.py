@@ -85,6 +85,8 @@ class BaseMultimodalInputProcessor:
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
         """Return multimodal token IDs if available; otherwise None.
+
+        The token IDs filtered by this method should be contiguous for each multimodal item, i.e. special tokens if any should be included.
         """
         processor = self.get_processor()
         if processor is not None and getattr(processor, 'mm_token_ids',
