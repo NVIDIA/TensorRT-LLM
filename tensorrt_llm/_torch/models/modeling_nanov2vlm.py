@@ -33,6 +33,9 @@ def _is_disagg() -> bool:
 
 # TODO: update the reference config path once Nano v2 VLM is released.
 IMAGE_TOKEN_ID = 131072
+IMG_CONTEXT_TOKEN = "<image>"
+IMG_START_TOKEN = "<img>"
+IMG_END_TOKEN = "</img>"
 
 
 class SquaredReLU(nn.Module):
@@ -41,8 +44,7 @@ class SquaredReLU(nn.Module):
         return torch.pow(torch.nn.functional.relu(x), 2)
 
 
-class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
-                            transformers.generation.GenerationMixin):
+class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
 
     def __init__(self,
                  model_config: ModelConfig[transformers.PretrainedConfig]):
@@ -61,20 +63,21 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         self.llm_hidden_size = config.llm_config.hidden_size
         self.mlp1 = nn.Sequential(
             nn.RMSNorm(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
-                       eps=config.llm_config.rms_norm_eps),
+                       eps=config.llm_config.rms_norm_eps,
+                       dtype=config.torch_dtype),
             nn.Linear(self.vit_hidden_size * int(1 / self.downsample_ratio)**2,
                       self.vision_projection_hidden_size,
-                      bias=False), SquaredReLU(),
+                      bias=False,
+                      dtype=config.torch_dtype), SquaredReLU(),
             nn.Linear(self.vision_projection_hidden_size,
                       self.llm_hidden_size,
-                      bias=False))
-        self.mlp1 = self.mlp1.to(config.torch_dtype)
+                      bias=False,
+                      dtype=config.torch_dtype))
 
         # Construct the vision encoder.
         vision_model_config = copy.deepcopy(model_config)
         vision_model_config.pretrained_config = vision_model_config.pretrained_config.vision_config
         self.vision_model = RADIOVisionModel(vision_model_config)
-        self.vision_model.to(config.torch_dtype)
 
     def load_weights(self, weights):
         # Load mlp1 weights.
@@ -111,7 +114,6 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
 
     def extract_feature(self, pixel_values):
         vit_embeds = self.vision_model(pixel_values)
-        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
         # Down-sampling and projection.
         h = w = int(vit_embeds.shape[1]**0.5)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
@@ -131,11 +133,11 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel,
         ],
                                          dim=0)
         # -> [num_patches, channel, height, width]
-        batched_num_patches = torch.cat([
+        patch_list = [
             multimodal_param.multimodal_data["num_patches"]
             for multimodal_param in multimodal_params
-        ],
-                                        dim=0).tolist()
+        ]
+        batched_num_patches = torch.cat(patch_list, dim=0).tolist()
         # -> list of[num_patches1, num_patches2, ...]
         batched_image_embeds = self.extract_feature(batched_pixel_values)
         # -> [num_patches, num_image_token, hidden_size]
@@ -176,9 +178,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
         self.processor = transformers.AutoImageProcessor.from_pretrained(
             model_path, trust_remote_code=True, use_fast=self.use_fast)
-        self.img_context_token = "<image>"
-        self.img_start_token = "<img>"
-        self.img_end_token = "</img>"
+
+        self.img_context_token = IMG_CONTEXT_TOKEN
+        self.img_start_token = IMG_START_TOKEN
+        self.img_end_token = IMG_END_TOKEN
         self.dtype = model_config.torch_dtype
 
     def get_vocab_size(self):
@@ -194,7 +197,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         **kwargs,
     ):
 
-        def get_internvl_target_ratios(
+        def _get_internvl_target_ratios(
             min_num: int,
             max_num: int,
         ) -> list[tuple[int, int]]:
@@ -205,8 +208,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                              if min_num <= i * j <= max_num}
             return sorted(target_ratios, key=lambda x: x[0] * x[1])
 
-        def find_closest_aspect_ratio(aspect_ratio, target_ratios, width,
-                                      height, image_size):
+        def _find_closest_aspect_ratio(aspect_ratio, target_ratios, width,
+                                       height, image_size):
             best_factor = float('-inf')
             best_ratio = (1, 1)
             area = width * height
@@ -221,7 +224,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                     best_ratio = ratio
             return best_ratio
 
-        def calculate_targets(
+        def _calculate_targets(
             orig_width: int,
             orig_height: int,
             target_ratios: list[tuple[int, int]],
@@ -230,7 +233,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             aspect_ratio = orig_width / orig_height
 
             # find the closest aspect ratio to the target
-            target_aspect_ratio = find_closest_aspect_ratio(
+            target_aspect_ratio = _find_closest_aspect_ratio(
                 aspect_ratio,
                 target_ratios,
                 width=orig_width,
@@ -243,10 +246,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
         image_height = image.height
         image_width = image.width
-        target_ratios = get_internvl_target_ratios(1,
-                                                   self.processor.max_num_tiles)
-        blocks = calculate_targets(image_width, image_height, target_ratios,
-                                   self.image_size)
+        target_ratios = _get_internvl_target_ratios(
+            1, self.processor.max_num_tiles)
+        blocks = _calculate_targets(image_width, image_height, target_ratios,
+                                    self.image_size)
         if self.processor.use_thumbnail and blocks != 1:
             blocks += 1
         num_image_tokens = self.num_image_token * blocks
@@ -309,7 +312,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
     model_type="NemotronH_Nano_VL_V2",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
-            "image": "<image>",
+            "image": IMG_CONTEXT_TOKEN,
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
@@ -332,7 +335,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         if not _is_disagg():
             self.vision_encoder = NanoV2VLVisionEncoder(model_config).eval()
-            self.vision_encoder.to(config.torch_dtype)
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
