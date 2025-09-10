@@ -18,22 +18,38 @@ SLURM_NTASKS_PER_NODE = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-# This test assumes that there are 2 nodes, one for ctx and one for gen.
-# So we can use the node rank to determine which node the ctx/gen server is on.
-# Then run the disagg-server and test_chat on the ctx node.
+# This test assumes that there are >2 nodes, we run ctx/disagg-server/client on the first node,
+# and run gen the second node.
 
 CTX_SERVER_PORT = 8001
 GEN_SERVER_PORT = 8002
 DISAGG_SERVER_PORT = 8000
 
 
-# We run this test on two nodes, so by removing the current node from the node list, we can get the other node
-def get_the_other_host():
-    assert len(NODE_LIST) == 2
+# Exclude the current node from the node list, then return other nodes by idx
+def get_the_other_host(idx=0):
+    assert len(NODE_LIST) >= 2
     assert socket.gethostname() in NODE_LIST
     node_list = NODE_LIST.copy()
     node_list.remove(socket.gethostname())
-    return node_list[0]
+    return node_list[idx]
+
+
+def is_ctx_node():
+    return NODE_RANK == 0
+
+
+def is_gen_node():
+    return NODE_RANK == 1
+
+
+def is_disagg_node():
+    return NODE_RANK == 0
+
+
+# The test is run on multinodes but only the first node's output is used for assertion
+def is_pytest_node():
+    return NODE_RANK == 0
 
 
 def find_nic():
@@ -42,7 +58,8 @@ def find_nic():
     try:
         # iproute2 may not be installed
         result = subprocess.check_output(
-            f"ip route get {test_ip} | sed -E 's/.*?dev (\\S+) .*/\\1/;t;d'")
+            f"ip route get {test_ip} | sed -E 's/.*?dev (\\S+) .*/\\1/;t;d'",
+            shell=True)
         nic_name = result.decode('utf-8').strip()
         print(f"get NIC name from ip route, result: {nic_name}")
         return nic_name
@@ -105,7 +122,6 @@ def gen_tp_pp_size(request):
 @pytest.fixture(scope="module")
 def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
     host = socket.gethostname()
-    assert len(NODE_LIST) == 2
     assert host in NODE_LIST
     extra_config = {
         "cache_transceiver_config": {
@@ -117,7 +133,7 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
         },
         "disable_overlap_scheduler": True,
     }
-    if NODE_RANK == 0:
+    if is_ctx_node():
         print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")
         model_path = get_model_path(model_name)
         tp_size, pp_size = ctx_tp_pp_size
@@ -131,7 +147,7 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
                                 rank=RANK % SLURM_NTASKS_PER_NODE,
                                 extra_config=extra_config) as server:
             yield server
-    elif NODE_RANK == 1:
+    elif is_gen_node():
         print(f"starting gen_server for rank {RANK} node rank {NODE_RANK}")
         model_path = get_model_path(model_name)
         tp_size, pp_size = gen_tp_pp_size
@@ -139,19 +155,23 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
         with RemoteOpenAIServer(model_path,
                                 port=GEN_SERVER_PORT,
                                 cli_args=args,
-                                host=host,
+                                host="0.0.0.0",
                                 env=env(),
                                 rank=RANK % SLURM_NTASKS_PER_NODE,
                                 extra_config=extra_config) as server:
             yield server
+    else:
+        yield None
 
 
 @pytest.fixture(scope="module")
 def disagg_server(worker: RemoteOpenAIServer):
-    if RANK == 0:
+    if is_disagg_node():
         print(f"starting disagg_server for rank {RANK} node rank {NODE_RANK}")
         ctx_url = f"localhost:8001"  # Use localhost since the ctx server is on the same node
-        gen_url = f"{get_the_other_host()}:8002"
+        # TODO: Hopefully the NODE_LIST is ordered by NODE_RANK, this test is only tested with 2 nodes now
+        # We need to test with 4 nodes or more
+        gen_url = f"{get_the_other_host(0)}:8002"
         print(f"ctx_url: {ctx_url} gen_url: {gen_url}")
         with RemoteDisaggOpenAIServer(ctx_servers=[ctx_url],
                                       gen_servers=[gen_url],
@@ -166,7 +186,7 @@ def disagg_server(worker: RemoteOpenAIServer):
 
 @pytest.fixture(scope="module")
 def client(disagg_server: RemoteDisaggOpenAIServer):
-    if RANK == 0:
+    if is_pytest_node():
         return disagg_server.get_client()
     else:
         print(f"skipping client for rank {RANK} node rank {NODE_RANK}")
@@ -197,7 +217,7 @@ def wait_for_endpoint_down(url: str, timeout: int = 300):
 
 
 def test_completion(client: openai.OpenAI, model_name: str):
-    if RANK == 0:
+    if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
         prompt = "What is the result of 1+1? Answer in one word: "
         completion = client.completions.create(
@@ -211,9 +231,11 @@ def test_completion(client: openai.OpenAI, model_name: str):
         assert completion.id is not None
         message = completion.choices[0].text
         assert message.startswith('2.')
-    else:
-        url = f"http://{get_the_other_host()}:{DISAGG_SERVER_PORT}/health/"
-        # keep gen workers alive until the test ends
+    elif is_gen_node():
+        # keep gen workers alive until the test ends, again we hope the NODE_LIST is ordered by NODE_RANK
+        url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
         wait_for_endpoint_ready(url)
         wait_for_endpoint_down(url)
+        assert True
+    else:
         assert True
