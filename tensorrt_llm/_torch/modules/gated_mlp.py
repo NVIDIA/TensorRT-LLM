@@ -134,6 +134,8 @@ class GatedMLP(nn.Module):
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if self.mapping.rank == 0:
+            print(f"limin: GatedMLP, begin")
         if bool(lora_params):
             return self.forward_lora(x, all_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
@@ -143,6 +145,8 @@ class GatedMLP(nn.Module):
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 layer_idx=self.layer_idx)
+        if self.mapping.rank == 0:
+            print(f"limin: GatedMLP, end")
         return output
 
     def forward_lora(

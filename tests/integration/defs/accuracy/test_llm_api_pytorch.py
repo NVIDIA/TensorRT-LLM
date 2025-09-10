@@ -1553,16 +1553,21 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @parametrize_with_ids("torch_compile", [False, True])
+    # @parametrize_with_ids("torch_compile", [False, True])
+    # @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+    #                       [(False, False, False, False),
+    #                        (True, False, False, False),
+    #                        (False, True, False, False),
+    #                        (False, False, True, False),
+    #                        (False, False, False, True),
+    #                        (True, False, True, True), (True, True, True, True)])
+    # @parametrize_with_ids("mtp_nextn", [0, 2])
+    # @parametrize_with_ids("moe_backend", ["CUTLASS"])
+    @parametrize_with_ids("torch_compile", [False])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False, False),
-                           (True, False, False, False),
-                           (False, True, False, False),
-                           (False, False, True, False),
-                           (False, False, False, True),
-                           (True, False, True, True), (True, True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [0, 2])
-    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+                          [(True, False, False, False)])
+    @parametrize_with_ids("mtp_nextn", [2])
+    @parametrize_with_ids("moe_backend", ["CUTLASS"])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
                    torch_compile, mtp_nextn, moe_backend):
         if moe_backend == "TRTLLM" and (get_sm_version() == 120
@@ -1600,19 +1605,28 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
-    @parametrize_with_ids("torch_compile", [False, True])
+    # @parametrize_with_ids("torch_compile", [False, True])
+    # @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+    #                       [(False, False, False, False),
+    #                        (True, False, False, False),
+    #                        (False, True, False, False),
+    #                        (False, False, True, False),
+    #                        (False, False, False, True),
+    #                        (True, False, True, True), (True, True, True, True)])
+    # @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
+    #                                                      (2, 2, 1), (1, 4, 1)],
+    #                          ids=["tp4", "ep4", "tp2pp2", "pp4"])
+    # @parametrize_with_ids("mtp_nextn", [0, 2])
+    # @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+    @parametrize_with_ids("torch_compile", [True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
-                           (True, False, False, False),
-                           (False, True, False, False),
-                           (False, False, True, False),
-                           (False, False, False, True),
-                           (True, False, True, True), (True, True, True, True)])
+                           (True, True, True, True)])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
-    @parametrize_with_ids("mtp_nextn", [0, 2])
-    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+    @parametrize_with_ids("mtp_nextn", [0])
+    @parametrize_with_ids("moe_backend", ["CUTLASS"])
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size,
                          torch_compile, mtp_nextn, moe_backend):

@@ -683,6 +683,7 @@ class MLA(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        self.mapping = mapping
 
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
@@ -1431,7 +1432,8 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
-
+        if self.mapping.rank == 0:
+            print(f"limin: MLA, begin")
         attn_output = self.create_output(hidden_states)
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
@@ -1444,4 +1446,6 @@ class MLA(nn.Module):
                               output=attn_output)
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+        if self.mapping.rank == 0:
+            print(f"limin: MLA, end")
         return attn_output

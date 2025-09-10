@@ -766,9 +766,34 @@ class NVFP4LinearMethod(LinearMethodBase):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
-        output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
-                                             module.weight_scale, module.alpha,
-                                             module.dtype)
+        # used for clearing L2 cache (256MB)
+        cache_size = 256 * 1024 * 1024
+        cache = torch.empty(int(cache_size // 4), dtype=torch.int).cuda()
+        cache.zero_()
+        if not module.use_cute_dsl_fp4_mm:
+            output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
+                                                 module.weight_scale,
+                                                 module.alpha, module.dtype)
+        else:
+            # print(
+            #     f"limin: linear layer, act_fp4.shape = {act_fp4.shape}, module.weight.shape = {module.weight.shape}, act_sf.shape = {act_sf.shape}, module.weight_scale.shape = {module.weight_scale.shape}, module.alpha.shape = {module.alpha.shape}"
+            # )
+            # print(f"limin: module.alpha = {module.alpha}")
+            # print(f"limin: module.alpha.dtype = {module.alpha.dtype}")
+            # print(f"limin: module.scalar_alpha = {module.scalar_alpha}")
+            output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                act_fp4, module.weight, act_sf, module.weight_scale,
+                module.scalar_alpha, module.dtype)
+
+        # print(f"limin: nvfp4_linear, input.shape = {input.shape}, module.weight.shape = {module.weight.shape} ")
+        # with nvtx.annotate(f"nvfp4_gemm, input.shape = {input.shape}, module.weight.shape = {module.weight.shape}", color="green"):
+        #     output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
+        #                                           module.weight_scale,
+        #                                           module.alpha, module.dtype)
+        # with nvtx.annotate(f"cute_dsl_nvfp4_gemm, input.shape = {input.shape}, module.weight.shape = {module.weight.shape}", color="green"):
+        #     output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+        #         act_fp4, module.weight, act_sf, module.weight_scale,
+        #         module.scalar_alpha, module.dtype)
         if bias is not None:
             output = output + bias
         return output
@@ -843,6 +868,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         E2M1_MAX = 6.0
         module.inv_input_scale.data = module.input_scale / E2M1_MAX
         copy_weight(module.alpha, alpha)
+        module.scalar_alpha = alpha.item()
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]) -> None:
@@ -860,6 +886,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
+        module.scalar_alpha = alpha.item()
+
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
         copy_weight(module.weight, fused_weight)
 
@@ -897,6 +925,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
+        module.scalar_alpha = alpha.item()
 
 
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
@@ -1789,6 +1818,7 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
+        use_cute_dsl_fp4_mm: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -1806,6 +1836,7 @@ class Linear(nn.Module):
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        self.use_cute_dsl_fp4_mm = use_cute_dsl_fp4_mm
 
         local_in_features = in_features
         local_out_features = out_features
@@ -1984,4 +2015,5 @@ class Linear(nn.Module):
         assert self._weights_created
 
         weight_mode = self.weights_loading_config.weight_mode
+        # print(f"limin: weight_mode = {weight_mode}")
         self.quant_method.load_weights(self, weights, weight_mode)
