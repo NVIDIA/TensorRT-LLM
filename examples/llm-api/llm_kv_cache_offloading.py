@@ -5,16 +5,11 @@ from tensorrt_llm.llmapi import KvCacheConfig
 
 
 def main(args):
-
     prompt_a = (
-        "the following question and four candidate answers (A, B, C and D), choose the best answer."
-        "The following excerpt is from a pamphlet. You will do me the justice to remember, "
-    )
-
-    prompt_b = (
-        "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
-        "The following excerpt is from a pamphlet. You will do me the justice to remember, "
-    )
+        "Returns the per-iterations statistics computed since last call to this method. "
+        "Contains at most iter_stats_max_iterations iterations.")
+    prompt_b = ("Use for skipping decoding step for non generation model, "
+                "and return the batch_output (such as mm_embeddings)")
     max_batch_size = 1
     max_seq_len = 256
 
@@ -24,7 +19,7 @@ def main(args):
 
     sampling_params = SamplingParams(max_tokens=max_seq_len)
 
-    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    llm = LLM(model="Qwen/Qwen3-8B",
               max_batch_size=max_batch_size,
               max_seq_len=max_seq_len,
               kv_cache_config=KvCacheConfig(enable_block_reuse=True,
