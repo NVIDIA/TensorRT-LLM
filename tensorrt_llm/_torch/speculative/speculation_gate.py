@@ -29,18 +29,21 @@ class SpeculationGate:
 
     def record_avg_decoded(
             self,
-            avg_decoded_tokens_per_iter: Optional[float],
+            avg_decoded_tokens_per_iter: float,
             request_id: Optional[int] = None) -> Tuple[bool, Optional[float]]:
         """
-		Record a completed request's avg_decoded_tokens_per_iter.
-		Returns (disabled_now, current_avg_accept) where disabled_now is True only when the call causes disable.
-		"""
+        Record a completed request's avg_decoded_tokens_per_iter.
+        Returns (disabled_now, current_avg_accept) where disabled_now is True only when the call causes disable.
+        """
         if self.disabled or self.window is None or self.window <= 0 or self.threshold is None:
             return False, None
 
+        # Extra Guard: if caller passed None, skip updating the rolling stats
+        if avg_decoded_tokens_per_iter is None:
+            return False, None
+
         accepted_len = 0.0
-        if avg_decoded_tokens_per_iter is not None:
-            accepted_len = max(0.0, float(avg_decoded_tokens_per_iter) - 1.0)
+        accepted_len = max(0.0, float(avg_decoded_tokens_per_iter) - 1.0)
 
         # Log per-request completion for debug
         if request_id is not None:
@@ -50,6 +53,8 @@ class SpeculationGate:
 
         # O(1) rolling update
         self.acceptance_history.append(accepted_len)
+        logger.debug(
+            f"[SpeculationGate] Acceptance history: {self.acceptance_history}")
         self.acceptance_sum += accepted_len
         if len(self.acceptance_history) > self.window:
             removed = self.acceptance_history.popleft()

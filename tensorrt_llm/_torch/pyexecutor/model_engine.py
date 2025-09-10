@@ -166,19 +166,6 @@ class PyTorchModelEngine(ModelEngine):
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
         self.enable_spec_decode = self.is_spec_decode
-        # Rolling acceptance tracking
-        self.acceptance_window = getattr(
-            spec_config, 'acceptance_window',
-            None) if spec_config is not None else None
-        self.acceptance_length_threshold = getattr(
-            spec_config, 'acceptance_length_threshold',
-            None) if spec_config is not None else None
-        # Initialize speculation gate early since it only depends on config
-        self.speculation_permanently_disabled = False
-        self.speculation_gate = None
-        if self.acceptance_window and self.acceptance_length_threshold is not None:
-            self.speculation_gate = SpeculationGate(
-                self.acceptance_window, self.acceptance_length_threshold)
         self.is_draft_model = is_draft_model
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(

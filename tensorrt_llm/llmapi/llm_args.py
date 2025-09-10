@@ -369,9 +369,6 @@ class DecodingBaseConfig(StrictBaseModel):
     # (N = acceptance_window) drops below this value.
     acceptance_length_threshold: Optional[float] = None
 
-    # Upper bound to avoid accidental huge windows
-    MAX_ACCEPTANCE_WINDOW: ClassVar[int] = 100000
-
     # Validate acceptance controls at field level so they run on model creation
     @field_validator('acceptance_window')
     @classmethod
@@ -381,10 +378,6 @@ class DecodingBaseConfig(StrictBaseModel):
         if v < 0:
             raise ValueError(
                 f"acceptance_window must be >= 0 (0 disables), got {v}")
-        if v > cls.MAX_ACCEPTANCE_WINDOW:
-            raise ValueError(
-                f"acceptance_window must be <= {cls.MAX_ACCEPTANCE_WINDOW}, got {v}"
-            )
         return v
 
     @field_validator('acceptance_length_threshold')
