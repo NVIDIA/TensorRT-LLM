@@ -100,6 +100,7 @@ class MPIDist(Distributed):
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
         self.create_tp_comm()
+        self.create_pp_comm()
 
     def broadcast(self, obj, root=0):
         return mpi_broadcast(obj, root)
@@ -135,6 +136,10 @@ class MPIDist(Distributed):
         new_group = mpi_comm().group.Incl(self.mapping.tp_group)
         self.tp_comm = mpi_comm().Create_group(new_group)
 
+    def create_pp_comm(self):
+        new_group = mpi_comm().group.Incl(self.mapping.pp_group)
+        self.pp_comm = mpi_comm().Create_group(new_group)
+
     def tp_allgather(self, obj):
         return self.tp_comm.allgather(obj)
 
@@ -143,6 +148,15 @@ class MPIDist(Distributed):
 
     def tp_broadcast(self, obj, root=0):
         return self.tp_comm.bcast(obj, root)
+
+    def pp_allgather(self, obj):
+        return self.pp_comm.allgather(obj)
+
+    def pp_gather(self, obj):
+        return self.pp_comm.gather(obj)
+
+    def pp_broadcast(self, obj, root=0):
+        return self.pp_comm.bcast(obj, root)
 
 
 class TorchDist(Distributed):

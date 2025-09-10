@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+import pydantic
 import pytest
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM, LlmArgs
@@ -145,6 +146,21 @@ def test_config_flow(
     else:
         # For LLM with _autodeploy backend, executor should not be called directly
         pass
+
+
+@pytest.mark.parametrize(
+    "model_factory",
+    [
+        "Foo",
+        # typo.
+        "AutomodelForCausalLMFactory",
+    ],
+)
+def test_non_registered_model_factory(model_factory: str):
+    with pytest.raises(
+        pydantic.ValidationError, match="does not exist in the model factory registry"
+    ):
+        LlmArgs(model="test-model", model_factory=model_factory)
 
 
 @pytest.mark.parametrize(

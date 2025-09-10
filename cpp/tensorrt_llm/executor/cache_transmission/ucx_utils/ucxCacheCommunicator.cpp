@@ -85,41 +85,74 @@ static std::string getLocalIp()
         perror("getifaddrs");
         return ip;
     }
-
+    bool getIp = false;
     // Loop through the linked list of interfaces
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
+    for (int ipVIndex = 0; ipVIndex < 2; ipVIndex++)
     {
-        // Check if the interface is an IP interface
-        if (ifa->ifa_addr == nullptr)
-            continue;
-
-        std::string ucxInterface = common::getEnvUCXInterface();
-        if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
+        for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
         {
-            continue;
+            // Check if the interface is an IP interface
+            if (ifa->ifa_addr == nullptr)
+                continue;
+
+            std::string ucxInterface = common::getEnvUCXInterface();
+            if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
+            {
+                continue;
+            }
+
+            // Skip the loopback interface
+            if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+            {
+                continue;
+            }
+
+            // Check if the address family is AF_INET (IPv4)
+            int addressFamily = (ipVIndex == 0) ? AF_INET : AF_INET6;
+
+            if (ifa->ifa_addr->sa_family == addressFamily)
+            {
+                if (ipVIndex == 0) // IPv4
+                {
+                    addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
+                    char address_buffer[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
+
+                    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s",
+                        ifa->ifa_name, address_buffer);
+                    ip = address_buffer;
+                }
+                else // IPv6
+                {
+                    addr_ptr = &((struct sockaddr_in6*) ifa->ifa_addr)->sin6_addr;
+                    char address_buffer[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, addr_ptr, address_buffer, sizeof(address_buffer));
+
+                    if (address_buffer[0] == 'f' && address_buffer[1] == 'e' && address_buffer[2] == '8'
+                        && address_buffer[3] == '0')
+                    {
+                        // local link address
+
+                        ip = std::string(address_buffer) + "%" + ifa->ifa_name;
+                    }
+                    else
+                    {
+                        ip = address_buffer;
+                    }
+                    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s",
+                        ifa->ifa_name, ip.c_str());
+                }
+
+                getIp = true;
+                break;
+            }
         }
-
-        // Skip the loopback interface
-        if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+        if (getIp)
         {
-            continue;
-        }
-
-        // Check if the address family is AF_INET (IPv4)
-        // TODO: USER CAN SPECIFY THE IP ADDRESS
-        if (ifa->ifa_addr->sa_family == AF_INET)
-        {
-            addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
-            char address_buffer[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
-
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
-                address_buffer);
-            ip = address_buffer;
             break;
         }
     }
-    if (ifa == nullptr)
+    if (!getIp)
     {
         TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
             "UCX   No valid IP address found please set correct UCX interface with env variable TRTLLM_UCX_INTERFACE");
@@ -132,7 +165,7 @@ static std::string getLocalIp()
 std::optional<std::pair<std::string, int>> parse_zmq_endpoint(std::string const& endpoint)
 {
     std::regex ipv4_regex(R"(tcp://([\d\.]+):(\d+))");
-    std::regex ipv6_regex(R"(tcp://\[([0-9a-fA-F:]+)\]:(\d+))");
+    std::regex ipv6_regex(R"(tcp://\[([0-9a-fA-F:%\w]+)\]:(\d+))");
     std::smatch match;
     if (std::regex_match(endpoint, match, ipv4_regex))
     {
@@ -171,6 +204,15 @@ UcxConnectionManager::UcxConnectionManager()
         mZmqRepSocket = zmq::socket_t(mZmqContext, zmq::socket_type::rep);
         mZmqRepSocket.set(zmq::sockopt::sndhwm, 1000);
         std::string localIp = getLocalIp();
+        if (localIp.find(':') != std::string::npos)
+        {
+            // ipv6
+            mZmqRepSocket.set(zmq::sockopt::ipv6, 1);
+
+            localIp = "[" + localIp + "]";
+        }
+        TLLM_LOG_INFO(
+            mpi::MpiComm::world().getRank(), "UcxConnectionManager::UcxConnectionManager localIp: %s", localIp.c_str());
         mZmqRepSocket.bind("tcp://" + localIp + ":*");
         mZmqRepEndpoint = mZmqRepSocket.get(zmq::sockopt::last_endpoint);
         TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "UcxConnectionManager::UcxConnectionManager mZmqRepEndpoint: %s",
@@ -285,6 +327,7 @@ UcxConnectionManager::~UcxConnectionManager()
     if (mZmqRepThread.joinable())
     {
         zmq::socket_t socket(mZmqContext, zmq::socket_type::req);
+        socket.set(zmq::sockopt::ipv6, 1);
         socket.connect(mZmqRepEndpoint);
         UcxCmMessage stopMessage(UcxCmMessage::MessageType::STOP, std::nullopt);
         std::ostringstream oStream;
@@ -366,6 +409,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
             // connection at a time, guaranteeing that the only one listener will send connectionId to requester in the
             // same time.
             auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
+            reqSocket.set(zmq::sockopt::ipv6, 1);
             reqSocket.connect(build_zmq_endpoint(ip, port));
             UcxCmMessage getWorkerAddressMessage(UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress);
             std::ostringstream oStream;
