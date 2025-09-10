@@ -175,14 +175,14 @@ class Llama4Attention(Attention):
             q = self._attention_scaling(q, position_ids)
 
         q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.forward_impl(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        attention_mask,
-                                        None,
-                                        None,
-                                        None,
+        attn_output = self.forward_impl(q=q,
+                                        k=k,
+                                        v=v,
+                                        attn_metadata=attn_metadata,
+                                        attention_mask=attention_mask,
+                                        attention_window_size=None,
+                                        attention_mask_data=None,
+                                        mrope_config=None,
                                         attention_sinks=None)
 
         if isinstance(attn_output, tuple):

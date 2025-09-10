@@ -247,7 +247,6 @@ class CUDAGraphRunner:
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
-        print(f"[TRT-LLM DEBUG] position_ids.shape: {position_ids.shape}")
         if engine.use_mrope and current_inputs.get(
                 'multimodal_params') is not None:
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)

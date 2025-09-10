@@ -1396,12 +1396,13 @@ class PyTorchModelEngine(ModelEngine):
                     mrope_position_ids.append(ctx_mrope_position_ids)
 
                 # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
-                multimodal_params.to_device(
-                    "multimodal_data",
-                    "cuda",
-                    pin_memory=True,
-                    keyword=getattr(self.model, "multimodal_data_device_paths",
-                                    None))
+                multimodal_params.to_device("multimodal_data",
+                                            "cuda",
+                                            pin_memory=True,
+                                            filter_keywords=getattr(
+                                                self.model,
+                                                "multimodal_data_device_paths",
+                                                None))
 
                 #re-assign the multimodal_data to the request after to_device for generation requests
                 request.py_multimodal_data = multimodal_params.multimodal_data
@@ -1563,7 +1564,9 @@ class PyTorchModelEngine(ModelEngine):
                             "multimodal_data",
                             "cuda",
                             pin_memory=True,
-                            keyword=["mrope_config.mrope_position_deltas"])
+                            filter_keywords=[
+                                "mrope_config.mrope_position_deltas"
+                            ])
                         multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot

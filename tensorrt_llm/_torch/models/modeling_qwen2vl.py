@@ -41,6 +41,7 @@ from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
+PAD_INDEX = -100  # https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
 
 def process_weights(weights: Dict,
@@ -489,6 +490,11 @@ class Qwen2_5_VLVisionAttention(Attention):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]],
         **kwargs,
     ) -> torch.Tensor:
+        # NOTE: Need separate Attention forward() for Qwen2.5-VL for multiple reasons
+        # 1. We don't have the route for handing over position_embeddings to the Attention forward()
+        # 2. Could not override the apply_rope() as we don't have the position_ids in the Vision Attention's rotary embedding.
+        # (TODO: yechank-nvidia) Make OOTO path more modular and reusable for Attention's Rotary Embedding.
+
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv, None, None
         q, k, v = self.split_qkv(q, k, v)
@@ -502,11 +508,11 @@ class Qwen2_5_VLVisionAttention(Attention):
                             -1), k.reshape(seq_length,
                                            -1), v.reshape(seq_length, -1)
         q, k, v = self.convert_qkv(q, k, v)
-        output = self.forward_impl(q,
-                                   k,
-                                   v,
-                                   attn_metadata,
-                                   PredefinedAttentionMask.FULL,
+        output = self.forward_impl(q=q,
+                                   k=k,
+                                   v=v,
+                                   attn_metadata=attn_metadata,
+                                   attention_mask=PredefinedAttentionMask.FULL,
                                    attention_window_size=None,
                                    attention_mask_data=None,
                                    mrope_config=None,
@@ -530,7 +536,6 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         self.attn = Qwen2_5_VLVisionAttention(model_config, layer_idx)
         self.mlp = Qwen2_5_VLMLP(config, bias=True)
 
-    # Referenced from transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
     @torch.inference_mode()
     def forward(
         self,
@@ -539,13 +544,19 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
+
+        residual = hidden_states
+        hidden_states = self.norm1(hidden_states)
+        hidden_states = residual + self.attn(
+            hidden_states=hidden_states,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+
+        residual = hidden_states
+        hidden_states = self.norm2(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
         return hidden_states
 
 
@@ -576,27 +587,12 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
                    mapping=model_config.mapping),
         )
 
-    # Referenced from transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
     @torch.inference_mode()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.mlp(self.ln_q(x).view(-1, self.hidden_size))
+        x = self.ln_q(x)
+        x = x.view(-1, self.hidden_size)
+        x = self.mlp(x)
         return x
-
-
-class Qwen2_5_VisionRotaryEmbedding(nn.Module):
-
-    def __init__(self, dim: int, theta: float = 10000.0) -> None:
-        super().__init__()
-        inv_freq = 1.0 / (theta
-                          **(torch.arange(0, dim, 2, dtype=torch.float) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(seqlen,
-                           device=self.inv_freq.device,
-                           dtype=self.inv_freq.dtype)
-        freqs = torch.outer(seq, self.inv_freq)
-        return freqs
 
 
 class Qwen2_5_VisionModel(torch.nn.Module):
@@ -640,7 +636,6 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             kv_cache_manager=None,
         )
 
-    # Referenced from transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
         for t, h, w in grid_thw:
@@ -671,7 +666,6 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
-    # Referenced from transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
     def get_window_index(self, grid_thw):
         window_index: list = []
         seq_lens = []
@@ -689,7 +683,8 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
-            index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
+            index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant",
+                                 PAD_INDEX)
             index_padded = index_padded.reshape(
                 grid_t,
                 num_windows_h,
@@ -703,9 +698,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
                 vit_merger_window_size,
                 vit_merger_window_size,
             )
-            seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+            seqlens = (index_padded != PAD_INDEX).sum([2, 3]).reshape(-1)
             index_padded = index_padded.reshape(-1)
-            index_new = index_padded[index_padded != -100]
+            index_new = index_padded[index_padded != PAD_INDEX]
             window_index.append(index_new + window_index_id)
             seqlens = seqlens * self.spatial_merge_unit
             seq_lens.extend(seqlens.tolist())
@@ -729,7 +724,6 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         attn_metadata.prepare()
         return attn_metadata
 
-    # Referenced from transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
     @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor,
                 **kwargs) -> torch.Tensor:
@@ -761,14 +755,14 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        for layer_num, blk in enumerate(self.blocks):
+        for layer_num, block in enumerate(self.blocks):
 
             if layer_num in self.fullatt_block_indexes:
                 attn_metadata = full_attn_metadata
             else:
                 attn_metadata = window_attn_metadata
 
-            hidden_states = blk(
+            hidden_states = block(
                 hidden_states,
                 attn_metadata=attn_metadata,
                 position_embeddings=position_embeddings,
@@ -790,13 +784,14 @@ class Qwen2VLModelBase(PreTrainedModel):
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
 
         # NOTE: Setting disable_fuse_rope to True to do mrope fusion in the model engine by pre-computing rotary_cos_sin in the model engine
-        model_config.pretrained_config.text_config.disable_fuse_rope = kwargs.get(
-            'disable_fuse_rope', False)
-
+        disabble_fuse_rope = kwargs.get('disable_fuse_rope', False)
+        model_config.pretrained_config.text_config.disable_fuse_rope = disabble_fuse_rope
         config = model_config.pretrained_config
 
         assert model_config.attn_backend == 'TRTLLM', "Qwen2/2.5-VL only supports TRTLLM backend now"
         super().__init__(config)
+        if not disabble_fuse_rope:
+            self.init_mrope_embedding(model_config)
 
         self.model_config = model_config
         if hasattr(self, "llm"):
@@ -816,8 +811,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         self.post_config()
         self.is_loaded = True
 
-    def init_mrope_embedding(self):
-        config = self.model_config.pretrained_config
+    def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
+        config = model_config.pretrained_config
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.from_string(config.rope_scaling["type"]),
             rope=RopeParams.from_config(config),
@@ -827,14 +822,14 @@ class Qwen2VLModelBase(PreTrainedModel):
             head_dim=config.hidden_size // config.num_attention_heads,
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
-        )
+        ).to('cuda')
         self.mrope_position_ids_padding_cuda = torch.zeros((
             3,
             1,
-            self.model_config.pretrained_config.max_position_embeddings,
+            config.max_position_embeddings,
         ),
                                                            dtype=torch.int32,
-                                                           device=self.device)
+                                                           device='cuda')
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         pass
@@ -985,8 +980,6 @@ class Qwen2VLModel(Qwen2VLModelBase):
             self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
 
         self.llm.load_weights(weights, weight_mapper)
-        if not self.model_config.pretrained_config.disable_fuse_rope:
-            self.init_mrope_embedding()
 
 
 @register_vision_encoder(Qwen2VisionModelBase,
@@ -1032,5 +1025,3 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
             self.mm_encoder.load_state_dict(vision_weights, strict=True)
 
         self.llm.load_weights(weights, weight_mapper)
-        if not self.model_config.pretrained_config.disable_fuse_rope:
-            self.init_mrope_embedding()

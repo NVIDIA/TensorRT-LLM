@@ -146,7 +146,7 @@ class TestMultimodalParamsDeviceTransfer(unittest.TestCase):
         result = params.multimodal_data["image"]["pixel_values"]
         self.assertEqual(result.device, torch.device("cuda:0"))
 
-    def test_to_device_with_keyword(self):
+    def test_to_device_with_filter_keywords(self):
         """Test converting data to device with keyword."""
         params = MultimodalParams()
         params.multimodal_data = self.sample_multimodal_data.copy()
@@ -154,7 +154,7 @@ class TestMultimodalParamsDeviceTransfer(unittest.TestCase):
         params.to_device("multimodal_data",
                          device="cuda:0",
                          pin_memory=True,
-                         keyword=["image.pixel_values"])
+                         filter_keywords=["image.pixel_values"])
 
         result = params.multimodal_data["image"]["pixel_values"]
         self.assertEqual(result.device, torch.device("cuda:0"))
