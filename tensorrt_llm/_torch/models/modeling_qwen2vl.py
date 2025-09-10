@@ -981,7 +981,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if not DISAGG:
-            vision_encoder_weights = process_weights("visual", weights)
+            vision_encoder_weights = process_weights(weights, "visual")
             self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
 
         self.llm.load_weights(weights, weight_mapper)
