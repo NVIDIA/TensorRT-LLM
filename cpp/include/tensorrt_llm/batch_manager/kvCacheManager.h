@@ -1708,6 +1708,25 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
+private:
+    // Maximum number of sequences
+    SizeType32 mMaxNumSequences;
+    // Maximum beam width
+    SizeType32 mMaxBeamWidth;
+    nvinfer1::DataType mDataType;
+    // Maximum kv cache length per sequence
+    SizeType32 mMaxAttentionWindow;
+    // Number of tokens per block
+    SizeType32 mTokensPerBlock;
+    // Number of tokens to fill up the sink tokens to a full block size
+    SizeType32 mSinkBubbleLength;
+    // Number of tokens in the sink blocks
+    SizeType32 mSinkBlockTokenLength;
+    // Block manager
+    BlockManager mBlockManager;
+    // Map of all sequences
+    std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
+    // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
     // Mutex to protect access to mSequences
     mutable std::mutex mSequencesMtx;
