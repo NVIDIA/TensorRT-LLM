@@ -5,6 +5,8 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
+accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized
+accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=2]
