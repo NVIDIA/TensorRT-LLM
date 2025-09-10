@@ -7,12 +7,12 @@ from tensorrt_llm.llmapi import KvCacheConfig
 def main(args):
 
     prompt_a = (
-        "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
+        "the following question and four candidate answers (A, B, C and D), choose the best answer."
         "The following excerpt is from a pamphlet. You will do me the justice to remember, "
     )
 
     prompt_b = (
-        "the following question and four candidate answers (A, B, C and D), choose the best answer."
+        "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
         "The following excerpt is from a pamphlet. You will do me the justice to remember, "
     )
     max_batch_size = 1
