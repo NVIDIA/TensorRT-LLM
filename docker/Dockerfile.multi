@@ -63,7 +63,7 @@ COPY docker/common/install_polygraphy.sh install_polygraphy.sh
 RUN bash ./install.sh --polygraphy && rm install_polygraphy.sh
 
 COPY docker/common/install_mpi4py.sh install_mpi4py.sh
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --mpi4py && install_mpi4py.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --mpi4py && rm install_mpi4py.sh
 
 ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
