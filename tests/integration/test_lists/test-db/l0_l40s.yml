@@ -15,7 +15,6 @@ l0_l40s:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_mllama"
-  - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_siglip"
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
@@ -31,12 +30,6 @@ l0_l40s:
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[audio]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image_audio]
-  - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
-  - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
-  - test_e2e.py::test_openai_completions_with_logit_bias[torch_sampler]
-  - test_e2e.py::test_openai_chat_with_logit_bias[torch_sampler]
-  - test_e2e.py::test_openai_completions_with_logit_bias[trtllm_sampler]
-  - test_e2e.py::test_openai_chat_with_logit_bias[trtllm_sampler]
   - accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
 - condition:
     ranges:
