@@ -211,9 +211,10 @@ class MTPSpecMetadata(SpecMetadata):
 
 class MTPStore(TorchStore):
 
-    def __init__(self, *, max_draft_len: int, max_num_sequences: int,
-                 max_beam_width: int):
+    def __init__(self, *, max_draft_len: int, max_total_draft_tokens: int,
+                 max_num_sequences: int, max_beam_width: int):
         super().__init__(max_draft_len=max_draft_len,
+                         max_total_draft_tokens=max_total_draft_tokens,
                          max_num_sequences=max_num_sequences,
                          max_beam_width=max_beam_width)
         self.next_new_tokens = int_tensor(
@@ -236,9 +237,11 @@ class MTPSampler(Sampler):
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
         self.draft_len = nextn
-        self.store = MTPStore(max_draft_len=nextn,
-                              max_num_sequences=args.max_num_sequences,
-                              max_beam_width=args.max_beam_width)
+        self.store = MTPStore(
+            max_draft_len=nextn,
+            max_num_sequences=args.max_num_sequences,
+            max_beam_width=args.max_beam_width,
+            max_total_draft_tokens=args.max_total_draft_tokens)
         self.max_seq_len = args.max_seq_len
 
     def _request_common_handling(self, request: LlmRequest,
