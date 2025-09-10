@@ -361,7 +361,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # notify the workers to quit
         if all(not f.done() for f in self.mpi_futures):
-            self.request_queue.put_noblock(None)
+            self.request_queue.put_noblock(None, retry=4)
 
     def shutdown(self):
         if not self.workers_started:

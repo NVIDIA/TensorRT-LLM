@@ -5,7 +5,6 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
-from ...builder import BuildConfig
 from ...llmapi.llm_args import LoadFormat, SamplerType
 from ...logger import logger
 from ...mapping import Mapping
@@ -119,7 +118,6 @@ EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',
     'pytorch_backend_config',
     'max_seq_len',
-    'tokens_per_block',
     'mapping',
     'hf_model_dir',
     'mm_encoder_only',
@@ -131,7 +129,6 @@ def update_executor_config(
         backend: Optional[str] = None,
         pytorch_backend_config: Optional[PyTorchConfig] = None,
         mapping: Optional[Mapping] = None,
-        build_config: Optional[BuildConfig] = None,
         speculative_config: Optional["DecodingBaseConfig"] = None,
         hf_model_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
@@ -155,10 +152,6 @@ def update_executor_config(
     executor_config.mm_encoder_only = mm_encoder_only
 
     logger.info(f"{executor_config.pytorch_backend_config}")
-
-    build_config = build_config or BuildConfig()
-    # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
-    executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
 
     executor_config.hf_model_dir = hf_model_dir
 

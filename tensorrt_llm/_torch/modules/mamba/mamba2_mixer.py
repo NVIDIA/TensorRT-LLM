@@ -89,14 +89,16 @@ class Mamba2Mixer(nn.Module):
         self.is_paged_state = False
 
         # in_proj
-        self.in_proj = Linear(d_model,
-                              d_in_proj,
-                              bias=bias,
-                              dtype=dtype,
-                              mapping=self.mapping,
-                              tensor_parallel_mode=TensorParallelMode.COLUMN,
-                              quant_config=config.get_quant_config(),
-                              allreduce_strategy=config.allreduce_strategy)
+        self.in_proj = Linear(
+            d_model,
+            d_in_proj,
+            bias=bias,
+            dtype=dtype,
+            mapping=self.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=config.get_quant_config(),
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -138,14 +140,16 @@ class Mamba2Mixer(nn.Module):
         )
 
         # out_proj
-        self.out_proj = Linear(d_inner,
-                               d_model,
-                               bias=bias,
-                               dtype=dtype,
-                               mapping=self.mapping,
-                               tensor_parallel_mode=TensorParallelMode.ROW,
-                               quant_config=config.get_quant_config(),
-                               allreduce_strategy=config.allreduce_strategy)
+        self.out_proj = Linear(
+            d_inner,
+            d_model,
+            bias=bias,
+            dtype=dtype,
+            mapping=self.mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            quant_config=config.get_quant_config(),
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy)
 
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
 

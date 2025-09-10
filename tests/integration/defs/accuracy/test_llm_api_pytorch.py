@@ -970,6 +970,8 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
+@skip_post_blackwell
+@skip_pre_hopper
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
@@ -1565,6 +1567,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
                    torch_compile, mtp_nextn, moe_backend):
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -1613,8 +1620,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          torch_compile, mtp_nextn, moe_backend):
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        if moe_backend == "TRTLLM" and get_sm_version() == 120:
-            pytest.skip("MOE TRTLLM backend does not support SM version 120")
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(
@@ -1877,14 +1886,30 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          32,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         True,
+                         True,
+                         True,
+                         True,
+                         8,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
         ],
         ids=[
             "latency", "latency_trtllmgen", "throughput", "throughput_tp8",
-            "throughput_tp4", "throughput_mtp"
+            "throughput_tp4", "throughput_mtp", "throughput_bs8_mtp"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend):
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1913,6 +1938,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            # This covers the case with relatively large seqlen in the generation phase.
+            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             # Commented out because GPQA takes too long to run
             # task = GPQADiamond(self.MODEL_NAME)
@@ -2317,6 +2345,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
 
     @skip_pre_hopper
+    @pytest.mark.skip(reason="https://nvbugs/5505402")
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(1, 1, 1, False, True, True)],
@@ -2507,6 +2536,11 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         moe_backend,
         torch_compile,
     ):
+
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
 
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -2699,6 +2733,11 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, moe_backend, eagle3):
 
+        if moe_backend == "TRTLLM" and (get_sm_version() == 120
+                                        or get_sm_version() == 121):
+            pytest.skip(
+                "MOE TRTLLM backend does not support SM version 120 or 121")
+
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -2778,7 +2817,7 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
 
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        with LLM(self.MODEL_PATH, max_seq_len=4096) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -3045,10 +3084,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
 class TestEXAONE4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        enable_partial_reuse=False,
-        max_attention_window=[4096, 4096, 4096, 131072])
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    enable_partial_reuse=False)
 
     def test_auto_dtype(self):
         model_path = f"{llm_models_root()}/EXAONE-4.0-32B"
