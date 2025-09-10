@@ -181,12 +181,13 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
 
 
 def get_local_ip(test_ip):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect((test_ip, 80))
-    return s.getsockname()[0]
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((test_ip, 80))
+        return s.getsockname()[0]
 
 
-# TODO: integrate this into disagg-serving
+# TODO: Avoid introducing another dependency since this is for test only. If we need to
+# detect UCX interface in the ctx/gen server, we need to support ipv6 and use a package like netifaces
 def get_local_interfaces():
     """ Returns a dictionary of name:ip key value pairs. """
     MAX_BYTES = 4096
@@ -229,52 +230,74 @@ def expand_slurm_nodelist(nodelist_str):
     if not nodelist_str or nodelist_str.strip() == "":
         return []
 
-    # Split by comma for multiple node groups
-    #node_groups = [group.strip() for group in nodelist_str.split(',')]
+    # Split top-level groups by commas not inside brackets.
+    groups: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in nodelist_str:
+        if ch == '[':
+            depth += 1
+        elif ch == ']' and depth:
+            depth -= 1
+        if ch == ',' and depth == 0:
+            groups.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        groups.append(''.join(buf).strip())
+
+    for group in groups:
+        bracket_match = re.match(r'^([^\[]+)\[(.+?)\]$', group)
+        if bracket_match:
+            prefix = bracket_match.group(1)
+            range_part = bracket_match.group(2)
+
     expanded_nodes = []
 
-    # Check if this group has bracket notation
-    bracket_match = re.match(r'^(.+?)\[(.+?)\]$', nodelist_str)
-    print(f"nodelist_str: {nodelist_str}, bracket_match: {bracket_match}")
-    if bracket_match:
-        prefix = bracket_match.group(1)
-        range_part = bracket_match.group(2)
+    for group in groups:
+        # Check if this group has bracket notation
+        bracket_match = re.match(r'^(.+?)\[(.+?)\]$', group)
+        print(f"nodelist_str: {nodelist_str}, bracket_match: {bracket_match}")
+        if bracket_match:
+            prefix = bracket_match.group(1)
+            range_part = bracket_match.group(2)
 
-        # Handle ranges and individual numbers within brackets
-        range_parts = range_part.split(',')
+            # Handle ranges and individual numbers within brackets
+            range_parts = range_part.split(',')
 
-        for part in range_parts:
-            part = part.strip()
+            for part in range_parts:
+                part = part.strip()
 
-            # Check if it's a range (contains dash)
-            if '-' in part:
-                range_match = re.match(r'^(\d+)-(\d+)$', part)
-                if range_match:
-                    start_num = int(range_match.group(1))
-                    end_num = int(range_match.group(2))
-                    # Determine zero-padding width from the original format
-                    start_str = range_match.group(1)
-                    width = len(start_str)
+                # Check if it's a range (contains dash)
+                if '-' in part:
+                    range_match = re.match(r'^(\d+)-(\d+)$', part)
+                    if range_match:
+                        start_num = int(range_match.group(1))
+                        end_num = int(range_match.group(2))
+                        # Determine zero-padding width from the original format
+                        start_str = range_match.group(1)
+                        width = len(start_str)
 
-                    # Generate range
-                    for num in range(start_num, end_num + 1):
-                        node_name = f"{prefix}{num:0{width}d}"
+                        # Generate range
+                        for num in range(start_num, end_num + 1):
+                            node_name = f"{prefix}{num:0{width}d}"
+                            expanded_nodes.append(node_name)
+                    else:
+                        # Handle non-numeric ranges or invalid format
+                        expanded_nodes.append(part)
+                else:
+                    # Individual number
+                    if part.isdigit():
+                        # Preserve zero-padding
+                        node_name = f"{prefix}{part}"
                         expanded_nodes.append(node_name)
-                else:
-                    # Handle non-numeric ranges or invalid format
-                    expanded_nodes.append(part)
-            else:
-                # Individual number
-                if part.isdigit():
-                    # Preserve zero-padding
-                    node_name = f"{prefix}{part}"
-                    expanded_nodes.append(node_name)
-                else:
-                    # Handle non-numeric individual items
-                    node_name = f"{prefix}{part}"
-                    expanded_nodes.append(node_name)
-    else:
-        # No brackets, just add the node as-is
-        expanded_nodes.append(nodelist_str)
+                    else:
+                        # Handle non-numeric individual items
+                        node_name = f"{prefix}{part}"
+                        expanded_nodes.append(node_name)
+        else:
+            # No brackets, just add the node as-is
+            expanded_nodes.append(nodelist_str)
 
     return expanded_nodes
