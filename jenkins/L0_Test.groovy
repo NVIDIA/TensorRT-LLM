@@ -321,7 +321,6 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
         "--collect-only",
         "--test-list=${testDBList}",
         "--quiet",
-        "--rootdir ${llmSrc}/tests/integration/defs",
         "--splits ${splits}",
         "--group ${splitId}"
     ]
@@ -334,9 +333,15 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
             returnStdout: true
         ).trim()
 
-        // If pytest succeeds, filter the output to get only test lines with '::'
-        shardTestList = pytestOutput.split('\n').findAll { line ->
-            line.contains('::')
+        // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
+        def lines = pytestOutput.split('\n')
+        def foundRunningLine = false
+        shardTestList = lines.findAll { line ->
+            if (line.matches(/.*Running \d+ items in this shard.*/)) {
+                foundRunningLine = true
+                return false  // Don't include the "Running" line itself
+            }
+            return foundRunningLine && line.contains('::')
         }
     } catch (Exception e) {
         echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
@@ -350,10 +355,14 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
 
         // Read the original test list to check for ISOLATION markers
         def originalTestLines = readFile(file: testDBList).readLines()
-        def isolateMarkerTests = originalTestLines.findAll { line ->
-            line.trim() && line.contains(' ISOLATION')
-        }.collect { line ->
-            line.replaceAll(' ISOLATION', '').trim()
+
+        // Create a map for quick lookup of original test lines (both with and without ISOLATION marker)
+        def originalTestMap = [:]
+        originalTestLines.each { originalLine ->
+            if (originalLine.trim()) {
+                def cleanLine = originalLine.replaceAll(' ISOLATION', '').trim()
+                originalTestMap[cleanLine] = originalLine.trim()
+            }
         }
 
         shardTestList.each { test ->
@@ -367,10 +376,14 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
                     trimmedTest = trimmedTest.substring(startIndex, endIndex)
                 }
 
-                if (isolateMarkerTests.contains(trimmedTest)) {
-                    shardIsolateTests.add(trimmedTest)
-                } else {
-                    shardRegularTests.add(trimmedTest)
+                // Look up the original test line from testDBList
+                def originalTestLine = originalTestMap[trimmedTest]
+                if (originalTestLine) {
+                    if (originalTestLine.contains(' ISOLATION')) {
+                        shardIsolateTests.add(originalTestLine.replaceAll(' ISOLATION', '').trim())
+                    } else {
+                        shardRegularTests.add(originalTestLine)
+                    }
                 }
             }
         }
