@@ -311,44 +311,52 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     }
 }
 
-def processShardTestList(llmSrc, testDBList, splitId, splits) {
+def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
     // List tests in current shard before running pytest
     echo "Listing tests in current shard (${splitId}/${splits}) before execution..."
-    def testListCmd = [
-        "LLM_ROOT=${llmSrc}",
-        "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-        "pytest",
-        "--collect-only",
-        "--test-list=${testDBList}",
-        "--quiet",
-        "--splits ${splits}",
-        "--group ${splitId}"
-    ]
-
+    
     def shardTestList = []
-    try {
-        // First execute the pytest command and check if it succeeds
-        def pytestOutput = sh(
-            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
-            returnStdout: true
-        ).trim()
+    
+    if (perfMode) {
+        // In perfMode, skip pytest collection as it may cause errors with automatically generated testcases
+        // Instead, use all tests from the original testDBList
+        echo "Performance mode enabled - skipping pytest collection, using all tests from testDBList"
+    } else {
+        def testListCmd = [
+            "LLM_ROOT=${llmSrc}",
+            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
+            "pytest",
+            "--collect-only",
+            "--test-list=${testDBList}",
+            "--quiet",
+            "--splits ${splits}",
+            "--group ${splitId}"
+        ]
 
-        // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
-        def lines = pytestOutput.split('\n')
-        def foundRunningLine = false
-        shardTestList = lines.findAll { line ->
-            if (line.matches(/.*Running \d+ items in this shard.*/)) {
-                foundRunningLine = true
-                return false  // Don't include the "Running" line itself
+        try {
+            // First execute the pytest command and check if it succeeds
+            def pytestOutput = sh(
+                script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
+                returnStdout: true
+            ).trim()
+
+            // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
+            def lines = pytestOutput.split('\n')
+            def foundRunningLine = false
+            shardTestList = lines.findAll { line ->
+                if (line.matches(/.*Running \d+ items in this shard.*/)) {
+                    foundRunningLine = true
+                    return false  // Don't include the "Running" line itself
+                }
+                return foundRunningLine && line.contains('::')
             }
-            return foundRunningLine && line.contains('::')
+        } catch (Exception e) {
+            echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
+            error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
         }
-    } catch (Exception e) {
-        echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
-        error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
     }
 
-    if (shardTestList) {
+    if (shardTestList || perfMode) {
         // Split the shard test list into regular and isolate tests
         def shardRegularTests = []
         def shardIsolateTests = []
@@ -356,33 +364,39 @@ def processShardTestList(llmSrc, testDBList, splitId, splits) {
         // Read the original test list to check for ISOLATION markers
         def originalTestLines = readFile(file: testDBList).readLines()
 
-        // Create a map for quick lookup of original test lines (both with and without ISOLATION marker)
-        def originalTestMap = [:]
-        originalTestLines.each { originalLine ->
-            if (originalLine.trim()) {
-                def cleanLine = originalLine.replaceAll(' ISOLATION', '').trim()
-                originalTestMap[cleanLine] = originalLine.trim()
-            }
-        }
-
-        shardTestList.each { test ->
-            def trimmedTest = test.trim()
-            if (trimmedTest) {
-                // Process test_unittests.py::test_unittests_v2[xxxx] pattern
-                if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
-                    // Extract content between [ and ]
-                    def startIndex = trimmedTest.indexOf('[') + 1
-                    def endIndex = trimmedTest.lastIndexOf(']')
-                    trimmedTest = trimmedTest.substring(startIndex, endIndex)
+        if (perfMode) {
+            // In perfMode, put all tests in regular and skip isolation
+            echo "Performance mode enabled - all tests will run as regular tests (no isolation)"
+            shardRegularTests = originalTestLines.findAll { it.trim() }
+        } else {
+            // Create a map for quick lookup of original test lines (both with and without ISOLATION marker)
+            def originalTestMap = [:]
+            originalTestLines.each { originalLine ->
+                if (originalLine.trim()) {
+                    def cleanLine = originalLine.replaceAll(' ISOLATION', '').trim()
+                    originalTestMap[cleanLine] = originalLine.trim()
                 }
+            }
 
-                // Look up the original test line from testDBList
-                def originalTestLine = originalTestMap[trimmedTest]
-                if (originalTestLine) {
-                    if (originalTestLine.contains(' ISOLATION')) {
-                        shardIsolateTests.add(originalTestLine.replaceAll(' ISOLATION', '').trim())
-                    } else {
-                        shardRegularTests.add(originalTestLine)
+            shardTestList.each { test ->
+                def trimmedTest = test.trim()
+                if (trimmedTest) {
+                    // Process test_unittests.py::test_unittests_v2[xxxx] pattern
+                    if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
+                        // Extract content between [ and ]
+                        def startIndex = trimmedTest.indexOf('[') + 1
+                        def endIndex = trimmedTest.lastIndexOf(']')
+                        trimmedTest = trimmedTest.substring(startIndex, endIndex)
+                    }
+
+                    // Look up the original test line from testDBList
+                    def originalTestLine = originalTestMap[trimmedTest]
+                    if (originalTestLine) {
+                        if (originalTestLine.contains(' ISOLATION')) {
+                            shardIsolateTests.add(originalTestLine.replaceAll(' ISOLATION', '').trim())
+                        } else {
+                            shardRegularTests.add(originalTestLine)
+                        }
                     }
                 }
             }
@@ -1843,7 +1857,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def testDBList = renderTestDB(testList, llmSrc, stageName)
 
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits)
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
 
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
