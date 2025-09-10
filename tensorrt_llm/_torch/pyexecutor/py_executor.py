@@ -220,6 +220,7 @@ class PyExecutor:
         self.expected_num_active_requests = 0
         self.ctx_in_transmission_requests = []
         self.previous_batch: Optional[BatchState] = None
+        self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
@@ -966,11 +967,15 @@ class PyExecutor:
                 self.model_engine.max_num_tokens,
                 self.model_engine.spec_config.max_draft_len)
             self.model_engine.enable_spec_decode = self.use_spec_decode
-            # If speculation is off, this function sets py_draft_tokens to None
-            # for all active requests. If it's on, we initialize py_draft_tokens
-            # with dummy draft tokens to make the scheduler aware of the fact
-            # that speculation is about to happen.
-            self._prepare_draft_requests()
+
+            # When overlap scheduler is enabled, and we already prepared the draft tokens in the previous batch,
+            # we don't need to initialize py_draft_tokens at this stage because we haven't append the accepted tokens to the request yet.
+            if not self.has_previous_draft_tokens:
+                # If speculation is off, this function sets py_draft_tokens to None
+                # for all active requests. If it's on, we initialize py_draft_tokens
+                # with dummy draft tokens to make the scheduler aware of the fact
+                # that speculation is about to happen.
+                self._prepare_draft_requests()
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
@@ -1195,12 +1200,25 @@ class PyExecutor:
                         self.guided_decoder.add_batch(scheduled_batch)
                         self.guided_decoder.init_disagg_gen_requests()
 
-                    previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
+                    previous_tensors = self.previous_batch and self.previous_batch.sample_state
+                    target_inputs = None
+                    draft_outputs = None
+                    if self.drafter is not None and self.use_spec_decode:
+                        target_inputs, draft_outputs, draft_batch = self._handle_speculative_decoding(
+                            scheduled_batch, previous_tensors)
+
+                    if target_inputs is not None:
+                        previous_tensors_device = target_inputs
+                    else:
+                        previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
-                    if self.previous_batch is not None:
+                    if target_inputs is not None:
+                        self._process_draft_results(scheduled_batch,
+                                                    draft_outputs, draft_batch)
+                    elif self.previous_batch is not None:
                         self._update_requests(self.previous_batch.sample_state)
 
                     if self.guided_decoder is not None:
@@ -1220,7 +1238,6 @@ class PyExecutor:
 
                     if self.previous_batch is not None:
                         self._process_previous_batch()
-                        self.previous_batch: Optional[BatchState] = None
 
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -1952,6 +1969,96 @@ class PyExecutor:
         """Remove reqids of current requests from self.inflight_req_ids."""
         for req in scheduled_requests.all_requests():
             self.inflight_req_ids.erase(req.request_id)
+
+    def _handle_speculative_decoding(self, scheduled_batch, previous_tensors):
+        """
+        Handle speculative decoding logic.
+
+        Args:
+            scheduled_batch: The scheduled batch to process
+            previous_tensors: Previous iteration tensors
+
+        Returns:
+            Tuple of (target_inputs, draft_outputs, draft_batch)
+        """
+        with request_context(is_draft=True, scheduled_requests=scheduled_batch):
+            has_draft_batch = (
+                self.previous_batch is not None
+                and self.drafter.should_forward_draft_model(scheduled_batch))
+
+            if has_draft_batch:
+                self._update_requests(self.previous_batch.sample_state)
+                if self.has_previous_draft_tokens:
+                    self._prepare_draft_requests()
+
+                target_inputs, draft_outputs, draft_batch = self.drafter.generate_draft_tokens_with_overlap(
+                    scheduled_batch, self.resource_manager,
+                    previous_tensors.device if previous_tensors else None,
+                    self.guided_decoder)
+
+                self.has_previous_draft_tokens = target_inputs is not None and target_inputs.next_draft_tokens is not None
+            else:
+                self.has_previous_draft_tokens = False
+                target_inputs, draft_outputs, draft_batch = None, None, None
+
+        return target_inputs, draft_outputs, draft_batch
+
+    def _process_draft_results(self, scheduled_batch, draft_outputs,
+                               draft_batch):
+        """
+        Process the results from draft model execution.
+
+        Args:
+            scheduled_batch: The scheduled batch
+            draft_outputs: The outputs from the draft model
+            draft_batch: The draft batch that was processed
+        """
+        req_id_to_old_request = {
+            req.py_request_id: req
+            for req in scheduled_batch.all_requests()
+        }
+
+        if self.drafter.use_static_draft_loop:
+            self.process_static_draft_outputs(draft_outputs, draft_batch,
+                                              req_id_to_old_request)
+        elif draft_outputs is not None:
+            self._process_dynamic_draft_outputs(scheduled_batch, draft_outputs,
+                                                req_id_to_old_request)
+
+    def process_static_draft_outputs(self, draft_outputs, draft_batch,
+                                     req_id_to_old_request):
+        """
+        Process outputs from static draft loop.
+
+        Args:
+            draft_outputs: The outputs from the draft model
+            draft_batch: The draft batch that was processed
+            req_id_to_old_request: Mapping from request ID to original request
+        """
+        self.drafter.process_static_draft_outputs(draft_outputs, draft_batch,
+                                                  req_id_to_old_request)
+
+    def _process_dynamic_draft_outputs(self, scheduled_batch, draft_outputs,
+                                       req_id_to_old_request):
+        """
+        Process outputs from dynamic draft loop.
+
+        Args:
+            scheduled_batch: The scheduled batch
+            draft_outputs: The outputs from the draft model
+            req_id_to_old_request: Mapping from request ID to original request
+        """
+        self.drafter.update_requests(draft_outputs)
+        self.drafter.process_decoded_tokens(draft_outputs.scheduled_requests,
+                                            req_id_to_old_request)
+
+        # Rollback draft tokens if guided decoder is available
+        if self.guided_decoder is not None:
+            self.guided_decoder.add_batch(scheduled_batch)
+            if hasattr(self.drafter, "guided_decoder"):
+                self.guided_decoder.rollback_draft_tokens()
+
+        self.drafter.pad_draft_tokens_for_cuda_graph(scheduled_batch)
 
 
 class DisaggPPTerminationHandler:
