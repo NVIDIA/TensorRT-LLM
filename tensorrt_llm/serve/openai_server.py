@@ -926,12 +926,12 @@ class OpenAIServer:
     async def __call__(self, host, port):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
+        config = uvicorn.Config(self.app,
+                                host=host,
+                                port=port,
+                                log_level="info",
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         if self.server_threads > 1:
-            config = uvicorn.Config(self.app,
-                                    host=host,
-                                    port=port,
-                                    log_level="info",
-                                    timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
             sockets = [config.bind_socket()]
             servers = [MultiThreadServer(config=config) for _ in range(self.server_threads)]
 
@@ -942,9 +942,4 @@ class OpenAIServer:
                 await asyncio.sleep(1.0)
 
         else:
-            config = uvicorn.Config(self.app,
-                                    host=host,
-                                    port=port,
-                                    log_level="info",
-                                    timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
             await uvicorn.Server(config).serve()

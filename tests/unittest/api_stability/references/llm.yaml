@@ -52,6 +52,10 @@ methods:
         annotation: int
         default: 0
         status: prototype
+      num_server_threads:
+        annotation: int
+        default: 1
+        status: prototype
       postprocess_tokenizer_dir:
         annotation: Optional[str]
         default: null

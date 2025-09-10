@@ -1402,6 +1402,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     num_server_threads: int = Field(
         default=1,
+        ge=1,
         description="The number of threads used for trtllm-serve process.",
         status="prototype")
 
