@@ -7,7 +7,6 @@ from typing import Dict, Optional, Union
 
 import torch
 import zmq
-import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
@@ -121,7 +120,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                                       name="proxy_request_queue")
         self.worker_init_status_queue = IpcQueue(
             is_server=True,
-            socket_type=zmq.REP,
+            socket_type=zmq.ROUTER,
             name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
@@ -322,7 +321,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         while True:
             if self.worker_init_status_queue.poll(1):
                 ready_signal, error_trace = self.worker_init_status_queue.get()
-                # send ACK to the worker
+                # Send ACK to the worker
                 self.worker_init_status_queue.put("ACK")
                 break
             if any(fut.done() for fut in self.mpi_futures):

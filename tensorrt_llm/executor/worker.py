@@ -709,37 +709,6 @@ class GenerationExecutorWorker(GenerationExecutor):
         self.shutdown()
 
 
-def notify_proxy_with_retry(queue, message, max_retries=5, timeout=1):
-    """
-    Notify proxy via REQ/REP socket with automatic retry on failure
-
-    Args:
-        queue: IpcQueue with REQ socket type
-        message: Message to send to proxy
-        max_retries: Maximum retry attempts (default: 5)
-        timeout: Timeout in seconds for each attempt (default: 1)
-
-    Returns:
-        bool: True if proxy confirmed receipt, False if failed after all retries
-    """
-    retry_count = 0
-
-    while retry_count < max_retries:
-        try:
-            queue.put(message)
-            # Wait for ACK with timeout
-            if queue.poll(timeout):
-                queue.get()
-                return True
-            else:
-                retry_count += 1
-
-        except Exception:
-            retry_count += 1
-
-    return False
-
-
 @print_traceback_on_error
 def worker_main(
     engine: Path | Engine,
@@ -801,7 +770,7 @@ def worker_main(
         worker_init_status_queue = IpcQueue(
             worker_queues.worker_init_status_queue_addr,
             is_server=False,
-            socket_type=zmq.REQ,
+            socket_type=zmq.DEALER,
             name="worker_init_status_queue")
         mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
                                        is_server=False,
@@ -903,7 +872,7 @@ def worker_main(
         if is_leader:
             # Send error message with confirmation
             error_msg = (e, traceback.format_exc())
-            if not notify_proxy_with_retry(worker_init_status_queue, error_msg):
+            if not worker_init_status_queue.notify_with_retry(error_msg):
                 logger.error("Failed to deliver error message to proxy")
         return
 
@@ -924,8 +893,7 @@ def worker_main(
                                                    kv_cache_events_queue)
                 # Send ready signal with confirmation
                 ready_msg = (ready_signal, None)
-                if not notify_proxy_with_retry(worker_init_status_queue,
-                                               ready_msg):
+                if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
