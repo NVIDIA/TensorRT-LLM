@@ -350,19 +350,28 @@ class ModelConfig(Generic[TConfig]):
             json_quant_configs.get('activation_scheme', None).upper()
         ) if json_quant_configs.get("activation_scheme") else None
 
-        json_exclude_quant_configs = json_quant_configs.get('exclude_quantization', None)
-        if json_exclude_quant_configs:
+        json_exclude_quantization= json_quant_configs.get('exclude_quantization', None)
+        if json_exclude_quantization:
             quant_config.exclude_quant_config = {
                 "quant_algo": QuantAlgo(
-                    json_exclude_quant_configs.get('quant_algo', None).upper()
-                ) if json_exclude_quant_configs.get("quant_algo") else None,
+                    json_exclude_quantization.get('quant_algo', None).upper()
+                ) if json_exclude_quantization.get("quant_algo") else None,
                 "kv_cache_quant_algo": QuantAlgo(
-                    json_exclude_quant_configs.get("kv_cache_quant_algo").upper()
-                ) if json_exclude_quant_configs.get("kv_cache_quant_algo") else None,
+                    json_exclude_quantization.get("kv_cache_quant_algo").upper()
+                ) if json_exclude_quantization.get("kv_cache_quant_algo") else None,
                 "activation_scheme": ActivationScheme(
-                    json_exclude_quant_configs.get('activation_scheme', None).upper()
-                ) if json_exclude_quant_configs.get("activation_scheme") else None,
+                    json_exclude_quantization.get('activation_scheme', None).upper()
+                ) if json_exclude_quantization.get("activation_scheme") else None,
+                "group_size": json_exclude_quantization.get('group_size', None),
             }
+            if quant_config.exclude_quantization["quant_algo"] in [QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.W4A8_AWQ]:
+                if quant_config.exclude_quantization["group_size"] is None:
+                    quant_config.exclude_quantization["group_size"] = 128
+
+        if quant_config.quant_algo in [QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.W4A8_AWQ]:
+            if quant_config.group_size is None:
+                quant_config.group_size = 128
+
         return quant_config, layer_quant_config
 
     @staticmethod
@@ -409,8 +418,11 @@ class ModelConfig(Generic[TConfig]):
                 'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                 'embedding', 'unembedding'
             ]
+        elif hf_quant_config.get("quant_method") == "fp8":
+            quant_config.quant_algo = QuantAlgo.FP8
         elif hf_quant_config.get("quant_method") == "w4a8_awq":
             quant_config.quant_algo = QuantAlgo.W4A8_AWQ
+            quant_config.group_size = hf_quant_config.get("weight_group_size", 128)
         else:
             raise NotImplementedError(f"Unsupported quantization_config: {hf_quant_config}.")
 
@@ -422,25 +434,40 @@ class ModelConfig(Generic[TConfig]):
             if hf_quant_config.get("activation_scheme") else None
         # set exclude_modules
         if quant_config.exclude_modules:
-            if hf_quant_config.get("ignored_modules"):
-                quant_config.exclude_modules += hf_quant_config.get("ignored_modules")
+            if hf_quant_config.get("ignored_layers"):
+                quant_config.exclude_modules += hf_quant_config.get("ignored_layers")
         else:
-            quant_config.exclude_modules = hf_quant_config.get("ignored_modules")
+            quant_config.exclude_modules = hf_quant_config.get("ignored_layers")
 
         # set exclude_quant_config
         hf_ignored_quantization_config = hf_quant_config.get("ignored_quantization_config")
         if hf_ignored_quantization_config:
             quant_config.exclude_quant_config = {
-                "quant_algo": QuantAlgo(
-                    hf_ignored_quantization_config.get("quant_method").upper()
-                ) if hf_ignored_quantization_config.get("quant_method") else None,
                 "kv_cache_quant_algo": QuantAlgo(
                     hf_ignored_quantization_config.get("kv_cache_quant_method").upper()
                 ) if hf_ignored_quantization_config.get("kv_cache_quant_method") else None,
                 "activation_scheme": ActivationScheme(
                     hf_ignored_quantization_config.get("activation_scheme").upper()
                 ) if hf_ignored_quantization_config.get("activation_scheme") else None,
+                "group_size": 128,
             }
+            if hf_ignored_quantization_config.get(
+                    "quant_method") == "fp8" and hf_ignored_quantization_config.get("weight_block_size", []):
+                quant_config.exclude_quantization["quant_algo"] = QuantAlgo.FP8_BLOCK_SCALES
+                block_size = hf_ignored_quantization_config.get("weight_block_size", [])
+                assert tuple(block_size) == (
+                    128,
+                    128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
+                quant_config.exclude_quantization["group_size"] = block_size[0]
+            elif hf_ignored_quantization_config.get("quant_method") == "fp8":
+                quant_config.exclude_quantization["quant_algo"] = QuantAlgo.FP8
+            elif hf_ignored_quantization_config.get("quant_method") == "w4a8_awq":
+                quant_config.exclude_quantization["quant_algo"] = QuantAlgo.W4A8_AWQ
+                quant_config.exclude_quantization["group_size"] = hf_ignored_quantization_config.get(
+                    "weight_group_size", 128)
+            else:
+                raise NotImplementedError(f"Unsupported quantization_config.ignored_quantization_config: "
+                                          f"{hf_ignored_quantization_config}.")
 
         logger.info(f"Load quantization config from pretrained config, quant_config: {quant_config}")
 

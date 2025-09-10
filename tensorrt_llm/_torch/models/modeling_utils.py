@@ -482,12 +482,18 @@ class DecoderModelForCausalLM(nn.Module,
             kv_cache_quant_algo = quant_config.kv_cache_quant_algo
         quant_algo = None
         activation_scheme = None
-        exclude_quant_config = quant_config.exclude_quant_config
-        if exclude_quant_config:
-            quant_algo = exclude_quant_config.get("quant_algo", None)
-            activation_scheme = exclude_quant_config.get("activation_scheme", None)
+        group_size = 128
+        exclude_quantization = quant_config.exclude_quantization
+        if exclude_quantization:
+            quant_algo = exclude_quantization.get("quant_algo", None)
+            activation_scheme = exclude_quantization.get("activation_scheme", None)
+            group_size = exclude_quantization.get("group_size", 128)
         new_config = QuantConfig(
-            quant_algo=quant_algo, kv_cache_quant_algo=kv_cache_quant_algo, activation_scheme=activation_scheme)
+            quant_algo=quant_algo,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            activation_scheme=activation_scheme,
+            group_size=group_size,
+        )
 
         if quant_config is not None:
             if quant_config.exclude_modules is not None:

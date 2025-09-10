@@ -143,7 +143,7 @@ class QuantConfig:
         pre_quant_scale (bool): Whether to use pre-quant scale for quantization. Defaults to False.
         exclude_modules (List[str], optional): The module name patterns that are skipped in quantization. Defaults to None.
         mamba_ssm_cache_dtype (str, optional): The data type for mamba SSM cache. Defaults to None.
-        exclude_quant_config  (Dict, optional): The model of exclude_modules will use exclude_quant_config.
+        exclude_quantization  (Dict, optional): The model of exclude_modules will use exclude_quantization.
         activation_scheme (tensorrt_llm.quantization.mode.ActivationScheme, optional): The input of activation quantize scheme.
     """
     quant_algo: Optional[QuantAlgo] = None
@@ -156,7 +156,7 @@ class QuantConfig:
     pre_quant_scale: bool = False
     exclude_modules: Optional[List[str]] = None
     mamba_ssm_cache_dtype: Optional[str] = None
-    exclude_quant_config: Optional[Dict] = None
+    exclude_quantization: Optional[Dict] = None
     activation_scheme: Optional[ActivationScheme] = None
 
     @cached_property
