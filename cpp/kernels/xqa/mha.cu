@@ -505,7 +505,8 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                         bool const maskFlag = col + actualQSeqLen < nbValidCols
                             ? true
                             : packedMask & (1u << ((col + actualQSeqLen - nbValidCols) - maskPosStart));
-                        acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : -INFINITY;
+                        acc(m, n)(i, j)
+                            = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : mha::numeric_limits<float>::lowest();
                     }
                 }
             }
