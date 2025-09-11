@@ -357,7 +357,7 @@ def test_llm_with_kv_cache_retention_config():
     kv_cache_retention_config = KvCacheRetentionConfig([
         KvCacheRetentionConfig.TokenRangeRetentionConfig(
             0, 2, 30, datetime.timedelta(seconds=30))
-    ], 80)
+    ], 80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
 
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,

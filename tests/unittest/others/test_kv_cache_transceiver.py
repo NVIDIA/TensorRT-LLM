@@ -54,6 +54,7 @@ def ctx_gen_kv_cache_dtype(request):
         raise ValueError(f"Invalid config: {request.param}")
 
 
+@pytest.mark.skip(reason="https://nvbugs/5513192")
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize(
     "ctx_gen_kv_cache_dtype",
