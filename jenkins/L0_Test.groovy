@@ -577,6 +577,9 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     ),
                     numRetries: 3
                 )
+                // echo the slurm output
+                def slurmOutput = pipeline.readFile(file: slurmOutputFile)
+                echo "slurmOutput: ${slurmOutput}"
             }
 
             echo "Finished test stage execution."
@@ -1536,6 +1539,15 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/trtllmExecutorWorker /opt/tritonserver/backends/tensorrtllm/")
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
+
+        // Test machine
+        try {
+            sh "python3 ${llmSrc}/jenkins/scripts/gemm_test.py"
+            echo "GEMM test completed successfully. The machine is healthy."
+        } catch (Exception e) {
+            echo "GEMM test failed: ${e.getMessage()}"
+            error("Machine Error: GEMM test failed, please check CUDA and GPU environment.")
+        }
     }
 
     if (testFilter[(DEBUG_MODE)]) {
