@@ -19,6 +19,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/operators.h>
 #include <nanobind/stl/bind_vector.h>
+#include <nanobind/stl/chrono.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -511,4 +512,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, nb::rv_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
+
+    m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
 }
