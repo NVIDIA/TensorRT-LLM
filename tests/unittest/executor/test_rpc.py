@@ -505,7 +505,7 @@ class TestApp:
             yield i
 
 
-class TestRpcStreaming:
+class TestRpcAsync:
     # Use setup_method/teardown_method for pytest class-based setup/teardown
     def setup_method(self):
         """Setup RPC server and client for tests."""

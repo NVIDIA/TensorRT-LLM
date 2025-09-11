@@ -7,7 +7,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from ...llmapi.utils import ManagedThread
+from ...llmapi.utils import ManagedThread, logger_debug
 from ...logger import logger
 from ..ipc import ZeroMqQueue
 from .rpc_common import (RPCError, RPCRequest, RPCResponse, RPCStreamingError,
@@ -22,7 +22,7 @@ class RPCServer:
     def __init__(self,
                  instance,
                  hmac_key=None,
-                 num_workers: int = 1,
+                 num_workers: int = 4,
                  timeout: float = 0.5,
                  async_run_task: bool = False):
         """
@@ -34,6 +34,8 @@ class RPCServer:
             num_workers (int): Number of worker threads.
             timeout (int): Timeout for RPC calls.
             async_run_task (bool): Whether to run the task asynchronously.
+
+        NOTE: make num_workers larger if there are some streaming tasks runs infinitely.
         """
         self._instance = instance
         self._hmac_key = hmac_key
@@ -63,7 +65,8 @@ class RPCServer:
         # Automatically register the instance
         self.register_instance(instance)
 
-        logger.debug(f"RPC Server initialized with {num_workers} workers.")
+        logger_debug(f"RPC Server initialized with {num_workers} workers.",
+                     color="green")
 
     @property
     def address(self) -> str:
@@ -103,7 +106,7 @@ class RPCServer:
         if self._stop_event.is_set():
             return
 
-        logger.debug(
+        logger_debug(
             "RPC Server shutdown signal received. Terminating server...")
 
         # Set the stop event to True, this will trigger the dispatcher routine and
@@ -112,22 +115,22 @@ class RPCServer:
         self._stop_event.set()
 
         # The worker routine should process the pending requests
-        logger.debug(
+        logger_debug(
             f"RPC Server shutdown: {self._num_pending_requests} pending requests"
         )
         while self._num_pending_requests > 0:
             time.sleep(0.01)
-        logger.debug(f"RPC Server shutdown finished pending requests")
+        logger_debug(f"RPC Server shutdown finished pending requests")
 
         if not is_remote_call:
             # Block the thread until shutdown is finished
 
             # 1. Wait for the dispatcher thread to exit, so that no new requests are accepted
-            logger.debug(f"RPC Server dispatcher thread joining")
+            logger_debug(f"RPC Server dispatcher thread joining")
             if self._dispatcher_thread:
                 self._dispatcher_thread.join()
                 self._dispatcher_thread = None
-            logger.debug(f"RPC Server dispatcher thread joined")
+            logger_debug(f"RPC Server dispatcher thread joined")
 
             # 2. Wait for the executor to exit, it will wait for the pending requests to be processed
             if self._executor:
@@ -142,13 +145,13 @@ class RPCServer:
             # if the shutdown is called by a remote call, this method itself will
             # be executed in a executor thread, so we cannot join the dispatcher thread as
             # the dispatcher thread is awaiting for the shutdown result.
-            logger.debug(
+            logger_debug(
                 f"RPC Server to shutdown: {self._num_pending_requests} pending requests"
             )
 
             while self._num_pending_requests > 0:
                 time.sleep(0.01)
-            logger.debug(f"RPC Server shutdown finished pending requests")
+            logger_debug(f"RPC Server shutdown finished pending requests")
 
     def register_function(self, func, name=None):
         """Exposes a single function to clients."""
@@ -157,11 +160,11 @@ class RPCServer:
             logger.warning(
                 f"Function '{fname}' is already registered. Overwriting.")
         self._functions[fname] = func
-        logger.debug(f"Registered function: {fname}")
+        logger_debug(f"Registered function: {fname}")
 
     def register_instance(self, instance):
         """Exposes all public methods of a class instance."""
-        logger.debug(
+        logger_debug(
             f"Registering instance of class: {instance.__class__.__name__}")
         for name in dir(instance):
             if not name.startswith('_'):
@@ -184,7 +187,7 @@ class RPCServer:
             try:
                 req: RPCRequest = await self._client_socket.get_async_noblock(
                     timeout=0.5)
-                logger.debug(f"RPC dispatcher got request: {req}")
+                logger_debug(f"RPC dispatcher got request: {req}")
             except asyncio.TimeoutError:
                 await asyncio.sleep(0)
                 continue
@@ -235,10 +238,10 @@ class RPCServer:
 
                 # Some tasks don't need response, e.g. submit_request or shutdown
                 if req.need_response and response is not None:
-                    logger.debug(
+                    logger_debug(
                         f"RPC Server sending response for request {req}")
                     await self._client_socket.put_async(response)
-                    logger.debug(f"RPC Server sent response for request {req}")
+                    logger_debug(f"RPC Server sent response for request {req}")
 
             self._num_pending_requests -= 1
 
@@ -255,6 +258,7 @@ class RPCServer:
         try:
             if inspect.iscoroutinefunction(func):
                 # Execute async function directly in event loop, no need to run in executor due to the GIL
+                logger_debug(f"RPC Server running async task {req.method_name}")
                 result = await asyncio.wait_for(func(*req.args, **req.kwargs),
                                                 timeout=req.timeout)
             else:
@@ -264,11 +268,12 @@ class RPCServer:
                 def call_with_kwargs():
                     return func(*req.args, **req.kwargs)
 
+                logger_debug(f"RPC Server running task {req.method_name}")
                 result = await asyncio.wait_for(loop.run_in_executor(
                     self._executor, call_with_kwargs),
                                                 timeout=req.timeout)
 
-            logger.debug(f"RPC Server returned result for request {req}")
+            logger_debug(f"RPC Server returned result for request {req}")
             response = RPCResponse(req.request_id, result)
 
         except asyncio.TimeoutError:
@@ -315,6 +320,7 @@ class RPCServer:
         sequence_number = 0
 
         try:
+            logger_debug(f"RPC Server running streaming task {req.method_name}")
             # Send start signal
             await self._client_socket.put_async(
                 RPCResponse(req.request_id, None, None, True, sequence_number,
@@ -323,6 +329,8 @@ class RPCServer:
 
             # Stream the results
             async for result in func(*req.args, **req.kwargs):
+                logger_debug(
+                    f"RPC Server got data and ready to send result {result}")
                 await self._client_socket.put_async(
                     RPCResponse(req.request_id, result, None, True,
                                 sequence_number, 'data'))

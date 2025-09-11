@@ -14,6 +14,7 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
+from .rpc.rpc_common import RPCParams
 from .rpc_worker import RpcWorker
 from .utils import (ErrorResponse, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response)
@@ -90,7 +91,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         clock = 0
         while not self._shutdown_event.is_set():
             if clock % 1 == 0:
-                responses = self.fetch_responses_remote()
+                responses = self.fetch_responses_remote(
+                )  # RPC request => RPC server; result => RPC client
                 self.handle_responses(responses)
             if clock % 10 == 0:
                 stats = self.fetch_stats_remote()  # TODO
@@ -144,7 +146,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         logprob_params = self._get_logprob_params(request)
 
         # submit is a fire-and-forget operation, don't need to wait for response
-        self.rpc_client.submit(request, __rpc_need_response=False)
+        self.rpc_client.submit(request,
+                               __rpc_params=RPCParams(need_response=False))
 
         result = GenerationResult(
             request,
@@ -157,16 +160,19 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         return result
 
     def fetch_responses_remote(self):
-        return self.rpc_client.fetch_responses(__rpc_timeout=20)
+        return self.rpc_client.fetch_responses(__rpc_params=RPCParams(
+            timeout=20))
 
     def fetch_stats_remote(self):
         return self.rpc_client.fetch_stats()
 
     def setup_engine_remote(self):
-        return self.rpc_client.setup_engine(__rpc_timeout=60 * 20)  # 20 min
+        return self.rpc_client.setup_engine(
+            __rpc_params=RPCParams(timeout=60 * 20))  # 20 min
 
     def shutdown_remote(self):
-        self.rpc_client.shutdown(__rpc_timeout=60 * 20)  # 20 min
+        self.rpc_client.shutdown(__rpc_params=RPCParams(timeout=60 *
+                                                        20))  # 20 min
 
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id)
