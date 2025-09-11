@@ -356,8 +356,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
                 lineIndex++
                 echo "DEBUG: Processing line ${lineIndex}: '${line}'"
 
-                if (line.matches(/.*Running \d+ items in this shard.*/)) {
-                    echo "DEBUG: Found 'Running X items in this shard' line: '${line}'"
+                if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
+                    echo "DEBUG: Found 'Running X items in this shard' or '[pytest-split] Running group' line: '${line}'"
                     foundRunningLine = true
                     return false  // Don't include the "Running" line itself
                 }
