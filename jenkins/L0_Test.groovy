@@ -340,18 +340,50 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
                 returnStdout: true
             ).trim()
 
+            // Debug: Show the raw pytest output
+            echo "DEBUG: Raw pytestOutput (${pytestOutput.length()} characters):"
+            echo "<<<START_PYTEST_OUTPUT>>>"
+            echo "${pytestOutput}"
+            echo "<<<END_PYTEST_OUTPUT>>>"
+
             // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
             def lines = pytestOutput.split('\n')
+            echo "DEBUG: Split into ${lines.size()} lines"
+
             def foundRunningLine = false
+            def lineIndex = 0
             shardTestList = lines.findAll { line ->
+                lineIndex++
+                echo "DEBUG: Processing line ${lineIndex}: '${line}'"
+
                 if (line.matches(/.*Running \d+ items in this shard.*/)) {
+                    echo "DEBUG: Found 'Running X items in this shard' line: '${line}'"
                     foundRunningLine = true
                     return false  // Don't include the "Running" line itself
                 }
-                return foundRunningLine && line.contains('::')
+
+                def hasDoubleColon = line.contains('::')
+                def shouldInclude = foundRunningLine && hasDoubleColon
+                echo "DEBUG: Line analysis - foundRunningLine: ${foundRunningLine}, hasDoubleColon: ${hasDoubleColon}, shouldInclude: ${shouldInclude}"
+
+                return shouldInclude
+            }
+
+            echo "DEBUG: Filtering complete. shardTestList size: ${shardTestList.size()}"
+            if (shardTestList.size() > 0) {
+                echo "DEBUG: shardTestList contents:"
+                shardTestList.eachWithIndex { test, index ->
+                    echo "  [${index}]: ${test}"
+                }
+            } else {
+                echo "DEBUG: shardTestList is empty"
             }
         } catch (Exception e) {
             echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
+            echo "DEBUG: Exception details: ${e.class.name}: ${e.message}"
+            if (e.stackTrace) {
+                echo "DEBUG: Stack trace: ${e.stackTrace.take(5).join('\n')}"
+            }
             error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
         }
     }
