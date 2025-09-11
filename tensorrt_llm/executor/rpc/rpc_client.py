@@ -201,7 +201,6 @@ class RPCClient:
         timeout = rpc_params.timeout if rpc_params.timeout is not None else self._timeout
 
         request_id = uuid.uuid4().hex
-        logger_debug(f"RPC client sending request: {request_id}")
         request = RPCRequest(request_id,
                              method_name,
                              args,

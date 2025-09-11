@@ -118,6 +118,7 @@ class RPCServer:
         logger_debug(
             f"RPC Server shutdown: {self._num_pending_requests} pending requests"
         )
+
         while self._num_pending_requests > 0:
             time.sleep(0.01)
         logger_debug(f"RPC Server shutdown finished pending requests")
@@ -194,10 +195,13 @@ class RPCServer:
 
             await self._queue.put(req)  # type: ignore
 
-            # shutdown is a builtin method depends on _num_pending_requests, so
-            # it should not be counted
-            if req.method_name != "__rpc_shutdown":
+            # shutdown methods depend on _num_pending_requests, so
+            # they should not be counted
+            if req.method_name not in ["__rpc_shutdown", "shutdown"]:
                 self._num_pending_requests += 1
+                logger_debug(
+                    f"Dispatcher received request {req}, pending: {self._num_pending_requests}"
+                )
 
     async def _worker_routine(self, stop_event: threading.Event):
         """The routine executed by each worker thread."""
@@ -213,11 +217,36 @@ class RPCServer:
                 await asyncio.sleep(0)
                 continue
 
-            # Check if this is a streaming request
-            if req.is_streaming and req.method_name in self._functions:
-                func = self._functions[req.method_name]
+            # check if the method name is in the functions
+            if req.method_name not in self._functions:
+                logger.error(
+                    f"Method '{req.method_name}' not found in RPC server.")
+                if not req.need_response:
+                    continue
+                if req.is_streaming:
+                    await self._client_socket.put_async(
+                        RPCResponse(
+                            req.request_id,
+                            None,
+                            RPCStreamingError(
+                                f"Method '{req.method_name}' not found in RPC server.",
+                                traceback=traceback.format_exc()),
+                            stream_status='error'))
+                else:
+                    response = RPCResponse(
+                        req.request_id,
+                        None,
+                        RPCError(
+                            f"Method '{req.method_name}' not found in RPC server.",
+                            traceback=traceback.format_exc()),
+                    )
+                    await self._client_socket.put_async(response)
+
+                continue
+
+            func = self._functions[req.method_name]
+            if req.is_streaming:
                 if inspect.isasyncgenfunction(func):
-                    # Process streaming request
                     await self._process_streaming_request(req)
                 else:
                     # Non-streaming function called with streaming flag
@@ -239,26 +268,25 @@ class RPCServer:
                 # Some tasks don't need response, e.g. submit_request or shutdown
                 if req.need_response and response is not None:
                     logger_debug(
-                        f"RPC Server sending response for request {req}")
+                        f"RPC Server sending response for request {req}, pending: {self._num_pending_requests}"
+                    )
                     await self._client_socket.put_async(response)
                     logger_debug(f"RPC Server sent response for request {req}")
 
-            self._num_pending_requests -= 1
+            # Only decrement if this request was counted in the first place
+            if req.method_name not in ["__rpc_shutdown", "shutdown"]:
+                self._num_pending_requests -= 1
 
     async def _process_request(self, req: RPCRequest) -> Optional[RPCResponse]:
         """Process a request. Returns None for streaming requests (handled separately)."""
-        if req.method_name not in self._functions:
-            return RPCResponse(
-                req.request_id, None,
-                RPCError(f"Method '{req.method_name}' not found in RPC server.",
-                         traceback=traceback.format_exc()))
-
         func = self._functions[req.method_name]
 
         try:
             if inspect.iscoroutinefunction(func):
                 # Execute async function directly in event loop, no need to run in executor due to the GIL
-                logger_debug(f"RPC Server running async task {req.method_name}")
+                logger_debug(
+                    f"RPC Server running async task {req.method_name} in dispatcher"
+                )
                 result = await asyncio.wait_for(func(*req.args, **req.kwargs),
                                                 timeout=req.timeout)
             else:
@@ -268,7 +296,9 @@ class RPCServer:
                 def call_with_kwargs():
                     return func(*req.args, **req.kwargs)
 
-                logger_debug(f"RPC Server running task {req.method_name}")
+                logger_debug(
+                    f"RPC Server running async task {req.method_name} in worker"
+                )
                 result = await asyncio.wait_for(loop.run_in_executor(
                     self._executor, call_with_kwargs),
                                                 timeout=req.timeout)
@@ -292,17 +322,6 @@ class RPCServer:
 
     async def _process_streaming_request(self, req: RPCRequest):
         """Process a streaming request by sending multiple responses."""
-        if req.method_name not in self._functions:
-            await self._client_socket.put_async(
-                RPCResponse(
-                    req.request_id,
-                    None,
-                    RPCStreamingError(
-                        f"Method '{req.method_name}' not found in RPC server.",
-                        traceback=traceback.format_exc()),
-                    stream_status='error'))
-            return
-
         func = self._functions[req.method_name]
 
         if not inspect.isasyncgenfunction(func):
