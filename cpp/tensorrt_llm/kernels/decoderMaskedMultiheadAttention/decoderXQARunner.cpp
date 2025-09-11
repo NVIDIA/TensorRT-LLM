@@ -74,20 +74,6 @@ constexpr inline T roundUp(T a, T b)
 
 DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams, bool for_configure_plugin)
 {
-    int const smVersion = tensorrt_llm::common::getSMVersion();
-    if (xqaParams.multi_query_tokens)
-    {
-        auto const grpSize = xqaParams.num_q_heads / xqaParams.num_kv_heads;
-        // Ampere XQA supports spec dec with pre-compiled cubins (may also work with JIT but not implemented yet)
-        // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
-        // now.
-        bool const supportedByHopperXqa
-            = (smVersion == 90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && grpSize <= 64);
-        bool const supportedBySm120Mla
-            = (smVersion == 120 && xqaParams.isMLA() && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3);
-        return (supportedByHopperXqa || supportedBySm120Mla) ? mJITImpl.get() : mPrecompiledImpl.get();
-    }
-
     std::optional<bool> envEnableXQAJIT = tensorrt_llm::common::getEnvEnableXQAJIT();
 
     if (envEnableXQAJIT.has_value())
