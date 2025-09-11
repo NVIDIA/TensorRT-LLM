@@ -76,7 +76,7 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
   -o trace -f true \
   -t 'cuda,nvtx,python-gil' -c cudaProfilerApi \
   --cuda-graph-trace node \
-  -e TLLM_PROFILE_RECORD_GC=1,TLLM_LLMAPI_ENABLE_NVTX=1,TLLM_TORCH_PROFILE_TRACE=trace.json \
+  -e TLLM_PROFILE_RECORD_GC=1,TLLM_NVTX_DEBUG=1,TLLM_TORCH_PROFILE_TRACE=trace.json \
   --trace-fork-before-exec=true \
   trtllm-bench \ # or trtllm-serve command
     --model deepseek-ai/DeepSeek-V3 \
