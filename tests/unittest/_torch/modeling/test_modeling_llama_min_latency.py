@@ -1,3 +1,4 @@
+import types
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -266,11 +267,6 @@ class TestLlama4MinLatency(unittest.TestCase):
         attention_backend = "TRTLLM"
         metadata_cls = get_attention_backend(attention_backend).Metadata
 
-        if transformers.__version__ >= "4.55.0":
-            self.skipTest(
-                "The transformers 4.55.0 has accuracy issues while 4.33.1 works fine. "
-                "https://nvbugspro.nvidia.com/bug/5441729")
-
         torch.random.manual_seed(0)
         config_dict = deepcopy(LLAMA_4_MAVERICK_TWO_LAYER_CONFIG)
         # 17B * sizeof(float16) plus some extra for activations
@@ -286,6 +282,29 @@ class TestLlama4MinLatency(unittest.TestCase):
 
         with torch.device(device), default_dtype(dtype):
             hf_llama = HFLlama4ForConditionalGeneration(llama_config).eval()
+
+            # transformers 4.55.0+ has a bug in Llama4. Monkey-patch it for now
+            # until we upgrade to a transformers version containing the fix:
+            # https://github.com/huggingface/transformers/pull/40609
+            if transformers.__version__ >= "4.55.0":
+
+                def override_forward(self, hidden_states):
+                    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+                    router_scores, router_logits = self.router(hidden_states)
+                    routed_in = hidden_states.repeat(router_scores.shape[1], 1)
+                    routed_in = routed_in * router_scores.transpose(
+                        0, 1).reshape(-1, 1)
+                    routed_out = self.experts(routed_in)
+                    out = self.shared_expert(hidden_states)
+                    out.add_(
+                        routed_out.reshape(router_scores.shape[1], -1,
+                                           routed_out.shape[-1]).sum(dim=0))
+                    return out, router_logits
+
+                for layer in hf_llama.language_model.model.layers:
+                    if layer.is_moe_layer:
+                        layer.feed_forward.forward = types.MethodType(
+                            override_forward, layer.feed_forward)
 
             model_config = ModelConfig(pretrained_config=llama_config,
                                        attn_backend=attention_backend)
