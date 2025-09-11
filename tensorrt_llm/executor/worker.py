@@ -14,6 +14,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
@@ -1050,14 +1051,14 @@ def _get_params_for_first_rsp(
 
 
 def _get_logprobs(worker,
-                  response: tllm.Response,
+                  response: Union[tllm.Response, LlmResponse],
                   is_pytorch_backend=False) -> Optional[LogProbsResult]:
-    """Compute logprob and prompt logprob and clear out logits if applicable.
+    """Compute logprobs from response logits when needed.
+
+    Logprobs provenance varies by backend:
+    - PyTorch: Generation logprobs computed in sampler, only prompt logprobs computed here
+    - TRT: Both prompt and generation logprobs computed here from logits
     """
-    if is_pytorch_backend:
-        # _get_logprobs() is a WAR for the TRT backend, where top-k logprobs are computed post runtime.
-        # In the PyTorch backend, logprobs are already computed during runtime if requested.
-        return None
 
     logprobs_result = None
     generation_result = worker._results.get(response.client_id, None)
@@ -1067,6 +1068,26 @@ def _get_logprobs(worker,
 
     logprob_params = getattr(generation_result, "_logprob_params", None)
     if logprob_params:
+        if is_pytorch_backend:
+            if not logprob_params.prompt_logprobs:
+                # PyTorch: generation logprobs computed in sampler, no post-processing needed
+                return
+            else:
+                # PyTorch: compute only prompt logprobs from context logits
+                # This can be done as a postprocessing step instead of coupling it to the
+                # pytorch engine, because prompt_logprobs calculation is not complicated by
+                # generation sampling strategies. Therefore it is simpler to do it here than
+                # doing it in the pytorch engine and plumbing it through the response.
+                logprobs_result = compute_logprobs(
+                    logprob_params.prompt_logprobs, None,
+                    response.result.context_logits, None, None)
+                # Drop context logits if user didn't explicitly request them
+                if logprob_params.drop_context_logits and hasattr(
+                        response, 'clear_context_logits'):
+                    response.clear_context_logits()
+                return logprobs_result
+
+        # TRT backend: compute both prompt and generation logprobs from logits
         logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
                                            logprob_params.logprobs,
                                            response.result.context_logits,
