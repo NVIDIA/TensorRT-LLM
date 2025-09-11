@@ -2378,13 +2378,14 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     if model_name == "qwen2-vl-7b-instruct" and modality == "image":
         match_ratio = 4.0 / 6
 
+    parsed_outputs = parse_output(output)
     for prompt_output, prompt_keywords in zip(
-            parse_output(output), expected_keywords[model_name][modality]):
+            parsed_outputs, expected_keywords[model_name][modality]):
         matches = [
             keyword in prompt_output.lower() for keyword in prompt_keywords
         ]
         obs_match_ratio = 1. * sum(matches) / len(matches)
-        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nFull output: {parsed_outputs}\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
 
     print("All answers are correct!")
 
@@ -2517,13 +2518,14 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
     match_ratio = 0.6
-    for prompt_output, prompt_keywords in zip(parse_output(output),
+    parsed_outputs = parse_output(output)
+    for prompt_output, prompt_keywords in zip(parsed_outputs,
                                               expected_keywords[modality]):
         matches = [
             keyword in prompt_output.lower() for keyword in prompt_keywords
         ]
         obs_match_ratio = 1. * sum(matches) / len(matches)
-        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nFull output: {parsed_outputs}\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
 
     print("All answers are correct!")
 
@@ -2623,13 +2625,14 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
         match_ratio = 0.6
 
     # Check output accuracy
+    parsed_outputs = parse_output(output)
     for prompt_output, prompt_keywords in zip(
-            parse_output(output), expected_keywords[model_name]["image"]):
+            parsed_outputs, expected_keywords[model_name]["image"]):
         matches = [
             keyword in prompt_output.lower() for keyword in prompt_keywords
         ]
         obs_match_ratio = 1. * sum(matches) / len(matches)
-        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nFull output: {parsed_outputs}\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
 
     print("All answers are correct!")
 
@@ -2722,8 +2725,9 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         match_ratio = 0.6
 
     # Check output accuracy
+    parsed_outputs = parse_output(output)
     for prompt_output, prompt_keywords in zip(
-            parse_output(output), expected_keywords[model_name]["image"]):
+            parsed_outputs, expected_keywords[model_name]["image"]):
         matches = [
             keyword in prompt_output.lower() for keyword in prompt_keywords
         ]
@@ -2732,7 +2736,7 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         print("prompt_keywords:", prompt_keywords)
         print("matches:", matches)
         print("obs_match_ratio:", obs_match_ratio)
-        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nFull output: {parsed_outputs}\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
 
     print("All answers are correct!")
 
