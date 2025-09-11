@@ -2,6 +2,8 @@
 
 set -ex
 
+CUDA_VER="13"
+
 install_boost() {
   # Install boost version >= 1.78 for boost::span
   # Current libboost-dev apt packages are < 1.78, so install from tar.gz
@@ -21,17 +23,10 @@ install_triton_deps() {
       python3-build \
       libb64-dev \
       libarchive-dev \
+      datacenter-gpu-manager-4-cuda${CUDA_VER} \
     && install_boost \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-  # Copy /tmp/libdcgm.so* files back to /usr/lib/<arch>-linux-gnu/
-  if [ -d /usr/lib/x86_64-linux-gnu ]; then
-    cp -f /tmp/libdcgm.so* /usr/lib/x86_64-linux-gnu/ || true
-  elif [ -d /usr/lib/aarch64-linux-gnu ]; then
-    cp -f /tmp/libdcgm.so* /usr/lib/aarch64-linux-gnu/ || true
-  else
-    echo "Target /usr/lib directory for architecture not found, skipping libdcgm.so* copy"
-  fi
 }
 
 # Install Triton only if base image is Ubuntu

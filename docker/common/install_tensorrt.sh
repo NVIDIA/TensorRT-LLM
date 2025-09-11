@@ -40,9 +40,8 @@ fi
 install_ubuntu_requirements() {
     apt-get update && apt-get install -y --no-install-recommends gnupg2 curl ca-certificates
     ARCH=$(uname -m)
-    ARCH2="amd64"
-    if [ "$ARCH" = "amd64" ];then ARCH="x86_64" && ARCH2="amd64";fi
-    if [ "$ARCH" = "aarch64" ];then ARCH="sbsa" && ARCH2="arm64";fi
+    if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
+    if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
     curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${ARCH}/cuda-keyring_1.1-1_all.deb
     dpkg -i cuda-keyring_1.1-1_all.deb
@@ -133,15 +132,9 @@ install_tensorrt() {
         RELEASE_URL_TRT="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/${TRT_VER_SHORT}/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz"
     fi
 
-    # Download TensorRT (6GB file, needs longer timeout)
-    echo "Downloading TensorRT from: ${RELEASE_URL_TRT}"
-    if [ "$ARCH" = "x86_64" ];then
-        curl -L --insecure --connect-timeout 600 --max-time 3600 --retry 3 -o /tmp/TensorRT.tar "${RELEASE_URL_TRT}"
-    else
-        wget --retry-connrefused --timeout=180 --tries=10 --continue ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
-    fi
+    wget --retry-connrefused --timeout=180 --tries=10 --continue ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/
-    mv /usr/local/TensorRT-* /usr/local/tensorrt
+    mv /usr/local/TensorRT-${TRT_VER} /usr/local/tensorrt
     pip3 install --no-cache-dir /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
     rm -rf /tmp/TensorRT.tar
     echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
