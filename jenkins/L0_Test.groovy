@@ -2359,7 +2359,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key) + "-subJob-runTest", 1, 1, true, null)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key) + "-SubJob-RunTest", 1, 1, true, null)
                         }
                     })
                 }
@@ -2592,7 +2592,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name + "-subJob-testImage", 1, 1, true, null)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name + "-SubJob-TestImage", 1, 1, true, null)
                 })
             }
         } else {
