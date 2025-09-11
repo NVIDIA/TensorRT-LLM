@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@yanchaol-dlcluster', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -105,13 +105,14 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200"]
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
-COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=60 -o ServerAliveCountMax=5"
+COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
-            ip           : cluster.ip,
-            host         : cluster.host,
+            ip           : randomLoginNode,
+            host         : randomLoginNode,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
@@ -145,9 +146,10 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 //TODO: consolidate slurm related code for both multi nodes and single nodes
 def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID, String slurmOutputFile) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
-            ip           : cluster.ip,
-            host         : cluster.host,
+            ip           : randomLoginNode,
+            host         : randomLoginNode,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
@@ -207,9 +209,10 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
 
 def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, String slurmJobID) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
-            ip           : cluster.ip,
-            host         : cluster.host,
+            ip           : randomLoginNode,
+            host         : randomLoginNode,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
@@ -290,13 +293,15 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
 
     def slurmJobID = null
+    def dockerArgs = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+            def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
             def remote = [
-                    ip           : cluster.ip,
-                    host         : cluster.host,
+                    ip           : randomLoginNode,
+                    host         : randomLoginNode,
                     user         : "${pipeline.USERNAME}",
                     passwd       : "${pipeline.PASSWORD}",
                     allowAnyHosts: true,
@@ -313,6 +318,8 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3)
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
+
+                Utils.exec(pipeline, script: "echo Sleeping to before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -353,9 +360,10 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
         stage('Checking if the Node is Online') {
             withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
                 def remote = [
-                        ip           : cluster.ip,
-                        host         : cluster.host,
+                        ip           : randomLoginNode,
+                        host         : randomLoginNode,
                         user         : "${pipeline.USERNAME}",
                         passwd       : "${pipeline.PASSWORD}",
                         allowAnyHosts: true,
@@ -373,8 +381,6 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                def dockerGPUOption = ""
-
                 node(nodeName) {
                     sh """
                         env | sort
@@ -393,7 +399,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     // Dynamically set GPU arguments based on environment variables
                     // https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
                     // It's intentional to check NV_GPU first.
-                    dockerGPUOption = sh(script: """
+                    dockerArgs = sh(script: """
                         if [ -n "\$NV_GPU" ]; then
                             echo "--gpus '\\"device=\$NV_GPU\\"'"
                         elif [ -n "\$CUDA_VISIBLE_DEVICES" ]; then
@@ -404,7 +410,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     """, returnStdout: true).trim()
                 }
 
-                def dockerArgs = "${dockerGPUOption} " +
+                dockerArgs = "${dockerArgs} " +
                     "--cap-add=SYS_ADMIN " +
                     "--ipc=host " +
                     "--entrypoint=\"\" " +
@@ -415,18 +421,17 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add=SYSLOG"
 
-                echo "Final dockerArgs: ${dockerArgs}"
-
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
                 }
-
-                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
-                executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+                echo "Final dockerArgs: ${dockerArgs}"
             } else {
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
             }
         }
+
+        slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
+        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
     } finally {
         stage("Clean up SLURM Resources") {
             // Workaround to handle the interruption during clean up SLURM resources
@@ -473,9 +478,10 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 passwordVariable: 'PASSWORD'
             )
         ]) {
+            def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
             def remote = [
-                    ip           : cluster.ip,
-                    host         : cluster.host,
+                    ip           : randomLoginNode,
+                    host         : randomLoginNode,
                     user         : "${pipeline.USERNAME}",
                     passwd       : "${pipeline.PASSWORD}",
                     allowAnyHosts: true,
@@ -545,7 +551,8 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
                 def scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
                 def scriptContent = """#!/bin/bash
-                    set -o pipefail
+                    set -Exeuo pipefail
+                    trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
@@ -571,6 +578,8 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             }
 
             stage('Run Test') {
+                Utils.exec(pipeline, script: "echo Sleeping to before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
+
                 Utils.exec(
                     pipeline,
                     timeout: false,
@@ -1940,14 +1949,18 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
                 stage('Pull Docker Image') {
                     docker.image(image).pull()
                 }
-                docker.image(image).inside(dockerArgs) {
-                    runner()
+                // We submit the Slurm job with SlurmConfig.DEFAULT_TIMEOUT minutes (300) timeout
+                // The timeout here is to avoid the Slurm job being stuck.
+                timeout(time: SlurmConfig.DEFAULT_TIMEOUT, unit: 'MINUTES') {
+                    docker.image(image).inside(dockerArgs) {
+                        runner()
+                    }
                 }
             } catch (Exception e) {
                 if (e.getMessage()?.contains("Failed to kill container")) {
                     echo "Known benign error ignored: ${e.getMessage()}"
                 } else {
-                    throw e // Re-throw if it's a different IOException
+                    throw e // Re-throw if it's a different Exception
                 }
             }
         }
@@ -2128,10 +2141,11 @@ def launchTestJobs(pipeline, testFilter)
 
     multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],
