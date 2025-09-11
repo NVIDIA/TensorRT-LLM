@@ -73,7 +73,7 @@ def vision_arena_dataset_path():
 @skip_gpu_memory_less_than_80gb
 @pytest.mark.parametrize("dataset_name,dataset_args",
                          [("random_image", {
-                             "--random-image-size": "1",
+                             "--random-num-images": "1",
                              "--random-image-size": "512",
                          }),
                           ("random_image", {

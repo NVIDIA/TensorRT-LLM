@@ -18,18 +18,21 @@ from .swiglu import swiglu
 
 class GatedMLP(nn.Module):
 
-    def __init__(self,
-                 *,
-                 hidden_size: int,
-                 intermediate_size: int,
-                 bias: bool,
-                 activation: Callable[[torch.Tensor], torch.Tensor] = F.silu,
-                 dtype: Optional[torch.dtype] = None,
-                 config: Optional[ModelConfig] = None,
-                 overridden_tp_size: Optional[int] = None,
-                 reduce_output: bool = True,
-                 layer_idx: Optional[int] = None,
-                 use_cute_dsl_blockscaling_mm: bool = False):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        bias: bool,
+        activation: Callable[[torch.Tensor], torch.Tensor] = F.silu,
+        dtype: Optional[torch.dtype] = None,
+        config: Optional[ModelConfig] = None,
+        overridden_tp_size: Optional[int] = None,
+        reduce_output: bool = True,
+        layer_idx: Optional[int] = None,
+        use_cute_dsl_blockscaling_mm: bool = False,
+        disable_deep_gemm: bool = False,
+    ):
 
         super().__init__()
         self.layer_idx = layer_idx
@@ -68,7 +71,9 @@ class GatedMLP(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            disable_deep_gemm=disable_deep_gemm,
+        )
 
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
                                    [self.hidden_size])
@@ -86,7 +91,9 @@ class GatedMLP(nn.Module):
             lora=self.down_lora,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            disable_deep_gemm=disable_deep_gemm,
+        )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
         # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora
