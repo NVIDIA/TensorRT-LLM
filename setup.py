@@ -260,4 +260,4 @@ setup(
     install_requires=required_deps,
     dependency_links=
     extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
-    python_requires=">=3.7, <4")
+    python_requires=">=3.10, <4")

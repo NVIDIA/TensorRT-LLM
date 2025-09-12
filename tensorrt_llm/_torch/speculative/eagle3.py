@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
 from torch import nn
@@ -14,6 +14,9 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 from .mtp import MTPSampler
+
+if TYPE_CHECKING:
+    from ...llmapi.llm_args import EagleDecodingConfig
 
 
 class Eagle3ResourceManager(BaseResourceManager):
