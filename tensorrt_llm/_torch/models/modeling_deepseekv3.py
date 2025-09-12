@@ -66,7 +66,8 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+                     create_lm_head_tp_mapping)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
@@ -145,6 +146,12 @@ class DeepseekV3MTPHead(nn.Module):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
+        if self.model_config.mapping.enable_attention_dp and \
+            getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
+            self.mapping_lm_head_tp = create_lm_head_tp_mapping(
+                self.model_config.mapping)
+        else:
+            self.mapping_lm_head_tp = self.model_config.mapping
 
     @torch.compile(options={"max-autotune": True})
     def get_last_token_states(self, hidden_states, attn_metadata):
@@ -167,10 +174,21 @@ class DeepseekV3MTPHead(nn.Module):
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
-        if not (self.model_config.mapping.enable_attention_dp):
+        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+        enable_lm_head_tp_in_adp = self.model_config.mapping.enable_lm_head_tp_in_adp
+
+        # Add pre-lm gather logic
+        if enable_lm_head_tp_in_adp:
+            # ADP + LM TP mode: perform All-Gather before LM_head
+            hidden_states = allgather(hidden_states,
+                                      self.mapping_lm_head_tp,
+                                      dim=0)
+
+        # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = False
-        logits = lm_head(hidden_states)
-        if not (self.model_config.mapping.enable_attention_dp):
+        logits = lm_head(hidden_states, is_spec_decoding_head=True)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = True
         return logits
 
