@@ -211,9 +211,10 @@ class MTPSpecMetadata(SpecMetadata):
 
 class MTPStore(TorchStore):
 
-    def __init__(self, *, max_draft_len: int, max_num_sequences: int,
-                 max_beam_width: int):
+    def __init__(self, *, max_draft_len: int, max_total_draft_tokens: int,
+                 max_num_sequences: int, max_beam_width: int):
         super().__init__(max_draft_len=max_draft_len,
+                         max_total_draft_tokens=max_total_draft_tokens,
                          max_num_sequences=max_num_sequences,
                          max_beam_width=max_beam_width)
         self.next_new_tokens = int_tensor(
@@ -236,9 +237,11 @@ class MTPSampler(Sampler):
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
         self.draft_len = nextn
-        self.store = MTPStore(max_draft_len=nextn,
-                              max_num_sequences=args.max_num_sequences,
-                              max_beam_width=args.max_beam_width)
+        self.store = MTPStore(
+            max_draft_len=nextn,
+            max_num_sequences=args.max_num_sequences,
+            max_beam_width=args.max_beam_width,
+            max_total_draft_tokens=args.max_total_draft_tokens)
         self.max_seq_len = args.max_seq_len
 
     def _request_common_handling(self, request: LlmRequest,
@@ -250,7 +253,11 @@ class MTPSampler(Sampler):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
         request.py_decoding_iter += 1
 
-    def update_requests(self, state: SampleStateMTP) -> None:
+    def update_requests(
+            self,
+            state: SampleStateMTP,
+            resource_manager: Optional[BaseResourceManager] = None) -> None:
+        # resource_manager will be not be used in this function
         assert isinstance(state, SampleStateMTP)
 
         state.sampler_event.synchronize()
