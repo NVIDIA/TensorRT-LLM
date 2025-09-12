@@ -29,6 +29,13 @@ from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
+try:
+    from .modeling_seedoss import \
+        SeedOssForCausalLM  # requires transformers with SeedOssConfig
+    _HAS_SEEDOSS = True
+except Exception:
+    _HAS_SEEDOSS = False
+
 # Note: for better readiblity, this should have same order as imports above
 __all__ = [
     "AutoModelForCausalLM",
@@ -72,3 +79,6 @@ else:
     print(
         f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
     )
+
+if _HAS_SEEDOSS:
+    __all__.append("SeedOssForCausalLM")
