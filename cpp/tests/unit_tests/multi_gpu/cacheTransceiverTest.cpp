@@ -177,6 +177,7 @@ public:
     MOCK_METHOD(texec::kv_cache::CommState const&, getCommState, (), (const));
     MOCK_METHOD(void, setCommState, (texec::kv_cache::CommState), (override));
     MOCK_METHOD(size_t, getCounterpartsCount, (LlmRequest::RequestIdType), (const));
+    MOCK_METHOD(void, sendReadySignal, (LlmRequest::RequestIdType, bool), (override));
     MOCK_METHOD(void, release, (LlmRequest::RequestIdType), (override));
 
 private:
@@ -190,6 +191,7 @@ class MockDataReceiver : public DataReceiver
 public:
     MOCK_METHOD(TransferSession, sendRequestInfo, (LlmRequest const&), (override));
     MOCK_METHOD(void, receiveSync, (TransferSession&), (override));
+    MOCK_METHOD(bool, receiveReadySignal, (TransferSession&), (override));
 };
 
 class MockTransceiverTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -245,6 +247,7 @@ TEST_F(MockTransceiverTest, MpiRequesterBasic)
     EXPECT_CALL(*receiver, sendRequestInfo)
         .WillOnce(Return(TransferSession({nullptr}, DataContext{0}, *state, *state,
             tensorrt_llm::runtime::BufferManager{std::make_shared<tr::CudaStream>()}, nullptr)));
+    EXPECT_CALL(*receiver, receiveReadySignal).WillOnce(Return(true));
     EXPECT_CALL(*receiver, receiveSync).WillOnce(Return());
     DataRequester requester{std::move(receiver)};
     auto request = makeLlmRequest(0);

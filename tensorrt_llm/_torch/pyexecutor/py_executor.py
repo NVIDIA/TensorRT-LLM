@@ -270,6 +270,7 @@ class PyExecutor:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
                 self.num_micro_batches, self.dist)
 
+        self.cancel_request_in_transmission = []
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
         else:
@@ -1762,6 +1763,13 @@ class PyExecutor:
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
 
+                # Cancel the request in the kv cache transceiver if it is in transmission
+                if self.kv_cache_transceiver is not None:
+                    if request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS or \
+                        request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                        self.kv_cache_transceiver.cancel_request(request)
+                        self.cancel_request_in_transmission.append(req_id)
+
         if self.enable_attention_dp:
             # TODO: revisit the cancel logic of attention dp
             # When enable attention dp, each rank does not have full copy of requests
@@ -1854,7 +1862,9 @@ class PyExecutor:
             if request_done:
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
-                else:
+                # If the request is not in transmission, we can terminate it
+                # Otherwise, we need to wait for the signal from the kv cache transceiver
+                elif req_id not in self.cancel_request_in_transmission:
                     requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)

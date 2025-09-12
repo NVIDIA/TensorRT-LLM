@@ -128,6 +128,22 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
     mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo);
 }
 
+void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) const
+{
+    ReadySignalInfo readySignalInfo{mRemoteAgentName, ctx, isReady};
+    NotificationInfo notificationInfo{readySignalInfo};
+    std::stringstream ss;
+    NotificationInfo::serialize(notificationInfo, ss);
+    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
+}
+
+bool AgentConnection::recvReadySignal(DataContext const& ctx) const
+{
+    ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
+    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo);
+    return true;
+}
+
 void AgentConnection::sendRequestAndBufferInfo(
     batch_manager::RequestInfo& requestInfo, std::optional<size_t> cacheBufferId, int validConnectionIdx)
 {
@@ -431,11 +447,11 @@ int AgentConnectionManager::getDeviceId() const
     return mDeviceId;
 }
 
-void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo const& syncInfo)
+template <typename NotificationType>
+void AgentConnectionManager::waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo)
 {
     while (true)
     {
-
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
@@ -455,10 +471,31 @@ void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName,
                 bool erase = false;
                 if (std::holds_alternative<NotificationSyncInfo>(notificationInfo.mInfo))
                 {
-                    auto notificationSyncInfo = std::get<NotificationSyncInfo>(notificationInfo.mInfo);
-                    if (notificationSyncInfo.mContext.getTag() == syncInfo.mContext.getTag()
-                        && notificationSyncInfo.mAgentName == syncInfo.mAgentName)
+                    auto notificationData = std::get<NotificationSyncInfo>(notificationInfo.mInfo);
+                    if (notificationData.mContext.getTag() == expectedInfo.mContext.getTag()
+                        && notificationData.mAgentName == expectedInfo.mAgentName)
                     {
+                        erase = true;
+                        it2 = notifs.erase(it2);
+                        if (notifs.empty())
+                        {
+                            it = mUnhandledNotifications.erase(it);
+                        }
+                        return;
+                    }
+                }
+                else if (std::holds_alternative<ReadySignalInfo>(notificationInfo.mInfo))
+                {
+                    auto readySignalData = std::get<ReadySignalInfo>(notificationInfo.mInfo);
+                    if (readySignalData.mContext.getTag() == expectedInfo.mContext.getTag()
+                        && readySignalData.mAgentName == expectedInfo.mAgentName)
+                    {
+                        // Only copy if the expected type is ReadySignalInfo
+                        if constexpr (std::is_same_v<NotificationType, ReadySignalInfo>)
+                        {
+                            expectedInfo.mIsReady = readySignalData.mIsReady;
+                        }
+
                         erase = true;
                         it2 = notifs.erase(it2);
                         if (notifs.empty())
@@ -483,6 +520,22 @@ void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName,
             }
         }
     }
+}
+
+// Explicit template instantiations
+template void AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
+    std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo);
+template void AgentConnectionManager::waitForNotification<ReadySignalInfo>(
+    std::string const& remoteAgentName, ReadySignalInfo& expectedInfo);
+
+void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo)
+{
+    waitForNotification(remoteAgentName, syncInfo);
+}
+
+void AgentConnectionManager::waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo)
+{
+    waitForNotification(remoteAgentName, readySignalInfo);
 }
 
 std::string const& AgentConnectionManager::getAgentName() const
