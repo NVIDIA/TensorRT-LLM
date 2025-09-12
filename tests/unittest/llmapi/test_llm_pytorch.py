@@ -174,7 +174,10 @@ def test_llm_reward_model():
 
 
 def test_llm_perf_metrics():
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    disable_overlap_scheduler = False
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              disable_overlap_scheduler=disable_overlap_scheduler)
     sampling_params = SamplingParams(max_tokens=10, return_perf_metrics=True)
     outputs = llm.generate(prompts, sampling_params)
     assert outputs[0].outputs[0].request_perf_metrics is not None
@@ -194,7 +197,8 @@ def test_llm_perf_metrics():
     assert kv_cache_metrics.kv_cache_hit_rate == 0
 
     assert perf_metrics.first_iter is not None
-    assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
+    assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - (
+        1 if disable_overlap_scheduler else 2)
     assert perf_metrics.last_iter == perf_metrics.iter
 
 

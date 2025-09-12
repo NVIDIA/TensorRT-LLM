@@ -2204,9 +2204,8 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
             results.append(stats)
 
         assert results
-        if not use_overlap:
-            validate_stats(results, pytorch_backend, max_tokens,
-                           enable_iter_req_stats)
+        validate_stats(results, pytorch_backend, max_tokens,
+                       enable_iter_req_stats)
 
     async def main():
         for i in range(2):  # test recurrent usage
