@@ -127,6 +127,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
                 sh "ls ${stageName}"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
+                ensureStageResultNotUploaded(stageName)
                 trtllm_utils.uploadArtifacts(
                     "results-${stageName}.tar.gz",
                     "${UPLOAD_PATH}/test-results/"
@@ -676,6 +677,10 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
 ]
 
+class GlobalState {
+    static def uploadResultStageNames = []
+}
+
 String getShortenedJobName(String path)
 {
     static final nameMapping = [
@@ -707,7 +712,7 @@ String getShortenedJobName(String path)
     return parts.join('-').toLowerCase()
 }
 
-def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false)
+def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="")
 {
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
@@ -719,6 +724,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         stageIsInterrupted = true
         throw e
     } finally {
+        ensureStageResultNotUploaded(stageName + postTag)
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
@@ -746,9 +752,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "STAGE_NAME=${stageName}"
             sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
             echo "Upload test results."
-            sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
             trtllm_utils.uploadArtifacts(
-                "results-${stageName}.tar.gz",
+                "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
             junit(testResults: "${stageName}/results*.xml")
@@ -1735,7 +1741,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 }
 
 
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="")
 {
     cacheErrorAndUploadResult(stageName, {
         runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
@@ -1775,7 +1781,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         // Copy CPP test result
         sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
         sh "ls ${stageName}/ -all"
-    })
+    }, false, postTag)
 }
 
 
@@ -1910,6 +1916,19 @@ def checkStageName(stageNames) {
     }
 }
 
+def ensureStageResultNotUploaded(stageName) {
+    if(!GlobalState.uploadResultStageNames.contains(stageName)) {
+        GlobalState.uploadResultStageNames.add(stageName)
+    } else {
+        stage('Upload Test Results') {
+            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                error "Upload test results for ${stageName} failed because it has already been uploaded."
+            }
+        }
+    }
+}
+
+// TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
 def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
 {
     return {
@@ -2348,7 +2367,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null, "-SubJob-RunTest")
                         }
                     })
                 }
@@ -2581,7 +2600,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage")
                 })
             }
         } else {
