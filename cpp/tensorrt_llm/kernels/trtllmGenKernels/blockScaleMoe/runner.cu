@@ -49,6 +49,55 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "")
 }
 } // namespace
 
+int32_t getMaxPermutedPaddedCount(int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding)
+{
+    int32_t maxCtas = getMaxNumCtasInBatchDim(numTokens, expertsPerToken, numExperts, padding);
+    return maxCtas * padding;
+}
+
+std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType)
+{
+    switch (routingMethodType)
+    {
+    case RoutingMethodType::Default: return "Default";
+    case RoutingMethodType::Renormalize: return "Renormalize";
+    case RoutingMethodType::DeepSeekV3: return "DeepSeekV3";
+    case RoutingMethodType::Llama4: return "Llama4";
+    case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
+    default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
+    };
+}
+
+int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts, int32_t tileTokensDim)
+{
+    // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
+    // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine
+    // the actual number of CTAs to run.
+
+    // Initialize number of tokens with the number of expanded tokens after routing.
+    int32_t numRemainingTokens = numTokens * topK;
+    int32_t maxNumCtasInBatchDim = 0;
+    // First, distribute one token each expert until token depletion to maximize CTA tile count.
+    int32_t numExpertsFilled = std::min(numExperts, numRemainingTokens);
+    maxNumCtasInBatchDim += numExpertsFilled;
+    numRemainingTokens -= numExpertsFilled;
+    // Next, greedily pour all remaining tokens to one expert to maximize CTA tile count.
+    // E.g., at this point tokens over 4 experts are [1, 1, 1, 1], and we have 4 tokens left.
+    // If each CTA handles 4 tokens/expert, the greedy strategy is to pour all remaining tokens
+    // to any one expert to get to the 5th CTA tile. Otherwise, we can only get 4 tiles in total.
+    //
+    // Another way to reason about this is to pour the remaining tokens into buckets of some fixed
+    // capacity. These buckets, if full, can then be attributed to any expert; it does not have to
+    // belong to the same expert every time.
+    if (numRemainingTokens > 0)
+    {
+        // For every tileTokenDim tokens, we add an extra CTA tile in the token dimension.
+        // The number of CTA tiles is given by divDown(numRemainingTokens, tokenTileDim).
+        maxNumCtasInBatchDim += (numRemainingTokens / tileTokensDim);
+    }
+    return maxNumCtasInBatchDim;
+}
+
 Runner::Runner() {}
 
 Runner::Runner(int32_t tileTokensDim)
