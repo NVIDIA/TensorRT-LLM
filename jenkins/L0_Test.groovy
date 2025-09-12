@@ -247,6 +247,219 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
     }
 }
 
+def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
+    // Run the isolated tests one by one to avoid any potential conflicts
+    def isolateTestList = preprocessedLists.isolate
+    echo "Found ${preprocessedLists.isolateCount} isolated tests to run"
+    def isolateTestLines = readFile(file: isolateTestList).readLines()
+
+    for (int i = 0; i < isolateTestLines.size(); i++) {
+        def isolateTestName = isolateTestLines[i].trim()
+        // Create a temporary file for this single isolated test
+        def singleTestFile = "${isolateTestList}_isolated_${i}.txt"
+        sh "echo '${isolateTestName}' > ${singleTestFile}"
+        sh "cat ${singleTestFile}"
+
+        def isolateTestCmdLine = testCmdLine.findAll { cmd ->
+            !cmd.contains("--test-list=") &&
+            !cmd.contains("--test-prefix=") &&
+            !cmd.contains("--csv=") &&
+            !cmd.contains("--junit-xml")
+        }
+        isolateTestCmdLine += ["--test-list=${singleTestFile}"]
+        isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
+        isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
+        isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+        isolateTestCmdLine += ["--cov-append"]  // Append coverage data to avoid overwriting previous data
+
+        try {
+            sh """
+                cd ${llmSrc}/tests/integration/defs && \
+                ${isolateTestCmdLine.join(" ")}
+            """
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            error "The isolated test ${isolateTestName} failed."
+        } finally {
+            // Clean up the temporary test file
+            sh "rm -f ${singleTestFile}"
+        }
+    }
+}
+
+def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
+    // List tests in current shard before running pytest
+    echo "Listing tests in current shard (${splitId}/${splits}) before execution..."
+
+    def shardTestList = []
+
+    if (perfMode) {
+        // In perfMode, skip pytest collection as it may cause errors with automatically generated testcases
+        // Instead, use all tests from the original testDBList
+        echo "Performance mode enabled - skipping pytest collection, using all tests from testDBList"
+    } else {
+        def testListCmd = [
+            "LLM_ROOT=${llmSrc}",
+            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
+            "pytest",
+            "--collect-only",
+            "--test-list=${testDBList}",
+            "--quiet",
+            "--splits ${splits}",
+            "--group ${splitId}"
+        ]
+
+        try {
+            // First execute the pytest command and check if it succeeds
+            def pytestOutput = sh(
+                script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
+                returnStdout: true
+            ).trim()
+
+            // Debug: Show the raw pytest output
+            echo "DEBUG: Raw pytestOutput (${pytestOutput.length()} characters):"
+            echo "<<<START_PYTEST_OUTPUT>>>"
+            echo "${pytestOutput}"
+            echo "<<<END_PYTEST_OUTPUT>>>"
+
+            // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
+            def lines = pytestOutput.split('\n')
+            echo "DEBUG: Split into ${lines.size()} lines"
+
+            def foundRunningLine = false
+            def lineIndex = 0
+            shardTestList = lines.findAll { line ->
+                lineIndex++
+                echo "DEBUG: Processing line ${lineIndex}: '${line}'"
+
+                if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
+                    echo "DEBUG: Found 'Running X items in this shard' or '[pytest-split] Running group' line: '${line}'"
+                    foundRunningLine = true
+                    return false  // Don't include the "Running" line itself
+                }
+
+                def hasDoubleColon = line.contains('::')
+                def shouldInclude = foundRunningLine && hasDoubleColon
+                echo "DEBUG: Line analysis - foundRunningLine: ${foundRunningLine}, hasDoubleColon: ${hasDoubleColon}, shouldInclude: ${shouldInclude}"
+
+                return shouldInclude
+            }
+
+            echo "DEBUG: Filtering complete. shardTestList size: ${shardTestList.size()}"
+            if (shardTestList.size() > 0) {
+                echo "DEBUG: shardTestList contents:"
+                shardTestList.eachWithIndex { test, index ->
+                    echo "  [${index}]: ${test}"
+                }
+            } else {
+                echo "DEBUG: shardTestList is empty"
+            }
+        } catch (Exception e) {
+            echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
+            echo "DEBUG: Exception details: ${e.class.name}: ${e.message}"
+            if (e.stackTrace) {
+                echo "DEBUG: Stack trace: ${e.stackTrace.take(5).join('\n')}"
+            }
+            error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
+        }
+    }
+
+    if (shardTestList || perfMode) {
+        // Split the shard test list into regular and isolate tests
+        def shardRegularTests = []
+        def shardIsolateTests = []
+
+        // Read the original test list to check for ISOLATION markers
+        def originalTestLines = readFile(file: testDBList).readLines()
+
+        if (perfMode) {
+            // In perfMode, put all tests in regular and skip isolation
+            echo "Performance mode enabled - all tests will run as regular tests (no isolation)"
+            shardRegularTests = originalTestLines.findAll { it.trim() }
+        } else {
+            // Create a map for quick lookup of original test lines (both with and without ISOLATION marker)
+            def originalTestMap = [:]
+            originalTestLines.each { originalLine ->
+                if (originalLine.trim()) {
+                    def cleanLine = originalLine.replaceAll(' ISOLATION', '').trim()
+                    originalTestMap[cleanLine] = originalLine.trim()
+                }
+            }
+
+            shardTestList.each { test ->
+                def trimmedTest = test.trim()
+                if (trimmedTest) {
+                    // Process test_unittests.py::test_unittests_v2[xxxx] pattern
+                    if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
+                        // Extract content between [ and ]
+                        def startIndex = trimmedTest.indexOf('[') + 1
+                        def endIndex = trimmedTest.lastIndexOf(']')
+                        trimmedTest = trimmedTest.substring(startIndex, endIndex)
+                    }
+
+                    // Look up the original test line from testDBList
+                    def originalTestLine = originalTestMap[trimmedTest]
+                    if (originalTestLine) {
+                        if (originalTestLine.contains(' ISOLATION')) {
+                            shardIsolateTests.add(originalTestLine.replaceAll(' ISOLATION', '').trim())
+                        } else {
+                            shardRegularTests.add(originalTestLine)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Define file paths for regular and isolate tests
+        def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
+        def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
+
+        // Create shard-specific test files
+        if (shardRegularTests.size() > 0) {
+            def shardRegularContent = shardRegularTests.join('\n')
+            sh "echo '${shardRegularContent.replace("'", "'\\''")}' > ${regularTestList}"
+            echo "Created ${regularTestList} with ${shardRegularTests.size()} regular tests for this shard"
+        } else {
+            sh "touch ${regularTestList}"
+            echo "No regular tests in this shard, created empty file: ${regularTestList}"
+        }
+        sh "cat ${regularTestList}"
+
+        if (shardIsolateTests.size() > 0) {
+            def shardIsolateContent = shardIsolateTests.join('\n')
+            sh "echo '${shardIsolateContent.replace("'", "'\\''")}' > ${isolateTestList}"
+            echo "Created ${isolateTestList} with ${shardIsolateTests.size()} isolate tests for this shard"
+        } else {
+            sh "touch ${isolateTestList}"
+            echo "No isolate tests in this shard, created empty file: ${isolateTestList}"
+        }
+        sh "cat ${isolateTestList}"
+
+        // Return preprocessed lists object for compatibility
+        return [
+            regular: regularTestList,
+            isolate: isolateTestList,
+            regularCount: shardRegularTests.size(),
+            isolateCount: shardIsolateTests.size()
+        ]
+    } else {
+        echo "No tests found in current shard or failed to list tests"
+        // Create empty files and preprocessed lists object
+        def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
+        def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
+        sh "touch ${regularTestList}"
+        sh "touch ${isolateTestList}"
+
+        return [
+            regular: regularTestList,
+            isolate: isolateTestList,
+            regularCount: 0,
+            isolateCount: 0
+        ]
+    }
+}
+
 def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner)
 {
     runner {
@@ -1631,7 +1844,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
-        testList = "${testList}_${splitId}"
+
+        // Process shard test list and create separate files for regular and isolate tests
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
+
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
             "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
@@ -1647,15 +1863,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "--timeout=${pytestTestTimeout}",
             "--rootdir ${llmSrc}/tests/integration/defs",
             "--test-prefix=${stageName}",
-            "--splits ${splits}",
-            "--group ${splitId}",
             "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
-            "--test-list=${testDBList}",
             "--output-dir=${WORKSPACE}/${stageName}/",
             "--csv=${WORKSPACE}/${stageName}/report.csv",
             "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
             "-o junit_logging=out-err"
         ]
+
+        // Only add --test-list if there are regular tests to run
+        if (preprocessedLists.regularCount > 0) {
+            testCmdLine.add(testCmdLine.size() - 4, "--test-list=${preprocessedLists.regular}")
+        }
         if (perfMode) {
             testCmdLine += [
                 "--perf",
@@ -1702,11 +1920,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             ]) {
                 sh "env | sort"
                 try {
-                    sh """
-                        rm -rf ${stageName}/ && \
-                        cd ${llmSrc}/tests/integration/defs && \
-                        ${testCmdLine.join(" ")}
-                    """
+                    if (preprocessedLists.regularCount > 0) {
+                        sh """
+                            rm -rf ${stageName}/ && \
+                            cd ${llmSrc}/tests/integration/defs && \
+                            ${testCmdLine.join(" ")}
+                        """
+                    } else {
+                        echo "No regular tests to run for stage ${stageName}"
+                        sh "mkdir -p ${stageName}"
+                        // Create an empty results.xml file for consistency
+                        sh """
+                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
+                            echo '<testsuites>' >> ${stageName}/results.xml
+                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
+                            echo '</testsuite>' >> ${stageName}/results.xml
+                            echo '</testsuites>' >> ${stageName}/results.xml
+                        """
+                    }
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
@@ -1716,6 +1947,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     }
                 }
             }
+        }
+
+        // Run the isolated tests if exists
+        if (preprocessedLists.isolateCount > 0) {
+            echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
+            runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
+        } else {
+            echo "No isolated tests to run for stage ${stageName}"
         }
 
         if (perfMode) {
