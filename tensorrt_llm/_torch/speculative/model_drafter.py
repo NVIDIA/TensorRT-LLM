@@ -10,8 +10,7 @@ from tensorrt_llm.logger import logger
 
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
-from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
-                                      get_draft_token_length)
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
                                   TorchSampler)
@@ -600,20 +599,6 @@ class ModelDrafter(Drafter):
             previous_draft_state = sample_state
 
         return previous_draft_state
-
-    def pad_draft_tokens_for_cuda_graph(
-            self, scheduled_requests: ScheduledRequests) -> None:
-        """
-        Pad draft tokens to the max draft length for CUDA graph compatibility.
-
-        Args:
-            scheduled_requests: The scheduled requests to pad
-        """
-        for req in scheduled_requests.generation_requests:
-            max_draft_tokens = self.max_draft_tokens
-            num_draft_tokens = get_draft_token_length(req)
-            req.py_draft_tokens.extend(
-                0 for _ in range(max_draft_tokens - num_draft_tokens))
 
     def generate_draft_tokens_with_overlap(
         self, scheduled_batch: ScheduledRequests,

@@ -17,30 +17,34 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter",
     [
-        [True, "TRTLLM", True, False, False, False],
-        [False, "TRTLLM", True, False, False, False],
-        [True, "FLASHINFER", True, False, False, False],
-        [False, "FLASHINFER", True, False, False, False],
-        [False, "TRTLLM", False, True, True, False],
-        [True, "TRTLLM", False, True, True, False],
-        [True, "TRTLLM", True, False, True, True],
-        [True, "TRTLLM", True, False, True, False],
+        [True, "TRTLLM", True, False, False, False, True],
+        [True, "TRTLLM", True, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, True],
+        [False, "TRTLLM", True, False, False, False, False],
+        [True, "FLASHINFER", True, False, False, False, True],
+        [False, "FLASHINFER", True, False, False, False, True],
+        [False, "TRTLLM", False, True, True, False, True],
+        [True, "TRTLLM", False, True, True, False, True],
+        [True, "TRTLLM", True, False, True, True, True],
+        [True, "TRTLLM", True, False, True, False, True],
         # TODO: nvbugs/5461761
-        # [True, "TRTLLM", True, False, False, True],
-        [True, "TRTLLM", True, False, False, True],
-        [False, "TRTLLM", True, False, False, True],
-        [True, "TRTLLM", False, False, False, False],
-        [False, "TRTLLM", False, False, False, False],
-        [True, "TRTLLM", False, False, False, True],
-        [True, "FLASHINFER", False, False, False, False],
-        [False, "FLASHINFER", False, False, False, False],
+        # [True, "TRTLLM", True, False, False, True, True],
+        [True, "TRTLLM", False, False, False, False, True],
+        [False, "TRTLLM", False, False, False, False, True],
+        [True, "TRTLLM", False, False, False, False, False],
+        [False, "TRTLLM", False, False, False, False, False],
+        [True, "TRTLLM", False, False, False, True, True],
+        [True, "TRTLLM", False, False, False, True, False],
+        [True, "FLASHINFER", False, False, False, False, True],
+        [False, "FLASHINFER", False, False, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
-                      use_one_model: bool, enable_chunked_prefill: bool):
+                      use_one_model: bool, enable_chunked_prefill: bool,
+                      use_chain_drafter: bool):
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -84,52 +88,63 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         eagle3_one_model=use_one_model,
     )
 
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+    # Set the development flag to control use_chain_drafter behavior
+    original_env_value = os.environ.get("TRTLLM_ALLOW_CHAIN_DRAFTER", "0")
+    try:
+        os.environ[
+            "TRTLLM_ALLOW_CHAIN_DRAFTER"] = "1" if use_chain_drafter else "0"
+        # Create the LLM instance with the mocked flag controlling use_chain_drafter
+        llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
-    # Acceptance rate tests
-    if enable_chunked_prefill:
-        # Use a long prompt for chunked prefill tests.
-        prompts = [
-            "The capital of France is a city of romance, art, fashion, and cuisine. Paris is a must-visit destination for anyone who loves history, architecture, and culture. From the iconic Eiffel Tower to the world-famous Louvre Museum, Paris has something to offer for every interest and age.\nThe city is divided into 20 arrondissements, each with its own unique character and charm. The Latin Quarter is a popular area for students and young travelers, while the Champs-Élysées is a hub for shopping and dining. The Montmartre neighborhood is famous for its bohemian vibe and stunning views of the city.\nParis is also known for its beautiful parks and gardens, such as the Luxembourg Gardens and the Tuileries Garden. The city has a rich history, with landmarks like the Notre-Dame Cathedral and the Arc de Triomphe. Visitors can also explore the city's many museums, including the Musée d'Orsay and the Musée Rodin.\nIn addition to its cultural and historical attractions, Paris is also a great destination for foodies. The city is famous for its cuisine, including croissants, baguettes, and cheese. Visitors can sample the city's famous dishes at one of the many restaurants, cafes, and "
+        # Acceptance rate tests
+        if enable_chunked_prefill:
+            # Use a long prompt for chunked prefill tests.
+            prompts = [
+                "The capital of France is a city of romance, art, fashion, and cuisine. Paris is a must-visit destination for anyone who loves history, architecture, and culture. From the iconic Eiffel Tower to the world-famous Louvre Museum, Paris has something to offer for every interest and age.\nThe city is divided into 20 arrondissements, each with its own unique character and charm. The Latin Quarter is a popular area for students and young travelers, while the Champs-Élysées is a hub for shopping and dining. The Montmartre neighborhood is famous for its bohemian vibe and stunning views of the city.\nParis is also known for its beautiful parks and gardens, such as the Luxembourg Gardens and the Tuileries Garden. The city has a rich history, with landmarks like the Notre-Dame Cathedral and the Arc de Triomphe. Visitors can also explore the city's many museums, including the Musée d'Orsay and the Musée Rodin.\nIn addition to its cultural and historical attractions, Paris is also a great destination for foodies. The city is famous for its cuisine, including croissants, baguettes, and cheese. Visitors can sample the city's famous dishes at one of the many restaurants, cafes, and "
+            ]
+            tok_ids = llm_spec.tokenizer.encode(prompts[0])
+        else:
+            prompts = [
+                "The capital of France is",
+                "The president of the United States is",
+            ]
+            tok_ids = llm_spec.tokenizer.encode("The future of AI is")
+
+        num_tokens = 0
+        num_drafted = 0
+        num_accepted = 0
+        sampling_params = SamplingParams(max_tokens=128, temperature=0)
+        for output in llm_spec.generate_async(tok_ids,
+                                              sampling_params,
+                                              streaming=True):
+            new_tokens = output.outputs[0].token_ids
+            num_drafted += max_draft_len
+            num_accepted += len(new_tokens) - num_tokens - 1
+            num_tokens = len(new_tokens)
+
+        accept_rate = num_accepted / num_drafted
+        assert accept_rate > 0.15
+
+        # Output tests
+        sampling_params = SamplingParams(max_tokens=10, temperature=0)
+
+        results_spec = llm_spec.generate(prompts, sampling_params)
+        generated_text_spec = [
+            result.outputs[0].text for result in results_spec
         ]
-        tok_ids = llm_spec.tokenizer.encode(prompts[0])
-    else:
-        prompts = [
-            "The capital of France is",
-            "The president of the United States is",
-        ]
-        tok_ids = llm_spec.tokenizer.encode("The future of AI is")
+        llm_spec.shutdown()
 
-    num_tokens = 0
-    num_drafted = 0
-    num_accepted = 0
-    sampling_params = SamplingParams(max_tokens=128, temperature=0)
-    for output in llm_spec.generate_async(tok_ids,
-                                          sampling_params,
-                                          streaming=True):
-        new_tokens = output.outputs[0].token_ids
-        num_drafted += max_draft_len
-        num_accepted += len(new_tokens) - num_tokens - 1
-        num_tokens = len(new_tokens)
+        llm_ref = LLM(**llm_common_config)
+        results_ref = llm_ref.generate(prompts, sampling_params)
+        generated_text_ref = [result.outputs[0].text for result in results_ref]
+        llm_ref.shutdown()
 
-    accept_rate = num_accepted / num_drafted
-    assert accept_rate > 0.15
-
-    # Output tests
-    sampling_params = SamplingParams(max_tokens=10, temperature=0)
-
-    results_spec = llm_spec.generate(prompts, sampling_params)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
-    llm_spec.shutdown()
-
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    llm_ref.shutdown()
-
-    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        # The spec decode algorithm currently guarantees identical results
-        assert text_spec == text_ref
+        for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
+            # The spec decode algorithm currently guarantees identical results
+            assert text_spec == text_ref
+    finally:
+        # Restore the original environment variable value
+        os.environ["TRTLLM_ALLOW_CHAIN_DRAFTER"] = original_env_value
 
 
 def test_deepseek_eagle3():
