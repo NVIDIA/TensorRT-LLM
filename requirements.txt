@@ -46,7 +46,7 @@ click_option_group
 aenum
 pyzmq
 fastapi==0.115.4
-uvicorn
+uvicorn[standard]
 setuptools<80
 ordered-set
 peft

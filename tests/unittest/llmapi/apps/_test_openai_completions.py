@@ -29,13 +29,22 @@ def num_postprocess_workers(request):
     return request.param
 
 
+@pytest.fixture(scope="module",
+                params=[1, 2],
+                ids=["disable_multi_threading", "enable_multi_threading"])
+def num_server_threads(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str, num_postprocess_workers: int):
+def server(model_name: str, backend: str, num_postprocess_workers: int,
+           num_server_threads: str):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
     if backend == "trt":
         args.extend(["--max_beam_width", "4"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
+    args.extend(["--num_server_threads", f"{num_server_threads}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 

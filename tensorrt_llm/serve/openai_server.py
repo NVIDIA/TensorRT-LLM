@@ -3,6 +3,8 @@ import asyncio
 import os
 import re
 import signal
+import threading
+import time
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -64,6 +66,32 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
+class MultiThreadServer(uvicorn.Server):
+    def run(self, sockets=None):
+        try:
+            import uvloop
+            asyncio.set_event_loop(uvloop.new_event_loop())
+        except ImportError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # When running in a thread, we'll not have an eventloop yet.
+            loop = asyncio.new_event_loop()
+        loop.run_until_complete(self.serve(sockets=sockets))
+
+    def run_in_thread(self, sockets=None):
+        self.thread = threading.Thread(target=self.run,
+                                       name="UvicornThread",
+                                       args=(sockets, ))
+        self.thread.start()
+        while not self.started:
+            time.sleep(1e-3)
+
+    def shutdown(self):
+        self.should_exit = True
+        self.thread.join()
 
 class OpenAIServer:
 
@@ -71,12 +99,14 @@ class OpenAIServer:
                  llm: Union[LLM, MultimodalEncoder],
                  model: str,
                  server_role: Optional[ServerRole],
-                 metadata_server_cfg: MetadataServerConfig):
+                 metadata_server_cfg: MetadataServerConfig,
+                 num_server_threads: int):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.server_role = server_role
         self.binding_addr = None  # Will be set in __call__
+        self.num_server_threads = num_server_threads
         hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
         trust_remote_code = llm.args.trust_remote_code
         try:
@@ -902,4 +932,15 @@ class OpenAIServer:
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve()
+        if self.num_server_threads > 1:
+            sockets = [config.bind_socket()]
+            servers = [MultiThreadServer(config=config) for _ in range(self.num_server_threads)]
+
+            for s in servers:
+                s.run_in_thread(sockets=sockets)
+
+            while not all([s.should_exit for s in servers]):
+                await asyncio.sleep(1.0)
+
+        else:
+            await uvicorn.Server(config).serve()

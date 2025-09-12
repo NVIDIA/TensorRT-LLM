@@ -156,7 +156,8 @@ def launch_server(host: str,
                   port: int,
                   llm_args: dict,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                  server_role: Optional[ServerRole] = None):
+                  server_role: Optional[ServerRole] = None,
+                  num_server_threads=1):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -175,7 +176,8 @@ def launch_server(host: str,
     server = OpenAIServer(llm=llm,
                           model=model,
                           server_role=server_role,
-                          metadata_server_cfg=metadata_server_cfg)
+                          metadata_server_cfg=metadata_server_cfg,
+                          num_server_threads=num_server_threads)
 
     asyncio.run(server(host, port))
 
@@ -269,6 +271,10 @@ def launch_mm_encoder_server(
     default=0,
     help="[Experimental] Number of workers to postprocess raw responses "
     "to comply with OpenAI protocol.")
+@click.option("--num_server_threads",
+              type=int,
+              default=1,
+              help="[Experimental] Number of threads to use for trtllm-serve.")
 @click.option("--trust_remote_code",
               is_flag=True,
               default=False,
@@ -309,8 +315,9 @@ def serve(
         max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
         ep_size: Optional[int], cluster_size: Optional[int],
         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
-        num_postprocess_workers: int, trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+        num_postprocess_workers: int, num_server_threads: int,
+        trust_remote_code: bool, extra_llm_api_options: Optional[str],
+        reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool):
     """Running an OpenAI API compatible server
@@ -355,7 +362,8 @@ def serve(
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
-    launch_server(host, port, llm_args, metadata_server_cfg, server_role)
+    launch_server(host, port, llm_args, metadata_server_cfg, server_role,
+                  num_server_threads)
 
 
 @click.command("mm_embedding_serve")
