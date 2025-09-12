@@ -1,7 +1,6 @@
 # Plan for phi4-mm model support.
 # (done) step 1: support legacy inference pipeline for phi4-mm model.
-# (done) step 2: refactor the inference pipeline to use AGGREGATE mode (https://github.com/NVIDIA/TensorRT-LLM/pull/5522).
-# (todo) step 3: optimization
+# (done) step 2: refactor the inference pipeline to use AGGREGATE mode (https://github.com/NVIDIA/TensorRT-LLM/pull/5522).# (todo) step 3: optimization
 #   * use TRTLLM-attention to replace original pytorch attention in vision/audio encoders.
 #   * use data parallel to accelerate inference.
 

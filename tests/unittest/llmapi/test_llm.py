@@ -549,6 +549,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 @pytest.mark.parametrize("chunked", [True, False])
 @pytest.mark.part0
+@pytest.mark.mpi_ray_parity
 def test_llm_generate_async_with_stream_interval(chunked):
     model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
     max_num_tokens = 256
