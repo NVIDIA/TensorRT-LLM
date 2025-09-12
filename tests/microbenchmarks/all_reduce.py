@@ -29,6 +29,8 @@ from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
+from tensorrt_llm.bindings.internal.userbuffers import \
+    initialize_userbuffers_manager
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 
 
@@ -62,9 +64,10 @@ def allreduce_benchmark(dtype: str,
         print(
             f"{'world_size':<15}, {'dtype':<10}, {'message size':<15}, {'strategy':<10}, {'fusion':<20}, {'version':<10}, {'duration (ms)':<10}"
         )
+    initialize_userbuffers_manager(mapping.world_size, 1, 1, mapping.rank,
+                                   gpus_per_node, max_size, True)
     while size < max_size:
         input = torch.ones((bs, hidden_size), dtype=torch_dtype, device="cuda")
-
         for version in ["v1"]:
             for fusion in [
                     AllReduceFusionOp.RESIDUAL_RMS_NORM, AllReduceFusionOp.NONE
@@ -73,6 +76,7 @@ def allreduce_benchmark(dtype: str,
                         AllReduceStrategy.NCCL,
                         AllReduceStrategy.ONESHOT,
                         AllReduceStrategy.TWOSHOT,
+                        AllReduceStrategy.NCCL_SYMMETRIC,
                 ]:
                     if size >= 25600000 and fusion != AllReduceFusionOp.NONE:
                         continue
