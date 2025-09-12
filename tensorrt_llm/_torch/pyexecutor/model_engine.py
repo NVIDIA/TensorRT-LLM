@@ -40,7 +40,7 @@ from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..metadata import KVCacheParams
-from ..model_config import ModelConfig, MoeLoadBalancerConfig
+from ..model_config import ModelConfig, MoeLoadBalancerConfig, MoEPrefetchConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
@@ -315,6 +315,7 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
             moe_load_balancer=pytorch_backend_config.moe_load_balancer,
+            moe_prefetch_config=pytorch_backend_config.moe_prefetch_config,
             lora_config=lora_config,
             drafting_loop_wrapper=drafting_loop_wrapper)
         # In case that some tests use stub models and override `_load_model`.
@@ -951,6 +952,7 @@ class PyTorchModelEngine(ModelEngine):
                     max_num_tokens: int,
                     moe_max_num_tokens: Optional[int] = None,
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
+                    moe_prefetch_config: Optional[MoEPrefetchConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
                     drafting_loop_wrapper: Optional[Callable[
                         [torch.nn.Module], torch.nn.Module]] = None,
@@ -967,6 +969,7 @@ class PyTorchModelEngine(ModelEngine):
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
+            moe_prefetch_config=moe_prefetch_config,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
             mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,

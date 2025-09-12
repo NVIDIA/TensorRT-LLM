@@ -21,7 +21,8 @@ from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import MoE, VanillaMoE
+from ..modules.fused_moe import (MoE, MoEPrefetchManager, MoEPrefetchProxy,
+                                 VanillaMoE)
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -238,6 +239,61 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.prologue = []
         self.epilogue = []
         self.keep_embed_tokens = False
+
+    # helper function to calculate moe layer indices for moe weight prefetching
+    def _calculate_moe_layer_indices(self, model_config: ModelConfig,
+                                     model_name: str):
+        config = model_config.pretrained_config
+        num_hidden_layers = config.num_hidden_layers
+
+        model_name = model_name.lower() if model_name else ""
+
+        # default: all layers' MLP are moe
+        moe_layer_freq = 1
+        first_k_dense_replace = 0
+        moe_layer_offset = 0
+
+        if "deepseek" in model_name:
+            # deepseek v3, r1, v3.1
+            moe_layer_freq = config.moe_layer_freq
+            first_k_dense_replace = config.first_k_dense_replace
+        elif "llama4" in model_name:
+            # llama 4 maverick, scout
+            moe_layer_freq = config.interleave_moe_layer_step
+            moe_layer_offset = 1
+
+        moe_layer_indices = [
+            i for i in range(num_hidden_layers)
+            if i >= first_k_dense_replace and (i + moe_layer_offset) %
+            moe_layer_freq == 0
+        ]
+
+        return moe_layer_indices
+
+    def __moe_prefetch_init__(self,
+                              model_config: ModelConfig,
+                              model_name: str = None):
+        self.use_moe_prefetch = False
+        self.moe_prefetch_manager = None
+        self.moe_prefetch_proxy_list = [
+            None
+            for _ in range(model_config.pretrained_config.num_hidden_layers)
+        ]
+
+        if model_config.moe_prefetch_config is not None:
+            self.use_moe_prefetch = True
+
+            # calculate moe layer indices
+            moe_layer_indices = self._calculate_moe_layer_indices(
+                model_config, model_name)
+
+            self.moe_prefetch_manager = MoEPrefetchManager(
+                moe_layer_indices,
+                model_config.moe_prefetch_config.prefetch_depth,
+                model_config.moe_prefetch_config.prefetch_stride)
+            for layer_idx in self.moe_prefetch_manager.prefetch_layer_indices:
+                self.moe_prefetch_proxy_list[layer_idx] = MoEPrefetchProxy(
+                    layer_idx, self.moe_prefetch_manager)
 
     def forward(
         self,

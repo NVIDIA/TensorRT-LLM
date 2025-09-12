@@ -191,6 +191,34 @@ class MoeConfig(StrictBaseModel):
         "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
     )
 
+    # moe weight prefetching config
+    use_moe_prefetch: bool = Field(
+        default=False, description="Whether to use MoE prefetching.")
+
+    moe_prefetch_depth: Optional[int] = Field(
+        default=None,
+        description="The depth of MoE prefetching device buffers.")
+
+    moe_prefetch_stride: Optional[int] = Field(
+        default=None, description="The stride of MoE prefetching layers.")
+
+    moe_prefetch_config: Optional[object] = Field(
+        default=None,
+        description="The configuration for MoE prefetching.",
+        json_schema_extra={
+            "type":
+            "Optional[tensorrt_llm._torch.model_config.MoEPrefetchConfig]"
+        })
+
+    @field_validator('moe_prefetch_depth', 'moe_prefetch_stride')
+    @classmethod
+    def validate_positive_integers(cls, v):
+        if v is not None and (not isinstance(v, int) or v <= 0):
+            raise ValueError(
+                f"MoE prefetching depth and stride must be positive, but got {v}"
+            )
+        return v
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -2431,6 +2459,16 @@ class TorchLlmArgs(BaseLlmArgs):
                 ) from e
         return self
 
+    @model_validator(mode="after")
+    def validate_moe_prefetch_config(self):
+        from .._torch.model_config import MoEPrefetchConfig
+        if self.moe_config.use_moe_prefetch and self.moe_config.moe_prefetch_config is None:
+            depth = self.moe_config.moe_prefetch_depth or 2
+            stride = self.moe_config.moe_prefetch_stride or 1
+            self.moe_config.moe_prefetch_config = MoEPrefetchConfig(
+                prefetch_depth=depth, prefetch_stride=stride)
+        return self
+
     @model_validator(mode='after')
     def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
         """Validate CUDA graph configuration.
@@ -2564,6 +2602,7 @@ class TorchLlmArgs(BaseLlmArgs):
             moe_load_balancer=self.moe_config.load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
+            moe_prefetch_config=self.moe_config.moe_prefetch_config,
             enable_mixed_sampler=self.enable_mixed_sampler,
             sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
