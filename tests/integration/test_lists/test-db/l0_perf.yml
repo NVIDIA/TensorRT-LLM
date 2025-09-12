@@ -29,3 +29,17 @@ l0_perf:
         backend: pytorch
     tests:
       - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-float16-input_output_len:128,128-reqs:8192]
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+      wildcards:
+        gpu:
+          - '*h100*'
+        linux_distribution_name: ubuntu*
+      terms:
+        stage: pre_merge
+        backend: pytorch
+    tests:
+      - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-_autodeploy-float16-input_output_len:128,128-reqs:8192]
