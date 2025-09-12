@@ -147,10 +147,12 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
                     "results-${stageName}.tar.gz",
                     "${UPLOAD_PATH}/test-results/"
                 )
-                junit(testResults: "${stageName}/results*.xml")
             } else {
                 println("No results xml to submit")
             }
+        }
+        if (downloadSucceed) {
+            junit(testResults: "${stageName}/results*.xml")
         }
     }
 }
