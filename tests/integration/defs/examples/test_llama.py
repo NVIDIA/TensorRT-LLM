@@ -25,9 +25,10 @@ import defs.ci_profiler
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd,
                          get_cpp_benchmark, get_trt_llm_lib_dir, parse_output,
-                         quantize_data, similar, test_multi_lora_support,
-                         venv_check_call, venv_check_output,
-                         venv_mpi_check_call)
+                         quantize_data, similar,
+                         test_llm_torch_multi_lora_support,
+                         test_multi_lora_support, venv_check_call,
+                         venv_check_output, venv_mpi_check_call)
 # yapf: disable
 from defs.conftest import (get_device_count, get_device_memory,
                            get_host_total_memory, get_sm_version,
@@ -4036,6 +4037,49 @@ def test_llama_3_x_fp8_with_bf16_lora(llama_example_root, llm_datasets_root,
     defs.ci_profiler.stop("test_multi_lora_support")
     print(
         f"test_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_multi_lora_support')} sec"
+    )
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llama_model_root", [
+    'llama-v3-8b-instruct-hf',
+    'llama-3.1-8b-instruct',
+    'llama-3.2-1b-instruct',
+    'llama-3.2-3b-instruct',
+    'llama-3.3-70b-instruct',
+],
+                         indirect=True)
+def test_llama_3_x_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
+                                        qcache_dir_without_install_package,
+                                        llm_venv, engine_dir, llama_model_root):
+    """Run Llama models with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    if llama_model_root == "llama-3.3-70b-instruct":
+        tensor_parallel_size = 8
+        if get_device_count() < 8:
+            pytest.skip(
+                "Skipping: llama-3.3-70b-instruct model requires 8 GPUs")
+    else:
+        tensor_parallel_size = 1
+
+    print("Testing with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=llama_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["q_proj", "k_proj", "v_proj"],
+        zero_lora_weights=True,
+        use_code_prompts=False,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
+    print(
+        f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"
     )
 
 
