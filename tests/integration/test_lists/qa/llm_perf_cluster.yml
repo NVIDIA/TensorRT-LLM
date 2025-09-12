@@ -144,3 +144,12 @@ llm_perf_cluster:
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:2000,500-ep:8-tp:8-gpus:8] TIMEOUT (40)
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-streaming-float8-input_output_len:2000,500-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:8-ep:8-tp:8-gpus:8]
+  #gpt_oss_120b
+  # max throughput test
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:1280-con:256-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:2560-con:512-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:5120-con:1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:20480-con:4096-ep:8-tp:8-gpus:8] TIMEOUT(180)
+  # min latency test
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:8-con:1-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:100-con:32-ep:8-tp:8-gpus:8]
