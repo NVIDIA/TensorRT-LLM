@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
@@ -109,7 +109,6 @@ class Qwen3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -125,7 +124,6 @@ class Qwen3DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            mrope_config=mrope_config,
             **kwargs,
         )
 
@@ -173,7 +171,6 @@ class Qwen3Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -194,7 +191,6 @@ class Qwen3Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
-                mrope_config=mrope_config,
                 spec_metadata=spec_metadata,
             )
 

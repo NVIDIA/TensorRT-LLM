@@ -300,6 +300,14 @@ def main():
         prompt = args.prompt[i]
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        if args.return_context_logits:
+            print(f"[{i}] Context logits: {output.context_logits}")
+        if args.return_generation_logits:
+            print(
+                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+            )
+        if args.logprobs:
+            print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
 
 
 if __name__ == "__main__":
