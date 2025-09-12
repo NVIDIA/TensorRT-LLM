@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set up error handling
-set -Exeuo pipefail
+set -Eeuo pipefail
 trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' ERR
 
 cd $resourcePathNode
@@ -44,9 +44,13 @@ export CPP_TEST_TIMEOUT_OVERRIDDEN=$pytestTestTimeout
 export LLM_ROOT=$llmSrcNode
 export LLM_MODELS_ROOT=$MODEL_CACHE_DIR
 export UCX_TLS=^gdr_copy
+
+# TODO: Move back to tensorrt_llm/llmapi/trtllm-llmapi-launch later
+llmapiLaunchScript="$llmSrcNode/jenkins/scripts/trtllm-llmapi-launch"
+chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 testCmdLines=(
-    "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
+    "$llmapiLaunchScript"
     "pytest"
     "-v"
     "--timeout-method=thread"
@@ -94,4 +98,12 @@ echo "$LD_LIBRARY_PATH"
 env | sort
 fullCmd="${testCmdLines[*]}"
 echo "Full Command: $fullCmd"
+
+# Turn off "exit on error" so the following lines always run
+set +e
+trap - ERR
+
 eval $fullCmd
+exitCode=$?
+echo "Pytest exit code: $exitCode"
+exit $exitCode

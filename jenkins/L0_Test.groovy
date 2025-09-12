@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@yanchaol-dlcluster', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -119,11 +119,14 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         ]
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+
+        def downloadSucceed = false
+
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results/results.xml"
             def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
-            def downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
+            downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
             if (downloadSucceed) {
                 sh "ls ${stageName}"
                 echo "Upload test results."
@@ -137,8 +140,9 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
                 println("No results xml to submit")
             }
         }
+
         if (downloadSucceed) {
-            junit(testResults: "${stageName}/results*.xml")
+            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
         }
     }
 }
@@ -319,7 +323,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
 
-                Utils.exec(pipeline, script: "echo Sleeping to before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
+                Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -551,7 +555,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
                 def scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
                 def scriptContent = """#!/bin/bash
-                    set -Exeuo pipefail
+                    set -Eeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
@@ -578,7 +582,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             }
 
             stage('Run Test') {
-                Utils.exec(pipeline, script: "echo Sleeping to before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
+                Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
                 Utils.exec(
                     pipeline,
@@ -2141,10 +2145,11 @@ def launchTestJobs(pipeline, testFilter)
 
     multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 5, 8, 2],
+        // Disable GB200 multi-node testing in L0 pre-merge until the configuration issue is resolved (https://nvbugs/5455140)
+        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
