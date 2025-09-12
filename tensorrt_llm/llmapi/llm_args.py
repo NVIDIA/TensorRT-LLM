@@ -1388,6 +1388,11 @@ class BaseLlmArgs(StrictBaseModel):
         exclude=True,
         alias="_mpi_session")
 
+    otlp_traces_endpoint: Optional[str] = Field(
+        default=None,
+        description="Target URL to which OpenTelemetry traces will be sent.",
+        alias="otlp_traces_endpoint")
+
     backend: Optional[str] = Field(
         default=None,
         description="The backend to use for this LLM instance.",
