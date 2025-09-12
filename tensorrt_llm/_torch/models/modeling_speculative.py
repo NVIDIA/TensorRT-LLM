@@ -410,6 +410,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     assert key in ('attn_layers', 'mla_layers')
                     assert key in model_config.extra_attrs
                     model_config.extra_attrs[key].update(value)
+        self.layer_idx = -1
 
     def forward(
         self,
@@ -430,6 +431,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             **kwargs,
         )
 
+        if spec_metadata is not None and spec_metadata.is_layer_capture(
+                self.layer_idx):
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states)
         if attn_metadata.padded_num_tokens is not None:
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
