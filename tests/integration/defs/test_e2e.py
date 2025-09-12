@@ -1549,6 +1549,20 @@ def test_trtllm_serve_lora_example(llm_root, llm_venv):
 
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
+def test_trtllm_serve_top_logprobs(llm_root, llm_venv, backend: str):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_top_logprobs.py"), "-k", backend
+    ])
+
+
+@pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_misc_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
