@@ -280,16 +280,15 @@ public:
 #else
     static constexpr bool use_fp8 = false;
     static constexpr bool use_w4afp8 = false;
-    static constexpr bool use_wfp4afp4 = false;
 #endif
     static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
 #if defined(ENABLE_FP4)
     static constexpr bool use_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
-    static constexpr bool use_wfp4afp4 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+    static constexpr bool use_wfp4afp8 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
 #else
     static constexpr bool use_fp4 = false;
-    static constexpr bool use_wfp4afp4 = false;
+    static constexpr bool use_wfp4afp8 = false;
 #endif
 
     void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,

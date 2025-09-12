@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_100f
 
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor
@@ -34,7 +34,7 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     b_tmp = b.permute(1, 2, 0)
 
     # Note: we have different output scale shape for fp8_quantize_1x128, so we need to handle it differently for sm100 and other archs.
-    if get_sm_version() == 100:
+    if is_sm_100f():
         input_scale_tmp = a_sf.permute(1, 0).as_strided((m, w_k, 1),
                                                         (1, m, m * w_k))
     else:

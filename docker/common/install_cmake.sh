@@ -3,7 +3,7 @@
 set -ex
 
 ARCH=$(uname -m)
-CMAKE_VERSION="3.30.2"
+CMAKE_VERSION="4.0.3"
 GITHUB_URL="https://github.com"
 if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}

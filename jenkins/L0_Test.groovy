@@ -37,8 +37,16 @@ LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE_12_9="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.1-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE_12_9="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.1-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+
+LLM_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+
+DLFW_IMAGE_12_9 = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
+
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.08-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -56,13 +64,19 @@ def TARNAME = "tarName"
 def VANILLA_CONFIG = "Vanilla"
 
 @Field
+def VANILLA_CONFIG_CU12 = "Vanilla_CU12"
+
+@Field
 def SINGLE_DEVICE_CONFIG = "SingleDevice"
 
 @Field
 def LLVM_CONFIG = "LLVM"
 
 @Field
-LINUX_AARCH64_CONFIG = "linux_aarch64"
+def LINUX_AARCH64_CONFIG = "linux_aarch64"
+
+@Field
+def LINUX_AARCH64_CONFIG_CU12 = "linux_aarch64_CU12"
 
 @Field
 def PYBIND_CONFIG = "Pybind"
@@ -71,9 +85,11 @@ def PYBIND_CONFIG = "Pybind"
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
+  (VANILLA_CONFIG_CU12) : [(TARNAME) : "TensorRT-LLM-CU12.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
+  (LINUX_AARCH64_CONFIG_CU12) : [(TARNAME) : "TensorRT-LLM-GH200-CU12.tar.gz"],
   (PYBIND_CONFIG) : [(TARNAME) : "pybind-TensorRT-LLM.tar.gz"],
 ]
 
@@ -938,6 +954,17 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
+    // TODO: remove this after GH200 driver upgrade
+    def hostnameMatch = ""
+    if (type == "gh200") {
+        hostnameMatch = """
+                              - key: "kubernetes.io/hostname"
+                                operator: NotIn
+                                values:
+                                - "lego-cg1-qct-070.ipp3a2.colossus"
+                                - "lego-cg1-qct-079.ipp3a2.colossus\""""
+    }
+
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
@@ -957,7 +984,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
-                                - "core"
+                                - "core"${hostnameMatch}
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -1532,6 +1559,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (env.alternativeTRT) {
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
         }
+        if (stageName.contains("-CU12")) {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' requirements.txt && cat requirements.txt")
+        }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
@@ -1792,7 +1822,7 @@ def checkPipInstall(pipeline, wheel_path)
 }
 
 
-def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
+def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312", is_cu12=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -1800,7 +1830,10 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
     if (env.alternativeTRT) {
-        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+        sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+    }
+    if (is_cu12) {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd tensorrt_llm/ && sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' requirements.txt && cat requirements.txt")
     }
 
     // Random sleep to avoid resource contention
@@ -1820,7 +1853,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     }
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
-        buildArgs += " -a '90-real;100-real;120-real'"
+        buildArgs += " -a '90-real;100-real;103-real;120-real'"
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
@@ -2076,7 +2109,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(key.contains("-CU12-") ? LLM_DOCKER_IMAGE_12_9 : LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -2087,6 +2120,9 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("Pybind")) {
             config = PYBIND_CONFIG
         }
+        if (key.contains("-CU12-")) {
+            config = VANILLA_CONFIG_CU12
+        }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
     }]]}
     fullSet = parallelJobs.keySet()
@@ -2096,6 +2132,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
         "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -2106,6 +2143,9 @@ def launchTestJobs(pipeline, testFilter)
         }
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
+        }
+        if (key.contains("-CU12-")) {
+            config = VANILLA_CONFIG_CU12
         }
         runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
     }]]}
@@ -2123,6 +2163,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 1],
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
@@ -2141,7 +2182,7 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
-        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
+        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(key.contains("-CU12-") ? LLM_SBSA_DOCKER_IMAGE_12_9 : LLM_DOCKER_IMAGE, values[0], "arm64"), {
             runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3])
         }]]}
 
@@ -2196,16 +2237,16 @@ def launchTestJobs(pipeline, testFilter)
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+            LLM_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
-            true,
+            false,
             "dlfw/",
             DLFW_IMAGE,
             false,
         ],
-        "PY310-UB2204": [
-            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+        "PY310-UB2204-CU12": [
+            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE_12_9,
             "A10",
             X86_64_TRIPLE,
             true,
@@ -2213,8 +2254,8 @@ def launchTestJobs(pipeline, testFilter)
             UBUNTU_22_04_IMAGE,
             false,
         ],
-        "PY312-UB2404": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+        "PY312-UB2404-CU12": [
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE_12_9,
             "RTX5090",
             X86_64_TRIPLE,
             true,
@@ -2225,8 +2266,8 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
-        "PY312-UB2404": [
-            LLM_DOCKER_IMAGE,
+        "PY312-UB2404-CU12": [
+            LLM_SBSA_DOCKER_IMAGE_12_9,
             "GH200",
             AARCH64_TRIPLE,
             false,
@@ -2293,7 +2334,7 @@ def launchTestJobs(pipeline, testFilter)
                     env = ["LD_LIBRARY_PATH+=:/usr/local/cuda/compat"]
                 }
                 withEnv(env) {
-                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver)
+                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver, key.contains("CU12"))
                 }
             }
 
@@ -2318,7 +2359,7 @@ def launchTestJobs(pipeline, testFilter)
                         echo "###### Prerequisites Start ######"
                         echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
-                        if (values[5] == DLFW_IMAGE) {
+                        if (values[5] == DLFW_IMAGE || values[5] == DLFW_IMAGE_12_9) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
@@ -2327,19 +2368,48 @@ def launchTestJobs(pipeline, testFilter)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
-                        if (values[5] != DLFW_IMAGE) {
+                        if (values[5] != DLFW_IMAGE && values[5] != DLFW_IMAGE_12_9) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
+                            if (key.contains("CU12")) {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
+                            } else {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-13-0")
+                            }
                         }
-
+                        if (key.contains("CU12")) {
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "sed -i '/^# .*<For CUDA 12\\.9>\$/ {s/^# //; n; s/^/# /}' ${LLM_ROOT}/requirements.txt")
+                            sh "cat ${LLM_ROOT}/requirements.txt"
+                        }
                         // Extra PyTorch CUDA 12.8 install for SBSA platform and Blackwell GPUs bare-metal environments
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            if (key.contains("CU12")) {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            } else {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            }
+                        }
+
+                        // TODO: Remove this after public triton supports CUDA 13.
+                        if (key == "PY312-DLFW" && values[2] == X86_64_TRIPLE) {
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install https://download.pytorch.org/whl/nightly/pytorch_triton-3.3.1%2Bgitc8757738-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")
+                            sh """
+                                cd /usr/local/lib/python3.12/dist-packages/ && \
+                                ls -la | grep pytorch_triton && \
+                                mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
+                                cd triton-3.3.1+gitc8757738.dist-info && \
+                                echo "Current directory: \$(pwd)" && \
+                                echo "Files in directory:" && \
+                                ls -la && \
+                                sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
+                                sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
+                                echo "METADATA after update:" && \
+                                grep "^Name:" METADATA
+                            """
                         }
 
                         def libEnv = []
@@ -2361,9 +2431,10 @@ def launchTestJobs(pipeline, testFilter)
                             })
                         }
                         echo "###### Run LLMAPI tests Start ######"
-                        def config = VANILLA_CONFIG
+
+                        def config = key.contains("CU12") ? VANILLA_CONFIG_CU12 : VANILLA_CONFIG
                         if (cpu_arch == AARCH64_TRIPLE) {
-                            config = LINUX_AARCH64_CONFIG
+                            config = key.contains("CU12") ? LINUX_AARCH64_CONFIG_CU12 : LINUX_AARCH64_CONFIG
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
@@ -2639,6 +2710,7 @@ pipeline {
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
+        CMAKE_POLICY_VERSION_MINIMUM="3.5"
     }
     stages {
         stage("Setup environment")

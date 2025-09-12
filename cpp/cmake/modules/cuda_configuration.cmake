@@ -138,6 +138,9 @@ function(setup_cuda_architectures)
         message(FATAL_ERROR "Unrecognized CUDA architecture: ${CUDA_ARCH}")
       endif()
     endforeach()
+    if("103" IN_LIST CMAKE_CUDA_ARCHITECTURES_CLEAN)
+      list(APPEND CMAKE_CUDA_ARCHITECTURES_CLEAN "100")
+    endif()
     list(REMOVE_DUPLICATES CMAKE_CUDA_ARCHITECTURES_CLEAN)
     set(CMAKE_CUDA_ARCHITECTURES_RAW ${CMAKE_CUDA_ARCHITECTURES_CLEAN})
   endif()
@@ -150,6 +153,9 @@ function(setup_cuda_architectures)
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.7")
       list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 100 120)
     endif()
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
+      list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 103)
+    endif()
   endif()
 
   # CMAKE_CUDA_ARCHITECTURES_ORIG contains all architectures enabled, without
@@ -160,7 +166,14 @@ function(setup_cuda_architectures)
       ${CMAKE_CUDA_ARCHITECTURES_ORIG}
       PARENT_SCOPE)
 
-  set(ARCHITECTURES_WITH_KERNELS 80 86 89 90 100 120)
+  set(ARCHITECTURES_WITH_KERNELS
+      80
+      86
+      89
+      90
+      100
+      103
+      120)
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
     if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")

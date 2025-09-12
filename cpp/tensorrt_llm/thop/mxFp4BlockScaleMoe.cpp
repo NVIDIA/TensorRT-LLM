@@ -46,8 +46,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t moeConfigIndex)
 {
-    auto const sm = tensorrt_llm::common::getSMVersion();
-    TORCH_CHECK(sm == 100, "Only SM100 is supported by FP4 block scale MOE");
+    TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by MXFP4 block scale MOE");
     TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64,
         "tile_tokens_dim must be 8, 16, 32, 64");
     TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float
