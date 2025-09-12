@@ -34,6 +34,12 @@
 #include <fstream>
 #include <vector>
 
+// Forward declare TransferSession in the correct global namespace scope
+namespace tensorrt_llm::batch_manager
+{
+class TransferSession;
+}
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
@@ -48,8 +54,6 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
 
-class TransferSession;
-
 // Used to support the cache transmission with different layouts and different protocols.
 class BaseCacheFormatter
 {
@@ -58,11 +62,11 @@ public:
 
     /// @brief Format the cache data into bytes for sending.
     /// @param session The transfer session.
-    virtual void format(TransferSession& session) = 0;
+    virtual void format(tensorrt_llm::batch_manager::TransferSession& session) = 0;
 
     /// @brief Unformat the cache data from received bytes.
     /// @param session The transfer session.
-    virtual void unformat(TransferSession& session) = 0;
+    virtual void unformat(tensorrt_llm::batch_manager::TransferSession& session) = 0;
 
     /// @brief Determine whether the sender is applicable to the source and target.
     /// @param selfConfig Source data arrangement.
@@ -102,9 +106,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void format(TransferSession& session) override;
+    void format(tensorrt_llm::batch_manager::TransferSession& session) override;
 
-    void unformat(TransferSession& session) override;
+    void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 

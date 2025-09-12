@@ -33,10 +33,15 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+namespace tensorrt_llm::batch_manager
 {
 
+namespace kv_cache_manager
+{
 class BaseCacheFormatter;
+}
+
+using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
 
 // TODO: unify the following class into a namespace like tensorrt_llm::transmission
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
@@ -118,8 +123,6 @@ struct TransceiverTag
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
 };
-
-using BaseCacheFormatter = BaseCacheFormatter;
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
 // executor smoothly receives the data.
@@ -242,4 +245,4 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace tensorrt_llm::batch_manager

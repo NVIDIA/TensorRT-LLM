@@ -155,7 +155,7 @@ std::vector<size_t> CacheFormatter::pickRecvConnections(
     return ret;
 }
 
-void CacheFormatter::format(TransferSession& session)
+void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_format);
     auto const& llmRequest = session.getLlmRequest();
@@ -469,7 +469,7 @@ void CacheFormatter::format(TransferSession& session)
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
 }
 
-void CacheFormatter::unformat(TransferSession& session)
+void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
     auto const& llmRequest = session.getLlmRequest();
