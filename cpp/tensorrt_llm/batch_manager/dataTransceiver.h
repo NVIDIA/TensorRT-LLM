@@ -183,42 +183,42 @@ public:
     CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
+    CacheSender() = default;
+
     /// @brief Asynchronously respond to the request and send data.
     /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
     /// should remain valid until future synchronization.
     /// @return Once the data is fully sent, the future object will become valid.
-    [[nodiscard]] std::future<void> sendAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> sendAsync(LlmRequest& llmRequest) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
-    [[nodiscard]] executor::kv_cache::CommState const& getCommState() const;
+    [[nodiscard]] virtual executor::kv_cache::CommState const& getCommState() const;
 
     /// @brief Reset the internal communicator status.
     /// @param commState The communicator status.
-    void setCommState(executor::kv_cache::CommState commState);
-
-    /// @brief Receive the request information.
-    /// @return The request information.
-    [[nodiscard]] RequestInfo recvRequestInfo();
+    virtual void setCommState(executor::kv_cache::CommState commState);
 
     /// @brief Synchronously send data.
     /// @param llmRequest The request object to which the data belongs.
-    void sendSync(LlmRequest const& llmRequest);
+    virtual void sendSync(LlmRequest const& llmRequest);
 
-    /// @brief Send the request information.
-    /// @param llmRequest The request object to which the information belongs.
-    [[nodiscard]] TransferSession sendRequestInfo(LlmRequest const& llmRequest);
-
-    /// @brief Synchronously receive data.
-    /// @param session The transfer session.
-    void receiveSync(TransferSession& session);
+    /// @brief Receive request information.
+    /// @param llmRequest The request object to which the data belongs.
+    virtual RequestInfo recvRequestInfo();
 
     /// @brief Destructor.
-    ~CacheSender();
+    virtual ~CacheSender();
 
 private:
     class Impl;
-    std::unique_ptr<Impl> mImpl;
+
+    struct ImplDeleter
+    {
+        void operator()(Impl*);
+    };
+
+    std::unique_ptr<Impl, ImplDeleter> mImpl;
 };
 
 class CacheReceiver
@@ -228,21 +228,29 @@ public:
     CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
 
+    CacheReceiver() = default;
+
     /// @brief Asynchronously send a request to receive data.
     /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
     /// data for this request should remain intact only after future synchronization.
     /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
 
-    TransferSession sendRequestInfo(LlmRequest const& llmRequest);
+    virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 
-    void receiveSync(TransferSession& session);
+    virtual void receiveSync(TransferSession& session);
     /// @brief Destructor.
-    ~CacheReceiver();
+    virtual ~CacheReceiver();
 
 private:
     class Impl;
-    std::unique_ptr<Impl> mImpl;
+
+    struct ImplDeleter
+    {
+        void operator()(Impl*);
+    };
+
+    std::unique_ptr<Impl, ImplDeleter> mImpl;
 };
 
 } // namespace tensorrt_llm::batch_manager

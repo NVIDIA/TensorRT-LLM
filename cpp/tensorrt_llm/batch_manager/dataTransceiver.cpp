@@ -833,9 +833,19 @@ private:
     runtime::BufferManager mBufferManager;
 };
 
+void CacheSender::ImplDeleter::operator()(Impl* ptr)
+{
+    delete ptr;
+}
+
+void CacheReceiver::ImplDeleter::operator()(Impl* ptr)
+{
+    delete ptr;
+}
+
 CacheSender::CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
     SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
-    : mImpl{std::make_unique<Impl>(manager, selfCacheState, selfIndex, std::move(formatter))}
+    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfCacheState, selfIndex, std::move(formatter)))}
 {
 }
 
@@ -856,9 +866,19 @@ void CacheSender::setCommState(executor::kv_cache::CommState commState)
 
 CacheSender::~CacheSender() = default;
 
+void CacheSender::sendSync(LlmRequest const& llmRequest)
+{
+    mImpl->sendSync(llmRequest);
+}
+
+RequestInfo CacheSender::recvRequestInfo()
+{
+    return mImpl->recvRequestInfo();
+}
+
 CacheReceiver::CacheReceiver(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
-    : mImpl{std::make_unique<Impl>(manager, selfCacheState, selfIndex, std::move(formatter))}
+    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfCacheState, selfIndex, std::move(formatter)))}
 {
 }
 
@@ -868,5 +888,15 @@ std::future<void> CacheReceiver::receiveAsync(LlmRequest& llmRequest) const
 }
 
 CacheReceiver::~CacheReceiver() = default;
+
+TransferSession CacheReceiver::sendRequestInfo(LlmRequest const& llmRequest)
+{
+    return mImpl->sendRequestInfo(llmRequest);
+}
+
+void CacheReceiver::receiveSync(TransferSession& session)
+{
+    mImpl->receiveSync(session);
+}
 
 } // namespace tensorrt_llm::batch_manager
