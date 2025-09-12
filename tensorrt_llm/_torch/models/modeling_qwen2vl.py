@@ -21,8 +21,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_uncached_mm_embeds,
-                                        fuse_input_embeds)
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
@@ -280,7 +280,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
                                                 mm_processor_kwargs)
         if not mm_data:
             fused_input_ids = processed_inputs['input_ids']
-            # Flatten the tensor to get a simple list of integers
             return fused_input_ids.flatten().to(torch.int32).tolist(), {}
 
         pixel_values = processed_inputs.get('pixel_values', None)
@@ -594,17 +593,19 @@ class Qwen2VLModelBase(PreTrainedModel):
 
         if len(multimodal_params) > 0:
             if not DISAGG:
-                mm_embeds = self.mm_encoder.forward(
-                    multimodal_params[:num_context_requests])
+                mm_embeds = get_multimodal_embeddings(
+                    encoder_forward_fn=self.mm_encoder.forward,
+                    multimodal_params=multimodal_params[:num_context_requests])
             else:
-                mm_embeds = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "Qwen2VLModel does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
             mrope_config = self._parse_and_concat_mrope_config(
                 multimodal_params, num_context_requests,
                 num_generation_requests)
-            mm_embeds = find_uncached_mm_embeds(
+
+            mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
 
         if 'mrope_position_deltas' in kwargs:
