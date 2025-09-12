@@ -46,7 +46,7 @@ export LLM_MODELS_ROOT=$MODEL_CACHE_DIR
 export UCX_TLS=^gdr_copy
 cd $llmSrcNode/tests/integration/defs
 testCmdLines=(
-    "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
+    "$llmSrcNode/jenkins/scripts/trtllm-llmapi-launch"
     "pytest"
     "-v"
     "--timeout-method=thread"
@@ -95,3 +95,7 @@ env | sort
 fullCmd="${testCmdLines[*]}"
 echo "Full Command: $fullCmd"
 eval $fullCmd
+
+exitCode=$?
+echo "Pytest exit code: $exitCode"
+exit $exitCode
