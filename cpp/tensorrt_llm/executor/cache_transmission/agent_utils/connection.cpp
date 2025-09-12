@@ -128,8 +128,8 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
     mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo);
 }
 
-void AgentConnection::sendRequestAndBufferInfo(batch_manager::kv_cache_manager::RequestInfo& requestInfo,
-    std::optional<size_t> cacheBufferId, int validConnectionIdx)
+void AgentConnection::sendRequestAndBufferInfo(
+    batch_manager::RequestInfo& requestInfo, std::optional<size_t> cacheBufferId, int validConnectionIdx)
 {
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
 
@@ -255,8 +255,7 @@ AgentConnectionManager::AgentConnectionManager(
         " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
 }
 
-AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
-    batch_manager::kv_cache_manager::RequestInfo& requestInfo)
+AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batch_manager::RequestInfo& requestInfo)
 {
     // recv remoteAgentDesc, and bufferDesc , and validSegmentIdx ,
 

@@ -32,7 +32,7 @@
 #include <memory>
 #include <unordered_map>
 
-namespace tensorrt_llm::batch_manager::kv_cache_manager
+namespace tensorrt_llm::batch_manager
 {
 
 using BlockRange = tensorrt_llm::batch_manager::kv_cache_manager::BlockRange;
@@ -182,7 +182,7 @@ RequestInfo::RequestInfo(
 {
 }
 
-bool kv_cache_manager::RequestInfo::operator==(RequestInfo const& rhs) const
+bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
     return mRequestId == rhs.mRequestId && mBlockHashes == rhs.mBlockHashes && mTransState == rhs.mTransState;
 }
@@ -869,4 +869,4 @@ std::future<void> CacheReceiver::receiveAsync(LlmRequest& llmRequest) const
 
 CacheReceiver::~CacheReceiver() = default;
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+} // namespace tensorrt_llm::batch_manager
