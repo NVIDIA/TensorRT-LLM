@@ -441,6 +441,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("eagle3_one_model", [True, False])
     def test_eagle3(self, overlap_scheduler, eagle3_one_model):
+        if overlap_scheduler and not eagle3_one_model:
+            pytest.skip("Two-model eagle3 does not support overlap scheduler.")
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 4,
