@@ -26,7 +26,7 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
                     create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response, print_alive_threads)
+                    print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -157,16 +157,25 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.put(CancellingRequest(request_id))
 
     def dispatch_result_task(self) -> bool:
+        from tensorrt_llm._torch.pyexecutor import llm_request
+
+        from .postproc_worker import PostprocWorker
+
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
         with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-            if (res := self.result_queue.get()) is None:
-                return False  # shutdown the thread
+            if self.result_queue.poll(1):
+                res = self.result_queue.get()
+            else:
+                return False
 
         async_queues = []
         event_loop = None
 
         def process_res(res):
+            assert isinstance(res,
+                              (llm_request.LlmResponse, PostprocWorker.Output,
+                               ErrorResponse))  # Valid response types
             client_id = res.client_id
             nonlocal event_loop
             nonlocal async_queues
@@ -180,17 +189,18 @@ class GenerationExecutorProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
-            if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res, ErrorResponse):
+            if (isinstance(res, llm_request.LlmResponse)
+                    and res.result and res.result.is_final) or (isinstance(
+                        res, ErrorResponse)) or (isinstance(
+                            res, PostprocWorker.Output) and res.is_final):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
 
         for i in res:
             global_tracer().log_instant("IPC.get")
-            if i is None:
-                return False
-            process_res(i)
+            if i is not None:
+                process_res(i)
 
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
