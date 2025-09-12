@@ -127,7 +127,8 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
 def test_deepseek_eagle3():
     use_cuda_graph = True
     attn_backend = "TRTLLM"
-    disable_overlap_scheduler = False
+    # Two-model eagle3 does not support overlap scheduler
+    disable_overlap_scheduler = True
     enable_block_reuse = False
     use_one_model = False
     enable_chunked_prefill = False
@@ -230,7 +231,8 @@ def test_deepseek_eagle3():
 def test_multi_eagle3(use_one_model: bool):
     use_cuda_graph = True
     attn_backend = "TRTLLM"
-    disable_overlap_scheduler = False
+    # Two-model eagle3 does not support overlap scheduler
+    disable_overlap_scheduler = not use_one_model
     enable_block_reuse = False
     enable_chunked_prefill = False
 
