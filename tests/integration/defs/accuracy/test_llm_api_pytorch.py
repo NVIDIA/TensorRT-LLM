@@ -1718,13 +1718,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     @parametrize_with_ids("kv_cache_reuse", [True, False])
-    @parametrize_with_ids(
-        "quant_dtype",
-        [
-            pytest.param("none", marks=skip_pre_hopper),
-            # pytest.param("fp8", marks=skip_pre_hopper),
-            pytest.param("nvfp4", marks=skip_pre_blackwell)
-        ])
+    @parametrize_with_ids("quant_dtype", [
+        pytest.param("none", marks=skip_pre_hopper),
+        pytest.param("fp8", marks=skip_pre_hopper),
+        pytest.param("nvfp4", marks=skip_pre_blackwell)
+    ])
     # currently, chunked prefill is not supported for fp8 and nvfp4
     def test_chunked_prefill(self, quant_dtype, kv_cache_reuse, fp8kv,
                              overlap_scheduler):

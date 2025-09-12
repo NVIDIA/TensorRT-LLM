@@ -1189,11 +1189,15 @@ class MLA(nn.Module):
             temp_cu_chunked_seq_len = attn_metadata.cu_chunked_seq_len[loop_idx]
             total_ctx_chunked_tokens = attn_metadata.host_cu_chunked_seq_len[
                 loop_idx, attn_metadata.num_contexts]
+            chunked_global_offset = attn_metadata.chunked_global_offset[
+                loop_idx]
+            chunked_max_seq_len = attn_metadata.max_chunk_len_per_loop[loop_idx]
             chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
                 metadata=attn_metadata,
-                chunked_idx=loop_idx,
                 num_ctx_cached_tokens=total_ctx_chunked_tokens,
                 cu_chunked_seq_len=temp_cu_chunked_seq_len,
+                chunked_global_offset=chunked_global_offset,
+                chunked_max_seq_len=chunked_max_seq_len,
                 out_dtype=q.dtype)
 
             # up proj to uncompressed kv
@@ -1242,6 +1246,8 @@ class MLA(nn.Module):
                 out_scale=out_scale,
                 attention_mask=PredefinedAttentionMask.FULL,
                 softmax_stats_tensor=self.temp_softmax_stats_tensor,
+                chunked_prefill_buffer_batch_size=attn_metadata.
+                runtime_features.chunked_prefill_buffer_batch_size,
                 output=temp_attn_output,
             )
             # merge attn result
@@ -1292,6 +1298,8 @@ class MLA(nn.Module):
             latent_cache=None,
             out_scale=out_scale,
             softmax_stats_tensor=self.temp_softmax_stats_tensor,
+            chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.
+            chunked_prefill_buffer_batch_size,
             output=temp_attn_output,
         )
         temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
