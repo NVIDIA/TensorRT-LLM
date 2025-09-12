@@ -56,7 +56,7 @@ struct TopKRedType
     {
         auto valueBits
             = cub::Traits<TypeExpW>::TwiddleIn(reinterpret_cast<typename cub::Traits<TypeExpW>::UnsignedBits&>(val));
-        TypeCmp compactTmp = reinterpret_cast<TypeCmp&>(valueBits);
+        TypeCmp compactTmp = valueBits;
         compactTmp = (compactTmp << moveBits) | (0xFFFF & (maxIdx - idx));
         // Use 65535 minus idx to give higher priority to elements with smaller indices.
         return compactTmp;
