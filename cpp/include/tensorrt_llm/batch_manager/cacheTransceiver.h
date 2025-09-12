@@ -34,8 +34,14 @@ namespace tensorrt_llm::batch_manager
 
 class ContextProgress;
 class BaseCacheTransceiver;
-class DataResponder;
-class DataRequester;
+
+namespace kv_cache_manager
+{
+class BaseKVCacheManager;
+} // namespace kv_cache_manager
+
+class CacheSender;
+class CacheReceiver;
 
 class CacheTransceiverFactory
 {
@@ -110,9 +116,9 @@ private:
 
     void setContextState(LlmRequest* llmRequest);
 
-    std::unique_ptr<DataResponder> mDataResponder;
-    std::unique_ptr<DataRequester> mDataRequester;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mResponderFutures;
+    std::unique_ptr<CacheSender> mCacheSender;
+    std::unique_ptr<CacheReceiver> mCacheReceiver;
+    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const *mMpiGroupComm{nullptr}, *mMpiWorldComm{nullptr};
     std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm, mMpiGroupDataComm,

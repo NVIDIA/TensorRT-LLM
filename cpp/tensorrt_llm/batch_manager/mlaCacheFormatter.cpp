@@ -84,7 +84,7 @@ bool MLACacheFormatter::needSendCache(
     return selfTpRank % (selfTPNum / destTPNum) == 0;
 }
 
-void MLACacheFormatter::format(TransferSession& session)
+void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_format);
     auto const& llmRequest = session.getLlmRequest();
@@ -292,7 +292,7 @@ void MLACacheFormatter::format(TransferSession& session)
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.", llmRequest.mRequestId);
 }
 
-void MLACacheFormatter::unformat(TransferSession& session)
+void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_unformat);
     auto const& llmRequest = session.getLlmRequest();
