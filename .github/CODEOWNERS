@@ -148,6 +148,19 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.h @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
 
+## Build System
+/scripts/build_wheel.py @NVIDIA/trt-llm-build-devs
+/scripts/build_cpp_examples.py @NVIDIA/trt-llm-build-devs
+
+### Python Build System
+/setup.py @NVIDIA/trt-llm-build-devs
+/pyproject.toml @NVIDIA/trt-llm-build-devs
+/requirements*.txt @NVIDIA/trt-llm-build-devs
+
+### C++ Build System
+/cpp/cmake @NVIDIA/trt-llm-build-devs
+**/CMakeLists.txt @NVIDIA/trt-llm-build-devs
+**/*.cmake @NVIDIA/trt-llm-build-devs
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
