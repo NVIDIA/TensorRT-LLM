@@ -1760,6 +1760,24 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
     ])
 
 
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("ctx_config", ["tp2pp1", "tp1pp2"],
+                         ids=["ctx_tp2pp1", "ctx_tp1pp2"])
+@pytest.mark.parametrize("gen_config", ["tp2pp1", "tp1pp2"],
+                         ids=["gen_tp2pp1", "gen_tp1pp2"])
+def test_openai_disaggregated_serving_multi_nodes(llm_root, llm_venv,
+                                                  ctx_config, gen_config):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m",
+        "pytest",
+        str(test_root /
+            f"_test_disagg_serving_multi_nodes.py::test_completion[{ctx_config}-{gen_config}]"
+            ),
+    ])
+
+
 ### PyTorch examples
 
 
