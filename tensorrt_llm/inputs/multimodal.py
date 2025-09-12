@@ -96,6 +96,7 @@ class MultimodalRuntimeData:
         num_cached_tokens: Total number of cached tokens for this sequence
         mm_token_lengths: Length of each multimodal token chunk
         mm_token_positions: Starting positions of each multimodal token chunk
+        special_token_offsets: Starting positions of special tokens in the union of all multimodal token chunks (optional, depending on the model)
         prompt_tokens: Current iteration of prompt tokens for this sequence (optional). Need it for chunk prefill if enabled (#TODO)
         num_cached_mm_tokens: Number of multimodal tokens that are cached in this iteration (computed)
         total_mm_tokens: Total number of multimodal tokens in this sequence (computed)
@@ -103,6 +104,7 @@ class MultimodalRuntimeData:
     num_cached_tokens: int
     mm_token_lengths: List[int]
     mm_token_positions: List[int]
+    special_token_offsets: List[int]
 
     # TODO: support chunk prefill for multimodal
     # When chunk prefill is enabled, we need to pass the prompt tokens for current chunk and mask to find the included mm tokens
@@ -110,6 +112,10 @@ class MultimodalRuntimeData:
 
     num_cached_mm_tokens: Optional[int] = None
     total_mm_tokens: Optional[int] = None
+
+    num_cached_special_tokens: Optional[int] = 0
+    num_special_tokens_in_chunk: Optional[int] = 0
+    total_special_tokens: Optional[int] = 0
 
     def __post_init__(self):
         # Validate input data
@@ -150,6 +156,16 @@ class MultimodalRuntimeData:
                 f"num_cached_tokens ({self.num_cached_tokens})")
         self.total_mm_tokens = sum(self.mm_token_lengths)
 
+        if len(self.special_token_offsets) > 0:
+            self.num_cached_special_tokens = sum(
+                1 for offset in self.special_token_offsets
+                if offset < self.num_cached_mm_tokens)
+            # reserved for chunked prefill
+            self.num_special_tokens_in_chunk = sum(
+                1 for offset in self.special_token_offsets
+                if self.num_cached_mm_tokens <= offset < self.total_mm_tokens)
+            self.total_special_tokens = len(self.special_token_offsets)
+
 
 @dataclass
 class MultimodalParams:
@@ -184,6 +200,7 @@ class MultimodalParams:
                 "video_height": torch.Tensor | List[int],
                 "video_width": torch.Tensor | List[int],
             },
+            "special_token_offsets": List[int],          # List of starting positions of special tokens in the union of all multimodal token chunks, if available
             # ... other modalities
         }
     """
@@ -531,10 +548,12 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
 
 
 def find_mm_token_positions(
-        input_ids: Union[torch.Tensor, List[int], np.ndarray],
-        num_mm_tokens: List[int],
-        vocab_size: Optional[int] = None,
-        mm_token_ids: Optional[torch.Tensor] = None) -> List[int]:
+    input_ids: Union[torch.Tensor, List[int], np.ndarray],
+    num_mm_tokens: List[int],
+    vocab_size: Optional[int] = None,
+    mm_token_ids: Optional[torch.Tensor] = None,
+    mm_special_token_ids: Optional[torch.Tensor] = None
+) -> Tuple[List[int], List[int]]:
     """Get starting positions of contiguous multimodal token chunks using known lengths.
 
     This function finds multimodal tokens (with IDs > vocab_size or matching mm_token_ids)
@@ -552,6 +571,7 @@ def find_mm_token_positions(
 
     Returns:
         List of starting positions for each contiguous multimodal token chunk
+        (Optional) List of starting positions of special tokens in the union of all multimodal token chunks
     """
     if mm_token_ids is None and vocab_size is None:
         raise ValueError(
@@ -600,7 +620,15 @@ def find_mm_token_positions(
             # Move to the next chunk
             current_position += length
 
-    return start_positions
+    start_special_token_positions = []
+    if mm_special_token_ids is not None:
+        mm_token_ids = input_ids[mm_positions]
+        special_token_mask_in_mm = torch.isin(mm_token_ids,
+                                              mm_special_token_ids)
+        start_special_token_positions = torch.where(
+            special_token_mask_in_mm)[0].tolist()
+
+    return start_positions, start_special_token_positions
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],

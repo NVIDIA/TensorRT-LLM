@@ -80,13 +80,19 @@ def find_uncached_mm_embeds(
     # Partial caching, return the sliced mm_embeds
     current_pos = 0
     slices = []
+
     for param in multimodal_params:
         runtime = param.multimodal_runtime
-        slices.append((current_pos + runtime.num_cached_mm_tokens,
-                       current_pos + runtime.total_mm_tokens))
+        local_start_pos = runtime.num_cached_mm_tokens - runtime.num_cached_special_tokens
+        local_end_pos = runtime.total_mm_tokens - runtime.total_special_tokens
+
+        start_pos = current_pos + local_start_pos
+        end_pos = current_pos + local_end_pos
+        slices.append((start_pos, end_pos))
         if len(mm_embeds
                ) == 1:  # pre-concatenated mm_embeds, need global offset
             current_pos += runtime.total_mm_tokens
+            current_pos -= runtime.total_special_tokens
 
     sliced_mm_embeds = []
     if len(mm_embeds) == 1:
