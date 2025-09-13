@@ -4,6 +4,7 @@ from queue import Queue
 from threading import Event
 from typing import AsyncGenerator, Optional, Union
 
+from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from .._utils import mpi_rank
@@ -80,6 +81,12 @@ class RpcWorker(WorkerBase):
             f"RpcWorker {mpi_rank()} quitting fetch_responses_loop_async",
             color="yellow")
 
+    def setup_engine(self):
+        # Force all the ranks to wait here, and start creating the executor simultaneously.
+        mpi_comm().barrier()
+
+        super().setup_engine()
+
     def shutdown(self):
         logger_debug(f"RPC worker {mpi_rank()} is shutting down",
                      color="yellow")
@@ -111,8 +118,6 @@ class RpcWorker(WorkerBase):
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
 
         if mpi_rank() != 0:
-            logger_debug(f"Worker {mpi_rank()} is setting up the engine",
-                         color="yellow")
             # The non-leader worker will setup the engine immediately.
             # The leader worker will wait for the RPC call to propagate the
             # potential error.
@@ -125,7 +130,7 @@ class RpcWorker(WorkerBase):
                          color="yellow")
             # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client
             # Set num_workers to larger than 1 since there are some streaming tasks runs infinitely, such as await_responses_async.
-            rpc_server = RPCServer(worker, num_workers=4)
+            rpc_server = RPCServer(worker, num_workers=6)
             rpc_server.bind(rpc_addr)
             rpc_server.start()
 

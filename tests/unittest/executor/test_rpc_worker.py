@@ -12,6 +12,7 @@ from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc import RPCClient, RPCParams
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.executor.rpc_worker import RpcWorker
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -26,7 +27,7 @@ class TestRpcWorkerTP1:
 
     def setup_method(self):
         self.executor_config = create_fake_executor_config(model_path)
-        self.pool, self.addr = self.create_tp1_worker_process()
+        self.pool, self.addr = self.create_worker_pool()
         self.client = self.create_rpc_client(self.addr)
         self.client.setup_engine()
         time.sleep(10)
@@ -183,33 +184,34 @@ class TestRpcWorkerTP1:
 class TestRpcWorkerTP2:
 
     def setup_method(self):
-        self.executor_config = create_fake_executor_config(model_path)
-        self.pool, self.addr = self.create_worker_pool()
+        self.executor_config = create_fake_executor_config(model_path,
+                                                           tp_size=2)
+        self.session, self.addr, self.futures = self.create_worker_session()
         self.client = self.create_rpc_client(self.addr)
         self.client.setup_engine()
         time.sleep(10)
 
     def teardown_method(self):
         self.client.shutdown()
-        self.pool.shutdown()
+        self.session.shutdown()
         self.client.close()
 
-    def create_worker_pool(self):
+    def create_worker_session(self):
+        session = MpiPoolSession(n_workers=2)
         addr = GenerationExecutorRpcProxy.gen_uniq_rpc_addr()
-        mp_context = multiprocessing.get_context(
-            'spawn')  # spawn for CUDA context
-        pool = ProcessPoolExecutor(max_workers=2, mp_context=mp_context)
-        pool.submit(RpcWorker.main_task,
-                    engine=model_path,
-                    rpc_addr=addr,
-                    executor_config=self.executor_config)
-        return pool, addr
+        futures = session.submit(RpcWorker.main_task,
+                                 engine=model_path,
+                                 rpc_addr=addr,
+                                 executor_config=self.executor_config,
+                                 model_world_size=2)
+        return session, addr, futures
 
     def create_rpc_client(self, addr: str):
-        client = RPCClient(addr)
-        return client
+        return RPCClient(addr)
 
     def test_create_shutdown(self):
+        # Invoke setup_engine in rank 0, and that will unblock all the ranks to
+        # invoke setup_engine simultaneously.
         pass
 
     def test_fetch_responses_sync(self):
