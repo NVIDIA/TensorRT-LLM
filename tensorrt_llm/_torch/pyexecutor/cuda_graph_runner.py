@@ -231,7 +231,8 @@ class CUDAGraphRunner:
 
         if "mrope_position_deltas" in current_inputs:
             assert "mrope_position_deltas" in static_tensors
-            static_tensors["mrope_position_deltas"][:batch_size].copy_(
+            mrope_num = current_inputs["mrope_position_deltas"].shape[0]
+            static_tensors["mrope_position_deltas"][:mrope_num].copy_(
                 current_inputs["mrope_position_deltas"])
 
         self.graphs[key].replay()
