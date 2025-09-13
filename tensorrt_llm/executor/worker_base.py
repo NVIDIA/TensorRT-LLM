@@ -92,6 +92,11 @@ class WorkerBase(GenerationExecutor):
         self._runtime_model_config: Optional[ModelConfig] = None
 
     def setup_engine(self) -> None:
+        logger_debug(f"WorkerBase {self.rank} is setting up the engine",
+                     color="yellow")
+
+        # Force all the ranks to wait here, and start creating the executor simultaneously.
+        mpi_comm().barrier()
 
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
@@ -143,7 +148,13 @@ class WorkerBase(GenerationExecutor):
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
 
+            logger_debug(f"WorkerBase {self.rank} creating py_executor",
+                         color="yellow")
             self.engine = create_executor(**args)
+            logger_debug(f"WorkerBase {self.rank} created py_executor",
+                         color="yellow")
+        logger_debug(f"WorkerBase {self.rank} setup engine done",
+                     color="yellow")
 
         self._setup_lora(engine, executor_config, self._lora_config)
 
