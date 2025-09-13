@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+
+ // TODO: perhaps test for SM120
+ // if this not works try bf16-mxfp4
+ 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
@@ -220,8 +224,9 @@ protected:
 #endif
         bool should_skip_no_device = mDeviceCount <= 0;
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && ANY_FP4;
-        return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100) && ANY_FP4;
+        bool should_skip_unsupported_sm120 = (getSMVersion() >= 120) && !ANY_FPX;
+        return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4 || should_skip_unsupported_sm120;
     }
 
     static void SetUpTestCase()
