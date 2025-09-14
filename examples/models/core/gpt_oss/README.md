@@ -26,6 +26,15 @@ In MoE, the weights are pre-quantized to mxfp4. The activation can be in either 
 
 For best performance, use the `TRITON` moe_backend on Hopper for both latency and throughput cases. Use `CUTLASS` for throughput cases and `TRTLLM` for latency cases on Blackwell.
 
+## KV Cache Support Matrix
+
+|   device  | bf16 kv cache dtype | fp8 kv cache dtype |
+|:---------:|:-------------------:|--------------------|
+|   Hopper  | yes                 | no                 |
+| Blackwell | yes                 | yes                |
+
+On Blackwell GPUs, support for FP8 KV cache is available, allowing the key-value cache to be stored in FP8 format. This reduces memory usage and bandwidth requirements, which can lead to higher throughput and improved overall performance, especially for large batch sizes or long sequence generation.
+
 ## Harmony Examples
 
 ### Function Calling

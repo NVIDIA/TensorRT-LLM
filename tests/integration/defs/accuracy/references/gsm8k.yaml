@@ -198,13 +198,24 @@ mistralai/Codestral-22B-v0.1:
   - accuracy: 67.10
 GPT-OSS/BF16:
   - accuracy: 90.3
+  - kv_cache_quant_algo: FP8
+    accuracy: 90.3
 GPT-OSS/MXFP4:
   - accuracy: 90.3
   - quant_algo: W4A8_MXFP4_MXFP8
     accuracy: 90.3
+  - quant_algo: W4A8_MXFP4_MXFP8
+    kv_cache_quant_algo: FP8
+    accuracy: 90.3
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 90.3
+  - quant_algo: W4A8_MXFP4_FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 90.3
   - quant_algo: W4A16_MXFP4
+    accuracy: 90.3
+  - quant_algo: W4A16_MXFP4
+    kv_cache_quant_algo: FP8
     accuracy: 90.3
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 88.36

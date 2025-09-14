@@ -202,22 +202,27 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(
             }
         }
 
+        // Update the sums with the attention sink value.
+        if (attentionSinksPtr != nullptr)
+        {
+            float attentionSinkVal = exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+            // Multiply the attention sink value by 448.f if the MMA data type is e4m3 as the sum value
+            // has also included the 448.f quantization scale.
+            sumVal += IsE4m3Bmm ? attentionSinkVal * 448.f : attentionSinkVal;
+        }
+
         // Stores the final softmax stats values to global memory if needed (Helix attention, which
         // splits seqLenKv across GPUs).
         if (storesSoftmaxStats && isValidRow && headDimIdx == 0)
         {
             // The softmaxScale.
             float softmaxScale = (softmaxScaleLog2 * (1.f / M_LOG2E));
+            // The sumScale to unscale the 448.f quantization scale from P.
+            float sumScale = IsE4m3Bmm ? (1.f / 448.f) : 1.f;
             // The final max and sum values.
-            float2 stats{maxVal * softmaxScale, sumVal};
+            float2 stats{maxVal * softmaxScale, sumVal * sumScale};
             // Store the final max and sum values to global memory.
             reinterpret_cast<float2*>(softmaxStatsPtr)[validRowIdx] = stats;
-        }
-
-        // Update the sums with the attention sink value.
-        if (attentionSinksPtr != nullptr)
-        {
-            sumVal += exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
         }
 
         // The final normalized scale.
