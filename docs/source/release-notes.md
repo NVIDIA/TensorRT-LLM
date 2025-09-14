@@ -6,6 +6,8 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ## TensorRT-LLM Release 1.0
 
+TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now stable and the default experience, and the LLM API is now stable. For more details on new developments in 1.0, please see below.
+
 ### Key Features and Enhancements
 - **Model Support**
   - Add Mistral3.1 VLM model support
@@ -92,14 +94,17 @@ All published functionality in the Release Notes has been fully tested and verif
   - Add support for TRTLLM CustomDataset
   - Make benchmark_serving part of the library
 
+- Documentation:
+  - Refactored the doc structure to focus on the PyTorch workflow.
+  - Improved the LLMAPI and API reference documentation. Stable APIs are now protected and will remain consistent in subsequent versions following v1.0.
+  - Removed legacy documentation related to the TensorRT workflow.
 
 ### Infrastructure Changes
 - The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.06-py3`.
 - The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.06-py3`.
-- The dependent public PyTorch version is updated to 2.8.0.
 - The dependent NVIDIA ModelOpt version is updated to 0.33.
 - The dependent xgrammar version is updated to 0.1.21.
-- The dependent transformers version is updated to 4.51.3.
+- The dependent transformers version is updated to 4.53.1.
 
 ### API Changes
 - **BREAKING CHANGE** Promote PyTorch to be the default LLM backend
@@ -171,7 +176,6 @@ All published functionality in the Release Notes has been fully tested and verif
 - Fix the unexpected keyword argument 'streaming' (#5436)
 
 ### Known Issues
-- On bare-metal Ubuntu 22.04 or 24.04, please install the `cuda-python==12.9.1` package after installing the TensorRT-LLM wheel. This resolves an incompatibility issue with the default cuda-python 13 of error `ImportError: cannot import name 'cuda' from 'cuda'`.
 - When using disaggregated serving with pipeline parallelism and KV cache reuse, a hang can occur. This will be fixed in a future release. In the meantime, disabling KV cache reuse will fix this issue.
 - Running multi-node cases where each node has just a single GPU is known to fail. This will be addressed in a future release. 
 
