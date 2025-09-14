@@ -90,8 +90,6 @@ NVCC_FLAGS += $(PREPROCESSOR_FLAGS)
 # The include directories.
 INCLUDE_DIRS += -I./src -I./generated -I$(CUDA)/include
 
-GENCODE_SM72 = -gencode=arch=compute_72,code=\"sm_72\"
-GENCODE_SM75 = -gencode=arch=compute_75,code=\"sm_75\"
 GENCODE_SM80 = -gencode=arch=compute_80,code=\"sm_80\"
 GENCODE_SM86 = -gencode=arch=compute_86,code=\"sm_86\"
 GENCODE_SM87 = -gencode=arch=compute_87,code=\"sm_87\"
@@ -126,8 +124,6 @@ CUBIN_OBJ = $(patsubst %.cubin.cpp, %.cubin.o, $(CUBIN_CPP))
 
 GENCODES =
 
-GENCODES += $(GENCODE_SM72)
-GENCODES += $(GENCODE_SM75)
 GENCODES += $(GENCODE_SM80)
 GENCODES += $(GENCODE_SM86)
 GENCODES += $(GENCODE_SM89)
@@ -240,10 +236,6 @@ bin/libfmha_cubin.a: $(CUBIN_OBJ)
 
 ###################################################################################################
 
-obj/%_sm72.cu.o: ./generated/%_sm72.cu ./src/*.h ./src/fmha/*.h
-	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM72) $(INCLUDE_DIRS) -c -o $@ $<
-obj/%_sm75.cu.o: ./generated/%_sm75.cu ./src/*.h ./src/fmha/*.h
-	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM75) $(INCLUDE_DIRS) -c -o $@ $<
 obj/%_sm80.cu.o: ./generated/%_sm80.cu ./src/*.h ./src/fmha/*.h
 	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM80) $(INCLUDE_DIRS) -c -o $@ $<
 obj/%_sm86.cu.o: ./generated/%_sm86.cu ./src/*.h ./src/fmha/*.h
@@ -259,10 +251,6 @@ obj/%_sm100.cu.o: ./generated/%_sm100.cu ./src/*.h ./src/fmha/*.h ./src/fmha/hop
 obj/%_sm120.cu.o: ./generated/%_sm120.cu ./src/*.h ./src/fmha/*.h
 	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM120) $(INCLUDE_DIRS) -c -o $@ $<
 
-obj/%_sm72.no_i2f_f2i.cu.o: ./generated/%_sm72.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
-	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM72) $(INCLUDE_DIRS) -c -o $@ $<
-obj/%_sm75.no_i2f_f2i.cu.o: ./generated/%_sm75.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
-	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM75) $(INCLUDE_DIRS) -c -o $@ $<
 obj/%_sm80.no_i2f_f2i.cu.o: ./generated/%_sm80.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
 	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM80) $(INCLUDE_DIRS) -c -o $@ $<
 obj/%_sm86.no_i2f_f2i.cu.o: ./generated/%_sm86.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
@@ -307,10 +295,6 @@ $(UNIT_TEST_OBJ_SM80): %.o : $(UNIT_TEST_CPP_SM80) ./src/*.h ./src/fmha/*.h
 
 ###################################################################################################
 
-cubin/%_sm72.cu.cubin: ./generated/%_sm72.cu ./src/*.h ./src/fmha/*.h
-	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM72) $(INCLUDE_DIRS) -cubin -o $@ $<
-cubin/%_sm75.cu.cubin: ./generated/%_sm75.cu ./src/*.h ./src/fmha/*.h
-	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM75) $(INCLUDE_DIRS) -cubin -o $@ $<
 cubin/%_sm80.cu.cubin: ./generated/%_sm80.cu ./src/*.h ./src/fmha/*.h
 	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM80) $(INCLUDE_DIRS) -cubin -o $@ $<
 cubin/%_sm86.cu.cubin: ./generated/%_sm86.cu ./src/*.h ./src/fmha/*.h
@@ -326,10 +310,6 @@ cubin/%_sm100.cu.cubin: ./generated/%_sm100.cu ./src/*.h ./src/fmha/*.h
 cubin/%_sm120.cu.cubin: ./generated/%_sm120.cu ./src/*.h ./src/fmha/*.h
 	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM120) $(INCLUDE_DIRS) -cubin -o $@ $<
 
-cubin/%_sm72.no_i2f_f2i.cu.cubin: ./generated/%_sm72.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
-	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM72) $(INCLUDE_DIRS) -cubin -o $@ $<
-cubin/%_sm75.no_i2f_f2i.cu.cubin: ./generated/%_sm75.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
-	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM75) $(INCLUDE_DIRS) -cubin -o $@ $<
 cubin/%_sm80.no_i2f_f2i.cu.cubin: ./generated/%_sm80.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
 	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM80) $(INCLUDE_DIRS) -cubin -o $@ $<
 cubin/%_sm86.no_i2f_f2i.cu.cubin: ./generated/%_sm86.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
