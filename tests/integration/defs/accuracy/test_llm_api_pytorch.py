@@ -2923,7 +2923,6 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
     extra_evaluator_kwargs = {
         "fewshot_as_multiturn": True,
         "apply_chat_template": True,
@@ -2931,6 +2930,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -2939,7 +2939,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (True, True),
     ])
-    def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler, mocker):
+    def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
+                     overlap_scheduler, mocker):
         MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
@@ -2951,11 +2952,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        dtype=kv_cache_dtype)
+
         llm = LLM(MODEL_PATH,
                   tensor_parallel_size=1,
                   pipeline_parallel_size=1,
                   moe_expert_parallel_size=1,
-                  kv_cache_config=self.kv_cache_config,
+                  kv_cache_config=kv_cache_config,
                   **pytorch_config,
                   moe_config=MoeConfig(backend=moe_backend))
 
@@ -2966,6 +2970,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -2978,8 +2983,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (4, 1, 4, True, True, True),
         ],
         ids=["tp4", "ep4", "dp4"])
-    def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
-                      attention_dp, cuda_graph, overlap_scheduler, mocker):
+    def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
+                      ep_size, attention_dp, cuda_graph, overlap_scheduler,
+                      mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -2991,11 +2997,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        dtype=kv_cache_dtype)
+
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
-                  kv_cache_config=self.kv_cache_config,
+                  kv_cache_config=kv_cache_config,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
                   moe_config=MoeConfig(backend=moe_backend))
@@ -3007,13 +3016,15 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (4, 1, 4, True, True, True),
         ],
         ids=["dp4"])
-    def test_w4a16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                   overlap_scheduler, monkeypatch, mocker):
+    def test_w4a16(self, kv_cache_dtype, tp_size, pp_size, ep_size,
+                   attention_dp, cuda_graph, overlap_scheduler, monkeypatch,
+                   mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -3025,11 +3036,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        dtype=kv_cache_dtype)
+
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
-                  kv_cache_config=self.kv_cache_config,
+                  kv_cache_config=kv_cache_config,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
                   moe_backend="TRITON")
@@ -3040,6 +3054,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
     @pytest.mark.parametrize(
         "moe_backend",
         ["CUTLASS",
@@ -3052,8 +3067,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (2, 1, 2, True, True, True),
         ],
         ids=["tp2", "ep2", "dp2"])
-    def test_w4_2gpus(self, moe_backend, tp_size, pp_size, ep_size,
-                      attention_dp, cuda_graph, overlap_scheduler, mocker):
+    def test_w4_2gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
+                      ep_size, attention_dp, cuda_graph, overlap_scheduler,
+                      mocker):
         MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
@@ -3063,11 +3079,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        dtype=kv_cache_dtype)
+
         llm = LLM(MODEL_PATH,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
-                  kv_cache_config=self.kv_cache_config,
+                  kv_cache_config=kv_cache_config,
                   max_seq_len=8192,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
