@@ -3,7 +3,7 @@
 import copy
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -313,3 +313,7 @@ class ModelFactoryRegistry:
     @classmethod
     def has(cls, model_factory_cls: str) -> bool:
         return model_factory_cls in cls._registry
+
+    @classmethod
+    def entries(cls) -> List[str]:
+        return list(cls._registry.keys())

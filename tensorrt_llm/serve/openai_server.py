@@ -386,15 +386,19 @@ class OpenAIServer:
 
         async def chat_stream_generator(
                 promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            if not self.postproc_worker_enabled:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-            async for res in promise:
-                pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                await self._extract_metrics(res)
-                for pp_res in pp_results:
-                    yield pp_res
-            yield "data: [DONE]\n\n"
-            nvtx_mark("generation ends")
+            try:
+                if not self.postproc_worker_enabled:
+                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                async for res in promise:
+                    pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                    await self._extract_metrics(res)
+                    for pp_res in pp_results:
+                        yield pp_res
+                yield "data: [DONE]\n\n"
+                nvtx_mark("generation ends")
+            except:
+                logger.error(traceback.format_exc())
+                raise
 
         async def create_chat_response(
                 promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
@@ -420,7 +424,9 @@ class OpenAIServer:
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size)
+                vocab_size=self.tokenizer.tokenizer.vocab_size,
+                gather_generation_logits=self.llm.args.gather_generation_logits,
+                backend=self.llm.args.backend)
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
@@ -608,15 +614,20 @@ class OpenAIServer:
             return merged_rsp
 
         async def completion_generator(promise: RequestOutput, params: Optional[PostprocParams]):
-            async for output in promise:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = params.post_processor, params.postproc_args
-                    pp_result = post_processor(output, args)
-                else:
-                    pp_result = output.outputs[0]._postprocess_result
-                await self._extract_metrics(output)
-                for pp_res in pp_result:
-                    yield pp_res
+            try:
+                async for output in promise:
+                    if not self.postproc_worker_enabled:
+                        post_processor, args = params.post_processor, params.postproc_args
+                        pp_result = post_processor(output, args)
+                    else:
+                        pp_result = output.outputs[0]._postprocess_result
+                    await self._extract_metrics(output)
+                    for pp_res in pp_result:
+                        yield pp_res
+            except:
+                logger.error(traceback.format_exc())
+                raise
+
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
