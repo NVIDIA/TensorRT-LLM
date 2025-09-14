@@ -443,22 +443,17 @@ class ModelDrafter(Drafter):
                     draft_length] = draft_tensors[0:draft_length, idx]
 
     def _setup_draft_batch_and_resources(
-        self,
-        scheduled_batch: ScheduledRequests,
-        guided_decoder: Optional[GuidedDecoder] = None
+        self, scheduled_batch: ScheduledRequests
     ) -> Tuple[Optional[ScheduledRequests], Optional[Dict[int, LlmRequest]]]:
         """
         Setup draft batch and prepare resources.
 
         Args:
             scheduled_batch: The scheduled requests
-            guided_decoder: The guided decoder
 
         Returns:
             Tuple of (draft_batch, req_id_to_old_request) or (None, None) if no batch
         """
-        if guided_decoder is not None:
-            guided_decoder.rollback_rejected_tokens(scheduled_batch)
 
         draft_batch = self._prepare_draft_batch(scheduled_batch)
         if draft_batch.batch_size == 0:
@@ -510,11 +505,8 @@ class ModelDrafter(Drafter):
                                     req_id_to_old_request)
 
     def _execute_draft_iteration(
-        self,
-        draft_batch: ScheduledRequests,
-        resource_manager: ResourceManager,
-        previous_draft_state: Optional[SampleState],
-        guided_decoder: Optional[GuidedDecoder] = None
+        self, draft_batch: ScheduledRequests, resource_manager: ResourceManager,
+        previous_draft_state: Optional[SampleState]
     ) -> Tuple[Any, Optional[SampleState]]:
         """Forward pass through the draft model."""
         outputs = self.forward_draft_model(
@@ -527,11 +519,10 @@ class ModelDrafter(Drafter):
         if previous_draft_state is not None:
             self.update_requests(previous_draft_state)
 
-        if guided_decoder is not None:
-            guided_decoder.add_batch(draft_batch)
-            guided_decoder.execute(outputs['logits'],
-                                   outputs['logits'],
-                                   d2t=outputs.get('d2t'))
+        if self.guided_decoder is not None:
+            self.guided_decoder.add_batch(draft_batch)
+            self.guided_decoder.execute(outputs['logits'],
+                                        d2t=outputs.get('d2t'))
 
         sample_state = self.sample_async(draft_batch, outputs)
         self.update_request_states(draft_batch)
@@ -543,7 +534,6 @@ class ModelDrafter(Drafter):
         draft_batch: ScheduledRequests,
         resource_manager: ResourceManager,
         req_id_to_old_request: Dict[int, LlmRequest],
-        guided_decoder: Optional[GuidedDecoder] = None,
         target_inputs: Optional[SampleStateTensorsMTP] = None,
         num_draft_reqs: Optional[int] = None,
         initial_draft_state: Optional[SampleState] = None
@@ -555,7 +545,6 @@ class ModelDrafter(Drafter):
             draft_batch: The draft batch to process
             resource_manager: The resource manager
             req_id_to_old_request: Mapping from request ID to original request
-            guided_decoder: The guided decoder
             target_inputs: Optional target inputs to update (for overlap mode)
             num_draft_reqs: Number of draft requests (for overlap mode)
             initial_draft_state: The initial draft state from the first forward pass
@@ -575,8 +564,7 @@ class ModelDrafter(Drafter):
                 break
 
             _, sample_state = self._execute_draft_iteration(
-                draft_batch, resource_manager, previous_draft_state,
-                guided_decoder)
+                draft_batch, resource_manager, previous_draft_state)
 
             # Update target inputs if provided (for overlap mode)
             if target_inputs is not None and num_draft_reqs is not None:
@@ -603,8 +591,7 @@ class ModelDrafter(Drafter):
     def generate_draft_tokens_with_overlap(
         self, scheduled_batch: ScheduledRequests,
         resource_manager: ResourceManager,
-        previous_tensors: Optional[SampleStateTensors],
-        guided_decoder: Optional[GuidedDecoder]
+        previous_tensors: Optional[SampleStateTensors]
     ) -> Tuple[Optional[SampleStateTensorsMTP], Optional[Any],
                Optional[ScheduledRequests]]:
         """
@@ -622,7 +609,7 @@ class ModelDrafter(Drafter):
                 - Draft sample state or None
         """
         draft_batch, req_id_to_old_request = self._setup_draft_batch_and_resources(
-            scheduled_batch, guided_decoder)
+            scheduled_batch)
         if draft_batch is None:
             return None, None, None
 
@@ -652,7 +639,6 @@ class ModelDrafter(Drafter):
         if self.guided_decoder is not None:
             self.guided_decoder.add_batch(draft_batch)
             self.guided_decoder.execute(outputs['logits'],
-                                        outputs['logits'],
                                         d2t=outputs.get('d2t'))
         draft_sample_state = self.sample_async(draft_batch, outputs)
 
@@ -669,8 +655,8 @@ class ModelDrafter(Drafter):
 
         # Execute the iterative draft loop
         previous_draft_state = self._execute_draft_loop(
-            draft_batch, resource_manager, req_id_to_old_request,
-            guided_decoder, target_inputs, num_draft_reqs, draft_sample_state)
+            draft_batch, resource_manager, req_id_to_old_request, target_inputs,
+            num_draft_reqs, draft_sample_state)
 
         return target_inputs, previous_draft_state, draft_batch
 
@@ -719,8 +705,8 @@ class ModelDrafter(Drafter):
 
             # Execute the iterative draft loop
             previous_draft_state = self._execute_draft_loop(
-                draft_batch, resource_manager, req_id_to_old_request,
-                self.guided_decoder, None, None, sample_state)
+                draft_batch, resource_manager, req_id_to_old_request, None,
+                None, sample_state)
 
             # Final cleanup
             if previous_draft_state is not None:

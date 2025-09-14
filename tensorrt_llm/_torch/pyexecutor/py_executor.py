@@ -1983,8 +1983,7 @@ class PyExecutor:
 
                 target_inputs, draft_outputs, draft_batch = self.drafter.generate_draft_tokens_with_overlap(
                     scheduled_batch, self.resource_manager,
-                    previous_tensors.device if previous_tensors else None,
-                    self.guided_decoder)
+                    previous_tensors.device if previous_tensors else None)
 
                 self.has_previous_draft_tokens = target_inputs is not None and target_inputs.next_draft_tokens is not None
             else:
