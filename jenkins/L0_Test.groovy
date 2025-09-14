@@ -2150,6 +2150,7 @@ def launchTestJobs(pipeline, testFilter)
         // "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
         // "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
         // "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],

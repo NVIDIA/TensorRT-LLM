@@ -105,5 +105,5 @@ trap - ERR
 
 eval $fullCmd
 exitCode=$?
-echo "Pytest exit code: $exitCode"
+echo "Rank$SLURM_LOCALID Pytest exit code: $exitCode"
 exit $exitCode
