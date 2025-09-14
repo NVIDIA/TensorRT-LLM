@@ -264,5 +264,7 @@ def run_sharding_pattern_detection_test(
     # Convert to sets for unordered comparison
     detected_set = set(detected_transformations)
     expected_set = set(expected_transformations)
+    print("detected_set", detected_set)
+    print("expected_set", expected_set)
 
     assert detected_set == expected_set, "Expected sharding pattern does not match detected pattern"

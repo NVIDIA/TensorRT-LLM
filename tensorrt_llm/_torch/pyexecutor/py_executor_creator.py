@@ -467,11 +467,11 @@ def create_py_executor(
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
             # To deal with cases like this, we instantiate them both concurrently.
             with ThreadPoolExecutor(max_workers=2) as executor:
-                connector_worker_task = executor.submit(worker_cls)
+                connector_worker_task = executor.submit(worker_cls, llm_args)
 
                 if scheduler_cls is not None and rank == 0:
                     connector_scheduler_task = executor.submit(
-                        scheduler_cls, executor_config.tokens_per_block)
+                        scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
                 else:
                     connector_scheduler = None
@@ -493,17 +493,29 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(
-            executor_config=executor_config,
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
             mapping=mapping,
             net_max_seq_len=net_max_seq_len,
-            kv_connector_manager=kv_connector_manager)
+            kv_connector_manager=kv_connector_manager,
+            max_num_tokens=executor_config.max_num_tokens,
+            max_beam_width=executor_config.max_beam_width,
+            tokens_per_block=executor_config.tokens_per_block,
+            max_seq_len=executor_config.max_seq_len,
+            max_batch_size=executor_config.max_batch_size,
+            kv_cache_config=executor_config.kv_cache_config,
+            pytorch_backend_config=executor_config.pytorch_backend_config,
+            speculative_config=executor_config.speculative_config,
+        )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
+            # Originally, executor_config.max_seq_len might be changed inside build_managers and used
+            # below in create_py_executor_instance. Since now, we are changing
+            # kv_cache_creator._max_seq_len instead, restore executor_config.max_seq_len.
+            executor_config.max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(executor_config.max_seq_len, sampler)
 
     # Resource managers for speculative decoding
@@ -564,10 +576,14 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
-            # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
+            # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
             # the original value before creating the final KV cache.
-            executor_config.max_seq_len = max_seq_len
+            kv_cache_creator._max_seq_len = max_seq_len
             kv_cache_creator.build_managers(resources, False)
+            # Originally, executor_config.max_seq_len might be changed again inside build_managers
+            # Since now, we are changing kv_cache_creator.max_seq_len instead.
+            # Restore executor_config.max_seq_len which has been used in create_py_executor_instance
+            executor_config.max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(executor_config.max_seq_len, sampler)
 
             for eng in [model_engine, draft_model_engine]:
