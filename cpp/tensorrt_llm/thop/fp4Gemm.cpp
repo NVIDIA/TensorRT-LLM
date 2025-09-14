@@ -25,6 +25,10 @@
 #include "fp4_gemm.h"
 #endif
 
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
+#include "tensorrt_llm/kernels/cublaslt_kernels/fp4_gemm/fp4_gemm_cublaslt.h"
+#endif
+
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/native/cuda/Resize.h>
 
@@ -49,6 +53,13 @@ using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInter
 
 namespace torch_ext
 {
+
+// Backend selection enum
+enum class Fp4GemmBackend
+{
+    CUTLASS,    // Default backend
+    CUBLASLT    // cuBLASLt backend
+};
 
 namespace
 {
@@ -86,29 +97,59 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k, FP4
 template <typename T>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, int64_t batch_count,
-    tkc::CutlassGemmConfig const& gemmConfig, FP4GemmType fp4GemmType)
+    tkc::CutlassGemmConfig const& gemmConfig, FP4GemmType fp4GemmType, Fp4GemmBackend backend = Fp4GemmBackend::CUTLASS)
 {
-    if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+    
+    if (backend == Fp4GemmBackend::CUBLASLT)
     {
-        CutlassFp4GemmRunner<T, FP4GemmType::W4A8_MXFP4_MXFP8> gemmRunner;
+#ifdef ENABLE_CUBLASLT_FP4_GEMM
+        // Verify only W4A4_NVFP4_NVFP4 is supported
+        if (fp4GemmType != FP4GemmType::W4A4_NVFP4_NVFP4)
+        {
+            throw std::runtime_error("cuBLASLt backend only supports W4A4_NVFP4_NVFP4");
+        }
+        
+        // Call cuBLASLt implementation (using heuristic, no tuner needed)
+        tensorrt_llm::kernels::cublaslt_kernels::CublasLtFp4GemmRunner<T> gemmRunner;
         int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
-
+        
         at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
-
-        gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
-            mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
-            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+        
+        gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), 
+                       mat1Scale.const_data_ptr(), mat2Scale.const_data_ptr(), 
+                       globalScale.data_ptr<float>(), m, n, k, batch_count,
+                       reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, 
+                       at::cuda::getCurrentCUDAStream(mat1.get_device()), true);
+#else
+        throw std::runtime_error("cuBLASLt FP4 GEMM support not enabled");
+#endif
     }
-    else if (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
+    else
     {
-        CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
-        int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
+        // Existing CUTLASS implementation
+        
+        if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+        {
+            CutlassFp4GemmRunner<T, FP4GemmType::W4A8_MXFP4_MXFP8> gemmRunner;
+            int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
 
-        at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
+            at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
 
-        gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
-            mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
-            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+            gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
+                mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
+                reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+        }
+        else if (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
+        {
+            CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
+            int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
+
+            at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
+
+            gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
+                mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
+                reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+        }
     }
 }
 
@@ -302,6 +343,64 @@ private:
     at::ScalarType mOutputDtype;
     FP4GemmType mfp4GemmType;
 };
+
+// cuBLASLt specific function
+void cublaslt_nvfp4_gemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, 
+                        at::Tensor const& mat1Scale, at::Tensor const& mat2Scale, 
+                        at::Tensor const& globalScale)
+{
+    
+    int64_t m = mat1.sizes()[0];
+    int64_t n = mat2.sizes()[0];
+    int64_t k = mat2.sizes()[1] * 2; // FP4 compresses K dimension
+    
+    
+    // Call corresponding template based on output type
+    switch (out.scalar_type())
+    {
+    case at::ScalarType::Half:
+        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, 
+                     m, n, k, 1, tkc::CutlassGemmConfig{}, 
+                     FP4GemmType::W4A4_NVFP4_NVFP4, Fp4GemmBackend::CUBLASLT);
+        break;
+    case at::ScalarType::Float:
+        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, 
+                      m, n, k, 1, tkc::CutlassGemmConfig{}, 
+                      FP4GemmType::W4A4_NVFP4_NVFP4, Fp4GemmBackend::CUBLASLT);
+        break;
+#ifdef ENABLE_BF16
+    case at::ScalarType::BFloat16:
+        runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, 
+                              m, n, k, 1, tkc::CutlassGemmConfig{}, 
+                              FP4GemmType::W4A4_NVFP4_NVFP4, Fp4GemmBackend::CUBLASLT);
+        break;
+#endif
+    default:
+        throw std::runtime_error("Unsupported output dtype for cuBLASLt FP4 GEMM");
+    }
+}
+
+// Explicit template instantiation
+template void runGemm<half>(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, 
+                           at::Tensor const& mat1Scale, at::Tensor const& mat2Scale, 
+                           at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, 
+                           int64_t batch_count, tkc::CutlassGemmConfig const& gemmConfig, 
+                           FP4GemmType fp4GemmType, Fp4GemmBackend backend);
+
+template void runGemm<float>(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, 
+                            at::Tensor const& mat1Scale, at::Tensor const& mat2Scale, 
+                            at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, 
+                            int64_t batch_count, tkc::CutlassGemmConfig const& gemmConfig, 
+                            FP4GemmType fp4GemmType, Fp4GemmBackend backend);
+
+#ifdef ENABLE_BF16
+template void runGemm<__nv_bfloat16>(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, 
+                                    at::Tensor const& mat1Scale, at::Tensor const& mat2Scale, 
+                                    at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, 
+                                    int64_t batch_count, tkc::CutlassGemmConfig const& gemmConfig, 
+                                    FP4GemmType fp4GemmType, Fp4GemmBackend backend);
+#endif
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -317,10 +416,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fp4_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale, int fp4GemmType, "
         "ScalarType? out_dtype=None) -> Tensor");
+    m.def("cublaslt_nvfp4_gemm(Tensor out, Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale) -> ()");
 }
+
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_bmm", &torch_ext::fp4_bmm);
     m.impl("fp4_gemm", &torch_ext::fp4_bmm);
+    m.impl("cublaslt_nvfp4_gemm", &torch_ext::cublaslt_nvfp4_gemm);
 }

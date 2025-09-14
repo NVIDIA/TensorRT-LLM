@@ -440,24 +440,76 @@ def nvfp4_gemm(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     to_userbuffers: bool = False,
+    backend: str = "cublaslt",  # Default to cuBLASLt backend
 ) -> torch.Tensor:
+    # Validate backend selection
+    if backend not in ["cutlass", "cublaslt"]:
+        raise ValueError(f"Unsupported backend: {backend}. Must be 'cutlass' or 'cublaslt'")
+    
+    if backend == "cublaslt":
+        # Directly call cuBLASLt implementation, using built-in heuristic, skip tuner
+        # Note: cuBLASLt now uses the same scaling factor type as CUTLASS
+        result = cublaslt_nvfp4_gemm_impl(
+            act_fp4, weight, act_sf, weight_scale, alpha, 
+            output_dtype, to_userbuffers
+        )
+        return result
+    else:
+        # Existing CUTLASS implementation (with TensorRT-LLM tuner)
+        tuner = AutoTuner.get()
 
-    tuner = AutoTuner.get()
+        # allocate workspace for profiling
+        nvfp4_gemm_runner = FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                                          to_userbuffers, output_dtype)
 
-    # allocate workspace for profiling
-    nvfp4_gemm_runner = FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
-                                      to_userbuffers, output_dtype)
+        _, best_tactic = tuner.choose_one(
+            "trtllm::fp4_gemm::gemm",
+            [nvfp4_gemm_runner],
+            FP4GemmRunner.tuning_config,
+            [act_fp4, weight, act_sf, weight_scale, alpha],
+        )
 
-    _, best_tactic = tuner.choose_one(
-        "trtllm::fp4_gemm::gemm",
-        [nvfp4_gemm_runner],
-        FP4GemmRunner.tuning_config,
-        [act_fp4, weight, act_sf, weight_scale, alpha],
+        result = nvfp4_gemm_runner(
+            inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
+            tactic=best_tactic)
+        return result
+
+
+def cublaslt_nvfp4_gemm_impl(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
+) -> torch.Tensor:
+    """cuBLASLt FP4 GEMM implementation using built-in heuristic"""
+    # Validate input types
+    if act_fp4.dtype != fp4_utils.FLOAT4_E2M1X2:
+        raise ValueError(f"Expected act_fp4 dtype {fp4_utils.FLOAT4_E2M1X2}, got {act_fp4.dtype}")
+    if weight.dtype != fp4_utils.FLOAT4_E2M1X2:
+        raise ValueError(f"Expected weight dtype {fp4_utils.FLOAT4_E2M1X2}, got {weight.dtype}")
+    
+    # Create output tensor
+    # Keep consistent output shape [m, n] with CUTLASS
+    output_shape = [act_fp4.size(0), weight.size(0)]
+    
+    if to_userbuffers:
+        from ..utils import create_userbuffers_tensor
+        out = create_userbuffers_tensor(output_shape, output_dtype)[0]
+    else:
+        out = torch.empty(output_shape, dtype=output_dtype, device=act_fp4.device)
+    
+    # Call C++ cuBLASLt implementation (using built-in heuristic)
+    # Swap input order to match cuBLASLt's column-major format:
+    # - Change gemm(act_fp4, weight) to gemm(weight, act_fp4)
+    # - This way cuBLASLt's output is in correct row-major format
+    torch.ops.trtllm.cublaslt_nvfp4_gemm(
+        out, weight, act_fp4, weight_scale, act_sf, alpha  # Swapped act_fp4 and weight positions
     )
-
-    return nvfp4_gemm_runner(
-        inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-        tactic=best_tactic)
+    
+    return out
 
 
 @nvfp4_gemm.register_fake

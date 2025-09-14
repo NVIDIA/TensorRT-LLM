@@ -97,6 +97,12 @@ set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})
 
+# Link cuBLASLt FP4 GEMM library
+if(ENABLE_CUBLASLT_FP4_GEMM)
+  target_link_libraries(th_common PRIVATE cublaslt_fp4_gemm)
+  target_compile_definitions(th_common PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
+endif()
+
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
                              PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
