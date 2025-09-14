@@ -588,6 +588,26 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
             tma_ws_configs.end());
     }
 
+    // Filter out SM120 mixed FP8xFP4 configs that use K=64 tiles ("...64B")
+    // Prefer K in {128, 256} only for MX path on SM120.
+    if (sm == 120 || sm == 121)
+    {
+        constexpr bool IsFp8xFp4
+            = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+        if constexpr (IsFp8xFp4)
+        {
+            // Restrict SM120 MXFP8xMXFP4 to 128x128x128 only
+            tma_ws_configs.erase(
+                std::remove_if(
+                    tma_ws_configs.begin(), tma_ws_configs.end(), [](cutlass_extensions::CutlassGemmConfig const& cfg)
+                    {
+                        return cfg.sm_version >= 120
+                            && cfg.tile_config_sm120 != cutlass_extensions::CutlassTileConfigSM120::CtaShape128x128x128B;
+                    }),
+                tma_ws_configs.end());
+        }
+    }
+
     return tma_ws_configs;
 }
 
