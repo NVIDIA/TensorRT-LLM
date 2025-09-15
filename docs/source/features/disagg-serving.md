@@ -169,7 +169,7 @@ curl http://localhost:8000/v1/completions \
 
 #### Launching disaggregated servers on SLURM clusters
 
-Please refer to [Disaggregated Inference Benchmark Scripts](../../../../examples/disaggregated/slurm).
+Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
 
 ### Dynamo
 
