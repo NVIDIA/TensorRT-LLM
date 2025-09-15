@@ -7,6 +7,7 @@ with proper workspace management and synchronization.
 
 from typing import Optional
 import torch
+from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.mapping import Mapping
 
@@ -23,6 +24,9 @@ class MoeAlltoAll:
     MAX_RANKS = 64
     MAX_TOP_K = 8
     MAX_PAYLOADS = 8
+    
+    # Single shared workspace/memory across the process
+    _WORKSPACE: dict | None = None
     
     # MetaInfo indices - initialized from C++ constants
     FLAG_VAL_OFFSET_INDEX = None
@@ -73,23 +77,39 @@ class MoeAlltoAll:
         if not isinstance(self.num_experts, int) or self.num_experts <= 0:
             raise ValueError("num_experts must be a positive int")
         self.workspace_size_per_rank = workspace_size_per_rank
-        
-        # Initialize MNNVL memory
+
+        # Initialize or reuse workspace
         MnnvlMemory.initialize()
-        self.mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
-        self.workspace = self.mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-        
-        # Initialize and get metainfo
-        # moe_a2a_metainfo contains offsets indexed by class constants:
-        # FLAG_VAL_OFFSET_INDEX, LOCAL_TOKEN_COUNTER_OFFSET_INDEX, SEND_COUNTERS_OFFSET_INDEX,
-        # COMPLETION_FLAGS_OFFSET_INDEX, SEND_INDICES_OFFSET_INDEX, PAYLOAD_DATA_OFFSET_INDEX
-        # This provides robust binding between Python and C++ without hardcoded indices
-        self.moe_a2a_metainfo = torch.ops.trtllm.moe_a2a_initialize(
-            self.workspace,
-            self.ep_rank,
-            self.ep_size,
-            self.max_num_tokens_per_rank
-        )
+
+        if self._WORKSPACE is None:
+            tllm_logger.info(f"MoE AlltoAll: Allocating workspace with size {workspace_size_per_rank} bytes. ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}")
+            mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
+            workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
+            metainfo = torch.ops.trtllm.moe_a2a_initialize(
+                workspace,
+                self.ep_rank,
+                self.ep_size,
+                self.max_num_tokens_per_rank,
+            )
+            MoeAlltoAll._WORKSPACE = {
+                "workspace_size_per_rank": workspace_size_per_rank,
+                "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
+                "ep_rank": self.ep_rank,
+                "ep_size": self.ep_size,
+                "mnnvl_mem": mnnvl_mem,
+                "workspace": workspace,
+                "metainfo": metainfo,
+            }
+        else:
+            assert self._WORKSPACE["workspace_size_per_rank"] == workspace_size_per_rank, "reuse workspace with different workspace_size_per_rank"
+            assert self._WORKSPACE["max_num_tokens_per_rank"] == self.max_num_tokens_per_rank, "reuse workspace with different max_num_tokens_per_rank"
+            assert self._WORKSPACE["ep_rank"] == self.ep_rank, "reuse workspace with different ep_rank"
+            assert self._WORKSPACE["ep_size"] == self.ep_size, "reuse workspace with different ep_size"
+
+        self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
+        self.workspace = self._WORKSPACE["workspace"]
+        self.moe_a2a_metainfo = self._WORKSPACE["metainfo"]
+        self.max_num_tokens_per_rank = self._WORKSPACE["max_num_tokens_per_rank"]
         # Internal state and aux data
         self.send_indices: torch.Tensor | None = None
         self.send_counters: torch.Tensor | None = None
