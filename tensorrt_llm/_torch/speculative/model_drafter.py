@@ -216,6 +216,10 @@ class ModelDrafter(Drafter):
                 self._add_to_draft_batch(draft_batch, new_request, request)
 
             for request in scheduled_requests.generation_requests:
+                if request.state == LlmRequestState.GENERATION_COMPLETE:
+                    # Skip generation complete requests. This could happen when enabling overlap scheduler.
+                    continue
+
                 if request.py_draft_pages_allocated == 0:
                     # No space for draft tokens
                     continue
@@ -358,6 +362,9 @@ class ModelDrafter(Drafter):
             return True
 
         for request in scheduled_batch.generation_requests:
+            if request.state == LlmRequestState.GENERATION_COMPLETE:
+                continue
+
             if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
                 continue
             return True
