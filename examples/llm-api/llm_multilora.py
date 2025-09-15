@@ -1,9 +1,10 @@
 ### :section Customization
 ### :title Generate text with multiple LoRA adapters
 ### :order 5
+
+import argparse
 from typing import Optional
 
-import click
 from huggingface_hub import snapshot_download
 
 from tensorrt_llm import LLM
@@ -11,23 +12,10 @@ from tensorrt_llm.executor import LoRARequest
 from tensorrt_llm.lora_helper import LoraConfig
 
 
-@click.command()
-@click.option("--chatbot_lora_dir",
-              type=str,
-              default=None,
-              help="Path to the chatbot LoRA directory")
-@click.option("--mental_health_lora_dir",
-              type=str,
-              default=None,
-              help="Path to the mental health LoRA directory")
-@click.option("--tarot_lora_dir",
-              type=str,
-              default=None,
-              help="Path to the tarot LoRA directory")
 def main(chatbot_lora_dir: Optional[str], mental_health_lora_dir: Optional[str],
          tarot_lora_dir: Optional[str]):
 
-    # Download the LoRA adapters from huggingface hub.
+    # Download the LoRA adapters from huggingface hub, if not provided via command line args.
     if chatbot_lora_dir is None:
         chatbot_lora_dir = snapshot_download(
             repo_id="snshrivas10/sft-tiny-chatbot")
@@ -82,4 +70,20 @@ def main(chatbot_lora_dir: Optional[str], mental_health_lora_dir: Optional[str],
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(
+        description="Generate text with multiple LoRA adapters")
+    parser.add_argument('--chatbot_lora_dir',
+                        type=str,
+                        default=None,
+                        help='Path to the chatbot LoRA directory')
+    parser.add_argument('--mental_health_lora_dir',
+                        type=str,
+                        default=None,
+                        help='Path to the mental health LoRA directory')
+    parser.add_argument('--tarot_lora_dir',
+                        type=str,
+                        default=None,
+                        help='Path to the tarot LoRA directory')
+    args = parser.parse_args()
+    main(args.chatbot_lora_dir, args.mental_health_lora_dir,
+         args.tarot_lora_dir)
