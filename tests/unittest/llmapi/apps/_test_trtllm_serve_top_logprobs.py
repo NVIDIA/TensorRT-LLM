@@ -31,7 +31,8 @@ def temp_extra_llm_api_options_file():
             "gather_generation_logits": True,
             "kv_cache_config": {
                 "enable_block_reuse": False,
-            }
+            },
+            "max_top_logprobs": 1
         }
 
         with open(temp_file_path, 'w') as f:

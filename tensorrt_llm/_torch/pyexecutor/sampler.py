@@ -292,7 +292,7 @@ def greedy_search_sampling_batch(logits):
     """
     next_tokens = torch.argmax(logits, dim=-1)
     softmax = torch.softmax(logits, dim=-1)
-    return next_tokens, softmax, None
+    return next_tokens, softmax, next_tokens.unsqueeze(-1)
 
 
 def get_rejected_indices(draft_probs: torch.Tensor, target_probs: torch.Tensor,
