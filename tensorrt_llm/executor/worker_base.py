@@ -2,7 +2,6 @@ import copy
 import datetime
 import enum
 import json
-import weakref
 from pathlib import Path
 from queue import Queue
 from typing import Dict, List, Optional, Tuple, Union
@@ -15,7 +14,8 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import PybindMirror
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, PybindMirror
+from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, logger_debug, print_colored_debug
 from ..logger import logger
@@ -24,10 +24,11 @@ from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
-from ..sampling_params import SamplingParams
+from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
-from .postproc_worker import PostprocParams, PostprocWorker
+from .postproc_worker import (PostprocParams, PostprocWorker,
+                              PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs)
@@ -54,115 +55,152 @@ class WorkerBase(GenerationExecutor):
         self,
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
+        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
-        super().__init__(is_llm_executor=is_llm_executor)
+        postproc_config = postproc_worker_config or PostprocWorkerConfig()
+        super().__init__(
+            num_postprocess_workers=postproc_config.num_postprocess_workers,
+            postprocess_tokenizer_dir=postproc_config.postprocess_tokenizer_dir,
+            is_llm_executor=is_llm_executor,
+        )
 
-        # Persist constructor arguments for deferred setup
-        self._engine_input = engine
+        # inputs
+        self._engine = engine
+        self._executor_config = executor_config
+        self._batched_logits_processor = batched_logits_processor
+        self._hf_model_dir = hf_model_dir
+        self._tokenizer = tokenizer
+        self._kv_connector_config = kv_connector_config
         self._lora_config = lora_config
-        self._garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+        self.llm_args = llm_args
 
-        self.engine = None
+        self.result_queue: Optional[IpcQueue] = None
+        self.postproc_queues: Optional[List[IpcQueue]] = None
         self.rank = mpi_rank()
         self.global_rank = global_mpi_rank()
         # mapping: client_id -> GenerationResult
         self._results: Dict[int, GenerationResult] = {}
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
-        self._executor_config = executor_config
-        self._is_pytorch_backend = getattr(self._executor_config, "backend",
-                                           None) == "pytorch"
+        self._await_response_helper = AwaitResponseHelper(
+            self)  # TODO: make it weakref
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
+            "pytorch", "_autodeploy"
+        ]
 
-        if global_mpi_size() > 1:
-            logger.set_rank(self.global_rank)
-
-        if isinstance(engine, list):
-            self.engine = engine[self.rank]
-
-        self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
-
-        self.postproc_queues = None
-        self.result_queue = None
-
-        self._lora_manager: Optional[LoraManager] = None
-        self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
-        self._runtime_model_config: Optional[ModelConfig] = None
+        if not self._is_pytorch_backend and kv_connector_config is not None:
+            raise ValueError(
+                "KV connector config is only supported for PyTorch backend")
 
     def setup_engine(self) -> None:
         logger_debug(f"WorkerBase {self.rank} is setting up the engine",
                      color="yellow")
-
         # Force all the ranks to wait here, and start creating the executor simultaneously.
         mpi_comm().barrier()
 
-        device_id = self.global_rank % torch.cuda.device_count()
-        torch.cuda.set_device(device_id)
+        if global_mpi_size() > 1:
+            logger.set_rank(self.global_rank)
 
-        # Make sure C++ executor would use same devices/ranks as py_executor
-        global_rank = global_mpi_rank()
-        comm_ranks = mpi_comm().allgather(global_rank)
-        device_ids = mpi_comm().allgather(device_id)
-
+        engine = self._engine
+        self.llm_args
+        batched_logits_processor = self._batched_logits_processor
+        hf_model_dir = self._hf_model_dir
+        tokenizer = self._tokenizer
+        lora_config = self._lora_config
+        kv_connector_config = self._kv_connector_config
         executor_config = self._executor_config
-        if executor_config is None:
-            executor_config = tllm.ExecutorConfig(1)
-            self._executor_config = executor_config
+        assert hf_model_dir is not None
 
-        executor_config.parallel_config = tllm.ParallelConfig(
-            participant_ids=comm_ranks, device_ids=device_ids)
-
-        engine = self._engine_input
         if isinstance(engine, list):
             engine = engine[self.rank]
 
-        if isinstance(engine, Engine):
-            self.engine = tllm.Executor(engine.engine,
-                                        json.dumps(engine.config.to_dict(),
-                                                   cls=ConfigEncoder),
-                                        tllm.ModelType.DECODER_ONLY,
-                                        executor_config=executor_config,
-                                        managed_weights=engine.managed_weights)
-        elif not hasattr(executor_config, "backend"):
-            self.engine = tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                        executor_config)
-        else:
-            args = {
-                "executor_config": executor_config,
-                "checkpoint_dir": executor_config.hf_model_dir,
-            }
-            if executor_config.backend == "pytorch":
+        def _get_comm_ranks_device_id():
+            device_id = self.global_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_id)
+            # Make sure C++ executor would use same devices/ranks as py_executor
+            global_rank = global_mpi_rank()
+            comm_ranks = mpi_comm().allgather(global_rank)
+            device_ids = mpi_comm().allgather(device_id)
+            return comm_ranks, device_ids
+
+        def _create_py_executor():
+            args = {}
+            assert hasattr(
+                self.llm_args, "backend"
+            ), "llm_args should be with backend in _create_py_executor"
+            _ = _get_comm_ranks_device_id()
+            if self.llm_args.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
-                args["lora_config"] = self._lora_config
-                args[
-                    "garbage_collection_gen0_threshold"] = self._garbage_collection_gen0_threshold
-            elif executor_config.backend == "_autodeploy":
+                args["llm_args"] = self.llm_args
+                args["checkpoint_dir"] = hf_model_dir
+                args["tokenizer"] = tokenizer
+                args["lora_config"] = lora_config
+                args["kv_connector_config"] = kv_connector_config
+            elif self.llm_args.backend == "_autodeploy":
+                from tensorrt_llm._torch.auto_deploy.llm_args import \
+                    LlmArgs as ADLlmArgs
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
+                assert isinstance(self.llm_args, ADLlmArgs)
+                args["ad_config"] = self.llm_args.get_pytorch_backend_config()
             else:
                 raise ValueError(
-                    f"Unsupported backend config: {executor_config.backend}")
+                    f"Unsupported backend config: {self.llm_args.backend}")
 
-            logger_debug(f"WorkerBase {self.rank} creating py_executor",
-                         color="yellow")
-            self.engine = create_executor(**args)
-            logger_debug(f"WorkerBase {self.rank} created py_executor",
-                         color="yellow")
-        logger_debug(f"WorkerBase {self.rank} setup engine done",
-                     color="yellow")
+            # Define additional attributes that can be used later, such as in _deduce_max_tokens
+            self.mapping = self.llm_args.parallel_config.to_mapping()
+            self.checkpoint_loader = None
+            if self.llm_args.backend == "pytorch":
+                from tensorrt_llm._torch.pyexecutor.config import \
+                    _construct_checkpoint_loader
+                self.checkpoint_loader = _construct_checkpoint_loader(
+                    self.llm_args.backend, self.llm_args.checkpoint_loader,
+                    self.llm_args.checkpoint_format)
 
-        self._setup_lora(engine, executor_config, self._lora_config)
+            _executor = create_executor(**args)
+            self.max_seq_len = self.llm_args.max_seq_len
+            if _executor.max_seq_len is not None:
+                # max_seq_len might be updated by model engine as in create_py_executor
+                self.max_seq_len = _executor.max_seq_len
+            return _executor
 
-    def _setup_lora(self, engine: Union[Path, Engine],
-                    executor_config: tllm.ExecutorConfig,
-                    lora_config: Optional[LoraConfig]) -> None:
-        """Setup LoRA and prompt adapter managers."""
-        # LoRA setup
+        def _create_engine(executor_config):
+            if executor_config is None:
+                executor_config = tllm.ExecutorConfig(1)
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_batched=batched_logits_processor, replicate=False)
+            comm_ranks, device_ids = _get_comm_ranks_device_id()
+            executor_config.parallel_config = tllm.ParallelConfig(
+                participant_ids=comm_ranks, device_ids=device_ids)
+
+            if isinstance(engine, Engine):
+                return tllm.Executor(engine.engine,
+                                     json.dumps(engine.config.to_dict(),
+                                                cls=ConfigEncoder),
+                                     tllm.ModelType.DECODER_ONLY,
+                                     executor_config=executor_config,
+                                     managed_weights=engine.managed_weights)
+
+            assert not hasattr(executor_config, "backend")
+            return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
+                                 executor_config)
+
+        self.engine = _create_py_executor(
+        ) if self.llm_args is not None else _create_engine(executor_config)
+
+        self._lora_manager: Optional[LoraManager] = None
+        self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
+        self._runtime_model_config: Optional[ModelConfig] = None
         if self.rank == 0 and isinstance(self.engine, tllm.Executor):
             if isinstance(engine, Engine):
                 engine_config = engine.config
@@ -181,8 +219,9 @@ class WorkerBase(GenerationExecutor):
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
-        if getattr(executor_config, "backend",
-                   "") == "pytorch" and lora_config is not None:
+        if self.llm_args and getattr(
+                self.llm_args, "backend",
+                "") == "pytorch" and lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
@@ -284,44 +323,79 @@ class WorkerBase(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        is_overlap_enabled = self._is_pytorch_backend and not self._executor_config.pytorch_backend_config.disable_overlap_scheduler
-        if is_overlap_enabled:
-            is_disaggregated = self.engine.kv_cache_transceiver is not None
-            if is_disaggregated and (
-                    request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
-                raise ValueError(
-                    "Context only requests are not supported in pytorch backend when overlap is enabled."
-                )
+        if self._is_pytorch_backend:
+            if not self.llm_args.disable_overlap_scheduler:
+                is_disaggregated = self.engine.kv_cache_transceiver is not None
+                if is_disaggregated and (
+                        request_type
+                        == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
+                    raise ValueError(
+                        "Context only requests are not supported in pytorch backend when overlap is enabled."
+                    )
 
         assert request.id is not None
 
         def _deduce_max_tokens(request: GenerationRequest,
-                               executor_config: tllm.ExecutorConfig) -> int:
-            if request.sampling_params.max_tokens:
-                return request.sampling_params.max_tokens
+                               executor_config: tllm.ExecutorConfig,
+                               llm_args: Optional[BaseLlmArgs] = None) -> int:
             # deduce max_tokens when it's not set by user
+            max_tokens = request.sampling_params.max_tokens
             query_token_len = len(
                 request.query_token_ids) if request.query_token_ids else 0
-            cp_size = 1 if (not hasattr(executor_config, "mapping")
-                            or executor_config.mapping.cp_size
-                            is None) else executor_config.mapping.cp_size
-            if not hasattr(executor_config, "max_seq_len"):
-                raise RuntimeError(
-                    "max_tokens for sampling is not set and cannot be deduced")
+
+            cp_size = 1
+            max_seq_len = None
+            if llm_args is not None:
+                # deduce max_tokens by llm args
+                assert executor_config is None, "An empty executor_config in _deduce_max_tokens is expected when LLM arguments are defined."
+                if hasattr(self,
+                           "mapping") and self.mapping.cp_size is not None:
+                    cp_size = self.mapping.cp_size
+                max_seq_len = getattr(self, "max_seq_len", None)
+            else:
+                # deduce max_tokens by executor config
+                if hasattr(executor_config, "mapping"
+                           ) and executor_config.mapping.cp_size is not None:
+                    cp_size = executor_config.mapping.cp_size
+                max_seq_len = getattr(executor_config, "max_seq_len", None)
+            if max_seq_len is None:
+                logger.warning("`default_max_tokens` cannot be deduced")
+                if max_tokens is None:
+                    raise ValueError(
+                        "`max_tokens` must be set when `default_max_tokens` cannot be deduced"
+                    )
+                else:
+                    # use max_tokens if can't deduce default_max_tokens
+                    return max_tokens
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
-            default_max_tokens = executor_config.max_seq_len - splited_prompt_len - query_token_len
-            if default_max_tokens < 0:
-                raise ValueError(
-                    f"Deduced max_tokens {default_max_tokens} is less than 0, because"
-                    f"prompt length {splited_prompt_len} plus query length {query_token_len} "
-                    f"is larger than max_seq_len {executor_config.max_seq_len}")
-            return default_max_tokens
+            default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
+            if default_max_tokens <= 0:
+                logger.warning(
+                    f"`default_max_tokens` ({default_max_tokens}) should be greater than 0, "
+                    f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
+                    f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
+                )
+                if max_tokens is None:
+                    raise ValueError(
+                        "`max_tokens` must be set when `default_max_tokens` is illegal"
+                    )
+            # default_max_tokens is the biggest available value
+            if max_tokens is None:
+                return default_max_tokens
+            elif max_tokens > default_max_tokens:
+                logger.warning(
+                    f"User-specified `max_tokens` ({max_tokens}) is greater than deduced "
+                    f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
+                )
+                return default_max_tokens
+            return max_tokens
 
         try:
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
-                max_tokens=_deduce_max_tokens(request, self._executor_config),
+                max_tokens=_deduce_max_tokens(request, self._executor_config,
+                                              self.llm_args),
                 streaming=request.streaming,
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
@@ -353,7 +427,8 @@ class WorkerBase(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
-                type=request_type)
+                type=request_type,
+                cache_salt_id=request.cache_salt_id)
             executor_request.py_lora_path = py_lora_path
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
@@ -372,6 +447,9 @@ class WorkerBase(GenerationExecutor):
             executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
+
+            if request.arrival_time is not None:
+                executor_request.py_arrival_time = request.arrival_time
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow

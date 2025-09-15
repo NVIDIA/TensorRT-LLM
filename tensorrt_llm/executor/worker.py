@@ -15,7 +15,9 @@ from tensorrt_llm.logger import logger
 from .._utils import KVCacheEventSerializer, mpi_comm, mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
 from ..llmapi.mpi_session import set_mpi_session_cpp
+from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
@@ -50,7 +52,10 @@ class GenerationExecutorWorker(BaseWorker):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
         super().__init__(
             engine=engine,
@@ -81,6 +86,8 @@ class GenerationExecutorWorker(BaseWorker):
             self.dispatch_kv_cache_events_task,
             error_queue=self._error_queue,
             name="dispatch_kv_cache_events_thread")
+
+        self.setup_engine()
 
     def _create_iteration_result_queue(self,
                                        it_result_queue: IterationResultQueue):
@@ -248,7 +255,10 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
-    garbage_collection_gen0_threshold: Optional[int] = None,
+    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+    hf_model_dir: Optional[Path] = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    llm_args: Optional[BaseLlmArgs] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -376,7 +386,10 @@ def worker_main(
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+            kv_connector_config=kv_connector_config,
+            hf_model_dir=hf_model_dir,
+            tokenizer=tokenizer,
+            llm_args=llm_args)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
