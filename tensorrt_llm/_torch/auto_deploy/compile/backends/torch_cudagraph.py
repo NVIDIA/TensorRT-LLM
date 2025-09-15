@@ -25,8 +25,8 @@ class CapturedGraph(nn.Module):
         self._in_spec = in_spec
         self._out_spec = out_spec
         self.model = model
-        self.cuda_graph_batch_sizes_max = max(cuda_graph_batch_sizes)
-        ad_logger.info(f"Setting {self.cuda_graph_batch_sizes_max=}")
+        self.cuda_graph_max_batch_size = max(cuda_graph_batch_sizes)
+        ad_logger.info(f"Setting {self.cuda_graph_max_batch_size=}")
         self.num_batched_inputs = num_batched_inputs if num_batched_inputs is not None else 1
         self.graphs: Dict[Tuple[int, ...], CUDAGraph] = {}
         self._input_buffers: List[torch.Tensor] = [
@@ -88,21 +88,20 @@ class CapturedGraph(nn.Module):
         # sanity checks on the batched inputs
         msg_bs = (
             f"Input batch size exceeds maximum CUDA graph batch size. "
-            f"Max CUDA graph batch size: {self.cuda_graph_batch_sizes_max}, "
+            f"CUDA graph max batch size: {self.cuda_graph_max_batch_size}, "
             f"but got input batch sizes: {[input.shape[0] for input in args_batched]}. "
-            f"Did you intentionally set the maximal value of cuda_graph_batch_sizes lower"
-            f"than the max_batch_size? It will fall back to non-CUDA graph forward pass for"
+            f"Did you intentionally set the maximal value of cuda_graph_batch_sizes lower "
+            f"than the max_batch_size? It will fall back to non-CUDA graph forward pass for "
             f"batch sizes exceeding the max_batch_size."
         )
         msg_ndim = "Expecting at least a 2D for batched input tensors."
-        assert all(self.cuda_graph_batch_sizes_max >= input.shape[0] for input in args_batched), (
-            msg_bs
-        )
+        if any(self.cuda_graph_max_batch_size < input.shape[0] for input in args_batched):
+            ad_logger.info(msg_bs)
         assert all(input.ndim > 1 for input in args_batched), msg_ndim
 
         # repeat the batched input tensors to the max batch size
         self._input_buffers = [
-            input[:1].repeat_interleave(self.cuda_graph_batch_sizes_max, dim=0)
+            input[:1].repeat_interleave(self.cuda_graph_max_batch_size, dim=0)
             for input in args_batched
         ]
 
@@ -111,7 +110,7 @@ class CapturedGraph(nn.Module):
 
         # capture output once with max batch size to capture output buffers
         with CudaGraphWarmUpPhase():
-            ad_logger.info(f"Warm up with {self.cuda_graph_batch_sizes_max=} before graph capture")
+            ad_logger.info(f"Warm up with {self.cuda_graph_max_batch_size=} before graph capture")
             out = self.model(*args, **kwargs)
         self._out_buffer_flat, out_spec = tree_flatten(out)
         assert out_spec == self._out_spec, "Output spec mismatch."

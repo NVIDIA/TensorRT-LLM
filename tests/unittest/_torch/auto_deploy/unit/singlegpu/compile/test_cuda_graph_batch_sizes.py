@@ -138,7 +138,7 @@ class TestCudaGraphBatchSizes:
             cuda_graph_batch_sizes=cuda_graph_batch_sizes,
         )
 
-        assert captured_graph.cuda_graph_batch_sizes_max == max(cuda_graph_batch_sizes)
+        assert captured_graph.cuda_graph_max_batch_size == max(cuda_graph_batch_sizes)
         assert captured_graph.cuda_graph_batch_sizes == sorted(cuda_graph_batch_sizes, reverse=True)
 
     def test_forward_fallback_for_oversized_batch(self, simple_model_and_inputs):
@@ -155,7 +155,7 @@ class TestCudaGraphBatchSizes:
         )
 
         # Capture with small input
-        small_input = data["input_tensor"][:4]  # batch size 4
+        small_input = data["input_tensor"]  # batch size 16
         captured_graph.capture_graph(small_input)
 
         # Test forward with oversized input (should fall back)
