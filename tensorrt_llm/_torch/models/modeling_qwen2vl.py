@@ -41,7 +41,7 @@ from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
-PAD_INDEX = -100  # https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
+PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
 
 def process_weights(weights: Dict,

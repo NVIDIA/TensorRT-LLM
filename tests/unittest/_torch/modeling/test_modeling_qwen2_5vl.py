@@ -187,7 +187,7 @@ class TestQwen2_5_VL(unittest.TestCase):
                 "multimodal_data",
                 device,
                 pin_memory=True,
-                filter_keywords=getattr(model, "multimodal_data_device_paths",
+                target_keywords=getattr(model, "multimodal_data_device_paths",
                                         None))
             multimodal_params_list.append(multimodal_params)
         input_ids = torch.tensor(input_ids, dtype=torch.int32, device=device)
@@ -474,7 +474,7 @@ class TestQwen2_5_VL(unittest.TestCase):
                 "multimodal_data",
                 device,
                 pin_memory=True,
-                filter_keywords=["mrope_config.mrope_position_deltas"])
+                target_keywords=["mrope_config.mrope_position_deltas"])
             gen_multimodal_params_list.append(multimodal_param)
 
         graph_runner = None
