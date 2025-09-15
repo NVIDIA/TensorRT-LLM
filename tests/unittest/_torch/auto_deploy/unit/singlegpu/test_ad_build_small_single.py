@@ -95,7 +95,6 @@ def test_build_ad(experiment_config: Dict):
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
     experiment_config = ExperimentConfig(**experiment_config)
-    print(f"Experiment Config: {experiment_config}")
     original_init = InferenceOptimizer.__init__
 
     def check_and_original_init(self, factory, ad_config):

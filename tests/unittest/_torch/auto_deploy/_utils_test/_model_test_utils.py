@@ -432,7 +432,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "Qwen/Qwen2.5-3B-Instruct": {
-        "llm_models_subdir": "Qwen/Qwen2.5-3B-Instruct",
+        "llm_models_subdir": "Qwen2.5-3B-Instruct",
         "model_kwargs": {
             "num_hidden_layers": 2,
         },
