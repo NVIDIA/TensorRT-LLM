@@ -32,8 +32,8 @@ from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
                      prune_checkpoint, quantize_data, refit_model,
                      venv_check_call)
 from .conftest import (llm_models_root, skip_no_sm120, skip_nvlink_inactive,
-                       skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper,
-                       tests_path, unittest_path)
+                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
+                       skip_pre_hopper, tests_path, unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -1549,6 +1549,20 @@ def test_trtllm_serve_lora_example(llm_root, llm_venv):
 
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
+def test_trtllm_serve_top_logprobs(llm_root, llm_venv, backend: str):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_top_logprobs.py"), "-k", backend
+    ])
+
+
+@pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_misc_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -2155,6 +2169,40 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         _check_mem_usage(running_log, [85.6, 0, 0, 0], 8)
 
 
+@skip_pre_ada
+@skip_post_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param('DeepSeek-R1-W4AFP8',
+                 'DeepSeek-R1/DeepSeek-R1-W4AFP8',
+                 marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--moe_tp_size=1",
+            "--moe_ep_size=8",
+            "--tp_size=8",
+            "--use_cuda_graph",
+            f"--kv_cache_fraction={_MEM_FRACTION_50}",
+            "--max_batch_size=1",
+            "--max_seq_len=512",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [50.0, 0, 0, 0], 8)
+
+
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2299,8 +2347,8 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                  marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param("gemma-3-27b-it",
                  "gemma/gemma-3-27b-it",
-                 marks=(skip_post_blackwell,
-                        pytest.mark.skip_less_device_memory(80000))),
+                 marks=(pytest.mark.skip_less_device_memory(80000),
+                        skip_post_blackwell)),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
@@ -2695,10 +2743,10 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
-    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
-    ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
     pytest.param(
         "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
+    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
+    ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
 ])
 def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
                                         model_path):

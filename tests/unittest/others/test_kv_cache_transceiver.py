@@ -4,6 +4,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
     create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -74,12 +75,14 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
     cache_transceiver_config = trtllm.CacheTransceiverConfig(
         backend=trtllm.CacheTransceiverBackendType.DEFAULT,
         max_tokens_in_buffer=512)
-
+    dist = MPIDist(mapping=mapping)
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
-        mapping, kv_cache_manager_ctx, attention_type, cache_transceiver_config)
+        mapping, dist, kv_cache_manager_ctx, attention_type,
+        cache_transceiver_config)
 
     kv_cache_transceiver_gen = create_kv_cache_transceiver(
-        mapping, kv_cache_manager_gen, attention_type, cache_transceiver_config)
+        mapping, dist, kv_cache_manager_gen, attention_type,
+        cache_transceiver_config)
 
     fill_kv_cache_buffer(kv_cache_manager_ctx)
 
