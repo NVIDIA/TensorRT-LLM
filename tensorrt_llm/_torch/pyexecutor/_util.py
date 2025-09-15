@@ -48,23 +48,16 @@ GB = 1 << 30
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
-    def __init__(
-        self,
-        *,
-        model_engine: PyTorchModelEngine,
-        draft_model_engine: Optional[PyTorchModelEngine],
-        mapping: Mapping,
-        net_max_seq_len: int,
-        kv_connector_manager: Optional[KvCacheConnectorManager],
-        max_num_tokens: int,
-        max_beam_width: int,
-        tokens_per_block: int,
-        max_seq_len: int,
-        max_batch_size: int,
-        kv_cache_config: trtllm.KvCacheConfig,
-        pytorch_backend_config: PyTorchConfig,
-        speculative_config: SpeculativeConfig,
-    ):
+    def __init__(self, *, model_engine: PyTorchModelEngine,
+                 draft_model_engine: Optional[PyTorchModelEngine],
+                 mapping: Mapping, net_max_seq_len: int,
+                 kv_connector_manager: Optional[KvCacheConnectorManager],
+                 max_num_tokens: int, max_beam_width: int,
+                 tokens_per_block: int, max_seq_len: int, max_batch_size: int,
+                 kv_cache_config: trtllm.KvCacheConfig,
+                 pytorch_backend_config: PyTorchConfig,
+                 speculative_config: SpeculativeConfig,
+                 profiling_stage_data: Optional[dict]):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
         self._mapping = mapping
@@ -170,7 +163,7 @@ class KvCacheCreator:
             "ViT's encoder")
             return requests
         text_prompt = input_processor.get_prompt_for_profiling()
-        max_beam_width = self._executor_config.max_beam_width
+        max_beam_width = self._max_beam_width
         input_processor_with_hash = create_input_processor_with_hash(
             input_processor)
         prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
@@ -180,8 +173,6 @@ class KvCacheCreator:
 
         max_num_tokens = len(prompt_token_ids)
         remaining_tokens = max(max_num_tokens, input_seq_len)
-        # add +1 to max_num_tokens to avoid assert in line 772 of tensorrt_llm/_torch/attention_backend/trtllm.py
-        self._executor_config.max_seq_len = remaining_tokens + 1
         if remaining_tokens > input_seq_len:
             logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len." \
                            f"Multimedia prompt has {remaining_tokens} while the input_seq_len is: {input_seq_len}")
@@ -417,6 +408,9 @@ class KvCacheCreator:
         )
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        if isinstance(self._profiling_stage_data, dict):
+            self._profiling_stage_data[
+                "max_gpu_total_bytes"] = kv_cache_max_memory
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(
