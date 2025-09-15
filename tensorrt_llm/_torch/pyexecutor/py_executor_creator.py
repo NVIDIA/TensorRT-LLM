@@ -207,6 +207,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     lora_config: Optional[LoraConfig] = None,
     kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+    profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
