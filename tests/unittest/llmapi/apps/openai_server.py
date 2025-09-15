@@ -129,8 +129,8 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.host = "localhost"
-        self.port = port if port is not None else find_free_port()
-        self.rank = 0  # rank is always 0 since there is only one disagg server
+        self.port = find_free_port() if port is None or port < 0 else port
+        self.rank = 0
         with tempfile.NamedTemporaryFile(mode="w+",
                                          delete=False,
                                          delete_on_close=False) as f:

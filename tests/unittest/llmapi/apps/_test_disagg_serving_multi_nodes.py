@@ -57,12 +57,17 @@ def find_nic():
     print(f"test_ip: {test_ip} for the other host {get_the_other_host()}")
     try:
         # iproute2 may not be installed
-        proc = subprocess.run(f"ip route get {test_ip}",
+        proc = subprocess.run(["ip", "route", "get", test_ip],
                               capture_output=True,
                               text=True,
                               shell=True,
                               check=True)
-        nic_name = proc.stdout.split()[4]
+        output_parts = proc.stdout.split()
+        if "dev" in output_parts:
+            dev_idx = output_parts.index("dev")
+            nic_name = output_parts[dev_idx + 1]
+        else:
+            raise ValueError("Could not find 'dev' in ip route output")
         print(f"get NIC name from ip route, result: {nic_name}")
         return nic_name
     except Exception as e:
