@@ -1,6 +1,8 @@
 ### :section Customization
 ### :title Generate text with multiple LoRA adapters
 ### :order 5
+from typing import Optional
+
 import click
 from huggingface_hub import snapshot_download
 
@@ -22,8 +24,8 @@ from tensorrt_llm.lora_helper import LoraConfig
               type=str,
               default=None,
               help="Path to the tarot LoRA directory")
-def main(chatbot_lora_dir: str | None, mental_health_lora_dir: str | None,
-         tarot_lora_dir: str | None):
+def main(chatbot_lora_dir: Optional[str], mental_health_lora_dir: Optional[str],
+         tarot_lora_dir: Optional[str]):
 
     # Download the LoRA adapters from huggingface hub.
     if chatbot_lora_dir is None:
