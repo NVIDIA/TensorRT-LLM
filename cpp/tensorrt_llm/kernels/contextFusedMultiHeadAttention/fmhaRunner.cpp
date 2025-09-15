@@ -486,13 +486,13 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     }
     else
     {
-        bool isHopperBF16ContextMLA = (mFixedParams.headSize == mFixedParams.headSizeV + 64) && isSm90
-            && mFixedParams.dataType == DATA_TYPE_BF16 && mFixedParams.headSizeV == 128;
+        bool isHopperContextMLA = (mFixedParams.headSize == mFixedParams.headSizeV + 64) && isSm90
+            && (mFixedParams.dataType == DATA_TYPE_BF16 || mFixedParams.dataType == DATA_TYPE_E4M3)
+            && mFixedParams.headSizeV == 128;
         mLaunchParams.supportReturnSoftmaxStats = (runnerParams.softmaxStatsPtr != nullptr
             && mLaunchParams.flash_attention && mLaunchParams.warp_specialization
-            && ((!isHopperBF16ContextMLA
-                    && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
-                || (isHopperBF16ContextMLA
+            && ((!isHopperContextMLA && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
+                || (isHopperContextMLA
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 }
