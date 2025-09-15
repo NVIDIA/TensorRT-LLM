@@ -856,3 +856,22 @@ def test_llm_with_proxy_error():
                 match="Mock GenerationExecutorWorker initialization failed"):
             llm = LLM(model=llama_model_path,
                       kv_cache_config=global_kvcache_config)
+
+
+@pytest.mark.part0
+@pytest.mark.xfail(reason="https://nvbugs/5513423")
+def test_min_tokens():
+    """Check min_tokens is respected."""
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              enable_mixed_sampler=True,
+              max_seq_len=20000)
+
+    output_len = 5000
+    sampling_params = SamplingParams(max_tokens=output_len,
+                                     min_tokens=output_len,
+                                     temperature=1)
+    res = llm.generate("The end.", sampling_params=sampling_params)
+
+    assert len(res.outputs) == 1
+    assert len(res.outputs[0].token_ids) == output_len
