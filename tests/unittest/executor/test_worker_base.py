@@ -29,10 +29,11 @@ class TestWorkerBase:
     class FakeWorker(WorkerBase):
 
         def __init__(self, engine: str):
-            super().__init__(engine=engine)
-            executor_config = create_fake_executor_config(engine)
+            super().__init__(engine=engine, hf_model_dir=engine)
+            llm_args, executor_config = create_fake_executor_config(engine)
             # Pass config in constructor and finalize with parameterless setup
             self._executor_config = executor_config
+            self.llm_args = llm_args
             self.setup_engine()
 
     def test_create_engine(self):
@@ -99,7 +100,6 @@ def create_fake_executor_config(model_path, tp_size=1):
 
     update_executor_config(
         executor_config,
-        backend="pytorch",
         pytorch_backend_config=llm_args.get_pytorch_backend_config(),
         mapping=llm_args.parallel_config.to_mapping(),
         speculative_config=llm_args.speculative_config,
@@ -110,14 +110,14 @@ def create_fake_executor_config(model_path, tp_size=1):
         checkpoint_loader=llm_args.checkpoint_loader,
     )
 
-    return executor_config
+    return llm_args, executor_config
 
 
 class TestRpcWorkerBaseTP2:
 
     def setup_method(self):
-        self.executor_config = create_fake_executor_config(model_path,
-                                                           tp_size=2)
+        self.llm_args, self.executor_config = create_fake_executor_config(
+            model_path, tp_size=2)
         self.session = self.create_worker_session()
         # No need to sleep here - the session is ready immediately
 
@@ -126,9 +126,11 @@ class TestRpcWorkerBaseTP2:
         return session
 
     def test_create_executor(self):
-        futures = self.session.submit(TestRpcWorkerBaseTP2.create_executor,
-                                      engine=model_path,
-                                      executor_config=self.executor_config)
+        futures = self.session.submit(
+            TestRpcWorkerBaseTP2.create_executor,
+            engine=model_path,
+            llm_args=self.llm_args,
+        )
         # Wait for completion
         for future in futures:
             future.result()
@@ -136,7 +138,7 @@ class TestRpcWorkerBaseTP2:
         self.session.shutdown()
 
     @staticmethod
-    def create_executor(engine, executor_config):
+    def create_executor(engine, llm_args):
         # Set MPI session for C++ backend
         set_mpi_session_cpp(mpi_comm())
 
@@ -156,7 +158,8 @@ class TestRpcWorkerBaseTP2:
         try:
             print(f"[Test] Rank {rank} creating WorkerBase...")
             executor = WorkerBase(engine=engine,
-                                  executor_config=executor_config)
+                                  llm_args=llm_args,
+                                  hf_model_dir=engine)
 
             # For PyTorch backend, all ranks need to participate in setup
             print(f"[Test] Rank {rank} calling setup_engine...")

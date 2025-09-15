@@ -23,14 +23,15 @@ class TestRpcProxy:
 
     def create_proxy(self, tp_size: int):
         # Create executor config with the correct tp_size
-        executor_config = create_fake_executor_config(model_path,
-                                                      tp_size=tp_size)
+        llm_args, executor_config = create_fake_executor_config(model_path,
+                                                                tp_size=tp_size)
 
         mpi_session = MpiPoolSession(n_workers=tp_size)
         proxy = GenerationExecutorRpcProxy(
             worker_kwargs={
                 "engine": model_path,
-                "executor_config": executor_config,
+                "executor_config": None,
+                "llm_args": llm_args,
                 "model_world_size": tp_size,
             },
             model_world_size=tp_size,

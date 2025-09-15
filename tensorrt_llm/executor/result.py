@@ -14,7 +14,7 @@ from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import AsyncQueue
+from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
@@ -300,6 +300,7 @@ class GenerationResultBase:
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
             self.record_stats(output, req_perf_metrics_dict)
 
+    @print_traceback_on_error
     @nvtx_range_debug("handle_response",
                       color="red",
                       category="GenerationResultBase")
