@@ -1179,6 +1179,10 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         sf_k = pad_up(real_k // sf_vec_size, 4)
         sf_n = pad_up(n, 128)
 
+        # the scaling tensor is 1D. we need to make sure it has been padded to the correct shape
+        assert a_sf_tensor.shape == (sf_m * sf_k)
+        assert b_sf_tensor.shape == (sf_n * sf_k)
+
         a_ptr = self.make_cute_dsl_global_pointer(a_tensor,
                                                   cutlass.Float4E2M1FN, 32)
         b_ptr = self.make_cute_dsl_global_pointer(b_tensor,
@@ -1264,10 +1268,10 @@ def cute_dsl_nvfp4_gemm_blackwell(
         "trtllm::cute_dsl_nvfp4_gemm_blackwell",
         [cute_dsl_nvfp4_gemm_blackwell_runner],
         CuteDSLNVFP4BlackwellLinear.tuning_config,
-        [input, weight, input_scale, weight_scale, alpha, output_dtype],
+        [input, weight, input_scale, weight_scale],
     )
     return cute_dsl_nvfp4_gemm_blackwell_runner(
-        inputs=[input, weight, input_scale, weight_scale, alpha, output_dtype],
+        inputs=[input, weight, input_scale, weight_scale],
         tactic=best_tactic,
     )
 
