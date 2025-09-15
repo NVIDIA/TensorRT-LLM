@@ -297,6 +297,6 @@ def expand_slurm_nodelist(nodelist_str):
                         expanded_nodes.append(node_name)
         else:
             # No brackets, just add the node as-is
-            expanded_nodes.append(nodelist_str)
+            expanded_nodes.append(group)
 
     return expanded_nodes
