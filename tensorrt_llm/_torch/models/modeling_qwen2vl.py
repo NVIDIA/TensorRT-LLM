@@ -392,6 +392,11 @@ class Qwen2VisionModelBase(nn.Module):
             raise NotImplementedError(
                 f"Model class {model_class} not implemented")
 
+        self.post_config()
+
+    def post_config(self):
+        self.config = self.model_config.pretrained_config.vision_config
+
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
