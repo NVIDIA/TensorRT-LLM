@@ -9,7 +9,7 @@ import pytest
 from test_worker_base import create_fake_executor_config
 
 from tensorrt_llm.executor.request import GenerationRequest
-from tensorrt_llm.executor.rpc import RPCClient, RPCParams
+from tensorrt_llm.executor.rpc import RPCClient
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.executor.rpc_worker import RpcWorker
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
@@ -29,11 +29,11 @@ class TestRpcWorkerTP1:
         self.executor_config = create_fake_executor_config(model_path)
         self.pool, self.addr = self.create_worker_pool()
         self.client = self.create_rpc_client(self.addr)
-        self.client.setup_engine()
+        self.client.setup_engine().remote()
         time.sleep(10)
 
     def teardown_method(self):
-        self.client.shutdown()
+        self.client.shutdown().remote()
         self.pool.shutdown()
         self.client.close()
 
@@ -56,23 +56,24 @@ class TestRpcWorkerTP1:
         pass
 
     def test_fetch_responses_sync(self):
-        self.client.submit(GenerationRequest(
-            prompt_token_ids=[3, 4, 5],
-            sampling_params=SamplingParams(max_tokens=5)),
-                           __rpc_params=RPCParams(need_response=False))
-        results = self.client.fetch_responses()
+        self.client.submit(
+            GenerationRequest(prompt_token_ids=[3, 4, 5],
+                              sampling_params=SamplingParams(
+                                  max_tokens=5)), ).remote(need_response=False)
+        results = []
+        while not results:
+            results.extend(self.client.fetch_responses().remote())
         assert len(results) == 1
 
     def test_fetch_responses_streaming_sync(self):
-        self.client.submit(GenerationRequest(
-            prompt_token_ids=[3, 4, 5],
-            sampling_params=SamplingParams(max_tokens=5),
-            streaming=True),
-                           __rpc_params=RPCParams(need_response=False))
+        self.client.submit(
+            GenerationRequest(prompt_token_ids=[3, 4, 5],
+                              sampling_params=SamplingParams(max_tokens=5),
+                              streaming=True), ).remote(need_response=False)
 
         results = []
         for i in range(10):
-            res = self.client.fetch_responses()
+            res = self.client.fetch_responses().remote()
             results.extend(res)
             print(f"fetch_responses {i} result: {results}")
         assert 0 < len(results) <= 5
@@ -81,16 +82,15 @@ class TestRpcWorkerTP1:
 
     @pytest.mark.asyncio
     async def test_fetch_responses_streaming_async(self):
-        self.client.submit(GenerationRequest(
-            prompt_token_ids=[3, 4, 5],
-            sampling_params=SamplingParams(max_tokens=5),
-            streaming=True),
-                           __rpc_params=RPCParams(need_response=False))
+        self.client.submit(
+            GenerationRequest(prompt_token_ids=[3, 4, 5],
+                              sampling_params=SamplingParams(max_tokens=5),
+                              streaming=True), ).remote(need_response=False)
 
         results = []
         # Must fetch all the responses, or the PyExecutor will hang
         for i in range(10):
-            res = await self.client.fetch_responses_async.call_async()
+            res = await self.client.fetch_responses_async().remote_async()
             results.extend(res)
             print(f"fetch_responses_async {i} result: {results}")
         assert 0 < len(results) <= 5
@@ -106,8 +106,7 @@ class TestRpcWorkerTP1:
                     GenerationRequest(
                         prompt_token_ids=[3, 4, 5],
                         sampling_params=SamplingParams(max_tokens=5),
-                        streaming=True),
-                    __rpc_params=RPCParams(need_response=False))
+                        streaming=True), ).remote(need_response=False)
                 assert ret is None
                 print("submit result: ", ret)
 
@@ -117,8 +116,8 @@ class TestRpcWorkerTP1:
 
             print(f"start to fetch_responses_async")
             no = 0
-            async for result in self.client.fetch_responses_loop_async.call_streaming(
-            ):
+            async for result in self.client.fetch_responses_loop_async(
+            ).remote_streaming():
                 print(f"fetch_responses_async {no} result: {result}")
                 results.extend(result)  # result is a list of responses
                 no += 1
@@ -138,8 +137,8 @@ class TestRpcWorkerTP1:
             ret = self.client.submit(
                 GenerationRequest(
                     prompt_token_ids=[3, 4, 5],
-                    sampling_params=SamplingParams(max_tokens=10)),
-                __rpc_params=RPCParams(need_response=False))
+                    sampling_params=SamplingParams(max_tokens=10)), ).remote(
+                        need_response=False)
             assert ret is None  # need_response = False
 
             print(f"submit result: {ret}")
@@ -148,8 +147,8 @@ class TestRpcWorkerTP1:
             # or the shutdown will hang.
             results = []
             time.sleep(8)  # wait for PyExecutor to finish the generation
-            results.extend(
-                self.client.fetch_responses())  # fetch_responses will block
+            results.extend(self.client.fetch_responses().remote()
+                           )  # fetch_responses will block
             print(f"fetch_responses result: {results}")
             assert len(results) == 1  # one request, one response
 
@@ -157,8 +156,7 @@ class TestRpcWorkerTP1:
             ret = self.client.submit(
                 GenerationRequest(prompt_token_ids=[3, 4, 5],
                                   sampling_params=SamplingParams(max_tokens=10),
-                                  streaming=True),
-                __rpc_params=RPCParams(need_response=False))
+                                  streaming=True), ).remote(need_response=False)
             assert ret is None
             print("submit result: ", ret)
 
@@ -169,9 +167,7 @@ class TestRpcWorkerTP1:
 
             while not results:
                 time.sleep(1)
-                results.extend(
-                    self.client.fetch_responses(__rpc_params=RPCParams(
-                        timeout=10)))
+                results.extend(self.client.fetch_responses().remote(timeout=10))
                 print(f"try fetch_responses result: {results}")
             print(f"fetch_responses result: {results}")
             assert results
@@ -188,11 +184,11 @@ class TestRpcWorkerTP2:
                                                            tp_size=2)
         self.session, self.addr, self.futures = self.create_worker_session()
         self.client = self.create_rpc_client(self.addr)
-        self.client.setup_engine()
+        self.client.setup_engine().remote()
         time.sleep(10)
 
     def teardown_method(self):
-        self.client.shutdown()
+        self.client.shutdown().remote()
         self.session.shutdown()
         self.client.close()
 
@@ -215,9 +211,12 @@ class TestRpcWorkerTP2:
         pass
 
     def test_fetch_responses_sync(self):
-        self.client.submit(GenerationRequest(
-            prompt_token_ids=[3, 4, 5],
-            sampling_params=SamplingParams(max_tokens=5)),
-                           __rpc_params=RPCParams(need_response=False))
-        results = self.client.fetch_responses()
+        self.client.submit(
+            GenerationRequest(prompt_token_ids=[3, 4, 5],
+                              sampling_params=SamplingParams(
+                                  max_tokens=5)), )\
+                                    .remote(need_response=False)
+        results = []
+        while not results:
+            results.extend(self.client.fetch_responses().remote())
         assert len(results) == 1
