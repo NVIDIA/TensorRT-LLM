@@ -375,6 +375,7 @@ class Qwen2VisionModelBase(nn.Module):
         super().__init__()
         config = model_config.pretrained_config.vision_config
         config.torch_dtype = model_config.pretrained_config.torch_dtype
+        self.model_config = model_config
         self.model_dtype = config.torch_dtype
 
         if model_class in [
@@ -385,7 +386,8 @@ class Qwen2VisionModelBase(nn.Module):
             config._attn_implementation = 'flash_attention_2'
             self.visual = model_class(config).to(self.model_dtype).eval()
         elif model_class == Qwen2_5_VisionModel:
-            self.visual = model_class(model_config).to(self.model_dtype).eval()
+            self.visual = model_class(self.model_config).to(
+                self.model_dtype).eval()
         else:
             raise NotImplementedError(
                 f"Model class {model_class} not implemented")
