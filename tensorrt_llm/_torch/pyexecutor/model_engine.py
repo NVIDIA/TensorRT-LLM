@@ -1325,11 +1325,13 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
 
             # Multimodal
-            # TODO: enable chunk prefill for multimodal (maybe need to pass prompt_tokens to MultimodalRuntimeData)
             py_multimodal_runtime = MultimodalRuntimeData(
                 mm_token_lengths=request.multimodal_lengths,
                 mm_token_positions=request.multimodal_positions,
-                num_cached_tokens=past_seen_token_num
+                past_seen_token_num=past_seen_token_num,
+                chunk_end_pos=end_compute,
+                special_token_offsets=request.py_multimodal_data.get(
+                    'special_token_offsets', []),
             ) if request.multimodal_hashes is not None else None
 
             multimodal_params = MultimodalParams(
@@ -1348,9 +1350,6 @@ class PyTorchModelEngine(ModelEngine):
 
         if len(multimodal_params_list) > 0:
             # discard the text token indices as it only includes context tokens at this moment
-            print(
-                f"len multimodal_params_list: {len(multimodal_params_list)} from model_engine"
-            )
             _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
         else:
             mm_token_indices = None

@@ -5,6 +5,7 @@ from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
+from ..executor.result import Logprob, TokenLogprobs
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
                                        ReasoningParserFactory)
 from ..llmapi.tokenizer import TransformersTokenizer
@@ -39,6 +40,7 @@ class ChatPostprocArgs(PostprocArgs):
     tool_choice: Optional[Union[Literal["none"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     return_logprobs: bool = False
+    top_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
@@ -56,23 +58,38 @@ class ChatPostprocArgs(PostprocArgs):
             tools=request.tools,
             tool_choice=request.tool_choice,
             stream_options=request.stream_options,
-            return_logprobs=request.logprobs,
+            return_logprobs=bool(request.logprobs),
+            top_logprobs=bool(request.top_logprobs),
         )
 
 
 def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
-                    logprobs: List[float]) -> ChatCompletionLogProbs:
+                    logprobs: List[float] | TokenLogprobs,
+                    top_logprobs: bool) -> ChatCompletionLogProbs:
     assert len(token_ids) == len(logprobs), \
             "token_ids and logprobs have different lengths"
     content: List[ChatCompletionLogProbsContent] = []
     for token_id, logprob in zip(token_ids, logprobs):
+        logprob: float | dict[int, Logprob]
         token = tokenizer.decode(token_id)
-        # returning multiple logprobs is not supported
-        first_logprob = ChatCompletionLogProbsContent(
+        chat_logprob = ChatCompletionLogProbsContent(
             token=token,
-            logprob=max(logprob, -9999.0),
-            bytes=list(token.encode("utf-8", errors="replace")))
-        content.append(first_logprob)
+            bytes=list(token.encode("utf-8", errors="replace")),
+        )
+        if isinstance(logprob, dict):
+            if token_id in logprob:
+                chat_logprob.logprob = max(logprob[token_id].logprob, -9999.0)
+                if top_logprobs:
+                    chat_logprob.top_logprobs = [
+                        ChatCompletionLogProbsContent(
+                            token=(tk := tokenizer.decode(tid)),
+                            logprob=max(logprob.logprob, -9999.0),
+                            bytes=list(tk.encode("utf-8", errors="replace")))
+                        for tid, logprob in logprob.items()
+                    ]
+        else:
+            chat_logprob.logprob = max(logprob, -9999.0)
+        content.append(chat_logprob)
     chat_logprobs = ChatCompletionLogProbs(content=content)
     return chat_logprobs
 
@@ -178,7 +195,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
             choice.logprobs = create_logprobs(token_ids, args.tokenizer,
-                                              logprobs)
+                                              logprobs, args.top_logprobs)
         if output.finish_reason is not None:
             choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
@@ -247,7 +264,8 @@ def chat_response_post_processor(
 
         if args.return_logprobs:
             choice.logprobs = create_logprobs(output.token_ids, args.tokenizer,
-                                              output.logprobs)
+                                              output.logprobs,
+                                              args.top_logprobs)
         choices.append(choice)
 
     if args.echo and args.last_message_content:

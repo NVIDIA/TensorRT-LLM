@@ -14,10 +14,18 @@ def model():
     return "gpt_oss/gpt-oss-20b/"
 
 
+@pytest.fixture(scope="module",
+                params=[0, 2],
+                ids=["disable_processpool", "enable_processpool"])
+def num_postprocess_workers(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model: str):
+def server(model: str, num_postprocess_workers: int):
     model_path = get_model_path(model)
-    with RemoteOpenAIServer(model_path) as remote_server:
+    args = ["--num_postprocess_workers", f"{num_postprocess_workers}"]
+    with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
 
