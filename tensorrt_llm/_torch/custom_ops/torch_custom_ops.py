@@ -1128,8 +1128,7 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             )
         ]
 
-    def make_cute_dsl_global_pointer(self, tensor: torch.Tensor,
-                                     dtype: cutlass.dtype,
+    def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                      assumed_align: int) -> cute.Pointer:
         return make_ptr(
             dtype,
@@ -1180,8 +1179,8 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         sf_n = pad_up(n, 128)
 
         # the scaling tensor is 1D. we need to make sure it has been padded to the correct shape
-        assert a_sf_tensor.shape == (sf_m * sf_k)
-        assert b_sf_tensor.shape == (sf_n * sf_k)
+        assert a_sf_tensor.shape == (sf_m * sf_k, )
+        assert b_sf_tensor.shape == (sf_n * sf_k, )
 
         a_ptr = self.make_cute_dsl_global_pointer(a_tensor,
                                                   cutlass.Float4E2M1FN, 32)
