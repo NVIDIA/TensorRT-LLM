@@ -324,12 +324,9 @@ class SamplingParams:
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
         if self.logprobs is not None:
-            if self._greedy_decoding and self.logprobs > 0:
+            if self._greedy_decoding and self.logprobs > 1:
                 # check for greedy sampling
-                raise ValueError(
-                    "logprobs > 0 must not be specified for greedy sampling, "
-                    "as it provides the same output as logprobs = 0 in this case."
-                )
+                raise ValueError(f"logprobs {self.logprobs} must not exceed 1 for greedy sampling")
             elif self.top_k is not None and self.top_k < self.logprobs:
                 # check for top-k sampling
                 raise ValueError(f"logprobs {self.logprobs} must not exceed top_k {self.top_k}")
