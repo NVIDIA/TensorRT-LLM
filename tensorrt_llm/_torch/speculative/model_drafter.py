@@ -226,6 +226,13 @@ class ModelDrafter(Drafter):
             ScheduledRequests: The prepared draft batch
         """
         try:
+            for req in scheduled_requests.all_requests():
+                if self.use_static_draft_loop:
+                    req.d2t = self.draft_model_engine.model.draft_model.model.d2t.data
+                    req.py_draft_use_greedy_sampling = True
+                else:
+                    req.d2t = self.draft_model_engine.model.model.d2t.data
+
             draft_batch = ScheduledRequests()
 
             for request in scheduled_requests.context_requests:
@@ -537,23 +544,22 @@ class ModelDrafter(Drafter):
             draft_batch: The draft batch that was processed
             req_id_to_old_request: Mapping from draft request ID to original request
         """
-        if isinstance(outputs, torch.Tensor):
-            # For non-overlap scheduler path.
-            outputs_host = outputs.cpu()
-        else:
-            outputs_host = outputs.host.new_tokens
-            outputs.sampler_event.synchronize()
 
-        for token_idx in range(self.max_draft_tokens):
-            for req_idx, req in enumerate(draft_batch.all_requests()):
+        draft_tokens_host = outputs["new_draft_tokens"].cpu()
+        draft_logits = outputs["draft_logits"]
+        for req_idx, req in enumerate(draft_batch.all_requests()):
+            target_model_req = req_id_to_old_request[req.py_request_id]
+            if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                # Chunked prefill request in progress; no need to append draft tokens
+                continue
+            py_draft_logits = []
+            for token_idx in range(self.max_draft_tokens):
                 target_model_req = req_id_to_old_request[req.py_request_id]
-                if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
-                    # Chunked prefill request in progress; no need to append draft tokens
-                    continue
-
-                target_req = req_id_to_old_request[req.py_request_id]
-                target_req.py_draft_tokens.append(
-                    outputs_host[token_idx][req_idx])
+                target_model_req.py_draft_tokens.append(
+                    draft_tokens_host[token_idx][req_idx])
+                py_draft_logits.append(draft_logits[token_idx][req_idx])
+            target_model_req.py_draft_logits = torch.stack(
+                py_draft_logits).unsqueeze(0)
 
         # Clean up draft resources
         for req in draft_batch.all_requests():

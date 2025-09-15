@@ -312,8 +312,11 @@ def greedy_search_sampling_batch(
     next_tokens = torch.argmax(logits, dim=-1)
     if softmax_indices is not None:
         logits = logits[softmax_indices.to(logits.device, non_blocking=True)]
-    softmax = torch.softmax(logits, dim=-1)
-    return next_tokens, softmax
+    probs = torch.zeros_like(logits)
+    probs.scatter_(dim=-1,
+                   index=next_tokens.unsqueeze(-1),
+                   src=torch.ones_like(logits))
+    return next_tokens, probs
 
 
 def get_rejected_indices(draft_probs: torch.Tensor, target_probs: torch.Tensor,
@@ -1134,13 +1137,30 @@ class TorchSampler(Sampler):
         #        filtering of vocab_size logits, out of vocab_size in
         #        total. The 'sample' below should generally be avoided
         #        by retaining the draft_probs during drafting (TRTLLM-7772).
-        sampling_strategy = _request_strategy(request, vocab_size=2**31)
+        draft_sampling_strategy = (
+            "greedy", None
+        ) if request.py_draft_use_greedy_sampling else _request_strategy(request, vocab_size=2**31)
         generator = self.get_generator(request.py_draft_logits.device)
-        _, draft_probs = sample(sampling_strategy,
+        _, draft_probs = sample(draft_sampling_strategy,
                                 request.py_draft_logits,
                                 generator=generator)
         draft_probs = draft_probs.squeeze(0)
         target_probs = request.py_target_probs
+        d2t = getattr(request, "d2t", None)
+        if d2t is not None:
+            vocab_t = draft_probs.shape[-1]
+            vocab_q = target_probs.shape[-1]
+            assert d2t.numel(
+            ) == vocab_t, f"d2t size mismatch: {d2t.numel()} != {vocab_t}"
+            assert d2t.device == draft_probs.device, f"d2t device mismatch: {d2t.device} != {draft_probs.device}"
+            aligned_draft_probs = torch.zeros(
+                (*draft_probs.shape[:-1], vocab_q),
+                device=draft_probs.device,
+                dtype=draft_probs.dtype)
+            source_indices = torch.arange(vocab_t, device=draft_probs.device)
+            target_indices = (source_indices + d2t) % vocab_q
+            aligned_draft_probs[..., target_indices] = draft_probs
+            draft_probs = aligned_draft_probs
         rejected_indices = get_rejected_indices(draft_probs, target_probs,
                                                 generator,
                                                 request.py_draft_tokens)
