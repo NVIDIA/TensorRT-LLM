@@ -50,6 +50,7 @@ extensions = [
     'sphinx.ext.autosummary',
     'sphinx.ext.viewcode',
     'sphinx.ext.napoleon',
+    'sphinx.ext.mathjax',
     'myst_parser',  # for markdown support
     "breathe",
     'sphinx.ext.todo',
@@ -86,6 +87,8 @@ myst_heading_anchors = 4
 myst_enable_extensions = [
     "deflist",
     "substitution",
+    "dollarmath",
+    "amsmath",
 ]
 
 myst_substitutions = {
