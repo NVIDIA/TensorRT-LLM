@@ -811,12 +811,6 @@ def worker_main(
         mp_stats_queue.put(None)
         kv_cache_events_queue.put(None)
 
-    def close_queues():
-        if is_leader:
-            mp_stats_queue.close()
-            kv_cache_events_queue.close()
-            worker_init_status_queue.close()
-
     postprocess_worker_futures = []
     if is_leader and postproc_worker_config.enabled:
         print_colored_debug(f"initiate postprocess workers...", "yellow")
@@ -911,7 +905,6 @@ def worker_main(
                         raise ValueError(f"Unknown request type: {type(req)}")
 
                 notify_proxy_threads_to_quit()
-                close_queues()
 
         except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.
@@ -920,7 +913,6 @@ def worker_main(
         except Exception as e:  # other critical errors
             if is_leader:
                 notify_proxy_threads_to_quit()
-                close_queues()
             logger.error(traceback.format_exc())
             # This will be captured by mpi4py and handled by future.done_callback
             raise e
