@@ -15,7 +15,6 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
-from .rpc.rpc_common import RPCParams
 from .rpc_worker import RpcWorker
 from .utils import (ErrorResponse, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response)
@@ -89,8 +88,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         """
         Main loop of the proxy, it will invoke the actions periodically.
         """
-        async for responses in self.rpc_client.fetch_responses_loop_async.call_streaming(
-        ):
+        async for responses in self.rpc_client.fetch_responses_loop_async(
+        ).remote_streaming():
             if self._shutdown_event.is_set():
                 return
             self.handle_responses(responses)
@@ -145,8 +144,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         logprob_params = self._get_logprob_params(request)
 
         # submit is a fire-and-forget operation, don't need to wait for response
-        self.rpc_client.submit(request,
-                               __rpc_params=RPCParams(need_response=False))
+        self.rpc_client.submit(request).remote(need_response=False)
 
         result = GenerationResult(
             request,
@@ -159,22 +157,20 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         return result
 
     def fetch_responses_remote(self):
-        return self.rpc_client.fetch_responses(__rpc_params=RPCParams(
-            timeout=20))
+        return self.rpc_client.fetch_responses().remote(timeout=20)
 
     def fetch_stats_remote(self):
-        return self.rpc_client.fetch_stats()
+        return self.rpc_client.fetch_stats().remote()
 
     def setup_engine_remote(self):
-        return self.rpc_client.setup_engine(__rpc_params=RPCParams(
-            need_response=True))
+        return self.rpc_client.setup_engine().remote(need_response=True)
 
     def shutdown_remote(self):
         logger_debug(f"Shutting down rpc remote", color="yellow")
-        self.rpc_client.shutdown()
+        self.rpc_client.shutdown().remote()
 
     def abort_request(self, request_id: int) -> None:
-        return self.rpc_client.abort_request(request_id)
+        return self.rpc_client.abort_request(request_id).remote()
 
     def shutdown(self):
         if self._shutdown_event.is_set():
