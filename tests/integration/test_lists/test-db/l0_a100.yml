@@ -15,6 +15,7 @@ l0_a100:
   tests:
     - unittest/llmapi/test_llm_pytorch.py
     - unittest/llmapi/test_mpi_session.py # generic tests
+    - unittest/trt/model_api/test_model_quantization.py
 - condition:
     ranges:
       system_gpu_count:
@@ -65,7 +66,6 @@ l0_a100:
   - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
   - accuracy/test_cli_flow.py::TestGpt2::test_weight_only[int8] # 1 min
   - unittest/trt/model_api/test_model_level_api.py
-  - unittest/trt/model_api/test_model_quantization.py
   - unittest/trt/model_api/test_model_api_multi_gpu.py
   - unittest/trt/model/test_gpt_e2e.py
   - unittest/trt/model/eagle
