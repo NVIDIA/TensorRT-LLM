@@ -60,37 +60,28 @@ from cutlass.cute.runtime import from_dlpack
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
-    """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
-    and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
+    """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
+    and Blackwell GPU architectural features, including persistent tile scheduling and warp specialization.
 
-    :param sf_vec_size: Scalefactor vector size.
-    :type sf_vec_size: int
-    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N)
-    :type mma_tiler_mn: Tuple[int, int]
-    :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
-    :type cluster_shape_mn: Tuple[int, int]
-
-    :note: In current version, A and B tensor must have the same data type
-        - i.e., Float8E4M3FN for A and Float8E5M2 for B is not supported
-
-    :note: Supported combinations of A/B data types, SF data typs and SF vector size:
-        - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
-        - MXF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU + sf_vec_size: 32
-        - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN + sf_vec_size: 16
-
-    :note: Supported accumulator data types:
-        - Float32
-
-    :note: Supported C data types:
-        - Float32
-        - Float16/BFloat16
-        - Float8E4M3FN/Float8E5M2
-    :note: Constraints:
-        - MMA tiler M must be 128 or 256 (use_2cta_instrs)
-        - MMA tiler N must be 128/256
-        - Cluster shape M must be multiple of 2 if Mma tiler M is 256
-        - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-        - Also, Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
+    Notes:
+        - In the current version, tensors A and B must have the same data type.
+          For example, using Float8E4M3FN for A and Float8E5M2 for B is not supported.
+        - Supported combinations of A/B data types, scale factor (SF) data types, and SF vector size:
+            * MXF8:   A/B: Float8E5M2/Float8E4M3FN, SF: Float8E8M0FNU, sf_vec_size: 32
+            * MXF4:   A/B: Float4E2M1FN,            SF: Float8E8M0FNU, sf_vec_size: 32
+            * NVF4:   A/B: Float4E2M1FN,            SF: Float8E8M0FNU/Float8E4M3FN, sf_vec_size: 16
+        - Supported accumulator data types:
+            * Float32
+        - Supported C data types:
+            * Float32
+            * Float16/BFloat16
+            * Float8E4M3FN/Float8E5M2
+        - Constraints:
+            * MMA tiler M must be 128 or 256 (use_2cta_instrs).
+            * MMA tiler N must be 128 or 256.
+            * Cluster shape M must be a multiple of 2 if MMA tiler M is 256.
+            * Cluster shape M/N must be positive and a power of 2, with total cluster size <= 16.
+            * Cluster shape M/N must be <= 4 for scale factor multicasts due to limited scale factor size.
 
     Example:
         >>> gemm = Sm100BlockScaledPersistentDenseGemmKernel(
@@ -119,12 +110,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         2.  Cluster Shape:
             - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
 
-        :param sf_vec_size: Scalefactor vector size.
-        :type sf_vec_size: int
-        :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
-        :type mma_tiler_mn: Tuple[int, int]
-        :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
-        :type cluster_shape_mn: Tuple[int, int]
+        Args:
+            sf_vec_size (int): Scalefactor vector size.
+            mma_tiler_mn (Tuple[int, int]): Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N).
+            cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
         """
 
         self.acc_dtype = cutlass.Float32
@@ -320,23 +309,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         - Define shared storage for kernel
         - Launch the kernel synchronously
 
-        :param a_tensor: Input tensor A
-        :type a_tensor: cute.Tensor
-        :param b_tensor: Input tensor B
-        :type b_tensor: cute.Tensor
-        :param sfa_tensor: Scale factor tensor A
-        :type sfa_tensor: cute.Tensor
-        :param sfb_tensor: Scale factor tensor B
-        :type sfb_tensor: cute.Tensor
-        :param c_tensor: Output tensor C
-        :type c_tensor: cute.Tensor
-        :param max_active_clusters: Maximum number of active clusters
-        :type max_active_clusters: cutlass.Constexpr
-        :param stream: CUDA stream for asynchronous execution
-        :type stream: cuda.CUstream
-        :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
-        :type epilogue_op: cutlass.Constexpr
-        :raises TypeError: If input data types are incompatible with the MMA instruction.
+        Args:
+            a_tensor (cute.Tensor): Input tensor A
+            b_tensor (cute.Tensor): Input tensor B
+            sfa_tensor (cute.Tensor): Scale factor tensor A
+            sfb_tensor (cute.Tensor): Scale factor tensor B
+            c_tensor (cute.Tensor): Output tensor C
+            max_active_clusters (cutlass.Constexpr): Maximum number of active clusters
+            stream (cuda.CUstream): CUDA stream for asynchronous execution
+            epilogue_op (cutlass.Constexpr): Optional elementwise lambda function to apply to the output tensor
+
+        Raises:
+            TypeError: If input data types are incompatible with the MMA instruction.
         """
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a_tensor.element_type
@@ -1342,16 +1326,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         Make tiledCopy for smem to tmem load for scale factor tensor, then use it to partition smem memory (source) and tensor memory (destination).
 
-        :param sSF: The scale factor tensor in smem
-        :type sSF: cute.Tensor
-        :param tSF: The scale factor tensor in tmem
-        :type tSF: cute.Tensor
+        Args:
+            sSF (cute.Tensor): The scale factor tensor in smem
+            tSF (cute.Tensor): The scale factor tensor in tmem
 
-        :return: A tuple containing (tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t) where:
-            - tiled_copy_s2t: The tiled copy operation for smem to tmem load for scale factor tensor(s2t)
-            - tCsSF_compact_s2t: The partitioned scale factor tensor in smem
-            - tSF_compact_s2t: The partitioned scale factor tensor in tmem
-        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
+        Returns:
+            A tuple containing (tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t) where:
+                - tiled_copy_s2t: The tiled copy operation for smem to tmem load for scale factor tensor(s2t)
+                - tCsSF_compact_s2t: The partitioned scale factor tensor in smem
+                - tSF_compact_s2t: The partitioned scale factor tensor in tmem
         """
         # (MMA, MMA_MN, MMA_K, STAGE)
         tCsSF_compact = cute.filter_zeros(sSF)
@@ -1387,22 +1370,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
 
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
-        :param tAcc: The accumulator tensor to be copied and partitioned
-        :type tAcc: cute.Tensor
-        :param gC_mnl: The global tensor C
-        :type gC_mnl: cute.Tensor
-        :param epi_tile: The epilogue tiler
-        :type epi_tile: cute.Tile
-        :param use_2cta_instrs: Whether use_2cta_instrs is enabled
-        :type use_2cta_instrs: bool
+        Args:
+            tidx (cutlass.Int32): The thread index in epilogue warp groups
+            tAcc (cute.Tensor): The accumulator tensor to be copied and partitioned
+            gC_mnl (cute.Tensor): The global tensor C
+            epi_tile (cute.Tile): The epilogue tiler
+            use_2cta_instrs (bool): Whether use_2cta_instrs is enabled
 
-        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
-            - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
-            - tTR_tAcc: The partitioned accumulator tensor
-            - tTR_rAcc: The accumulated tensor in register used to hold t2r results
-        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
+        Returns:
+            A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
+                - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
+                - tTR_tAcc: The partitioned accumulator tensor
+                - tTR_rAcc: The accumulated tensor in register used to hold t2r results
         """
         # Make tiledCopy for tensor memory load
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
@@ -1446,21 +1425,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory (destination).
 
-        :param tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
-        :type tiled_copy_t2r: cute.TiledCopy
-        :param tTR_rC: The partitioned accumulator tensor
-        :type tTR_rC: cute.Tensor
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
-        :param sC: The shared memory tensor to be copied and partitioned
-        :type sC: cute.Tensor
-        :type sepi: cute.Tensor
+        Args:
+            tiled_copy_t2r (cute.TiledCopy): The tiled copy operation for tmem to register copy(t2r)
+            tTR_rC (cute.Tensor): The partitioned accumulator tensor
+            tidx (cutlass.Int32): The thread index in epilogue warp groups
+            sC (cute.Tensor): The shared memory tensor to be copied and partitioned
+            sepi (cute.Tensor):
 
-        :return: A tuple containing (tiled_copy_r2s, tRS_rC, tRS_sC) where:
-            - tiled_copy_r2s: The tiled copy operation for register to smem copy(r2s)
-            - tRS_rC: The partitioned tensor C (register source)
-            - tRS_sC: The partitioned tensor C (smem destination)
-        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
+        Returns:
+            A tuple containing (tiled_copy_r2s, tRS_rC, tRS_sC) where:
+                - tiled_copy_r2s: The tiled copy operation for register to smem copy(r2s)
+                - tRS_rC: The partitioned tensor C (register source)
+                - tRS_sC: The partitioned tensor C (smem destination)
         """
         copy_atom_r2s = sm100_utils.get_smem_store_op(self.c_layout,
                                                       self.c_dtype,
@@ -1482,25 +1458,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         sC: cute.Tensor,
     ) -> Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
-        """Make tiledCopy for global memory store, then use it to:
+        """
+        Make tiledCopy for global memory store, then use it to:
         partition shared memory (source) and global memory (destination) for TMA store version.
 
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
-        :param atom: The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
-        :type atom: cute.CopyAtom or cute.TiledCopy
-        :param gC_mnl: The global tensor C
-        :type gC_mnl: cute.Tensor
-        :param epi_tile: The epilogue tiler
-        :type epi_tile: cute.Tile
-        :param sC: The shared memory tensor to be copied and partitioned
-        :type sC: cute.Tensor
+        Args:
+            tidx (cutlass.Int32): The thread index in epilogue warp groups
+            atom (Union[cute.CopyAtom, cute.TiledCopy]): The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
+            gC_mnl (cute.Tensor): The global tensor C
+            epi_tile (cute.Tile): The epilogue tiler
+            sC (cute.Tensor): The shared memory tensor to be copied and partitioned
 
-        :return: A tuple containing (tma_atom_c, bSG_sC, bSG_gC) where:
-            - tma_atom_c: The TMA copy atom
-            - bSG_sC: The partitioned shared memory tensor C
-            - bSG_gC: The partitioned global tensor C
-        :rtype: Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]
+        Returns:
+            A tuple containing (tma_atom_c, bSG_sC, bSG_gC) where:
+                - tma_atom_c: The TMA copy atom
+                - bSG_sC: The partitioned shared memory tensor C
+                - bSG_gC: The partitioned global tensor C
         """
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
         gC_epi = cute.flat_divide(
@@ -1536,38 +1509,31 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         smem_capacity: int,
         occupancy: int,
     ) -> Tuple[int, int, int]:
-        """Computes the number of stages for A/B/C operands based on heuristics.
+        """Computes the optimal number of pipeline stages for operands.
 
-        :param tiled_mma: The tiled MMA object defining the core computation.
-        :type tiled_mma: cute.TiledMma
-        :param mma_tiler_mnk: The shape (M, N, K) of the MMA tiler.
-        :type mma_tiler_mnk: tuple[int, int, int]
-        :param a_dtype: Data type of operand A.
-        :type a_dtype: type[cutlass.Numeric]
-        :param a_major_mode: Major mode of operand A.
-        :type a_major_mode: tcgen05.OperandMajorMode
-        :param b_dtype: Data type of operand B.
-        :type b_dtype: type[cutlass.Numeric]
-        :param b_major_mode: Major mode of operand B.
-        :type b_major_mode: tcgen05.OperandMajorMode
-        :param epi_tile: The epilogue tile shape.
-        :type epi_tile: cute.Tile
-        :param c_dtype: Data type of operand C (output).
-        :type c_dtype: type[cutlass.Numeric]
-        :param c_layout: Layout enum of operand C.
-        :type c_layout: utils.LayoutEnum
-        :param sf_dtype: Data type of Scale factor.
-        :type sf_dtype: type[cutlass.Numeric]
-        :param sf_vec_size: Scale factor vector size.
-        :type sf_vec_size: int
-        :param smem_capacity: Total available shared memory capacity in bytes.
-        :type smem_capacity: int
-        :param occupancy: Target number of CTAs per SM (occupancy).
-        :type occupancy: int
+        This method uses heuristics to determine the number of stages for the
+        accumulator (ACC), A/B operands, and C operand based on the kernel
+        configuration and available shared memory.
 
-        :return: A tuple containing the computed number of stages for:
-                 (ACC stages, A/B operand stages, C stages)
-        :rtype: tuple[int, int, int]
+        Args:
+            tiled_mma (cute.TiledMma): The tiled MMA object.
+            mma_tiler_mnk (Tuple[int, int, int]): The shape (M, N, K) of the
+                MMA tiler.
+            a_dtype (Type[cutlass.Numeric]): Data type of operand A.
+            a_major_mode (tcgen05.OperandMajorMode): Layout of operand A.
+            b_dtype (Type[cutlass.Numeric]): Data type of operand B.
+            b_major_mode (tcgen05.OperandMajorMode): Layout of operand B.
+            epi_tile (cute.Tile): The epilogue tile shape.
+            c_dtype (Type[cutlass.Numeric]): Data type of operand C.
+            c_layout (utils.LayoutEnum): Layout of operand C.
+            sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
+            sf_vec_size (int): Vector size of the scale factors.
+            smem_capacity (int): Total available shared memory in bytes.
+            occupancy (int): Target number of CTAs per SM.
+
+        Returns:
+            Tuple[int, int, int]: A tuple containing the number of stages for
+                (ACC, A/B, C).
         """
         # ACC stages
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
@@ -1642,21 +1608,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
-        """Use persistent tile scheduler to compute the grid size for the output tensor C.
+        """Computes the grid size for the kernel launch.
 
-        :param c: The output tensor C
-        :type c: cute.Tensor
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
-        :type cluster_shape_mn: tuple[int, int]
-        :param max_active_clusters: Maximum number of active clusters.
-        :type max_active_clusters: cutlass.Constexpr
+        This method uses a persistent tile scheduler to determine the grid
+        dimensions based on the output tensor shape and hardware constraints.
 
-        :return: A tuple containing:
-            - tile_sched_params: Parameters for the persistent tile scheduler.
-            - grid: Grid shape for kernel launch.
-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
+        Args:
+            c (cute.Tensor): The output tensor C.
+            cta_tile_shape_mnk (Tuple[int, int, int]): The shape (M, N, K) of the
+                CTA tile.
+            cluster_shape_mn (Tuple[int, int]): The shape of a CTA cluster.
+            max_active_clusters (cutlass.Constexpr): The maximum number of
+                active clusters supported by the hardware.
+
+        Returns:
+            A tuple containing the tile scheduler parameters and the computed
+            grid shape.
         """
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
@@ -1677,20 +1644,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         c_dtype: Type[cutlass.Numeric],
     ) -> bool:
-        """
-        Check if the dtypes and sf_vec_size are valid combinations
+        """Checks if the data types and scale factor vector size are a valid combination.
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param sf_dtype: The data type of the scale factor
-        :type sf_dtype: Type[cutlass.Numeric]
-        :param sf_vec_size: The vector size of the scale factor
-        :type sf_vec_size: int
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
+        Args:
+            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
+            sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
+            sf_vec_size (int): Vector size of the scale factors.
+            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
 
-        :return: True if the dtypes and sf_vec_size are valid, False otherwise
-        :rtype: bool
+        Returns:
+            bool: True if the combination is valid, False otherwise.
         """
         is_valid = True
 
@@ -1737,22 +1700,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_major: str,
         c_major: str,
     ) -> bool:
-        """
-        Check if the dtypes and sf_vec_size are valid combinations
+        """Checks if the tensor layouts are valid for the given data types.
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param a_major: The major dimension of the A tensor
-        :type a_major: str
-        :param b_major: The major dimension of the B tensor
-        :type b_major: str
-        :param c_major: The major dimension of the C tensor
-        :type c_major: str
+        Args:
+            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
+            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
+            a_major (str): The major layout of tensor A ('k' or 'm').
+            b_major (str): The major layout of tensor B ('k' or 'n').
+            c_major (str): The major layout of tensor C ('n' or 'm').
 
-        :return: True if the layouts are valid, False otherwise
-        :rtype: bool
+        Returns:
+            bool: True if the layouts are valid, False otherwise.
         """
         is_valid = True
 
@@ -1766,16 +1724,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
     ) -> bool:
-        """
-        Check if the mma tiler and cluster shape are valid
+        """Checks if the MMA tiler and cluster shape are a valid combination.
 
-        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
-        :type mma_tiler_mn: Tuple[int, int]
-        :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
-        :type cluster_shape_mn: Tuple[int, int]
+        Args:
+            mma_tiler_mn (Tuple[int, int]): The (M, N) shape of the MMA tiler.
+            cluster_shape_mn (Tuple[int, int]): The (M, N) shape of the CTA cluster.
 
-        :return: True if the mma tiler and cluster shape are valid, False otherwise
-        :rtype: bool
+        Returns:
+            bool: True if the combination is valid, False otherwise.
         """
         is_valid = True
         # Skip invalid mma tile shape
@@ -1810,30 +1766,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_major: str,
         c_major: str,
     ) -> bool:
-        """
-        Check if the tensor alignment is valid
+        """Checks if the tensor dimensions are valid for memory alignment.
 
-        :param m: The number of rows in the A tensor
-        :type m: int
-        :param n: The number of columns in the B tensor
-        :type n: int
-        :param k: The number of columns in the A tensor
-        :type k: int
-        :param l: The number of columns in the C tensor
-        :type l: int
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param a_major: The major axis of the A tensor
-        :type a_major: str
-        :param b_major: The major axis of the B tensor
-        :type b_major: str
-        :param c_major: The major axis of the C tensor
-        :type c_major: str
+        Args:
+            m (int): The M dimension of the GEMM problem.
+            n (int): The N dimension of the GEMM problem.
+            k (int): The K dimension of the GEMM problem.
+            l (int): The batch dimension (L) of the GEMM problem.
+            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
+            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
+            a_major (str): The major layout of tensor A ('k' or 'm').
+            b_major (str): The major layout of tensor B ('k' or 'n').
+            c_major (str): The major layout of tensor C ('n' or 'm').
 
-        :return: True if the problem shape is valid, False otherwise
-        :rtype: bool
+        Returns:
+            bool: True if the tensor alignment is valid, False otherwise.
         """
         is_valid = True
 
@@ -1868,38 +1815,29 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_major: str,
         c_major: str,
     ) -> bool:
-        """
-        Check if the gemm can be implemented
+        """Checks if the kernel can implement the given GEMM problem.
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param sf_dtype: The data type of the scale factor tensor
-        :type sf_dtype: Type[cutlass.Numeric]
-        :param sf_vec_size: The vector size
-        :type sf_vec_size: int
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
-        :type mma_tiler_mn: Tuple[int, int]
-        :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
-        :type cluster_shape_mn: Tuple[int, int]
-        :param m: The number of rows in the A tensor
-        :type m: int
-        :param n: The number of columns in the B tensor
-        :type n: int
-        :param k: The number of columns in the A tensor
-        :type k: int
-        :param l: The number of columns in the C tensor
-        :type l: int
-        :param a_major: The major axis of the A tensor
-        :type a_major: str
-        :param b_major: The major axis of the B tensor
-        :type b_major: str
-        :param c_major: The major axis of the C tensor
-        :type c_major: str
+        This method aggregates checks for data types, layouts, tile shapes,
+        and alignment to determine if the configuration is supported.
 
-        :return: True if the gemm can be implemented, False otherwise
-        :rtype: bool
+        Args:
+            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
+            sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
+            sf_vec_size (int): Vector size of the scale factors.
+            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
+            mma_tiler_mn (Tuple[int, int]): The (M, N) shape of the MMA tiler.
+            cluster_shape_mn (Tuple[int, int]): The (M, N) shape of the CTA
+                cluster.
+            m (int): The M dimension of the GEMM problem.
+            n (int): The N dimension of the GEMM problem.
+            k (int): The K dimension of the GEMM problem.
+            l (int): The batch dimension (L) of the GEMM problem.
+            a_major (str): The major layout of tensor A ('k' or 'm').
+            b_major (str): The major layout of tensor B ('k' or 'n').
+            c_major (str): The major layout of tensor C ('n' or 'm').
+
+        Returns:
+            bool: True if the configuration is supported, False otherwise.
         """
         can_implement = True
         # Skip unsupported types
@@ -1926,7 +1864,13 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     sf_ref_tensor: cute.Tensor,
     sf_mma_tensor: cute.Tensor,
 ):
-    """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)xL layout"""
+    """Converts a scale factor tensor from MKL to an MMA-compatible layout.
+
+    Args:
+        sf_ref_tensor (cute.Tensor): The source tensor in MKL layout.
+        sf_mma_tensor (cute.Tensor): The destination tensor in the target MMA
+            layout M(32x4xrest_m) x K(4xrest_k) x L.
+    """
     # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
     # group to ((32, 4, rest_m), (4, rest_k), l)
     sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
@@ -1945,12 +1889,21 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
     ):
+        """Initializes the GEMM kernel wrapper.
+
+        Args:
+            sf_vec_size (int): Scale factor vector size.
+            mma_tiler_mn (Tuple[int, int]): Shape of the MMA instruction tile
+                (M, N).
+            cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N).
+        """
         self.sf_vec_size = sf_vec_size
         self.mma_tiler_mn = mma_tiler_mn
         self.cluster_shape_mn = cluster_shape_mn
 
     @staticmethod
     def ceil_div(a, b):
+        """Computes ceiling division."""
         return (a + b - 1) // b
 
     # fully dynamic shape
@@ -1974,6 +1927,28 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
         current_stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
+        """Executes the wrapped GEMM kernel with dynamically shaped tensors.
+
+        Args:
+            m (int): The M dimension of the GEMM problem.
+            n (int): The N dimension of the GEMM problem.
+            k (int): The K dimension of the GEMM problem.
+            sf_m (int): The M dimension of the scale factor tensor.
+            sf_n (int): The N dimension of the scale factor tensor.
+            sf_k (int): The K dimension of the scale factor tensor.
+            l (cutlass.Constexpr): The batch dimension (L) of the GEMM problem.
+            a_ptr (cute.Pointer): Pointer to the A tensor.
+            b_ptr (cute.Pointer): Pointer to the B tensor.
+            a_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for A.
+            b_sf_ptr (cute.Pointer): Pointer to the scale factor tensor for B.
+            c_ptr (cute.Pointer): Pointer to the C tensor.
+            alpha (cutlass.Float32): Scaling factor for the GEMM output.
+            max_active_clusters (cutlass.Constexpr): Maximum number of active
+                clusters.
+            current_stream (cuda.CUstream): CUDA stream for the operation.
+            epilogue_op (cutlass.Constexpr, optional): Elementwise lambda
+                function for the epilogue. Defaults to identity.
+        """
 
         # m, k, l
         a_tensor = cute.make_tensor(
@@ -2032,41 +2007,41 @@ def run(
     use_cold_l2: bool = False,
     **kwargs,
 ):
-    """Execute a persistent batched dense blockscaled GEMM operation on Blackwell architecture with performance benchmarking.
+    """Runs and benchmarks the persistent batched dense block-scaled GEMM.
 
-    This function prepares input tensors, configures and launches the persistent GEMM kernel,
-    optionally performs reference validation, and benchmarks the execution performance.
+    This function prepares input tensors, launches the kernel, optionally
+    validates the results against a reference implementation, and measures
+    performance.
 
-    :param mnkl: Problem size (M, N, K, L)
-    :type mnkl: Tuple[int, int, int, int]
-    :param ab_dtype: Data type for input tensors A and B
-    :type ab_dtype: Type[cutlass.Numeric]
-    :param sf_dtype: Data type for scale factor tensor
-    :type sf_dtype: Type[cutlass.Numeric]
-    :param sf_vec_size: Vector size for scale factor tensor
-    :type sf_vec_size: int
-    :param c_dtype: Data type for output tensor C
-    :type c_dtype: Type[cutlass.Numeric]
-    :param a_major/b_major/c_major: Memory layout of tensor A/B/C
-    :type a_major/b_major/c_major: str
-    :param mma_tiler_mn: MMA tiling size.
-    :type mma_tiler_mn: Tuple[int, int]
-    :param cluster_shape_mn: Cluster shape.
-    :type cluster_shape_mn: Tuple[int, int]
-    :param tolerance: Tolerance value for reference validation comparison, defaults to 1e-01
-    :type tolerance: float, optional
-    :param warmup_iterations: Number of warmup iterations before benchmarking, defaults to 0
-    :type warmup_iterations: int, optional
-    :param iterations: Number of benchmark iterations to run, defaults to 1
-    :type iterations: int, optional
-    :param skip_ref_check: Whether to skip reference result validation, defaults to False
-    :type skip_ref_check: bool, optional
-    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
-    :type use_cold_l2: bool, optional
-    :raises RuntimeError: If CUDA GPU is not available
-    :raises ValueError: If the configuration is invalid or unsupported by the kernel
-    :return: Execution time of the GEMM kernel
-    :rtype: float
+    Args:
+        mnkl (Tuple[int, int, int, int]): The dimensions (M, N, K, L) of the
+            GEMM problem.
+        ab_dtype (Type[cutlass.Numeric]): Data type for input tensors A and B.
+        sf_dtype (Type[cutlass.Numeric]): Data type for the scale factor tensors.
+        sf_vec_size (int): Vector size for the scale factor tensors.
+        c_dtype (Type[cutlass.Numeric]): Data type for the output tensor C.
+        a_major (str): The major layout of tensor A ('k' or 'm').
+        b_major (str): The major layout of tensor B ('k' or 'n').
+        c_major (str): The major layout of tensor C ('n' or 'm').
+        mma_tiler_mn (Tuple[int, int]): The shape of the MMA tile.
+        cluster_shape_mn (Tuple[int, int]): The shape of the CTA cluster.
+        tolerance (float, optional): Tolerance for result validation.
+            Defaults to 1e-01.
+        warmup_iterations (int, optional): Number of warmup runs. Defaults to 0.
+        iterations (int, optional): Number of benchmark iterations.
+            Defaults to 1.
+        skip_ref_check (bool, optional): If True, skips result validation.
+            Defaults to False.
+        use_cold_l2 (bool, optional): If True, uses a circular buffer to
+            ensure a cold L2 cache. Defaults to False.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        float: The execution time of the kernel in microseconds.
+
+    Raises:
+        RuntimeError: If no CUDA-capable GPU is available.
+        TypeError: If the configuration is not supported by the kernel.
     """
     print(f"Running Sm100 Persistent Dense BlockScaled GEMM test with:")
     print(f"mnkl: {mnkl}")

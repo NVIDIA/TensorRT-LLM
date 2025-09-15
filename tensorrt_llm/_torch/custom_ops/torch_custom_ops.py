@@ -2,6 +2,23 @@ import sys
 from functools import lru_cache
 from typing import List, Mapping, Optional, Tuple
 
+import torch
+import triton  # type: ignore[import]
+
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm import deep_gemm
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.math_utils import pad_up
+
+from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig)
+from ..modules.multi_stream_utils import do_multi_stream
+from ..modules.swiglu import silu_and_mul_kernel
+from ..utils import (fp4_scale_infer_shape,
+                     get_last_power_of_2_num_tokens_buckets,
+                     last_positive_power_of_2)
+
 try:
     if sys.version_info >= (3, 12):
         HAS_CUTLASS_DSL = True
@@ -18,26 +35,10 @@ try:
 except ImportError:
     HAS_CUTLASS_DSL = False
 
-import torch
-import triton  # type: ignore[import]
-
 try:
     from cuda.bindings import driver as cuda
 except ImportError:
     from cuda import cuda
-
-import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm import deep_gemm
-from tensorrt_llm._utils import get_sm_version
-
-from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-                         OptimizationProfile, TunableRunner, TuningConfig)
-from ..modules.multi_stream_utils import do_multi_stream
-from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (fp4_scale_infer_shape,
-                     get_last_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2)
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -1057,10 +1058,6 @@ def _(
     return x.new_empty((b, d), dtype=o_dtype)
 
 
-def pad_up(x: int, y: int) -> int:
-    return ((x + y - 1) // y) * y
-
-
 class CuteDSLNVFP4BlackwellLinear(TunableRunner):
     kernel_dict = dict()
 
@@ -1071,8 +1068,16 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
     )
 
-    def __init__(self):
+    def __init__(self, alpha: float, output_dtype: torch.dtype):
         super().__init__()
+        self.alpha = alpha
+        self.output_dtype = output_dtype
+        assert output_dtype == torch.bfloat16
+
+        if get_sm_version() != 100:
+            raise ValueError(
+                f"SM version {get_sm_version()} is not supported for CuteDSLNVFP4BlackwellLinear, it only supports SM 100"
+            )
 
     def get_valid_tactics(
         self,
@@ -1098,14 +1103,14 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         sf_vec_size = 16
 
         # full shamoo
-        mma_tiler_mn_candi = [(256, 128), (128, 128), (128, 256), (256, 256),
-                              (256, 64), (128, 64)]
-        cluster_shape_mn_candi = [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2),
-                                  (2, 4), (4, 1), (4, 2), (4, 4)]
+        mma_tiler_mn_candidates = [(256, 128), (128, 128), (128, 256),
+                                   (256, 256), (256, 64), (128, 64)]
+        cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2),
+                                       (2, 4), (4, 1), (4, 2), (4, 4)]
         return [
             (mma_tiler_mn, cluster_shape_mn)
-            for mma_tiler_mn in mma_tiler_mn_candi
-            for cluster_shape_mn in cluster_shape_mn_candi
+            for mma_tiler_mn in mma_tiler_mn_candidates
+            for cluster_shape_mn in cluster_shape_mn_candidates
             if Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
                 cutlass.Float4E2M1FN,  # ab_dtype,
                 cutlass.Float8E4M3FN,  # sf_dtype
@@ -1123,22 +1128,36 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             )
         ]
 
+    def make_cute_dsl_global_pointer(self, tensor: torch.Tensor,
+                                     dtype: cutlass.dtype,
+                                     assumed_align: int) -> cute.Pointer:
+        return make_ptr(
+            dtype,
+            tensor.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=assumed_align,
+        )
+
     def forward(
         self,
         inputs: List[torch.Tensor],
         tactic,
     ) -> torch.Tensor:
-        """Performs fp8 blockwise (deepgemm like) operation using CuTe DSL.
-        :param a (inputs[0]): Input tensor of shape (m, k)
-        :type a: torch.Tensor, type: fp4
-        :param b (inputs[1]): Weight tensor of shape (n, k)
-        :type b: torch.Tensor, type: fp4
-        :param a_sf (inputs[2]): Input scale tensor of shape (k//16, m).
-        :type a_sf: torch.Tensor, type: fp8
-        :param b_sf (inputs[3]): Weight scale tensor of shape (n, k//16)
-        :type b_sf: torch.Tensor, type: fp8
-        :return: Output tensor of shape (m, n)
-        :rtype: torch.Tensor, type: bf16
+        """
+        Performs fp8 blockwise gemm operation using CuTe DSL.
+
+        Args:
+            inputs (List[torch.Tensor]):
+                inputs[0]: Input tensor of shape (m, k), dtype: fp4.
+                inputs[1]: Weight tensor of shape (n, k), dtype: fp4.
+                inputs[2]: Input scale tensor of shape (k//16, m), dtype: fp8.
+                inputs[3]: Weight scale tensor of shape (n, k//16), dtype: fp8.
+                inputs[4]: Alpha scaling factor. dtype: float32.
+                inputs[5]: Output dtype, expected to be torch.bfloat16.
+            tactic: Tiling and cluster strategy, typically a tuple (mma_tiler_mn, cluster_shape_mn).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
         """
         sf_vec_size = 16
 
@@ -1151,59 +1170,37 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
                 (1, 1),
             ]
 
-        a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha, output_dtype = inputs
-        assert output_dtype == torch.bfloat16
+        a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
         m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
-        c_tensor = torch.empty(*(m, n), dtype=output_dtype, device="cuda")
+        c_tensor = torch.empty(*(m, n), dtype=self.output_dtype, device="cuda")
 
         real_k = k * 2
         sf_m = pad_up(m, 128)
         sf_k = pad_up(real_k // sf_vec_size, 4)
         sf_n = pad_up(n, 128)
 
-        a_ptr = make_ptr(
-            # cutlass type
-            cutlass.Float4E2M1FN,
-            a_tensor.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
-        )
-        b_ptr = make_ptr(
-            cutlass.Float4E2M1FN,
-            b_tensor.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
-        )
-        a_sf_ptr = make_ptr(
-            cutlass.Float8E4M3FN,
-            a_sf_tensor.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        b_sf_ptr = make_ptr(
-            cutlass.Float8E4M3FN,
-            b_sf_tensor.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        c_ptr = make_ptr(
-            cutlass.BFloat16,
-            c_tensor.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
+        a_ptr = self.make_cute_dsl_global_pointer(a_tensor,
+                                                  cutlass.Float4E2M1FN, 32)
+        b_ptr = self.make_cute_dsl_global_pointer(b_tensor,
+                                                  cutlass.Float4E2M1FN, 32)
+        a_sf_ptr = self.make_cute_dsl_global_pointer(a_sf_tensor,
+                                                     cutlass.Float8E4M3FN, 16)
+        b_sf_ptr = self.make_cute_dsl_global_pointer(b_sf_tensor,
+                                                     cutlass.Float8E4M3FN, 16)
+        c_ptr = self.make_cute_dsl_global_pointer(c_tensor, cutlass.BFloat16,
+                                                  16)
 
         # get stream
         torch_stream = torch.cuda.current_stream()
         stream = cuda.CUstream(torch_stream.cuda_stream)
 
         gemm_wrapper_func = Sm100BlockScaledPersistentDenseGemmKernelWrapper
-        cache_key = (
+        CACHE_KEY = (
             sf_vec_size,
             mma_tiler_mn,
             cluster_shape_mn,
         )
-        if cache_key not in CuteDSLNVFP4BlackwellLinear.kernel_dict:
+        if CACHE_KEY not in CuteDSLNVFP4BlackwellLinear.kernel_dict:
             gemm = gemm_wrapper_func(
                 sf_vec_size,
                 mma_tiler_mn,
@@ -1213,7 +1210,6 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             hardware_info = cutlass.utils.HardwareInfo()
             max_active_clusters = hardware_info.get_max_active_clusters(
                 cluster_shape_mn[0] * cluster_shape_mn[1])
-            hardware_info.get_l2_cache_size_in_bytes()
 
             compiled_gemm = cute.compile(
                 gemm,
@@ -1229,18 +1225,18 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
                 a_sf_ptr,
                 b_sf_ptr,
                 c_ptr,
-                alpha,
+                self.alpha,
                 max_active_clusters,
                 stream,
             )
 
-            CuteDSLNVFP4BlackwellLinear.kernel_dict[cache_key] = compiled_gemm
+            CuteDSLNVFP4BlackwellLinear.kernel_dict[CACHE_KEY] = compiled_gemm
         else:
-            compiled_gemm = CuteDSLNVFP4BlackwellLinear.kernel_dict[cache_key]
+            compiled_gemm = CuteDSLNVFP4BlackwellLinear.kernel_dict[CACHE_KEY]
 
         # launch gemm kernel
         compiled_gemm(m, n, real_k, sf_m // 128, sf_n // 128, sf_k // 4, a_ptr,
-                      b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha, stream)
+                      b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, self.alpha, stream)
         return c_tensor
 
 
@@ -1262,9 +1258,10 @@ def cute_dsl_nvfp4_gemm_blackwell(
 
     tuner = AutoTuner.get()
 
-    cute_dsl_nvfp4_gemm_blackwell_runner = CuteDSLNVFP4BlackwellLinear()
+    cute_dsl_nvfp4_gemm_blackwell_runner = CuteDSLNVFP4BlackwellLinear(
+        alpha, output_dtype)
     _, best_tactic = tuner.choose_one(
-        "trtllm::cute_dsl_nvfp4_gemm_blackwell::gemm",
+        "trtllm::cute_dsl_nvfp4_gemm_blackwell",
         [cute_dsl_nvfp4_gemm_blackwell_runner],
         CuteDSLNVFP4BlackwellLinear.tuning_config,
         [input, weight, input_scale, weight_scale, alpha, output_dtype],
@@ -1285,7 +1282,7 @@ def _(
     output_dtype: torch.dtype,
 ):
     # [m, k]
-    shape = [i for i in mat_a.shape]
+    shape = list(mat_a.shape)
     # [n, k]
     shape[-1] = mat_b.shape[-2]
     # output is fixed as bf16
