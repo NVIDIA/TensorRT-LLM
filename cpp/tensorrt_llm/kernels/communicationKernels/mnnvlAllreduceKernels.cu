@@ -96,8 +96,8 @@ inline __device__ float4 loadPackedVolatile<float4>(void const* ptr)
 {
     float4 return_value;
     asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-                 : "=f"(return_value.x), "=f"(return_value.y), "=f"(return_value.z), "=f"(return_value.w)
-                 : "l"(ptr));
+        : "=f"(return_value.x), "=f"(return_value.y), "=f"(return_value.z), "=f"(return_value.w)
+        : "l"(ptr));
     return return_value;
 }
 
