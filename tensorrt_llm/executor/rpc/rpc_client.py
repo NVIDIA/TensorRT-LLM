@@ -446,7 +446,6 @@ class RPCClient:
                     logger_debug(
                         f"RPC Client call_streaming received data: {response.result}",
                         color="green")
-                    # Yield data
                     yield response.result
                 elif response.stream_status == 'end':
                     # End of stream

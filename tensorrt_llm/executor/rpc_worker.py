@@ -10,6 +10,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
+from ..llmapi.llm_args import BaseLlmArgs
 from ..logger import set_level
 from ..lora_manager import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
@@ -37,13 +38,17 @@ class RpcWorker(WorkerBase):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
+        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
     ) -> None:
         super().__init__(
             engine=engine,
             executor_config=executor_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+            llm_args=llm_args,
+            batched_logits_processor=batched_logits_processor)
         self.shutdown_event = Event()
 
         self._response_queue = Queue()
@@ -104,6 +109,7 @@ class RpcWorker(WorkerBase):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
         **kwargs,
     ) -> None:
         if enable_llm_debug():
@@ -115,7 +121,9 @@ class RpcWorker(WorkerBase):
             executor_config=executor_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+            llm_args=llm_args,
+            batched_logits_processor=batched_logits_processor)
 
         if mpi_rank() != 0:
             # The non-leader worker will setup the engine immediately.
