@@ -25,8 +25,8 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
-from .modeling_multimodal_utils import (find_uncached_mm_embeds,
-                                        fuse_input_embeds)
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
 from .modeling_utils import (filter_weights, register_auto_model,
                              register_vision_encoder)
 
@@ -462,21 +462,16 @@ class LlavaNextModel(PreTrainedModel):
         mm_embeds = []
         if len(multimodal_params) > 0:
             if not DISAGG:
-                if multimodal_params[0].multimodal_data.get(
-                        "multimodal_embedding", None) is not None:
-                    mm_embeds = [
-                        multimodal_param.multimodal_data["multimodal_embedding"]
-                        for multimodal_param in multimodal_params
-                    ]
-                else:
-                    mm_embeds = self.mm_encoder.forward(multimodal_params)
-                mm_embeds = find_uncached_mm_embeds(
-                    mm_embeds, multimodal_params[:num_context_requests])
+                mm_embeds = get_multimodal_embeddings(
+                    encoder_forward_fn=self.mm_encoder.forward,
+                    multimodal_params=multimodal_params[:num_context_requests])
             else:
-                mm_embeds = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "LlavaNextModel does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
+            mm_embeds = find_input_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
         input_ids, inputs_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs)
 

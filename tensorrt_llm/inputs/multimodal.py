@@ -90,37 +90,51 @@ class MultimodalRuntimeData:
     """Runtime data for tracking multimodal token caching and reuse per request sequence.
 
     This class tracks which multimodal tokens are cached vs. need to be processed
-    for each request sequence during KV cache reuse scenarios.
+    for each request sequence during both KV cache reuse and chunked prefill scenarios.
 
     Attributes:
-        num_cached_tokens: Total number of cached tokens for this sequence
+        past_seen_token_num: Total number of tokens seen in previous iterations (cached)
         mm_token_lengths: Length of each multimodal token chunk
         mm_token_positions: Starting positions of each multimodal token chunk
-        prompt_tokens: Current iteration of prompt tokens for this sequence (optional). Need it for chunk prefill if enabled (#TODO)
-        num_cached_mm_tokens: Number of multimodal tokens that are cached in this iteration (computed)
-        total_mm_tokens: Total number of multimodal tokens in this sequence (computed)
+        chunk_end_pos: End position of the current chunk for chunked prefill
+        special_token_offsets: Starting positions of special tokens in the union of all multimodal token chunks (optional, depending on the model)
+
+        num_unseen_mm_tokens: Number of multimodal tokens that are cached (computed)
+        num_mm_tokens_in_chunk: Number of multimodal tokens in the current chunk (computed)
+        total_mm_tokens_in_request: Total number of multimodal tokens in the request sequence (computed)
+
+        num_unseen_special_tokens: Number of special tokens that are cached (computed)
+        num_special_tokens_in_chunk: Number of special tokens in the current chunk (computed)
+        total_special_tokens_in_request: Total number of special tokens in the request sequence (computed)
     """
-    num_cached_tokens: int
+    past_seen_token_num: int
     mm_token_lengths: List[int]
     mm_token_positions: List[int]
+    chunk_end_pos: int
+    special_token_offsets: List[int]
 
-    # TODO: support chunk prefill for multimodal
-    # When chunk prefill is enabled, we need to pass the prompt tokens for current chunk and mask to find the included mm tokens
-    prompt_tokens: Optional[List[int]] = None
+    num_unseen_mm_tokens: Optional[int] = None
+    num_mm_tokens_in_chunk: Optional[int] = None
+    total_mm_tokens_in_request: Optional[int] = None
 
-    num_cached_mm_tokens: Optional[int] = None
-    total_mm_tokens: Optional[int] = None
+    num_unseen_special_tokens: Optional[int] = 0
+    num_special_tokens_in_chunk: Optional[int] = 0
+    total_special_tokens_in_request: Optional[int] = 0
+
+    # TODO: fine-grained control of encoder runner/cache to each mm_item
 
     def __post_init__(self):
         # Validate input data
+        if self.total_mm_tokens_in_request is None:
+            self.total_mm_tokens_in_request = sum(self.mm_token_lengths)
         if len(self.mm_token_positions) != len(self.mm_token_lengths):
             raise ValueError(
                 f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
             )
 
-        if self.num_cached_tokens < 0:
+        if self.past_seen_token_num < 0:
             raise ValueError(
-                f"num_cached_tokens must be non-negative, got {self.num_cached_tokens}"
+                f"past_seen_token_num must be non-negative, got {self.past_seen_token_num}"
             )
 
         if any(length <= 0 for length in self.mm_token_lengths):
@@ -133,22 +147,49 @@ class MultimodalRuntimeData:
                 f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
             )
 
-        if self.num_cached_mm_tokens is None:
+        if self.num_unseen_mm_tokens is None or self.num_mm_tokens_in_chunk is None:
             # Compute cached multimodal tokens based on positions and cached tokens
-            self.num_cached_mm_tokens = 0
+            self.num_unseen_mm_tokens = 0
+            self.num_mm_tokens_in_chunk = 0
+            remainder = 0
             for pos, length in zip(self.mm_token_positions,
                                    self.mm_token_lengths):
-                if pos + length <= self.num_cached_tokens:
-                    self.num_cached_mm_tokens += length
-                elif pos < self.num_cached_tokens:
+                if pos + length <= self.past_seen_token_num:
+                    self.num_unseen_mm_tokens += length
+                elif pos < self.past_seen_token_num:
                     # Partial overlap - only count the cached portion
-                    self.num_cached_mm_tokens += self.num_cached_tokens - pos
+                    self.num_unseen_mm_tokens += self.past_seen_token_num - pos
+                    self.num_mm_tokens_in_chunk += min(
+                        self.chunk_end_pos,
+                        pos + length) - self.past_seen_token_num
+                else:
+                    if pos + length > self.chunk_end_pos:
+                        # Partial overlap - only count the cached portion
+                        if pos < self.chunk_end_pos:
+                            self.num_mm_tokens_in_chunk += self.chunk_end_pos - pos
+                        else:
+                            remainder += length
+                    else:
+                        # Full overlap - count the entire mm item chunk
+                        self.num_mm_tokens_in_chunk += length
 
-        if self.num_cached_mm_tokens > self.num_cached_tokens:
+        if len(self.special_token_offsets) > 0:
+            self.num_unseen_special_tokens = sum(
+                1 for offset in self.special_token_offsets
+                if offset < self.num_unseen_mm_tokens)
+            mm_tokens_end_pos = self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk
+            self.num_special_tokens_in_chunk = sum(
+                1 for offset in self.special_token_offsets
+                if self.num_unseen_mm_tokens <= offset < mm_tokens_end_pos)
+
+            self.total_special_tokens_in_request = len(
+                self.special_token_offsets)
+
+        if self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk + remainder > sum(
+                self.mm_token_lengths):
             raise ValueError(
-                f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to "
-                f"num_cached_tokens ({self.num_cached_tokens})")
-        self.total_mm_tokens = sum(self.mm_token_lengths)
+                f"num_unseen_mm_tokens ({self.num_unseen_mm_tokens}) + num_mm_tokens_in_chunk ({self.num_mm_tokens_in_chunk}) + remainder ({remainder}) must be less than or equal to sum of mm_token_lengths ({sum(self.mm_token_lengths)})"
+            )
 
 
 @dataclass
@@ -184,6 +225,7 @@ class MultimodalParams:
                 "video_height": torch.Tensor | List[int],
                 "video_width": torch.Tensor | List[int],
             },
+            "special_token_offsets": List[int],          # List of starting positions of special tokens in the union of all multimodal token chunks, if available
             # ... other modalities
         }
     """
@@ -531,10 +573,12 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
 
 
 def find_mm_token_positions(
-        input_ids: Union[torch.Tensor, List[int], np.ndarray],
-        num_mm_tokens: List[int],
-        vocab_size: Optional[int] = None,
-        mm_token_ids: Optional[torch.Tensor] = None) -> List[int]:
+    input_ids: Union[torch.Tensor, List[int], np.ndarray],
+    num_mm_tokens: List[int],
+    vocab_size: Optional[int] = None,
+    mm_token_ids: Optional[torch.Tensor] = None,
+    mm_special_token_ids: Optional[torch.Tensor] = None
+) -> Tuple[List[int], List[int]]:
     """Get starting positions of contiguous multimodal token chunks using known lengths.
 
     This function finds multimodal tokens (with IDs > vocab_size or matching mm_token_ids)
@@ -551,7 +595,8 @@ def find_mm_token_positions(
         mm_token_ids: Specific token IDs that represent multimodal tokens
 
     Returns:
-        List of starting positions for each contiguous multimodal token chunk
+        List of starting positions for each contiguous multimodal token
+        (Optional) List of starting positions of special tokens in the union of all multimodal token chunks
     """
     if mm_token_ids is None and vocab_size is None:
         raise ValueError(
@@ -600,7 +645,15 @@ def find_mm_token_positions(
             # Move to the next chunk
             current_position += length
 
-    return start_positions
+    start_special_token_positions = []
+    if mm_special_token_ids is not None:
+        mm_token_ids = input_ids[mm_positions]
+        special_token_mask_in_mm = torch.isin(mm_token_ids,
+                                              mm_special_token_ids)
+        start_special_token_positions = torch.where(
+            special_token_mask_in_mm)[0].tolist()
+
+    return start_positions, start_special_token_positions
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
