@@ -57,7 +57,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp() or self.is_eagle3_one_model(
+        ) or self.has_draft_model()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()

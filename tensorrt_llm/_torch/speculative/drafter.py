@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, final
 
-from ..pyexecutor.llm_request import LlmRequest
+from ..pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from ..pyexecutor.resource_manager import ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 
@@ -52,3 +52,18 @@ class Drafter(ABC):
 
         num_effective_requests = min(len(requests), max_batch_size, token_cap)
         return num_effective_requests <= self.max_concurrency
+
+    @final
+    def pad_draft_tokens_for_cuda_graph(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        """
+        Pad draft tokens to the max draft length for CUDA graph compatibility.
+
+        Args:
+            scheduled_requests: The scheduled requests to pad
+        """
+        for req in scheduled_requests.generation_requests:
+            max_draft_tokens = self.max_draft_tokens
+            num_draft_tokens = get_draft_token_length(req)
+            req.py_draft_tokens.extend(
+                0 for _ in range(max_draft_tokens - num_draft_tokens))
