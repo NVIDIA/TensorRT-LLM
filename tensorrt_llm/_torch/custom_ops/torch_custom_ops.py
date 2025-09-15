@@ -1129,7 +1129,7 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         ]
 
     def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
-                                     assumed_align: int) -> cute.Pointer:
+                                     assumed_align: int):
         return make_ptr(
             dtype,
             tensor.data_ptr(),
