@@ -99,7 +99,7 @@ class CapturedGraph(nn.Module):
             ad_logger.info(msg_bs)
         assert all(input.ndim > 1 for input in args_batched), msg_ndim
 
-        # repeat the batched input tensors to the max batch size
+        # repeat the batched input tensors to the cuda_graph_max_batch_size
         self._input_buffers = [
             input[:1].repeat_interleave(self.cuda_graph_max_batch_size, dim=0)
             for input in args_batched
@@ -108,7 +108,13 @@ class CapturedGraph(nn.Module):
         # create new args, kwargs with the input buffers and static args
         args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
 
-        # capture output once with max batch size to capture output buffers
+        # truncate input buffers to cuda_graph_max_batch_size
+        inputs_truncated = [
+            in_buffer[: self.cuda_graph_max_batch_size] for in_buffer in self._input_buffers
+        ]
+        args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
+
+        # capture output once with cuda_graph_max_batch_size to capture output buffers
         with CudaGraphWarmUpPhase():
             ad_logger.info(f"Warm up with {self.cuda_graph_max_batch_size=} before graph capture")
             out = self.model(*args, **kwargs)
@@ -118,11 +124,6 @@ class CapturedGraph(nn.Module):
         # capture graph now for a range of batch sizes
         for bs in self.cuda_graph_batch_sizes:
             ad_logger.info(f"Capturing graph for batch size: {bs}")
-
-            # setup args, kwargs
-            inputs_truncated = [in_buffer[:bs] for in_buffer in self._input_buffers]
-            args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
-
             # capture graph for truncated inputs
             combined_shape = sum((input.shape for input in inputs_truncated), start=())
             self.graphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
