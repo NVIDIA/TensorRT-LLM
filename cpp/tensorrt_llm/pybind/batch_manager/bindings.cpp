@@ -438,11 +438,13 @@ void initBindings(pybind11::module_& m)
         [](std::vector<std::shared_ptr<tb::LlmRequest>>& requests,
             std::vector<std::vector<tb::LlmRequest::TokenIdType>> const& tokens, int beam_idx)
         {
-            TLLM_CHECK_WITH_INFO(requests.size() == tokens.size(), "Expected the same number of requests and token containers.");
+            TLLM_CHECK_WITH_INFO(
+                requests.size() == tokens.size(), "Expected the same number of requests and token containers.");
 
             for (int i = 0; i < requests.size(); ++i)
             {
-                for (const auto& token : tokens[i]) {
+                for (const auto& token : tokens[i])
+                {
                     requests[i]->addNewToken(token, beam_idx);
                 }
             }

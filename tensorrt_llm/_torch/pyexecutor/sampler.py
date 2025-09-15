@@ -487,10 +487,16 @@ class TorchSampler(Sampler):
                                      finish_reasons: FinishReasons) -> int:
         num_accepted = 0
         while True:
-            new_token = add_token(request, new_tokens, beam=BEAM_0, step=num_accepted, cache=self._cached_tokens)
+            new_token = add_token(request,
+                                  new_tokens,
+                                  beam=BEAM_0,
+                                  step=num_accepted,
+                                  cache=self._cached_tokens)
             if self.finish_if_reason(request, finish_reasons, step=0):
-                break            
-            if len(request.py_draft_tokens) <= num_accepted or request.py_draft_tokens[num_accepted] != new_token:
+                break
+            if len(request.py_draft_tokens
+                   ) <= num_accepted or request.py_draft_tokens[
+                       num_accepted] != new_token:
                 break
             num_accepted += 1
         return num_accepted
@@ -519,10 +525,10 @@ class TorchSampler(Sampler):
             new_token = request.py_draft_tokens[i]
             new_tokens[i, request.seq_slot, BEAM_0] = new_token
             add_token(request,
-                        new_tokens,
-                        beam=BEAM_0,
-                        step=i,
-                        cache=self._cached_tokens)
+                      new_tokens,
+                      beam=BEAM_0,
+                      step=i,
+                      cache=self._cached_tokens)
             if handle_stop_single_beam(request,
                                        new_token,
                                        max_seq_len=self.max_seq_len):
@@ -533,10 +539,10 @@ class TorchSampler(Sampler):
                                         num_accepted)
             new_tokens[num_accepted, request.seq_slot, BEAM_0] = new_token
             add_token(request,
-                        new_tokens,
-                        beam=BEAM_0,
-                        step=num_accepted,
-                        cache=self._cached_tokens)
+                      new_tokens,
+                      beam=BEAM_0,
+                      step=num_accepted,
+                      cache=self._cached_tokens)
             handle_stop_single_beam(request,
                                     new_token,
                                     max_seq_len=self.max_seq_len)
@@ -584,9 +590,10 @@ class TorchSampler(Sampler):
             processed += num_accepted
             self.handle_logprobs(req, state, beam=BEAM_0, count=processed)
             req.py_decoding_iter += 1
-        
+
         # Commit adding tokens
-        add_new_tokens_to_requests(list(self._cached_tokens.keys()), list(self._cached_tokens.values()), BEAM_0)
+        add_new_tokens_to_requests(list(self._cached_tokens.keys()),
+                                   list(self._cached_tokens.values()), BEAM_0)
 
     def log_probs_host(self, scheduled_requests: ScheduledRequests):
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
@@ -1292,9 +1299,8 @@ class TRTLLMSampler(Sampler):
         ]
 
         # Add new tokens
-        new_tokens = [
-            [new_tokens_host[r.py_seq_slot]] for r in reqs_with_new_tokens
-        ]
+        new_tokens = [[new_tokens_host[r.py_seq_slot]]
+                      for r in reqs_with_new_tokens]
         add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
 
         # Log probs
