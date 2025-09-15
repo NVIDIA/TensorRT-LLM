@@ -269,6 +269,12 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.KV_CACHE_SIZE:
     re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
 }
+
+# Additional regex patterns for _autodeploy backend
+AUTODEPLOY_PERF_METRIC_LOG_QUERIES = {
+    PerfMetricType.KV_CACHE_SIZE:
+    re.compile(r".*Final KV cache size after resize: ([\d\.]+) GiB.*"),
+}
 # (Relative threshold, Absolute threshold) for all metric types
 PERF_METRIC_THRESHOLD = {
     PerfMetricType.BUILD_TIME: (0.1, 30),  # Ignore build time regression < 30ms
@@ -1501,18 +1507,30 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         # Make sure we have outputs.
         assert cmd_idx in outputs, f"Output log for command {cmd_idx} does not exist!"
 
-        # Use the regex to go through the log from the N-th command, where N = cmd_idx.
+        # Use all applicable regex patterns to go through the log from the N-th command, where N = cmd_idx.
         print_info(
             f"Searching for metric {metric_name} from output log of command {cmd_idx} ..."
         )
 
-        regex_matches = [
-            metric.metric_regex.search(line)
-            for line in outputs[cmd_idx].split("\n")
-        ]
-        metric_values = [
-            float(match.group(1)) for match in regex_matches if match
-        ]
+        metric_values = []
+        all_regex_patterns = self._get_all_metric_regexes(metric.metric_type)
+
+        for regex_pattern in all_regex_patterns:
+            regex_matches = [
+                regex_pattern.search(line)
+                for line in outputs[cmd_idx].split("\n")
+            ]
+            pattern_values = [
+                float(match.group(1)) for match in regex_matches if match
+            ]
+
+            # No unit conversion needed for _autodeploy backend KV cache since it's already in GiB
+
+            metric_values.extend(pattern_values)
+
+            # If we found values with this pattern, we can stop trying other patterns
+            if pattern_values:
+                break
 
         if len(metric_values) == 0:
             if self._build_script == "trtllm-build" and metric.metric_type == PerfMetricType.ENGINE_SIZE:
@@ -1802,6 +1820,26 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if metric_type not in PERF_METRIC_LOG_QUERIES:
                 raise ValueError(f"Unexpected metric_type: {metric_type}")
             return PERF_METRIC_LOG_QUERIES[metric_type]
+
+    def _get_all_metric_regexes(
+            self, metric_type: PerfMetricType) -> List[re.Pattern]:
+        """
+        Get all applicable regex patterns for the metric type and backend.
+        Returns a list of regex patterns to try in order.
+        """
+        regex_patterns = []
+
+        # Add the primary regex pattern
+        regex_patterns.append(self._get_metric_regex(metric_type))
+
+        # For _autodeploy backend with KV_CACHE_SIZE, add autodeploy-specific patterns
+        if (self._config.backend == "_autodeploy"
+                and metric_type == PerfMetricType.KV_CACHE_SIZE
+                and metric_type in AUTODEPLOY_PERF_METRIC_LOG_QUERIES):
+            regex_patterns.append(
+                AUTODEPLOY_PERF_METRIC_LOG_QUERIES[metric_type])
+
+        return regex_patterns
 
     def _get_metric_threshold(self, metric_type: PerfMetricType) -> float:
         """
