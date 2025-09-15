@@ -3,7 +3,7 @@
 from typing import Dict
 
 import pytest
-from _model_test_utils import get_small_model_config
+from _model_test_utils import get_small_model_config_pytest_param
 from build_and_run_ad import ExperimentConfig, main
 
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig, LlmArgs, _ParallelConfig
@@ -44,54 +44,50 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
 @pytest.mark.parametrize(
     "experiment_config",
     [
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             attn_backend="flashinfer",
             compile_backend="torch-opt",
         ),
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
             attn_backend="triton",
             compile_backend="torch-simple",
         ),
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "Qwen/Qwen3-30B-A3B",
             attn_backend="triton",
             compile_backend="torch-simple",
         ),
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "microsoft/Phi-3-mini-4k-instruct",
             attn_backend="triton",
             compile_backend="torch-simple",
         ),
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             attn_backend="flashinfer",
             compile_backend="torch-simple",
         ),
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "deepseek-ai/DeepSeek-V3",
             attn_backend="triton",
             compile_backend="torch-simple",
         ),
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "microsoft/Phi-3-mini-4k-instruct",
             attn_backend="torch",
             compile_backend="torch-simple",
         ),
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "Qwen/Qwen2.5-3B-Instruct",
             attn_backend="triton",
             compile_backend="torch-compile",
         ),
-        pytest.param(
-            get_small_model_config(
-                "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
-                attn_backend="flashinfer",
-                compile_backend="torch-simple",
-            ),
-            # Human readable name for readability / easier selection with `-k`.
-            id="mistral-small-3.1-24b",
+        get_small_model_config_pytest_param(
+            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+            attn_backend="flashinfer",
+            compile_backend="torch-simple",
         ),
     ],
 )
