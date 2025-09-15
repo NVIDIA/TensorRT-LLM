@@ -4,6 +4,7 @@ import functools
 import gc
 import inspect
 import math
+import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -662,7 +663,10 @@ class PyTorchModelEngine(ModelEngine):
                         torch.cuda.synchronize()
 
         if self.pytorch_backend_config.enable_autotuner:
-            with self.no_cuda_graph(), autotune():
+            # handle multiple rank issue
+            cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+            with self.no_cuda_graph(), autotune(cache_path=cache_path,
+                                                rank=self.mapping.rank):
                 result = get_autotune_warmup_request()
                 with release_batch(result) as batch:
                     if batch is None:
