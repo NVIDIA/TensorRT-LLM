@@ -56,6 +56,7 @@ static constexpr SizeType32 kSecondaryLevel = 1;
 
 class KVCacheBlock;
 class KVCachePromptLookupNode;
+class KVCachePromptLookup;
 class BlockManager;
 class KVCacheManager;
 class KVCacheTransferManager;
@@ -66,6 +67,7 @@ using VecTokens = std::vector<TokenIdType>;
 using BeamTokens = std::vector<VecTokens>;
 using BlockPtr = std::shared_ptr<KVCacheBlock>;
 using LookupNodePtr = std::shared_ptr<KVCachePromptLookupNode>;
+using LookupPtr = std::shared_ptr<KVCachePromptLookup>;
 using FreeBlocksQueue = std::list<BlockPtr>;
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
@@ -209,7 +211,7 @@ public:
 
     void setBlockKey(BlockKey const& blockKey, bool isFull);
 
-    BlockKey getBlockKey();
+    BlockKey getBlockKey() const;
 
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
@@ -234,6 +236,8 @@ public:
 
     [[nodiscard]] BlockPtr getBlock(SizeType32 windowSize) const;
 
+    [[nodiscard]] bool isFull() const;
+
 private:
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
     BlockKey mBlockKey;
@@ -252,7 +256,7 @@ class KVCachePromptLookup
 public:
     explicit KVCachePromptLookup(CacheType cacheType, SizeType32 tokensPerBlock);
 
-    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest& llmRequest, SizeType32 inputLength, bool enablePartialReuse, bool createNodes);
+    [[nodiscard]] std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> lookup(LlmRequest const & llmRequest, SizeType32 inputLength, bool enablePartialReuse, bool createNodes);
 
 private:
     // Root of search structure
@@ -299,7 +303,7 @@ public:
     // because it is needed by the former when KVCacheBlock might not be stored
     // in lookup structure and therefore cannot get this value from there
     void setBlockKey(BlockKey const& blockKey, bool isFull);
-    BlockKey getBlockKey();
+    BlockKey getBlockKey() const;
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
     BlockPtr const& getPrevBlockInSeq() const;
@@ -1216,6 +1220,9 @@ private:
     std::vector<SizeType32> mLayerToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
+
+    bool mEnablePartialReuse;
+    LookupPtr mLookup;
 };
 
 struct OffsetTableDimensions

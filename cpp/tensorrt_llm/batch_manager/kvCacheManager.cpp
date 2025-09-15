@@ -304,7 +304,7 @@ void KVCacheBlock::setBlockKey(BlockKey const& blockKey, bool isFull)
     mIsFull = isFull;
 }
 
-BlockKey KVCacheBlock::getBlockKey()
+BlockKey KVCacheBlock::getBlockKey() const
 {
     return mBlockKey;
 }
@@ -414,7 +414,7 @@ KVCachePromptLookup::KVCachePromptLookup(CacheType cacheType, SizeType32 tokensP
 {
 }
 
-std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::lookup(LlmRequest& llmRequest, SizeType32 inputLength, bool enablePartialReuse, bool create)
+std::vector<std::tuple<bool,SizeType32,LookupNodePtr>> KVCachePromptLookup::lookup(LlmRequest const& llmRequest, SizeType32 inputLength, bool enablePartialReuse, bool create)
 {
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
@@ -465,7 +465,7 @@ void KVCachePromptLookupNode::setBlockKey(BlockKey const& blockKey, bool isFull)
     mIsFull = isFull;
 }
 
-BlockKey KVCachePromptLookupNode::getBlockKey()
+BlockKey KVCachePromptLookupNode::getBlockKey() const
 {
     return mBlockKey;
 }
@@ -502,7 +502,7 @@ void KVCachePromptLookupNode::removeNextNode(BlockKey const& blockKey)
 
 std::tuple<bool, SizeType32, LookupNodePtr> KVCachePromptLookupNode::findMatchingNode(BlockKey const& blockKey, bool enablePartialReuse) const
 {
-    if (blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0)
+    if (blockKey.uniqueTokens.size() == 0 || mNextNodes.size() == 0)
     {
         return {false, 0, nullptr};
     }
@@ -540,7 +540,12 @@ void KVCachePromptLookupNode::setBlock(SizeType32 windowSize, BlockPtr block)
 
 BlockPtr KVCachePromptLookupNode::getBlock(SizeType32 windowSize) const
 {
-    return mBlocks[windowSize];
+    return mBlocks.at(windowSize);
+}
+
+bool KVCachePromptLookupNode::isFull() const
+{
+    return mIsFull;
 }
 
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
@@ -597,6 +602,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mEventManager{std::move(eventManager)}
     , mStream{stream}
     , mCacheType{cacheType}
+    , mEnablePartialReuse{enablePartialReuse}
+    , mLookup{std::make_shared<KVCachePromptLookup>(cacheType, tokensPerBlock)}
 {
     auto const uniqueWindowSizeToLayers
         = BaseKVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, mNumLayers);
@@ -787,7 +794,8 @@ bool WindowBlockManager::verifyQueueIntegrity()
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
     // Lookup prompt nodes once for all window block managers
-    auto matchedPromptNodes = mLookup.lookup(llmRequest, 0, mEnablePartialReuse, true);
+    auto constexpr beamIdx = 0;
+    auto matchedPromptNodes = mLookup->lookup(llmRequest, 0, mEnablePartialReuse, true);
     for (auto const& [windowSize, _] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
@@ -1234,7 +1242,7 @@ void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLeng
     LlmRequest& llmRequest, SizeType32 windowSize)
 {
     // Lookup prompt nodes once for all window block managers
-    auto matchedPromptNodes = mLookup.lookup(llmRequest, inputLength, mEnablePartialReuse, false);
+    auto matchedPromptNodes = mLookup->lookup(llmRequest, inputLength, mEnablePartialReuse, false);
     // Find kv cache blocks to reuse for each window manager
     mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest, matchedPromptNodes);
 }
@@ -1535,7 +1543,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // Create nodes if no match is found.
     if (storeBlocksForReuse)
     {
-        auto matchedPromptNodes = mLookup.lookup(llmRequest, 0, mEnablePartialReuse, true);
+        auto matchedPromptNodes = mLookup->lookup(llmRequest, 0, mEnablePartialReuse, true);
         // TODO: This loop can be parallelized with openmp
         for (auto& [windowSize, manager] : mWindowBlockManagers)
         {
@@ -1578,7 +1586,7 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
     }
 
     // Lookup prompt nodes once for all window block managers
-    auto matchedPromptNodes = mLookup.lookup(llmRequest, 0, mEnablePartialReuse, true);
+    auto matchedPromptNodes = mLookup->lookup(llmRequest, 0, mEnablePartialReuse, true);
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
