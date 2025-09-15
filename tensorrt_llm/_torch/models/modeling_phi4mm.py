@@ -29,8 +29,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_uncached_mm_embeds,
-                                        fuse_input_embeds)
+from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_utils import register_auto_model
 
 # Special token ids from the original Phi-4-multimodal-instruct implementation
@@ -604,7 +603,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
                     multimodal_param.multimodal_data["multimodal_embedding"]
                     for multimodal_param in multimodal_params
                 ]
-            mm_embedding = find_uncached_mm_embeds(
+            mm_embedding = find_input_mm_embeds(
                 mm_embedding, multimodal_params[:num_context_requests])
 
         input_ids, input_embeds = fuse_input_embeds(
