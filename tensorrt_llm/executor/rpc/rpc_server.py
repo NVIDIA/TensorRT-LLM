@@ -50,8 +50,8 @@ class RPCServer:
         self._num_pending_requests = 0
 
         self._functions = {
-            "__rpc_shutdown": lambda: self.shutdown(is_remote_call=True),
-            "__rpc_get_attr": lambda name: self.get_attr(name),
+            "_rpc_shutdown": lambda: self.shutdown(is_remote_call=True),
+            "_rpc_get_attr": lambda name: self.get_attr(name),
         }
         self._dispatcher_thread: Optional[ManagedThread] = None
         if async_run_task:
@@ -197,7 +197,7 @@ class RPCServer:
 
             # shutdown methods depend on _num_pending_requests, so
             # they should not be counted
-            if req.method_name not in ["__rpc_shutdown", "shutdown"]:
+            if req.method_name not in ["_rpc_shutdown", "shutdown"]:
                 self._num_pending_requests += 1
                 logger_debug(
                     f"Dispatcher received request {req}, pending: {self._num_pending_requests}"
@@ -221,6 +221,8 @@ class RPCServer:
             if req.method_name not in self._functions:
                 logger.error(
                     f"Method '{req.method_name}' not found in RPC server.")
+                self._num_pending_requests -= 1
+
                 if not req.need_response:
                     continue
                 if req.is_streaming:
@@ -274,7 +276,7 @@ class RPCServer:
                     logger_debug(f"RPC Server sent response for request {req}")
 
             # Only decrement if this request was counted in the first place
-            if req.method_name not in ["__rpc_shutdown", "shutdown"]:
+            if req.method_name not in ["_rpc_shutdown", "shutdown"]:
                 self._num_pending_requests -= 1
 
     async def _process_request(self, req: RPCRequest) -> Optional[RPCResponse]:
