@@ -983,8 +983,9 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
-            response = _maybe_wrap_response(self.worker, response,
-                                            self.worker._is_pytorch_backend)
+            if not response.has_error():
+                response = _maybe_wrap_response(self.worker, response,
+                                                self.worker._is_pytorch_backend)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.

@@ -253,21 +253,29 @@ class GenerationExecutor(ABC):
         """
         if error is not None:
             # For details please refer to the comment of `GenerationResult.error`
-            if isinstance(error, Exception):
+
+            if isinstance(error, RequestError):
+                # A per-request error, can be captured and ignored
+                if enable_llm_debug():
+                    print_colored(f"Got per-request error: {repr(error)}\n",
+                                  "red")
+            elif isinstance(error, str):
+                # A per-request error, can be captured and ignored
+                if enable_llm_debug():
+                    print_colored(f"Got per-request error: {repr(error)}\n",
+                                  "red")
+                    print_colored(str(traceback.extract_stack()) + "\n", "red")
+                error = RequestError(error)
+            else:
                 # Serious error from background thread or process
+                if not isinstance(error, BaseException):
+                    error = RuntimeError(repr(error))
                 if enable_llm_debug():
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
                 self.shutdown()
-                raise error
-            elif isinstance(error, str):
-                if enable_llm_debug():
-                    print_colored(f"Got per-request error: {repr(error)}\n",
-                                  "red")
-                    print_colored(str(traceback.extract_stack()) + "\n", "red")
-                # A per-request error, can be captured and ignored
-                raise RequestError(error)
+            raise error
 
         # Here we raise the first error in the queue. This method will be called repeatedly and user can choose to catch
         # more than one error.
