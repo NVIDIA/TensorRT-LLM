@@ -1318,6 +1318,11 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
 #else
             float scale = global_sum_mi == 0.f ? 1.0f : 1.0f / global_sum_mi;
 #endif
+            if constexpr (Kernel_traits::RETURN_SOFTMAX_STATS)
+            {
+                // Save the dequant exp sum for softmax saver.
+                global_sum[mi] *= Traits_o::SOFTMAX_FP_DEQUANT_SCALE;
+            }
 // Assume only N has multiple MMAs (MMAS_M = 1).
 #pragma unroll
             for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)

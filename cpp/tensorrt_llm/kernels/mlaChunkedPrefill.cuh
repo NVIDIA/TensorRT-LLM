@@ -35,7 +35,7 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T c
 // load single chunk kv from kv_cache for each request
 template <typename T, typename TCache>
 void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray const& kv_cache, int const num_contexts,
-    int64_t const* cu_ctx_chunked_len, int lora_size, int rope_size, int chunked_size, int chunked_idx,
-    float const* kv_scale_quant_orig_ptr, cudaStream_t stream);
+    int64_t const* cu_ctx_chunked_len, int64_t const* chunked_ld_global_offset, int lora_size, int rope_size,
+    int max_seq_len, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm
