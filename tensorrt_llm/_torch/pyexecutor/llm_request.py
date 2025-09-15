@@ -370,6 +370,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.use_draft_model = is_draft
         # Whether the request is for the first forward of the draft model.
         self.py_is_first_draft = is_first_draft
+        self.d2t = None
+        self.py_draft_use_greedy_sampling = False
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
