@@ -43,6 +43,7 @@ from ..metadata import KVCacheParams
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
@@ -426,7 +427,6 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.iter_states = {}
-        self._cuda_graphs = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
@@ -1038,6 +1038,9 @@ class PyTorchModelEngine(ModelEngine):
 
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)
+                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                ):
+                    model.draft_model.load_weights_from_target_model(model)
 
             elif load_format == LoadFormat.VISION_ONLY:
                 # Vision weights are already loaded within the model.
@@ -1257,6 +1260,16 @@ class PyTorchModelEngine(ModelEngine):
 
         return total_num_tokens, False, attn_all_rank_num_tokens
 
+    def _prepare_multimodal_indices(self, input_ids: list[int]):
+        input_ids = torch.tensor(input_ids, dtype=torch.int, device="cpu")
+        vocab_size = self.model.config.vocab_size
+        # TODO: unify naming of mm_token_ids across models
+        mm_token_ids = getattr(self.model, "mm_token_ids", None)
+
+        text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+            input_ids, vocab_size=vocab_size, mm_token_ids=mm_token_ids)
+        return text_token_indices, mm_token_indices
+
     def _prepare_tp_inputs(
             self,
             scheduled_requests: ScheduledRequests,
@@ -1333,6 +1346,14 @@ class PyTorchModelEngine(ModelEngine):
 
             request.py_batch_idx = request.py_seq_slot
 
+        if len(multimodal_params_list) > 0:
+            # discard the text token indices as it only includes context tokens at this moment
+            print(
+                f"len multimodal_params_list: {len(multimodal_params_list)} from model_engine"
+            )
+            _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
+        else:
+            mm_token_indices = None
         num_ctx_requests = len(scheduled_requests.context_requests)
         num_ctx_tokens = len(input_ids)
 
@@ -1695,6 +1716,14 @@ class PyTorchModelEngine(ModelEngine):
                 all_rank_num_seqs = [item[1] for item in all_rank_num_tokens]
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+
+        if mm_token_indices is not None:
+            mask = torch.ones(total_num_tokens, dtype=torch.bool)
+            mask[mm_token_indices] = False
+            inputs['mm_token_indices'] = mm_token_indices.pin_memory().to(
+                "cuda", non_blocking=True)
+            inputs['text_token_indices'] = torch.where(mask)[0].pin_memory().to(
+                "cuda", non_blocking=True)
 
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)

@@ -9,6 +9,8 @@ import torch
 from blake3 import blake3
 from torchvision.transforms import ToPILImage
 
+from tensorrt_llm.logger import logger
+
 # Default hasher
 default_hasher = blake3
 
@@ -22,16 +24,17 @@ class MultimodalInput:
     """
 
     multimodal_positions: List[int]
-    """Starting positions of each multimodal chunk in the token sequence.
+    """Starting positions of each contiguous multimodal token chunk in the token sequence.
 
     Contains only the start position of each chunk, not all positions of multimodal tokens.
     This is different from mm_positions elsewhere which contains all positions.
     """
 
     multimodal_lengths: List[int]
-    """Length (number of tokens) of each multimodal item.
+    """Length of each contiguous multimodal token chunk, including any special tokens.
 
-    Combined with multimodal_positions, this defines the token spans for each multimodal item.
+    Each span is unique to its multimodal item and may include special tokens for some models,
+    (e.g., image_end_token, image_break_token for mistral3) mixed with the actual multimodal tokens.
     """
 
     def __post_init__(self):
@@ -435,13 +438,22 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
     """Apply hashing to multimodal data items."""
 
     def _hash_image(image):
-        # only support single modality w/ PIL.Image.Image for now
         # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
         hasher = hash_lib()
         if isinstance(image, torch.Tensor):
-            # TODO: Device tensor hashing is an open issue. Limited hashing to CPU for now.
-            image = image.cpu()
-        hasher.update(serialize_item(image))
+            # Ensure tensor is on CPU and contiguous for consistent hashing
+            image = image.detach().cpu().contiguous()
+            hasher.update(serialize_item(image))
+        elif isinstance(image, list):
+            # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
+            for frame in image:
+                hasher.update(b"<frame>")
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.detach().cpu().contiguous()
+                hasher.update(serialize_item(frame))
+        else:
+            hasher.update(serialize_item(image))
+
         return hasher.hexdigest()
 
     mm_items = {
@@ -474,7 +486,13 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
 
 def find_mm_token_lengths(mm_data: Dict[str, Any],
                           input_processor: Any) -> List[int]:
-    """Get multimodal token lengths from multimodal data items. """
+    """Get the maximum contiguous multimodal token lengths from multimodal data items.
+
+    Returns the total token count for each multimodal item, including any special tokens
+    (e.g., image_begin, image_end, image_break) that may be mixed with the actual
+    multimodal content tokens. This mm_token_lengths represents the full contiguous chunk from beginning
+    to end, not just pure image/video/audio tokens.
+    """
 
     mm_items = {
         modality: items if isinstance(items, list) else [items]
@@ -483,54 +501,67 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
     num_mm_tokens = {}
 
     for modality, items in mm_items.items():
-        if modality != "image":
-            #TODO: support other modalities
-            raise ValueError(
-                f"Unsupported modality: {modality}. Only 'image' modality is currently supported for hashing."
-            )
-        if not hasattr(input_processor, "get_num_tokens_per_image"):
-            #TODO: backward compatibility for models that don't yet have get_num_tokens_per_image implemented
-            #TODO: only support qwen2_vl for now
+        if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
             raise AttributeError(
-                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_image' method required for multimodal hashing."
+                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
             )
 
         modality_token_lengths = []
         for item in items:
-            if isinstance(item, torch.Tensor):
-                item = ToPILImage()(item)
-            num_tokens = input_processor.get_num_tokens_per_image(
-                image_width=item.width,
-                image_height=item.height,
-            )
-            modality_token_lengths.append(num_tokens)
+            if modality == "image":
+                if isinstance(item, torch.Tensor):
+                    item = ToPILImage()(item)
+                num_tokens = input_processor.get_num_tokens_per_image(
+                    image=item, )
+                modality_token_lengths.append(num_tokens)
+            elif modality == "video":
+                assert isinstance(item, list), "Video must be a list of frames"
+                if isinstance(item[0], torch.Tensor):
+                    item = [ToPILImage()(frame) for frame in item]
+                num_tokens = input_processor.get_num_tokens_per_video(
+                    video=item, )
+                modality_token_lengths.append(num_tokens)
+            else:
+                # TODO: add audio support if needed
+                raise ValueError(f"Unsupported modality: {modality}")
 
         num_mm_tokens[modality] = modality_token_lengths
 
-    return num_mm_tokens['image']  # flatten all mm instances to a single list
+    return num_mm_tokens  # flatten all mm instances to a single list
 
 
-def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
-                                             np.ndarray],
-                            num_mm_tokens: List[int],
-                            vocab_size: int,
-                            mm_token_ids: torch.Tensor = None) -> List[int]:
-    """Get multimodal token positions using IDs > vocab_size and known lengths.
+def find_mm_token_positions(
+        input_ids: Union[torch.Tensor, List[int], np.ndarray],
+        num_mm_tokens: List[int],
+        vocab_size: Optional[int] = None,
+        mm_token_ids: Optional[torch.Tensor] = None) -> List[int]:
+    """Get starting positions of contiguous multimodal token chunks using known lengths.
 
-    This function finds multimodal tokens (with IDs > vocab_size) and uses the
-    provided lengths in num_mm_tokens to identify where each chunk starts.
-    This works even when there are no gaps between different image sequences
-    (e.g., when all images use the same token IDs).
+    This function finds multimodal tokens (with IDs > vocab_size or matching mm_token_ids)
+    and uses the provided lengths in num_mm_tokens to identify where each contiguous chunk starts.
+    Each chunk in num_mm_tokens is assumed to be a contiguous block of multimodal tokens for each multimodal item, and may include special tokens (e.g., image_begin, image_end, image_break) within the chunk.
+
+    Note: at least one of vocab_size or mm_token_ids must be provided. If mm_token_ids
+    is provided, vocab_size is ignored.
 
     Args:
         input_ids: Token sequence (tensor, list, or numpy array)
-        num_mm_tokens: List of lengths for each multimodal token chunk
-        vocab_size: Size of the model's vocabulary
-        mm_token_ids (optional): possible token ids for multimodal tokens
+        num_mm_tokens: List of contiguous chunk lengths for each multimodal item
+        vocab_size: Size of the model's vocabulary (used to identify tokens > vocab_size)
+        mm_token_ids: Specific token IDs that represent multimodal tokens
 
     Returns:
-        List of starting positions for each multimodal token chunk
+        List of starting positions for each contiguous multimodal token chunk
     """
+    if mm_token_ids is None and vocab_size is None:
+        raise ValueError(
+            "Provide either mm_token_ids or vocab_size to find multimodal token positions"
+        )
+    if mm_token_ids is not None and vocab_size is not None:
+        logger.warning(
+            "Both mm_token_ids and vocab_size are provided, using mm_token_ids and ignoring vocab_size"
+        )
+
     # Convert input_ids to tensor if needed
     if not isinstance(input_ids, torch.Tensor):
         if isinstance(input_ids, list):
@@ -542,6 +573,9 @@ def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
     if mm_token_ids is None:
         mm_mask = input_ids >= vocab_size
     else:
+        if mm_token_ids.ndim != 1:
+            raise ValueError("mm_token_ids must be a 1D tensor")
+        mm_token_ids = torch.unique(mm_token_ids)
         mm_mask = torch.isin(input_ids, mm_token_ids)
 
     # If no multimodal tokens found, return empty list

@@ -109,6 +109,7 @@ class Logger(metaclass=Singleton):
         self._func_wrapper(severity)(" ".join(parts))
 
     def log_once(self, severity, *msg, key):
+        assert key is not None, "key is required for log_once"
         if key not in self._appeared_keys:
             self._appeared_keys.add(key)
             self.log(severity, *msg)

@@ -67,7 +67,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         get_small_model_config(
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             attn_backend="flashinfer",
-            compile_backend="torch-opt",
+            compile_backend="torch-simple",
         ),
         get_small_model_config(
             "deepseek-ai/DeepSeek-V3",
@@ -83,6 +83,15 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "Qwen/Qwen2.5-3B-Instruct",
             attn_backend="triton",
             compile_backend="torch-compile",
+        ),
+        pytest.param(
+            get_small_model_config(
+                "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+                attn_backend="flashinfer",
+                compile_backend="torch-simple",
+            ),
+            # Human readable name for readability / easier selection with `-k`.
+            id="mistral-small-3.1-24b",
         ),
     ],
 )

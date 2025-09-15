@@ -2,7 +2,7 @@
 
 # Installing on Linux via `pip`
 
-1. Install TensorRT-LLM (tested on Ubuntu 24.04).
+1. Install TensorRT LLM (tested on Ubuntu 24.04).
 
    ### Install prerequisites
 
@@ -23,14 +23,14 @@
 
    ```{tip}
    Instead of manually installing the preqrequisites as described
-   above, it is also possible to use the pre-built [TensorRT-LLM Develop container
+   above, it is also possible to use the pre-built [TensorRT LLM Develop container
    image hosted on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel)
    (see [here](containers) for information on container tags).
    ```
 
-   ### Install pre-built TensorRT-LLM wheel
+   ### Install pre-built TensorRT LLM wheel
 
-   Once all prerequisites are in place, TensorRT-LLM can be installed as follows:
+   Once all prerequisites are in place, TensorRT LLM can be installed as follows:
 
    ```bash
    pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
@@ -46,12 +46,12 @@
 
 **Known limitations**
 
-There are some known limitations when you pip install pre-built TensorRT-LLM wheel package.
+There are some known limitations when you pip install pre-built TensorRT LLM wheel package.
 
 1. MPI in the Slurm environment
 
-    If you encounter an error while running TensorRT-LLM in a Slurm-managed cluster, you need to reconfigure the MPI installation to work with Slurm.
-    The setup methods depends on your slurm configuration, pls check with your admin. This is not a TensorRT-LLM specific, rather a general mpi+slurm issue.
+    If you encounter an error while running TensorRT LLM in a Slurm-managed cluster, you need to reconfigure the MPI installation to work with Slurm.
+    The setup methods depends on your slurm configuration, pls check with your admin. This is not a TensorRT LLM specific, rather a general mpi+slurm issue.
     ```
     The application appears to have been direct launched using "srun",
     but OMPI was not built with SLURM support. This usually happens

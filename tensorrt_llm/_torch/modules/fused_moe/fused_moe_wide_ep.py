@@ -82,13 +82,13 @@ class WideEPMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            layer_idx=layer_idx,
         )
 
         assert self.use_dp, "Attention DP should be used with WideEP."
         assert self.parallel_size > 1, "WideEP should only be enabled with parallel_size > 1"
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.layer_idx = layer_idx
 
         moe_load_balancer = get_moe_load_balancer()
         self.layer_load_balancer = None
@@ -374,10 +374,10 @@ class WideEPMoE(MoE):
             use_all_to_all: bool,
             output_dtype: Optional[torch.dtype] = None,
             all_rank_num_tokens: Optional[List[int]] = None,
-            all_rank_max_num_tokens: Optional[int] = None,
             use_dp_padding: Optional[bool] = None,
             repeating_info: Tuple = (True, True),
     ) -> torch.Tensor:
+        all_rank_max_num_tokens = max(all_rank_num_tokens)
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
             output_dtype = output_dtype
@@ -710,18 +710,21 @@ class WideEPMoE(MoE):
 
         return final_hidden_states
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert all_rank_num_tokens is not None
         assert use_dp_padding is not None
+
+        all_rank_max_num_tokens = max(all_rank_num_tokens)
 
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = self.calculate_num_chunks(all_rank_num_tokens)
@@ -742,7 +745,6 @@ class WideEPMoE(MoE):
                 use_all_to_all,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
-                all_rank_max_num_tokens=all_rank_max_num_tokens,
                 use_dp_padding=use_dp_padding,
                 repeating_info=(is_first_call, is_last_call))
             outputs = self.reducescatter_or_allreduce(
@@ -801,8 +803,6 @@ class WideEPMoE(MoE):
                                 use_all_to_all,
                                 all_rank_num_tokens=all_rank_num_tokens_list[
                                     idx_chunk],
-                                all_rank_max_num_tokens=
-                                all_rank_max_num_tokens_list[idx_chunk],
                                 use_dp_padding=use_dp_padding,
                                 repeating_info=(is_first_call, is_last_call))
                         if idx_chunk > 0:
@@ -819,8 +819,6 @@ class WideEPMoE(MoE):
                             use_all_to_all,
                             all_rank_num_tokens=all_rank_num_tokens_list[
                                 idx_chunk],
-                            all_rank_max_num_tokens=all_rank_max_num_tokens_list[
-                                idx_chunk],
                             use_dp_padding=use_dp_padding,
                             repeating_info=(is_first_call, is_last_call))
                         with torch.cuda.stream(self.aux_stream):
@@ -836,8 +834,6 @@ class WideEPMoE(MoE):
                         router_logits,
                         use_all_to_all,
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk],
-                        all_rank_max_num_tokens=all_rank_max_num_tokens_list[
-                            idx_chunk],
                         repeating_info=(is_first_call, is_last_call))
 
                 outputs_list.append(outputs)

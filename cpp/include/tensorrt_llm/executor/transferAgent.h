@@ -17,10 +17,14 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -109,6 +113,80 @@ private:
     std::vector<MemoryDesc> mDescs;
 };
 
+class FileDesc
+{
+public:
+    FileDesc(std::string const& filename, int flags, mode_t mode, size_t len)
+        : mLen{len}
+    {
+        int fd = ::open(filename.c_str(), flags, mode);
+        TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' (GDS)", filename.c_str());
+        this->fd = fd;
+    }
+
+    FileDesc(FileDesc&& other) noexcept
+        : fd(other.fd)
+        , mLen(other.mLen)
+    {
+        other.fd = -1;
+        other.mLen = 0;
+    }
+
+    FileDesc& operator=(FileDesc&& other) noexcept
+    {
+        if (this != &other)
+        {
+            if (fd != -1)
+                ::close(fd);
+            fd = other.fd;
+            mLen = other.mLen;
+            other.fd = -1;
+            other.mLen = 0;
+        }
+        return *this;
+    }
+
+    ~FileDesc()
+    {
+        if (fd != -1)
+            ::close(fd);
+    }
+
+    [[nodiscard]] uint64_t getFd() const noexcept
+    {
+        return fd;
+    }
+
+    [[nodiscard]] size_t getLen() const noexcept
+    {
+        return mLen;
+    }
+
+    FileDesc(FileDesc const&) = delete;
+    FileDesc& operator=(FileDesc const&) = delete;
+
+private:
+    int fd;
+    size_t mLen;
+};
+
+class FileDescs
+{
+public:
+    FileDescs(std::vector<FileDesc>&& descs)
+        : mDescs(std::move(descs))
+    {
+    }
+
+    [[nodiscard]] std::vector<FileDesc> const& getDescs() const noexcept
+    {
+        return mDescs;
+    }
+
+private:
+    std::vector<FileDesc> mDescs;
+};
+
 using TransferDescs = MemoryDescs;
 using RegisterDescs = MemoryDescs;
 using SyncMessage = std::string;
@@ -195,6 +273,7 @@ struct BaseAgentConfig
 {
     std::string mName;
     bool useProgThread;
+    bool multiThread;
 };
 
 class BaseTransferAgent
@@ -219,6 +298,13 @@ public:
     virtual ConnectionInfoType getConnectionInfo() = 0;
     virtual void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) = 0;
     virtual bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) = 0;
+};
+
+class BaseLoopbackAgent
+{
+public:
+    virtual ~BaseLoopbackAgent() = default;
+    virtual void executeLoopbackRequest(MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) = 0;
 };
 
 class DynLibLoader final
@@ -259,6 +345,20 @@ template <typename... Args>
         using CreateNixlFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
         auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
             "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
+        return func(std::forward<Args>(args)...);
+    }
+    TLLM_THROW("Unknown backend name.");
+}
+
+template <typename... Args>
+[[nodiscard]] std::shared_ptr<BaseLoopbackAgent> makeLoopbackAgent(std::string const& backend, Args&&... args)
+{
+    if (backend == "nixl")
+    {
+        auto& loader = DynLibLoader::getInstance();
+        using CreateNixlFuncType = std::shared_ptr<BaseLoopbackAgent> (*)(BaseAgentConfig const*);
+        auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
+            "libtensorrt_llm_nixl_wrapper.so", "createNixlLoopbackAgent");
         return func(std::forward<Args>(args)...);
     }
     TLLM_THROW("Unknown backend name.");

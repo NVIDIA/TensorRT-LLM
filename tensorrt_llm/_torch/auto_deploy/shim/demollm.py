@@ -1,8 +1,9 @@
 """A demo LLM api to for debugging and testing purposes of e2e workflows."""
 
 import gc
+from collections import defaultdict
 from queue import Empty
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -10,6 +11,7 @@ import torch.multiprocessing as mp
 from ....executor import GenerationExecutor
 from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
+from ....inputs.multimodal import MultimodalParams
 from ....sampling_params import SamplingParams
 from ...pyexecutor.sampler import greedy_search_sampling_batch, top_k_sampling_batch
 from ..distributed import common as dist_ad
@@ -34,8 +36,11 @@ class DemoEngine(ADEngine):
         self.queue = mp.Queue()
 
     @torch.inference_mode()
-    def __call__(self, requests: GenerationRequest) -> mp.Queue:
+    def __call__(
+        self, requests: GenerationRequest, multimodal_params: Optional[MultimodalParams]
+    ) -> mp.Queue:
         """Generate tokens and put the results in a queue and return the queue."""
+        requests.multimodal_params = multimodal_params
         output = self.generate_tokens_batched([requests])[0]
         self.queue.put(output)
         return self.queue
@@ -45,7 +50,7 @@ class DemoEngine(ADEngine):
         self.queue.close()
         self.queue.join_thread()
 
-    def _assign_pages(self) -> List[List[int]]:
+    def _assign_pages(self, total_lens: List[int]) -> List[List[int]]:
         """A simple heuristic to assign pages based on current sequence info.
 
         In a nutshell, we will look at the following information to update the page assignments:
@@ -67,7 +72,6 @@ class DemoEngine(ADEngine):
         unassigned page if needed.
         """
         si = self.cache_seq_interface.info
-        total_lens = [s_l + i_p for s_l, i_p in zip(si.sequence_lengths, si.input_positions)]
         page_assignments = si.page_assignments
 
         free_pages = set(range(si.num_pages)) - {i for pages in page_assignments for i in pages}
@@ -76,7 +80,7 @@ class DemoEngine(ADEngine):
             extra_tokens = t_l - len(pages) * si.page_size
             num_extra_pages = (extra_tokens // si.page_size) + (extra_tokens > 0)
             updated_assignments.append(pages + [free_pages.pop() for _ in range(num_extra_pages)])
-        si.assign_cache_loc(updated_assignments)
+        return updated_assignments
 
     def generate_tokens_batched(
         self, requests: List[GenerationRequest]
@@ -91,32 +95,57 @@ class DemoEngine(ADEngine):
         )
         assert sampling_params.best_of == 1, "Best-of is not supported."
 
-        # set up sequence info object
+        # set up sequence info object for decode phase
         sequence_info = self.cache_seq_interface.info
+
+        input_ids = []
+        total_lens = []
+        extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+        for request in requests:
+            total_lens.append(len(request.prompt_token_ids))
+            input_ids.append(request.prompt_token_ids)
+            if request.multimodal_params is not None:
+                for k, v in request.multimodal_params.multimodal_data.items():
+                    extra_args[k].append(v)
+
         sequence_info.reset()
-        sequence_info.nest_sequences([r.prompt_token_ids for r in requests])
+        sequence_info.nest_sequences(
+            input_ids=input_ids,
+            input_pos=0,
+            page_assignments=self._assign_pages(total_lens),
+            **extra_args,
+        )
 
         # setup objects we want to track for the output
         batch_size = sequence_info.num_sequences
         new_tokens = [[] for _ in range(batch_size)]  # [batch_size][max_seq_len]
         stop_tokens = sampling_params._get_stop_words()
+        # NOTE: TRTLLM has made the intentional choice to separate `end_id` from `stop_words`, and not
+        # include the former in the latter's corresponding stop IDs. From a UX perspective, `stop_words`
+        # are optional, and can be customized per user requests, whereas `end_id` is static per model,
+        # and should always be used outside of benchmarking.
+        stop_tokens.append([sampling_params.end_id])
         idxs_stop = [sampling_params.max_tokens - 1] * batch_size
         gen_logits = [] if sampling_params.return_generation_logits else None
         context_logits: Optional[List[torch.Tensor]] = None
 
         def _generate_single_step(idx: int):
-            # assign pages
-            self._assign_pages()
-
-            # get the logits and then last token logits in each sequence ([b, 1, vocab_size])
             logits = self._compute_logits()
             logits_last = torch.stack([l_one_seq[-1] for l_one_seq in logits]).float().unsqueeze(1)
 
             token_ids, _ = self._decode_tokens(logits_last, sampling_params)  # [b,1]
 
-            # update sequence info accordingly for next step
-            sequence_info.update_pos(sequence_info.sequence_lengths)
-            sequence_info.nest_sequences(token_ids)
+            # update sequence info accordingly for next step (generate phase)
+            input_pos_next = sequence_info.input_pos
+            seq_lens_current = sequence_info.seq_len
+            input_pos_next = [ip + sl for ip, sl in zip(input_pos_next, seq_lens_current)]
+            total_lens_next = [ip + len(t_ids) for ip, t_ids in zip(input_pos_next, token_ids)]
+            sequence_info.nest_sequences(
+                token_ids,
+                input_pos=input_pos_next,
+                page_assignments=self._assign_pages(total_lens_next),
+            )
 
             # nest new tokens and run stop check
             for b, (new_tokens_b, new_id) in enumerate(zip(new_tokens, token_ids)):
@@ -255,6 +284,7 @@ class DemoGenerationExecutor(GenerationExecutor):
         def _unpack(inputs) -> GenerationRequest:
             args, kwargs = inputs  # unpack the inputs
             request: GenerationRequest = args[0]
+            request.multimodal_params: Optional[MultimodalParams] = args[1]
             return request
 
         engine = DemoEngine.build_from_config(**engine_kwargs)
@@ -309,8 +339,11 @@ class DemoGenerationExecutor(GenerationExecutor):
             request.set_id(client_id)
 
         # submit request to our demo engine and store results
+        # NOTE: when returning from this function, the reference request.multimodal_params will
+        # be cleared immediately. So we pass it in explicitly to maintain a reference even when
+        # requests get submitted asynchronously.
         result = GenerationResult(request)
-        result.queue = self.engine_executor(request)
+        result.queue = self.engine_executor(request, request.multimodal_params)
 
         return result
 

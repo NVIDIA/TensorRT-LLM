@@ -116,6 +116,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
+        disable_deep_gemm: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -134,6 +135,7 @@ class Attention(nn.Module):
             config (Optional[ModelConfig]): The model configuration.
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
+            disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -215,7 +217,10 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            disable_deep_gemm=disable_deep_gemm,
+        )
+
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
@@ -230,7 +235,9 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.o_lora,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            disable_deep_gemm=disable_deep_gemm,
+        )
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -315,7 +322,8 @@ class Attention(nn.Module):
         if self.attn_backend == "TRTLLM":
             has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                                or self.o_proj.has_fp8_block_scales
-                               or self.o_proj.has_fp8_rowwise)
+                               or self.o_proj.has_fp8_rowwise
+                               or self.o_proj.has_w4a8_nvfp4_fp8)
             if has_quant_scale and (self.attn.has_fp8_kv_cache
                                     or self.attn.has_fp4_kv_cache):
                 out_dtype = torch.float8_e4m3fn
@@ -338,25 +346,20 @@ class Attention(nn.Module):
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
     ):
-
-        padded_num_tokens = attn_metadata.padded_num_tokens
         num_tokens = attn_metadata.num_tokens
 
-        if padded_num_tokens is not None:
-            assert q.shape[0] == padded_num_tokens
-            q = q[:num_tokens, :]
-            if k is not None:
-                assert k.shape[0] == padded_num_tokens
-                k = k[:num_tokens, :]
-            if v is not None:
-                assert v.shape[0] == padded_num_tokens
-                v = v[:num_tokens, :]
+        q = q[:num_tokens, :]
+        if k is not None:
+            k = k[:num_tokens, :]
+        if v is not None:
+            v = v[:num_tokens, :]
 
         out_scale = None
         out_scale_sf = None
         has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
                            or self.o_proj.has_fp8_block_scales
-                           or self.o_proj.has_fp8_rowwise)
+                           or self.o_proj.has_fp8_rowwise
+                           or self.o_proj.has_w4a8_nvfp4_fp8)
         if has_quant_scale:
             out_scale = self.o_proj.inv_input_scale
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output:
@@ -575,8 +578,13 @@ def fp8_block_scaling_bmm_out(
     if sm_version == 90 or sm_version == 89:
         mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
             mat1)
+
+        output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
         torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
-                                                   mat1_scale, mat2_scale, out)
+                                                   mat1_scale, mat2_scale,
+                                                   output)
+        out.copy_(output)
+
     elif sm_version == 100:
         torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
     else:
@@ -954,12 +962,10 @@ class MLA(nn.Module):
         num_generations = attn_metadata.num_generations
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_tokens = attn_metadata.num_tokens
-        padded_num_tokens = attn_metadata.padded_num_tokens
 
-        if padded_num_tokens is not None:
-            hidden_states = hidden_states[:num_tokens, ...]
-            if position_ids is not None:
-                position_ids = position_ids[:num_tokens, ...]
+        hidden_states = hidden_states[:num_tokens, ...]
+        if position_ids is not None:
+            position_ids = position_ids[..., :num_tokens]
 
         if self.is_lite:
             compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
