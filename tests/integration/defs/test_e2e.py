@@ -2364,9 +2364,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     # NOTE: individual tests need to be enabled in
     # tests/integration/test_lists/qa/examples_test_list.txt
 
-    if model_name == "Nano-v2-VLM" and modality == "video":
-        pytest.skip("Nano V2 VLM cannot support video modality.")
-
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     test_data_root = Path(
         os.path.join(llm_models_root(), "multimodals", "test_data"))
@@ -2412,6 +2409,13 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ["natural", "ocean", "waves", "stormy", "overcast", "sea"],
                 ["mountain", "rock", "large", "clear", "blue", "sky"],
                 ["road", "lane", "vehicle", "bus", "cars", "traffic"],
+            ],
+            "video": [
+                [
+                    "person", "red", "dress", "walking", "street", "black",
+                    "leather", "jacket"
+                ],
+                ["space", "earth", "black", "frame", "city", "lights", "dark"],
             ],
             "mixture_text_image":
             [["invented", "internet", "person", "people", "computers"],
@@ -2518,6 +2522,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     if model_name == "Nano-v2-VLM":
         cmd.append("--max_batch_size=128")
         cmd.append("--disable_kv_cache_reuse")
+        if modality == "video":
+            cmd.append("--max_num_tokens=20480")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 

@@ -33,9 +33,10 @@ def _is_disagg() -> bool:
 
 # TODO: update the reference config path once Nano v2 VLM is released.
 IMAGE_TOKEN_ID = 131072
-IMG_CONTEXT_TOKEN = "<image>"
-IMG_START_TOKEN = "<img>"
-IMG_END_TOKEN = "</img>"
+IMG_CONTEXT_TOKEN = "<image>"  # nosec
+VIDEO_CONTEXT_TOKEN = "<video>"  # nosec
+IMG_START_TOKEN = "<img>"  # nosec
+IMG_END_TOKEN = "</img>"  # nosec
 
 
 class SquaredReLU(nn.Module):
@@ -127,11 +128,11 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     def forward(self, multimodal_params: List[MultimodalParams]):
         mm_embedding = []
         # Batch data.
-        batched_pixel_values = torch.cat([
+        pixel_values = [
             multimodal_param.multimodal_data["pixel_values"]
             for multimodal_param in multimodal_params
-        ],
-                                         dim=0)
+        ]
+        batched_pixel_values = torch.cat(pixel_values, dim=0)
         # -> [num_patches, channel, height, width]
         patch_list = [
             multimodal_param.multimodal_data["num_patches"]
@@ -180,6 +181,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             model_path, trust_remote_code=True, use_fast=self.use_fast)
 
         self.img_context_token = IMG_CONTEXT_TOKEN
+        self.video_context_token = VIDEO_CONTEXT_TOKEN
         self.img_start_token = IMG_START_TOKEN
         self.img_end_token = IMG_END_TOKEN
         self.dtype = model_config.torch_dtype
@@ -262,7 +264,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
             "multi_modal_data", {})
         images = mm_data.get("image", None)
-
+        videos = mm_data.get("video", None)
         if images is not None:
             if isinstance(images[0], torch.Tensor):
                 # NanoV2VL can only support PIL images. Convert normalized tensors (0-1) to PIL images (0-255).
@@ -270,28 +272,68 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                     Image.fromarray((image.permute(1, 2, 0) * 255).to(
                         torch.uint8).cpu().numpy()) for image in images
                 ]
+            # Processing for multimodal data.
+            processed_images = self.processor(images=images,
+                                              return_tensors='pt').to(
+                                                  self.device)
+            # Insert enough special tokens for image embedding.
+            parts = text_prompt.split(self.img_context_token)
+            if len(parts) - 1 != len(processed_images['num_patches']):
+                raise ValueError(
+                    f"Number of {self.img_context_token} tokens ({len(parts) - 1}) doesn't match num_patches_list length ({len(processed_images['num_patches'])})"
+                )
+            processed_query = parts[0]
+            for num_patches, part in zip(processed_images['num_patches'],
+                                         parts[1:]):
+                feature_size = num_patches * self.num_image_token
+                image_repl = self.img_start_token + self.img_context_token * feature_size + self.img_end_token
+                processed_query += image_repl + part
+
+        elif videos is not None:
+            num_videos = len(videos)
+
+            num_patches_list = []
+            pixel_values_list = []
+            parts = text_prompt.split(self.video_context_token)
+            if len(parts) - 1 != num_videos:
+                raise ValueError(
+                    f"Number of {self.video_context_token} tokens ({len(parts) - 1}) doesn't match number of videos ({num_videos})"
+                )
+            # Process videos one by one to get correct processed_query.
+            processed_query = ""
+            for video_index, video in enumerate(videos):
+                if isinstance(videos[0][0], torch.Tensor):
+                    # NanoV2VL can only support PIL images. Convert normalized tensors (0-1) to PIL images (0-255).
+                    images = [
+                        Image.fromarray((image.permute(1, 2, 0) * 255).to(
+                            torch.uint8).cpu().numpy()) for image in video
+                    ]
+                else:
+                    images = video
+                # Processing for multimodal data.
+                processed_images = self.processor(images=images,
+                                                  return_tensors='pt').to(
+                                                      self.device)
+                num_patches_list.append(processed_images['num_patches'])
+                pixel_values_list.append(processed_images['pixel_values'])
+
+                # Processing the text prompt.
+                processed_query += parts[video_index]
+                for num_patches in processed_images['num_patches']:
+                    feature_size = num_patches * self.num_image_token
+                    image_repl = self.img_start_token + self.img_context_token * feature_size + self.img_end_token
+                    processed_query += image_repl
+            processed_query += parts[num_videos]
+            processed_images['num_patches'] = torch.tensor(
+                [sum(num_patches) for num_patches in num_patches_list])
+            processed_images['pixel_values'] = torch.cat(pixel_values_list,
+                                                         dim=0)
         else:
             input_ids = self.tokenizer.encode(text_prompt,
                                               add_special_tokens=False,
                                               return_tensors="pt")
             return input_ids[0].to(torch.int32).tolist(), {}
 
-        # Processing for multimodal data.
-        processed_images = self.processor(images=images,
-                                          return_tensors='pt').to(self.device)
-
-        # Insert enough special tokens for image embedding.
-        parts = text_prompt.split(self.img_context_token)
-        if len(parts) - 1 != len(processed_images['num_patches']):
-            raise ValueError(
-                f"Number of {self.img_context_token} tokens ({len(parts) - 1}) doesn't match num_patches_list length ({len(processed_images['num_patches'])})"
-            )
-        processed_query = parts[0]
-        for num_patches, part in zip(processed_images['num_patches'],
-                                     parts[1:]):
-            feature_size = num_patches * self.num_image_token
-            image_repl = self.img_start_token + self.img_context_token * feature_size + self.img_end_token
-            processed_query += image_repl + part
         input_ids = self.tokenizer.encode(processed_query,
                                           add_special_tokens=False,
                                           return_tensors="pt")
@@ -313,6 +355,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
             "image": IMG_CONTEXT_TOKEN,
+            "video": VIDEO_CONTEXT_TOKEN,
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
