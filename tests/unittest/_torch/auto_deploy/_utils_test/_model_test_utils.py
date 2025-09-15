@@ -253,6 +253,28 @@ class BMMDynamicModel(nn.Module):
         return torch.bmm(x, dynamic_weights)
 
 
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+class FakeFP8Linear(nn.Linear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        device = self.weight.device
+        amax = self.weight.detach().abs().max().to(torch.float)
+        eps = torch.finfo(torch.float32).tiny
+        weight_scale = torch.clamp(amax / FP8_MAX, min=eps).to(device)
+        self.weight = nn.Parameter((self.weight / weight_scale).to(torch.float8_e4m3fn))
+        self.register_buffer(
+            "input_scale", torch.tensor(1.0, device=self.weight.device, dtype=torch.float)
+        )
+        self.register_buffer("weight_scale", weight_scale)
+
+    def forward(self, x):
+        return torch.ops.auto_deploy.torch_fake_quant_fp8_linear(
+            x, self.weight, self.bias, [self.input_scale], [self.weight_scale], [], []
+        )
+
+
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {
@@ -432,6 +454,15 @@ _SMALL_MODEL_CONFIGS = {
         ),
         "model_kwargs": {
             "num_hidden_layers": 2,
+        },
+    },
+    "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
+        "model": f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503",
+        "model_factory": "Mistral3VLM",
+        "compile_backend": "torch-simple",
+        "model_kwargs": {
+            "text_config": {"num_hidden_layers": 2},
+            "vision_config": {"num_hidden_layers": 2},
         },
     },
 }

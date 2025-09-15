@@ -394,7 +394,7 @@ void initRequestBindings(nb::module_& m)
         new (&kvCacheRetentionConfig) tle::KvCacheRetentionConfig(
             nb::cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(state[0]),
             nb::cast<tle::RetentionPriority>(state[1]), nb::cast<std::optional<std::chrono::milliseconds>>(state[2]),
-            nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::optional<std::string>>(state[4]));
+            nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::string>(state[4]));
     };
 
     auto kvCacheRetentionConfig = nb::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
@@ -417,7 +417,7 @@ void initRequestBindings(nb::module_& m)
     // TokenRangeRetentionPriority bindings have been defined.
     kvCacheRetentionConfig
         .def(nb::init<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>, tle::RetentionPriority,
-                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::optional<std::string>>(),
+                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::string>(),
             nb::arg("token_range_retention_configs"),
             nb::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             nb::arg("decode_duration_ms") = nb::none(), nb::arg("transfer_mode") = tle::KvCacheTransferMode::DRAM,
@@ -889,19 +889,20 @@ void initRequestBindings(nb::module_& m)
         .def(nb::init<>())
         .def_rw("is_final", &tle::Result::isFinal)
         .def_rw("output_token_ids", &tle::Result::outputTokenIds)
-        .def_rw("cum_log_probs", &tle::Result::cumLogProbs)
-        .def_rw("log_probs", &tle::Result::logProbs)
-        .def_rw("context_logits", &tle::Result::contextLogits)
-        .def_rw("generation_logits", &tle::Result::generationLogits)
-        .def_rw("spec_dec_fast_logits_info", &tle::Result::specDecFastLogitsInfo)
-        .def_rw("encoder_output", &tle::Result::encoderOutput)
+        .def_rw("cum_log_probs", &tle::Result::cumLogProbs, nb::arg("cum_log_probs").none())
+        .def_rw("log_probs", &tle::Result::logProbs, nb::arg("log_probs").none())
+        .def_rw("context_logits", &tle::Result::contextLogits, nb::arg("context_logits").none())
+        .def_rw("generation_logits", &tle::Result::generationLogits, nb::arg("generation_logits").none())
+        .def_rw("spec_dec_fast_logits_info", &tle::Result::specDecFastLogitsInfo,
+            nb::arg("spec_dec_fast_logits_info").none())
+        .def_rw("encoder_output", &tle::Result::encoderOutput, nb::arg("encoder_output").none())
         .def_rw("finish_reasons", &tle::Result::finishReasons)
         .def_rw("sequence_index", &tle::Result::sequenceIndex)
         .def_rw("is_sequence_final", &tle::Result::isSequenceFinal)
         .def_rw("decoding_iter", &tle::Result::decodingIter)
         .def_rw("avg_decoded_tokens_per_iter", &tle::Result::avgDecodedTokensPerIter)
-        .def_rw("context_phase_params", &tle::Result::contextPhaseParams)
-        .def_rw("request_perf_metrics", &tle::Result::requestPerfMetrics)
+        .def_rw("context_phase_params", &tle::Result::contextPhaseParams, nb::arg("context_phase_params").none())
+        .def_rw("request_perf_metrics", &tle::Result::requestPerfMetrics, nb::arg("request_perf_metrics").none())
         .def_rw("additional_outputs", &tle::Result::additionalOutputs)
         .def("__getstate__", resultGetstate)
         .def("__setstate__", resultSetstate);

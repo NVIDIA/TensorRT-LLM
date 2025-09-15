@@ -102,7 +102,7 @@ def test_cudagraph_capture_replay(
         graph_module,
         in_spec,
         out_spec,
-        max_batch_size=batch_size,
+        cuda_graph_batch_sizes=[batch_size],
         num_batched_inputs=num_inputs,
     )
 

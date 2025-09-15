@@ -614,7 +614,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         assert input.dtype == torch.bfloat16
 
         if get_sm_version() == 100:
-            if module.use_cute_dsl_blockscaling_mm:
+            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
                 # TODO (@lmin): replace with cute_dsl gemm
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
@@ -1798,6 +1798,7 @@ class Linear(nn.Module):
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
+        disable_deep_gemm: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -1816,6 +1817,7 @@ class Linear(nn.Module):
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_nvfp4_blockscaling_mm = use_cute_dsl_nvfp4_blockscaling_mm
+        self.disable_deep_gemm = disable_deep_gemm
 
         local_in_features = in_features
         local_out_features = out_features
