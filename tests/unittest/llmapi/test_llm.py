@@ -1882,7 +1882,6 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
 @pytest.mark.parametrize(
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
     [(2, None, True, False), (None, 2, False, False)])
-@pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5516849")
 def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                              logprobs: Optional[int],
                              return_context_logits: bool,
@@ -1894,7 +1893,6 @@ def test_llm_return_logprobs(prompt_logprobs: Optional[int],
 
 @pytest.mark.skip(reason="https://nvbugs/5516660")
 @force_ampere
-@pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5516849")
 def test_llm_return_logprobs_streaming():
     llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
 
