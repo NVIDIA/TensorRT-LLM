@@ -40,9 +40,6 @@ class CUDAGraphRunner:
         self.max_beam_width = engine.max_beam_width
         self.spec_config = engine.spec_config
 
-        self.max_possible_draft_len = (self.spec_config.max_draft_len
-                                       if self.enable_spec_decode else 0)
-
         self.graphs: Dict[Tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[Tuple[int, int],
                                  Callable[[], Optional[torch.Tensor]]] = {}
@@ -58,7 +55,7 @@ class CUDAGraphRunner:
         """Allocates static tensors sized for the largest possible batch."""
         engine = self._get_engine()
 
-        token_per_request = self.max_possible_draft_len + 1
+        token_per_request = self.draft_len + 1
         max_total_tokens = (self.max_supported_batch_size *
                             self.max_beam_width * token_per_request)
         max_total_tokens = min(max_total_tokens, engine.max_num_tokens)
@@ -78,7 +75,7 @@ class CUDAGraphRunner:
 
     @property
     def enable_spec_decode(self):
-        return self._get_engine().is_spec_decode
+        return self._get_engine().enable_spec_decode
 
     @property
     def draft_len(self):
@@ -174,7 +171,7 @@ class CUDAGraphRunner:
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
-        token_per_request = self.max_possible_draft_len + 1
+        token_per_request = self.draft_len + 1
         num_tokens_for_capture = (batch_size * self.max_beam_width *
                                   token_per_request)
 

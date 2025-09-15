@@ -563,6 +563,9 @@ class TorchSampler(Sampler):
             if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
+            else:
+                req.py_num_accepted_draft_tokens = 0
+                req.py_rewind_len = 0
             processed += num_accepted
             self.handle_logprobs(req, state, beam=self.BEAM, count=processed)
             req.py_decoding_iter += 1
