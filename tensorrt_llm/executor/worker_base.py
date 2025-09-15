@@ -17,7 +17,7 @@ from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, print_colored_debug
+from ..llmapi.utils import _SyncQueue, logger_debug, print_colored_debug
 from ..logger import logger
 from ..lora_manager import LoraConfig, LoraManager
 from ..metrics import RequestEventTiming
@@ -92,6 +92,11 @@ class WorkerBase(GenerationExecutor):
         self._runtime_model_config: Optional[ModelConfig] = None
 
     def setup_engine(self) -> None:
+        logger_debug(f"WorkerBase {self.rank} is setting up the engine",
+                     color="yellow")
+
+        # Force all the ranks to wait here, and start creating the executor simultaneously.
+        mpi_comm().barrier()
 
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
@@ -142,7 +147,14 @@ class WorkerBase(GenerationExecutor):
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
+
+            logger_debug(f"WorkerBase {self.rank} creating py_executor",
+                         color="yellow")
             self.engine = create_executor(**args)
+            logger_debug(f"WorkerBase {self.rank} created py_executor",
+                         color="yellow")
+        logger_debug(f"WorkerBase {self.rank} setup engine done",
+                     color="yellow")
 
         self._setup_lora(engine, executor_config, self._lora_config)
 
@@ -468,16 +480,23 @@ class WorkerBase(GenerationExecutor):
         self._client_id_to_request_id.pop(client_id, None)
 
     def shutdown(self):
-        if self.engine is not None:
-            if self.engine.can_enqueue_requests():
-                self.engine.shutdown()
-                self.engine = None
+        if self.engine is None:
+            return
 
-            if hasattr(
-                    self._executor_config, "checkpoint_loader"
-            ) and self._executor_config.checkpoint_loader is not None:
-                self._executor_config.checkpoint_loader.cleanup()
-                self._executor_config.checkpoint_loader = None
+        logger_debug(f"WorkerBase {self.rank} is shutting down", color="yellow")
+        if self.engine.can_enqueue_requests():
+            self.engine.shutdown()
+            self.engine = None
+
+        if hasattr(self._executor_config, "checkpoint_loader"
+                   ) and self._executor_config.checkpoint_loader is not None:
+            self._executor_config.checkpoint_loader.cleanup()
+            self._executor_config.checkpoint_loader = None
+
+        self.engine = None
+
+        logger_debug(f"WorkerBase {self.rank} shutdown done", color="yellow")
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 

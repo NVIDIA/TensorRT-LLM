@@ -1,6 +1,19 @@
 from typing import Any, Literal, NamedTuple, Optional
 
 
+class RPCParams(NamedTuple):
+    """ Parameters for RPC calls. """
+
+    # seconds to wait for the response
+    timeout: Optional[float] = None
+
+    # whether the client needs the response, if False, it will return immediately
+    need_response: bool = True
+
+    # mode for RPC calls: "sync", "async", or "future"
+    mode: str = "sync"
+
+
 # --- Custom Exceptions ---
 class RPCError(Exception):
     """Custom exception for RPC-related errors raised on the client side.

@@ -1,9 +1,13 @@
+import asyncio
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import torch
 
 from tensorrt_llm.llmapi.llm_utils import *
+from tensorrt_llm.llmapi.utils import AsyncQueue
 
 # isort: off
 from .test_llm import llama_model_path
@@ -58,3 +62,25 @@ def test_LlmArgs_default_gpus_per_node():
     # set explicitly
     llm_args = TrtLlmArgs(model=llama_model_path, gpus_per_node=6)
     assert llm_args.gpus_per_node == 6
+
+
+def test_AsyncQueue():
+    queue = AsyncQueue()
+
+    # put data to queue sync in a thread
+    # async get data from queue in the current event loop
+    # NOTE: the event loop in the two threads are different
+
+    def put_data_to_queue():
+        for i in range(10):
+            time.sleep(0.1)
+            queue.put(i)
+
+    async def get_data_from_queue():
+        for i in range(10):
+            print(f"get: {queue.get()}")
+
+    thread = threading.Thread(target=put_data_to_queue)
+    thread.start()
+    asyncio.run(get_data_from_queue())
+    thread.join()
