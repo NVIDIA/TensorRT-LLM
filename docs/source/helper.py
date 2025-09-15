@@ -310,6 +310,14 @@ def generate_llmapi():
     public_classes_names = extract_all_and_eval(llmapi_all_file)['__all__']
 
     content = underline("API Reference", "-") + "\n\n"
+    content += ".. note::\n"
+    content += "    Since version 1.0, we have attached a status label to `LLM`, `LlmArgs` and `TorchLlmArgs` Classes.\n\n"
+    content += '    1. :tag:`prototype` - The item is a prototype and is subject to change.\n'
+    content += '    2. :tag:`beta` - The item is in beta and approaching stability.\n'
+    content += '    3. :tag:`deprecated` - The item is deprecated and will be removed in a future release.\n'
+    content += "    4. For the remaining items without a status label, they are considered **stable**.\n"
+    content += "\n"
+
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
         options = [
@@ -328,7 +336,6 @@ def generate_llmapi():
 
         content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
         content += "\n".join(options) + "\n\n"
-
     with open(doc_path, "w+") as f:
         f.write(content)
 
