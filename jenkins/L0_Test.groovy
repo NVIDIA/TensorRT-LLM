@@ -121,28 +121,33 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200"]
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
-COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=60 -o ServerAliveCountMax=5"
+COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
-            ip           : cluster.ip,
-            host         : cluster.host,
+            ip           : randomLoginNode,
+            host         : randomLoginNode,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
         ]
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+
+        def downloadSucceed = false
+
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results/results.xml"
             def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
-            def downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
+            downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
             if (downloadSucceed) {
                 sh "ls ${stageName}"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
+                ensureStageResultNotUploaded(stageName)
                 trtllm_utils.uploadArtifacts(
                     "results-${stageName}.tar.gz",
                     "${UPLOAD_PATH}/test-results/"
@@ -151,8 +156,9 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
                 println("No results xml to submit")
             }
         }
+
         if (downloadSucceed) {
-            junit(testResults: "${stageName}/results*.xml")
+            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
         }
     }
 }
@@ -160,9 +166,10 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 //TODO: consolidate slurm related code for both multi nodes and single nodes
 def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID, String slurmOutputFile) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
-            ip           : cluster.ip,
-            host         : cluster.host,
+            ip           : randomLoginNode,
+            host         : randomLoginNode,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
@@ -222,9 +229,10 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
 
 def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, String slurmJobID) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
-            ip           : cluster.ip,
-            host         : cluster.host,
+            ip           : randomLoginNode,
+            host         : randomLoginNode,
             user         : "${pipeline.USERNAME}",
             passwd       : "${pipeline.PASSWORD}",
             allowAnyHosts: true,
@@ -305,13 +313,15 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
 
     def slurmJobID = null
+    def dockerArgs = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+            def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
             def remote = [
-                    ip           : cluster.ip,
-                    host         : cluster.host,
+                    ip           : randomLoginNode,
+                    host         : randomLoginNode,
                     user         : "${pipeline.USERNAME}",
                     passwd       : "${pipeline.PASSWORD}",
                     allowAnyHosts: true,
@@ -328,6 +338,8 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3)
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
+
+                Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -368,9 +380,10 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
         stage('Checking if the Node is Online') {
             withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
                 def remote = [
-                        ip           : cluster.ip,
-                        host         : cluster.host,
+                        ip           : randomLoginNode,
+                        host         : randomLoginNode,
                         user         : "${pipeline.USERNAME}",
                         passwd       : "${pipeline.PASSWORD}",
                         allowAnyHosts: true,
@@ -388,8 +401,6 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                def dockerGPUOption = ""
-
                 node(nodeName) {
                     sh """
                         env | sort
@@ -408,7 +419,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     // Dynamically set GPU arguments based on environment variables
                     // https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
                     // It's intentional to check NV_GPU first.
-                    dockerGPUOption = sh(script: """
+                    dockerArgs = sh(script: """
                         if [ -n "\$NV_GPU" ]; then
                             echo "--gpus '\\"device=\$NV_GPU\\"'"
                         elif [ -n "\$CUDA_VISIBLE_DEVICES" ]; then
@@ -419,7 +430,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     """, returnStdout: true).trim()
                 }
 
-                def dockerArgs = "${dockerGPUOption} " +
+                dockerArgs = "${dockerArgs} " +
                     "--cap-add=SYS_ADMIN " +
                     "--ipc=host " +
                     "--entrypoint=\"\" " +
@@ -430,18 +441,17 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                     "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
                     "--cap-add=SYSLOG"
 
-                echo "Final dockerArgs: ${dockerArgs}"
-
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
                 }
-
-                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
-                executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+                echo "Final dockerArgs: ${dockerArgs}"
             } else {
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
             }
         }
+
+        slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
+        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
     } finally {
         stage("Clean up SLURM Resources") {
             // Workaround to handle the interruption during clean up SLURM resources
@@ -488,9 +498,10 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 passwordVariable: 'PASSWORD'
             )
         ]) {
+            def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
             def remote = [
-                    ip           : cluster.ip,
-                    host         : cluster.host,
+                    ip           : randomLoginNode,
+                    host         : randomLoginNode,
                     user         : "${pipeline.USERNAME}",
                     passwd       : "${pipeline.PASSWORD}",
                     allowAnyHosts: true,
@@ -560,7 +571,8 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
                 def scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
                 def scriptContent = """#!/bin/bash
-                    set -o pipefail
+                    set -Eeuo pipefail
+                    trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
@@ -586,6 +598,8 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             }
 
             stage('Run Test') {
+                Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
+
                 Utils.exec(
                     pipeline,
                     timeout: false,
@@ -692,6 +706,10 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
 ]
 
+class GlobalState {
+    static def uploadResultStageNames = []
+}
+
 String getShortenedJobName(String path)
 {
     static final nameMapping = [
@@ -723,7 +741,7 @@ String getShortenedJobName(String path)
     return parts.join('-').toLowerCase()
 }
 
-def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false)
+def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="")
 {
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
@@ -735,6 +753,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         stageIsInterrupted = true
         throw e
     } finally {
+        ensureStageResultNotUploaded(stageName + postTag)
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
@@ -762,9 +781,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "STAGE_NAME=${stageName}"
             sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
             echo "Upload test results."
-            sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
             trtllm_utils.uploadArtifacts(
-                "results-${stageName}.tar.gz",
+                "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
             junit(testResults: "${stageName}/results*.xml")
@@ -1765,7 +1784,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 }
 
 
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="")
 {
     cacheErrorAndUploadResult(stageName, {
         runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
@@ -1805,7 +1824,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         // Copy CPP test result
         sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
         sh "ls ${stageName}/ -all"
-    })
+    }, false, postTag)
 }
 
 
@@ -1943,6 +1962,19 @@ def checkStageName(stageNames) {
     }
 }
 
+def ensureStageResultNotUploaded(stageName) {
+    if(!GlobalState.uploadResultStageNames.contains(stageName)) {
+        GlobalState.uploadResultStageNames.add(stageName)
+    } else {
+        stage('Upload Test Results') {
+            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                error "Upload test results for ${stageName} failed because it has already been uploaded."
+            }
+        }
+    }
+}
+
+// TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
 def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
 {
     return {
@@ -1954,14 +1986,18 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
                 stage('Pull Docker Image') {
                     docker.image(image).pull()
                 }
-                docker.image(image).inside(dockerArgs) {
-                    runner()
+                // We submit the Slurm job with SlurmConfig.DEFAULT_TIMEOUT minutes (300) timeout
+                // The timeout here is to avoid the Slurm job being stuck.
+                timeout(time: SlurmConfig.DEFAULT_TIMEOUT, unit: 'MINUTES') {
+                    docker.image(image).inside(dockerArgs) {
+                        runner()
+                    }
                 }
             } catch (Exception e) {
                 if (e.getMessage()?.contains("Failed to kill container")) {
                     echo "Known benign error ignored: ${e.getMessage()}"
                 } else {
-                    throw e // Re-throw if it's a different IOException
+                    throw e // Re-throw if it's a different Exception
                 }
             }
         }
@@ -2150,10 +2186,11 @@ def launchTestJobs(pipeline, testFilter)
 
     multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
+        // Disable GB200 multi-node testing in L0 pre-merge until the configuration issue is resolved (https://nvbugs/5455140)
+        // "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
+        // "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],
@@ -2419,7 +2456,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null, "-SubJob-RunTest")
                         }
                     })
                 }
@@ -2652,7 +2689,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage")
                 })
             }
         } else {

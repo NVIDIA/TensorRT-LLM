@@ -1877,6 +1877,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         asyncio.run(main())
 
 
+@pytest.mark.skip(reason="https://nvbugs/5516660")
 @force_ampere
 @pytest.mark.parametrize(
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
@@ -1891,6 +1892,7 @@ def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                                      return_generation_logits)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5516660")
 @force_ampere
 @pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5516849")
 def test_llm_return_logprobs_streaming():
