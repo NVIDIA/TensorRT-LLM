@@ -826,7 +826,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale,
+                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
+                            self.next_attn.qkv_proj, 'input_scale') else None,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             elif use_fp4_allreduce and self.next_attn is not None:
@@ -837,7 +838,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                         RESIDUAL_RMS_NORM_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale,
+                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
+                            self.next_attn.qkv_proj, 'input_scale') else None,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:
