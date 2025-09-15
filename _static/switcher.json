@@ -103,5 +103,9 @@
     {
         "version": "1.1.0rc2.post1",
         "url": "https://nvidia.github.io/TensorRT-LLM/1.1.0rc2.post1/"
+    },
+    {
+        "version": "1.1.0rc2.post2",
+        "url": "https://nvidia.github.io/TensorRT-LLM/1.1.0rc2.post2/"
     }
 ]
