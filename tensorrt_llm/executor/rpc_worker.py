@@ -57,8 +57,8 @@ class RpcWorker(WorkerBase):
                      color="yellow")
         # NOTE: This is a blocking call, it will wait for the responses to be available.
         super().await_responses(timeout)
-        logger_debug(f"RpcWorker returning responses", color="yellow")
         qsize = self._response_queue.qsize()
+        logger_debug(f"RpcWorker returning {qsize} responses", color="yellow")
         return [self._response_queue.get() for _ in range(qsize)]
 
     async def fetch_responses_async(self) -> list:

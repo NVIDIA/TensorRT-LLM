@@ -11,6 +11,59 @@ from .rpc_common import (RPCCancelled, RPCParams, RPCRequest, RPCResponse,
                          RPCStreamingError, RPCTimeout)
 
 
+class RemoteCall:
+    """Helper class to enable chained remote call syntax like client.method().remote()"""
+
+    def __init__(self, client: 'RPCClient', method_name: str, *args, **kwargs):
+        self.client = client
+        self.method_name = method_name
+        self.args = args
+        self.kwargs = kwargs
+
+    def remote(self,
+               timeout: Optional[float] = None,
+               need_response: bool = True) -> Any:
+        """Synchronous remote call with optional RPC parameters."""
+        rpc_params = RPCParams(timeout=timeout,
+                               need_response=need_response,
+                               mode="sync")
+        self.kwargs["__rpc_params"] = rpc_params
+        return self.client._call_sync(self.method_name, *self.args,
+                                      **self.kwargs)
+
+    def remote_async(self,
+                     timeout: Optional[float] = None,
+                     need_response: bool = True):
+        """Asynchronous remote call that returns a coroutine."""
+        rpc_params = RPCParams(timeout=timeout,
+                               need_response=need_response,
+                               mode="async")
+        self.kwargs["__rpc_params"] = rpc_params
+        return self.client._call_async(self.method_name, *self.args,
+                                       **self.kwargs)
+
+    def remote_future(self,
+                      timeout: Optional[float] = None,
+                      need_response: bool = True) -> concurrent.futures.Future:
+        """Remote call that returns a Future object."""
+        rpc_params = RPCParams(timeout=timeout,
+                               need_response=need_response,
+                               mode="future")
+        self.kwargs["__rpc_params"] = rpc_params
+        return self.client.call_future(self.method_name, *self.args,
+                                       **self.kwargs)
+
+    def remote_streaming(self,
+                         timeout: Optional[float] = None) -> AsyncIterator[Any]:
+        """Remote call for streaming results."""
+        rpc_params = RPCParams(timeout=timeout,
+                               need_response=True,
+                               mode="async")
+        self.kwargs["__rpc_params"] = rpc_params
+        return self.client.call_streaming(self.method_name, *self.args,
+                                          **self.kwargs)
+
+
 class RPCClient:
     """
     An RPC Client that connects to the RPCServer.
@@ -53,7 +106,7 @@ class RPCClient:
         if self._server_stopped:
             return
 
-        self.call_sync("__rpc_shutdown")
+        self._rpc_shutdown().remote()
 
         self._server_stopped = True
 
@@ -258,6 +311,9 @@ class RPCClient:
 
     def _call_sync(self, method_name, *args, **kwargs):
         """Synchronous version of RPC call."""
+        logger_debug(
+            f"RPC Client calling method: {method_name} with args: {args} and kwargs: {kwargs}"
+        )
         self._ensure_event_loop()
         future = asyncio.run_coroutine_threadsafe(
             self._call_async(method_name, *args, **kwargs), self._loop)
@@ -412,54 +468,25 @@ class RPCClient:
     def get_server_attr(self, name: str):
         """ Get the attribute of the RPC server.
         This is mainly used for testing. """
-        return self._call_sync("__rpc_get_attr",
-                               name,
-                               __rpc_params=RPCParams(timeout=10))
+        return self._rpc_get_attr(name).remote()
 
     def __getattr__(self, name):
         """
         Magically handles calls to non-existent methods.
-        Returns a proxy object that supports multiple calling patterns.
+        Returns a callable that when invoked returns a RemoteCall instance.
+
+        This enables the new syntax:
+            client.method(args).remote()
+            await client.method(args).remote_async()
+            client.method(args).remote_future()
+            async for x in client.method(args).remote_streaming()
         """
+        logger_debug(f"RPC Client getting attribute: {name}")
 
-        class MethodProxy:
+        def method_caller(*args, **kwargs):
+            return RemoteCall(self, name, *args, **kwargs)
 
-            def __init__(self, client, method_name):
-                self.client = client
-                self.method_name = method_name
-
-            def __call__(self, *args, **kwargs):
-                """Default synchronous call"""
-                rpc_params = kwargs.get("__rpc_params", RPCParams())
-                mode = rpc_params.mode
-                if mode == "sync":
-                    return self.client._call_sync(self.method_name, *args,
-                                                  **kwargs)
-                elif mode == "async":
-                    return self.client._call_async(self.method_name, *args,
-                                                   **kwargs)
-                elif mode == "future":
-                    return self.client.call_future(self.method_name, *args,
-                                                   **kwargs)
-                else:
-                    raise ValueError(f"Invalid RPC mode: {mode}")
-
-            def call_async(self, *args, **kwargs):
-                """Async call - returns coroutine"""
-                return self.client._call_async(self.method_name, *args,
-                                               **kwargs)
-
-            def call_future(self, *args, **kwargs) -> concurrent.futures.Future:
-                """Future call - returns Future object"""
-                return self.client.call_future(self.method_name, *args,
-                                               **kwargs)
-
-            def call_streaming(self, *args, **kwargs) -> AsyncIterator[Any]:
-                """Streaming call - returns async iterator"""
-                return self.client.call_streaming(self.method_name, *args,
-                                                  **kwargs)
-
-        return MethodProxy(self, name)
+        return method_caller
 
     def __enter__(self):
         return self
