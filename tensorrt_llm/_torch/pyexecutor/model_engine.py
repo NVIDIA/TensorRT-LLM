@@ -1399,7 +1399,7 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
                                             pin_memory=True,
-                                            filter_keywords=getattr(
+                                            target_keywords=getattr(
                                                 self.model,
                                                 "multimodal_data_device_paths",
                                                 None))
@@ -1564,7 +1564,7 @@ class PyTorchModelEngine(ModelEngine):
                             "multimodal_data",
                             "cuda",
                             pin_memory=True,
-                            filter_keywords=[
+                            target_keywords=[
                                 "mrope_config.mrope_position_deltas"
                             ])
                         multimodal_params_list.append(multimodal_params)

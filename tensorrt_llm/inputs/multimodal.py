@@ -405,14 +405,14 @@ class MultimodalParams:
                   element: str,
                   device: str,
                   pin_memory: bool = False,
-                  filter_keywords: Optional[List[str]] = None) -> None:
+                  target_keywords: Optional[List[str]] = None) -> None:
         """Move specified multimodal data element to target device.
 
         Args:
             element: Element to move (only "multimodal_data" is supported)
             device: Target device (e.g., "cuda", "cpu")
             pin_memory: Whether to pin memory for asynchronous transfers
-            filter_keywords: Optional list of keyword paths to filter which data to move.
+            target_keywords: Optional list of keyword paths to filter which data to move.
                     Each string can be a simple key or dot-separated path
                     (e.g., ["image.pixel_values", "mrope_config"])
                     If provided, only data matching these paths will be moved to device.
@@ -431,7 +431,7 @@ class MultimodalParams:
             return  # Nothing to move
 
         # If keyword is specified, only move data for those keyword paths
-        if filter_keywords is not None:
+        if target_keywords is not None:
             if not isinstance(data, dict):
                 raise ValueError(
                     f"multimodal_data must be a dictionary when keyword is specified, "
@@ -439,7 +439,7 @@ class MultimodalParams:
 
             # Process multiple keyword paths
             transformed_data = self._move_multiple_paths_to_device(
-                data, filter_keywords, device, pin_memory)
+                data, target_keywords, device, pin_memory)
         else:
             # Move all data as before
             transformed_data = self._apply_tensor_operation(
@@ -448,13 +448,13 @@ class MultimodalParams:
         setattr(self, element, transformed_data)
 
     def _move_multiple_paths_to_device(self, data: Dict[str, Any],
-                                       filter_keywords: List[str], device: str,
+                                       target_keywords: List[str], device: str,
                                        pin_memory: bool) -> Dict[str, Any]:
         """Move multiple nested data paths to device.
 
         Args:
             data: The multimodal data dictionary
-            filter_keywords: List of keyword paths (can be dot-separated)
+            target_keywords: List of keyword paths (can be dot-separated)
             device: Target device
             pin_memory: Whether to pin memory
 
@@ -462,7 +462,7 @@ class MultimodalParams:
             Updated data dictionary with specified paths moved to device
         """
         result = data
-        for keyword_path in filter_keywords:
+        for keyword_path in target_keywords:
             # Parse each keyword path
             if '.' in keyword_path:
                 key_path = keyword_path.split('.')
