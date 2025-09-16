@@ -178,8 +178,7 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
         check=True)
 
     # For chunked prefill, we need to enable -save-softmax (dtype: bf16, layout: separate-q-k-v).
-    # Currently fp8 kernel doesn't support saving softmax.
-    if dtype == "-bf16":
+    if dtype in ["-bf16", "-e4m3"]:
         # padding mask
         subprocess.run(
             f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "

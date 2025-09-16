@@ -14,8 +14,9 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
+@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.high_cuda_memory
-def test_dynamic_spec_decode():
+def test_dynamic_spec_decode(disable_overlap_scheduler: bool):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
@@ -32,7 +33,7 @@ def test_dynamic_spec_decode():
     llm_common_config = dict(
         model=target_model_dir,
         attn_backend="TRTLLM",
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
@@ -51,8 +52,8 @@ def test_dynamic_spec_decode():
     )
 
     # Mock should_use_spec_decode to return True for first two calls, then False
-    def mock_should_use_spec_decode(self, requests, max_batch_size,
-                                    max_num_tokens, max_draft_len):
+    def mock_should_use_spec_decode(requests, max_batch_size, max_num_tokens,
+                                    max_draft_len):
         if not hasattr(mock_should_use_spec_decode, 'call_count'):
             mock_should_use_spec_decode.call_count = 0
         mock_should_use_spec_decode.call_count += 1

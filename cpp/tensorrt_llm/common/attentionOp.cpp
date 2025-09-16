@@ -764,8 +764,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     if (mEnableContextFMHA && mFP8ContextMLA && mFmhaDispatcher->isSeparateQAndKvInput())
     {
         fp8_q_buf_size = max_num_tokens * static_cast<size_t>(total_q_dim_all_heads);
-        fp8_k_buf_size = max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
-        fp8_v_buf_size = max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
+        fp8_k_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
+        fp8_v_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
     }
 
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
@@ -2530,22 +2530,22 @@ int AttentionOp::initialize() noexcept
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120 || mSM == 121,
-            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100, sm_120 or sm_121.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 103 || mSM == 120 || mSM == 121,
+            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100f, sm_120 or sm_121.");
     }
 
     // Pre-Check of FP8 Generation MLA.
     if (mFP8GenerationMLA)
     {
         TLLM_CHECK_WITH_INFO(mIsMLAEnabled, "FP8 Generation MLA cannot be enabled because MLA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120 || mSM == 121,
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 103 || mSM == 120 || mSM == 121,
             "FP8 Generation MLA is supported on Ada, Hopper or Blackwell architecture.");
     }
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100 || mSM == 120 || mSM == 121,
-        "fuse_fp4_quant only supports SM100 or SM120 or SM121 devices.");
+    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || (mSM == 100 || mSM == 103) || mSM == 120 || mSM == 121,
+        "fuse_fp4_quant only supports SM100f or SM120 or SM121 devices.");
 
     // Check requirements for FP4 KV cache.
     TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA,
