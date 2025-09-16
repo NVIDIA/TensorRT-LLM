@@ -77,7 +77,7 @@ llm_perf_sanity:
   #pytorch backend
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-maxbs:256-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-streaming-bfloat16-input_output_len:128,128-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-bfloat16-maxbs:1-input_output_len:128,128-reqs:10-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-bfloat16-maxbs:1-maxnt:256-input_output_len:128,128-reqs:10-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.2_1b-bench-pytorch-bfloat16-input_output_len:128,128-gpus:2]
 
 # FP8 tests for systems with 2+ GPUs
@@ -191,8 +191,8 @@ llm_perf_sanity:
 
   tests:
   #llama_v3.1_70b
-  #pytorch backend
-  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-pytorch-bfloat16-maxbs:1-input_output_len:512,32-quant:fp8-gpus:8]
+  #trt backend
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-maxbs:1-maxnt:544-input_output_len:512,32-quant:fp8-gpus:8]
   #llama_v3.3_70b_instruct_fp8
   #pytorch backend
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:8]
@@ -213,10 +213,12 @@ llm_perf_sanity:
 
   tests:
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-streaming-pytorch-float8-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-streaming-float8-input_output_len:128,128]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-streaming-float8-input_output_len:2000,500]
   - perf/test_perf.py::test_perf[llama_v3.1_405b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-input_output_len:512,32-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:20000-kv_frac:0.6-input_output_len:20000,2000-reqs:1000-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_scout_17b_16e_instruct_fp8-bench-pytorch-float8-maxbs:1024-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-reqs:1000-ep:8-tp:8-gpus:8] TIMEOUT(100)
-  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8] TIMEOUT(45)
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp8-bench-pytorch-float8-input_output_len:1000,2000-con:256-ep:8-gpus:8] TIMEOUT(60)
+  - perf/test_perf.py::test_perf[deepseek_v3_lite-disagg_server-ctx_dp:4-gen_tp:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-disagg_server-ctx_dp:4-gen_tp:4]

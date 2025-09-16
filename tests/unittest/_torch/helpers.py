@@ -162,3 +162,33 @@ def reference_block_scale_moe_torch(
         results[batch_idx] += final_scales[batch_idx, nth_expert, None] * output
 
     return results.view_as(x)
+
+
+class MockPytorchBackendConfig:
+
+    def __init__(self, use_cuda_graph, cuda_graph_padding_enabled):
+        self.use_cuda_graph = use_cuda_graph
+        self.cuda_graph_padding_enabled = cuda_graph_padding_enabled
+
+
+class MockEngine:
+    """A replacement for SimpleNamespace that supports weak references."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def create_mock_engine(batch_size: int):
+
+    return MockEngine(
+        pytorch_backend_config=MockPytorchBackendConfig(
+            use_cuda_graph=True, cuda_graph_padding_enabled=False),
+        _cuda_graph_batch_sizes=[batch_size],
+        _max_cuda_graph_batch_size=batch_size,
+        max_beam_width=1,
+        max_num_tokens=8192,
+        is_spec_decode=False,
+        spec_config=None,
+        _cuda_graph_mem_pool=None,
+        use_mrope=False,
+    )

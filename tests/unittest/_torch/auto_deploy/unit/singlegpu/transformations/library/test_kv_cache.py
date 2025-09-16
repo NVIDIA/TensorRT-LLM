@@ -54,17 +54,19 @@ class GQAWithSdpa(GQA):
             self.num_key_value_groups = None
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Forward pass with input tokens and optional position ids.
         position_ids parameter added to match expected interface in kvcache.py
         """
-        b, s, _ = x.shape
+        b, s, _ = input_ids.shape
 
         # Project input to q, k, v representations
-        q = self.q_proj(x)  # [b, s, n*h_d]
-        k = self.k_proj(x)  # [b, s, n_kv*h_d]
-        v = self.v_proj(x)  # [b, s, n_kv*h_d]
+        q = self.q_proj(input_ids)  # [b, s, n*h_d]
+        k = self.k_proj(input_ids)  # [b, s, n_kv*h_d]
+        v = self.v_proj(input_ids)  # [b, s, n_kv*h_d]
 
         # Reshape to [b, s, n, h_d]
         q = q.view(b, s, self.num_heads, self.head_dim)
@@ -126,9 +128,9 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     ci = SequenceEmbeddingInfo(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
+        hidden_size=hidden_size,
+        dtype=dtype,
     )
-    ci.hidden_size = hidden_size
-    ci.dtype = dtype
     cm = CachedSequenceInterface(sequence_info=ci, device="cuda")
 
     # Create the model with SDPA and wrap it in a fake factory
@@ -180,9 +182,9 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     cm.initialize_caches()
 
     # Helper function to call the model with proper sequence nesting
-    def _call_and_unnest(x):
+    def _call_and_unnest(x, input_pos):
         # Use nest_sequences to properly set input_ids and automatically update position_ids
-        cm.info.nest_sequences(x, allow_realloc=True)
+        cm.info.nest_sequences(x, input_pos=input_pos)
 
         # Use the cm.args as is - it already contains the correct position_ids
         y = gm(*cm.args)
@@ -192,31 +194,25 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
 
     # Test 1: Regular inference (all tokens at once)
     cm.info.reset()
-    y_no_cache = _call_and_unnest(x)
+    y_no_cache = _call_and_unnest(x, 0)
     assert all_close(y_model, y_no_cache, atol=atol, rtol=rtol)
 
     # Test 2: Autoregressive inference with KV cache
     cm.info.reset()
     y_with_cache = torch.empty_like(y_model)
-    for i in range(x.shape[1]):
+    for i_p in range(x.shape[1]):
         # Just pass the current token
-        y_with_cache[:, i : i + 1] = _call_and_unnest(x[:, i : i + 1])
-        # Update position for next token
-        cm.info.update_pos(1)  # This automatically updates position_ids too
+        y_with_cache[:, i_p : i_p + 1] = _call_and_unnest(x[:, i_p : i_p + 1], i_p)
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 3: Cache continuation after random tokens
-    cm.info.update_pos(-num_reset_steps)  # Rewind position
-    for i in range(num_random_steps):
-        _call_and_unnest(torch.rand_like(x[:, :1]))
-        cm.info.update_pos(1)
+    for i_p in range(x.shape[1] - num_reset_steps, x.shape[1] - num_reset_steps + num_random_steps):
+        _call_and_unnest(torch.rand_like(x[:, :1]), i_p)
 
     # Continue inference from previous context
     cm.info.reset()
-    cm.info.update_pos(x.shape[1] - num_reset_steps)
-    for i in range(x.shape[1] - num_reset_steps, x.shape[1]):
-        y_with_cache[:, i : i + 1] = _call_and_unnest(x[:, i : i + 1])
-        cm.info.update_pos(1)
+    for i_p in range(x.shape[1] - num_reset_steps, x.shape[1]):
+        y_with_cache[:, i_p : i_p + 1] = _call_and_unnest(x[:, i_p : i_p + 1], i_p)
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 4: Exportability of the transformed model

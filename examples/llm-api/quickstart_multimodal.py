@@ -122,6 +122,15 @@ def add_multimodal_args(parser):
          " ├── __init__.py"
          " ├── <model_name>.py"
          " └── <sub_dirs>"))
+    # Add multiturn conversation related parameters
+    parser.add_argument("--multiturn",
+                        action="store_true",
+                        help="Enable multi-turn conversation mode.")
+    parser.add_argument(
+        "--conversation_turns",
+        type=int,
+        default=2,
+        help="Number of conversation turns for automated testing.")
     return parser
 
 
@@ -145,7 +154,6 @@ def parse_arguments():
     parser = add_lora_args(parser)
     args = parser.parse_args()
 
-    args.disable_kv_cache_reuse = True  # kv cache reuse does not work for multimodal, force overwrite
     if args.kv_cache_fraction is None:
         args.kv_cache_fraction = 0.6  # lower the default kv cache fraction for multimodal
 
@@ -188,6 +196,80 @@ def main():
         f"Unsupported model_type: {model_type} found!\n" \
         f"Supported types: {MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()}"
 
+    # If multiturn mode is enabled
+    if args.multiturn:
+        # Run predefined multiturn conversation examples
+        assert args.prompt is not None, "Please provide a prompt for multiturn conversation."
+        assert args.media is not None, "Please provide media for multiturn conversation."
+        # Determine how many turns to run
+        max_turns = min(args.conversation_turns, len(args.prompt))
+        generated_outputs = []  # Store generated outputs for return
+
+        # Initialize conversation history with the first prompt
+        conversation_history = args.prompt[0] if args.prompt else ""
+
+        for i in range(max_turns):
+            print(f"\n--- Turn {i+1} ---")
+
+            try:
+                # Use multimodal input loader to process input with conversation context
+                # Use accumulated conversation history instead of just the current prompt
+                cur_prompt = conversation_history
+                inputs = default_multimodal_input_loader(
+                    tokenizer=llm.tokenizer,
+                    model_dir=llm._hf_model_dir,
+                    model_type=model_type,
+                    modality=args.modality,
+                    prompts=[cur_prompt],
+                    media=args.media,
+                    image_data_format="pt",
+                    num_frames=8,
+                    device="cpu")
+
+                lora_request = None
+                if args.load_lora:
+                    if model_class is None:
+                        raise ValueError(
+                            "model_class must be provided when load_lora is True"
+                        )
+                    lora_request = model_class.lora_request(
+                        len(inputs), args.modality, llm._hf_model_dir)
+
+                # Generate response
+                outputs = llm.generate(inputs,
+                                       sampling_params,
+                                       lora_request=lora_request)
+                assert outputs and len(
+                    outputs) > 0 and outputs[0].outputs and len(
+                        outputs[0].outputs) > 0
+                response = outputs[0].outputs[0].text.strip()
+
+                # Store generated output
+                generated_outputs.append({
+                    "turn": i + 1,
+                    "user_input": cur_prompt,
+                    "assistant_response": response,
+                    "media": args.media
+                })
+
+                conversation_history = conversation_history + "\n" + response
+                if i + 1 < len(args.prompt):
+                    conversation_history = conversation_history + "\n" + args.prompt[
+                        i + 1]
+
+            except Exception as e:
+                print(f"Error in turn {i+1}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        for i, output in enumerate(generated_outputs):
+            print(
+                f"[{i}] Prompt: {output['user_input']!r}, Generated text: {output['assistant_response']!r}"
+            )
+        return
+
+    # Original single-turn processing logic
     # set prompts and media to example prompts and images if they are not provided
     if args.prompt is None:
         args.prompt = example_medias_and_prompts[args.modality]["prompt"]

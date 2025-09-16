@@ -17,8 +17,6 @@
 Model pytorch yaml config for trtllm-bench perf tests
 """
 
-from tensorrt_llm.llmapi import KvCacheConfig
-
 
 def recursive_update(d, u):
     for k, v in u.items():
@@ -198,10 +196,19 @@ def get_model_yaml_config(model_label: str,
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:
+        # Derive the requested number of adapters from model_label (segment like "loras:X")
+        lora_count = 1
+        for part in model_label.split('-'):
+            if part.startswith('loras:'):
+                lora_count = max(1, int(part.split(':', 1)[1]))
+                break
+
         lora_config = {
             'lora_config': {
                 'lora_dir': lora_dirs if lora_dirs is not None else [],
-                'max_lora_rank': 64
+                'max_lora_rank': 64,
+                'max_loras': lora_count,
+                'max_cpu_loras': lora_count,
             }
         }
         if 'phi_4_multimodal_instruct' in model_label:
@@ -219,9 +226,10 @@ def get_model_yaml_config(model_label: str,
                 'swap_gate_up_proj_lora_b_weight'] = False
         base_config.update(lora_config)
 
-    kv_cache_config = base_config.get('kv_cache_config', KvCacheConfig())
+    kv_cache_config = base_config.get('kv_cache_config', {})
     if 'kv_cache_dtype' in base_config:
-        kv_cache_config.dtype = base_config.pop('kv_cache_dtype', 'auto')
+        kv_cache_dtype = base_config.pop('kv_cache_dtype', 'auto')
+        kv_cache_config['dtype'] = kv_cache_dtype
         base_config.update({'kv_cache_config': kv_cache_config})
 
     return base_config

@@ -707,13 +707,13 @@ public:
 
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mGemmProfilerBackend.init(mMoERunner, GemmProfilerBackend::GemmToProfile::Undefined, typeToDtypeID<DataType>(),
-            typeToDtypeID<WeightType>(), typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize,
-            mGroupSize, mActType, mUseBias, mUseLora, /*min_latency_mode=*/false,
+            typeToDtypeID<WeightType>(), typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mHiddenSize,
+            mInterSize, mGroupSize, mActType, mUseBias, mUseLora, /*min_latency_mode=*/false,
             /*need_weights=*/false, parallelism_config, /*enable_alltoall=*/false);
 #else
         mGemmProfilerBackend.init(mMoERunner, GemmProfilerBackend::GemmToProfile::Undefined, typeToDtypeID<DataType>(),
-            typeToDtypeID<WeightType>(), typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize,
-            mGroupSize, mActType, mUseBias, mUseLora, /*min_latency_mode=*/false,
+            typeToDtypeID<WeightType>(), typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mHiddenSize,
+            mInterSize, mGroupSize, mActType, mUseBias, mUseLora, /*min_latency_mode=*/false,
             /*need_weights=*/false, parallelism_config);
 #endif
 
@@ -989,7 +989,7 @@ public:
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
                 ActivationParams(mActType), mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
                 mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
-                mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
+                mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
                 mFinalOutput + mFinalOutputSize * mBufferIndex,
                 mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config,
                 /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
@@ -1001,10 +1001,10 @@ public:
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
                 ActivationParams(mActType), mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
                 mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
-                mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
+                mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
                 mFinalOutput + mFinalOutputSize * mBufferIndex,
-                mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config, mUseLora,
-                mLoraParams[mBufferIndex],
+                mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config,
+                /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
                 /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
 #endif
             break;
@@ -1074,10 +1074,10 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
         state.SkipWithMessage("Out of range tactic");
         return;
     }
+    auto tactics1 = mMoERunner.getTactics(MoeGemmId::GEMM_1);
+    auto tactics2 = mMoERunner.getTactics(MoeGemmId::GEMM_2);
     if (LOG_LEVEL >= INFO)
     {
-        auto tactics1 = mMoERunner.getTactics(MoeGemmId::GEMM_1);
-        auto tactics2 = mMoERunner.getTactics(MoeGemmId::GEMM_2);
         std::cout << "Selected tactic #1: " << tactic_idx1 << "/" << tactics1.size() << "\n"
                   << tactics1[tactic_idx1].toString() << std::endl;
         std::cout << "Selected tactic #2: " << tactic_idx2 << "/" << tactics2.size() << "\n"
@@ -1085,6 +1085,20 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     }
     state.counters["tactic_idx1"] = tactic_idx1;
     state.counters["tactic_idx2"] = tactic_idx2;
+
+    state.counters["t1_sm_version"] = tactics1[tactic_idx1].sm_version;
+    state.counters["t1_tile_shape"] = tactics1[tactic_idx1].getTileConfigAsInt();
+    state.counters["t1_cluster_shape"] = (int) tactics1[tactic_idx1].cluster_shape;
+    state.counters["t1_dynamic_cluster_shape"] = (int) tactics1[tactic_idx1].dynamic_cluster_shape;
+    state.counters["t1_fallback_cluster_shape"] = (int) tactics1[tactic_idx1].fallback_cluster_shape;
+    state.counters["t1_epilogue_schedule"] = (int) tactics1[tactic_idx1].epilogue_schedule;
+
+    state.counters["t2_sm_version"] = tactics2[tactic_idx2].sm_version;
+    state.counters["t2_tile_shape"] = tactics2[tactic_idx2].getTileConfigAsInt();
+    state.counters["t2_cluster_shape"] = (int) tactics2[tactic_idx2].cluster_shape;
+    state.counters["t2_dynamic_cluster_shape"] = (int) tactics2[tactic_idx2].dynamic_cluster_shape;
+    state.counters["t2_fallback_cluster_shape"] = (int) tactics2[tactic_idx2].fallback_cluster_shape;
+    state.counters["t2_epilogue_schedule"] = (int) tactics2[tactic_idx2].epilogue_schedule;
 
     createGraph(parallelism_config, gemm_to_profile);
 

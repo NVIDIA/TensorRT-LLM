@@ -1,10 +1,5 @@
 # This file defines code ownership rules for the repository.
 
-# The following rule should only be uncommented on release branches (e.g., release/0.19).
-# The rule below requires that any PR to release/**/* branches must be approved by at least one member
-# of the NVIDIA/trt-llm-release-branch-approval team, regardless of who else approves the PR.
-# Without approval from a member of this team, PRs cannot be merged to release branches.
-# * @NVIDIA/trt-llm-release-branch-approval
 
 ## TensorRT-LLM Infra
 ### CI
@@ -39,6 +34,7 @@
 ## TensorRT-LLM Pytorch backend - AutoDeploy flow
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
+/tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 
 ## TensorRT-LLM Pytorch - Speculative Decoding
 /tensorrt_llm/_torch/speculative @NVIDIA/trt-llm-torch-spec-decoding
@@ -151,6 +147,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /cpp/tensorrt_llm/batch_manager/dataTransceiver.h @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.cpp @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.h @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
 
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
@@ -159,3 +156,9 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 # from a member of this team, PRs affecting public APIs cannot be merged to main or release branches.
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
+
+# The following rule should only be uncommented on release branches (e.g., release/0.19).
+# The rule below requires that any PR to release/**/* branches must be approved by at least one member
+# of the NVIDIA/trt-llm-release-branch-approval team, regardless of who else approves the PR.
+# Without approval from a member of this team, PRs cannot be merged to release branches.
+# * @NVIDIA/trt-llm-release-branch-approval

@@ -61,6 +61,8 @@ def getSMVersion():
 def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
     verbose = 0
     sm_version = getSMVersion()
+    if flag == "-use-attention-sinks" and sm_version != 90:
+        pytest.skip("use-attention-sinks is only supported on sm90 currently.")
     if sm_version == 90 and tiled_kernel == "-force-non-tiled":
         pytest.skip(
             "Tiled/non-tiled flags only make a difference to ampere-style kernels."
@@ -165,8 +167,8 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
     if dtype == "-bf16" and s == 4096:
         epsilon += ' -epsilon 0.03'
 
-    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 120:
-        pytest.skip("FP8 MLAs are only supported on sm120 currently.")
+    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version not in [90, 120]:
+        pytest.skip("FP8 MLAs are only supported on sm90 and sm120 currently.")
 
     # Context phase kernels, always use separate-q-k-v layout.
     subprocess.run(
@@ -176,8 +178,7 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
         check=True)
 
     # For chunked prefill, we need to enable -save-softmax (dtype: bf16, layout: separate-q-k-v).
-    # Currently fp8 kernel doesn't support saving softmax.
-    if dtype == "-bf16":
+    if dtype in ["-bf16", "-e4m3"]:
         # padding mask
         subprocess.run(
             f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "

@@ -30,6 +30,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         return {
             'skip_tokenizer_init': False,
             'trust_remote_code': True,
+            # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/7142):
+            # AutoDeploy does not support cache reuse yet.
             'kv_cache_config': {
                 'enable_block_reuse': False,
             },
@@ -42,7 +44,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             'skip_loading_weights': False,
             'compile_backend': 'torch-opt',
             'free_mem_ratio': 0.7,
-            'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256]
+            'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
         }
 
     def get_default_sampling_params(self):

@@ -27,6 +27,7 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative import SpecMetadata
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs import (ExtraProcessedInputs, InputProcessor,
                                  MultimodalPlaceholderMetadata,
@@ -258,13 +259,19 @@ class Mistral3InputProcessor(InputProcessor):
         if pixel_values is not None:
             # We have no use for the `attention_mask`.
             processed.pop("attention_mask")
+            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
+            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
+            # reaching the model forward. Since its values are used to infer the amount of padding
+            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
+            # list here to avoid this.
+            processed["image_sizes"] = processed["image_sizes"].tolist()
             # NOTE: `processed` is a dict-like object, but not actually a dict.
             extra_processed_inputs = {
                 "multimodal_data": {
                     "image": {
                         **processed
                     }
-                },
+                }
             }
 
         return input_ids, extra_processed_inputs
@@ -314,8 +321,10 @@ class Mistral3VLM(PreTrainedModel):
         self.llm = MistralForCausalLM(llm_model_config)
 
         self._device = "cuda"
-        vision_model_config = self._get_sub_model_config(
-            model_config, "vision_config")
+        # NOTE: current `modelopt` does not support quantizing the vision portion.
+        vision_model_config = self._get_sub_model_config(model_config,
+                                                         "vision_config",
+                                                         quant_config=None)
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
         self._multi_modal_projector = Mistral3MultiModalProjector(model_config)
@@ -385,19 +394,22 @@ class Mistral3VLM(PreTrainedModel):
                     f"Expected as many `pixel_values` ({len(pixel_values)}) and "
                     f"`image_sizes` ({len(image_sizes)}) as number of multimodal parameters "
                     f"({multimodal_params_len}).")
-            batched_pixel_values, batched_image_sizes = self._batch_pixel_values(
+            image_sizes = [torch.tensor(x) for x in image_sizes]
+            batched_pixel_values, batched_image_sizes = self.batch_pixel_values(
                 pixel_values=pixel_values, image_sizes=image_sizes)
             mm_embeds = [
                 self._get_image_features(pixel_values=batched_pixel_values,
                                          image_sizes=batched_image_sizes)
             ]
 
-        input_ids, inputs_embeds = fuse_input_embeds(
-            embedding_layer=self.llm.model.embed_tokens,
-            input_ids=input_ids,
-            mm_embeds=mm_embeds,
-            mm_token_ids=self._image_token_ids,
-        )
+        with nvtx_range("[mistral] Fuse input embeds"):
+            input_ids, inputs_embeds = fuse_input_embeds(
+                embedding_layer=self.llm.model.embed_tokens,
+                input_ids=input_ids,
+                mm_embeds=mm_embeds,
+                mm_token_ids=self._image_token_ids,
+                **kwargs,
+            )
 
         return self.llm.forward(
             attn_metadata=attn_metadata,
@@ -411,12 +423,14 @@ class Mistral3VLM(PreTrainedModel):
     def _get_sub_model_config(
         model_config: ModelConfig[MistralConfig],
         name: str,
+        **changes,
     ) -> ModelConfig:
         # Extract the subconfig from the `transformers` config and shove it into our own
         # `ModelConfig` class.
         sub_model_config: ModelConfig[MistralConfig] = dataclasses.replace(
             model_config,
             pretrained_config=getattr(model_config.pretrained_config, name),
+            **changes,
         )
         # Make sure some fields that are not explicitly included in the sub config, but present
         # in the top-level config, are replicated.
@@ -434,13 +448,15 @@ class Mistral3VLM(PreTrainedModel):
         pixel_values: torch.Tensor,
         image_sizes: torch.Tensor,
     ):
-        image_outputs = self._vision_tower(
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
-        )
+        with nvtx_range("[mistral] ViT"):
+            image_outputs = self._vision_tower(
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+            )
 
-        image_features = self._multi_modal_projector(image_outputs.squeeze(0),
-                                                     image_sizes)
+        with nvtx_range("[mistral] MM projector"):
+            image_features = self._multi_modal_projector(
+                image_outputs.squeeze(0), image_sizes)
         return image_features
 
     # Original HF implementation:
@@ -450,23 +466,45 @@ class Mistral3VLM(PreTrainedModel):
     # (the transformers one expected numpy arrays).
     @staticmethod
     @torch.inference_mode()
-    def _batch_pixel_values(
+    @nvtx_range("[mistral] Batch images")
+    def batch_pixel_values(
         pixel_values: List[torch.Tensor],
         image_sizes: List[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # NOTES:
+        # * `pixel_values` is a list of `[B_idx, C, H_idx, W_idx]` tensors, i.e. a batch of images as
+        #   padded + batched by the input processor.
+        #   The height (H_idx) and width (W_idx) of each element need not coincide.
+        # * Similarly, each element in `image_sizes` describes the original image sizes prior to
+        #   padding for the corresponding element in `pixel_values`.
+
+        # The below creates a single `[sum(B_idx), 2]` tensor describing all image sizes, and then
+        # calculates the maximum height / width across all of them.
         batched_image_sizes = torch.cat(image_sizes)
         max_shape = batched_image_sizes.max(dim=0).values
+
+        # This next step then pads the pixel values potentially a second time by using the `max_shape`
+        # computed above. Note that as far as this function is concerned, the original sizes for
+        # batching purposes can be deduced from looking at the tensors in `pixel_values`, NOT in
+        # `image_sizes`.
         pixel_values = [
             torchvision.transforms.v2.functional.pad(
                 image,
                 # Per torchvision docs, this should be in LTRB order if it's a sequence of 4 numbers.
-                padding=[0, 0, max_shape[1] - size[1], max_shape[0] - size[0]],
+                padding=[
+                    0, 0, max_shape[1] - image.shape[-1],
+                    max_shape[0] - image.shape[-2]
+                ],
                 # Values extracted from HF implementation.
                 fill=0.0,
                 padding_mode="constant",
-            ) for image, size in zip(pixel_values, batched_image_sizes)
+            ) for image in pixel_values
         ]
         return torch.cat(pixel_values), batched_image_sizes
+
+    @property
+    def mm_token_ids(self):
+        return self._image_token_ids
 
 
 # Original implementation:

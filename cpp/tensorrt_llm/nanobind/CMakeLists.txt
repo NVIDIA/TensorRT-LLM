@@ -7,15 +7,18 @@ set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
     batch_manager/cacheTransceiver.cpp
+    batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
+    common/tllmExceptions.cpp
     executor/bindings.cpp
     executor/executor.cpp
     executor/executorConfig.cpp
     executor/request.cpp
     runtime/bindings.cpp
-    testing/modelSpecBinding.cpp
+    runtime/hostfunc.cpp
     runtime/moeBindings.cpp
+    testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
@@ -43,7 +46,7 @@ target_link_libraries(
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
          torch_python
-         CUDA::cuda_driver
+         ${CUDA_DRV_LIB}
          ${CUDA_NVML_LIB}
          th_common)
 target_compile_definitions(

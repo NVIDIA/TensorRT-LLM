@@ -36,9 +36,22 @@ struct TargetRanksInfo
 {
     int mDomainPPSize;
     int mDomainTPSize;
+    int mDomainCPSize;
     std::vector<int> mIRanks;
     int mDupHeadFactor;
     int mPeerDupHeadFactor;
+
+    // the size of the vector is equal to the mDomainPPSize. the value of the vector is the layer num should be fetched
+    // from each target PP rank in domain PP.
+    std::vector<int> mPeerAttentionLayerNumInDomainPP;
+
+    int getPeerPPDomainLayerNum(int targetRankIdx)
+    {
+        //[TP,PP]
+
+        int ppDomainRankIdx = targetRankIdx % mDomainPPSize;
+        return mPeerAttentionLayerNumInDomainPP[ppDomainRankIdx];
+    }
 };
 
 TargetRanksInfo targetIRanks(

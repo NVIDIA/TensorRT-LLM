@@ -1,5 +1,3 @@
-(support-matrix)=
-
 # Support Matrix
 
 TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA GPUs. The following sections provide a list of supported GPU architectures as well as important features implemented in TensorRT-LLM.
@@ -26,6 +24,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 | `MllamaForConditionalGeneration` | Llama 3.2 | `meta-llama/Llama-3.2-11B-Vision` | L |
 | `NemotronForCausalLM` | Nemotron-3, Nemotron-4, Minitron | `nvidia/Minitron-8B-Base` | L |
 | `NemotronNASForCausalLM` | NemotronNAS | `nvidia/Llama-3_3-Nemotron-Super-49B-v1` | L |
+| `Phi3ForCausalLM` | Phi-4  | `microsoft/Phi-4` | L |
 | `Phi4MMForCausalLM` | Phi-4-multimodal | `microsoft/Phi-4-multimodal-instruct` | L + I + A |
 | `Qwen2ForCausalLM` | QwQ, Qwen2 | `Qwen/Qwen2-7B-Instruct` | L |
 | `Qwen2ForProcessRewardModel` | Qwen2-based | `Qwen/Qwen2.5-Math-PRM-7B` | L |

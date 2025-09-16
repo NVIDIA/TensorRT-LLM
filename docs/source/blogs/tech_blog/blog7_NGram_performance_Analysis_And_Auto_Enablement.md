@@ -1,4 +1,4 @@
-# N-Gram Speculative Decoding in TensorRT‑LLM
+# N-Gram Speculative Decoding in TensorRT LLM
 N-Gram speculative decoding leverages the natural repetition in many LLM workloads. It splits previously seen text into configurable (key, value) n‑gram pairs and, during generation, swiftly proposes draft tokens by matching the current key against n-gram pools in memory.
 
 In this blog, we introduce design choices in TensorRT‑LLM’s N-Gram speculative decoding algorithm, share our experimental results of performance gains, and explain N-Gram's low barrier to adoption by deriving a simple heuristic to enable it.
@@ -35,7 +35,7 @@ Speculative decoding drafts several tokens, verifies them on the model, and keep
 
 
 ## Algorithm & Complexity
-`NGramDecodingConfig` in TensorRT-LLM:
+`NGramDecodingConfig` in TensorRT LLM:
 ```python
 spec_config = NGramDecodingConfig(
     max_draft_len = v ,             # max length of draft tokens
@@ -53,7 +53,7 @@ spec_config = NGramDecodingConfig(
 
 <div align="center">
   <figure>
-    <img src="../media/tech_blog7_init_sequence_scan.png" width="auto" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog7_init_sequence_scan.png" width="auto" height="auto">
   </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Request initial scan</em></sub></p>
@@ -66,7 +66,7 @@ spec_config = NGramDecodingConfig(
 
 <div align="center">
   <figure>
-    <img src="../media/tech_blog7_per_token_update.png" width="auto" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog7_per_token_update.png" width="auto" height="auto">
   </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Per-token update</em></sub></p>
@@ -107,7 +107,7 @@ For batch size of 1, 4 and 32, we configure the max_batch_size of the model acco
 
 <div align="center">
   <figure>
-    <img src="../media/tech_blog7_speed_up_first_turn.png" width="80%" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog7_speed_up_first_turn.png" width="80%" height="auto">
   </figure>
 </div>
 <p align="center"><sub><em>Figure 3. First Turn Speed-up</em></sub></p>
@@ -127,7 +127,7 @@ Figure 4 shows the distribution of accepted length (AL) with `k=3, v=5`. When `A
 
 <div align="center">
   <figure>
-    <img src="../media/tech_blog7_magpie_accepted_length_distribution.png" width="90%" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog7_magpie_accepted_length_distribution.png" width="90%" height="auto">
   </figure>
 </div>
 <p align="center"><sub><em>Figure 4. Accepted draft token length distribution</em></sub></p>
@@ -136,7 +136,7 @@ In Figure 5, for each iteration, we plot the average of accepted length (AL) for
 
 <div align="center">
   <figure>
-    <img src="../media/tech_blog7_al_over_iteration_magpie.png" width="auto" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog7_al_over_iteration_magpie.png" width="auto" height="auto">
   </figure>
 </div>
 <p align="center"><sub><em>Figure 5. AL over iteration</em></sub></p>
@@ -145,7 +145,7 @@ Figure 6 shows the speed-up with N-Gram speculative decoding for the second turn
 N-Gram with `k = 3, v = 5` delivers 96.13% of speed-up with single batch and 63.99% of speed-up with batch size 4. With batch size 32 and N-Gram `k = 5, v = 3`, the speed up is 33.06%.
 <div align="center">
   <figure>
-    <img src="../media/tech_blog7_speed_up_second_turn.png" width="80%" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog7_speed_up_second_turn.png" width="80%" height="auto">
   </figure>
 </div>
 <p align="center"><sub><em>Figure 6. Second Turn Speed-up</em></sub></p>
@@ -175,7 +175,7 @@ From the pie chart on the left, among the seven draft tokens proposed by N-Gram,
 
 <div align="center">
   <figure>
-    <img src="../media/tech_blog7_accepted_length_case2.png" width="auto" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog7_accepted_length_case2.png" width="auto" height="auto">
   </figure>
 </div>
 <p align="center"><sub><em>Figure 7. Accepted Tokens from Drafts</em></sub></p>

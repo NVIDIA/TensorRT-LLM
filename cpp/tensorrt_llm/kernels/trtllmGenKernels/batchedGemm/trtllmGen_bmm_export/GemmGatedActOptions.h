@@ -67,7 +67,12 @@ enum class ActType
     // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
     //
     // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
-    SwiGlu
+    SwiGlu,
+    // For ActType == GeGlu, we use the simplified version
+    //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
+    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+    // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
+    GeGlu,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -81,6 +86,7 @@ enum class ActType
     }
 
 TLLM_ACT_TYPE_FUNCTION(SwiGlu)
+TLLM_ACT_TYPE_FUNCTION(GeGlu)
 
 #undef TLLM_ACT_TYPE_FUNCTION
 
@@ -91,6 +97,7 @@ inline std::string getActTypeName(ActType type)
     switch (type)
     {
     case ActType::SwiGlu: return "SwiGlu";
+    case ActType::GeGlu: return "GeGlu";
     default: return "Unknown type";
     }
 }
@@ -179,7 +186,7 @@ inline std::string dumpOptions(GemmGatedActOptions const& options)
     ss << gemm::dumpOptions(options) << ", ";
     ss << "mActType="
        << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")," << std::endl;
-    ss << "mClampLimit=" << options.mClampBeforeAct << "," << std::endl;
+    ss << "mClampBeforeAct=" << options.mClampBeforeAct << "" << std::endl;
     return ss.str();
 }
 

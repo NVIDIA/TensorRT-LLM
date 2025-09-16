@@ -44,9 +44,6 @@ class UpdateInOutNodes(BaseTransform):
         # loop through nodes to get input, output, and get_attr nodes
         input_nodes, output_nodes = get_all_input_output_nodes(gm.graph)
 
-        # we only expect one input node
-        assert len(input_nodes) == 2, "Expected exactly two input nodes (input_ids, position_ids)."
-
         # NOTE: for now, we wanna make sure we *only* return the final output and no hidden states.
         # Later on, we can revisit how to support returning hidden states.
         assert len(output_nodes) == 1, "Expected exactly one output node!"
@@ -117,16 +114,17 @@ class InsertCachedAttention(BaseTransform):
 
         # retrieve input nodes
         input_nodes, _ = get_all_input_output_nodes(gm.graph)
+        input_nodes_mapping = {n.target: n for n in input_nodes}
+
+        # filtered and sorted for SequenceInfo arguments + constants (input_ids, position_ids, etc.)
+        inputs_from_info = [input_nodes_mapping[k] for k in cm.info.named_standard_args.keys()]
+        constants_from_info = cm.info.const_args_for_prepare_metadata
 
         # insert metadata computation and extract each argument as a node
         get_metadata, num_metadata = attn_descriptor.get_prepare_metadata_op()
         with graph.inserting_before(input_nodes[-1].next):
             ret_node = graph.call_function(
-                get_metadata,
-                args=(
-                    *input_nodes,
-                    cm.info.page_size,
-                ),
+                get_metadata, args=(*inputs_from_info, *constants_from_info)
             )
             metadata_nodes = [
                 graph.call_function(operator.getitem, args=(ret_node, idx))
@@ -232,7 +230,8 @@ class ResizeKVCache(BaseTransform):
         current_cache_size = cm.current_cache_size_bytes()
         current_num_pages = cm.info.num_pages
         ad_logger.info(
-            f"Current cache size: {current_cache_size}, Current num pages: {current_num_pages}"
+            f"Current cache size (MB): {current_cache_size // 1024 // 1024}, "
+            f"Current num pages (MB): {current_num_pages}"
         )
 
         if free_mem_ratio == 0.0:
@@ -243,7 +242,7 @@ class ResizeKVCache(BaseTransform):
 
         try:
             # Let's run a forward pass to get the memory usage
-            cm.info._set_max_num_tokens_sample()
+            cm.info.set_max_num_tokens_sample()
             free_mem_pre, _ = _get_mem_info_in_mb()
             ad_logger.info(f"Free memory before forward pass (MB): {free_mem_pre}")
 

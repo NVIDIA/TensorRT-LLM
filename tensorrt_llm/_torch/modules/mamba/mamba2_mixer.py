@@ -89,14 +89,16 @@ class Mamba2Mixer(nn.Module):
         self.is_paged_state = False
 
         # in_proj
-        self.in_proj = Linear(d_model,
-                              d_in_proj,
-                              bias=bias,
-                              dtype=dtype,
-                              mapping=self.mapping,
-                              tensor_parallel_mode=TensorParallelMode.COLUMN,
-                              quant_config=config.get_quant_config(),
-                              allreduce_strategy=config.allreduce_strategy)
+        self.in_proj = Linear(
+            d_model,
+            d_in_proj,
+            bias=bias,
+            dtype=dtype,
+            mapping=self.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=config.get_quant_config(),
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -138,14 +140,16 @@ class Mamba2Mixer(nn.Module):
         )
 
         # out_proj
-        self.out_proj = Linear(d_inner,
-                               d_model,
-                               bias=bias,
-                               dtype=dtype,
-                               mapping=self.mapping,
-                               tensor_parallel_mode=TensorParallelMode.ROW,
-                               quant_config=config.get_quant_config(),
-                               allreduce_strategy=config.allreduce_strategy)
+        self.out_proj = Linear(
+            d_inner,
+            d_model,
+            bias=bias,
+            dtype=dtype,
+            mapping=self.mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            quant_config=config.get_quant_config(),
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy)
 
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
 
@@ -191,12 +195,15 @@ class Mamba2Mixer(nn.Module):
 
             cu_seqlens = mamba_metadata.cu_seqlens[:num_prefills + 1]
             seq_idx = mamba_metadata.seq_idx
+            has_initial_states = mamba_metadata.has_initial_states[:
+                                                                   num_prefills]
 
             xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
                                      self.conv1d.weight,
                                      self.conv1d.bias,
                                      activation="silu",
                                      conv_states=conv_states,
+                                     has_initial_state=has_initial_states,
                                      query_start_loc=cu_seqlens,
                                      cache_indices=state_indices_p).transpose(
                                          0, 1)
@@ -216,6 +223,12 @@ class Mamba2Mixer(nn.Module):
                             "b l (h p) -> b l h p",
                             h=self.tp_nheads)
 
+            initial_states = None
+            if mamba_metadata.use_initial_states:
+                initial_states = torch.where(
+                    has_initial_states[:, None, None, None],
+                    ssm_states[state_indices_p], 0)
+
             y, current_ssm_states = mamba_chunk_scan_combined(
                 x_p,
                 dt_p,
@@ -226,7 +239,9 @@ class Mamba2Mixer(nn.Module):
                 D=self.D,
                 z=z_p,
                 dt_bias=self.dt_bias,
-                initial_states=None,
+                initial_states=initial_states,
+                chunk_indices=mamba_metadata.chunk_indices,
+                chunk_offsets=mamba_metadata.chunk_offsets,
                 dt_softplus=self.delta_softplus,
                 cu_seqlens=cu_seqlens,
                 seq_idx=seq_idx,

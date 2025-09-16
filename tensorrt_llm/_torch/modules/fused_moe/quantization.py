@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import tensorrt_llm.logger as trtllm_logger
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
@@ -742,7 +742,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
-        if get_sm_version() == 100:
+        if is_sm_100f():
             expert_ids = set(module.initial_local_expert_ids)
             if self.need_load_shared_weights(module):
                 expert_ids.update(
@@ -759,7 +759,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                         weight, scale)
         super().load_weights(module, weights, weight_loading_mode)
 
-        if get_sm_version() == 100:
+        if is_sm_100f():
             transfromed_w3_w1_scale = transform_sf_into_required_layout(
                 module.quant_scales[0],
                 mn=module.w3_w1_weight.shape[1],
@@ -1108,7 +1108,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             preprocessor = preprocess_weights_for_mixed_gemm
 
             w2_weight_shard = packer(
-                unpacker(w2_weight_shard.cpu()).T.contiguous()).to(
+                unpacker(w2_weight_shard.cpu().contiguous()).T.contiguous()).to(
                     w2_weight_shard.device)
             w2_weight_shard = preprocessor(w2_weight_shard, torch.quint4x2,
                                            torch.float8_e4m3fn,
@@ -1144,16 +1144,20 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             weight_scale_name = "weight_scale"
 
         assert (len(module.interleave) == 2)
+
+        # Ensure that the input_scale remains aligned across all ranks for W4A8 custom.
+        input_scale_expert_ids = module.initial_local_expert_ids if not w4a8_custom else range(
+            module.num_experts)
         # fc31 scales
         all_w3_input_scales = [
             load_weight_shard(weights[f"{expert_id}.w3.input_scale"],
                               device=self.device)
-            for expert_id in module.initial_local_expert_ids
+            for expert_id in input_scale_expert_ids
         ]
         all_w1_input_scales = [
             load_weight_shard(weights[f"{expert_id}.w1.input_scale"],
                               device=self.device)
-            for expert_id in module.initial_local_expert_ids
+            for expert_id in input_scale_expert_ids
         ]
         all_w3_w1_input_scales_max = torch.max(
             torch.stack(all_w3_input_scales),
@@ -2085,6 +2089,29 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
                                        non_blocking=True)
 
 
+def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
+                          shard_dim_size):
+
+    def lcm(a, b):
+        return abs(a * b) // math.gcd(a, b)
+
+    # The alignment should be the least common multiple of weight_alignment, scaling_vector_size,
+    # and tp_size. scaling_vector_size and tp_size must be considered
+    # to avoid fractional scaling factors.
+    alignment = lcm(weight_alignment, scaling_vector_size)
+    alignment = lcm(alignment, tp_size)
+
+    # If after the alignment, the sharding dim per shard is not a multiple of weight_alignment,
+    # we need to pad the weights to make it a multiple of weight_alignment.
+    padded_weights_dim = math.ceil(shard_dim_size / alignment) * alignment
+    per_shard = padded_weights_dim // tp_size
+    if per_shard % weight_alignment != 0:
+        alignment = weight_alignment * math.ceil(
+            per_shard / weight_alignment) * tp_size
+
+    return alignment
+
+
 class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self,
@@ -2249,31 +2276,43 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor):
+        # We pad before the sharding. This is done to avoid fractional scaling factors
+        # per shard.
+        #
+        # E.g. if we pad after the sharding, with intermediate_size = 2880,
+        # tp_size = 4, scaling_vector_size = 32, each shard gets 720 elements and
+        # 22.5 scaling factors. After padding, each shard gets 768 in
+        # intermediate_size, and 24 in scaling factors's intermediate_size.
+        # The 2nd rank will start loading the 23rd scaling factor,
+        # while it should've loaded 22nd for the first 16 elements only.
+        # We pad the weights before the sharding to avoid this issue.
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size, w1_weight.shape[0])
+        if len(w1_weight.shape) == 2:
+            # Pad weights
+            # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
+            assert w1_weight.dtype == torch.uint8
+            w1_weight = maybe_pad_for_mxfp4(w1_weight,
+                                            self.weight_alignment // 2,
+                                            alignment)
+            assert w3_weight.dtype == torch.uint8
+            w3_weight = maybe_pad_for_mxfp4(w3_weight,
+                                            self.weight_alignment // 2,
+                                            alignment)
+        else:
+            # Pad bias.
+            assert len(w1_weight.shape) == 1
+            assert len(w3_weight.shape) == 1
+            w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment)
+            w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment)
+
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN)
         w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN)
-
-        if len(w1_weight_shard.shape) == 2:
-            # Pad weights
-            # We already satisfy alignment factor 2 for we pad 2 MXFP4 into Uint8.
-            assert w1_weight_shard.dtype == torch.uint8
-            w1_weight_shard = maybe_pad_for_mxfp4(w1_weight_shard,
-                                                  self.weight_alignment // 2,
-                                                  self.weight_alignment)
-            assert w3_weight_shard.dtype == torch.uint8
-            w3_weight_shard = maybe_pad_for_mxfp4(w3_weight_shard,
-                                                  self.weight_alignment // 2,
-                                                  self.weight_alignment)
-        else:
-            # Pad bias.
-            assert len(w1_weight_shard.shape) == 1
-            w1_weight_shard = maybe_pad_for_mxfp4(w1_weight_shard,
-                                                  self.weight_alignment)
-            w3_weight_shard = maybe_pad_for_mxfp4(w3_weight_shard,
-                                                  self.weight_alignment)
 
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
@@ -2287,22 +2326,24 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
+        shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
+            w2_weight.shape) == 2 else w2_weight.shape[0]
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size, shard_w2_weight_dim)
+
+        if len(w2_weight.shape) == 2:
+            assert w2_weight.dtype == torch.uint8
+            w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment // 2,
+                                            self.weight_alignment)
+        else:
+            # Pad bias.
+            assert len(w2_weight.shape) == 1
+            w2_weight = maybe_pad_for_mxfp4(w2_weight, self.weight_alignment)
+
         w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW)
-
-        if len(w2_weight_shard.shape) == 2:
-            # Pad weights
-            # We already satisfy alignment factor 2 for we pad two MXFP4 into Uint8.
-            assert w2_weight_shard.dtype == torch.uint8
-            w2_weight_shard = maybe_pad_for_mxfp4(w2_weight_shard,
-                                                  self.weight_alignment // 2,
-                                                  self.weight_alignment)
-        else:
-            assert len(w2_weight_shard.shape) == 1
-            # Pad bias.
-            w2_weight_shard = maybe_pad_for_mxfp4(w2_weight_shard,
-                                                  self.weight_alignment)
 
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
@@ -2312,6 +2353,19 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             w3_weight_scale: torch.Tensor,
             dst_w3_w1_weight_scale: torch.Tensor):
         device = dst_w3_w1_weight_scale.device
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w3_weight_scale.shape[0])
+
+        w1_weight_scale = maybe_pad_for_mxfp4(
+            w1_weight_scale,
+            self.weight_alignment // module.scaling_vector_size, alignment)
+        w3_weight_scale = maybe_pad_for_mxfp4(
+            w3_weight_scale,
+            self.weight_alignment // module.scaling_vector_size, alignment)
+
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
@@ -2322,14 +2376,6 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        w1_weight_scale = maybe_pad_for_mxfp4(
-            w1_weight_scale,
-            self.weight_alignment // module.scaling_vector_size,
-            self.weight_alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
-            w3_weight_scale,
-            self.weight_alignment // module.scaling_vector_size,
-            self.weight_alignment)
 
         # Keep weights in device buffer
         dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale.chunk(
@@ -2350,15 +2396,21 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           w2_weight_scale: torch.Tensor,
                                           dst_w2_weight_scale: torch.Tensor):
         device = dst_w2_weight_scale.device
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w2_weight_scale.shape[-1])
+
+        w2_weight_scale = maybe_pad_for_mxfp4(
+            w2_weight_scale, alignment // module.scaling_vector_size,
+            self.weight_alignment)
+
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
-        w2_weight_scale = maybe_pad_for_mxfp4(
-            w2_weight_scale,
-            self.weight_alignment // module.scaling_vector_size,
-            self.weight_alignment)
 
         # Keep weights in device buffer
         dst_w2_weight_scale.copy_(
@@ -2556,6 +2608,38 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                  dst_w3_w1_weight: torch.Tensor):
         device = dst_w3_w1_weight.device
         assert device.type == "cuda"
+
+        # We pad before the sharding. This is done to avoid fractional scaling factors
+        # per shard.
+        #
+        # E.g. if we pad after the sharding, with intermediate_size = 2880,
+        # tp_size = 4, scaling_vector_size = 32, each shard gets 720 elements and
+        # 22.5 scaling factors. After padding, each shard gets 768 in
+        # intermediate_size, and 24 in scaling factors's intermediate_size.
+        # The 2nd rank will start loading the 23rd scaling factor,
+        # while it should've loaded 22nd for the first 16 elements only.
+        # We pad the weights before the sharding to avoid this issue.
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size, w1_weight.shape[0])
+        if len(w1_weight.shape) == 2:
+            # Pad weights
+            # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
+            assert w1_weight.dtype == torch.uint8
+            w1_weight = maybe_pad_for_mxfp4(w1_weight,
+                                            self.weight_alignment // 2,
+                                            alignment)
+            assert w3_weight.dtype == torch.uint8
+            w3_weight = maybe_pad_for_mxfp4(w3_weight,
+                                            self.weight_alignment // 2,
+                                            alignment)
+        else:
+            # Pad bias, TRTLLM backend expects float32 bias.
+            assert len(w1_weight.shape) == 1
+            assert len(w3_weight.shape) == 1
+            w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment).float()
+            w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment).float()
+
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -2566,26 +2650,6 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-
-        if len(w1_weight_shard.shape) == 2:
-            # Pad weights
-            # We already satisfy alignment factor of 2 for we pad two MXFP4 into Uint8.
-            assert w1_weight_shard.dtype == torch.uint8
-            w1_weight_shard = maybe_pad_for_mxfp4(w1_weight_shard,
-                                                  self.weight_alignment // 2,
-                                                  self.weight_alignment)
-            assert w3_weight_shard.dtype == torch.uint8
-            w3_weight_shard = maybe_pad_for_mxfp4(w3_weight_shard,
-                                                  self.weight_alignment // 2,
-                                                  self.weight_alignment)
-        else:
-            # Pad bias, TRTLLM backend expects float32 bias.
-            assert len(w1_weight_shard.shape) == 1
-            w1_weight_shard = maybe_pad_for_mxfp4(
-                w1_weight_shard, self.weight_alignment).float()
-            w3_weight_shard = maybe_pad_for_mxfp4(
-                w3_weight_shard, self.weight_alignment).float()
-
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
 
@@ -2612,26 +2676,30 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                               dst_w2_weight: torch.Tensor):
         device = dst_w2_weight.device
         assert device.type == "cuda"
+
+        shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
+            w2_weight.shape) == 2 else w2_weight.shape[0]
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size, shard_w2_weight_dim)
+
+        if len(w2_weight.shape) == 2:
+            assert w2_weight.dtype == torch.uint8
+            w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment // 2,
+                                            self.weight_alignment)
+        else:
+            # Pad bias, TRTLLM backend expects float32 bias.
+            # Divide bias by tp_size as we shard along the hidden dimension.
+            # The bias is applied at each TP rank before the final accumulation.
+            assert len(w2_weight.shape) == 1
+            w2_weight = maybe_pad_for_mxfp4(
+                w2_weight, self.weight_alignment).float() / module.tp_size
+
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
-
-        if len(w2_weight_shard.shape) == 2:
-            # Pad weights
-            # We already satisfy alignment factor of 2 for we pad two MXFP4 into Uint8.
-            assert w2_weight_shard.dtype == torch.uint8
-            w2_weight_shard = maybe_pad_for_mxfp4(w2_weight_shard,
-                                                  self.weight_alignment // 2,
-                                                  self.weight_alignment)
-        else:
-            # Pad bias, TRTLLM backend expects float32 bias.
-            # Divide bias by tp_size as we shard along the hidden dimension.
-            # The bias is applied at each TP rank before the final accumulation.
-            assert len(w2_weight_shard.shape) == 1
-            w2_weight_shard = maybe_pad_for_mxfp4(
-                w2_weight_shard, self.weight_alignment).float() / module.tp_size
 
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
@@ -2657,6 +2725,19 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             dst_w3_w1_weight_scale: torch.Tensor):
         device = dst_w3_w1_weight_scale.device
         assert device.type == "cuda"
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w3_weight_scale.shape[0])
+
+        w1_weight_scale = maybe_pad_for_mxfp4(
+            w1_weight_scale,
+            self.weight_alignment // module.scaling_vector_size, alignment)
+        w3_weight_scale = maybe_pad_for_mxfp4(
+            w3_weight_scale,
+            self.weight_alignment // module.scaling_vector_size, alignment)
+
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
@@ -2667,14 +2748,6 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        w1_weight_scale = maybe_pad_for_mxfp4(
-            w1_weight_scale,
-            self.weight_alignment // module.scaling_vector_size,
-            self.weight_alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
-            w3_weight_scale,
-            self.weight_alignment // module.scaling_vector_size,
-            self.weight_alignment)
 
         # Keep weights in device buffer
         dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale.chunk(
@@ -2715,20 +2788,21 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           dst_w2_weight_scale: torch.Tensor):
         device = dst_w2_weight_scale.device
         assert device.type == "cuda"
-        # The last rank might get not full tensor, but its remainder.
-        # E.g. TP=8 and w2_weight_scale.shape[1] = 90, the last rank will get 6 elements.
-        # Take the original width, pad it to the self.weight_alignment // module.scaling_vector_size,
-        # Use this value as padding for the weight scales.
-        original_width = math.ceil(w2_weight_scale.shape[1] / module.tp_size)
-        sfs_alignment = self.weight_alignment // module.scaling_vector_size
-        padded_width = math.ceil(original_width / sfs_alignment) * sfs_alignment
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w2_weight_scale.shape[-1])
+
+        w2_weight_scale = maybe_pad_for_mxfp4(
+            w2_weight_scale, alignment // module.scaling_vector_size,
+            self.weight_alignment)
+
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
-        w2_weight_scale = maybe_pad_for_mxfp4(w2_weight_scale, padded_width,
-                                              self.weight_alignment)
 
         # Keep weights in device buffer
         dst_w2_weight_scale.copy_(

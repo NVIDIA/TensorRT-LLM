@@ -2,14 +2,22 @@
 
 import copy
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Type
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
-from ..custom_ops.attention_interface import CacheConfig
+from ..custom_ops.attention_interface import CacheConfig, DynamicShapeCallback
 from ..utils.logger import ad_logger
+
+
+class ShardingConfigSource(Enum):
+    """Enum for factory source."""
+
+    HUGGINGFACE = "huggingface"
+    UNKNOWN = "unknown"
 
 
 class ModelFactory(ABC):
@@ -17,7 +25,8 @@ class ModelFactory(ABC):
 
     NOTE: we make the assumption that the model can be prompted with a set of input_ids and
     position_ids of shape (batch_size, seq_len) and will return a tensor of shape
-    (batch_size, seq_len, embedding_size).
+    (batch_size, seq_len, embedding_size) by default. Individual factories have the ability to
+    define additional optional inputs and their (dynamic) shapes.
     """
 
     def __init__(
@@ -38,6 +47,8 @@ class ModelFactory(ABC):
         self.max_seq_len = max_seq_len
         self._prefetched_model_path: Optional[str] = None
         self._prefetched_tokenizer_path: Optional[str] = None
+        self._sharding_config: Dict[str, Any] = {}
+        self._sharding_config["source"] = ShardingConfigSource.UNKNOWN
 
     @property
     def model(self) -> Optional[str]:
@@ -64,7 +75,7 @@ class ModelFactory(ABC):
         .. code-block:: python
 
             def forward(
-                self, input_ids: torch.Tensor, position_ids: torch.Tensor
+                self, input_ids: torch.Tensor, position_ids: torch.Tensor, *extra_args: torch.Tensor
             ) -> Sequence[torch.Tensor]: ...
 
         ``logits`` are assumed to be the first output of the model, i.e.,
@@ -77,6 +88,9 @@ class ModelFactory(ABC):
             input_ids.shape == (batch_size, seq_len)
             position_ids.shape == (batch_size, seq_len)
             logits.shape == (batch_size, seq_len, vocab_size)
+
+        We allow for additional arguments to be passed to the model's forward function as defined by
+        the factory.
         """
         # make sure model architecture is pre-fetched (no weights needed at this point)
         skip_loading_weights = self.skip_loading_weights
@@ -96,6 +110,10 @@ class ModelFactory(ABC):
         """Returns the quantization config for this model or None if not quantized."""
         return {}
 
+    def get_sharding_config(self) -> Dict:
+        """Returns the sharding config for this model."""
+        return self._sharding_config
+
     def get_cache_config(self) -> CacheConfig:
         """Return the cache configuration for the model.
 
@@ -109,6 +127,15 @@ class ModelFactory(ABC):
 
         Returns:
             The initialized tokenizer for the model. If the tokenizer is not available, then this
+            method should return None.
+        """
+        return None
+
+    def init_processor(self) -> Optional[Any]:
+        """Initialize the (multi-modal) processor for the model.
+
+        Returns:
+            The initialized processor for the model. If the processor is not available, then this
             method should return None.
         """
         return None
@@ -206,6 +233,35 @@ class ModelFactory(ABC):
             device: The device to load the model on.
         """
 
+    def get_example_inputs(self) -> Dict[str, torch.Tensor]:
+        """Return a dictionary of example inputs for the model.
+
+        This function can be overwritten by a factory when it requires a specific example input to
+        in order to run through export.
+
+        Returns:
+            A dictionary of example inputs for the model where the key corresponds to the argument
+            name and the value corresponds to the example input.
+        """
+        return {}
+
+    def get_extra_inputs(self) -> Dict[str, Tuple[torch.Tensor, Optional[DynamicShapeCallback]]]:
+        """Return a dictionary of extra model inputs that behave like optional forward arguments.
+
+        Returns:
+            A dictionary of extra inputs for the model where the key corresponds to the argument
+            name and the value corresponds to a tuple of (none_input, dynamic_shape_callback):
+                - `none_input`: The none input value of the extra input indicating the tensor
+                   value corresponding to the equivalent of the None input. `None` is not supported
+                   as we require the input to be a tensor. Hence, this none_input acts as a
+                   placeholder for the None input. We assume that the "optional" behavior of these
+                   arguments can be represented via a placeholder tensor and and an appropriate
+                   check within the forward function using ``torch.cond``.
+                - `dynamic_shape_callback`: A function that returns the dynamic shape of the extra
+                  input. Simply set to `None` if the extra input is not dynamic.
+        """
+        return {}
+
 
 class ModelFactoryRegistry:
     _registry: Dict[str, Type[ModelFactory]] = {}
@@ -226,3 +282,7 @@ class ModelFactoryRegistry:
     @classmethod
     def has(cls, model_factory_cls: str) -> bool:
         return model_factory_cls in cls._registry
+
+    @classmethod
+    def entries(cls) -> List[str]:
+        return list(cls._registry.keys())

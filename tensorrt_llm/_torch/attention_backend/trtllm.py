@@ -67,6 +67,7 @@ class TrtllmAttentionWrapper:
     qk_rope_head_dim: Optional[int]
     qk_nope_head_dim: Optional[int]
     v_head_dim: Optional[int]
+    chunked_prefill_buffer_batch_size: Optional[int]
     attention_chunk_size: Optional[int]
     softmax_stats_tensor: Optional[torch.Tensor]
     use_spec_decoding: bool
@@ -171,6 +172,8 @@ class TrtllmAttentionWrapper:
         kv_scale_quant_orig: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         out_scale_sf: Optional[torch.Tensor] = None,
+        kv_scales_sf: Optional[torch.Tensor] = None,
+        kv_scales_sf_inv: Optional[torch.Tensor] = None,
         use_nvfp4_output: bool = False,
         use_paged_context_fmha: bool = False,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
@@ -185,6 +188,7 @@ class TrtllmAttentionWrapper:
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        chunked_prefill_buffer_batch_size: int = 1,
         **kwargs,
     ):
         """
@@ -216,10 +220,13 @@ class TrtllmAttentionWrapper:
             kv_scale_quant_orig (torch.Tensor): The tensor to store the scaling factor for dequantization from INT8/FP8 in the KV cache, with shape (1) on GPU.
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             out_scale_sf (torch.Tensor): The tensor to store the global scale for NVFP4 scaling factors, with shape (1) on GPU.
+            kv_scales_sf (torch.Tensor): The tensor to store the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
+            kv_scales_sf_inv (torch.Tensor): The tensor to store the inverse of the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
+            chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -240,8 +247,8 @@ class TrtllmAttentionWrapper:
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
         self.workspace = workspace
         self.cache_indirection = cache_indirection
-        self.kv_scale_orig_quant = kv_scale_orig_quant
-        self.kv_scale_quant_orig = kv_scale_quant_orig
+        self.kv_scale_orig_quant = kv_scale_orig_quant if kv_scales_sf_inv is None else kv_scales_sf_inv
+        self.kv_scale_quant_orig = kv_scale_quant_orig if kv_scales_sf is None else kv_scales_sf
         self.out_scale = out_scale
         self.out_scale_sf = out_scale_sf
         self.use_paged_context_fmha = use_paged_context_fmha
@@ -267,6 +274,7 @@ class TrtllmAttentionWrapper:
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
+        self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
         self.kwargs.update(kwargs)
 
     def create_output(self, q: torch.Tensor, out_dtype: torch.dtype):
@@ -466,6 +474,7 @@ class TrtllmAttentionWrapper:
             self.use_paged_context_fmha,
             self.attention_input_type,
             self.is_mla_enable,
+            self.chunked_prefill_buffer_batch_size,
             self.q_lora_rank,
             self.kv_lora_rank,
             self.qk_nope_head_dim,
@@ -478,7 +487,6 @@ class TrtllmAttentionWrapper:
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
         )
-
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
         return output, output_sf
@@ -597,13 +605,65 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _post_init_with_buffers(self, buffers) -> None:
+
         # Set a default value, as max_num_sequences is not always set.
         if self.max_num_sequences is None:
             self.max_num_sequences = self.max_num_requests
 
-        self.prompt_lens_cuda = torch.empty(
+        def get_empty(tensor_shape: list[int], dtype: torch.dtype,
+                      cache_name: str) -> torch.Tensor:
+            """
+            Finds a compatible, reusable buffer from a cache or creates a new one.
+
+            This function searches for a pre-allocated tensor (buffer) that can be
+            reused for an operation involving a tensor with the shape of `tensor_shape`.
+
+            The compatibility rules are: The buffer's total elements must be >= tensor_shape's.
+
+            If a compatible buffer is found, it's returned immediately. Otherwise, a new
+            buffer is allocated on the 'cuda' device with the give properties of 'tensor_shape' and 'dtype'.
+
+            Args:
+                tensor_shape: The required shape.
+                dtype: The required dtype.
+                cache_name: The key for the specific list of buffers to search in.
+
+            Returns:
+                An existing compatible buffer or a newly created one.
+            """
+            if buffers is not None:
+                # Safely get the list of candidates. Defaults to an empty list if key is missing.
+                candidate_buffers = buffers.get(cache_name, [])
+                numel_like = math.prod(tensor_shape)
+
+                for buffer in candidate_buffers:
+                    numel_buffer = buffer.numel()
+
+                    # buffer just needs to be large enough.
+                    if numel_buffer >= numel_like:
+                        return buffer[0:numel_like].view(
+                            tensor_shape)  # Found a fit, return immediately.
+
+            # If we get here, no suitable buffer was found in the cache. Create a new one.
+            new_buffer = torch.zeros(tensor_shape, device='cuda', dtype=dtype)
+            if buffers is not None:
+                buffers.setdefault(cache_name, []).append(new_buffer)
+            return new_buffer
+
+        def get_empty_like(like_tensor: torch.Tensor,
+                           cache_name: str) -> torch.Tensor:
+            return get_empty(
+                like_tensor.shape,
+                cache_name=cache_name,
+                dtype=like_tensor.dtype,
+            )
+
+        self.prompt_lens_cuda = get_empty(
             (self.max_num_sequences, ),
-            device='cuda',
+            cache_name="prompt_lens_cuda",
             dtype=torch.int,
         )
         self.prompt_lens_cpu = torch.empty_like(
@@ -611,7 +671,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
             pin_memory=True,
         )
-        self.kv_lens_cuda = torch.empty_like(self.prompt_lens_cuda)
+        self.kv_lens_cuda = get_empty_like(
+            self.prompt_lens_cuda,
+            cache_name="kv_lens_cuda",
+        )
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
@@ -626,13 +689,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int8,
             )
         if self.kv_cache_manager is not None:
-            self.kv_cache_block_offsets = torch.empty(
+            self.kv_cache_block_offsets = get_empty(
                 [
                     self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
+                cache_name="kv_cache_block_offsets",
                 dtype=torch.int32,
-                device='cuda',
             )
             self.host_kv_cache_block_offsets = torch.empty_like(
                 self.kv_cache_block_offsets,
@@ -642,27 +705,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
-                self.block_ids_per_seq = torch.zeros(
+                self.block_ids_per_seq = get_empty(
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
                     ],
+                    cache_name="block_ids_per_seq",
                     dtype=torch.int32,
-                    device='cuda',
                 )
-                self.kv_block_ids_per_seq = torch.zeros(
+                self.kv_block_ids_per_seq = get_empty(
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
                     ],
+                    cache_name="kv_block_ids_per_seq",
                     dtype=torch.int32,
-                    device='cuda',
                 )
             if self.enable_context_mla_with_cached_kv:
                 # for kv cache reuse/chunked context in MLA
-                self.ctx_cached_token_indptr = torch.zeros(
+                self.ctx_cached_token_indptr = get_empty(
                     (self.max_num_requests + 1, ),
-                    device='cuda',
+                    cache_name="ctx_cached_token_indptr",
                     dtype=torch.int64,
                 )
                 self.host_ctx_cached_token_indptr = torch.zeros_like(
@@ -670,9 +733,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
-                self.ctx_uncached_token_indptr = torch.zeros(
+                self.ctx_uncached_token_indptr = get_empty(
                     (self.max_num_requests + 1, ),
-                    device='cuda',
+                    cache_name="ctx_uncached_token_indptr",
                     dtype=torch.int64,
                 )
                 self.host_ctx_uncached_token_indptr = torch.zeros_like(
@@ -681,9 +744,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
                 # context full seqlens include cached tokens and uncached tokens
-                self.ctx_kv_indptr = torch.zeros(
+                self.ctx_kv_indptr = get_empty(
                     (self.max_num_requests + 1, ),
-                    device='cuda',
+                    cache_name="ctx_kv_indptr",
                     dtype=torch.int64,
                 )
                 self.host_ctx_kv_indptr = torch.zeros_like(
@@ -765,8 +828,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
+
+            error_message = (
+                f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
+                f"exceeds the KV cache manager's maximum supported length "
+                f"({self.kv_cache_manager.max_seq_len}).")
+
             assert self.kv_lens[:self.num_seqs].max(
-            ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
+            ) <= self.kv_cache_manager.max_seq_len, error_message
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         self.kv_lens_runtime = self.kv_lens[:self.num_seqs]
@@ -794,8 +863,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
+        chunked_global_offset: torch.
+        Tensor,  # [chunked_loop_num + 1, num_contexts]
         cu_chunked_seq_len: torch.Tensor,
         merge_op_tensor: torch.Tensor,
+        max_chunk_len_per_loop: list[int],
         chunked_loop_num: int,
     ) -> None:
         """
@@ -804,24 +876,46 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         num_contexts = self.num_contexts
         chunk_size = self.runtime_features.chunk_size
-        cached_kv_lens = torch.tensor(
-            self.kv_cache_params.num_cached_tokens_per_seq,
-            dtype=torch.int,
-            device='cpu',
-        )
+        chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
+        total_chunk_size = chunk_size * chunk_batch_size
+        remain_buffer_len = total_chunk_size
+        current_batch_idx = 0
+        max_chunk_len_per_loop.clear()
+        max_chunk_len = 0
+        # cal chunked_seq_len
+        for batch_idx in range(num_contexts):
+            cached_kv_len = self.kv_cache_params.num_cached_tokens_per_seq[
+                batch_idx]
+            while cached_kv_len > 0:
+                used_buffer_len = min(remain_buffer_len, cached_kv_len)
+                chunked_seq_len[current_batch_idx, batch_idx] = used_buffer_len
+                max_chunk_len = max(max_chunk_len, used_buffer_len)
+                remain_buffer_len -= used_buffer_len
+                cached_kv_len -= used_buffer_len
+                chunked_global_offset[
+                    current_batch_idx + 1, batch_idx] = chunked_global_offset[
+                        current_batch_idx,
+                        batch_idx] + chunked_seq_len[current_batch_idx,
+                                                     batch_idx]
+                if remain_buffer_len == 0:
+                    current_batch_idx += 1
+                    remain_buffer_len = total_chunk_size
+                    max_chunk_len_per_loop.append(max_chunk_len)
+                    max_chunk_len = 0
+        if len(max_chunk_len_per_loop) < chunked_loop_num:
+            max_chunk_len_per_loop.append(max_chunk_len)
+        assert len(
+            max_chunk_len_per_loop
+        ) == chunked_loop_num, f"max_chunk_len_per_loop size {len(max_chunk_len_per_loop)} != chunked_loop_num {chunked_loop_num}"
         for loop_idx in range(chunked_loop_num):
             cu_chunked_seq_len[loop_idx, 0] = 0
-            used_chunk_seq_len = loop_idx * chunk_size
-            chunked_seq_len[loop_idx, :num_contexts] = torch.clamp(
-                cached_kv_lens[:num_contexts] - used_chunk_seq_len,
-                min=0,
-                max=chunk_size)
             torch.cumsum(chunked_seq_len[loop_idx, :num_contexts],
                          dim=0,
                          dtype=torch.int64,
                          out=cu_chunked_seq_len[loop_idx, 1:num_contexts + 1])
             for s in range(num_contexts):
-                if loop_idx == 0 and chunked_seq_len[loop_idx, s] > 0:
+                if chunked_seq_len[loop_idx, s] > 0 and (
+                        loop_idx == 0 or chunked_seq_len[loop_idx - 1, s] == 0):
                     merge_op_tensor[loop_idx, s] = 2  # copy only
                 elif chunked_seq_len[loop_idx, s] > 0:
                     merge_op_tensor[loop_idx, s] = 1  # merge
@@ -830,7 +924,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # set merge op for last attn
         for s in range(num_contexts):
-            if cached_kv_lens[s] == 0:
+            if self.kv_cache_params.num_cached_tokens_per_seq[s] == 0:
                 merge_op_tensor[chunked_loop_num, s] = 2  # copy only
             else:
                 merge_op_tensor[chunked_loop_num, s] = 1  # merge
@@ -852,14 +946,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # currently we assume that the chunk size is the same as the max_num_tokens
             if self.runtime_features.chunked_prefill:
                 chunk_size = self.runtime_features.chunk_size
-                self.chunked_loop_num = (self.max_ctx_cached_token_len +
-                                         chunk_size - 1) // chunk_size
-                self.chunked_seq_len = torch.empty(
+                chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
+                total_chunk_size = chunk_size * chunk_batch_size
+                self.chunked_loop_num = math.ceil(self.num_ctx_cached_tokens /
+                                                  total_chunk_size)
+                self.chunked_seq_len = torch.zeros(
                     (self.chunked_loop_num, self.num_seqs),
                     dtype=torch.int,
                     device='cuda',
                 )
-                self.host_chunked_seq_len = torch.empty_like(
+                self.host_chunked_seq_len = torch.zeros_like(
                     self.chunked_seq_len,
                     device='cpu',
                     pin_memory=True,
@@ -874,6 +970,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
+                self.chunked_global_offset = torch.zeros(
+                    (self.chunked_loop_num + 1, self.num_contexts),
+                    dtype=torch.int64,
+                    device='cuda',
+                )
+                self.host_chunked_global_offset = torch.zeros_like(
+                    self.chunked_global_offset,
+                    device='cpu',
+                    pin_memory=True,
+                )
+                self.max_chunk_len_per_loop = []
                 # For last chunk we use the uncached kv
                 self.merge_op_tensor = torch.empty(
                     (self.chunked_loop_num + 1, self.num_contexts),
@@ -888,8 +995,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
                 self.pre_process_for_chunked_prefill(
                     chunked_seq_len=self.host_chunked_seq_len,
+                    chunked_global_offset=self.host_chunked_global_offset,
                     cu_chunked_seq_len=self.host_cu_chunked_seq_len,
                     merge_op_tensor=self.host_merge_op_tensor,
+                    max_chunk_len_per_loop=self.max_chunk_len_per_loop,
                     chunked_loop_num=self.chunked_loop_num)
                 self.chunked_seq_len.copy_(self.host_chunked_seq_len,
                                            non_blocking=True)
@@ -897,6 +1006,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                               non_blocking=True)
                 self.merge_op_tensor.copy_(self.host_merge_op_tensor,
                                            non_blocking=True)
+                self.chunked_global_offset.copy_(
+                    self.host_chunked_global_offset, non_blocking=True)
         else:
             self.num_ctx_cached_tokens = 0
             self.max_ctx_cached_token_len = 0
@@ -1051,14 +1162,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
         self.v_head_dim = self.mla_params.v_head_dim if self.is_mla_enable else head_dim
-
-        self.kv_cache_scaling_factor = torch.tensor(
-            [1.0],
-            dtype=torch.float32,
-            device='cuda',
-        )
+        self.kv_cache_scaling_factor = torch.ones(1,
+                                                  dtype=torch.float32,
+                                                  device='cuda')
         self.kv_scale_quant_orig = self.kv_cache_scaling_factor
-        self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
+        self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1070,6 +1178,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
+            self.has_fp4_kv_cache = self.quant_config.layer_quant_mode.has_fp4_kv_cache(
+            )
 
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
@@ -1077,6 +1187,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_fp8_rowwise = self.quant_config.layer_quant_mode.has_fp8_rowwise(
             )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
+            self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
+            )
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if metadata.kv_cache_manager is None:
@@ -1092,6 +1204,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         out_scale: Optional[torch.Tensor] = None,
         out_scale_sf: Optional[torch.Tensor] = None,
+        kv_scales_sf: Optional[torch.Tensor] = None,
+        kv_scales_sf_inv: Optional[torch.Tensor] = None,
         *,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
@@ -1104,6 +1218,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        chunked_prefill_buffer_batch_size: int = 1,
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         assert isinstance(
@@ -1153,12 +1268,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
-            workspace=metadata.workspace,
+            workspace=metadata.
+            workspace,  # re-enable it, if pass None to it, fp8 mla will encounter invalid cuda free issue.
             cache_indirection=metadata.cache_indirection,
             kv_scale_orig_quant=self.kv_scale_orig_quant,
             kv_scale_quant_orig=self.kv_scale_quant_orig,
             out_scale=out_scale,
             out_scale_sf=out_scale_sf,
+            kv_scales_sf=kv_scales_sf,
+            kv_scales_sf_inv=kv_scales_sf_inv,
             use_nvfp4_output=use_nvfp4_output,
             use_paged_context_fmha=use_paged_context_fmha,
             attention_input_type=attention_input_type,
@@ -1175,6 +1293,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_generation_lengths=metadata.
             spec_decoding_generation_lengths,
             attention_sinks=attention_sinks,
+            chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
         )
         out_dtype = None
         if out_scale is not None:
@@ -1182,7 +1301,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # Use UINT8 as the container dtype for NVFP4.
                 out_dtype = torch.uint8
             elif (self.has_fp8_qdq or self.has_nvfp4 or self.has_fp8_block_wise
-                  or self.has_fp8_rowwise) and self.has_fp8_kv_cache:
+                  or self.has_fp8_rowwise
+                  or self.has_w4a8_nvfp4_fp8) and (self.has_fp8_kv_cache
+                                                   or self.has_fp4_kv_cache):
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 
@@ -1279,9 +1400,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def load_chunked_kv_cache_for_mla(
         self,
         metadata: TrtllmAttentionMetadata,
-        chunked_idx: int,
         num_ctx_cached_tokens: int,
         cu_chunked_seq_len: torch.Tensor,
+        chunked_global_offset: torch.Tensor,
+        chunked_max_seq_len: int,
         out_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
@@ -1305,6 +1427,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.num_contexts,
             num_ctx_cached_tokens,
             cu_chunked_seq_len,
+            chunked_global_offset,
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
@@ -1314,8 +1437,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.kv_lora_rank,
             self.mla_params.qk_rope_head_dim,
             metadata.kv_cache_manager.tokens_per_block,
-            metadata.runtime_features.chunk_size,
-            chunked_idx,
+            chunked_max_seq_len,
             metadata.kv_cache_manager.max_seq_len,
             sink_token_length,
             beam_width,

@@ -57,6 +57,13 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
 
     def support_overlap_scheduler(self):
+        return self.is_mtp() or self.is_eagle3_one_model(
+        ) or self.has_draft_model()
+
+    def support_guided_decoder(self):
+        return self.is_none() or self.has_spec_drafter()
+
+    def support_capturable_guided_decoder(self):
         return self.is_mtp() or self.is_eagle3_one_model()
 
     def has_draft_model(self):
@@ -126,11 +133,11 @@ class SpecMetadata:
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
     # The mode of speculative decoding.
-    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE,
+    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # Draft tokens.
-    draft_tokens: Optional[torch.Tensor] = None,
+    draft_tokens: Optional[torch.Tensor] = None
     # The length of the draft tokens.
-    draft_lens: Optional[torch.Tensor] = None,
+    draft_lens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
@@ -141,12 +148,7 @@ class SpecMetadata:
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
-    _all_rank_num_tokens: Optional[List[int]] = field(init=False,
-                                                      default=None,
-                                                      repr=False)
-    all_rank_num_tokens: Optional[List[int]]
-    # The max number of tokens among all ranks.
-    all_rank_max_num_tokens: Optional[int] = None
+    all_rank_num_tokens: Optional[List[int]] = None
 
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
@@ -185,6 +187,13 @@ class SpecMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
+    def is_layer_capture(self, layer_id: int):
+        """
+        Whether the layer should be captured (eg for Eagle3).
+        By default, does nothing.
+        """
+        return False
+
     def maybe_capture_hidden_states(self, layer_id: int,
                                     hidden_states: torch.Tensor,
                                     residual: torch.Tensor) -> None:
@@ -192,13 +201,3 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
-
-    @property
-    def all_rank_num_tokens(self) -> Optional[List[int]]:
-        return self._all_rank_num_tokens
-
-    @all_rank_num_tokens.setter
-    def all_rank_num_tokens(self, value: Optional[List[int]]):
-        value = value if value is not SpecMetadata.all_rank_num_tokens else None
-        self._all_rank_num_tokens = value
-        self.all_rank_max_num_tokens = max(value) if value is not None else None

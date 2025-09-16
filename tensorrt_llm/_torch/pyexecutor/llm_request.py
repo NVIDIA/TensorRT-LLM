@@ -1,6 +1,8 @@
+from collections.abc import Generator
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from itertools import pairwise
+from typing import Any, Dict, List, Optional, TypeAlias, Union
 
 import torch
 
@@ -339,7 +341,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
-        self.py_lora_task_layer_module_configs = None
+        self.py_lora_task_layer_module_configs: list[
+            tensorrt_llm.bindings.internal.runtime.
+            TaskLayerModuleConfig] | None = None
 
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
@@ -422,7 +426,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.child_requests.append(py_request)
 
 
-def convert_wordlist(word_list) -> List[List[int]]:
+StopWordList: TypeAlias = list[list[int]]
+
+
+def convert_wordlist(word_list) -> StopWordList:
     """Converts a wordlist from format:
 
     [[word_0 token_0, word_0 token_1, ...], [word_1 token_0, ...], ...]]
@@ -457,6 +464,16 @@ def convert_wordlist(word_list) -> List[List[int]]:
     if len(tokens) > len(offsets):
         offsets.extend([-1] * (len(tokens) - len(offsets)))
     return [tokens, offsets]
+
+
+def produce_stop_words(
+        py_stop_words_list: StopWordList) -> Generator[list[int], None, None]:
+    """yield stop sequences from the output of `convert_wordlist` above."""
+    stop_words_list, prefix_sum = py_stop_words_list
+    for start, end in pairwise((0, *prefix_sum)):  # first element: prepend 0
+        if end == -1:  # -1 is a sentinel value in convert_wordlist
+            break
+        yield stop_words_list[start:end]
 
 
 def executor_request_to_llm_request(
@@ -544,6 +561,8 @@ def executor_request_to_llm_request(
         priority=0.5,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
+        cache_salt_id=executor_request.cache_salt_id,
+        arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
     if child_req_ids:

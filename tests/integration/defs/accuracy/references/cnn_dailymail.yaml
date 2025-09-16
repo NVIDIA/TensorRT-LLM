@@ -1,5 +1,5 @@
 google/gemma-3-1b-it:
-  - accuracy: 22.988
+  - accuracy: 19.0
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 20.699
@@ -150,9 +150,11 @@ meta-llama/Llama-3.1-8B-Instruct:
   - quant_algo: FP8
     extra_acc_spec: temperature=0.8,top_p=0.95
     accuracy: 28.631
+  - extra_acc_spec: beam_width=2
+    accuracy: 31.223
   - quant_algo: FP8
-    extra_acc_spec: beam_width=4
-    accuracy: 31.391
+    extra_acc_spec: beam_width=2
+    accuracy: 31.201
 meta-llama/Llama-3.2-1B:
   - accuracy: 27.427
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
@@ -184,7 +186,8 @@ meta-llama/Llama-3.2-3B:
     kv_cache_quant_algo: FP8
     accuracy: 33.629
 meta-llama/Llama-3.3-70B-Instruct:
-  - spec_dec_algo: Eagle
+  - quant_algo: FP8
+    spec_dec_algo: Eagle
     accuracy: 33.244
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
@@ -214,6 +217,9 @@ mistralai/Mistral-7B-Instruct-v0.3:
     accuracy: 31.201
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 29.20
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.0
 mistralai/Mistral-Nemo-12b-Base:
   - accuracy: 28.906
   - quant_algo: FP8
@@ -322,6 +328,8 @@ Qwen/Qwen2.5-7B-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 33.248
+Qwen/QwQ-32B:
+  - accuracy: 30.358
 nvidia/Nemotron-Mini-4B-Instruct:
   - quant_algo: FP8
     accuracy: 25.247
@@ -342,6 +350,18 @@ deepseek-ai/DeepSeek-V3-Lite:
     spec_dec_algo: MTP
     accuracy: 26.230
 deepseek-ai/DeepSeek-R1:
+  - quant_algo: NVFP4
+    accuracy: 28.706
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 28.706
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 28.706
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 28.706
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 28.706
   - quant_algo: FP8_BLOCK_SCALES
