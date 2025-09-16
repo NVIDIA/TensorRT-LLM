@@ -58,9 +58,9 @@ enum class LlmRequestState : int32_t
                                             /// used in layer-wise transmission
     kDISAGG_GENERATION_TRANS_COMPLETE = 12, ///< Kv cache transmission are finished
     kGENERATION_IN_PROGRESS = 13,           ///< Generation phase is in progress
-    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
 
     // schedulable states ends
+    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
     kGENERATION_COMPLETE = 20,              ///< Generation phase completed
     kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 21, ///< Waiting context-only request transmitting the kv cache,
                                             /// after computation finished
