@@ -592,7 +592,8 @@ def find_mm_token_positions(
         input_ids: Token sequence (tensor, list, or numpy array)
         num_mm_tokens: List of contiguous chunk lengths for each multimodal item
         vocab_size: Size of the model's vocabulary (used to identify tokens > vocab_size)
-        mm_token_ids: Specific token IDs that represent multimodal tokens
+        mm_token_ids: Specific token IDs that represent multimodal tokens, including special tokens
+        mm_special_token_ids: Specific token IDs that represent special multimodal tokens
 
     Returns:
         List of starting positions for each contiguous multimodal token
@@ -614,13 +615,19 @@ def find_mm_token_positions(
         elif isinstance(input_ids, np.ndarray):
             input_ids = torch.from_numpy(input_ids)
 
-    # Create mask for multimodal tokens
+    # Create mask for multimodal tokens including special tokens if provided
     if mm_token_ids is None:
         mm_mask = input_ids >= vocab_size
+        if mm_special_token_ids is not None:
+            mm_mask = mm_mask | torch.isin(input_ids, mm_special_token_ids)
     else:
         if mm_token_ids.ndim != 1:
             raise ValueError("mm_token_ids must be a 1D tensor")
-        mm_token_ids = torch.unique(mm_token_ids)
+        if mm_special_token_ids is not None:
+            mm_token_ids = torch.unique(
+                torch.cat([mm_token_ids, mm_special_token_ids]))
+        else:
+            mm_token_ids = torch.unique(mm_token_ids)
         mm_mask = torch.isin(input_ids, mm_token_ids)
 
     # If no multimodal tokens found, return empty list
