@@ -1864,7 +1864,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
             async for output in llm.generate_async(prompt,
                                                    sampling_params,
                                                    streaming=True):
-                logprobs_result_streaming += output.outputs[0].logprobs
+                logprobs_result_streaming += output.outputs[0].logprobs_diff
 
             # comparing streaming logprobs result to non-streaming
             assert logprobs_result_streaming == logprobs_result

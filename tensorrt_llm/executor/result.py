@@ -267,11 +267,6 @@ class GenerationResultBase:
                 if isinstance(output.logprobs, list):
                     assert len(output.logprobs) == output.length
 
-        # In streaming mode, logprobs should contain only incremental data
-        if hasattr(self, '_streaming') and self._streaming:
-            # Replace logprobs with only the diff portion
-            output.logprobs = output.logprobs[output._last_logprobs_len:]
-
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
