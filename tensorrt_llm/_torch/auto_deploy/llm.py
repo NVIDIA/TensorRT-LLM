@@ -1,6 +1,8 @@
 import types
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
+
 from ...executor.result import CompletionOutput
 from ...inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
 from ...llmapi.llm import RequestOutput, _TorchLLM
@@ -39,6 +41,7 @@ class ADInputProcessor(DefaultInputProcessor):
                 "truncation": True,
                 "max_length": sampling_params.truncate_prompt_tokens,
             }
+
         # check for messages field and if yes, use the apply_chat_template method
         if "messages" in inputs:
             # TODO: we don't really need this but it makes for a good sanity check. Consider
@@ -71,9 +74,55 @@ class ADInputProcessor(DefaultInputProcessor):
             else:
                 extra_processed_inputs = None
             return token_ids[0].tolist(), extra_processed_inputs
+        elif "multi_modal_data" in inputs:
+            return self._mistral_process_inputs(inputs)
         else:
             token_ids = self.tokenizer.encode(inputs["prompt"], **kwargs)
-            return token_ids, None
+            extra_processed_inputs = None
+            if "multi_modal_data" in inputs:
+                extra_processed_inputs = {"multimodal_data": inputs["multi_modal_data"]}
+            return token_ids, extra_processed_inputs
+
+    def _mistral_process_inputs(self, inputs):
+        images = inputs.get("multi_modal_data", {}).get("image")
+        do_rescale = self.processor.image_processor.do_rescale
+        if images is not None and isinstance(images[0], torch.Tensor):
+            # The default multimodal input loader will normalize images to [0, 1] when the requested
+            # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
+            do_rescale = False
+
+        processed = self.processor(
+            text=inputs["prompt"],
+            images=images,
+            do_rescale=do_rescale,
+        )
+        input_ids = processed.pop("input_ids").tolist()[0]
+        # Remaining in `processed`:
+        # * "attention_mask": [B, num_input_tokens]
+        # * "pixel_values": [B, C, H, W]
+        # * "image_sizes": [B, 2]
+        extra_processed_inputs = None
+        pixel_values = processed.get("pixel_values")
+        if pixel_values is not None:
+            # We have no use for the `attention_mask`.
+            processed.pop("attention_mask")
+            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
+            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
+            # reaching the model forward. Since its values are used to infer the amount of padding
+            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
+            # list here to avoid this.
+            # processed["image_sizes"] = processed["image_sizes"].tolist()
+            # NOTE: `processed` is a dict-like object, but not actually a dict.
+            extra_processed_inputs = {
+                "multimodal_data": {
+                    **processed
+                    # "image": {
+                    #     **processed
+                    # }
+                }
+            }
+
+        return input_ids, extra_processed_inputs
 
 
 class LLM(_TorchLLM):
