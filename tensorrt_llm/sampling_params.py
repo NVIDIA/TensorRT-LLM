@@ -27,10 +27,14 @@ class GuidedDecodingParams:
     grammar: Optional[str] = None
     json_object: bool = False
     structural_tag: Optional[str] = None
+    guidance_start_token_id: Optional[int] = None
 
     def _validate(self):
+        exclude_fields = set(["guidance_start_token_id"])
         num_guides = 0
         for _field in fields(self):
+            if _field.name in exclude_fields:
+                continue
             num_guides += bool(getattr(self, _field.name))
         if num_guides > 1:
             raise ValueError(f"Only one guide can be used for a request, but got {num_guides}.")
@@ -459,7 +463,9 @@ class SamplingParams:
             return None
 
         if self.guided_decoding.json_object:
-            return tllme.GuidedDecodingParams(tllme.GuidedDecodingParams.GuideType.JSON)
+            return tllme.GuidedDecodingParams(
+                tllme.GuidedDecodingParams.GuideType.JSON, None, self.guided_decoding.guidance_start_token_id,
+            )
         elif self.guided_decoding.json is not None:
             json_schema = self.guided_decoding.json
             if isinstance(json_schema, BaseModel):
@@ -467,20 +473,21 @@ class SamplingParams:
             if isinstance(json_schema, dict):
                 json_schema = json.dumps(json_schema)
             return tllme.GuidedDecodingParams(
-                tllme.GuidedDecodingParams.GuideType.JSON_SCHEMA, json_schema
+                tllme.GuidedDecodingParams.GuideType.JSON_SCHEMA, json_schema, self.guided_decoding.guidance_start_token_id
             )
         elif self.guided_decoding.regex is not None:
             return tllme.GuidedDecodingParams(
-                tllme.GuidedDecodingParams.GuideType.REGEX, self.guided_decoding.regex
+                tllme.GuidedDecodingParams.GuideType.REGEX, self.guided_decoding.regex, self.guided_decoding.guidance_start_token_id
             )
         elif self.guided_decoding.grammar is not None:
             return tllme.GuidedDecodingParams(
-                tllme.GuidedDecodingParams.GuideType.EBNF_GRAMMAR, self.guided_decoding.grammar
+                tllme.GuidedDecodingParams.GuideType.EBNF_GRAMMAR, self.guided_decoding.grammar, self.guided_decoding.guidance_start_token_id
             )
         elif self.guided_decoding.structural_tag is not None:
             return tllme.GuidedDecodingParams(
                 tllme.GuidedDecodingParams.GuideType.STRUCTURAL_TAG,
                 self.guided_decoding.structural_tag,
+                self.guided_decoding.guidance_start_token_id,
             )
         else:
             return None

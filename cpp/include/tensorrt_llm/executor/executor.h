@@ -509,11 +509,12 @@ public:
         kSTRUCTURAL_TAG = 4,
     };
 
-    explicit GuidedDecodingParams(GuideType guideType, std::optional<std::string> guide = std::nullopt);
+    explicit GuidedDecodingParams(GuideType guideType, std::optional<std::string> guide = std::nullopt, std::optional<std::int32_t> guidanceStartTokenId = std::nullopt);
 
     bool operator==(GuidedDecodingParams const& other) const;
     [[nodiscard]] GuideType getGuideType() const;
     [[nodiscard]] std::optional<std::string> getGuide() const;
+    [[nodiscard]] std::optional<std::int32_t> getGuidanceStartTokenId() const;
 
 private:
     friend class Serialization;
@@ -523,6 +524,7 @@ private:
     /// @brief The detailed guide string. It could be a json schema, a regular expression or a EBNF grammar depending on
     /// mGuideType.
     std::optional<std::string> mGuide;
+    std::optional<std::int32_t> mGuidanceStartTokenId;
 };
 
 using RetentionPriority = SizeType32;
