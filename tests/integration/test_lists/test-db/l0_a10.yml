@@ -33,6 +33,7 @@ l0_a10:
   - test_e2e.py::test_openai_lora
   - test_e2e.py::test_trtllm_serve_multimodal_example
   - test_e2e.py::test_trtllm_serve_lora_example
+  - test_e2e.py::test_trtllm_serve_top_logprobs[pytorch]
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]
   - test_e2e.py::test_openai_completions_example[pytorch]
@@ -106,6 +107,7 @@ l0_a10:
   - llmapi/test_llm_examples.py::test_llmapi_server_example
   - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen2-0.5B]
   - test_e2e.py::test_trtllm_serve_example
+  - test_e2e.py::test_trtllm_serve_top_logprobs[trt]
   - test_e2e.py::test_openai_misc_example[trt]
   - test_e2e.py::test_openai_completions_example[trt]
   - test_e2e.py::test_openai_chat_example[trt]
