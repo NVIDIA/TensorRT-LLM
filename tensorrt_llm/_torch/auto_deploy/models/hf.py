@@ -217,6 +217,17 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self._set_sharding_config(model.config)
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
 
+        # TODO: add to ModelOPT QuantConfigReader/graph transforms
+        mto_ckpt_path = os.path.join(self.model, "modelopt_state.pth")
+        if os.path.exists(mto_ckpt_path):
+            import modelopt.torch.opt as mto  # noqa: E402
+
+            print(f"Loading ModelOpt checkpoint from {mto_ckpt_path}")
+            modelopt_state = torch.load(mto_ckpt_path, weights_only=False)
+            model = mto.restore_from_modelopt_state(model, modelopt_state)
+            print("Restored model:")
+            print(model)
+
         model.eval()
 
         if self._quant_config_reader is not None:

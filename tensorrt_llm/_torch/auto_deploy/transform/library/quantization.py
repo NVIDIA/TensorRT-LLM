@@ -19,6 +19,7 @@ from ...utils.node_utils import (
     is_bmm_op,
     is_linear_op,
 )
+from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ...utils.quantization_utils import (
     fp4_global_scale,
     fp8_scale,
@@ -533,3 +534,127 @@ class NVFP4QuantizationFromGraph(NVFP4LinearQuantizationFromConfig):
         return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
         )
+
+
+def _int4_linear_pattern(
+    x,
+    w,
+    amax,
+    pre_quant_scale,
+):
+    x_scaled = torch.mul(x, pre_quant_scale)
+    w_r = torch.reshape(w, (-1, 128))
+    amax_det = amax.detach()
+
+    # returns: (quantized_outputs_like_w_r, scale_like_amax)
+    tq_out = torch.ops.auto_deploy.tensor_quant_legacy.default(w_r, amax_det, 4, False, False)
+    q = tq_out[0]
+    scale = tq_out[1]
+
+    # dequant -> reshape back -> linear
+    scale_f32 = scale.to(x.dtype)
+    w_deq = torch.div(q, scale_f32)
+    w_deq = torch.reshape(w_deq, (w.shape[0], w.shape[1]))
+    return torch.ops.auto_deploy.torch_linear_simple.default(x_scaled, w_deq, None)
+
+
+def _int4_linear_repl(x, w, amax, pre_quant_scale):
+    return torch.ops.auto_deploy.torch_fake_quant_int4_linear.default(
+        x, w, None, [pre_quant_scale], [amax], [], []
+    )
+
+
+# pattern with bias
+def _int4_linear_pattern_2(
+    x,
+    w,
+    amax,
+    pre_quant_scale,
+    bias,
+):
+    x_scaled = torch.mul(x, pre_quant_scale)
+    w_r = torch.reshape(w, (-1, 128))  # Block Size is 128
+    amax_det = amax.detach()
+    # returns: (quantized_outputs_like_w_r, scale_like_amax)
+    tq_out = torch.ops.auto_deploy.tensor_quant_legacy.default(w_r, amax_det, 4, False, False)
+    q = tq_out[0]
+    scale = tq_out[1]
+
+    # dequant -> reshape back -> linear
+    scale_f32 = scale.to(x.dtype)
+    w_deq = torch.div(q, scale_f32)
+    w_deq = torch.reshape(w_deq, (w.shape[0], w.shape[1]))
+    return torch.ops.auto_deploy.torch_linear_simple.default(x_scaled, w_deq, bias)
+
+
+def _int4_linear_repl_2(x, w, amax, pre_quant_scale, bias):
+    return torch.ops.auto_deploy.torch_fake_quant_int4_linear.default(
+        x, w, bias, [pre_quant_scale], [amax], [], []
+    )
+
+
+@TransformRegistry.register("quantize_int4_from_graph")
+class INT4QuantizationFromGraph(BaseTransform):
+    """
+    Finds the INT4 weight fake-quant + dequant + reshape + linear subgraph and
+    replaces it with auto_deploy::torch_fake_quant_int4_linear.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        graph = gm.graph
+        patterns = ADPatternMatcherPass()
+
+        B0, B1, H = 2, 3, 896
+        OUT, IN = 896, 896
+        BLOCK = 128
+        NUM_ROWS = (OUT * IN) // BLOCK  # 6272
+
+        dummy_args = [
+            torch.randn(B0, B1, H, device="meta", dtype=torch.float32),  # x
+            torch.randn(OUT, IN, device="meta", dtype=torch.float32),  # w
+            torch.randn(NUM_ROWS, 1, device="meta", dtype=torch.bfloat16),  # amax
+            torch.randn(1, device="meta", dtype=torch.float32),  # pre_quant_scale
+        ]
+
+        register_ad_pattern(
+            search_fn=_int4_linear_pattern,
+            replace_fn=_int4_linear_repl,
+            patterns=patterns,
+            dummy_args=dummy_args,
+            op_ignore_types={
+                torch.ops.aten.reshape.default: (int,),
+                torch.ops.aten.to.dtype: (torch.dtype,),
+            },
+        )
+
+        dummy_args_2 = [
+            torch.randn(B0, B1, H, device="meta", dtype=torch.float32),  # x
+            torch.randn(OUT, IN, device="meta", dtype=torch.float32),  # w
+            torch.randn(NUM_ROWS, 1, device="meta", dtype=torch.bfloat16),  # amax
+            torch.randn(1, device="meta", dtype=torch.float32),  # pre_quant_scale
+            torch.randn(OUT, device="meta", dtype=torch.float32),  # bias
+        ]
+
+        register_ad_pattern(
+            search_fn=_int4_linear_pattern_2,
+            replace_fn=_int4_linear_repl_2,
+            patterns=patterns,
+            dummy_args=dummy_args_2,
+            op_ignore_types={
+                torch.ops.aten.reshape.default: (int,),
+                torch.ops.aten.to.dtype: (torch.dtype,),
+            },
+        )
+
+        num_matches = patterns.apply(graph)
+
+        info = TransformInfo(
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+        )
+        return gm, info
