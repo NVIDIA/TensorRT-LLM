@@ -1,4 +1,3 @@
-import logging
 import math
 import os
 import platform
@@ -8,7 +7,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import mpi_barrier
+from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -17,7 +16,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 _thread_local = threading.local()
-logger = logging.getLogger(__name__)
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -55,11 +53,15 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
 def get_allreduce_mnnvl_workspace(
     mapping: Mapping, dtype: torch.dtype
 ) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
+
     if not hasattr(_thread_local,
                    f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
         setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
                 {})
-
+    # Support topology split
+    comm = mpi_comm().Split(
+        int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
+        mapping.tp_rank)
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
 
     allreduce_mnnvl_workspaces = getattr(
@@ -77,7 +79,9 @@ def get_allreduce_mnnvl_workspace(
             buffer_size_in_bytes,
             mapping.tp_size,
             mapping.tp_rank,
-            torch.device("cuda", mapping.local_rank),
+            # Split the communicator according to the topology
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+            mapping.local_rank,
             True,  # mnNvlink
         )
 
@@ -87,7 +91,7 @@ def get_allreduce_mnnvl_workspace(
         buffer.fill_(-0.0)
         # CPU barrier since we assume this should not be called in cuda graph
         torch.cuda.synchronize()
-        mpi_barrier()
+        comm.Barrier()
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
@@ -458,12 +462,7 @@ class AllReduce(nn.Module):
             # Initialize MNNVL AllReduce if needed
             if self.strategy in (AllReduceStrategy.AUTO,
                                  AllReduceStrategy.MNNVL):
-                if self.mapping.tp_size != self.mapping.world_size:
-                    logger.debug(
-                        f"MNNVLAllReduce is disabled due to tp_size:{self.mapping.tp_size} "
-                        f"!= world_size:{self.mapping.world_size}")
-                    self.mnnvl_allreduce = None
-                elif MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
+                if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     try:
                         self.mnnvl_allreduce = MNNVLAllReduce(
                             self.mapping, dtype) if dtype else None
