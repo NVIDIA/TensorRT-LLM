@@ -149,9 +149,10 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
                     "For best performance please recompile with support for blackwell by "
                     "passing 103-real as an arch to build_wheel.py.");
             });
-        return dispatchMoeGemmFinalDispatchTmaWarpSpecialized<cutlass::arch::Sm100, T, WeightType, OutputType,
-            EpilogueTag, FUSION, TileShape, ClusterShape>(
+        dispatchMoeGemmFinalDispatchTmaWarpSpecialized<cutlass::arch::Sm100, T, WeightType, OutputType, EpilogueTag,
+            FUSION, TileShape, ClusterShape>(
             hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy, workspace_size);
+        return;
     }
 #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
