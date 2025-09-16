@@ -49,6 +49,8 @@ using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;
 using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
+using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 
 class TransferSession
 {
@@ -65,11 +67,12 @@ public:
         runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
         LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
         : mConnections(std::move(connections))
-        , mDataContext(dataContext)
+        , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
+        , mMeasures()
         , mRecordMeasure(recordMeasure)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
@@ -104,12 +107,12 @@ public:
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
 
-    [[nodiscard]] int32_t getIndexFromEnd() const noexcept
+    [[nodiscard]] int32_t getIndexFromEnd() const
     {
         return mIndexFromEnd;
     }
 
-    [[nodiscard]] BlockKey const& getLastBlockKey() const noexcept
+    [[nodiscard]] BlockKey const& getLastBlockKey() const
     {
         return mLastBlockKey;
     }

@@ -734,12 +734,12 @@ public:
             if (agentConnectionManager != nullptr)
             {
                 // TODO: index -> validConnectionIdx conversion
-                auto valideConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
+                auto validConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
                 TLLM_CHECK(cacheBufferId.has_value());
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, valideConnectionIdx);
+                    ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, validConnectionIdx);
             }
             else
             {

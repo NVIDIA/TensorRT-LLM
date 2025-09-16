@@ -3545,6 +3545,85 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
     }
 }
 
+TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksBasicNoPartial)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    std::vector<int> vec{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto blocks = chopVectorIntoBlocks<int>(vec, 10, 4, false);
+    std::vector<std::vector<int>> got(blocks.begin(), blocks.end());
+    ASSERT_EQ(got.size(), 2);
+    EXPECT_THAT(got[0], ::testing::ElementsAreArray({0, 1, 2, 3}));
+    EXPECT_THAT(got[1], ::testing::ElementsAreArray({4, 5, 6, 7}));
+}
+
+TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksBasicWithPartial)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    std::vector<int> vec{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto blocks = chopVectorIntoBlocks<int>(vec, 10, 4, true);
+    std::vector<std::vector<int>> got(blocks.begin(), blocks.end());
+    ASSERT_EQ(got.size(), 3);
+    EXPECT_THAT(got[0], ::testing::ElementsAreArray({0, 1, 2, 3}));
+    EXPECT_THAT(got[1], ::testing::ElementsAreArray({4, 5, 6, 7}));
+    EXPECT_THAT(got[2], ::testing::ElementsAreArray({8, 9}));
+}
+
+TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksWithUsableSize)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    std::vector<int> vec{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto blocks = chopVectorIntoBlocks<int>(vec, 7, 4, true);
+    std::vector<std::vector<int>> got(blocks.begin(), blocks.end());
+    ASSERT_EQ(got.size(), 2);
+    EXPECT_THAT(got[0], ::testing::ElementsAreArray({0, 1, 2, 3}));
+    EXPECT_THAT(got[1], ::testing::ElementsAreArray({4, 5, 6}));
+}
+
+TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        0, stream, std::nullopt, true, onboardBlocks);
+    kvCacheManager.allocatePools(false);
+
+    LlmRequest::RequestIdType requestId{0};
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequence(requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth, llmRequest);
+    auto const totalBlocks = kvCacheManager.getMaxNumBlocks();
+    auto const freeAfterAlloc = kvCacheManager.getNumFreeBlocks();
+    EXPECT_LT(freeAfterAlloc, totalBlocks);
+
+    kvCacheManager.pinBlocks(requestId);
+    auto lastBlockIdOpt = kvCacheManager.getLastBlockId(requestId);
+    ASSERT_TRUE(lastBlockIdOpt.has_value());
+    kvCacheManager.removeSequence(requestId, llmRequest);
+    auto const freeAfterRemovePinned = kvCacheManager.getNumFreeBlocks();
+    EXPECT_LT(freeAfterRemovePinned, totalBlocks);
+
+    kvCacheManager.unpinBlocksById(lastBlockIdOpt.value());
+    auto const freeAfterUnpin = kvCacheManager.getNumFreeBlocks();
+    EXPECT_EQ(freeAfterUnpin, totalBlocks);
+}
+
 TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamBlocking)
 {
     auto constexpr numLayers = 12;
