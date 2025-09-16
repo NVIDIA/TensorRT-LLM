@@ -1138,7 +1138,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     # Chunked Prefill for MLA can only be enabled on SM100
     @parametrize_with_ids(
         "enable_chunked_prefill",
-        [False, pytest.param(True, marks=skip_pre_blackwell)])
+        [False, pytest.param(True, marks=skip_pre_hopper)])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, False, False),
@@ -1718,13 +1718,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     @parametrize_with_ids("kv_cache_reuse", [True, False])
-    @parametrize_with_ids(
-        "quant_dtype",
-        [
-            pytest.param("none", marks=skip_pre_hopper),
-            # pytest.param("fp8", marks=skip_pre_hopper),
-            pytest.param("nvfp4", marks=skip_pre_blackwell)
-        ])
+    @parametrize_with_ids("quant_dtype", [
+        pytest.param("none", marks=skip_pre_hopper),
+        pytest.param("fp8", marks=skip_pre_hopper),
+        pytest.param("nvfp4", marks=skip_pre_blackwell)
+    ])
     # currently, chunked prefill is not supported for fp8 and nvfp4
     def test_chunked_prefill(self, quant_dtype, kv_cache_reuse, fp8kv,
                              overlap_scheduler):
@@ -1947,6 +1945,68 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             # task.evaluate(llm,
             #               extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        [
+            #  Use a larger batch_size to speed up the tests
+            pytest.param(8,
+                         1,
+                         4,
+                         3,
+                         False,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         1,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+        ],
+        ids=["latency", "throughput_tp4"])
+    def test_nvfp4_multi_gpus_chunked_prefill(self, tp_size, pp_size, ep_size,
+                                              mtp_nextn, fp8kv, attention_dp,
+                                              cuda_graph, overlap_scheduler,
+                                              max_batch_size, moe_backend):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config,
+                 enable_chunked_prefill=True) as llm:
+
+            assert llm.args.moe_config.backend == moe_backend
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
     @pytest.mark.parametrize(
@@ -1990,6 +2050,51 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
+        [(8, 1, 4, 3, False, False, True, True, 1),
+         (8, 1, 8, 0, True, True, True, True, 24)],
+        ids=["latency", "throughput"])
+    def test_fp8_blockscale_chunked_prefill(self, tp_size, pp_size, ep_size,
+                                            mtp_nextn, fp8kv, attention_dp,
+                                            cuda_graph, overlap_scheduler,
+                                            max_batch_size):
+        if get_sm_version() == 100:
+            moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        else:
+            moe_config = MoeConfig()
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=moe_config,
+        )
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config,
+                 enable_chunked_prefill=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 

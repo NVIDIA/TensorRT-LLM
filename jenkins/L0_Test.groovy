@@ -2066,8 +2066,9 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
-        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
+        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
+        "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
@@ -2177,7 +2178,6 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 1],
         "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
