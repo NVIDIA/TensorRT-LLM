@@ -21,7 +21,14 @@ foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   if(${CUDA_ARCH_MAJOR} GREATER_EQUAL 9)
     # The FP4-related conversion instructions in DeepEP require SM100a, SM110a,
     # or SM120a.
-    if(${CUDA_ARCH_MAJOR} GREATER_EQUAL 10 AND ${CUDA_ARCH_MINOR} EQUAL 0)
+    if(${CUDA_ARCH_MAJOR} EQUAL 10 AND ${CUDA_ARCH_MINOR} EQUAL 0)
+      if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.31)
+        list(APPEND DEEP_EP_CUDA_ARCHITECTURES "100f${CUDA_ARCH_POSTFIX}")
+      else()
+        list(APPEND DEEP_EP_CUDA_ARCHITECTURES "100a${CUDA_ARCH_POSTFIX}"
+             "103a${CUDA_ARCH_POSTFIX}")
+      endif()
+    elseif(${CUDA_ARCH_MAJOR} GREATER_EQUAL 10 AND ${CUDA_ARCH_MINOR} EQUAL 0)
       list(APPEND DEEP_EP_CUDA_ARCHITECTURES
            "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}a${CUDA_ARCH_POSTFIX}")
     else()
@@ -134,6 +141,8 @@ ExternalProject_Add(
                 ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
   COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
           src/CMakeLists.txt
+  COMMAND sed "s/_STANDARD 11/_STANDARD 17/" -i src/device/CMakeLists.txt
+  COMMAND sed "s/_STANDARD 11/_STANDARD 17/" -i src/CMakeLists.txt
   COMMAND patch -p1 --forward --batch -i
           ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
   CMAKE_CACHE_ARGS

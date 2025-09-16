@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=25.06-py3
-ARG TRITON_BASE_TAG=25.06-py3
+ARG BASE_TAG=25.08-py3
+ARG TRITON_BASE_TAG=25.08-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -71,6 +71,25 @@ RUN TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} bash ./install.sh --pytorch && rm i
 
 RUN bash ./install.sh --opencv && bash ./install.sh --protobuf && rm install.sh
 
+# wait for new triton to be published
+# Rename pytorch_triton package to triton
+RUN if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
+    else \
+        cd /usr/local/lib/python3.12/dist-packages/ && \
+        ls -la | grep pytorch_triton && \
+        mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
+        cd triton-3.3.1+gitc8757738.dist-info && \
+        echo "Current directory: $(pwd)" && \
+        echo "Files in directory:" && \
+        ls -la && \
+        sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
+        sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
+        echo "METADATA after update:" && \
+        grep "^Name:" METADATA; \
+    fi
+
+
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel
@@ -94,7 +113,6 @@ RUN bash ./install_nixl.sh && rm install_nixl.sh
 # Install etcd
 COPY docker/common/install_etcd.sh install_etcd.sh
 RUN bash ./install_etcd.sh && rm install_etcd.sh
-
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
