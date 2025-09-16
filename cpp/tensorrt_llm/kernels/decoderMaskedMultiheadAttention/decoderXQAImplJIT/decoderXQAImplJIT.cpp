@@ -55,6 +55,14 @@ DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
 {
 }
 
+bool DecoderXQAImplJIT::needHMMASpecDec(XQAParams const& xqaParams, bool forConfigurePlugin) const
+{
+
+    return xqaParams.multi_query_tokens && !jit::supportConfigQGMMA(xqaParams, mSM, forConfigurePlugin)
+        && jit::supportConfigHMMA(xqaParams, mSM, forConfigurePlugin)
+        && !jit::supportConfigMLA(xqaParams, mSM, forConfigurePlugin);
+}
+
 bool DecoderXQAImplJIT::supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const
 {
 
@@ -129,7 +137,7 @@ jit::CubinObjKey DecoderXQAImplJIT::getCubinObjKeyFromXQAParams(XQAParams const&
     loadKey.data_type = xqaParams.data_type;
     loadKey.sm = mSM;
 
-    XQAKernelRuntimeHashKey runtimeKey = getRuntimeHashKeyFromXQAParams(xqaParams, true);
+    XQAKernelRuntimeHashKey runtimeKey = getRuntimeHashKeyFromXQAParams(xqaParams, true, mSM);
     return {loadKey, runtimeKey};
 }
 
@@ -150,12 +158,16 @@ void DecoderXQAImplJIT::prepareForActualXQAParams(XQAParams const& xqaParams)
 
 void DecoderXQAImplJIT::prepare(XQAParams const& umbrellaXQAParams)
 {
-
     for (int beam_width = 1; beam_width <= umbrellaXQAParams.beam_width; ++beam_width)
     {
         XQAParams actualXQAParams = umbrellaXQAParams;
         actualXQAParams.beam_width = beam_width;
         prepareForActualXQAParams(actualXQAParams);
+        if (needHMMASpecDec(umbrellaXQAParams, true))
+        {
+            actualXQAParams.generation_input_length = 16; // a WAR to generate tileSize=32 JIT cubin
+            prepareForActualXQAParams(actualXQAParams);
+        }
     }
 }
 

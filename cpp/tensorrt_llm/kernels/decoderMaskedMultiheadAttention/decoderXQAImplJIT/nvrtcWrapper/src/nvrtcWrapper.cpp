@@ -130,6 +130,7 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     {
         macros["SPEC_DEC"] = "1";
     }
+    // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
     uint32_t const m_tilesize = [&context, num_q_heads_over_kv]() -> uint32_t
     {
         if (!context->multi_query_tokens)
@@ -140,7 +141,8 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
         {
             return 64;
         }
-        return 32;
+        uint32_t const m = context->q_seq_len * num_q_heads_over_kv;
+        return m < 16 ? 16 : 32;
     }();
     if (context->data_type == tensorrt_llm::kernels::DATA_TYPE_FP16)
     {
