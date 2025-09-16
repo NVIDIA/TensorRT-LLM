@@ -8,6 +8,10 @@ from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, KvCacheConfig,
                                           TorchLlmArgs)
 
+# isort: off
+from .test_llm import get_model_path
+# isort: on
+
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
@@ -16,10 +20,11 @@ def test_profile_kvcache():
                                     free_gpu_memory_fraction=0.9)
     cuda_graph_config = CudaGraphConfig(max_batch_size=512)
 
-    VLM_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
-    VLM_MODEL_PATH = "/workspace/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3"
-    LLM_MODEL = "Qwen/Qwen2.5-3B-Instruct"
-    LLM_MODEL_PATH = "/workspace/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1"
+    VLM_MODEL = "Qwen2.5-VL-7B-Instruct"
+    VLM_MODEL_PATH = get_model_path(VLM_MODEL)
+    LLM_MODEL = "Qwen2.5-7B-Instruct"
+    LLM_MODEL_PATH = get_model_path(LLM_MODEL)
+
     build_config = BuildConfig(max_batch_size=2048,
                                max_num_tokens=8192,
                                max_beam_width=1,
