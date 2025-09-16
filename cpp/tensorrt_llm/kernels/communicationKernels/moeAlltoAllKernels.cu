@@ -57,14 +57,48 @@ __device__ void warp_vectorized_copy_impl(void* dst, void const* src, int size, 
     uint8_t* dst_ptr = static_cast<uint8_t*>(dst);
     uint8_t const* src_ptr = static_cast<uint8_t const*>(src);
 
-    int offset = lane_id * VEC_SIZE;
-
-    while (offset < size)
+    int const stride = warpSize * VEC_SIZE;
+    int const initial_offset = lane_id * VEC_SIZE;
+    int remaining = size - initial_offset;
+    if (remaining <= 0)
     {
-        vec_t<uint8_t, VEC_SIZE> vec_data;
-        vec_data.load(src_ptr + offset);
-        vec_data.store(dst_ptr + offset);
-        offset += warpSize * VEC_SIZE;
+        return;
+    }
+
+    int num_iters = (remaining + stride - 1) / stride;
+    int unrolled_iters = (num_iters / 4) * 4;
+
+    // Unrolled main loop (factor 4)
+    for (int i = 0; i < unrolled_iters; i += 4)
+    {
+        int o0 = initial_offset + (i + 0) * stride;
+        int o1 = initial_offset + (i + 1) * stride;
+        int o2 = initial_offset + (i + 2) * stride;
+        int o3 = initial_offset + (i + 3) * stride;
+
+        vec_t<uint8_t, VEC_SIZE> v0;
+        vec_t<uint8_t, VEC_SIZE> v1;
+        vec_t<uint8_t, VEC_SIZE> v2;
+        vec_t<uint8_t, VEC_SIZE> v3;
+
+        v0.load(src_ptr + o0);
+        v1.load(src_ptr + o1);
+        v2.load(src_ptr + o2);
+        v3.load(src_ptr + o3);
+
+        v0.store(dst_ptr + o0);
+        v1.store(dst_ptr + o1);
+        v2.store(dst_ptr + o2);
+        v3.store(dst_ptr + o3);
+    }
+
+    // Remainder loop
+    for (int i = unrolled_iters; i < num_iters; ++i)
+    {
+        int o = initial_offset + i * stride;
+        vec_t<uint8_t, VEC_SIZE> v;
+        v.load(src_ptr + o);
+        v.store(dst_ptr + o);
     }
 }
 
@@ -318,29 +352,91 @@ __device__ void warp_vectorized_sum_impl(void* dst, void const* src, int size, i
     uint8_t* dst_ptr = static_cast<uint8_t*>(dst);
     uint8_t const* src_ptr = static_cast<uint8_t const*>(src);
 
-    int offset = lane_id * VEC_SIZE;
-
-    while (offset < size)
+    int const stride = warpSize * VEC_SIZE;
+    int const initial_offset = lane_id * VEC_SIZE;
+    int remaining = size - initial_offset;
+    if (remaining <= 0)
     {
+        return;
+    }
+
+    int num_iters = (remaining + stride - 1) / stride;
+    int unrolled_iters = (num_iters / 4) * 4;
+
+    // Unrolled main loop (factor 4)
+    for (int i = 0; i < unrolled_iters; i += 4)
+    {
+        int o0 = initial_offset + (i + 0) * stride;
+        int o1 = initial_offset + (i + 1) * stride;
+        int o2 = initial_offset + (i + 2) * stride;
+        int o3 = initial_offset + (i + 3) * stride;
+
+        vec_t<uint8_t, VEC_SIZE> src0;
+        vec_t<uint8_t, VEC_SIZE> src1;
+        vec_t<uint8_t, VEC_SIZE> src2;
+        vec_t<uint8_t, VEC_SIZE> src3;
+        vec_t<uint8_t, VEC_SIZE> dst0;
+        vec_t<uint8_t, VEC_SIZE> dst1;
+        vec_t<uint8_t, VEC_SIZE> dst2;
+        vec_t<uint8_t, VEC_SIZE> dst3;
+
+        // Load all inputs first
+        src0.load(src_ptr + o0); dst0.load(dst_ptr + o0);
+        src1.load(src_ptr + o1); dst1.load(dst_ptr + o1);
+        src2.load(src_ptr + o2); dst2.load(dst_ptr + o2);
+        src3.load(src_ptr + o3); dst3.load(dst_ptr + o3);
+
+        // Compute
+        constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
+        {
+            T* d = reinterpret_cast<T*>(&dst0);
+            T const* s = reinterpret_cast<T const*>(&src0);
+            #pragma unroll
+            for (int j = 0; j < elems_per_vec; j++) d[j] += s[j];
+        }
+        {
+            T* d = reinterpret_cast<T*>(&dst1);
+            T const* s = reinterpret_cast<T const*>(&src1);
+            #pragma unroll
+            for (int j = 0; j < elems_per_vec; j++) d[j] += s[j];
+        }
+        {
+            T* d = reinterpret_cast<T*>(&dst2);
+            T const* s = reinterpret_cast<T const*>(&src2);
+            #pragma unroll
+            for (int j = 0; j < elems_per_vec; j++) d[j] += s[j];
+        }
+        {
+            T* d = reinterpret_cast<T*>(&dst3);
+            T const* s = reinterpret_cast<T const*>(&src3);
+            #pragma unroll
+            for (int j = 0; j < elems_per_vec; j++) d[j] += s[j];
+        }
+
+        // Store all outputs
+        dst0.store(dst_ptr + o0);
+        dst1.store(dst_ptr + o1);
+        dst2.store(dst_ptr + o2);
+        dst3.store(dst_ptr + o3);
+    }
+
+    // Remainder loop
+    for (int i = unrolled_iters; i < num_iters; ++i)
+    {
+        int o = initial_offset + i * stride;
         vec_t<uint8_t, VEC_SIZE> src_vec;
         vec_t<uint8_t, VEC_SIZE> dst_vec;
-
-        src_vec.load(src_ptr + offset);
-        dst_vec.load(dst_ptr + offset);
-
-        // Reinterpret as typed arrays for arithmetic
+        src_vec.load(src_ptr + o);
+        dst_vec.load(dst_ptr + o);
         T* dst_typed = reinterpret_cast<T*>(&dst_vec);
         T const* src_typed = reinterpret_cast<T const*>(&src_vec);
         constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
-
-#pragma unroll
-        for (int i = 0; i < elems_per_vec; i++)
+        #pragma unroll
+        for (int j = 0; j < elems_per_vec; j++)
         {
-            dst_typed[i] += src_typed[i];
+            dst_typed[j] += src_typed[j];
         }
-
-        dst_vec.store(dst_ptr + offset);
-        offset += warpSize * VEC_SIZE;
+        dst_vec.store(dst_ptr + o);
     }
 }
 
@@ -376,23 +472,48 @@ __device__ void warp_vectorized_fill_impl(void* dst, T value, int size, int lane
     using flashinfer::vec_t;
 
     uint8_t* dst_ptr = static_cast<uint8_t*>(dst);
-    int offset = lane_id * VEC_SIZE;
-
-    while (offset < size)
+    int const stride = warpSize * VEC_SIZE;
+    int const initial_offset = lane_id * VEC_SIZE;
+    int remaining = size - initial_offset;
+    if (remaining <= 0)
     {
-        vec_t<uint8_t, VEC_SIZE> vec_data;
+        return;
+    }
 
-        // Fill the vector with the value of T
-        T* vec_as_T = reinterpret_cast<T*>(&vec_data);
+    int num_iters = (remaining + stride - 1) / stride;
+    int unrolled_iters = (num_iters / 4) * 4;
+
+    // Prepare a filled vector once
+    vec_t<uint8_t, VEC_SIZE> filled_vec;
+    {
+        T* vec_as_T = reinterpret_cast<T*>(&filled_vec);
         constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
-#pragma unroll
+        #pragma unroll
         for (int i = 0; i < elems_per_vec; i++)
         {
             vec_as_T[i] = value;
         }
+    }
 
-        vec_data.store(dst_ptr + offset);
-        offset += warpSize * VEC_SIZE;
+    // Unrolled main loop (factor 4)
+    for (int i = 0; i < unrolled_iters; i += 4)
+    {
+        int o0 = initial_offset + (i + 0) * stride;
+        int o1 = initial_offset + (i + 1) * stride;
+        int o2 = initial_offset + (i + 2) * stride;
+        int o3 = initial_offset + (i + 3) * stride;
+
+        filled_vec.store(dst_ptr + o0);
+        filled_vec.store(dst_ptr + o1);
+        filled_vec.store(dst_ptr + o2);
+        filled_vec.store(dst_ptr + o3);
+    }
+
+    // Remainder loop
+    for (int i = unrolled_iters; i < num_iters; ++i)
+    {
+        int o = initial_offset + i * stride;
+        filled_vec.store(dst_ptr + o);
     }
 }
 
