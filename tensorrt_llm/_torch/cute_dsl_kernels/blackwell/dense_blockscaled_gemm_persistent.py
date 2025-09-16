@@ -58,7 +58,8 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
+    PipelineTmaUmma, PipelineUmmaAsync)
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
@@ -711,9 +712,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                    cute.slice_(self.mma_tiler, (None, 0, None)),
                                    (None, None, None))
         # (bN, bK, RestN, RestK, RestL)
-        gSFB_nkl = cute.local_tile(mSFB_nkl,
-                                   cute.slice_(self.mma_tiler_sfb, (0, None, None)),
-                                   (None, None, None))
+        gSFB_nkl = cute.local_tile(
+            mSFB_nkl, cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+            (None, None, None))
         # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(mC_mnl,
                                  cute.slice_(self.mma_tiler, (None, None, 0)),
@@ -856,7 +857,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_mnl[1] // 2
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
+                tBgSFB_slice = tBgSFB[(None, slice_n, None,
+                                       mma_tile_coord_mnl[2])]
 
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
                 ab_producer_state.reset_count()
@@ -1031,10 +1033,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # Move in increments of 64 columns of SFB
                     offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                     shifted_ptr = cute.recast_ptr(
-                        acc_tmem_ptr
-                        + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                        + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
-                        + offset,
+                        acc_tmem_ptr +
+                        tcgen05.find_tmem_tensor_col_offset(tCtAcc_base) +
+                        tcgen05.find_tmem_tensor_col_offset(tCtSFA) + offset,
                         dtype=self.sf_dtype,
                     )
                     tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)

@@ -7,8 +7,8 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.math_utils import pad_up
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 scaling_vector_size = 16
 
@@ -32,28 +32,30 @@ def test_fp4_linear(dtype):
                                                       False)
 
     qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    l_fp4 = Linear(in_features=HIDDEN_SIZE,
-                   out_features=HIDDEN_SIZE,
-                   bias=False,
-                   dtype=dtype,
-                   quant_config=qc)
+    l_fp4 = Linear(
+        in_features=HIDDEN_SIZE,
+        out_features=HIDDEN_SIZE,
+        bias=False,
+        dtype=dtype,
+        quant_config=qc,
+    )
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
 
-    w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
-        w_sf_block.cpu().view(HIDDEN_SIZE, -1)))
+    w_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf_block.cpu().view(HIDDEN_SIZE, -1))
 
     l_fp4.load_weights([{
-        'input_scale':
+        "input_scale":
         1.0 / x_sf_global.cpu(),  # Simulates amax/(448*6) in modelopt ckpt
-        'weight':
+        "weight":
         w_fp4.cpu(),
-        'weight_scale':
+        "weight_scale":
         w_sf_block_unswizzled.view(
             torch.float8_e4m3fn),  # Simulates float8_e4m3fn in modelopt ckpt
-        'weight_scale_2':
-        1.0 / w_sf_global.cpu()  # Simulates amax/(448*6) in modelopt ckpt
+        "weight_scale_2":
+        1.0 / w_sf_global.cpu(),  # Simulates amax/(448*6) in modelopt ckpt
     }])
     l_fp4 = l_fp4.cuda()
 
@@ -73,8 +75,14 @@ def test_fp4_linear(dtype):
         x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
             x, x_sf_global, scaling_vector_size, False)
         output_ref = torch.ops.trtllm.fp4_gemm(
-            x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_ref,
-            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4, dtype)
+            x_fp4,
+            w_fp4,
+            x_sf_block,
+            w_sf_block,
+            alpha_ref,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+            dtype,
+        )
 
     # compare
     torch.cuda.synchronize()
@@ -85,9 +93,17 @@ def test_fp4_linear(dtype):
                     reason="cutlass-dsl 4.1.0 requires Python 3.12+")
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536),
-                                 (128, 2112, 7168), (128, 4096, 7168),
-                                 (128, 7168, 2048), [127, 1024, 3200]])
+@pytest.mark.parametrize(
+    "mnk",
+    [
+        (128, 7168, 16384),
+        (128, 24576, 1536),
+        (128, 2112, 7168),
+        (128, 4096, 7168),
+        (128, 7168, 2048),
+        [127, 1024, 3200],
+    ],
+)
 def test_fp4_linear_cute_dsl(dtype, mnk):
 
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
@@ -103,29 +119,31 @@ def test_fp4_linear_cute_dsl(dtype, mnk):
                                                       False)
 
     qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    l_fp4 = Linear(in_features=HIDDEN_SIZE,
-                   out_features=OUTPUT_SIZE,
-                   bias=False,
-                   dtype=dtype,
-                   quant_config=qc,
-                   use_cute_dsl_nvfp4_blockscaling_mm=True)
+    l_fp4 = Linear(
+        in_features=HIDDEN_SIZE,
+        out_features=OUTPUT_SIZE,
+        bias=False,
+        dtype=dtype,
+        quant_config=qc,
+        use_cute_dsl_nvfp4_blockscaling_mm=True,
+    )
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
 
-    w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
-        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1)))
+    w_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1))
 
     l_fp4.load_weights([{
-        'input_scale':
+        "input_scale":
         1.0 / x_sf_global.cpu(),  # Simulates amax/(448*6) in modelopt ckpt
-        'weight':
+        "weight":
         w_fp4.cpu(),
-        'weight_scale':
+        "weight_scale":
         w_sf_block_unswizzled.view(
             torch.float8_e4m3fn),  # Simulates float8_e4m3fn in modelopt ckpt
-        'weight_scale_2':
-        1.0 / w_sf_global.cpu()  # Simulates amax/(448*6) in modelopt ckpt
+        "weight_scale_2":
+        1.0 / w_sf_global.cpu(),  # Simulates amax/(448*6) in modelopt ckpt
     }])
     l_fp4 = l_fp4.cuda()
 
@@ -145,8 +163,14 @@ def test_fp4_linear_cute_dsl(dtype, mnk):
         x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
             x, x_sf_global, scaling_vector_size, False)
         output_ref = torch.ops.trtllm.fp4_gemm(
-            x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_ref,
-            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4, dtype)
+            x_fp4,
+            w_fp4,
+            x_sf_block,
+            w_sf_block,
+            alpha_ref,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+            dtype,
+        )
 
     # compare
     torch.cuda.synchronize()
@@ -167,29 +191,31 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
                                                       False)
 
     qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    l_fp4 = Linear(in_features=HIDDEN_SIZE,
-                   out_features=OUTPUT_SIZE,
-                   bias=False,
-                   dtype=dtype,
-                   quant_config=qc,
-                   use_cute_dsl_nvfp4_blockscaling_mm=True)
+    l_fp4 = Linear(
+        in_features=HIDDEN_SIZE,
+        out_features=OUTPUT_SIZE,
+        bias=False,
+        dtype=dtype,
+        quant_config=qc,
+        use_cute_dsl_nvfp4_blockscaling_mm=True,
+    )
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
 
-    w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
-        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1)))
+    w_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1))
 
     l_fp4.load_weights([{
-        'input_scale':
+        "input_scale":
         1.0 / x_sf_global.cpu(),  # Simulates amax/(448*6) in modelopt ckpt
-        'weight':
+        "weight":
         w_fp4.cpu(),
-        'weight_scale':
+        "weight_scale":
         w_sf_block_unswizzled.view(
             torch.float8_e4m3fn),  # Simulates float8_e4m3fn in modelopt ckpt
-        'weight_scale_2':
-        1.0 / w_sf_global.cpu()  # Simulates amax/(448*6) in modelopt ckpt
+        "weight_scale_2":
+        1.0 / w_sf_global.cpu(),  # Simulates amax/(448*6) in modelopt ckpt
     }])
     l_fp4 = l_fp4.cuda()
 
@@ -202,29 +228,31 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
     with torch.inference_mode(), autotune():
         output = l_fp4.forward(x)
 
-    l_fp4_ref = Linear(in_features=HIDDEN_SIZE,
-                       out_features=OUTPUT_SIZE,
-                       bias=False,
-                       dtype=dtype,
-                       quant_config=qc,
-                       use_cute_dsl_nvfp4_blockscaling_mm=False)
+    l_fp4_ref = Linear(
+        in_features=HIDDEN_SIZE,
+        out_features=OUTPUT_SIZE,
+        bias=False,
+        dtype=dtype,
+        quant_config=qc,
+        use_cute_dsl_nvfp4_blockscaling_mm=False,
+    )
 
     assert l_fp4_ref.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4_ref.weight_scale.dtype == fp4_utils.float4_sf_dtype
 
-    w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
-        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1)))
+    w_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1))
 
     l_fp4_ref.load_weights([{
-        'input_scale':
+        "input_scale":
         1.0 / x_sf_global.cpu(),  # Simulates amax/(448*6) in modelopt ckpt
-        'weight':
+        "weight":
         w_fp4.cpu(),
-        'weight_scale':
+        "weight_scale":
         w_sf_block_unswizzled.view(
             torch.float8_e4m3fn),  # Simulates float8_e4m3fn in modelopt ckpt
-        'weight_scale_2':
-        1.0 / w_sf_global.cpu()  # Simulates amax/(448*6) in modelopt ckpt
+        "weight_scale_2":
+        1.0 / w_sf_global.cpu(),  # Simulates amax/(448*6) in modelopt ckpt
     }])
     l_fp4_ref = l_fp4_ref.cuda()
 
@@ -255,8 +283,16 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
 
 
 # cold L2 cache for benchmarking (using circular buffer)
-def nvfp4_gemm_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE, test_ref=True, use_cold_l2_cache=True, warmup_iterations=2, iterations=1000):
-    import cutlass
+def nvfp4_gemm_perf_test(
+    dtype,
+    SEQ_LEN,
+    OUTPUT_SIZE,
+    HIDDEN_SIZE,
+    test_ref=True,
+    use_cold_l2_cache=True,
+    warmup_iterations=2,
+    iterations=1000,
+):
     import cutlass.cute as cute
     import nvtx
 
@@ -268,8 +304,9 @@ def nvfp4_gemm_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE, test_ref=True
     w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
                                                       scaling_vector_size,
                                                       False)
-    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
-            x, x_sf_global, scaling_vector_size, False)
+    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(x, x_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
 
     if use_cold_l2_cache:
         one_workspace_bytes = (x_fp4.numel() * x_fp4.element_size() +
@@ -287,15 +324,20 @@ def nvfp4_gemm_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE, test_ref=True
             w_fp4_list.append(w_fp4.clone())
             x_sf_block_list.append(x_sf_block.clone())
             w_sf_block_list.append(w_sf_block.clone())
-    
+
     with torch.inference_mode(), autotune():
-        with nvtx.annotate(f"cute_dsl tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="orange"):
+        with nvtx.annotate(
+                f"cute_dsl tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="orange",
+        ):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 x_fp4, w_fp4, x_sf_block, w_sf_block, 1.0, dtype)
 
     alpha_tensor = torch.tensor(1.0).cuda()
     if test_ref:
-        with nvtx.annotate(f"ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="orange"):
+        with nvtx.annotate(
+                f"ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="orange"):
             with torch.inference_mode(), autotune():
                 output_ref = torch.ops.trtllm.nvfp4_gemm(
                     x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_tensor, dtype)
@@ -303,33 +345,64 @@ def nvfp4_gemm_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE, test_ref=True
         print(f"PASSED")
 
     buffer_idx = 0
-    with nvtx.annotate(f"cute_dsl warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="green"):
+    with nvtx.annotate(
+            f"cute_dsl warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+            color="green"):
         for _ in range(warmup_iterations):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                x_fp4_list[buffer_idx%workspace_count], w_fp4_list[buffer_idx%workspace_count], x_sf_block_list[buffer_idx%workspace_count], w_sf_block_list[buffer_idx%workspace_count], 1.0, dtype)
+                x_fp4_list[buffer_idx % workspace_count],
+                w_fp4_list[buffer_idx % workspace_count],
+                x_sf_block_list[buffer_idx % workspace_count],
+                w_sf_block_list[buffer_idx % workspace_count],
+                1.0,
+                dtype,
+            )
             buffer_idx = buffer_idx + 1
 
-    with nvtx.annotate(f"cute_dsl run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="green"):
+    with nvtx.annotate(
+            f"cute_dsl run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+            color="green"):
         for i in range(iterations):
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                x_fp4_list[buffer_idx%workspace_count], w_fp4_list[buffer_idx%workspace_count], x_sf_block_list[buffer_idx%workspace_count], w_sf_block_list[buffer_idx%workspace_count], 1.0, dtype)
+                x_fp4_list[buffer_idx % workspace_count],
+                w_fp4_list[buffer_idx % workspace_count],
+                x_sf_block_list[buffer_idx % workspace_count],
+                w_sf_block_list[buffer_idx % workspace_count],
+                1.0,
+                dtype,
+            )
             buffer_idx = buffer_idx + 1
 
-
-    if test_ref: 
+    if test_ref:
         torch.testing.assert_close(output, output_ref)
         print(f"PASSED")
 
         buffer_idx = 0
-        with nvtx.annotate(f"ref warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="red"):
+        with nvtx.annotate(
+                f"ref warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="red"):
             for _ in range(warmup_iterations):
                 output_ref = torch.ops.trtllm.nvfp4_gemm(
-                    x_fp4_list[buffer_idx%workspace_count], w_fp4_list[buffer_idx%workspace_count], x_sf_block_list[buffer_idx%workspace_count], w_sf_block_list[buffer_idx%workspace_count], alpha_tensor, dtype)
+                    x_fp4_list[buffer_idx % workspace_count],
+                    w_fp4_list[buffer_idx % workspace_count],
+                    x_sf_block_list[buffer_idx % workspace_count],
+                    w_sf_block_list[buffer_idx % workspace_count],
+                    alpha_tensor,
+                    dtype,
+                )
                 buffer_idx = buffer_idx + 1
-        with nvtx.annotate(f"ref run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}", color="red"):
+        with nvtx.annotate(
+                f"ref run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="red"):
             for i in range(iterations):
                 output_ref = torch.ops.trtllm.nvfp4_gemm(
-                    x_fp4_list[buffer_idx%workspace_count], w_fp4_list[buffer_idx%workspace_count], x_sf_block_list[buffer_idx%workspace_count], w_sf_block_list[buffer_idx%workspace_count], alpha_tensor, dtype)
+                    x_fp4_list[buffer_idx % workspace_count],
+                    w_fp4_list[buffer_idx % workspace_count],
+                    x_sf_block_list[buffer_idx % workspace_count],
+                    w_sf_block_list[buffer_idx % workspace_count],
+                    alpha_tensor,
+                    dtype,
+                )
                 buffer_idx = buffer_idx + 1
 
 
@@ -340,7 +413,7 @@ if __name__ == "__main__":
     fp4_linear_perf_test(torch.bfloat16, 128, 2112, 7168)
     fp4_linear_perf_test(torch.bfloat16, 128, 4096, 7168)
     fp4_linear_perf_test(torch.bfloat16, 128, 7168, 2048)
-     
+
     # # group-1 test cases
     # for tokens in [128, 8192]:
     #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
@@ -348,7 +421,7 @@ if __name__ == "__main__":
     #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
     #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
     #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
-    
+
     # group-2 test cases
     # for m in [128, 256, 512]:
     #     # 128, 131584, 7168

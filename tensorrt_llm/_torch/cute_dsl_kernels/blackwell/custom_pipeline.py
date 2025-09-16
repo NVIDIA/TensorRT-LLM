@@ -9,23 +9,13 @@
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
-import enum
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Union
-import warnings
+from typing import Optional
 
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, if_generate
-
-from cutlass.pipeline import (
-    Agent,
-    CooperativeGroup,
-    PipelineOp,
-    PipelineState,
-    # pipeline_init_wait,
-    PipelineAsync,
-)
+from cutlass.pipeline import (CooperativeGroup, PipelineAsync, PipelineOp,
+                              PipelineState)
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
@@ -33,16 +23,6 @@ def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
     Fences the mbarrier init and syncs the threadblock or cluster
     """
     cute.arch.mbarrier_init_fence()
-
-    # print(f"limin: i am in trtllm pipeline_init_wait")
-
-    # limin-todo: questa's opt
-    # if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
-    #     # If not using clusters, sync the threadblock
-    #     _sync(Agent.ThreadBlock)
-    # else:
-    #     # If using clusters, sync the cluster
-    #     _sync(Agent.ThreadBlockCluster)
 
 
 ##############################################################################
@@ -60,43 +40,36 @@ class PipelineTmaUmma(PipelineAsync):
     cta_group: cute.nvgpu.tcgen05.CtaGroup
 
     @staticmethod
-    def _compute_mcast_arrival_mask(
-        cta_layout_vmnk: cute.Layout, mcast_mode_mn: tuple[int, int]
-    ):
+    def _compute_mcast_arrival_mask(cta_layout_vmnk: cute.Layout,
+                                    mcast_mode_mn: tuple[int, int]):
         """
         Computes a mask for signaling arrivals to multicasting threadblocks.
         """
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
+            cute.arch.block_idx_in_cluster())
+        cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(
+            cta_rank_in_cluster)
 
         tma_mcast_mask_a = cute.nvgpu.cpasync.create_tma_multicast_mask(
-            cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=2
-        )
+            cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=2)
         tma_mcast_mask_b = cute.nvgpu.cpasync.create_tma_multicast_mask(
-            cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=1
-        )
+            cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=1)
 
         block_in_cluster_coord_vmnk_peer = (
             cta_in_cluster_coord_vmnk[0] ^ 1,
             *cta_in_cluster_coord_vmnk[1:],
         )
         tma_mcast_mask_a_peer = cute.nvgpu.cpasync.create_tma_multicast_mask(
-            cta_layout_vmnk, block_in_cluster_coord_vmnk_peer, mcast_mode=2
-        )
+            cta_layout_vmnk, block_in_cluster_coord_vmnk_peer, mcast_mode=2)
         tma_mcast_mask_b_peer = cute.nvgpu.cpasync.create_tma_multicast_mask(
-            cta_layout_vmnk, block_in_cluster_coord_vmnk_peer, mcast_mode=1
-        )
+            cta_layout_vmnk, block_in_cluster_coord_vmnk_peer, mcast_mode=1)
 
         assert not (mcast_mode_mn[0] == 0 and mcast_mode_mn[1] == 0)
         if mcast_mode_mn[0] == 1 and mcast_mode_mn[1] == 1:
-            return (
-                tma_mcast_mask_a
-                | tma_mcast_mask_b
-                | tma_mcast_mask_a_peer
-                | tma_mcast_mask_b_peer
-            )
+            return (tma_mcast_mask_a
+                    | tma_mcast_mask_b
+                    | tma_mcast_mask_a_peer
+                    | tma_mcast_mask_b_peer)
         elif mcast_mode_mn[1] == 1:
             return tma_mcast_mask_b | tma_mcast_mask_b_peer
         assert mcast_mode_mn[0] == 1
@@ -119,14 +92,14 @@ class PipelineTmaUmma(PipelineAsync):
 
     @staticmethod
     def create(
-        *,
-        num_stages: int,
-        producer_group: CooperativeGroup,
-        consumer_group: CooperativeGroup,
-        tx_count: int,
-        barrier_storage: cute.Pointer = None,
-        cta_layout_vmnk: Optional[cute.Layout] = None,
-        mcast_mode_mn: tuple[int, int] = (1, 1),
+            *,
+            num_stages: int,
+            producer_group: CooperativeGroup,
+            consumer_group: CooperativeGroup,
+            tx_count: int,
+            barrier_storage: cute.Pointer = None,
+            cta_layout_vmnk: Optional[cute.Layout] = None,
+            mcast_mode_mn: tuple[int, int] = (1, 1),
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaUmma.
@@ -157,11 +130,10 @@ class PipelineTmaUmma(PipelineAsync):
         consumer = (consumer_type, consumer_group)
 
         sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer, tx_count
-        )
+            barrier_storage.align(min_align=8), num_stages, producer, tx_count)
         sync_object_empty = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
-        )
+            barrier_storage.align(min_align=8) + num_stages, num_stages,
+            consumer)
 
         if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
             # No mcast mask if not using clusters
@@ -170,15 +142,13 @@ class PipelineTmaUmma(PipelineAsync):
             is_leader_cta = True
         else:
             producer_mask = PipelineTmaUmma._compute_mcast_arrival_mask(
-                cta_layout_vmnk, mcast_mode_mn
-            )
-            is_leader_cta = PipelineTmaUmma._compute_is_leader_cta(cta_layout_vmnk)
+                cta_layout_vmnk, mcast_mode_mn)
+            is_leader_cta = PipelineTmaUmma._compute_is_leader_cta(
+                cta_layout_vmnk)
 
-        cta_group = (
-            cute.nvgpu.tcgen05.CtaGroup.ONE
-            if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, mode=[0]) == 1
-            else cute.nvgpu.tcgen05.CtaGroup.TWO
-        )
+        cta_group = (cute.nvgpu.tcgen05.CtaGroup.ONE if cta_layout_vmnk is None
+                     or cute.size(cta_layout_vmnk, mode=[0]) == 1 else
+                     cute.nvgpu.tcgen05.CtaGroup.TWO)
 
         consumer_mask = producer_mask
 
@@ -198,11 +168,12 @@ class PipelineTmaUmma(PipelineAsync):
         """
         UMMA consumer release buffer empty, cta_group needs to be provided.
         """
-        self.sync_object_empty.arrive(state.index, self.consumer_mask, self.cta_group)
+        self.sync_object_empty.arrive(state.index, self.consumer_mask,
+                                      self.cta_group)
 
-    def producer_acquire(
-        self, state: PipelineState, try_acquire_token: Optional[Boolean] = None
-    ):
+    def producer_acquire(self,
+                         state: PipelineState,
+                         try_acquire_token: Optional[Boolean] = None):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """
@@ -212,14 +183,14 @@ class PipelineTmaUmma(PipelineAsync):
         )
         if_generate(
             self.is_leader_cta,
-            lambda: self.sync_object_full.arrive(state.index, self.producer_mask),
+            lambda: self.sync_object_full.arrive(state.index, self.producer_mask
+                                                 ),
         )
 
     def producer_commit(self, state: PipelineState):
         """
         TMA producer commit is a noop since TMA instruction itself updates the transaction count.
         """
-        pass
 
 
 @dataclass(frozen=True)
@@ -236,12 +207,12 @@ class PipelineUmmaAsync(PipelineAsync):
         Computes a mask to signal completion of tmem buffers for 2CTA kernels.
         """
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-        return cute.make_layout_image_mask(
-            cta_layout_vmnk, cta_in_cluster_coord_vmnk, mode=0
-        )
+            cute.arch.block_idx_in_cluster())
+        cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(
+            cta_rank_in_cluster)
+        return cute.make_layout_image_mask(cta_layout_vmnk,
+                                           cta_in_cluster_coord_vmnk,
+                                           mode=0)
 
     @staticmethod
     def _compute_peer_cta_rank():
@@ -249,8 +220,7 @@ class PipelineUmmaAsync(PipelineAsync):
         Computes a mask to signal release of tmem buffers for 2CTA kernels.
         """
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
+            cute.arch.block_idx_in_cluster())
         return cta_rank_in_cluster // 2 * 2
 
     @staticmethod
@@ -287,29 +257,27 @@ class PipelineUmmaAsync(PipelineAsync):
         consumer = (consumer_type, consumer_group)
 
         sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer
-        )
+            barrier_storage.align(min_align=8), num_stages, producer)
         sync_object_empty = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
-        )
+            barrier_storage.align(min_align=8) + num_stages, num_stages,
+            consumer)
 
         if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
             # Set mask to None if not using clusters (i.e. 1CTA kernels)
             producer_mask = None
         else:
-            producer_mask = PipelineUmmaAsync._compute_tmem_sync_mask(cta_layout_vmnk)
+            producer_mask = PipelineUmmaAsync._compute_tmem_sync_mask(
+                cta_layout_vmnk)
 
         if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, mode=[0]) == 1:
-            # Set mask to None if not using 2CTA intructions
+            # Set mask to None if not using 2CTA instructions
             consumer_mask = None
         else:
             consumer_mask = PipelineUmmaAsync._compute_peer_cta_rank()
 
-        cta_group = (
-            cute.nvgpu.tcgen05.CtaGroup.ONE
-            if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, mode=[0]) == 1
-            else cute.nvgpu.tcgen05.CtaGroup.TWO
-        )
+        cta_group = (cute.nvgpu.tcgen05.CtaGroup.ONE if cta_layout_vmnk is None
+                     or cute.size(cta_layout_vmnk, mode=[0]) == 1 else
+                     cute.nvgpu.tcgen05.CtaGroup.TWO)
 
         pipeline_init_wait(cta_layout_vmnk)
 
@@ -326,7 +294,8 @@ class PipelineUmmaAsync(PipelineAsync):
         """
         UMMA producer commit buffer full, cta_group needs to be provided.
         """
-        self.sync_object_full.arrive(state.index, self.producer_mask, self.cta_group)
+        self.sync_object_full.arrive(state.index, self.producer_mask,
+                                     self.cta_group)
 
     def producer_tail(self, state: PipelineState):
         """
@@ -338,8 +307,7 @@ class PipelineUmmaAsync(PipelineAsync):
         :type state: PipelineState
         """
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
+            cute.arch.block_idx_in_cluster())
         is_leader_cta = cta_rank_in_cluster % 2 == 0
 
         def then_body():
