@@ -2296,13 +2296,17 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
         [
             (8, 1, 8, True, True, True, "CUTLASS", False),
+            (8, 1, 8, False, True, True, "TRTLLM", False),
             (8, 1, 8, True, True, True, "TRTLLM", False),
+            (8, 1, 8, False, True, True, "TRTLLM", True),
             (8, 1, 8, True, True, True, "TRTLLM", True),
         ],
         ids=[
             "latency_moe_cutlass",
             "latency_moe_trtllm",
+            "latency_moe_trtllm_attention_dp",
             "latency_moe_trtllm_eagle3",
+            "latency_moe_trtllm_eagle3_attention_dp",
         ],
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,

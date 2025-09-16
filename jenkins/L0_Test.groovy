@@ -1892,8 +1892,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
-    multiNodesSBSAConfigs = (1..7).collectEntries { i ->
-        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-multi-node", "l0_gb200_multi_nodes", i, 7, 8, 2]]
+    multiNodesSBSAConfigs = (1..8).collectEntries { i ->
+        ["GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-${i}".toString(), ["gb200-multi-node", "l0_gb200_multi_nodes", i, 8, 8, 2]]
     }
     fullSet += multiNodesSBSAConfigs.keySet()
 
