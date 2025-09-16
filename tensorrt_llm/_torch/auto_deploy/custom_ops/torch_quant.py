@@ -276,3 +276,66 @@ def torch_fake_quant_nvfp4_linear(
     weight_zp: List[torch.Tensor],
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
+
+
+@torch.library.custom_op("auto_deploy::torch_fake_quant_int4_linear", mutates_args=())
+def torch_fake_quant_int4_linear(
+    input: torch.Tensor,  # [..., K]
+    weight_quantized: torch.Tensor,  # [N, K]  (float; quant/dequant inside)
+    bias: Optional[torch.Tensor],  # [N] or None
+    input_scale: List[torch.Tensor],  # [ pre_quant_scale ]
+    weight_scale: List[torch.Tensor],  # [ amax ]
+    input_zp: List[torch.Tensor],  # unused
+    weight_zp: List[torch.Tensor],  # unused
+) -> torch.Tensor:
+    """
+    INT4 static blockwise (weight-only) fake quantization (eager reference).
+
+    Mapping to standard API:
+      - pre_quant_scale = input_scale[0]          (broadcastable to input)
+      - amax (per-block) = weight_scale[0]        (bf16, shape [rows, 1])
+    Assumes block_size = 128. We infer blocks as rows = (N*K)//128 and reshape via amax.shape[0].
+    Export-safe: no fresh torch.tensor(...), no .item() on FakeTensors.
+    """
+    x = input
+    w = weight_quantized
+
+    # (1) activation pre-scale
+    pre_quant_scale = input_scale[0].to(dtype=x.dtype)
+    x_scaled = torch.mul(x, pre_quant_scale)
+
+    # (2) block reshape from amax rows (rows = (N*K)//128)
+    amax = weight_scale[0]
+    amax_det = amax.detach()  # bf16
+    w_r = torch.reshape(w, (-1, 128))
+    # w_r = torch.reshape(w, (amax_det.shape[0], -1))  # [(N*K)//128, 128]
+
+    # (3) INT4 quant math: qmin = -8, qmax = 7
+    one = torch.ones_like(amax_det)  # bf16
+    qmax = torch.mul(one, 7.0)
+    qmin = torch.sub(torch.neg(qmax), 1)  # -8
+    scale = torch.div(qmax, amax_det)  # bf16
+
+    # (4) quantize/dequantize weights
+    q = torch.mul(w_r, scale)  # f32
+    q = torch.round_(q)  # in-place
+    q = torch.clamp(q, qmin, qmax)
+    w_deq = torch.div(q, scale.to(x.dtype))  # f32
+    w_deq = torch.reshape(w_deq, w.shape)  # [N, K]
+
+    # (5) linear
+    return torch.ops.auto_deploy.torch_linear_simple.default(x_scaled, w_deq, bias)
+
+
+@torch_fake_quant_int4_linear.register_fake
+def _fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+) -> torch.Tensor:
+    N = weight_quantized.shape[-2]
+    return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
