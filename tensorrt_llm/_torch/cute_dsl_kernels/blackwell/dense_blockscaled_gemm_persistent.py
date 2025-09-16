@@ -58,6 +58,8 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
+
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
@@ -619,7 +621,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_tma_producer)
-        ab_pipeline = pipeline.PipelineTmaUmma.create(
+        ab_pipeline = PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
@@ -635,7 +637,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads)
-        acc_pipeline = pipeline.PipelineUmmaAsync.create(
+        acc_pipeline = PipelineUmmaAsync.create(
             barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=acc_pipeline_producer_group,
@@ -654,7 +656,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_arrive_relaxed(aligned=True)
 
         #
         # Setup smem tensor A/B/SFA/SFB/C
