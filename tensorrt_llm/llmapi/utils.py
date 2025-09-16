@@ -517,6 +517,9 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
         arg_line = f"{indent}    {field_name} ({type_str}): "
         if status := field_info.get("status", None):
             arg_line += f":tag:`{status}` "
+        else:
+            arg_line += f":tag:`stable` "
+
         if field_description:
             arg_line += field_description.split('\n')[0]  # First line with type
 
@@ -571,9 +574,6 @@ class ApiParamTagger:
                 status = field_info.json_schema_extra['status']
                 self._amend_pydantic_field_description_with_tags(
                     cls, [field_name], status)
-            elif LABEL_STABLE_APIS:
-                self._amend_pydantic_field_description_with_tags(
-                    cls, [field_name], "stable")
 
     def _amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
                                                     field_names: list[str],
