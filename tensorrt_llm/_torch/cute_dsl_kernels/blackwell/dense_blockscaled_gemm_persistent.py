@@ -1925,6 +1925,7 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
         alpha: cutlass.Float32,
         max_active_clusters: cutlass.Constexpr,
         current_stream: cuda.CUstream,
+        swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Executes the wrapped GEMM kernel with dynamically shaped tensors.
@@ -1964,11 +1965,18 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
             ),
         )
         # m, n, l
-        c_tensor = cute.make_tensor(c_ptr,
-                                    layout=cute.make_ordered_layout(
-                                        (m, n, l),
-                                        order=(1, 0, 2),
-                                    ))
+        if cutlass.const_expr(swap_ab):
+            c_tensor = cute.make_tensor(c_ptr,
+                                        layout=cute.make_ordered_layout(
+                                            (m, n, l),
+                                            order=(0, 1, 2),
+                                        ))
+        else:
+            c_tensor = cute.make_tensor(c_ptr,
+                                        layout=cute.make_ordered_layout(
+                                            (m, n, l),
+                                            order=(1, 0, 2),
+                                        ))
         # (1, int(sf_m/128), int(sf_k/4), 32, 4, 4).permute(3, 4, 1, 5, 2, 0) => (32, 4, int(sf_m/128), 4, int(sf_k/4), l)
         sfa_tensor = cute.make_tensor(a_sf_ptr,
                                       layout=cute.make_ordered_layout(

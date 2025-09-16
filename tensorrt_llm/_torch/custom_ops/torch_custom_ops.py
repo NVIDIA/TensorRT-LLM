@@ -1094,39 +1094,50 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         # Note: the input tensor use uint8 to store fp4, so the real_k is k * 2
         real_k = k * 2
         batch_size = 1
+        sf_vec_size = 16
         # m,k
         a_major = "k"
         # n, k
         b_major = "k"
-        # m, n
-        c_major = "n"
-        sf_vec_size = 16
 
         # full shamoo
         mma_tiler_mn_candidates = [(256, 128), (128, 128), (128, 256),
                                    (256, 256), (256, 64), (128, 64)]
         cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2),
                                        (2, 4), (4, 1), (4, 2), (4, 4)]
-        return [
-            (mma_tiler_mn, cluster_shape_mn)
-            for mma_tiler_mn in mma_tiler_mn_candidates
-            for cluster_shape_mn in cluster_shape_mn_candidates
-            if Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-                cutlass.Float4E2M1FN,  # ab_dtype,
-                cutlass.Float8E4M3FN,  # sf_dtype
-                sf_vec_size,  # sf_vec_size,
-                cutlass.BFloat16,  # c_dtype,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                m,
-                n,
-                real_k,
-                batch_size,
-                a_major,
-                b_major,
-                c_major,
-            )
-        ]
+        swap_ab_candidates = [True, False]
+
+        valid_tactics = []
+        for swap_ab in swap_ab_candidates:
+            for mma_tiler_mn in mma_tiler_mn_candidates:
+                for cluster_shape_mn in cluster_shape_mn_candidates:
+                    if swap_ab:
+                        c_major = "m"
+                        kernel_m = n
+                        kernel_n = k
+                    else:
+                        c_major = "n"
+                        kernel_m = m
+                        kernel_n = n
+
+                    if Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+                        cutlass.Float4E2M1FN,  # ab_dtype,
+                        cutlass.Float8E4M3FN,  # sf_dtype
+                        sf_vec_size,  # sf_vec_size,
+                        cutlass.BFloat16,  # c_dtype,
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        batch_size,
+                        a_major,
+                        b_major,
+                        c_major,
+                    ):
+                        valid_tactics.append((mma_tiler_mn, cluster_shape_mn, swap_ab))
+
+        return valid_tactics
 
     def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                      assumed_align: int) -> cute.Pointer:
@@ -1161,17 +1172,21 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         sf_vec_size = 16
 
         if isinstance(tactic, tuple):
-            mma_tiler_mn, cluster_shape_mn = tactic
+            mma_tiler_mn, cluster_shape_mn, swap_ab = tactic
         else:
             # fallback to default tactic
-            mma_tiler_mn, cluster_shape_mn = [
+            mma_tiler_mn, cluster_shape_mn, swap_ab = [
                 (128, 128),
                 (1, 1),
+                False,
             ]
 
         a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
         m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
         c_tensor = torch.empty(*(m, n), dtype=self.output_dtype, device="cuda")
+
+        if swap_ab:
+            c_tensor = c_tensor.permute(1, 0)
 
         real_k = k * 2
         sf_m = pad_up(m, 128)
@@ -1202,7 +1217,27 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             sf_vec_size,
             mma_tiler_mn,
             cluster_shape_mn,
+            swap_ab,
         )
+        if swap_ab:
+            kernel_a_ptr = b_ptr
+            kernel_a_sf_ptr = b_sf_ptr
+            kernel_b_ptr = a_ptr
+            kernel_b_sf_ptr = a_sf_ptr
+            kernel_m = n
+            kernel_n = m
+            kernel_sf_m = sf_n
+            kernel_sf_n = sf_m
+        else:
+            kernel_a_ptr = a_ptr
+            kernel_a_sf_ptr = a_sf_ptr
+            kernel_b_ptr = b_ptr
+            kernel_b_sf_ptr = b_sf_ptr
+            kernel_m = m
+            kernel_n = n
+            kernel_sf_m = sf_m
+            kernel_sf_n = sf_n
+
         if CACHE_KEY not in CuteDSLNVFP4BlackwellLinear.kernel_dict:
             gemm = gemm_wrapper_func(
                 sf_vec_size,
@@ -1216,21 +1251,22 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
 
             compiled_gemm = cute.compile(
                 gemm,
-                m,
-                n,
+                kernel_m,
+                kernel_n,
                 real_k,
-                sf_m // 128,
-                sf_n // 128,
+                kernel_sf_m // 128,
+                kernel_sf_n // 128,
                 sf_k // 4,
                 1,
-                a_ptr,
-                b_ptr,
-                a_sf_ptr,
-                b_sf_ptr,
+                kernel_a_ptr,
+                kernel_b_ptr,
+                kernel_a_sf_ptr,
+                kernel_b_sf_ptr,
                 c_ptr,
                 self.alpha,
                 max_active_clusters,
                 stream,
+                swap_ab,
             )
 
             CuteDSLNVFP4BlackwellLinear.kernel_dict[CACHE_KEY] = compiled_gemm
@@ -1238,8 +1274,11 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             compiled_gemm = CuteDSLNVFP4BlackwellLinear.kernel_dict[CACHE_KEY]
 
         # launch gemm kernel
-        compiled_gemm(m, n, real_k, sf_m // 128, sf_n // 128, sf_k // 4, a_ptr,
-                      b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, self.alpha, stream)
+        compiled_gemm(kernel_m, kernel_n, real_k, kernel_sf_m // 128, kernel_sf_n // 128, sf_k // 4, kernel_a_ptr,
+                      kernel_b_ptr, kernel_a_sf_ptr, kernel_b_sf_ptr, c_ptr, self.alpha, stream)
+
+        if swap_ab:
+            c_tensor = c_tensor.permute(1, 0)
         return c_tensor
 
 
