@@ -230,7 +230,8 @@ def args_to_build_options(args):
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'disable_weight_only_quant_plugin':
-        args.disable_weight_only_quant_plugin
+        args.disable_weight_only_quant_plugin,
+        'load_model_on_cpu': args.load_model_on_cpu,
     }
 
 
@@ -259,13 +260,15 @@ def convert_and_save_hf(args):
                           moe_tp_size=args.moe_tp_size,
                           moe_ep_size=args.moe_ep_size,
                           cp_size=args.cp_size)
-        QWenForCausalLM.quantize(args.model_dir,
-                                 args.output_dir,
-                                 dtype=args.dtype,
-                                 mapping=mapping,
-                                 quant_config=quant_config,
-                                 calib_dataset=args.calib_dataset,
-                                 **override_fields)
+        QWenForCausalLM.quantize(
+            args.model_dir,
+            args.output_dir,
+            dtype=args.dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            device='cpu' if args.load_model_on_cpu else 'cuda',
+            calib_dataset=args.calib_dataset,
+            **override_fields)
     else:
 
         def convert_and_save_rank(args, rank):
