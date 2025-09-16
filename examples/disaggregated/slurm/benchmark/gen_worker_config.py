@@ -48,6 +48,11 @@ def gen_config_file(work_dir: str,
         server_port: Server port
     """
     ctx_config = {
+        'build_config': {
+            'max_batch_size': ctx_batch_size,
+            'max_num_tokens': ctx_max_num_tokens,
+            'max_seq_len': ctx_max_seq_len,
+        },
         'max_batch_size': ctx_batch_size,
         'max_num_tokens': ctx_max_num_tokens,
         'max_seq_len': ctx_max_seq_len,
@@ -79,6 +84,11 @@ def gen_config_file(work_dir: str,
         gen_moe_backend = "TRTLLM"
 
     gen_config = {
+        'build_config': {
+            'max_batch_size': gen_batch_size,
+            'max_num_tokens': gen_max_num_tokens,
+            'max_seq_len': gen_max_seq_len,
+        },
         'tensor_parallel_size': gen_tp_size,
         'moe_expert_parallel_size': gen_tp_size,
         'enable_attention_dp': True if gen_enable_attention_dp else False,
