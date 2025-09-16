@@ -173,7 +173,7 @@ def test_llm_reward_model():
     assert not outputs[0].outputs[0].text
 
 
-def test_llm_logprobs():
+def test_llm_topk_logprobs():
     topk_logprobs = 3
     max_tokens = 10
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
