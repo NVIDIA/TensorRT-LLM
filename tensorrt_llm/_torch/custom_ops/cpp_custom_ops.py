@@ -506,14 +506,5 @@ def _register_fake():
                                                             dtype=output_dtype)
 
     @torch.library.register_fake("trtllm::alltoall")
-    def _(input_list, group, num_lists):
-        assert len(input_list) > 0
-        group_size = len(group)
-        assert group_size > 0
-        assert len(input_list) % group_size == 0, \
-            "len(input_list) must be a multiple of len(group)"
-        if num_lists is not None:
-            # num_lists may be a SymInt; cast conservatively to int for the check
-            assert len(input_list) == group_size * int(num_lists), \
-                "len(input_list) must equal len(group) * num_lists when num_lists is set"
-        return [i.new_empty(i.shape) for i in input_list]
+    def _(output_list, input_list, group, num_lists) -> None:
+        pass
