@@ -1,9 +1,9 @@
 (build-image-to-dockerhub)=
 
-# Build the TensorRT-LLM Docker Image
+# Build the TensorRT LLM Docker Image
 When you develop trt-llm on cloud platform such as runpod, you may need to provide a docker image for the platform. So you firstly need to upload the image to dockerhub.
 
-## Build the TensorRT-LLM Docker Image and Upload to DockerHub
+## Build the TensorRT LLM Docker Image and Upload to DockerHub
 
 ```bash
 make -C docker build

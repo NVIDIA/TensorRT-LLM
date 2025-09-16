@@ -2,11 +2,11 @@
 
 # Adding a Model
 
-This document describes how to add a typical decoder-only model in TensorRT-LLM.
+This document describes how to add a typical decoder-only model in TensorRT LLM.
 
 ## Step 1. Write Modeling Part
 
-TensorRT-LLM provides different levels of APIs:
+TensorRT LLM provides different levels of APIs:
 
 - Low-level functions, for example, `concat`, `add`, and `sum`.
 - Basic layers, such as, `Linear` and `LayerNorm`.
@@ -14,7 +14,7 @@ TensorRT-LLM provides different levels of APIs:
 - Base class for typical decoder-only models, such as, `DecoderModelForCausalLM`.
 
 1. Create a model directory in `tensorrt_llm/models`, for example `my_model`.
-2. Write a `model.py` with TensorRT-LLM's APIs
+2. Write a `model.py` with TensorRT LLM's APIs
 
 ```python
 class MyDecoderLayer(Module):
@@ -52,7 +52,7 @@ class MyModelForCausalLM(DecoderModelForCausalLM):
 
 ## Step 2. Implement Weight Conversion
 
-The weights from source framework need to be converted and bound to the new added TensorRT-LLM model. Here is an example of converting HuggingFace weights:
+The weights from source framework need to be converted and bound to the new added TensorRT LLM model. Here is an example of converting HuggingFace weights:
 
 ```python
 class MyModelForCausalLM(DecoderModelForCausalLM):
@@ -62,8 +62,8 @@ class MyModelForCausalLM(DecoderModelForCausalLM):
             hf_model_dir,
             dtype='float16',
             mapping: Optional[Mapping] = None) -> MyModelForCausalLM
-        # create a TensorRT-LLM MyModelForCausalLM model object
-        # convert HuggingFace checkpoint to TensorRT-LLM expected weights dict
+        # create a TensorRT LLM MyModelForCausalLM model object
+        # convert HuggingFace checkpoint to TensorRT LLM expected weights dict
         # load the weights to MyModelForCausalLM object
 ```
 

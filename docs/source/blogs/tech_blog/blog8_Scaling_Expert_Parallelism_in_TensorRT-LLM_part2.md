@@ -1,11 +1,11 @@
-# Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)
+# Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)
 
-This blog post continues our previous work on [Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), where we introduced the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT-LLM. Building upon that foundation, we have made significant performance improvements through various optimizations, achieving better throughput and latency for large-scale MoE models.
+This blog post continues our previous work on [Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), where we introduced the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM. Building upon that foundation, we have made significant performance improvements through various optimizations, achieving better throughput and latency for large-scale MoE models.
 
-*By NVIDIA TensorRT-LLM Team*
+*By NVIDIA TensorRT LLM Team*
 
 ## Table of Contents
-- [Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)](#scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization)
+- [Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)](#scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization)
   - [Table of Contents](#table-of-contents)
   - [Optimization Highlights](#optimization-highlights)
     - [Kernel Optimizations](#kernel-optimizations)
@@ -28,7 +28,7 @@ This blog post continues our previous work on [Scaling Expert Parallelism in Ten
 
 ## Optimization Highlights
 
-Following the introduction of the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT-LLM in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), the TensorRT-LLM team has focused on optimizing the large EP implementation to improve performance.
+Following the introduction of the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md), the TensorRT LLM team has focused on optimizing the large EP implementation to improve performance.
 
 At the kernel level, we analyzed kernel duration and optimized performance by either improving existing kernels or developing new kernels that perform better. At the system level, we refined and optimized the EPLB implementation (which also helps reduce kernel scalability issues), integrated additional features such as MTP, and optimized host overhead to prevent Python code from slowing down inference.
 
@@ -94,7 +94,7 @@ This optimization was implemented in [PR 5570](https://github.com/NVIDIA/TensorR
 
 ### Expert Parallelism Load Balancer (EPLB)
 
-As introduced in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-load-balancer), EP-level workload imbalance is common for large-scale EP inference across multiple datasets and has significant performance impacts. TensorRT-LLM implements a set of functionalities to address this issue. We have refined the code and improved the usability of this feature, and the benefits of EPLB are directly reflected in kernel duration improvements.
+As introduced in our [previous blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#ep-load-balancer), EP-level workload imbalance is common for large-scale EP inference across multiple datasets and has significant performance impacts. TensorRT LLM implements a set of functionalities to address this issue. We have refined the code and improved the usability of this feature, and the benefits of EPLB are directly reflected in kernel duration improvements.
 
 The core challenge with EP scaling is that different experts receive varying amounts of work based on the routing decisions made by the MoE layer. This imbalance becomes more pronounced as EP size increases, leading to scenarios where some GPUs are heavily loaded while others remain underutilized. The Expert Parallelism Load Balancer (EPLB) addresses this by dynamically redistributing expert assignments to achieve better load balance across all participating GPUs.
 
@@ -235,7 +235,7 @@ After implementing huge pages, we found that warmup kernels now execute in only 
 
 ### Multi-Token Prediction (MTP)
 
-MTP allows verifying and accepting several draft tokens in a single iteration, which is very beneficial for scenarios that prefer low latency. TensorRT-LLM has supported MTP, and we refer to our previous [MTP blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md#mtp-implementation-in-tensorrt-llm) for more details on the implementation.
+MTP allows verifying and accepting several draft tokens in a single iteration, which is very beneficial for scenarios that prefer low latency. TensorRT LLM has supported MTP, and we refer to our previous [MTP blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md#mtp-implementation-in-tensorrt-llm) for more details on the implementation.
 
 For large EP, we have also extended the implementation so that it works well with online EPLB. This was implemented in [PR 5213](https://github.com/NVIDIA/TensorRT-LLM/pull/5213).
 
@@ -247,11 +247,11 @@ To address the increased host overhead when scaling parallelism in the system, w
 
 #### Reduce Binding and Inter-Process Communication Overhead
 
-TensorRT-LLM is designed to be composed of both C++ and Python code, so that C++ can handle the most performance-sensitive parts while Python handles higher-level logic. As we try to put more logic into Python to make the program easier to read and debug, there are still frequent conversations through binding interfaces between C++ and Python. Besides, since most of the logic is implemented in Python, there are several layers of implementation that communicate with each other through inter-process communication overhead. Frequent binding calls and serialization/deserialization introduced by inter-process communication slow down the core library.
+TensorRT LLM is designed to be composed of both C++ and Python code, so that C++ can handle the most performance-sensitive parts while Python handles higher-level logic. As we try to put more logic into Python to make the program easier to read and debug, there are still frequent conversations through binding interfaces between C++ and Python. Besides, since most of the logic is implemented in Python, there are several layers of implementation that communicate with each other through inter-process communication overhead. Frequent binding calls and serialization/deserialization introduced by inter-process communication slow down the core library.
 
 To improve program efficiency, we used environment variables introduced in the [performance analysis guidance](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-analysis.md) to measure and profile CPU overhead, and improved performance by reducing and reusing different binding calls as much as possible, and delaying Python object deserialization to avoid duplicated serialization and reduce message size when doing inter-process communication. This optimization was added in [PR 5224](https://github.com/NVIDIA/TensorRT-LLM/pull/5224). We have also reduced Python garbage collection (GC) impacts in [PR 5141](https://github.com/NVIDIA/TensorRT-LLM/pull/5141).
 
-To enable powerful NVTX markers for easier analysis of host overheads, TensorRT-LLM provides several useful environment variables:
+To enable powerful NVTX markers for easier analysis of host overheads, TensorRT LLM provides several useful environment variables:
 
 ```bash
 export TLLM_NVTX_DEBUG=1 # enables more NVTX markers
@@ -261,9 +261,9 @@ export TLLM_PROFILE_START_STOP=100-150 # enable specific iterations profiling
 
 #### Support Stream Interval
 
-As mentioned previously, one outcome of large-scale workloads is that they significantly increase the number of requests and responses that the system must handle, putting huge pressure on Python threads. When the GPU finishes one iteration of calculation, a batch of responses are generated under streaming mode. For each response, TensorRT-LLM must perform detokenization so that output IDs are converted to strings, and OpenAI API protocol objects need to be initialized so that responses can be returned to the user. This becomes time-consuming, especially when the number of responses is huge and the CPU must process them on each iteration. One observation from the user side will be reduced streaming performance when compared to non-streaming.
+As mentioned previously, one outcome of large-scale workloads is that they significantly increase the number of requests and responses that the system must handle, putting huge pressure on Python threads. When the GPU finishes one iteration of calculation, a batch of responses are generated under streaming mode. For each response, TensorRT LLM must perform detokenization so that output IDs are converted to strings, and OpenAI API protocol objects need to be initialized so that responses can be returned to the user. This becomes time-consuming, especially when the number of responses is huge and the CPU must process them on each iteration. One observation from the user side will be reduced streaming performance when compared to non-streaming.
 
-To address this problem, TensorRT-LLM has supported a feature called stream interval. Instead of handling all responses on each iteration, a user-specified `stream_interval` `N` indicates that responses will be handled and returned every `N` iterations. This way, on each iteration, there will still be one output ID generated, but it won't be returned to users immediately (except for the first token for the sake of time-to-first-token latency). Instead, tokens accumulate for `N` iterations, and one response is created to handle those `N` generated tokens, which greatly reduces pressure on the CPU side by giving more time for the CPU to catch up. Meanwhile, users can still get streamed output.
+To address this problem, TensorRT LLM has supported a feature called stream interval. Instead of handling all responses on each iteration, a user-specified `stream_interval` `N` indicates that responses will be handled and returned every `N` iterations. This way, on each iteration, there will still be one output ID generated, but it won't be returned to users immediately (except for the first token for the sake of time-to-first-token latency). Instead, tokens accumulate for `N` iterations, and one response is created to handle those `N` generated tokens, which greatly reduces pressure on the CPU side by giving more time for the CPU to catch up. Meanwhile, users can still get streamed output.
 
 This feature was added in [PR 5284](https://github.com/NVIDIA/TensorRT-LLM/pull/5284), and we have verified that it works effectively to reduce host overhead. In most cases, setting `stream_interval` to 2 or 4 should close the gap (if any) between streaming and non-streaming modes. The feature can be enabled by setting the following in the YAML extra config file:
 
@@ -307,7 +307,7 @@ When enabling MTP, there is an extra performance boost compared to the baseline.
 </div>
 <p align="center"><sub><em>Figure 8: DeepSeek R1 throughput on ISL/OSL 8k/1k with MTP enabled.</em></sub></p>
 
-To reproduce the numbers, refer to the [`examples/wide_ep/slurm_scripts`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/slurm_scripts) directory. The scripts there demonstrate how to launch TensorRT-LLM disaggregated serving with large-scale EP and other features enabled on a SLURM cluster.
+To reproduce the numbers, refer to the [`examples/wide_ep/slurm_scripts`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/slurm_scripts) directory. The scripts there demonstrate how to launch TensorRT LLM disaggregated serving with large-scale EP and other features enabled on a SLURM cluster.
 
 ## Future Work
 
@@ -317,6 +317,6 @@ We are planning to implement more performance optimizations for the large EP imp
 
 ## Acknowledgements
 
-This work represents an outstanding example of collaborative engineering excellence within the TensorRT-LLM team. The successful implementation and optimization of large-scale Expert Parallelism required coordinated efforts across multiple domains - from low-level CUDA kernel optimizations to high-level system architecture design. The dedication and technical expertise demonstrated by our team members throughout this project has been truly remarkable.
+This work represents an outstanding example of collaborative engineering excellence within the TensorRT LLM team. The successful implementation and optimization of large-scale Expert Parallelism required coordinated efforts across multiple domains - from low-level CUDA kernel optimizations to high-level system architecture design. The dedication and technical expertise demonstrated by our team members throughout this project has been truly remarkable.
 
 Large-scale Expert Parallelism represents one of the important workloads for users productive scenarios, enabling efficient deployment of large MoE models. The performance improvements achieved through this work demonstrate the transformative potential of expert parallelism at scale, and this work opens new possibilities for deploying increasingly sophisticated AI models in production environments.

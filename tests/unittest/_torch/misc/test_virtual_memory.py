@@ -209,6 +209,7 @@ def test_kv_cache_manager(memory_info_available):
         assert memory_usage_begin == memory_usage_end
 
 
+@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5458911")
 def test_cuda_graph(memory_info_available):
 
     def work(input: torch.Tensor) -> torch.Tensor:

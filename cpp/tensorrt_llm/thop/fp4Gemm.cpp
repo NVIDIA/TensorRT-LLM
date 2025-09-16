@@ -64,6 +64,12 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k, FP4
                 tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
                 tkc::ClusterShape::ClusterShape_1x1x1);
         }
+        else if (sm == 103)
+        {
+            return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM100::CtaShape128x256x256B,
+                tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
+                tkc::ClusterShape::ClusterShape_1x1x1);
+        }
         else
         {
             return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM100::CtaShape128x256x128B,

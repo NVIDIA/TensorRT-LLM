@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import tensorrt_llm.logger as trtllm_logger
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.utils.fp4_utils import (
@@ -742,7 +742,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
-        if get_sm_version() == 100:
+        if is_sm_100f():
             expert_ids = set(module.initial_local_expert_ids)
             if self.need_load_shared_weights(module):
                 expert_ids.update(
@@ -759,7 +759,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                         weight, scale)
         super().load_weights(module, weights, weight_loading_mode)
 
-        if get_sm_version() == 100:
+        if is_sm_100f():
             transfromed_w3_w1_scale = transform_sf_into_required_layout(
                 module.quant_scales[0],
                 mn=module.w3_w1_weight.shape[1],
@@ -1108,7 +1108,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             preprocessor = preprocess_weights_for_mixed_gemm
 
             w2_weight_shard = packer(
-                unpacker(w2_weight_shard.cpu()).T.contiguous()).to(
+                unpacker(w2_weight_shard.cpu().contiguous()).T.contiguous()).to(
                     w2_weight_shard.device)
             w2_weight_shard = preprocessor(w2_weight_shard, torch.quint4x2,
                                            torch.float8_e4m3fn,

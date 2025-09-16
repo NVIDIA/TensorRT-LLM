@@ -535,11 +535,13 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto enableAttentionDP = su::deserialize<decltype(CacheState::ParallelConfig::mEnableAttentionDP)>(is);
     auto DPrank = su::deserialize<decltype(CacheState::ParallelConfig::mDPrank)>(is);
     auto DPsize = su::deserialize<decltype(CacheState::ParallelConfig::mDPsize)>(is);
+    auto attentionLayerNumPerPP = su::deserialize<decltype(CacheState::ParallelConfig::mAttentionLayerNumPerPP)>(is);
     auto dataType = su::deserialize<decltype(CacheState::mDataType)>(is);
     auto attentionType = su::deserialize<decltype(CacheState::AttentionConfig::mAttentionType)>(is);
     auto kvFactor = su::deserialize<decltype(CacheState::AttentionConfig::mKvFactor)>(is);
     return CacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
-        contextParallelism, dataType, attentionType, kvFactor, enableAttentionDP, DPrank, DPsize};
+        contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
+        DPsize};
 }
 
 void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& os)
@@ -553,6 +555,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.mParallelConfig.mEnableAttentionDP, os);
     su::serialize(state.mParallelConfig.mDPrank, os);
     su::serialize(state.mParallelConfig.mDPsize, os);
+    su::serialize(state.mParallelConfig.mAttentionLayerNumPerPP, os);
     su::serialize(state.mDataType, os);
     su::serialize(state.mAttentionConfig.mAttentionType, os);
     su::serialize(state.mAttentionConfig.mKvFactor, os);
@@ -570,6 +573,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.mParallelConfig.mEnableAttentionDP);
     totalSize += su::serializedSize(state.mParallelConfig.mDPrank);
     totalSize += su::serializedSize(state.mParallelConfig.mDPsize);
+    totalSize += su::serializedSize(state.mParallelConfig.mAttentionLayerNumPerPP);
     totalSize += su::serializedSize(state.mDataType);
     totalSize += su::serializedSize(state.mAttentionConfig.mAttentionType);
     totalSize += su::serializedSize(state.mAttentionConfig.mKvFactor);
@@ -1594,7 +1598,7 @@ KvCacheRetentionConfig Serialization::deserializeKvCacheRetentionConfig(std::ist
     auto decodePriority = su::deserialize<executor::RetentionPriority>(is);
     auto decodeDurationMs = intToDuration(su::deserialize<std::optional<size_t>>(is));
     auto transferMode = su::deserialize<executor::KvCacheTransferMode>(is);
-    auto directory = su::deserialize<std::optional<std::string>>(is);
+    auto directory = su::deserialize<std::string>(is);
 
     return KvCacheRetentionConfig{
         tokenRangeRetentionPriorities, decodePriority, decodeDurationMs, transferMode, directory};

@@ -865,6 +865,40 @@ def main(*,
             # and validating python changes in the whl.
             clear_folder(dist_dir)
 
+        # Modify requirements.txt for wheel build based on CUDA version
+        def modify_requirements_for_cuda():
+            requirements_file = project_dir / "requirements.txt"
+            if os.environ.get("CUDA_VERSION", "").startswith("12."):
+                print(
+                    "Detected CUDA 12 environment, modifying requirements.txt for wheel build..."
+                )
+                with open(requirements_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                modified_lines = []
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    if "<For CUDA 12.9>" in line and line.strip().startswith(
+                            "#"):
+                        new_line = line.replace("# ", "", 1)
+                        print(
+                            f"Enable CUDA 12.9 dependency: {new_line.strip()}")
+                        modified_lines.append(new_line)
+                        print(
+                            f"Disable CUDA 13 dependency: # {lines[i + 1].strip()}"
+                        )
+                        modified_lines.append("# " + lines[i + 1])
+                        i += 1
+                    else:
+                        modified_lines.append(line)
+                    i += 1
+                with open(requirements_file, 'w', encoding='utf-8') as f:
+                    f.writelines(modified_lines)
+                return True
+            return False
+
+        modify_requirements_for_cuda()
+
         build_run(
             f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
         )

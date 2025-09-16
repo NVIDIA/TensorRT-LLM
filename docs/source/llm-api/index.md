@@ -10,7 +10,7 @@ While the LLM API simplifies inference workflows with a high-level interface, it
 ## Quick Start Example
 A simple inference example with TinyLlama using the LLM API:
 
-```{literalinclude} ../../examples/llm-api/quickstart_example.py
+```{literalinclude} ../../../examples/llm-api/quickstart_example.py
     :language: python
     :linenos:
 ```

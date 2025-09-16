@@ -85,7 +85,8 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<TimePoint> arrivalTime = std::nullopt)
         : Base(requestId,                                                                                       //
             maxNewTokens,                                                                                       //
             std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),                                 //
@@ -147,7 +148,8 @@ public:
             languageAdapterUid,                                                                                  //
             allottedTimeMs,                                                                                      //
             contextPhaseParams,                                                                                  //
-            cacheSaltID                                                                                          //
+            cacheSaltID,                                                                                         //
+            arrivalTime                                                                                          //
         )
     {
     }

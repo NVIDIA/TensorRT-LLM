@@ -126,6 +126,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mLanguageAdapterUid,                                       //
         mAllottedTimeMs,                                           //
         mContextPhaseParams,                                       //
-        mCacheSaltID                                               //
+        mCacheSaltID,                                              //
+        mPerfMetrics.timingMetrics.arrivalTime                     //
     );
 }

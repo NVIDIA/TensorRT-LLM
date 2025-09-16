@@ -14,16 +14,18 @@
  * limitations under the License.
  */
 #pragma once
-#include "nccl.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <memory>
 #if ENABLE_MULTI_DEVICE
+#include "nccl.h"
 #include "userbuffers.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <dlfcn.h>
 #endif
+#else
+using ncclWindow_t = void*;
 #endif
 
 namespace tensorrt_llm::runtime::ub
@@ -50,6 +52,7 @@ struct UBBuffer
         return (addr == nullptr) || (handle == -1) || (size == 0);
     }
 };
+
 #if ENABLE_MULTI_DEVICE
 class UserBufferAllocator
 {

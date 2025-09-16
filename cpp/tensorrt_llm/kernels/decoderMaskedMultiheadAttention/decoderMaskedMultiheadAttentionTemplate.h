@@ -2612,7 +2612,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             __shared__ typename BlockReduce::TempStorage temp_storage;
             // Obtain a segment of consecutive items that are blocked across threads (final_max from above)
             // Compute the block-wide max for thread0
-            final_max = BlockReduce(temp_storage).Reduce(thread_partial_max, cub::Max(), gridDim.z);
+            final_max = BlockReduce(temp_storage).Reduce(thread_partial_max, cuda::maximum(), gridDim.z);
 
             __shared__ float final_max_smem;
             if (tidx == 0)

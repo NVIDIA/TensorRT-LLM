@@ -6,7 +6,6 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
                     Optional, Union)
 
 import zmq
-import zmq.asyncio
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm

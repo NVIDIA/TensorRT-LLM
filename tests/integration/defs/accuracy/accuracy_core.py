@@ -417,7 +417,12 @@ class CliFlowAccuracyTestHarness:
     def install_requirements(self):
         requirements = f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}/requirements.txt"
         if exists(requirements):
-            self.llm_venv.run_cmd(["-m", "pip", "install", "-r", requirements])
+            self.llm_venv.run_cmd(
+                ["-m", "pip", "install", "-r", requirements],
+                env={
+                    "CMAKE_POLICY_VERSION_MINIMUM":
+                    "3.5"  # https://github.com/google/sentencepiece/issues/1111
+                })
 
     def initialize_case(self,
                         tasks: Optional[List[AccuracyTask]] = None,

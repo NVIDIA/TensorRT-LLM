@@ -637,15 +637,16 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         return final_hidden_states
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
         if self.use_dp and self.parallel_size > 1:
@@ -663,7 +664,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                           1) // self.moe_max_num_tokens
 
         if use_dp_padding:
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
                                           ] * len(all_rank_num_tokens)
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens

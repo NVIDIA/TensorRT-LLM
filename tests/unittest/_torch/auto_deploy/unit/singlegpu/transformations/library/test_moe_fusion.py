@@ -133,7 +133,7 @@ class BlockSparseTop2MLPFP4(nn.Module):
 
     def forward(self, hidden_states):
         x = hidden_states
-        w1_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+        w1_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
             x,
             self.w1_fp4,
             bias=None,
@@ -141,7 +141,7 @@ class BlockSparseTop2MLPFP4(nn.Module):
             weight_scale=self.w1_weight_scale,
             alpha=self.w1_alpha,
         )
-        w3_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+        w3_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
             x,
             self.w3_fp4,
             bias=None,
@@ -150,7 +150,7 @@ class BlockSparseTop2MLPFP4(nn.Module):
             alpha=self.w3_alpha,
         )
         fused = self.act_fn(w1_out) * w3_out
-        out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+        out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
             fused,
             self.w2_fp4,
             bias=None,
@@ -274,7 +274,7 @@ class MoEPatternModel(nn.Module):
         ),
         pytest.param(
             "NVFP4",
-            torch.ops.auto_deploy.torch_quant_fp4_moe,
+            torch.ops.auto_deploy.torch_quant_nvfp4_moe,
             0.05,
             0.01,
             marks=[
@@ -306,6 +306,12 @@ def test_moe_matching(quant_type, expected_op, atol, rtol):
             None,
             {
                 "match_moe_pattern": {
+                    "stage": "pattern_matcher",
+                },
+                "match_fp8_moe_pattern": {
+                    "stage": "pattern_matcher",
+                },
+                "match_nvfp4_moe_pattern": {
                     "stage": "pattern_matcher",
                 },
             },

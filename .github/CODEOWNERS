@@ -34,6 +34,7 @@
 ## TensorRT-LLM Pytorch backend - AutoDeploy flow
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
+/tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 
 ## TensorRT-LLM Pytorch - Speculative Decoding
 /tensorrt_llm/_torch/speculative @NVIDIA/trt-llm-torch-spec-decoding
