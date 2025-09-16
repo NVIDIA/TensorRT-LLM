@@ -48,6 +48,8 @@ using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;
 using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
+using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 
 class TransferSession
 {
@@ -61,14 +63,18 @@ public:
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
+        runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
+        LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
         : mConnections(std::move(connections))
-        , mDataContext(dataContext)
+        , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
+        , mMeasures()
         , mRecordMeasure(recordMeasure)
+        , mIndexFromEnd(indexFromEnd)
+        , mLastBlockKey(lastBlockKey)
     {
         TLLM_CHECK(!mConnections.empty());
     }
@@ -100,6 +106,16 @@ public:
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
 
+    [[nodiscard]] int32_t getIndexFromEnd() const
+    {
+        return mIndexFromEnd;
+    }
+
+    [[nodiscard]] BlockKey const& getLastBlockKey() const
+    {
+        return mLastBlockKey;
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     DataContext mDataContext;
@@ -109,10 +125,9 @@ private:
     LlmRequest const* mRequest;
     std::vector<Measure> mMeasures;
     bool mRecordMeasure{false};
+    int32_t mIndexFromEnd{0};
+    BlockKey mLastBlockKey{};
 };
-using TransferSession = kv_cache_manager::TransferSession;
-using UniqueToken = tensorrt_llm::runtime::UniqueToken;
-using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
 
 struct TransceiverTag
 {
