@@ -1735,11 +1735,16 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-def test_trtllm_benchmark_serving(llm_root, llm_venv):
+@pytest.mark.parametrize(
+    "model_name", ["llama-3.1-model/Meta-Llama-3.1-8B", "gpt_oss/gpt-oss-20b"])
+def test_trtllm_benchmark_serving(llm_venv, model_name):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_trtllm_serve_benchmark.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root /
+            f"_test_trtllm_serve_benchmark.py::test_trtllm_serve_benchmark[{model_name}]"
+            )
+    ])
 
 
 def test_build_time_benchmark_sanity(llm_root, llm_venv):
@@ -2647,6 +2652,114 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     # TODO: Setting max_batch_size=1 and repeating the same request helps test KV cache reuse indirectly,
     # but does not directly measure the KV cache hit rate. For a more direct test, we would need to enable
     # return_perf_metrics=True, which is not currently supported by the quickstart example CLI.
+    print("All answers are correct!")
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("model_name,model_path", [
+    ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
+    ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
+])
+def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
+                                                   model_name, model_path,
+                                                   modality):
+    # NOTE: individual tests need to be enabled in
+    # tests/integration/test_lists/qa/examples_test_list.txt
+
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
+    if modality == "video" and model_name == "llava-v1.6-mistral-7b":
+        pytest.skip("Skipping video modality test for llava-v1.6-mistral-7b")
+
+    num_same_requests = 3  # test kv cache reuse with multiple same requests
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe the natural environment in the image.",
+                "Describe the object and the weather condition in the image.",
+                "Describe the traffic condition on the road in the image.",
+            ],
+            "media": [
+                str(test_data_root / "seashore.png"),
+                str(test_data_root / "inpaint.png"),
+                str(test_data_root / "61.jpg"),
+            ],
+        },
+        "video": {
+            "prompt": [
+                "Tell me what you see in the video briefly.",
+                "Describe the scene in the video briefly.",
+            ],
+            "media": [
+                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+                str(test_data_root / "world.mp4"),
+            ],
+        },
+    }
+
+    expected_keywords = {
+        "llava-v1.6-mistral-7b": {
+            "image": [
+                ["ocean", "sky", "large", "waves", "shore", "blue"],
+                ['mountain', 'flat', 'clouds', 'road', 'sky'],
+                ["highway", "vehicles", "traffic", "bus", "suburban"],
+            ],
+        },
+        "qwen2-vl-7b-instruct": {
+            "image": [
+                ["ocean", "waves", "atmosphere", "stormy", "clouds", "intense"],
+                ["trees", "winding", "road", "sunny", "sky", "atmosphere"],
+                ["traffic", "vehicles", "moderate", "lanes", "road", "cars"],
+            ],
+            "video": [
+                ["city", "night", "lights", "jacket", "wet"],
+                ["earth", "spinning", "black"],
+            ],
+        },
+        "qwen2.5-vl-7b-instruct": {
+            "image": [
+                ["dramatic", "moody", "ocean", "stormy", "sky", "waves"],
+                ["large", "dome", "yosemite", "landmark", "rock", "road"],
+                [
+                    "highway", "traffic", "vehicles", "lanes", "congestion",
+                    "road"
+                ],
+            ],
+            "video": [
+                ["woman", "neon", "night", "jacket", "wet"],
+                ["earth", "world", "night", "lights", "cities"],
+            ],
+        },
+    }
+
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        modality,
+        "--prompt",
+        *accuracy_inputs[modality]["prompt"],
+        "--media",
+        *accuracy_inputs[modality]["media"],
+        "--enable_chunked_prefill",
+        "--max_num_tokens=256",
+    ]
+
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+    match_ratio = 4.0 / 5
+    for prompt_output, prompt_keywords in zip(
+            parse_output(output), expected_keywords[model_name][modality]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        print(
+            f"Prompt output: {prompt_output}\nExpected keywords: {prompt_keywords}\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} given threshold {match_ratio}"
+        )
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
     print("All answers are correct!")
 
 

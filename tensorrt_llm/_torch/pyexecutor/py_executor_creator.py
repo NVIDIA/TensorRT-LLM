@@ -1,6 +1,7 @@
 import copy
 import enum
 import importlib
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +36,13 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+
+
+# Development flag to control chain drafter feature
+def _get_allow_chain_drafter() -> bool:
+    """Get the chain drafter flag from environment variable."""
+    # Use environment variable for cross-process compatibility
+    return os.getenv("TRTLLM_ALLOW_CHAIN_DRAFTER", "0") == "1"
 
 
 class _ExecutorCreationStage(enum.Enum):
@@ -282,11 +290,15 @@ def create_py_executor(
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
 
-            use_chain_drafter = (
-                executor_config.guided_decoding_config is None
-                and not pytorch_backend_config.enable_mixed_sampler
-                and pytorch_backend_config.attn_backend == "TRTLLM")
+            if _get_allow_chain_drafter():
+                use_chain_drafter = (
+                    executor_config.guided_decoding_config is None
+                    and not pytorch_backend_config.enable_mixed_sampler
+                    and pytorch_backend_config.attn_backend == "TRTLLM")
+            else:
+                use_chain_drafter = False
 
+            logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
@@ -349,10 +361,10 @@ def create_py_executor(
 
         sm_version = get_sm_version()
         if executor_config.kv_cache_config.enable_block_reuse and sm_version not in [
-                90, 100, 120
+                90, 100, 103, 120
         ]:
             logger.warning(
-                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM120, "
+                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "
                 f"disable enable_block_reuse for SM{sm_version}")
             executor_config.kv_cache_config.enable_block_reuse = False
 
@@ -366,10 +378,10 @@ def create_py_executor(
             )
             executor_config.kv_cache_config.enable_block_reuse = False
         if executor_config.enable_chunked_context and sm_version not in [
-                90, 100
+                90, 100, 103, 120
         ]:
             logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM90/SM100, "
+                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
                 f"disable enable_chunked_context for SM{sm_version}")
             executor_config.enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False

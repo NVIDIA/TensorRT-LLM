@@ -25,7 +25,7 @@ if [[ -f "$DOCKERFILE_MULTI_PATH" ]]; then
 
         if [[ -n "$TRITON_BASE_TAG" ]]; then
             # Remove -py3 suffix and add r prefix
-            TRITON_SHORT_TAG="r${TRITON_BASE_TAG%-py3}"
+            TRITON_SHORT_TAG="r${TRITON_BASE_TAG%-py3*}"
             echo "Using triton tag from Dockerfile.multi: $TRITON_SHORT_TAG" >&2
         fi
     fi

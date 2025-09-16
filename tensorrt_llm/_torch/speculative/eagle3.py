@@ -94,8 +94,10 @@ class Eagle3SpecMetadata(SpecMetadata):
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
 
     def __post_init__(self):
-        if self.layers_to_capture is None:
-            if self.is_draft_model or self.num_layers == 1:
+        if self.is_draft_model:
+            self.layers_to_capture = (self.num_layers - 1, )
+        elif self.layers_to_capture is None:
+            if self.num_layers == 1:
                 self.layers_to_capture = (self.num_layers - 1, )
             else:
                 if self.num_layers <= 5:

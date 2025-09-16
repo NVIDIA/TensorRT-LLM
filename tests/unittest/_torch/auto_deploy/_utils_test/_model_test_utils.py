@@ -493,8 +493,11 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
     return experiment_config
 
 
-def get_small_model_config_pytest_param(model_hub_id: str, **llm_args_kwargs):
+def get_small_model_config_pytest_param(
+    model_hub_id: str, pytest_param_kwargs=None, **llm_args_kwargs
+):
     return pytest.param(
         get_small_model_config(model_hub_id, **llm_args_kwargs),
         id=model_hub_id,
+        **(pytest_param_kwargs or {}),
     )
