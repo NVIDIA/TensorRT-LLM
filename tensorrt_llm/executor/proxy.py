@@ -324,6 +324,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 ready_signal, error_trace = self.worker_init_status_queue.get()
                 # Send ACK to the worker
                 self.worker_init_status_queue.put("ACK")
+                logger.info("get signal from executor worker")
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
