@@ -312,10 +312,10 @@ def generate_llmapi():
     content = underline("API Reference", "-") + "\n\n"
     content += ".. note::\n"
     content += "    Since version 1.0, we have attached a status label to `LLM`, `LlmArgs` and `TorchLlmArgs` Classes.\n\n"
-    content += '    1. :tag:`prototype` - The item is a prototype and is subject to change.\n'
-    content += '    2. :tag:`beta` - The item is in beta and approaching stability.\n'
-    content += '    3. :tag:`deprecated` - The item is deprecated and will be removed in a future release.\n'
-    content += "    4. For the remaining items without a status label, they are considered **stable**.\n"
+    content += "    1. :tag:`stable` - The item is stable and will keep consistent.\n"
+    content += '    2. :tag:`prototype` - The item is a prototype and is subject to change.\n'
+    content += '    3. :tag:`beta` - The item is in beta and approaching stability.\n'
+    content += '    4. :tag:`deprecated` - The item is deprecated and will be removed in a future release.\n'
     content += "\n"
 
     for cls_name in public_classes_names:

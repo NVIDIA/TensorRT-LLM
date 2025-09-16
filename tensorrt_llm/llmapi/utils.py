@@ -550,6 +550,10 @@ def get_type_repr(cls):
     return f"{module_name}.{cls.__qualname__}"
 
 
+LABEL_STABLE_APIS: bool = True
+""" Whether to label the stable APIs with `stable` tags. """
+
+
 class ApiParamTagger:
     ''' A helper to tag the api doc according to the status of the fields.
     The status is set in the json_schema_extra of the field.
@@ -567,6 +571,9 @@ class ApiParamTagger:
                 status = field_info.json_schema_extra['status']
                 self._amend_pydantic_field_description_with_tags(
                     cls, [field_name], status)
+            elif LABEL_STABLE_APIS:
+                self._amend_pydantic_field_description_with_tags(
+                    cls, [field_name], "stable")
 
     def _amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
                                                     field_names: list[str],
