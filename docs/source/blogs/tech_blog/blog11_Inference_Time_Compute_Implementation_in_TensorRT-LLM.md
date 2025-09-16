@@ -7,11 +7,180 @@ By NVIDIA TensorRT-LLM Team
  -[Table of Content](table-of-content)
  -[Background and Motivation](background-and-motivation)
  -[Introduction for Scaffolding: A Framework for inference-time compute](introduction-for-scaffolding)
+  -[Core Features](scaffolding-core-feature)
+  -[Architecture](scaffolding-architecture)
+   -[Worker](scaffolding-architecture-worker)
+   -[Controller](scaffolding-architecture-controller)
+   -[ScaffoldingLlm](scaffolding-architecture-scaffoldingllm)
  -[An Example: Implement Dynasor on Scaffolding](example-for-scaffolding)
   -[Introduction for Dynasor](dynasor-introduction)
   -[Implement Dynasor-CoT in Scaffolding](dynasor-cot-implement-in-scaffolding)
   -[Implement Dynasor-CoT based Majority Voting in Scaffolding](dynasor-cot-based-majority-vote-in-scaffolding)
  -[Feature List on Scaffolding](scaffolding-feature-list)
+ -[Future Work](scaffolding-future-work)
+
+
+## Background and Motivation
+Inference-time compute (aka test-time scaling) is becoming increasingly important. In addition to simply increasing the length of the output, using various workflows such as best-of-N and MCTS (Monte Carlo Tree Search) to obtain better answers is also an important means. Further, most of the workflows of agentic or multi-agent are logically similar to these methods of inference-time compute, except that they use more complex tools and context engineering. However, how to conveniently define these methods while achieving excellent inference performance has become a new problem. Because good performance requires careful asynchronous scheduling, but writing asynchronous scheduling programs is not easy for algorithm engineers. When considering the use of external tools and token budget management, the problem becomes even more complex.
+
+
+LLM inference frameworks such as TensorRT-LLM,vLLM and SGLang provide high performance for inference of generation models or reward models, but they are only for single request inference. Popular Agent frameworks such as LangChain and Dify focus on enabling users to develop agents as simply as possible. But precisely because of this, they may have difficulty completing many inference-time compute methods that require precise definition and developments.
+
+
+So we want to build a good framework to support users in exploring and deploying more inference-time compute methods. It should provide a modular infrastructure and fill the gap in balancing usability and performance for inference-time compute.
+
+
+## Introduction for Scaffolding: A Framework for inference-time compute
+
+`Scaffolding` is a framework for inference-time compute with high performance. It makes it easy for users to integrate various methods (CoT, majority vote, best of N, MCTS) and execution backends (TRTLLM/Openai API/Tools) and also allows users to develop customized features such as token budget. 
+
+
+### Core Features
+The core features including:
+
+
+Decouple inference-time compute method and execution backend. Provides `Controller` concept for users to define the method, `Worker` concept to develop execution backend and `ScaffoldingLlm` to provide API for users to integrate `Controller` and `Worker` and run the request. 
+
+
+Make the inference-time compute method modular and reusable. An inference time compute method can be
+composed of multiple modules. In scaffolding, `Controller` can be constructed by a series of `Sub-Controllers`, then users can flexibly assemble and replace the `Sub-Controllers`.
+
+
+Provides sufficient concurrency to achieve good performance while ease of use. Concurrency is the key for performance. `Scaffolding` provides three levels of concurrency. The first level is that the different requests to a `ScaffoldingLlm` instance can be concurrent. The second level is that the multiple `Sub-Controllers` can be concurrent.The third level is that the multiply Tasks which yielded from `Controller` can be concurrent.
+
+
+### Architecture
+`Scaffolding` consists of three core components. Let's first briefly introduce these components. The `Worker` class is the backend that execute a single task, such as sending an inference request to an LLM inference framework or service, or completing a call to an external tool. The `Controller` class focuses on defining the workflow of a inference-time compute method. The `ScaffoldingLlm` class is responsible for integrating the two and completing the entire task.
+
+
+This is the call sequence diagram of `Scaffolding`:
+<div align="center">
+    <img src="../media/scaffolding_sequence.png" alt="Scaffolding Sequence" width="900px">
+</div>
+<p align="center"><sub><em>Figure 1. Scaffolding Sequence</em></sub></p>
+
+Here we can focus on two points. First, `ScaffoldingLlm` provides users with the interface. Second, the `Controller` does not directly call the Worker.
+
+
+Next, we will introduce the code of the core components.
+
+
+#### Worker
+```python
+class Worker(ABC):
+
+    async def run_task(self, task: Task) -> TaskStatus:
+        worker_cls = type(self)
+        if type(task) not in worker_cls.task_handlers:
+            return TaskStatus.WORKER_NOT_SUPPORTED
+        return await worker_cls.task_handlers[type(task)](self, task)
+
+    task_handlers = {}
+```
+`Worker`'s core interface is `run_task()`. This interface takes in a `Task`, then completes this `Task` and writes the result into the corresponding field. It should be noted that `run_task()` is an asynchronous function and it can be concurrently and asynchronously called with python asyncio.
+
+
+#### Controller
+```python
+class Controller(ABC):
+
+    def __init__(self):
+        self.task_collections = {}
+
+    def clone(self):
+        return copy.deepcopy(self)
+
+    def generate(self, prompt: str, **kwargs) -> GenerationResult:
+        task = GenerationTask.create_from_prompt(prompt)
+
+        yield from self.process([task], **kwargs)
+
+        return task.create_scaffolding_output()
+
+    def process(self, tasks: List[Task], **kwargs):
+        raise NotImplementedError
+```
+Its two core interfaces are `generate()` and `process()`. `generate()` is the entry point for `ScaffoldingLlm` to invoke. In the default implementation of `generte()`, it produces a `Task` and then invokes `process()`. The `process()` is the most important part of every `Contronller` class, as it defines the implementation the workflow of this inference-time compute method.
+
+
+Let's go into a specific subclass of `Controller` to see how `process()` is implemented. 
+```python
+class NativeGenerationController(Controller):
+
+    class WorkerTag(Enum):
+        GENERATION = "generation"
+
+    def process(self, tasks: List[Task], **kwargs):
+        for task in tasks:
+            task.worker_tag = self.WorkerTag.GENERATION
+            for key, value in self.sampling_params.items():
+                if getattr(task, key) is None:
+                    setattr(task, key, value)
+            task.streaming = self.streaming
+
+        yield tasks
+```
+Essentially, `process()` is an iterator in python that can return a list of tasks using yield statement. When the iterator is re-entered, that is, when the yield statement ends, the `Tasks` have been completed. That means the result of the `Task` has been written into its result field. Then the `process()` can proceed to the next steps.
+
+
+From here we can see that the implement of the `Controller` can focus on the design of the workflow. It does not directly call the `Worker` and does not need to care about how these tasks are completed. And that is how `Scaffolding` decouple inference-time compute method and execution backend.
+
+
+Also, `Controller` makes the inference-time compute method modular and reusable. It only requires the `sub-Controller` to be a member of class, and then the `process()` function of the `sub-Controller` is called using the “yield from” statement.
+```python
+yield from self.reward_controller.process(generation_tasks,
+                                                **reward_kwargs)
+```
+
+
+For the concurrency with ease of use, `Controller` provides two ways. As the code above shows, the yield statement yield a list of `Task`. So the first one is that the multiple Tasks in a yield statement is executed in parallel. The second way is for the multiple `sub-Controller` which can be executed in parallel. `Controller` provides syntactic sugar called `ParallelProcess`.
+```python
+generation_controllers = [
+            self.generation_controller for _ in range(sample_num)
+        ]
+        generation_kwargs_list = [generation_kwargs for _ in range(sample_num)]
+        generation_tasks = [copy.deepcopy(task) for _ in range(sample_num)]
+
+        yield ParallelProcess(generation_controllers,
+                              [[t] for t in generation_tasks],
+                              generation_kwargs_list)
+```
+
+
+#### ScaffoldingLlm
+With `Controller` and `Worker`, we still need something that can combine them together, that is the `ScaffoldingLlm` class.
+```python
+llm_worker = TRTLLMWorker.init_with_new_llm(
+    args.model_dir,
+    backend="pytorch",
+    max_batch_size=32,
+    max_num_tokens=4096,
+)
+
+prototype_controller = NativeGenerationController(sampling_params={
+    "temperature": 0.9,
+    "max_tokens": 1024,
+})
+
+llm = ScaffoldingLlm(
+    prototype_controller,
+    {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
+)
+results = llm.generate(prompts)
+```
+Users need to first create instances of `Worker` and `Controller`, and map them by `WorkerTag` to create the `ScaffoldingLlm` class. Then call the generate interface of `ScaffoldingLlm` to get the final result. 
+
+
+`ScaffoldingLlm` also provides async inferface.
+```python
+async for result in llm.generate_async(prompt):
+    print(">>>", result.outputs[0].text)
+```
+So an instance of `ScaffoldingLlm` can support the concurrent execution of multiple requests.
+
+
+Let's make a summary of the overall implementation of `Scaffolding`. If users want to implement a new inference-time compute method, users can develop a new `Controller`. They can also call some existing `Controllers` as its `sub-Controller`. If users want to implement a new backend, users can either create a new `Worker` or add a new `Task` handler to an existing `Worker`.  As for `ScaffoldingLlM`, we have hidden many complex implementations, such as async scheduling within `ScaffoldingLlM`, and users do not need to modify the code of `ScaffoldingLlM`.
+
 
 ## An Example: Implement Dynasor-CoT on Scaffolding
 Dynasor-CoT is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT) inference. This chapter discusses how inference-time compute methods can be smoothly integrated into the TRT-LLM Scaffolding framework, using Dynasor-CoT as an example.
@@ -19,10 +188,10 @@ Dynasor-CoT is a certainty-based, training-free approach to accelerate Chain-of-
 <div align="center">
     <img src="../media/tech_blog11_dynasor_demo.gif" alt="Dynasor Demo" width="900px">
 </div>
-<p align="center"><sub><em>Figure 1. Demo of DeepSeek-R1-Distill-Qwen-7B achieving a 5.74x speedup compared to the baseline when using Dynasor-CoT on MATH500</em></sub></p>
+<p align="center"><sub><em>Figure 2. Demo of DeepSeek-R1-Distill-Qwen-7B achieving a 5.74x speedup compared to the baseline when using Dynasor-CoT on MATH500</em></sub></p>
 
 ### Introducation for Dynasor-CoT
-#### Motivation
+#### Motivation of Dynasor-CoT
 LLM reasoning is highly token-inefficient, often requiring far more tokens to achieve the same accuracy as non-reasoning models. A major source of this inefficiency is that reasoning models tend to **self-doubt**; they often reach the correct answer early but then engage in extended verification behaviors like double-checking and reassessment.
 
 For instance, Figure 2 compares a traditional Qwen-7B model with a reasoning-focused, Deepseek-distilled Qwen-7B model on a simple question. While the traditional model reaches its answer in 180 tokens, the reasoning model expends 1,000 tokens on iterative verification, despite having already found the correct answer at token 340. This represents a significant waste of tokens for diminishing returns on accuracy.
@@ -60,9 +229,9 @@ Figure 4 provides an illustration:
 <p align="center"><sub><em>Figure 4. Illustration of Dynasor-CoT. Case 1: early exit due to consistent early-stage results. Case 2: continue generation due to inconsistent early-stage results. Case 3: responses containing hesitation words (e.g., wait) are disgarded.</em></sub></p>
 
 ### Implement Dynasor-CoT in Scaffolding
-A key difference between test-time methods like Dynasor-CoT and a normal LLM generation request is that the generation process can consist of multiple smaller, user-defined tasks. The results of these tasks can dynamically control the overall logic—for example, by determining whether to expand the scope of subsequent generation or to terminate the process entirely. In a single Dynasor-CoT request, generation proceeds chunk by chunk, with additional "probe" tasks running in parallel with the main generation. Once a consistent answer is formed across recent probes, the process terminates early.
+A key difference between inference-time compute methods like Dynasor-CoT and a normal LLM generation request is that the generation process can consist of multiple smaller, user-defined tasks. The results of these tasks can dynamically control the overall logic—for example, by determining whether to expand the scope of subsequent generation or to terminate the process entirely. In a single Dynasor-CoT request, generation proceeds chunk by chunk, with additional "probe" tasks running in parallel with the main generation. Once a consistent answer is formed across recent probes, the process terminates early.
 
-`Scaffolding` provides a perfect solution for customizing these kinds of data flows using a concept called a `Controller`. Within a `Controller`, we can customize the data flow logic by defining how and when these smaller tasks are submitted. To implement Dynasor-CoT, we simply inherit from the base `Controller` class and override the `process()` function to customize how it yields tasks. We don't need to worry about how these tasks are executed because the inference-time compute methods and the execution backend are modularized and decoupled in Scaffolding. These tasks are submitted to `ScaffoldingLlm`, which then dispatches workers to complete them.
+`Scaffolding` provides a good solution for customizing these kinds of data flows. Within a `Controller`, we can customize the data flow logic by defining how and when these smaller tasks are submitted. To implement Dynasor-CoT, we simply inherit from the base `Controller` class and override the `process()` function to customize how it yields tasks. We don't need to worry about how these tasks are executed because the inference-time compute methods and the execution backend are modularized and decoupled in Scaffolding. These tasks are submitted to `ScaffoldingLlm`, which then dispatches workers to complete them.
 
 Let's start the implementation by inheriting the `Controller` class and adding the necessary parameters for Dynasor-CoT.
 ```python
@@ -193,6 +362,7 @@ In the following `for` loop, each iteration performs these steps:
         tasks[0].output_str = current_prompt
         return
 ```
+The `probe_task` can utilize prefix kvcache reuse to enhance inference performance. TensorRT-LLM enables the kvcache of an in-progress request to be reused by other requests, so `probe_task` can `proposer_task`'s kvcache even though the `proposer_task` is in a continuous running state.
 
 Now we have implemented a `Controller` for Dynasor-CoT. Here is an example of how to use it:
 ```python
@@ -227,3 +397,31 @@ llm = ScaffoldingLlm(
     )
 results = llm.generate(prompts)
 ```
+
+
+## Feature List on Scaffolding
+Although users can customize their own `Controller`, `Worker` and `Task`, we have still implemented a series of the most used ones as the foundation.
+
+
+`Worker`: TensorRT-LLM, OpenaiAPI, MCP;
+
+
+`Task`: Generation, Reward, ToolCall;
+
+
+`Controller`: MajorityVote, PRMReward, BestOfN, MCTS;
+
+
+## Future Work
+The future work is divided into two parts.
+
+
+The first part is to enable `Scaffolding` to support more inference-time compute methods, especially the methods of agentic and multi-agent system. 
+
+
+The second part is that we hope to find more opportunities to optimize TensorRT-LLM based on `Scaffolding` workloads. For examples, in terms of kvcache prefix reuse, `Scaffolding` can identify which parts are system prompts, which parts are likely to be reused in the subsequent requests of the agent task, and which parts cannot be reused and can be evicted immediately.
+
+
+Finally, what we want to emphasize is that we welcome and look forward to more people joining our open source community. You can find these issues in the [TensorRT-LLM GitHub issues with Scaffolding tag](https://github.com/NVIDIA/TensorRT-LLM/issues?q=state%3Aopen%20label%3AScaffolding).
+
+
