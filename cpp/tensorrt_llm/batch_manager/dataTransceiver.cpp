@@ -256,6 +256,12 @@ public:
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
         mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
+        int asyncSendThreadNum = common::getEnvKVCacheSendMaxConcurrenceNum();
+        for (int i = 0; i < asyncSendThreadNum; i++)
+        {
+            mAsyncSendFutures.emplace_back(
+                std::async(std::launch::async, &Impl::handleAsyncSend, this, std::ref(mAsyncSendResource)));
+        }
     }
 
     [[nodiscard]] std::future<void> sendAsync(LlmRequest& llmRequest)
@@ -294,9 +300,9 @@ public:
 
     void release(LlmRequest::RequestIdType requestId)
     {
+        std::unique_lock<std::mutex> lk(mMtxForMap);
         auto it = mRequestToSession.find(requestId);
         TLLM_CHECK(it != mRequestToSession.end());
-        std::unique_lock<std::mutex> lk(mMtxForMap);
         if (!common::getEnvKVCacheTransferOutputPath().empty())
         {
             if (!mMeasuresFile.is_open())
@@ -368,11 +374,15 @@ public:
 
     void sendSync(LlmRequest const& llmRequest)
     {
-        auto it = mRequestToSession.find(llmRequest.mRequestId);
-        TLLM_CHECK(it != mRequestToSession.end());
-        auto& session = it->second;
-        session.setLlmRequest(llmRequest);
-        mFormatter->format(session);
+        TransferSession* session = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(mMtxForMap);
+            auto it = mRequestToSession.find(llmRequest.mRequestId);
+            TLLM_CHECK(it != mRequestToSession.end());
+            session = std::addressof(it->second);
+        }
+        session->setLlmRequest(llmRequest);
+        mFormatter->format(*session);
     }
 
     ~Impl()
@@ -386,6 +396,42 @@ private:
         LlmRequest* mRequest;
         std::promise<void> mPromise;
     };
+
+    struct AsyncSendResource
+    {
+        std::deque<Response> mSendQueue;
+        std::mutex mMtxForQueue;
+        std::condition_variable mCVforQueue;
+        std::atomic<bool> mTerminate{false};
+    };
+
+    void handleAsyncSend(AsyncSendResource& resource)
+    {
+        tensorrt_llm::common::setThreadName("dataTransAsyncSend");
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "Start handling async send");
+        while (!resource.mTerminate)
+        {
+            Response resp;
+            {
+                std::unique_lock lk(resource.mMtxForQueue);
+                resource.mCVforQueue.wait(
+                    lk, [&resource] { return !resource.mSendQueue.empty() || resource.mTerminate; });
+                if (resource.mTerminate)
+                {
+                    if (!resource.mSendQueue.empty())
+                    {
+                        TLLM_LOG_WARNING("There are still %zu requests in the mSendQueue, but encountered terminate.",
+                            resource.mSendQueue.size());
+                    }
+                    break;
+                }
+                resp = std::move(resource.mSendQueue.front());
+                resource.mSendQueue.pop_front();
+            }
+            // TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "Start sending request %zu", resp.mRequest->mRequestId);
+            sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));
+        }
+    }
 
     void sendAndRemoveResponse(RequestIdType id, Response resp) noexcept
     {
@@ -409,6 +455,13 @@ private:
         }
     }
 
+    void asyncSendAndRemoveResponse(RequestIdType id, Response resp) noexcept
+    {
+        std::unique_lock lk(mAsyncSendResource.mMtxForQueue);
+        mAsyncSendResource.mSendQueue.emplace_back(std::move(resp));
+        mAsyncSendResource.mCVforQueue.notify_one();
+    }
+
     void sendResponse(std::vector<size_t> const& blockHashes, std::map<RequestIdType, Response>::iterator it)
     {
         auto reqId = mCurrentRequest.value();
@@ -422,15 +475,7 @@ private:
             auto llmRequest = it->second.mRequest;
             llmRequest->setRequestedBlockHashes(std::move(blockHashes));
 
-            if (common::getEnvParallelCacheSend())
-            {
-                // TODO: Use a thread pool and check for thread safety.
-                std::thread(&CacheSender::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second)).detach();
-            }
-            else
-            {
-                CacheSender::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
-            }
+            asyncSendAndRemoveResponse(it->first, std::move(it->second));
             removeResponse(it);
         }
         mCurrentRequest = std::nullopt;
@@ -454,7 +499,7 @@ private:
                     break;
                 }
                 std::vector<size_t> blockHashes;
-                if (!isSending() && !mReadyResponses.empty())
+                if (!mReadyResponses.empty())
                 {
                     auto const& requestInfo = recvRequestInfo();
                     auto reqId = requestInfo.getRequestId();
@@ -507,6 +552,12 @@ private:
         // We don't have to wait for the future. If another thread is sending data, it won't pay attention
         // to the terminate flag.
         mSenderCv.notify_all();
+        mAsyncSendResource.mTerminate = true;
+        mAsyncSendResource.mCVforQueue.notify_all();
+        for (auto& future : mAsyncSendFutures)
+        {
+            future.get();
+        }
     }
 
     void removeResponse(std::map<RequestIdType, Response>::iterator it)
@@ -520,11 +571,6 @@ private:
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = false;
         }
-    }
-
-    [[nodiscard]] bool isSending() const
-    {
-        return mCurrentRequest.has_value();
     }
 
     [[nodiscard]] RequestIdType getCurrentRequestId() const
@@ -546,6 +592,8 @@ private:
     std::condition_variable mSenderCv;
     std::future<void> mResponseFuture;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
+    AsyncSendResource mAsyncSendResource;
+    std::vector<std::future<void>> mAsyncSendFutures;
     int mDeviceId{-1};
 
     executor::kv_cache::ConnectionManager* mManager;
