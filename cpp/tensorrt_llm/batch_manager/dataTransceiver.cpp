@@ -408,7 +408,6 @@ private:
     void handleAsyncSend(AsyncSendResource& resource)
     {
         tensorrt_llm::common::setThreadName("dataTransAsyncSend");
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "Start handling async send");
         while (!resource.mTerminate)
         {
             Response resp;
@@ -428,7 +427,6 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            // TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "Start sending request %zu", resp.mRequest->mRequestId);
             sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));
         }
     }
