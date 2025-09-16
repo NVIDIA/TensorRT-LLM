@@ -517,7 +517,7 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
         arg_line = f"{indent}    {field_name} ({type_str}): "
         if status := field_info.get("status", None):
             arg_line += f":tag:`{status}` "
-        else:
+        elif LABEL_STABLE_APIS:
             arg_line += f":tag:`stable` "
 
         if field_description:
