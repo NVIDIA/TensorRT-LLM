@@ -185,14 +185,14 @@ def skip_gpu_memory_less_than(required_memory: int):
     )
 
 
-skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1000 * 1000 *
+                                                           1000)
 
-skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1000 * 1000 *
+                                                           1000)
 
-skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1024 * 1024 *
-                                                            1024)
+skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1000 * 1000 *
+                                                            1000)
 
 
 def modelopt_installed():
