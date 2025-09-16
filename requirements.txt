@@ -74,3 +74,4 @@ triton==3.3.1; platform_machine == "x86_64"
 tiktoken
 blobfile
 openai-harmony==0.0.4
+nvidia-cutlass-dsl==4.1.0; python_version >= "3.12"
