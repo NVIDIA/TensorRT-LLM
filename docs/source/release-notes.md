@@ -4,6 +4,10 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## Early Access Build for GB300
+
+**This release is an early build with beta quality. Some functional and performance issues may present.**
+
 ## TensorRT-LLM Release 0.21.0
 
 ### Key Features and Enhancements
