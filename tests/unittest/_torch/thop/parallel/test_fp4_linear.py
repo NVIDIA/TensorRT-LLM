@@ -295,6 +295,12 @@ def nvfp4_gemm_perf_test(
             w_fp4_list.append(w_fp4.clone())
             x_sf_block_list.append(x_sf_block.clone())
             w_sf_block_list.append(w_sf_block.clone())
+    else:
+        workspace_count = 1
+        x_fp4_list = [x_fp4]
+        w_fp4_list = [w_fp4]
+        x_sf_block_list = [x_sf_block]
+        w_sf_block_list = [w_sf_block]
 
     with torch.inference_mode(), autotune():
         with nvtx.annotate(

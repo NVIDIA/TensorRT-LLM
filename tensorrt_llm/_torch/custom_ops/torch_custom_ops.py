@@ -1129,7 +1129,7 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
                     if swap_ab:
                         c_major = "m"
                         kernel_m = n
-                        kernel_n = k
+                        kernel_n = m
                     else:
                         c_major = "n"
                         kernel_m = m
