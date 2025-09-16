@@ -26,6 +26,7 @@ from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
+from ..utils import print_tensor
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
@@ -117,6 +118,7 @@ class Attention(nn.Module):
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
         disable_deep_gemm: bool = False,
+        attn_output_gate: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -162,6 +164,11 @@ class Attention(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
+        self.attn_output_gate = attn_output_gate
+
+        if self.attn_output_gate:
+            logger.warning_once("using attn output gate!",
+                                key="attn_output_gate")
 
         # [Chunked Attention]
         # Chunked attention is applied to context requests only. Chunked attention will be
@@ -207,7 +214,8 @@ class Attention(nn.Module):
 
         self.qkv_proj = Linear(
             self.hidden_size,
-            tp_size * self.q_size + 2 * tp_size * self.kv_size,
+            tp_size * self.q_size * (1 + self.attn_output_gate) +
+            2 * tp_size * self.kv_size,
             bias=bias,
             dtype=dtype,
             mapping=mapping,
@@ -385,6 +393,11 @@ class Attention(nn.Module):
                 mrope_config["mrope_rotary_cos_sin"] = mrope_rotary_cos_sin
             if mrope_position_deltas is not None:
                 mrope_config["mrope_position_deltas"] = mrope_position_deltas
+        
+        tmp_q, tmp_k, tmp_v = torch.split(q, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+        print_tensor(tmp_q, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::q 3", self.tp_rank)
+        print_tensor(tmp_k, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::k 3", self.tp_rank)
+        print_tensor(tmp_v, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::v 3", self.tp_rank)
 
         attn_output = self.attn.forward(
             q,
@@ -403,6 +416,7 @@ class Attention(nn.Module):
             output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
             attention_sinks=attention_sinks)
+        print_tensor(attn_output, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::attn_output 3", self.tp_rank)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
@@ -499,6 +513,8 @@ class Attention(nn.Module):
             torch.Tensor: The output tensor.
         """
         qkv = self.qkv_proj(hidden_states)
+        print_tensor(qkv, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::qkv 1", self.tp_rank)
+
 
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
@@ -511,6 +527,18 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+            orig_shape = q_gate.shape[:-1]
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+            q, gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*orig_shape, -1)
+            gate = gate.reshape(*orig_shape, -1)
+            ### TODO: avoid the redundant split and concat
+            qkv = torch.concat([q, k, v], dim=-1)
+        print_tensor(gate, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::gate 1", self.tp_rank)
+
         q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
@@ -518,7 +546,7 @@ class Attention(nn.Module):
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
 
-        output = self.forward_impl(q,
+        attn_output = self.forward_impl(q,
                                    k,
                                    v,
                                    attn_metadata,
@@ -528,10 +556,16 @@ class Attention(nn.Module):
                                    mrope_config=mrope_config,
                                    attention_sinks=attention_sinks)
 
-        attn_output = self.o_proj(output,
+        if self.attn_output_gate:
+            gate = torch.sigmoid(gate)
+            attn_output = attn_output * gate
+        print_tensor(attn_output, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::attn_output 4", self.tp_rank)
+
+        attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
+        print_tensor(attn_output, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::output 4", self.tp_rank)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -551,7 +585,8 @@ class Attention(nn.Module):
         """
         # If RoPE is fused into the attention OP, do not apply RoPE here.
         if not self.rope_fusion and position_ids is not None:
-            q, k, v = self.split_qkv(q, k, v)
+            if k is None and v is None:
+                q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
 
