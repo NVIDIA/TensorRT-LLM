@@ -710,7 +710,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                    (None, None, None))
         # (bN, bK, RestN, RestK, RestL)
         gSFB_nkl = cute.local_tile(mSFB_nkl,
-                                   cute.slice_(self.mma_tiler, (0, None, None)),
+                                   cute.slice_(self.mma_tiler_sfb, (0, None, None)),
                                    (None, None, None))
         # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(mC_mnl,
@@ -850,9 +850,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # ((atom_v, rest_v), RestK)
                 tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None,
                                        mma_tile_coord_mnl[2])]
+                slice_n = mma_tile_coord_mnl[1]
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    slice_n = mma_tile_coord_mnl[1] // 2
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, mma_tile_coord_mnl[1], None,
-                                       mma_tile_coord_mnl[2])]
+                tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
 
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
                 ab_producer_state.reset_count()
@@ -1022,6 +1024,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
+                tCtSFB_mma = tCtSFB
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    # Move in increments of 64 columns of SFB
+                    offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
+                    shifted_ptr = cute.recast_ptr(
+                        acc_tmem_ptr
+                        + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
+                        + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                        + offset,
+                        dtype=self.sf_dtype,
+                    )
+                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+
                 #
                 # Reset the ACCUMULATE field for each tile
                 #
@@ -1078,7 +1093,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             )
                             tiled_mma.set(
                                 tcgen05.Field.SFB,
-                                tCtSFB[sf_kphase_coord].iterator,
+                                tCtSFB_mma[sf_kphase_coord].iterator,
                             )
 
                             cute.gemm(
@@ -1737,7 +1752,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Skip invalid mma tile shape
         if not mma_tiler_mn[0] in [128, 256]:
             is_valid = False
-        if not mma_tiler_mn[1] in [128, 256]:
+        if not mma_tiler_mn[1] in [64, 128, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
