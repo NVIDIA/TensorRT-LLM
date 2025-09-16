@@ -425,15 +425,9 @@ class GenerationResultBase:
 
         # Since arrival_time and other timing metrics are based on different time origins,
         # we need to apply corrections to align them with absolute timestamps
-        time_correction = 0
-        arrival_timestamp = metrics_dict.get(MetricNames.ARRIVAL_TIMESTAMP, 0)
+        time_correction = time.time() - time.monotonic()
         arrival_time = req_perf_metrics_dict.get(
             RequestEventTiming.ARRIVAL_TIME, 0)
-        if arrival_timestamp > 0:
-            time_correction = arrival_timestamp - arrival_time
-        else:
-            time_correction = time.time() - metrics_dict.get(
-                MetricNames.E2E, -1) - arrival_time
 
         with tracing.global_otlp_tracer().start_as_current_span(
                 "llm_request",
