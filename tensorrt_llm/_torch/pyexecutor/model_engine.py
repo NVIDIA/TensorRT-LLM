@@ -914,13 +914,29 @@ class PyTorchModelEngine(ModelEngine):
                 num_ctx_requests = inputs['attn_metadata'].num_contexts
                 num_gen_requests = inputs['attn_metadata'].num_generations
                 num_ctx_tokens = inputs['attn_metadata'].num_ctx_tokens
+                num_chunked_ctx_requests = inputs[
+                    'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
                 inputs['position_ids'][0, num_ctx_tokens:] += (
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
-                inputs['attn_metadata'].kv_lens_cuda[
-                    num_ctx_requests:num_seqs] += (
-                        self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+                # Only TrtllmAttentionMetadata has kv_lens_cuda.
+                if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
+                    if num_chunked_ctx_requests > 0:
+                        # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
+                        inputs['attn_metadata'].kv_lens_cuda[
+                            num_ctx_requests -
+                            num_chunked_ctx_requests:num_ctx_requests] += (
+                                self.
+                                previous_kv_lens_offsets_cuda[:
+                                                              num_chunked_ctx_requests]
+                            )
+                    else:
+                        inputs['attn_metadata'].kv_lens_cuda[
+                            num_ctx_requests:num_seqs] += (
+                                self.
+                                previous_kv_lens_offsets_cuda[:num_gen_requests]
+                            )
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -1016,8 +1032,9 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            if self.without_logits:
-                assert isinstance(new_tensors_device, SampleStateTensorsMTP)
+            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsMTP.
+            if isinstance(new_tensors_device, SampleStateTensorsMTP):
+                assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
@@ -1056,11 +1073,13 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
 
             # Multimodal
-            # TODO: enable chunk prefill for multimodal (maybe need to pass prompt_tokens to MultimodalRuntimeData)
             py_multimodal_runtime = MultimodalRuntimeData(
                 mm_token_lengths=request.multimodal_lengths,
                 mm_token_positions=request.multimodal_positions,
-                num_cached_tokens=past_seen_token_num
+                past_seen_token_num=past_seen_token_num,
+                chunk_end_pos=end_compute,
+                special_token_offsets=request.py_multimodal_data.get(
+                    'special_token_offsets', []),
             ) if request.multimodal_hashes is not None else None
 
             multimodal_params = MultimodalParams(
@@ -1079,9 +1098,6 @@ class PyTorchModelEngine(ModelEngine):
 
         if len(multimodal_params_list) > 0:
             # discard the text token indices as it only includes context tokens at this moment
-            print(
-                f"len multimodal_params_list: {len(multimodal_params_list)} from model_engine"
-            )
             _, mm_token_indices = self._prepare_multimodal_indices(input_ids)
         else:
             mm_token_indices = None
@@ -1184,9 +1200,19 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
                                             (1 + self.runtime_draft_len))
-                num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 self.runtime_draft_len + 1)
-                prompt_lengths.append(request.py_prompt_len)
+                if self.spec_config.spec_dec_mode.has_draft_model():
+                    # In the overlap scheduler workflow, if having draft model, we already updated the previous batch before launching the target model,
+                    # so we only need to add the runtime_draft_len to the past_seen_token_num.
+                    num_cached_tokens_per_seq.append(past_seen_token_num +
+                                                     self.runtime_draft_len)
+                else:
+                    num_cached_tokens_per_seq.append(past_seen_token_num +
+                                                     self.runtime_draft_len + 1)
+                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend):
+                    prompt_lengths.append(1 + self.runtime_draft_len)
+                else:
+                    prompt_lengths.append(request.py_prompt_len)
 
         for request in generation_requests:
             request_ids.append(request.py_request_id)
@@ -1368,9 +1394,13 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        # Use num_chunked_ctx_requests to record the number of extend context requests,
+        # so that we can update the kv_lens_cuda correctly in _preprocess_inputs.
+        attn_metadata.num_chunked_ctx_requests = 0
         if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                 self.attn_backend):
             attn_metadata.num_contexts += len(extend_requests)
+            attn_metadata.num_chunked_ctx_requests = len(extend_requests)
 
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,

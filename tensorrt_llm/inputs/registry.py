@@ -85,6 +85,8 @@ class BaseMultimodalInputProcessor:
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
         """Return multimodal token IDs if available; otherwise None.
+
+        The token IDs filtered by this method should be contiguous for each multimodal item, i.e. special tokens if any should be included.
         """
         processor = self.get_processor()
         if processor is not None and getattr(processor, 'mm_token_ids',
@@ -96,6 +98,19 @@ class BaseMultimodalInputProcessor:
             "If needed, please override this method to return multimodal token ids. "
         )
         return None
+
+    def get_mm_special_token_ids(self) -> Optional[Tensor]:
+        """
+        Return multimodal special token IDs if available; otherwise None.
+
+        Special tokens refer to multimodal-related tokens (e.g. <image_end>, <image_break>) that are not part
+        of the ViT output but come from text embeddings. Some VLMs
+        (e.g., Mistral3, LLaMA4) mix special tokens with multimodal tokens,
+        so they need to be returned separately.
+        """
+        processor = self.get_processor()
+        return getattr(processor, "mm_special_token_ids",
+                       None) if processor else None
 
     @property
     def get_num_multimodal_tokens(self):
@@ -457,17 +472,24 @@ def create_input_processor_with_hash(
                 inputs, sampling_params)
             vocab_size = input_processor.get_vocab_size()
             mm_ids = input_processor.get_mm_token_ids()
+            mm_special_token_ids = input_processor.get_mm_special_token_ids()
             if vocab_size is None and mm_ids is None:
                 raise ValueError(
                     "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
                 )
-            start_positions = find_mm_token_positions(
+            start_positions, start_special_token_positions = find_mm_token_positions(
                 input_ids=prompt_token_ids,  # token sequence
                 num_mm_tokens=
                 num_mm_tokens,  # list of lengths of each chunk of visual tokens
                 vocab_size=vocab_size,
                 mm_token_ids=mm_ids,
+                mm_special_token_ids=mm_special_token_ids,
             )
+            # Store special token offsets if available
+            if len(start_special_token_positions
+                   ) > 0 and mm_special_token_ids is not None:
+                extra_processed_inputs["multimodal_data"][
+                    "special_token_offsets"] = start_special_token_positions
             # flatten the hashes from dict to a single list
             mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
             validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
