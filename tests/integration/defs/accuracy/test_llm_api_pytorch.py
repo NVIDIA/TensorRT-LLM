@@ -2018,7 +2018,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size):
-        if get_sm_version() == 100:
+        if get_sm_version() == 100 or get_sm_version() == 103:
             moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
