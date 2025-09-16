@@ -1,6 +1,7 @@
 import copy
 import enum
 import importlib
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +36,13 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+
+
+# Development flag to control chain drafter feature
+def _get_allow_chain_drafter() -> bool:
+    """Get the chain drafter flag from environment variable."""
+    # Use environment variable for cross-process compatibility
+    return os.getenv("TRTLLM_ALLOW_CHAIN_DRAFTER", "0") == "1"
 
 
 class _ExecutorCreationStage(enum.Enum):
@@ -282,11 +290,15 @@ def create_py_executor(
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
 
-            use_chain_drafter = (
-                executor_config.guided_decoding_config is None
-                and not pytorch_backend_config.enable_mixed_sampler
-                and pytorch_backend_config.attn_backend == "TRTLLM")
+            if _get_allow_chain_drafter():
+                use_chain_drafter = (
+                    executor_config.guided_decoding_config is None
+                    and not pytorch_backend_config.enable_mixed_sampler
+                    and pytorch_backend_config.attn_backend == "TRTLLM")
+            else:
+                use_chain_drafter = False
 
+            logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
@@ -366,10 +378,10 @@ def create_py_executor(
             )
             executor_config.kv_cache_config.enable_block_reuse = False
         if executor_config.enable_chunked_context and sm_version not in [
-                90, 100
+                90, 100, 120
         ]:
             logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM90/SM100, "
+                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM120, "
                 f"disable enable_chunked_context for SM{sm_version}")
             executor_config.enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
@@ -493,17 +505,29 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(
-            executor_config=executor_config,
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
             mapping=mapping,
             net_max_seq_len=net_max_seq_len,
-            kv_connector_manager=kv_connector_manager)
+            kv_connector_manager=kv_connector_manager,
+            max_num_tokens=executor_config.max_num_tokens,
+            max_beam_width=executor_config.max_beam_width,
+            tokens_per_block=executor_config.tokens_per_block,
+            max_seq_len=executor_config.max_seq_len,
+            max_batch_size=executor_config.max_batch_size,
+            kv_cache_config=executor_config.kv_cache_config,
+            pytorch_backend_config=executor_config.pytorch_backend_config,
+            speculative_config=executor_config.speculative_config,
+        )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
+            # Originally, executor_config.max_seq_len might be changed inside build_managers and used
+            # below in create_py_executor_instance. Since now, we are changing
+            # kv_cache_creator._max_seq_len instead, restore executor_config.max_seq_len.
+            executor_config.max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(executor_config.max_seq_len, sampler)
 
     # Resource managers for speculative decoding
@@ -564,10 +588,14 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
-            # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
+            # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
             # the original value before creating the final KV cache.
-            executor_config.max_seq_len = max_seq_len
+            kv_cache_creator._max_seq_len = max_seq_len
             kv_cache_creator.build_managers(resources, False)
+            # Originally, executor_config.max_seq_len might be changed again inside build_managers
+            # Since now, we are changing kv_cache_creator.max_seq_len instead.
+            # Restore executor_config.max_seq_len which has been used in create_py_executor_instance
+            executor_config.max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(executor_config.max_seq_len, sampler)
 
             for eng in [model_engine, draft_model_engine]:
