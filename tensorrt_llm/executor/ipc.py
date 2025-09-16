@@ -301,6 +301,9 @@ class FusedIpcQueue:
     def get(self) -> Any:
         return self.queue.get()
 
+    def poll(self, timeout: int) -> bool:
+        return self.queue.poll(timeout)
+
     @property
     def address(self) -> tuple[str, Optional[bytes]]:
         return self.queue.address
