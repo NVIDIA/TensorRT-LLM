@@ -22,15 +22,15 @@ from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 
-input_dim_t = Union[int, Tuple[int, int]]
+InputDimT = Union[int, Tuple[int, int]]
 
-# Model parameters which is not in config.json.
-# TODO: read from config.json when it is released.
-NUM_ATTENTION_HEADS_FOR_VIT = 16
-IMAGE_SIZE_FOR_VIT = 224
-PATCH_SIZE_FOR_VIT = 16
-EMBED_DIM_FOR_VIT = 1280
-DEPTH_FOR_VIT = 32
+
+class VITTIMMConfig(NamedTuple):
+    embed_dim: int
+    depth: int
+    num_attention_heads: int
+    intermediate_size: int
+    img_size: int
 
 
 class Resolution(NamedTuple):
@@ -38,45 +38,11 @@ class Resolution(NamedTuple):
     width: int
 
 
-class RADIOConfig(PretrainedConfig):
-    """Pretrained Hugging Face configuration for RADIO models.
-
-    Modified from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py.
-    """
-
-    def __init__(
-        self,
-        args: Optional[dict] = None,
-        version: str = "radio_v2.5-h",
-        patch_size: Optional[int] = None,
-        max_resolution: Optional[int] = None,
-        preferred_resolution: Optional[Resolution] = None,
-        adaptor_names: Union[str, List[str]] = None,
-        adaptor_configs: Dict[str, Dict[str, int]] = None,
-        vitdet_window_size: Optional[int] = None,
-        feature_normalizer_config: Optional[dict] = None,
-        inter_feature_normalizer_config: Optional[dict] = None,
-        **kwargs,
-    ):
-        self.args = args
-        for field in ["dtype", "amp_dtype"]:
-            if self.args is not None and field in self.args:
-                # Convert to a string in order to make it serializable.
-                # For example for torch.float32 we will store "float32".
-                self.args[field] = str(args[field]).split(".")[-1]
-        self.version = version
-        self.patch_size = patch_size
-        self.max_resolution = max_resolution
-        self.preferred_resolution = preferred_resolution
-
-        self.adaptor_names = adaptor_names
-        self.adaptor_configs = adaptor_configs
-        self.vitdet_window_size = vitdet_window_size
-        self.feature_normalizer_config = feature_normalizer_config
-        self.inter_feature_normalizer_config = inter_feature_normalizer_config
-        self.num_key_value_heads = NUM_ATTENTION_HEADS_FOR_VIT
-        self.num_attention_heads = NUM_ATTENTION_HEADS_FOR_VIT
-        super().__init__(**kwargs)
+# Modified from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/extra_timm_models.py
+VIT_TIMM_CONFIG_BY_NAME: dict[str, VITTIMMConfig] = {
+    "vit_huge_patch16_224": VITTIMMConfig(1280, 32, 16, 5120, 224),
+    # Add more configs here if needed.
+}
 
 
 class ClsToken(nn.Module):
@@ -113,10 +79,7 @@ class ClsToken(nn.Module):
         if self.token is None:
             return x
         token = self.token.unsqueeze(0).expand(x.shape[0], -1, -1)
-        x = torch.cat([
-            token,
-            x,
-        ], dim=1)
+        x = torch.cat([token, x], dim=1)
         return x
 
 
@@ -127,13 +90,12 @@ class ViTPatchGenerator(nn.Module):
         self,
         patch_size: int,
         embed_dim: int,
-        input_dims: input_dim_t,
+        input_dims: InputDimT,
         abs_pos: bool = True,
         normalize_patches: bool = False,
         cls_token: bool = False,
-        max_input_dims: Optional[input_dim_t] = None,
+        max_input_dims: Optional[InputDimT] = None,
         pos_dropout: float = 0.0,
-        return_pos_enc: bool = False,
         num_cls_tokens: int = 1,
         register_multiple: Optional[int] = None,
         num_registers: Optional[int] = None,
@@ -154,7 +116,6 @@ class ViTPatchGenerator(nn.Module):
 
         self.cpe_mode = max_input_dims != input_dims
         self.pos_dropout = pos_dropout
-        self.return_pos_enc = return_pos_enc
         self.patch_size = patch_size
         self.abs_pos = abs_pos
         self.embed_dim = embed_dim
@@ -166,6 +127,7 @@ class ViTPatchGenerator(nn.Module):
 
         self.im_to_patches = Im2Patches(patch_size)
         self.embedder = ViTPatchLinear(patch_size, embed_dim, bias=patch_bias)
+        self.pos_embed = None
         if abs_pos:
             scale = embed_dim**-0.5
             self.pos_embed = nn.Parameter(
@@ -185,8 +147,6 @@ class ViTPatchGenerator(nn.Module):
         patches, pos_enc = self.apply_pos_enc(patches, input_size=x.shape[2:])
         patches = self.cls_token(patches)
         patches = self.patch_normalizer(patches)
-        if self.return_pos_enc:
-            return patches, pos_enc
         return patches
 
     @property
@@ -211,7 +171,7 @@ class ViTPatchGenerator(nn.Module):
         patches: torch.Tensor,
         patch_idxs: Optional[torch.Tensor] = None,
         input_size: Optional[Tuple[int, int]] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.abs_pos:
             return patches
 
@@ -335,7 +295,7 @@ class Block(nn.Module):
         act_layer: Type[nn.Module] = nn.GELU,
         norm_layer: Type[nn.Module] = nn.LayerNorm,
         layer_idx: Optional[int] = None,
-        model_config: model_config_lib.ModelConfig[RADIOConfig] = None,
+        model_config: model_config_lib.ModelConfig[PretrainedConfig] = None,
     ) -> None:
         """Initialize Block.
 
@@ -410,15 +370,7 @@ class Block(nn.Module):
             config=self.model_config,
             layer_idx=layer_idx,
         )
-        if init_values:
-            raise NotImplementedError(
-                "Limited RADIO model support: Block does not support LayerScale for now."
-            )
         self.ls2 = nn.Identity()
-        if drop_path > 0.:
-            raise NotImplementedError(
-                "Limited RADIO model support: Block does not support DropPath for now."
-            )
         self.drop_path2 = nn.Identity()
 
     def forward(
@@ -487,7 +439,7 @@ class VisionTransformer(nn.Module):
         act_layer: Optional[nn.Module] = None,
         cpe_max_size: Optional[int] = None,
         special_args: Optional[dict] = None,
-        model_config: model_config_lib.ModelConfig[RADIOConfig] = None,
+        model_config: model_config_lib.ModelConfig[PretrainedConfig] = None,
         **kwargs,
     ) -> None:
         """
@@ -520,7 +472,7 @@ class VisionTransformer(nn.Module):
             norm_layer: Normalization layer.
             act_layer: MLP activation layer.
             cpe_max_size: Maximum size for CPE.
-            special_args: Special arguments in RADIOConfig.
+            special_args: Special arguments in PretrainedConfig.
             model_config: Model configuration.
             **kwargs: Additional keyword arguments, to store unused arguments.
         """
@@ -529,7 +481,9 @@ class VisionTransformer(nn.Module):
             raise ValueError(
                 "Class token must be used with global_pool == 'token'")
         if pos_embed not in ('', 'none', 'learn'):
-            raise ValueError(f"Invalid pos_embed: {pos_embed}")
+            raise ValueError(
+                f"Invalid pos_embed: {pos_embed} while the accepted values are '', 'none', 'learn'."
+            )
         use_fc_norm = global_pool in ('avg', 'avgmax',
                                       'max') if fc_norm is None else fc_norm
 
@@ -682,7 +636,7 @@ class RADIOVisionModelBase(nn.Module):
         adaptors: Optional[Dict[str, nn.Module]] = None,
         feature_normalizer: Optional[nn.Module] = None,
         inter_feature_normalizer: Optional[nn.Module] = None,
-        model_config: model_config_lib.ModelConfig[RADIOConfig] = None,
+        model_config: model_config_lib.ModelConfig[PretrainedConfig] = None,
     ):
         super().__init__()
 
@@ -702,18 +656,6 @@ class RADIOVisionModelBase(nn.Module):
         self.feature_normalizer = feature_normalizer
         self.inter_feature_normalizer = inter_feature_normalizer
         self.model_config = model_config
-
-    @property
-    def num_summary_tokens(self) -> int:
-        if hasattr(self.model, 'num_summary_tokens'):
-            return self.model.num_summary_tokens
-
-        patch_gen = getattr(self.model, "patch_generator", None)
-        if patch_gen is not None:
-            return patch_gen.num_skip
-        elif getattr(self.model, 'global_pool', None) == 'avg':
-            return 0
-        return 1
 
     @property
     def num_cls_tokens(self) -> int:
@@ -840,6 +782,16 @@ class RADIOVisionModel(PreTrainedModel):
 
         RADIOArgs = namedtuple("RADIOArgs", config.args.keys())
         args = RADIOArgs(**config.args)
+        # Get ViT model config.
+        model_name = args.model
+        intermediate_size = VIT_TIMM_CONFIG_BY_NAME[
+            model_name].intermediate_size
+        embed_dim = VIT_TIMM_CONFIG_BY_NAME[model_name].embed_dim
+        depth = VIT_TIMM_CONFIG_BY_NAME[model_name].depth
+        num_attention_heads = VIT_TIMM_CONFIG_BY_NAME[
+            model_name].num_attention_heads
+        img_size = VIT_TIMM_CONFIG_BY_NAME[model_name].img_size
+        mlp_ratio = intermediate_size / embed_dim
 
         # Build the model.
         in_chans = 3
@@ -848,12 +800,13 @@ class RADIOVisionModel(PreTrainedModel):
         elif args.input_size is not None:
             in_chans = args.input_size[0]
         vit_model = VisionTransformer(
-            img_size=IMAGE_SIZE_FOR_VIT,
-            patch_size=PATCH_SIZE_FOR_VIT,
-            embed_dim=EMBED_DIM_FOR_VIT,
-            depth=DEPTH_FOR_VIT,
-            num_heads=NUM_ATTENTION_HEADS_FOR_VIT,
+            img_size=img_size,
+            patch_size=config.patch_size,
             in_chans=in_chans,
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_attention_heads,
+            mlp_ratio=mlp_ratio,
             drop_rate=args.drop,
             special_args=args,
             model_config=model_config,
@@ -864,6 +817,7 @@ class RADIOVisionModel(PreTrainedModel):
         vit_model.head = nn.Identity()
         vit_model.to(dtype=config.torch_dtype)
 
+        # Note: image normalization is in image_processor, so the input_conditioner is Identity.
         input_conditioner = nn.Identity()
         input_conditioner.dtype = config.torch_dtype
 

@@ -595,6 +595,7 @@ accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4::test_fp8
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestNano_V2_VLM::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
 accuracy/test_llm_api_pytorch.py::TestMistralNemo12B::test_auto_dtype

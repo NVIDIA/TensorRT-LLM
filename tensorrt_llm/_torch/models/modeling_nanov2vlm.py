@@ -20,8 +20,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_uncached_mm_embeds,
-                                        fuse_input_embeds)
+from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_radio import RADIOVisionModel
 from .modeling_utils import register_auto_model
 
@@ -31,20 +30,13 @@ def _is_disagg() -> bool:
     return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
 
-# TODO: update the reference config path once Nano v2 VLM is released.
-IMAGE_TOKEN_ID = 131072
-IMG_CONTEXT_TOKEN = "<image>"  # nosec
-VIDEO_CONTEXT_TOKEN = "<video>"  # nosec
-IMG_START_TOKEN = "<img>"  # nosec
-IMG_END_TOKEN = "</img>"  # nosec
-
-
 class SquaredReLU(nn.Module):
 
     def forward(self, x):
         return torch.pow(torch.nn.functional.relu(x), 2)
 
 
+# Source codes are from NemotronH_Nano_VL_V2 modeling.py.
 class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
 
     def __init__(self,
@@ -166,6 +158,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         self.image_size = model_config.force_image_size
         self.patch_size = model_config.patch_size
         self.downsample_ratio = model_config.downsample_ratio
+        self.img_context_token_id = model_config.img_context_token_id
         self.num_image_token = int((self.image_size // self.patch_size)**2 *
                                    (self.downsample_ratio**2))
 
@@ -180,17 +173,17 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         self.processor = transformers.AutoImageProcessor.from_pretrained(
             model_path, trust_remote_code=True, use_fast=self.use_fast)
 
-        self.img_context_token = IMG_CONTEXT_TOKEN
-        self.video_context_token = VIDEO_CONTEXT_TOKEN
-        self.img_start_token = IMG_START_TOKEN
-        self.img_end_token = IMG_END_TOKEN
+        self.img_context_token = model_config.img_context_token
+        self.video_context_token = model_config.video_context_token
+        self.img_start_token = model_config.img_start_token
+        self.img_end_token = model_config.img_end_token
         self.dtype = model_config.torch_dtype
 
     def get_vocab_size(self):
         return self.model_config.llm_config.vocab_size
 
     def get_mm_token_ids(self):
-        return torch.tensor([IMAGE_TOKEN_ID], dtype=torch.int32)
+        return torch.tensor([self.img_context_token_id], dtype=torch.int32)
 
     def get_num_tokens_per_image(
         self,
@@ -265,6 +258,17 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             "multi_modal_data", {})
         images = mm_data.get("image", None)
         videos = mm_data.get("video", None)
+        if images is not None and videos is not None:
+            raise ValueError(
+                "NanoV2VL does not support both images and videos in the same prompt yet."
+            )
+
+        if images is None and videos is None:
+            input_ids = self.tokenizer.encode(text_prompt,
+                                              add_special_tokens=False,
+                                              return_tensors="pt")
+            return input_ids[0].to(torch.int32).tolist(), {}
+
         if images is not None:
             if isinstance(images[0], torch.Tensor):
                 # NanoV2VL can only support PIL images. Convert normalized tensors (0-1) to PIL images (0-255).
@@ -288,10 +292,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                 feature_size = num_patches * self.num_image_token
                 image_repl = self.img_start_token + self.img_context_token * feature_size + self.img_end_token
                 processed_query += image_repl + part
-
         elif videos is not None:
             num_videos = len(videos)
-
             num_patches_list = []
             pixel_values_list = []
             parts = text_prompt.split(self.video_context_token)
@@ -302,7 +304,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             # Process videos one by one to get correct processed_query.
             processed_query = ""
             for video_index, video in enumerate(videos):
-                if isinstance(videos[0][0], torch.Tensor):
+                if isinstance(video[0], torch.Tensor):
                     # NanoV2VL can only support PIL images. Convert normalized tensors (0-1) to PIL images (0-255).
                     images = [
                         Image.fromarray((image.permute(1, 2, 0) * 255).to(
@@ -328,11 +330,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
                 [sum(num_patches) for num_patches in num_patches_list])
             processed_images['pixel_values'] = torch.cat(pixel_values_list,
                                                          dim=0)
-        else:
-            input_ids = self.tokenizer.encode(text_prompt,
-                                              add_special_tokens=False,
-                                              return_tensors="pt")
-            return input_ids[0].to(torch.int32).tolist(), {}
 
         input_ids = self.tokenizer.encode(processed_query,
                                           add_special_tokens=False,
@@ -342,7 +339,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         multimodal_data = {}
         multimodal_data['pixel_values'] = processed_images['pixel_values'].to(
             self.dtype)
-        multimodal_data['num_patches'] = processed_images['num_patches']
+        multimodal_data['num_patches'] = processed_images['num_patches'].sum(
+            dim=0, keepdim=True)
         return input_ids[0].to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
         }
@@ -354,8 +352,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
     model_type="NemotronH_Nano_VL_V2",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
-            "image": IMG_CONTEXT_TOKEN,
-            "video": VIDEO_CONTEXT_TOKEN,
+            "image": "<image>",
+            "video": "<video>",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
@@ -384,8 +382,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         self.vocab_size = llm_model_config.pretrained_config.vocab_size
-        self.model_dtype = getattr(config, "torch_dtype", torch.float16)
-        logger.info(f"{self.dtype=} {self.model_dtype=}")
+        self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
+        self.img_context_token_id = config.img_context_token_id
         self.post_config()
         self.is_loaded = True
 
@@ -434,19 +432,18 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             if not _is_disagg():
                 mm_embedding = self.vision_encoder(multimodal_params)
             else:
-                # Directly fetch the multimodal embedding for DISAGG mode.
-                # This path is not functional now. `multimodal_params` will be prepared in PyExecutor.
-                mm_embedding = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
-            mm_embedding = find_uncached_mm_embeds(
+                raise NotImplementedError(
+                    "Nano-V2-VLM does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
+            mm_embedding = find_input_mm_embeds(
                 mm_embedding, multimodal_params[:num_context_requests])
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
             mm_embedding,
-            mm_token_ids=torch.tensor([IMAGE_TOKEN_ID], dtype=torch.int32),
+            mm_token_ids=torch.tensor([self.img_context_token_id],
+                                      dtype=torch.int32),
         )
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
