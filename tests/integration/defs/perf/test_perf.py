@@ -280,6 +280,7 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
 AUTODEPLOY_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.KV_CACHE_SIZE:
     re.compile(r".*Final KV cache size after resize: ([\d\.]+) GiB.*"),
+}
 DISAGG_SERVER_METRICS_LOG_QUERIES = {
     PerfMetricType.DISAGG_SERVER_E2EL:
     re.compile(r"Median E2EL \(ms\):\s*(\d+\.?\d*)"),
