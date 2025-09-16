@@ -26,7 +26,6 @@ from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
-from ..utils import print_tensor
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
@@ -394,10 +393,6 @@ class Attention(nn.Module):
             if mrope_position_deltas is not None:
                 mrope_config["mrope_position_deltas"] = mrope_position_deltas
         
-        tmp_q, tmp_k, tmp_v = torch.split(q, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        print_tensor(tmp_q, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::q 3", self.tp_rank)
-        print_tensor(tmp_k, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::k 3", self.tp_rank)
-        print_tensor(tmp_v, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::v 3", self.tp_rank)
 
         attn_output = self.attn.forward(
             q,
@@ -416,7 +411,6 @@ class Attention(nn.Module):
             output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
             attention_sinks=attention_sinks)
-        print_tensor(attn_output, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::attn_output 3", self.tp_rank)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
@@ -513,7 +507,6 @@ class Attention(nn.Module):
             torch.Tensor: The output tensor.
         """
         qkv = self.qkv_proj(hidden_states)
-        print_tensor(qkv, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::qkv 1", self.tp_rank)
 
 
         if bool(lora_params):
@@ -537,7 +530,6 @@ class Attention(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
             ### TODO: avoid the redundant split and concat
             qkv = torch.concat([q, k, v], dim=-1)
-        print_tensor(gate, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::gate 1", self.tp_rank)
 
         q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)
@@ -559,13 +551,11 @@ class Attention(nn.Module):
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
-        print_tensor(attn_output, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::attn_output 4", self.tp_rank)
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
-        print_tensor(attn_output, f"l_{self.layer_idx:2d} Qwen3HybridAttentionDecoderLayer::output 4", self.tp_rank)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

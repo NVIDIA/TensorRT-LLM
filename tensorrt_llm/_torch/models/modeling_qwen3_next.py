@@ -40,7 +40,6 @@ from .modeling_utils import (DecoderModel, EagerFusionConfig,
 
 from transformers import Qwen3NextConfig
 
-from ..utils import print_tensor
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
@@ -53,8 +52,6 @@ def divide(numerator, denominator):
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
-
-PRINT_DEBUG_INFO=False
 
 class Qwen3NextGate(nn.Module):
 
@@ -184,9 +181,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                           dim=0,
                                           sizes=all_rank_num_tokens)
 
-        print_tensor(hidden_states, "Qwen3NextSparseMoeBlock::hidden_states", self.model_config.mapping.tp_rank)
         router_logits = self.gate(hidden_states)
-        print_tensor(router_logits, "Qwen3NextSparseMoeBlock::router_logits", self.model_config.mapping.tp_rank)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
@@ -194,19 +189,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
         )
-        print_tensor(final_hidden_states, "Qwen3NextSparseMoeBlock::final_hidden_states 1", self.model_config.mapping.tp_rank)
 
         if not do_finalize:
             return final_hidden_states
 
         shared_expert_output = self.shared_expert(hidden_states)
-        print_tensor(shared_expert_output, "Qwen3NextSparseMoeBlock::shared_expert_output", self.model_config.mapping.tp_rank)
         shared_expert_output = F.sigmoid(
             self.shared_expert_gate(hidden_states)) * shared_expert_output
-        print_tensor(shared_expert_output, "Qwen3NextSparseMoeBlock::shared_expert_output", self.model_config.mapping.tp_rank)
 
         final_hidden_states = final_hidden_states + shared_expert_output
-        print_tensor(final_hidden_states, "Qwen3NextSparseMoeBlock::final_hidden_states 2", self.model_config.mapping.tp_rank)
 
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.allreduce(
@@ -618,22 +609,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         state_indices = attn_metadata.kv_cache_manager.get_state_indices(
         )[:num_prefills + num_decodes]
 
-        if PRINT_DEBUG_INFO:
-            print(f"state_indices: {state_indices}")
-            print(f"batch_split_size: {batch_split_size}")
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
-        if PRINT_DEBUG_INFO:
-            print(f"state_indices_p: {state_indices_p}")
-            print(f"state_indices_d: {state_indices_d}")
         conv_states = attn_metadata.kv_cache_manager.get_conv_states(
             self.layer_idx)
         ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
             self.layer_idx)
         has_prefill = num_prefills > 0
-        ### mamba2_mixer layer
 
-        print_tensor(hidden_states, "Qwen3NextGatedDeltaNet::hidden_states", self.model_config.mapping.tp_rank)
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
         query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
@@ -656,27 +639,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
        
-        if PRINT_DEBUG_INFO:
-            print(f"mixed_qkv: {mixed_qkv.shape}")
-            print(f"z: {z.shape}")
-            print(f"b: {b.shape}")
-            print(f"a: {a.shape}")
-        print_tensor(mixed_qkv, "Qwen3NextGatedDeltaNet::mixed_qkv", self.model_config.mapping.tp_rank)
-        print_tensor(z, "Qwen3NextGatedDeltaNet::z", self.model_config.mapping.tp_rank)
-        print_tensor(b, "Qwen3NextGatedDeltaNet::b", self.model_config.mapping.tp_rank)
-        print_tensor(a, "Qwen3NextGatedDeltaNet::a", self.model_config.mapping.tp_rank)
-        
         # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
 
         # - "cache_indices" updates the conv_state cache in positions
         #   pointed to by "mamba_cache_params.state_indices_tensor"
-        if PRINT_DEBUG_INFO:
-            print(f"mamba_metadata.cu_seqlens 11: {mamba_metadata.cu_seqlens}")
-            print(f"num_prefills: {num_prefills}")
-            print(f"num_decodes: {num_decodes}")
         cu_seqlens = mamba_metadata.cu_seqlens[:num_prefills + 1]
-        if PRINT_DEBUG_INFO:
-            print(f"cu_seqlens 11: {cu_seqlens}")
         has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
@@ -735,11 +702,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
 
-        print_tensor(query, "Qwen3NextGatedDeltaNet::query", self.model_config.mapping.tp_rank)
-        print_tensor(key, "Qwen3NextGatedDeltaNet::key", self.model_config.mapping.tp_rank)
-        print_tensor(value, "Qwen3NextGatedDeltaNet::value", self.model_config.mapping.tp_rank)
-        print_tensor(g, "Qwen3NextGatedDeltaNet::g", self.model_config.mapping.tp_rank)
-        print_tensor(beta, "Qwen3NextGatedDeltaNet::beta", self.model_config.mapping.tp_rank)
 
         ### TODO: support mixed prefill and decode requests
         if num_prefills > 0:
@@ -773,9 +735,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 
-        if PRINT_DEBUG_INFO:
-            print(f"state_indices_d: {state_indices_d}")
-            print(f"cu_seqlens: {cu_seqlens}")
         if num_decodes > 0:
             # query,: torch.Size([1, 1, 16, 128])
             # key,: torch.Size([1, 1, 16, 128])
@@ -786,21 +745,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # state_indices_d,: tensor([3], device='cuda:0', dtype=torch.int32)
             # cu_seqlens.to(torch.long): tensor([0], device='cuda:0')
 
-            if PRINT_DEBUG_INFO:
-                print(f"query,: {query.shape}")
-                print(f"key,: {key.shape}")
-                print(f"value,: {value.shape}")
-                print(f"g,: {g.shape}")
-                print(f"beta,: {beta.shape}")
-                print(f"ssm_states,: {ssm_states.shape}")
-                print(f"state_indices_d,: {state_indices_d}")
-                print(f"cu_seqlens.to(torch.long): {cu_seqlens.to(torch.long)}")
-            
             if cu_seqlens == 0:
                 cu_seqlens = torch.concat([cu_seqlens, torch.tensor([1], device=cu_seqlens.device)])
-            if PRINT_DEBUG_INFO:
-                print(f"cu_seqlens.to(torch.long) 2: {cu_seqlens.to(torch.long)}")
-                print()
                 
             # ValueError: The number of initial states is expected to be equal to the number of input sequences, i.e., 0 rather than 1.
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
@@ -819,7 +765,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 softplus_threshold=20.0,
             )
 
-        print_tensor(core_attn_out, "Qwen3NextGatedDeltaNet::core_attn_out", self.model_config.mapping.tp_rank)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -829,9 +774,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
 
-        print_tensor(core_attn_out, "Qwen3NextGatedDeltaNet::core_attn_out", self.model_config.mapping.tp_rank)
         output = self.out_proj(core_attn_out, all_reduce_params=all_reduce_params)
-        print_tensor(output, "Qwen3NextGatedDeltaNet::output", self.model_config.mapping.tp_rank)
         return output
 
 
@@ -896,8 +839,6 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::hidden_states 1", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::residual 1", self.model_config.mapping.tp_rank)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -906,16 +847,12 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
             self.fusion_config.POST_MOE_FUSION = False
         # Linear Attention
         ### FIXME: 1. forward_batch; 2. allreduce
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::hidden_states 2", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::residual 2", self.model_config.mapping.tp_rank)
         if hidden_states.shape[0] != 0:
             hidden_states = self.linear_attn(hidden_states, attn_metadata,
                                             all_reduce_params=AllReduceParams(
                                                 enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
                                                                       or self.mapping.tp_size == 1)),
                                              **kwargs)
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::hidden_states 3", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::residual 3", self.model_config.mapping.tp_rank)
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
@@ -931,8 +868,6 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::hidden_states 4", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::residual 4", self.model_config.mapping.tp_rank)
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
         do_finalize = not (hidden_states.shape[0]
@@ -949,8 +884,6 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
         )
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::hidden_states 5", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::residual 5", self.model_config.mapping.tp_rank)
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
                 hidden_states, residual = self.allreduce(
@@ -989,8 +922,6 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::hidden_states 6", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextLinearDecoderLayer::residual 6", self.model_config.mapping.tp_rank)
         return hidden_states, residual
 
 class Qwen3NextAttention(Qwen3Attention):
@@ -1059,8 +990,6 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::hidden_states 1", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::residual 1", self.model_config.mapping.tp_rank)
 
         if residual is None:
             residual = hidden_states
@@ -1068,8 +997,6 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::hidden_states 2", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::residual 2", self.model_config.mapping.tp_rank)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -1080,8 +1007,6 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                 enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::hidden_states 3", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::residual 3", self.model_config.mapping.tp_rank)
 
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
@@ -1096,8 +1021,6 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::hidden_states 4", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::residual 4", self.model_config.mapping.tp_rank)
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
         do_finalize = not (hidden_states.shape[0]
@@ -1114,8 +1037,6 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
         )
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::hidden_states 5", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::residual 5", self.model_config.mapping.tp_rank)
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
@@ -1155,8 +1076,6 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
-        print_tensor(hidden_states, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::hidden_states 6", self.model_config.mapping.tp_rank)
-        print_tensor(residual, f"l_{self.layer_idx:2d} Qwen3NextFullAttentionDecoderLayer::residual 6", self.model_config.mapping.tp_rank)
 
         return hidden_states, residual
 
@@ -1227,8 +1146,6 @@ class Qwen3NextModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if self.model_config.mapping.tp_rank == 0 and PRINT_DEBUG_INFO:
-            print(f"call Qwen3NextModel, input_ids: {input_ids}, {input_ids.shape}", flush=True)
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1246,7 +1163,6 @@ class Qwen3NextModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-        print_tensor(hidden_states, "Qwen3NextModel::hidden_states", self.model_config.mapping.tp_rank)
         residual = None
         for decoder_layer in self.layers:
             hidden_states, residual = decoder_layer(
@@ -1256,8 +1172,6 @@ class Qwen3NextModel(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
                 mamba_metadata=self.mamba_metadata)
-        if PRINT_DEBUG_INFO:
-            print_tensor(hidden_states, "Qwen3NextModel::hidden_states 8", self.model_config.mapping.tp_rank)
         return hidden_states
 
 
