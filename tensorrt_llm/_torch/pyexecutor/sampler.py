@@ -621,10 +621,14 @@ class TorchSampler(Sampler):
         finish_reasons_host = finish_reasons.to(device="cpu", non_blocking=True)
         sampler_event = torch.cuda.Event()
         sampler_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           device=SampleStateTensors(new_tokens=new_tokens),
-                           host=SampleStateTensors(new_tokens=new_tokens_host),
-                           sampler_event=sampler_event)
+        return SampleStateTorch(
+            scheduled_requests=scheduled_requests,
+            device=SampleStateTensors(new_tokens=new_tokens),
+            host=SampleStateTensorsHostTorch(
+                new_tokens=new_tokens_host,
+                finish_reasons=finish_reasons_host,
+            ),
+            sampler_event=sampler_event)
 
     @staticmethod
     def append_eagle3(tokens: torch.Tensor, model_outputs):
@@ -956,7 +960,6 @@ class TorchSampler(Sampler):
             logits = raw_logits[input_slice]
 
             req = requests[i]
-            print(f"{req.py_num_logprobs=}")
 
             if batched_next_tokens is None:
                 logits = self._apply_embedding_bias(logits, [req])
