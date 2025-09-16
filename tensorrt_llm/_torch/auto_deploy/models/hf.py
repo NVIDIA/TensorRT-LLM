@@ -179,6 +179,17 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
 
+        # TODO: add to ModelOPT QuantConfigReader/graph transforms
+        mto_ckpt_path = os.path.join(self.model, "modelopt_state.pth")
+        if os.path.exists(mto_ckpt_path):
+            import modelopt.torch.opt as mto  # noqa: E402
+
+            print(f"Loading ModelOpt checkpoint from {mto_ckpt_path}")
+            modelopt_state = torch.load(mto_ckpt_path, weights_only=False)
+            model = mto.restore_from_modelopt_state(model, modelopt_state)
+            print("Restored model:")
+            print(model)
+
         model.eval()
 
         return model
