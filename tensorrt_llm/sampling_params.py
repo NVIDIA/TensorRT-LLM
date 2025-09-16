@@ -450,9 +450,6 @@ class SamplingParams:
 
         if is_pytorch_backend:
             config_kwargs["return_log_probs"] = bool(self.logprobs)
-            # For PyTorch backend: if prompt_logprobs is requested but return_context_logits is False,
-            # we need to internally enable context logits for prompt logprobs computation
-            # They will be dropped after computation if the user didn't explicitly request them
             if self.prompt_logprobs and not self.return_context_logits:
                 logger.info(
                     "Since prompt_logprobs is requested but return_context_logits is False, "

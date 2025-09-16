@@ -245,14 +245,14 @@ class GenerationResultBase:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
         # prompt logprobs handling
-        if logprobs_result and logprobs_result.prompt is not None: # both backends
+        if logprobs_result and logprobs_result.prompt is not None:  # both backends
             output.prompt_logprobs = logprobs_result.prompt
         # generation logprobs handling (provenance varies by backend)
-        if logprobs_result and logprobs_result.generation is not None: # TRT backend
+        if logprobs_result and logprobs_result.generation is not None:  # TRT backend
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs += logprobs_result.generation
-        elif response_tensors.log_probs is not None: # PyTorch backend
+        elif response_tensors.log_probs is not None:  # PyTorch backend
             # handle logprobs directly from response tensors given by sampler
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs = response_tensors.log_probs[src_idx]
@@ -266,6 +266,12 @@ class GenerationResultBase:
                     output.logprobs = output.logprobs[:output.length]
                 if isinstance(output.logprobs, list):
                     assert len(output.logprobs) == output.length
+
+        # In streaming mode, logprobs should contain only incremental data
+        if hasattr(self, '_streaming') and self._streaming:
+            # Replace logprobs with only the diff portion
+            output.logprobs = output.logprobs[output._last_logprobs_len:]
+
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
@@ -710,6 +716,11 @@ def compute_logprobs(
     - Prompt logprobs (from context_logits): always used.
     - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
     - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
+
+    Returns:
+        LogProbsResult, a NamedTuple containing:
+            - prompt: Optional[List[Dict[token_id, Logprob]]] logprobs for prompt tokens.
+            - generation: Optional[List[Dict[token_id, Logprob]]] logprobs for generated tokens.
     """
 
     def _topk_logprobs(logits: torch.Tensor, top_k: int,

@@ -388,10 +388,33 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
-    def create_response(
-            self,
-            use_fast_logits=False,
-            mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
+    def create_response(self,
+                        use_fast_logits=False,
+                        mpi_world_rank=0) -> LlmResponse | None:
+        """Create an LlmResponse from the current request state.
+
+        This method generates a response containing the request's execution results,
+        including generated tokens, logits, and completion status. It wraps the
+        parent class's serialized result in a PyTorch-specific LlmResponse object.
+
+        Args:
+            use_fast_logits (bool, optional): Whether to use fast logits computation
+                for improved performance. Defaults to False.
+            mpi_world_rank (int, optional): The MPI world rank for distributed
+                inference. Defaults to 0.
+
+        Returns:
+            LlmResponse | None: An LlmResponse object containing the request results
+            if there is valid output, otherwise None.
+            The response includes:
+            - request_id: The request identifier (parent ID for child requests)
+            - result: LlmResult wrapping both serialized and PyTorch-specific results
+            - client_id: The client identifier for request routing
+
+        Note:
+            Returns None if the serialized result is empty (len(result) == 0),
+            indicating no output was generated for this request iteration.
+        """
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
         return LlmResponse(
