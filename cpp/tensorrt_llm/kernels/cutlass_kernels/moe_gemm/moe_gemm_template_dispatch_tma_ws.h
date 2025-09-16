@@ -194,6 +194,7 @@ constexpr bool are_tile_shapes_supported_sm100()
     return true;
 }
 
+// TODO: Perhaps
 template <typename ClusterTileShape, typename ClusterShape, typename DataType>
 constexpr bool are_tile_shapes_supported_sm120()
 {
@@ -380,11 +381,38 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
             TLLM_THROW("Unsupported SM100 configuration requested");
         }
     }
+    // TODO: Perhaps modify
     else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121)
     {
         TLLM_LOG_TRACE("At %s, SM120 config=%d", __PRETTY_FUNCTION__, (int) gemm_config.tile_config_sm120);
         if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
         {
+            // Minimal diagnostic to confirm intended SM120 kernel selection
+            constexpr const char* T_name = []()
+            {
+                if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) return "fp8_e4m3";
+                else if constexpr (std::is_same_v<T, __nv_fp4_e2m1>) return "fp4_e2m1";
+                else if constexpr (std::is_same_v<T, __nv_bfloat16>) return "bf16";
+                else if constexpr (std::is_same_v<T, half>) return "f16";
+                else if constexpr (std::is_same_v<T, float>) return "f32";
+                else return "unknown";
+            }();
+            constexpr const char* W_name = []()
+            {
+                if constexpr (std::is_same_v<WeightType, __nv_fp8_e4m3>) return "fp8_e4m3";
+                else if constexpr (std::is_same_v<WeightType, __nv_fp4_e2m1>) return "fp4_e2m1";
+                else if constexpr (std::is_same_v<WeightType, __nv_bfloat16>) return "bf16";
+                else if constexpr (std::is_same_v<WeightType, half>) return "f16";
+                else if constexpr (std::is_same_v<WeightType, float>) return "f32";
+                else return "unknown";
+            }();
+            constexpr bool IsFp8xFp4 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+            constexpr bool IsFp4Only = std::is_same_v<T, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+            TLLM_LOG_TRACE(
+                "SM120 TMA-WS dispatch: dtype=%s x %s (%s), fusion=%d, swap_ab=%d, cluster=%d, tile_sm120=%d, fpX_type=%d",
+                T_name, W_name, IsFp8xFp4 ? "fp8xfp4" : (IsFp4Only ? "fp4" : "other"), (int) FUSION,
+                (int) hopper_input.swap_ab, (int) gemm_config.cluster_shape, (int) gemm_config.tile_config_sm120,
+                (int) hopper_input.fpX_block_scaling_type);
             switch (gemm_config.tile_config_sm120)
             {
                 SHAPE_CASE(120, 128, 128, 64)
