@@ -24,3 +24,9 @@ class Qwen2MoeHfWeightMapper(HfWeightMapper):
                 updated_module_weights[new_weight_name] = weight_value
             del module_weights
             module.load_weights(weights=[updated_module_weights])
+        ### TODO: process linear_attn.conv1d weights in this function
+        # if isinstance(module, Linear):
+        #     for weight_name, weight_value in module_weights.items():
+        #         if "linear_attn.conv1d" in weight_name:
+        #             module_weights['weight'] = module_weights['weight'].squeeze(dim = 1)
+        #     module.load_weights(weights=[updated_module_weights])

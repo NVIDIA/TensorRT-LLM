@@ -11,3 +11,6 @@ def is_mla(config):
             config, "qk_rope_head_dim", None):
         return True
     return False
+
+def is_qwen3_next(config):
+    return getattr(config, 'linear_key_head_dim', 0) > 0
