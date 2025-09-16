@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=25.06-py3
-ARG TRITON_BASE_TAG=25.06-py3
+ARG BASE_TAG=25.08-py3
+ARG TRITON_BASE_TAG=25.08-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -15,70 +15,80 @@ LABEL com.nvidia.ai-terms="https://www.nvidia.com/en-us/agreements/enterprise-so
 # The default values come from `nvcr.io/nvidia/pytorch`
 ENV BASH_ENV=${BASH_ENV:-/etc/bash.bashrc}
 ENV ENV=${ENV:-/etc/shinit_v2}
+
 ARG GITHUB_MIRROR=""
 RUN echo "Using GitHub mirror: $GITHUB_MIRROR"
-SHELL ["/bin/bash", "-c"]
-
-# Clean up the pip constraint file from the base NGC PyTorch image.
-RUN [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
-
-FROM base AS devel
 
 ARG PYTHON_VERSION="3.12.3"
 RUN echo "Using Python version: $PYTHON_VERSION"
+
+SHELL ["/bin/bash", "-c"]
+
+FROM base AS devel
+
+#
+# NB: PyTorch requires this to be < 1.0
+ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
+
+COPY docker/common/install.sh install.sh
+
 COPY docker/common/install_base.sh install_base.sh
-RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_base.sh $PYTHON_VERSION && rm install_base.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
+    PYTHON_VERSION=${PYTHON_VERSION} \
+    bash ./install.sh --base && rm install_base.sh
 
 COPY docker/common/install_cmake.sh install_cmake.sh
-RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_cmake.sh && rm install_cmake.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --cmake && rm install_cmake.sh
 
 COPY docker/common/install_ccache.sh install_ccache.sh
-RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_ccache.sh && rm install_ccache.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --ccache && rm install_ccache.sh
 
-# Only take effect when the base image is Rocky Linux 8 with old CUDA version.
 COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
-RUN bash ./install_cuda_toolkit.sh && rm install_cuda_toolkit.sh
+RUN bash ./install.sh --cuda_toolkit && rm install_cuda_toolkit.sh
 
-# Download & install latest TRT release
 ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
 COPY docker/common/install_tensorrt.sh install_tensorrt.sh
-RUN bash ./install_tensorrt.sh \
-    --TRT_VER=${TRT_VER} \
-    --CUDA_VER=${CUDA_VER} \
-    --CUDNN_VER=${CUDNN_VER} \
-    --NCCL_VER=${NCCL_VER} \
-    --CUBLAS_VER=${CUBLAS_VER} && \
-    rm install_tensorrt.sh
+RUN TRT_VER=${TRT_VER} \
+    CUDA_VER=${CUDA_VER} \
+    CUDNN_VER=${CUDNN_VER} \
+    NCCL_VER=${NCCL_VER} \
+    CUBLAS_VER=${CUBLAS_VER} \
+    bash ./install.sh --tensorrt && rm install_tensorrt.sh
 
-# Install latest Polygraphy
 COPY docker/common/install_polygraphy.sh install_polygraphy.sh
-RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
+RUN bash ./install.sh --polygraphy && rm install_polygraphy.sh
 
-# Install mpi4py
 COPY docker/common/install_mpi4py.sh install_mpi4py.sh
-RUN GITHUB_MIRROR=$GITHUB_MIRROR bash ./install_mpi4py.sh && rm install_mpi4py.sh
+RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install.sh --mpi4py && rm install_mpi4py.sh
 
-# Install PyTorch
 ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
-RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
-#
-# NB: PyTorch requires this to be < 1.0
-ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
+RUN TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} bash ./install.sh --pytorch && rm install_pytorch.sh
 
-# Install OpenCV with FFMPEG support
-RUN pip3 uninstall -y opencv && \
-    rm -rf /usr/local/lib/python3*/dist-packages/cv2/ && \
-    pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
+RUN bash ./install.sh --opencv && bash ./install.sh --protobuf && rm install.sh
 
-# WARs against security issues inherited from pytorch:25.06
-# * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
-RUN pip3 install --upgrade --no-cache-dir \
-    "protobuf>=4.25.8"
+# wait for new triton to be published
+# Rename pytorch_triton package to triton
+RUN if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
+    else \
+        cd /usr/local/lib/python3.12/dist-packages/ && \
+        ls -la | grep pytorch_triton && \
+        mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
+        cd triton-3.3.1+gitc8757738.dist-info && \
+        echo "Current directory: $(pwd)" && \
+        echo "Files in directory:" && \
+        ls -la && \
+        sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
+        sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
+        echo "METADATA after update:" && \
+        grep "^Name:" METADATA; \
+    fi
+
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
@@ -103,7 +113,6 @@ RUN bash ./install_nixl.sh && rm install_nixl.sh
 # Install etcd
 COPY docker/common/install_etcd.sh install_etcd.sh
 RUN bash ./install_etcd.sh && rm install_etcd.sh
-
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm

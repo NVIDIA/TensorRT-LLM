@@ -21,6 +21,7 @@ from tensorrt_llm.metrics.enums import MetricNames
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
+from ..bindings import steady_clock_now
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
@@ -363,6 +364,9 @@ class BaseLLM:
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
 
+        arrival_time = steady_clock_now(
+        ) if self.args.return_perf_metrics else None
+
         sampling_params = self._prepare_sampling_params(sampling_params)
         cache_salt_id = get_cache_salt_id(
             cache_salt) if cache_salt is not None else None
@@ -462,6 +466,7 @@ class BaseLLM:
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
+            arrival_time=arrival_time,
         )
 
         if sampling_params.return_perf_metrics:

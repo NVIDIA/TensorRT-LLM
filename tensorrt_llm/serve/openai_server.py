@@ -424,10 +424,9 @@ class OpenAIServer:
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size)
-            # TODO: better way to enable metrics
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
-                sampling_params.return_perf_metrics = True
+                vocab_size=self.tokenizer.tokenizer.vocab_size,
+                gather_generation_logits=self.llm.args.gather_generation_logits,
+                backend=self.llm.args.backend)
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
