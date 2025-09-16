@@ -18,6 +18,7 @@ from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
+from ..bindings import steady_clock_now
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
@@ -27,7 +28,8 @@ from ..executor.postproc_worker import PostprocParams
 from ..executor.utils import (create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
-                      create_input_processor_with_hash, prompt_inputs)
+                      create_input_processor_with_hash, get_cache_salt_id,
+                      prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -325,6 +327,7 @@ class BaseLLM:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        cache_salt: Optional[str] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -339,7 +342,7 @@ class BaseLLM:
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
-
+            cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
@@ -348,8 +351,12 @@ class BaseLLM:
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
 
-        sampling_params = self._prepare_sampling_params(sampling_params)
+        arrival_time = steady_clock_now(
+        ) if self.args.return_perf_metrics else None
 
+        sampling_params = self._prepare_sampling_params(sampling_params)
+        cache_salt_id = get_cache_salt_id(
+            cache_salt) if cache_salt is not None else None
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         # TODO: Also support for trt backend
@@ -444,6 +451,8 @@ class BaseLLM:
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
+            cache_salt_id=cache_salt_id,
+            arrival_time=arrival_time,
         )
 
         return RequestOutput._from_generation_result(result, prompt,

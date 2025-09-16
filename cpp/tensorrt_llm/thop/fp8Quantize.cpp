@@ -67,7 +67,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self)
         act_buffer, act_scale_buffer, reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), n, m, stream);
 
     // Post-process the scale tensor for sm100 gemm/moe kernel
-    if (tensorrt_llm::common::getSMVersion() == 100)
+    if (tensorrt_llm::common::isSM100Family())
     {
         auto const num_n_blocks = (n + 127) / 128;
         auto const act_scal_elesize = num_n_blocks * m_padded;
@@ -119,8 +119,9 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
 
     int64_t scaleSizeInBytes = mGemmRunner.getActScaleSize(m, b * n);
     int64_t elementSize = scaleSizeInBytes / torch::elementSize(FP8_BLOCK_SCALING_SF_DTYPE);
-    at::Tensor scaleFP8SF = at::detail::empty_cuda(
-        {elementSize}, FP8_BLOCK_SCALING_SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
+    int m_4_align = (m + 3) / 4 * 4;
+    at::Tensor scaleFP8SF = at::detail::empty_cuda({b, m_4_align, elementSize / b / m_4_align},
+        FP8_BLOCK_SCALING_SF_DTYPE, self.device(), /* stride */ std::nullopt);
 
     __nv_fp8_e4m3* act_buffer = reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr());
     float* act_scale_buffer = reinterpret_cast<float*>(scaleFP8SF.data_ptr());

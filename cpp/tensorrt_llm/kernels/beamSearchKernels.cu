@@ -134,15 +134,14 @@ void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& 
     sync_check_cuda_error(stream);
 }
 
-template <typename T>
-__global__ void addCumLogProbs(T* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
+__global__ void addCumLogProbs(float* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
     FinishedState const* finished, int const* endIds, float const* diversityRates,
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM)
 {
     int const bid = blockIdx.x; // Index of request in batch
     runtime::SizeType32 const slot = batchSlots[bid];
     float const diversityRate{diversityRates[slot]};
-    T* pLocalLogProbs = pStage1LogProbs + bid * nBMIn * nBMOut * 2;
+    float* pLocalLogProbs = pStage1LogProbs + bid * nBMIn * nBMOut * 2;
 
     for (int i = threadIdx.x; i < nBMIn * nBMOut * 2; i += blockDim.x)
     {
@@ -160,13 +159,30 @@ __global__ void addCumLogProbs(T* __restrict pStage1LogProbs, float const* __res
     return;
 }
 
-template __global__ void addCumLogProbs<float>(float* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
+__global__ void addCumLogProbs(half* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
     FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
+    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM)
+{
+    int const bid = blockIdx.x; // Index of request in batch
+    runtime::SizeType32 const slot = batchSlots[bid];
+    float const diversityRate{diversityRates[slot]};
+    half* pLocalLogProbs = pStage1LogProbs + bid * nBMIn * nBMOut * 2;
 
-template __global__ void addCumLogProbs<half>(half* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
+    for (int i = threadIdx.x; i < nBMIn * nBMOut * 2; i += blockDim.x)
+    {
+        int const iBMIn = i / (nBMOut * 2);
+        if (finished[slot * nBMIn + iBMIn].isFinished())
+        {
+            pLocalLogProbs[i] += (i == endIds[slot]) ? 1.0f : 0.0f;
+        }
+        else
+        {
+            // nBM is used in VBWS since `cumLogProbs` is initialized with kMaxBeamWidth earlier than BeamSearchLayer
+            pLocalLogProbs[i] += cumLogProbs[slot * nBM + iBMIn] + diversityRate * iBMIn;
+        }
+    }
+    return;
+}
 
 __global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS,
     size_t const nBMIn, size_t const nBMOut, size_t const nV)

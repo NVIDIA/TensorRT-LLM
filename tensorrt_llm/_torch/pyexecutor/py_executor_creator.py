@@ -1,6 +1,7 @@
 import copy
 import enum
 import importlib
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,9 +15,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             ContextChunkingPolicy,
-                                            ExecutorConfig,
-                                            LogitsPostProcessorConfig,
-                                            ParallelConfig)
+                                            ExecutorConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
@@ -33,10 +32,17 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
-from .guided_decoder import GuidedDecoder
+from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+
+
+# Development flag to control chain drafter feature
+def _get_allow_chain_drafter() -> bool:
+    """Get the chain drafter flag from environment variable."""
+    # Use environment variable for cross-process compatibility
+    return os.getenv("TRTLLM_ALLOW_CHAIN_DRAFTER", "0") == "1"
 
 
 class _ExecutorCreationStage(enum.Enum):
@@ -211,20 +217,28 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     return mapping
 
 
+def update_sampler_max_seq_len(max_seq_len, sampler):
+    # Originally, TRTLLMSampler is constructed with executor_config, but
+    # _create_kv_cache_manager (via build_managers) may later overwrite executor_config.max_seq_len.
+    # Because TRTLLMSampler.sample_async still needs the updated limit and executor_config is
+    # deprecated inside TRTLLMSampler, keep TRTLLMSampler.max_seq_len updated with
+    # with executor_config.max_seq_len.
+    from .sampler import TRTLLMSampler
+
+    if isinstance(sampler, TRTLLMSampler):
+        assert hasattr(sampler, "max_seq_len")
+        sampler.max_seq_len = max_seq_len
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: str = None,
     tokenizer: Optional[TokenizerBase] = None,
     lora_config: Optional[LoraConfig] = None,
     kv_connector_config: Optional[KvCacheConnectorConfig] = None,
-    logits_post_processor_config: Optional[LogitsPostProcessorConfig] = None,
-    parallel_config: Optional[ParallelConfig] = None,
 ) -> PyExecutor:
 
     executor_config = llm_args.get_executor_config(checkpoint_dir, tokenizer)
-    executor_config.logits_post_processor_config = logits_post_processor_config
-    executor_config.parallel_config = parallel_config
-
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
 
     _mangle_executor_config(executor_config)
@@ -233,7 +247,7 @@ def create_py_executor(
     mapping = _get_mapping(executor_config)
 
     dist = MPIDist(mapping=mapping)
-
+    cache_transceiver_config = executor_config.cache_transceiver_config
     spec_config = executor_config.speculative_config
     has_draft_model_engine = False
     has_spec_drafter = False
@@ -276,11 +290,15 @@ def create_py_executor(
             # generation requests when we invoke it autoregressively
             draft_spec_config.max_draft_len = 0
 
-            use_chain_drafter = (
-                executor_config.guided_decoding_config is None
-                and not pytorch_backend_config.enable_mixed_sampler
-                and pytorch_backend_config.attn_backend == "TRTLLM")
+            if _get_allow_chain_drafter():
+                use_chain_drafter = (
+                    executor_config.guided_decoding_config is None
+                    and not pytorch_backend_config.enable_mixed_sampler
+                    and pytorch_backend_config.attn_backend == "TRTLLM")
+            else:
+                use_chain_drafter = False
 
+            logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):
@@ -343,10 +361,10 @@ def create_py_executor(
 
         sm_version = get_sm_version()
         if executor_config.kv_cache_config.enable_block_reuse and sm_version not in [
-                90, 100, 120
+                90, 100, 103, 120
         ]:
             logger.warning(
-                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM120, "
+                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "
                 f"disable enable_block_reuse for SM{sm_version}")
             executor_config.kv_cache_config.enable_block_reuse = False
 
@@ -360,10 +378,10 @@ def create_py_executor(
             )
             executor_config.kv_cache_config.enable_block_reuse = False
         if executor_config.enable_chunked_context and sm_version not in [
-                90, 100
+                90, 100, 103, 120
         ]:
             logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM90/SM100, "
+                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
                 f"disable enable_chunked_context for SM{sm_version}")
             executor_config.enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
@@ -393,23 +411,46 @@ def create_py_executor(
             _ExecutorCreationStage.GUIDED_DECODER):
         guided_decoder: Optional[GuidedDecoder] = None
         if executor_config.guided_decoding_config is not None:
-            if spec_config is not None and not has_spec_drafter:
-                raise ValueError(
-                    "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
-                )
             if mapping.is_last_pp_rank():
-                max_num_draft_tokens = 0
-                if spec_config is not None:
-                    max_num_draft_tokens = spec_config.max_draft_len
-                guided_decoder = GuidedDecoder(
+                kwargs = {
+                    "guided_decoding_config":
                     executor_config.guided_decoding_config,
-                    executor_config.max_batch_size,
-                    model_engine.model.vocab_size_padded,
-                    max_num_draft_tokens=max_num_draft_tokens)
+                    "max_num_sequences": executor_config.max_batch_size,
+                    "vocab_size_padded": model_engine.model.vocab_size_padded
+                }
+                if spec_config is not None:
+                    kwargs["max_num_draft_tokens"] = spec_config.max_draft_len
+
+                if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
+                ):
+                    # GuidedDecoder is applicable to non-speculative decoding and two-model speculative decoding.
+                    guided_decoder = GuidedDecoder(**kwargs)
+                elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
+                ):
+                    # CapturableGuidedDecoder is applicable to one-model speculative decoding.
+                    success = model_engine.set_guided_decoder(
+                        CapturableGuidedDecoder(**kwargs))
+                    if not success:
+                        raise ValueError(
+                            f"Failed to set guided decoder for speculative decoding mode: {spec_config.spec_dec_mode.name}."
+                        )
+                else:
+                    raise ValueError(
+                        f"Guided decoding is not supported for speculative decoding mode: {spec_config.spec_dec_mode.name}."
+                    )
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
-        sampler = instantiate_sampler(model_engine, executor_config,
-                                      pytorch_backend_config, mapping)
+        sampler = instantiate_sampler(
+            model_engine,
+            pytorch_backend_config,
+            mapping,
+            max_batch_size=executor_config.max_batch_size,
+            max_beam_width=executor_config.max_beam_width,
+            max_seq_len=executor_config.max_seq_len,
+            mm_encoder_only=executor_config.mm_encoder_only,
+            speculative_config=executor_config.speculative_config,
+            decoding_config=executor_config.decoding_config,
+            kv_cache_config=executor_config.kv_cache_config)
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     if kv_connector_config is not None:
@@ -438,11 +479,11 @@ def create_py_executor(
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
             # To deal with cases like this, we instantiate them both concurrently.
             with ThreadPoolExecutor(max_workers=2) as executor:
-                connector_worker_task = executor.submit(worker_cls)
+                connector_worker_task = executor.submit(worker_cls, llm_args)
 
                 if scheduler_cls is not None and rank == 0:
                     connector_scheduler_task = executor.submit(
-                        scheduler_cls, executor_config.tokens_per_block)
+                        scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
                 else:
                     connector_scheduler = None
@@ -464,17 +505,30 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(
-            executor_config=executor_config,
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
             mapping=mapping,
             net_max_seq_len=net_max_seq_len,
-            kv_connector_manager=kv_connector_manager)
+            kv_connector_manager=kv_connector_manager,
+            max_num_tokens=executor_config.max_num_tokens,
+            max_beam_width=executor_config.max_beam_width,
+            tokens_per_block=executor_config.tokens_per_block,
+            max_seq_len=executor_config.max_seq_len,
+            max_batch_size=executor_config.max_batch_size,
+            kv_cache_config=executor_config.kv_cache_config,
+            pytorch_backend_config=executor_config.pytorch_backend_config,
+            speculative_config=executor_config.speculative_config,
+        )
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
+            # Originally, executor_config.max_seq_len might be changed inside build_managers and used
+            # below in create_py_executor_instance. Since now, we are changing
+            # kv_cache_creator._max_seq_len instead, restore executor_config.max_seq_len.
+            executor_config.max_seq_len = kv_cache_creator._max_seq_len
+            update_sampler_max_seq_len(executor_config.max_seq_len, sampler)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -501,7 +555,6 @@ def create_py_executor(
             resources=resources,
             mapping=mapping,
             pytorch_backend_config=pytorch_backend_config,
-            executor_config=executor_config,
             ctx_chunk_config=ctx_chunk_config,
             model_engine=model_engine,
             start_worker=False,
@@ -513,7 +566,16 @@ def create_py_executor(
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             max_seq_len=executor_config.max_seq_len,
+            max_batch_size=executor_config.max_batch_size,
+            max_beam_width=executor_config.max_beam_width,
+            max_num_tokens=executor_config.max_num_tokens,
+            peft_cache_config=executor_config.peft_cache_config,
+            scheduler_config=executor_config.scheduler_config,
+            cache_transceiver_config=cache_transceiver_config,
         )
+        # Modify the executor_config.peft_cache_config which might be mutated
+        # inside create_py_executor_instance
+        executor_config.peft_cache_config = py_executor.peft_cache_config
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -526,10 +588,15 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
-            # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
+            # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
             # the original value before creating the final KV cache.
-            executor_config.max_seq_len = max_seq_len
+            kv_cache_creator._max_seq_len = max_seq_len
             kv_cache_creator.build_managers(resources, False)
+            # Originally, executor_config.max_seq_len might be changed again inside build_managers
+            # Since now, we are changing kv_cache_creator.max_seq_len instead.
+            # Restore executor_config.max_seq_len which has been used in create_py_executor_instance
+            executor_config.max_seq_len = kv_cache_creator._max_seq_len
+            update_sampler_max_seq_len(executor_config.max_seq_len, sampler)
 
             for eng in [model_engine, draft_model_engine]:
                 if eng is None:
@@ -546,7 +613,6 @@ def create_py_executor(
                 resources=resources,
                 mapping=mapping,
                 pytorch_backend_config=pytorch_backend_config,
-                executor_config=executor_config,
                 ctx_chunk_config=ctx_chunk_config,
                 model_engine=model_engine,
                 start_worker=False,
@@ -558,6 +624,12 @@ def create_py_executor(
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
                 max_seq_len=executor_config.max_seq_len,
+                max_batch_size=executor_config.max_batch_size,
+                max_beam_width=executor_config.max_beam_width,
+                max_num_tokens=executor_config.max_num_tokens,
+                peft_cache_config=executor_config.peft_cache_config,
+                scheduler_config=executor_config.scheduler_config,
+                cache_transceiver_config=cache_transceiver_config,
             )
 
     _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)

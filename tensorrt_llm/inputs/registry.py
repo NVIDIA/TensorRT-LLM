@@ -3,7 +3,8 @@ from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
                     TypeVar)
 
-from torch import nn
+from PIL import Image
+from torch import Tensor, nn
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
@@ -39,6 +40,142 @@ class InputProcessor(Protocol):
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         ...
+
+
+class BaseMultimodalInputProcessor:
+    """
+    Base class for multimodal input processors with default implementations
+    of get_num_tokens_per_image and get_num_tokens_per_video methods.
+
+    This class provides default implementations that work with most AutoProcessor-based
+    models. Specific processors can override these methods if they need custom logic.
+    """
+
+    def get_processor(self) -> Optional[Any]:
+        """Return the processor object if available; otherwise raise NotImplementedError.
+        """
+        if not hasattr(self, 'processor') and not hasattr(self, '_processor'):
+            raise NotImplementedError(
+                f"cannot find processor in {self.__class__.__name__}. "
+                "Please ensure the processor is stored under self.processor or self._processor."
+            )
+        return getattr(self, 'processor', getattr(self, '_processor', None))
+
+    def get_vocab_size(self) -> Optional[int]:
+        """Return the tokenizer/model vocabulary size if available; otherwise None.
+
+        Resolution order:
+        1) self.model_config.vocab_size
+        2) self.tokenizer.vocab_size
+        """
+        # 1) Model config
+        if hasattr(self, 'model_config') and getattr(
+                self.model_config, 'vocab_size', None) is not None:
+            return int(self.model_config.vocab_size)
+
+        # 2) Direct tokenizer on self
+        if hasattr(self, 'tokenizer') and getattr(self.tokenizer, 'vocab_size',
+                                                  None) is not None:
+            return int(self.tokenizer.vocab_size)
+
+        logger.warning(
+            f"Cannot determine vocab_size from {self.__class__.__name__}. "
+            "Please override this method to provide the vocabulary size. ")
+        return None
+
+    def get_mm_token_ids(self) -> Optional[Tensor]:
+        """Return multimodal token IDs if available; otherwise None.
+
+        The token IDs filtered by this method should be contiguous for each multimodal item, i.e. special tokens if any should be included.
+        """
+        processor = self.get_processor()
+        if processor is not None and getattr(processor, 'mm_token_ids',
+                                             None) is not None:
+            return processor.mm_token_ids
+
+        logger.warning(
+            f"Cannot determine mm_token_ids from {self.__class__.__name__}. "
+            "If needed, please override this method to return multimodal token ids. "
+        )
+        return None
+
+    def get_mm_special_token_ids(self) -> Optional[Tensor]:
+        """
+        Return multimodal special token IDs if available; otherwise None.
+
+        Special tokens refer to multimodal-related tokens (e.g. <image_end>, <image_break>) that are not part
+        of the ViT output but come from text embeddings. Some VLMs
+        (e.g., Mistral3, LLaMA4) mix special tokens with multimodal tokens,
+        so they need to be returned separately.
+        """
+        processor = self.get_processor()
+        return getattr(processor, "mm_special_token_ids",
+                       None) if processor else None
+
+    @property
+    def get_num_multimodal_tokens(self):
+        """
+        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        """
+        processor = self.get_processor()
+        if processor is not None and hasattr(processor,
+                                             '_get_num_multimodal_tokens'):
+            return processor._get_num_multimodal_tokens
+        else:
+            raise NotImplementedError(
+                f"get_num_multimodal_tokens not implemented for {self.__class__.__name__}. "
+                "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
+            )
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image: Image.Image,
+        **kwargs,
+    ):
+        """
+        Calculate the number of tokens generated for an image.
+
+        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        Returns the token count for the given image.
+
+        Subclasses can override this method to provide custom logic to calculate the number of tokens.
+        """
+        image_height = image.height
+        image_width = image.width
+        image_size = (image_height, image_width)
+        return self.get_num_multimodal_tokens([image_size],
+                                              **kwargs)["num_image_tokens"][0]
+
+    def get_num_tokens_per_video(
+        self,
+        *,
+        video: List[Image.Image],
+        **kwargs,
+    ):
+        """
+        Calculate the number of tokens generated for a video.
+
+        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        Returns the token count for the given video.
+
+        Subclasses can override this method to provide custom logic to calculate the number of tokens.
+        """
+        video_width = video[0].width
+        video_height = video[0].height
+        num_frames = len(video)
+        video_size = (num_frames, video_height, video_width)
+        try:
+            num_video_tokens = self.get_num_multimodal_tokens(
+                video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
+            return num_video_tokens
+        except Exception:
+            # Fallback: treat video as sequence of frames
+            num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
+                                                                 **kwargs)
+            temporal_patch_size = self.temporal_patch_size if hasattr(
+                self, 'temporal_patch_size') else 1
+            return num_tokens_per_frame * num_frames // temporal_patch_size
 
 
 class DefaultInputProcessor(InputProcessor):
@@ -327,16 +464,32 @@ def create_input_processor_with_hash(
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
         num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
+        # TODO: here we assume there is only one modality for now
+        num_mm_tokens = next(iter(num_mm_tokens.values()))
         if len(num_mm_tokens) > 0:
             mm_hashes = apply_mm_hashes(mm_data, hash_lib)
             prompt_token_ids, extra_processed_inputs = input_processor(
                 inputs, sampling_params)
-            start_positions = find_mm_token_positions(
+            vocab_size = input_processor.get_vocab_size()
+            mm_ids = input_processor.get_mm_token_ids()
+            mm_special_token_ids = input_processor.get_mm_special_token_ids()
+            if vocab_size is None and mm_ids is None:
+                raise ValueError(
+                    "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
+                )
+            start_positions, start_special_token_positions = find_mm_token_positions(
                 input_ids=prompt_token_ids,  # token sequence
                 num_mm_tokens=
                 num_mm_tokens,  # list of lengths of each chunk of visual tokens
-                vocab_size=input_processor.model_config.vocab_size,
+                vocab_size=vocab_size,
+                mm_token_ids=mm_ids,
+                mm_special_token_ids=mm_special_token_ids,
             )
+            # Store special token offsets if available
+            if len(start_special_token_positions
+                   ) > 0 and mm_special_token_ids is not None:
+                extra_processed_inputs["multimodal_data"][
+                    "special_token_offsets"] = start_special_token_positions
             # flatten the hashes from dict to a single list
             mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
             validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
@@ -358,8 +511,9 @@ def create_input_processor_with_hash(
         modalities = list(set(inputs['multi_modal_data'].keys())
                           ) if 'multi_modal_data' in inputs else []
         if len(modalities) > 0:
-            # NOTE: tensorrt_llm/inputs/multimodal.py:find_mm_token_lengths only supports image data for now
-            if len(modalities) == 1 and modalities[0] == "image":
+            # TODO: support multimodal hashing for multiple modalities within the same request
+            # TODO: add audio support
+            if len(modalities) == 1 and modalities[0] in ['image', 'video']:
                 # only try multimodal hashing if the inputs only contain image data
                 if input_processor.multimodal_hashing_supported is not None:
                     use_multimodal_hashing = input_processor.multimodal_hashing_supported

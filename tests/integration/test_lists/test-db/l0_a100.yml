@@ -15,6 +15,7 @@ l0_a100:
   tests:
     - unittest/llmapi/test_llm_pytorch.py
     - unittest/llmapi/test_mpi_session.py # generic tests
+    - unittest/trt/model_api/test_model_quantization.py
 - condition:
     ranges:
       system_gpu_count:
@@ -65,7 +66,6 @@ l0_a100:
   - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
   - accuracy/test_cli_flow.py::TestGpt2::test_weight_only[int8] # 1 min
   - unittest/trt/model_api/test_model_level_api.py
-  - unittest/trt/model_api/test_model_quantization.py
   - unittest/trt/model_api/test_model_api_multi_gpu.py
   - unittest/trt/model/test_gpt_e2e.py
   - unittest/trt/model/eagle
@@ -107,3 +107,17 @@ l0_a100:
   - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-max_utilization---1-1-1-False-tensorrt_llm_bls]
   - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-guaranteed_no_evict---1-1-1-False-ensemble]
   - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: fmha
+  tests:
+  - test_fmha.py::test_fmha

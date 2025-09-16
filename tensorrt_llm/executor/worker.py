@@ -18,8 +18,7 @@ from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import (BaseLlmArgs, KvCacheConnectorConfig,
-                               PybindMirror, TorchLlmArgs)
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig, PybindMirror
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
@@ -86,7 +85,9 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(
             self)  # TODO: make it weakref
         self._executor_config = executor_config
-        self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
+            "pytorch", "_autodeploy"
+        ]
         self.llm_args = llm_args
 
         if not self._is_pytorch_backend and kv_connector_config is not None:
@@ -113,6 +114,7 @@ class GenerationExecutorWorker(GenerationExecutor):
             assert hasattr(
                 self.llm_args, "backend"
             ), "llm_args should be with backend in _create_py_executor"
+            _ = _get_comm_ranks_device_id()
             if self.llm_args.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
@@ -122,13 +124,6 @@ class GenerationExecutorWorker(GenerationExecutor):
                 args["tokenizer"] = tokenizer
                 args["lora_config"] = lora_config
                 args["kv_connector_config"] = kv_connector_config
-                args[
-                    "logits_post_processor_config"] = tllm.LogitsPostProcessorConfig(
-                        processor_batched=batched_logits_processor,
-                        replicate=False)
-                comm_ranks, device_ids = _get_comm_ranks_device_id()
-                args["parallel_config"] = tllm.ParallelConfig(
-                    participant_ids=comm_ranks, device_ids=device_ids)
             elif self.llm_args.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs
@@ -474,7 +469,6 @@ class GenerationExecutorWorker(GenerationExecutor):
                 )
 
         if self._is_pytorch_backend:
-            assert isinstance(self.llm_args, TorchLlmArgs)
             if not self.llm_args.disable_overlap_scheduler:
                 is_disaggregated = self.engine.kv_cache_transceiver is not None
                 if is_disaggregated and (
@@ -578,7 +572,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
-                type=request_type)
+                type=request_type,
+                cache_salt_id=request.cache_salt_id)
             executor_request.py_lora_path = py_lora_path
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
@@ -597,6 +592,9 @@ class GenerationExecutorWorker(GenerationExecutor):
             executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
+
+            if request.arrival_time is not None:
+                executor_request.py_arrival_time = request.arrival_time
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow

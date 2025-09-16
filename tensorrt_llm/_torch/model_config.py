@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, TypeVar
@@ -82,12 +83,27 @@ def config_file_lock(timeout: int = 10):
     try:
         with lock:
             yield
-    except filelock.Timeout:
-        logger.warning(
-            f"Failed to acquire config lock within {timeout} seconds, proceeding without lock"
-        )
-        # Fallback: proceed without locking to avoid blocking indefinitely
-        yield
+    except (PermissionError, filelock.Timeout):
+        # Fallback to tempdir
+        tmp_dir = Path(tempfile.gettempdir())
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_lock_path = tmp_dir / "_remote_code.lock"
+        tmp_lock = filelock.FileLock(str(tmp_lock_path), timeout=timeout)
+        try:
+            with tmp_lock:
+                yield
+        except filelock.Timeout:
+            logger.warning(
+                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
+            )
+            # proceed without lock
+            yield
+        except (PermissionError) as e:
+            logger.warning(
+                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
+            )
+            # proceed without lock
+            yield
 
 
 @dataclass(kw_only=True)
@@ -494,7 +510,8 @@ class ModelConfig(Generic[TConfig]):
                 architectures = self.pretrained_config.architectures
                 if len(architectures
                        ) == 1 and architectures[0] == "DeciLMForCausalLM":
-                    mlp_hidden_size = self._infer_nemotron_ffn_mult()
+                    mlp_hidden_size = self._infer_nemotron_ffn_mult(
+                    ) // self.mapping.tp_size
                 else:
                     raise ValueError(
                         f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"

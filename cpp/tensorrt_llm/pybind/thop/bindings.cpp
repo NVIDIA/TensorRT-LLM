@@ -48,11 +48,13 @@ void initBindings(pybind11::module_& m)
         py::arg("q_scaling"), py::arg("position_embedding_type"), py::arg("rotary_embedding_dim"),
         py::arg("rotary_embedding_base"), py::arg("rotary_embedding_scale_type"), py::arg("rotary_embedding_scales"),
         py::arg("rotary_embedding_max_position_info"), py::arg("use_paged_context_fmha"),
-        py::arg("attention_input_type") = std::nullopt, py::arg("is_mla_enable"), py::arg("q_lora_rank") = std::nullopt,
+        py::arg("attention_input_type") = std::nullopt, py::arg("is_mla_enable"),
+        py::arg("chunked_prefill_buffer_batch_size") = std::nullopt, py::arg("q_lora_rank") = std::nullopt,
         py::arg("kv_lora_rank") = std::nullopt, py::arg("qk_nope_head_dim") = std::nullopt,
         py::arg("qk_rope_head_dim") = std::nullopt, py::arg("v_head_dim") = std::nullopt,
         py::arg("mrope_rotary_cos_sin") = std::nullopt, py::arg("mrope_position_deltas") = std::nullopt,
         py::arg("attention_chunk_size") = std::nullopt, py::arg("softmax_stats_tensor") = std::nullopt,
-        py::arg("spec_decoding_bool_params"), py::arg("spec_decoding_tensor_params"), "Multi-head attention operation");
+        py::arg("spec_decoding_bool_params"), py::arg("spec_decoding_tensor_params"), "Multi-head attention operation",
+        py::call_guard<py::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::pybind::thop

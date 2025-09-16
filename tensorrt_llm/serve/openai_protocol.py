@@ -19,7 +19,8 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -497,7 +498,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[int] = None
+    logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_completion_tokens: Optional[int] = Field(default=None,
                                                  validation_alias='max_tokens')
@@ -592,10 +593,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
+    cache_salt: Optional[str] = Field(
+        default=None,
+        description=
+        ("If specified, KV cache will be salted with the provided string "
+         "to limit the kv cache reuse on with the requests having the same string."
+         ))
+
     # doc: end-chat-completion-extra-params
 
-    def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
-
+    def to_sampling_params(self,
+                           vocab_size: int = 32000,
+                           gather_generation_logits: bool = False,
+                           backend: Optional[str] = None) -> SamplingParams:
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
             max_tokens=self.max_completion_tokens,
@@ -631,10 +641,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
-
-            # TODO: migrate to use logprobs and prompt_logprobs
-            _return_log_probs=bool(self.logprobs),
         )
+        if self.logprobs:
+            logprobs = 1 if not self.top_logprobs else self.top_logprobs
+            if backend == "pytorch":
+                sampling_params.logprobs = logprobs
+            else:
+                if gather_generation_logits:
+                    sampling_params.logprobs = logprobs
+                elif self.top_logprobs:
+                    raise ValueError(
+                        "`gather_generation_logits` must be `True` to use `top_logprobs`"
+                    )
+                else:
+                    sampling_params._return_log_probs = True
         return sampling_params
 
     @model_validator(mode='before')
@@ -659,9 +679,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        top_logprobs = data.get("top_logprobs")
-        if top_logprobs is not None and top_logprobs > 0:
-            raise ValueError("top_logprobs is not supported")
+        if (top_logprobs := data.get("top_logprobs")) is not None:
+            if top_logprobs < 0:
+                raise ValueError("top_logprobs must be positive or zero")
+            if not data.get("logprobs"):
+                raise ValueError(
+                    "logprobs must be true when using top_logprobs")
         return data
 
     @model_validator(mode="before")
@@ -670,6 +693,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
         return data
+
+    @field_validator("cache_salt")
+    @classmethod
+    def check_cache_salt_support(cls, v):
+        if v is not None:
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError(
+                    "Parameter 'cache_salt' must be a non-empty string if provided."
+                )
+        return v
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,

@@ -32,8 +32,8 @@ from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
                      prune_checkpoint, quantize_data, refit_model,
                      venv_check_call)
 from .conftest import (llm_models_root, skip_no_sm120, skip_nvlink_inactive,
-                       skip_post_blackwell, skip_pre_blackwell, skip_pre_hopper,
-                       tests_path, unittest_path)
+                       skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
+                       skip_pre_hopper, tests_path, unittest_path)
 
 sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
@@ -1549,12 +1549,38 @@ def test_trtllm_serve_lora_example(llm_root, llm_venv):
 
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
+def test_trtllm_serve_top_logprobs(llm_root, llm_venv, backend: str):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_top_logprobs.py"), "-k", backend
+    ])
+
+
+@pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_misc_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_openai_misc.py"), "-k", backend
     ])
+
+
+def test_openai_cache_salt(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_cache_salt.py")])
 
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
@@ -1709,11 +1735,16 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-def test_trtllm_benchmark_serving(llm_root, llm_venv):
+@pytest.mark.parametrize(
+    "model_name", ["llama-3.1-model/Meta-Llama-3.1-8B", "gpt_oss/gpt-oss-20b"])
+def test_trtllm_benchmark_serving(llm_venv, model_name):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_trtllm_serve_benchmark.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root /
+            f"_test_trtllm_serve_benchmark.py::test_trtllm_serve_benchmark[{model_name}]"
+            )
+    ])
 
 
 def test_build_time_benchmark_sanity(llm_root, llm_venv):
@@ -1743,7 +1774,7 @@ def parse_output(text):
     for item in text_lists:
         item = item.replace(os.linesep, "")
         while True:
-            match = re.search(r"(Generated text: \'(.*?)\')", item,
+            match = re.search(r'Generated text: ([\'"])(.*?)\1', item,
                               re.MULTILINE)
             if match is None:
                 break
@@ -2071,6 +2102,9 @@ def test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance(
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param(
         'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
+    pytest.param('DeepSeek-R1-0528-FP4',
+                 'DeepSeek-R1/DeepSeek-R1-0528-FP4',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
                                                    model_name, model_path):
@@ -2138,6 +2172,40 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         ],
                          stdout=running_log)
         _check_mem_usage(running_log, [85.6, 0, 0, 0], 8)
+
+
+@skip_pre_ada
+@skip_post_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param('DeepSeek-R1-W4AFP8',
+                 'DeepSeek-R1/DeepSeek-R1-W4AFP8',
+                 marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--moe_tp_size=1",
+            "--moe_ep_size=8",
+            "--tp_size=8",
+            "--use_cuda_graph",
+            f"--kv_cache_fraction={_MEM_FRACTION_50}",
+            "--max_batch_size=1",
+            "--max_seq_len=512",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [50.0, 0, 0, 0], 8)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -2284,7 +2352,8 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                  marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param("gemma-3-27b-it",
                  "gemma/gemma-3-27b-it",
-                 marks=pytest.mark.skip_less_device_memory(80000)),
+                 marks=(pytest.mark.skip_less_device_memory(80000),
+                        skip_post_blackwell)),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
@@ -2392,9 +2461,9 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "gemma-3-27b-it": {
             "image": [
-                ["dramatic", "turbulent", "waves", "ocean", "overcast"],
-                ["half", "dome", "yosemite", "landmark", "rounded"],
-                ["flowing", "traffic", "vehicles", "road", "Changi"],
+                ["natural", "turbulent", "dramatic", "scene", "wave"],
+                ["image", "famous", "rock", "granite", "landmark"],
+                ["traffic", "moderate", "heavy", "flowing", "cars"],
             ],
         },
     }
@@ -2409,6 +2478,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
+        # TODO: remove this once kv cache reuse is supported for all VLM models
+        "--disable_kv_cache_reuse",
     ]
     # NOTE: Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens for video.
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
@@ -2494,6 +2565,204 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             _check_mem_usage(running_log, [peak, 0, 0, 0])
 
 
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("model_name,model_path", [
+    ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
+    ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
+])
+def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
+                                                  model_name, model_path,
+                                                  modality):
+    # NOTE: individual tests need to be enabled in
+    # tests/integration/test_lists/qa/examples_test_list.txt
+
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
+    if modality == "video" and model_name == "llava-v1.6-mistral-7b":
+        pytest.skip("Skipping video modality test for llava-v1.6-mistral-7b")
+
+    num_same_requests = 3  # test kv cache reuse with multiple same requests
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe the natural environment in the image.",
+            ] * num_same_requests,
+            "media": [
+                str(test_data_root / "seashore.png"),
+            ] * num_same_requests,
+        },
+        "video": {
+            "prompt": [
+                "Tell me what you see in the video briefly.",
+            ] * num_same_requests,
+            "media": [
+                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+            ] * num_same_requests,
+        },
+    }
+
+    expected_keywords = {
+        "llava-v1.6-mistral-7b": {
+            "image": [
+                ["ocean", "sky", "large", "waves", "shore", "blue"],
+            ] * num_same_requests,
+        },
+        "qwen2.5-vl-7b-instruct": {
+            "image": [
+                ["dramatic", "moody", "ocean", "stormy", "sky", "waves"],
+            ] * num_same_requests,
+            "video": [
+                ["woman", "neon", "night", "jacket", "wet"],
+            ] * num_same_requests,
+        },
+    }
+
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        modality,
+        "--prompt",
+        *accuracy_inputs[modality]["prompt"],
+        "--media",
+        *accuracy_inputs[modality]["media"],
+        "--max_batch_size",  # single request at a time to test kv cache reuse
+        "1",
+    ]
+    # NOTE: Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens for video.
+    if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
+                      ] and modality == "video":
+        cmd.append("--max_num_tokens=16384")
+
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+    match_ratio = 4.0 / 5
+    for prompt_output, prompt_keywords in zip(
+            parse_output(output), expected_keywords[model_name][modality]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        print(
+            f"Prompt output: {prompt_output}\nExpected keywords: {prompt_keywords}\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} given threshold {match_ratio}"
+        )
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+    # TODO: Setting max_batch_size=1 and repeating the same request helps test KV cache reuse indirectly,
+    # but does not directly measure the KV cache hit rate. For a more direct test, we would need to enable
+    # return_perf_metrics=True, which is not currently supported by the quickstart example CLI.
+    print("All answers are correct!")
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("model_name,model_path", [
+    ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
+    ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
+])
+def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
+                                                   model_name, model_path,
+                                                   modality):
+    # NOTE: individual tests need to be enabled in
+    # tests/integration/test_lists/qa/examples_test_list.txt
+
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
+    if modality == "video" and model_name == "llava-v1.6-mistral-7b":
+        pytest.skip("Skipping video modality test for llava-v1.6-mistral-7b")
+
+    num_same_requests = 3  # test kv cache reuse with multiple same requests
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe the natural environment in the image.",
+                "Describe the object and the weather condition in the image.",
+                "Describe the traffic condition on the road in the image.",
+            ],
+            "media": [
+                str(test_data_root / "seashore.png"),
+                str(test_data_root / "inpaint.png"),
+                str(test_data_root / "61.jpg"),
+            ],
+        },
+        "video": {
+            "prompt": [
+                "Tell me what you see in the video briefly.",
+                "Describe the scene in the video briefly.",
+            ],
+            "media": [
+                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+                str(test_data_root / "world.mp4"),
+            ],
+        },
+    }
+
+    expected_keywords = {
+        "llava-v1.6-mistral-7b": {
+            "image": [
+                ["ocean", "sky", "large", "waves", "shore", "blue"],
+                ['mountain', 'flat', 'clouds', 'road', 'sky'],
+                ["highway", "vehicles", "traffic", "bus", "suburban"],
+            ],
+        },
+        "qwen2-vl-7b-instruct": {
+            "image": [
+                ["ocean", "waves", "atmosphere", "stormy", "clouds", "intense"],
+                ["trees", "winding", "road", "sunny", "sky", "atmosphere"],
+                ["traffic", "vehicles", "moderate", "lanes", "road", "cars"],
+            ],
+            "video": [
+                ["city", "night", "lights", "jacket", "wet"],
+                ["earth", "spinning", "black"],
+            ],
+        },
+        "qwen2.5-vl-7b-instruct": {
+            "image": [
+                ["dramatic", "moody", "ocean", "stormy", "sky", "waves"],
+                ["large", "dome", "yosemite", "landmark", "rock", "road"],
+                [
+                    "highway", "traffic", "vehicles", "lanes", "congestion",
+                    "road"
+                ],
+            ],
+            "video": [
+                ["woman", "neon", "night", "jacket", "wet"],
+                ["earth", "world", "night", "lights", "cities"],
+            ],
+        },
+    }
+
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        modality,
+        "--prompt",
+        *accuracy_inputs[modality]["prompt"],
+        "--media",
+        *accuracy_inputs[modality]["media"],
+        "--enable_chunked_prefill",
+        "--max_num_tokens=256",
+    ]
+
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+    match_ratio = 4.0 / 5
+    for prompt_output, prompt_keywords in zip(
+            parse_output(output), expected_keywords[model_name][modality]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        print(
+            f"Prompt output: {prompt_output}\nExpected keywords: {prompt_keywords}\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} given threshold {match_ratio}"
+        )
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+    print("All answers are correct!")
+
+
 @pytest.mark.parametrize("modality", ["image", "audio", "image_audio"])
 def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     model_name = "Phi-4-multimodal-instruct"
@@ -2567,6 +2836,8 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         "--load_lora",
         "--auto_model_name",
         "Phi4MMForCausalLM",
+        # TODO: remove this once kv cache reuse is supported for Phi-4-multimodal
+        "--disable_kv_cache_reuse",
     ]
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
@@ -2585,7 +2856,8 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
-    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
+    pytest.param(
+        "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
     ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
 ])
@@ -2630,8 +2902,8 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
         },
         "Phi-4-multimodal-instruct": {
             "image": [
-                ["image", "depicts", "mountain", "half", "rock"],
-                ["road", "car", "lane", "traffic", "bus"],
+                ["object", "mountain", "weather", "clear", "clouds"],
+                ["traffic", "road", "vehicles", "cars", "bus"],
             ],
         },
     }
@@ -2659,12 +2931,19 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
         cmd.append("--image_format=pil")
         cmd.append("--attention_backend=FLASHINFER")
         cmd.append("--disable_kv_cache_reuse")
+        cmd.append("--kv_cache_fraction=0.5")
+        cmd.append("--max_seq_len=1024")
     elif model_name == "Phi-4-multimodal-instruct":
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
         cmd.append("--auto_model_name")
+        # TODO: remove this once kv cache reuse is supported for Phi-4-multimodal
+        cmd.append("--disable_kv_cache_reuse")
         cmd.append("Phi4MMForCausalLM")
+    elif model_name == "mistral-small-3.1-24b-instruct":
+        # TODO: remove this once kv cache reuse is supported for Mistral
+        cmd.append("--disable_kv_cache_reuse")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
@@ -2687,9 +2966,10 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
-    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
     ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+    pytest.param(
+        "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
 ])
 def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
                                              model_path):
@@ -2755,12 +3035,21 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         cmd.append("--image_format=pil")
         cmd.append("--attention_backend=FLASHINFER")
         cmd.append("--disable_kv_cache_reuse")
+        cmd.append("--kv_cache_fraction=0.5")
+        cmd.append("--max_seq_len=1024")
+
     elif model_name == "Phi-4-multimodal-instruct":
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
         cmd.append("--load_lora")
         cmd.append("--auto_model_name")
         cmd.append("Phi4MMForCausalLM")
+        # TODO: remove this once kv cache reuse is supported for Phi-4
+        cmd.append("--disable_kv_cache_reuse")
+
+    elif model_name == "mistral-small-3.1-24b-instruct":
+        # TODO: remove this once kv cache reuse is supported for Mistral
+        cmd.append("--disable_kv_cache_reuse")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
     print("output:", output)

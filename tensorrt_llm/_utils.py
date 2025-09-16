@@ -691,6 +691,13 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+@lru_cache(maxsize=1)
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 100 or sm_version == 103
+
+
 def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":
@@ -929,11 +936,13 @@ class TensorWrapper:
         data_ptr: int,
         dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
         shape: Sequence[int],
+        strides: Optional[Sequence[int]] = None,
     ):
         assert isinstance(data_ptr, int)
         self._data_ptr = data_ptr
         self.dtype = dtype
         self.shape = shape
+        self.strides = strides
 
     def data_ptr(self):
         return self._data_ptr
@@ -969,10 +978,17 @@ class TensorWrapper:
     @property
     def __cuda_array_interface__(self):
         return {
-            "shape": self.shape,
-            "typestr": torch_dtype_to_np_typestr(self.dtype),
+            "shape":
+            self.shape,
+            "typestr":
+            torch_dtype_to_np_typestr(self.dtype),
             "data": (self.data_ptr() if self.numel() > 0 else 0, False),
-            "version": 3,
+            "strides": [
+                i * torch.tensor([], dtype=self.dtype).element_size()
+                for i in self.strides
+            ] if self.strides is not None else None,
+            "version":
+            3,
         }
 
     @staticmethod
