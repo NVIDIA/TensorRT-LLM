@@ -168,8 +168,8 @@ public:
         if (op.isMLAEnabled())
         {
             TORCH_CHECK(mla_tensor_params.size() == 1,
-            "Expecting 3 tensors for custom MLA tensor params: context_paged_kv, "
-            "context_kv_cache_block_offsets, helix_position_offsets.");
+                "Expecting 3 tensors for custom MLA tensor params: context_paged_kv, "
+                "context_kv_cache_block_offsets, helix_position_offsets.");
             if (is_context)
             {
                 if (latent_cache.has_value())
