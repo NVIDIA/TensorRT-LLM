@@ -8,6 +8,6 @@
 | LLaVA-NeXT         | Yes        | Yes                 | Yes            | Yes             |
 | Llama 4            | Yes        | Yes                 | No             | No              |
 | Mistral-Small-3.1  | Yes        | Yes                 | No             | No              |
-| Phi-4-multimodal   | Yes        | Yes                 | Yes            | No              |
+| Phi-4-multimodal   | Yes        | Yes                 | No             | No              |
 | Qwen2-VL           | Yes        | Yes                 | Yes            | Yes             |
 | Qwen2.5-VL         | Yes        | Yes                 | Yes            | Yes             |
