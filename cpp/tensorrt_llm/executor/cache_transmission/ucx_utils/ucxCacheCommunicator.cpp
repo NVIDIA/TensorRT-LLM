@@ -75,27 +75,29 @@ public:
 
 std::string getLocalIpByNic(std::string const& interface)
 {
-    struct ifaddrs* ifaddr;
+    struct ifaddrs* ifaddr = nullptr;
     if (getifaddrs(&ifaddr) == -1)
     {
         TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
             "getLocalIpByNic: Can't get local ip from NIC Interface. Please check whether TRTLLM_UCX_INTERFACE is set "
             "correctly.");
-        return std::string("UNKNOWN IP");
+        return std::string{};
     }
 
     for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
     {
         if (ifa->ifa_addr == nullptr)
+        {
             continue;
+        }
 
         if (ifa->ifa_name == interface)
         {
             if (ifa->ifa_addr->sa_family == AF_INET)
             {
-                char ip[INET_ADDRSTRLEN];
-                void* addr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
-                if (inet_ntop(AF_INET, addr, ip, sizeof(ip)) && std::strcmp(ip, "0.0.0.0") != 0)
+                char ip[INET_ADDRSTRLEN]{};
+                void* addr = &((reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr))->sin_addr);
+                if ((inet_ntop(AF_INET, addr, ip, sizeof(ip)) != nullptr) && std::strcmp(ip, "0.0.0.0") != 0)
                 {
                     freeifaddrs(ifaddr);
                     return std::string(ip);
@@ -103,9 +105,9 @@ std::string getLocalIpByNic(std::string const& interface)
             }
             else if (ifa->ifa_addr->sa_family == AF_INET6)
             {
-                char ip[INET6_ADDRSTRLEN];
-                void* addr = &((struct sockaddr_in6*) ifa->ifa_addr)->sin6_addr;
-                if (inet_ntop(AF_INET6, addr, ip, sizeof(ip)) && std::strncmp(ip, "fe80::", 6) != 0
+                char ip[INET6_ADDRSTRLEN]{};
+                void* addr = &((reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr))->sin6_addr);
+                if ((inet_ntop(AF_INET6, addr, ip, sizeof(ip)) != nullptr) && std::strncmp(ip, "fe80::", 6) != 0
                     && std::strcmp(ip, "::1") != 0)
                 {
                     freeifaddrs(ifaddr);
@@ -118,16 +120,16 @@ std::string getLocalIpByNic(std::string const& interface)
     freeifaddrs(ifaddr);
     TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
         "Can't get local ip from NIC Interface. Please check whether TRTLLM_UCX_INTERFACE is set correctly.");
-    return std::string("UNKNOWN IP");
+    return std::string{};
 }
 
 std::string getLocalIpByHostname()
 {
-    char hostname[256];
+    char hostname[256]{};
     if (gethostname(hostname, sizeof(hostname)) == -1)
     {
         TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(), "getLocalIpByHostname: Can't get hostname");
-        return std::string("UNKNOWN IP");
+        return std::string{};
     }
 
     struct addrinfo hints = {};
@@ -135,23 +137,22 @@ std::string getLocalIpByHostname()
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_CANONNAME;
 
-    struct addrinfo* res;
+    struct addrinfo* res = nullptr;
     if (getaddrinfo(hostname, nullptr, &hints, &res) != 0)
     {
         TLLM_LOG_WARNING(mpi::MpiComm::world().getRank(), "getLocalIpByHostname: Can't get address info for hostname");
-        return std::string("UNKNOWN IP");
+        return std::string{};
     }
 
     for (struct addrinfo* p = res; p != nullptr; p = p->ai_next)
     {
-        void* addr;
-        char ip[INET6_ADDRSTRLEN];
 
         if (p->ai_family == AF_INET)
         { // IPv4
-            struct sockaddr_in* ipv4 = (struct sockaddr_in*) p->ai_addr;
-            addr = &(ipv4->sin_addr);
-            if (inet_ntop(AF_INET, addr, ip, sizeof(ip)) && std::strcmp(ip, "127.0.0.1") != 0
+            char ip[INET_ADDRSTRLEN]{};
+            struct sockaddr_in* ipv4 = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
+            void* addr = &(ipv4->sin_addr);
+            if ((inet_ntop(AF_INET, addr, ip, sizeof(ip)) != nullptr) && std::strcmp(ip, "127.0.0.1") != 0
                 && std::strcmp(ip, "0.0.0.0") != 0)
             {
                 freeaddrinfo(res);
@@ -160,9 +161,10 @@ std::string getLocalIpByHostname()
         }
         else if (p->ai_family == AF_INET6)
         { // IPv6
-            struct sockaddr_in6* ipv6 = (struct sockaddr_in6*) p->ai_addr;
-            addr = &(ipv6->sin6_addr);
-            if (inet_ntop(AF_INET6, addr, ip, sizeof(ip)) && std::strncmp(ip, "fe80::", 6) != 0
+            char ip[INET6_ADDRSTRLEN]{};
+            struct sockaddr_in6* ipv6 = reinterpret_cast<struct sockaddr_in6*>(p->ai_addr);
+            void* addr = &(ipv6->sin6_addr);
+            if ((inet_ntop(AF_INET6, addr, ip, sizeof(ip)) != nullptr) && std::strncmp(ip, "fe80::", 6) != 0
                 && std::strcmp(ip, "::1") != 0)
             {
                 freeaddrinfo(res);
@@ -173,27 +175,32 @@ std::string getLocalIpByHostname()
 
     freeaddrinfo(res);
     TLLM_LOG_WARNING(mpi::MpiComm::world().getRank(), "getLocalIpByHostname: Can't get local ip from hostname");
-    return std::string("UNKNOWN IP");
+    return std::string{};
 }
 
 std::string getLocalIpByRemoteOrHostName()
 {
-    char ip[INET6_ADDRSTRLEN];
 
     // Try IPv4
-    struct sockaddr_in addr;
+    struct sockaddr_in addr
+    {
+    };
+
     addr.sin_family = AF_INET;
     addr.sin_port = htons(80);
-    inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr);
+    // using google's public dns server to get the local ip which can be accessed from remote
+    char const* dns_ip_v4 = "8.8.8.8";
+    inet_pton(AF_INET, dns_ip_v4, &addr.sin_addr);
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock != -1)
     {
-        if (connect(sock, (struct sockaddr*) &addr, sizeof(addr)) != -1)
+        if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != -1)
         {
             socklen_t addr_len = sizeof(addr);
-            if (getsockname(sock, (struct sockaddr*) &addr, &addr_len) != -1)
+            if (getsockname(sock, reinterpret_cast<struct sockaddr*>(&addr), &addr_len) != -1)
             {
+                char ip[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
                 close(sock);
                 return std::string(ip);
@@ -203,19 +210,25 @@ std::string getLocalIpByRemoteOrHostName()
     }
 
     // Try IPv6
-    struct sockaddr_in6 addr6;
+    struct sockaddr_in6 addr6
+    {
+    };
+
     addr6.sin6_family = AF_INET6;
     addr6.sin6_port = htons(80);
-    inet_pton(AF_INET6, "2001:4860:4860::8888", &addr6.sin6_addr);
+    // using google's public dns server
+    char const* dns_ipv6 = "2001:4860:4860::8888";
+    inet_pton(AF_INET6, dns_ipv6, &addr6.sin6_addr);
 
     sock = socket(AF_INET6, SOCK_DGRAM, 0);
     if (sock != -1)
     {
-        if (connect(sock, (struct sockaddr*) &addr6, sizeof(addr6)) != -1)
+        if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr6), sizeof(addr6)) != -1)
         {
             socklen_t addr_len = sizeof(addr6);
-            if (getsockname(sock, (struct sockaddr*) &addr6, &addr_len) != -1)
+            if (getsockname(sock, reinterpret_cast<struct sockaddr*>(&addr6), &addr_len) != -1)
             {
+                char ip[INET6_ADDRSTRLEN]{};
                 inet_ntop(AF_INET6, &addr6.sin6_addr, ip, sizeof(ip));
                 close(sock);
                 return std::string(ip);
@@ -231,17 +244,17 @@ std::string getLocalIpByRemoteOrHostName()
 static std::string getLocalIp()
 {
     std::string ucxInterface = common::getEnvUCXInterface();
-    std::string localIP = "UNKNOWN IP";
+    std::string localIP = {};
     if (!ucxInterface.empty())
     {
         localIP = getLocalIpByNic(ucxInterface);
     }
-    else
+    if (localIP.empty())
     {
         localIP = getLocalIpByRemoteOrHostName();
     }
     // check whether the localIP is valid
-    if (localIP == "UNKNOWN IP")
+    if (localIP.empty())
     {
         TLLM_THROW("getLocalIp: Can't get local ip");
     }
