@@ -30,12 +30,9 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
-                                                   CutlassFusedMoE,
-                                                   DefaultMoeRoutingMethod,
-                                                   RenormalizeMoeRoutingMethod,
-                                                   TritonFusedMoE, VanillaMoE,
-                                                   create_moe, WideEPMoE)
+from tensorrt_llm._torch.modules.fused_moe import (
+    BaseMoeRoutingMethod, CutlassFusedMoE, DefaultMoeRoutingMethod,
+    RenormalizeMoeRoutingMethod, TritonFusedMoE, create_moe, WideEPMoE)
 # isort: on
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
@@ -76,8 +73,10 @@ def test_fused_moe(moe_backend,
     if bias and moe_backend not in ["TRITON"]:
         pytest.skip("Bias not supported.")
 
-    mapping = Mapping()
+    mapping = mapping or Mapping()
     mapping.rank = mpi_rank()
+
+    torch.cuda.set_device(mapping.rank)
 
     with torch.device(f'cuda:{mapping.rank}'):
         SEQ_LEN = 8
@@ -165,18 +164,19 @@ def test_fused_moe(moe_backend,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
-@pytest.mark.parametrize("moe_cls", [CutlassFusedMoE, VanillaMoE])
+@pytest.mark.parametrize("moe_cls", ["CUTLASS", "VANILLA"])
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 def test_fused_moe_multi_gpu(moe_cls, ep_size):
     world_size = 4
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
             test_fused_moe,
-            *zip(*[(moe_cls, torch.bfloat16, 512, DefaultMoeRoutingMethod,
-                    Mapping(world_size=world_size,
-                            tp_size=world_size,
-                            moe_ep_size=ep_size,
-                            moe_tp_size=world_size // ep_size))] * world_size),
+            *zip(
+                *[(moe_cls, torch.bfloat16, 512, DefaultMoeRoutingMethod, False,
+                   Mapping(world_size=world_size,
+                           tp_size=world_size,
+                           moe_ep_size=ep_size,
+                           moe_tp_size=world_size // ep_size))] * world_size),
         )
         for r in results:
             assert r is None
@@ -273,6 +273,10 @@ def test_fused_moe_alltoall(alltoall_method_type):
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=False)
 
+            if alltoall_method_type == AlltoallMethodType.MNNVL and output.ndim == 3:
+                output = output.sum(dim=1)
+            print(f"output: {output.shape}")
+            print(f"ref_output: {ref_output.shape}")
             # Evaluate outputs
             torch.testing.assert_close(output,
                                        ref_output,
