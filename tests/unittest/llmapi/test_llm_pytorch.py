@@ -1,3 +1,4 @@
+import datetime
 import random
 from contextlib import contextmanager, nullcontext
 
@@ -5,7 +6,7 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutorWorker
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig, KvCacheRetentionConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
@@ -261,6 +262,20 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
                      sampling_params=sampling_params,
                      backend="pytorch",
                      enable_mixed_sampler=enable_mixed_sampler)
+
+
+@pytest.mark.part0
+def test_llm_with_kv_cache_retention_config():
+    kv_cache_retention_config = KvCacheRetentionConfig([
+        KvCacheRetentionConfig.TokenRangeRetentionConfig(
+            0, 2, 30, datetime.timedelta(seconds=30))
+    ], 80)
+
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+
+    for output in llm.generate(
+            prompts, kv_cache_retention_config=kv_cache_retention_config):
+        print(output)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
