@@ -65,13 +65,13 @@ class KvCacheCreator:
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
+        self._max_seq_len = max_seq_len
         self._dummy_reqs = self._create_dummy_context_requests(net_max_seq_len -
                                                                1)
         self._kv_connector_manager = kv_connector_manager
         self._pytorch_backend_config = pytorch_backend_config
         self._speculative_config = speculative_config
         self._tokens_per_block = tokens_per_block
-        self._max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._profiling_stage_data = profiling_stage_data
 
@@ -175,8 +175,11 @@ class KvCacheCreator:
         max_num_tokens = len(prompt_token_ids)
         remaining_tokens = max(max_num_tokens, input_seq_len)
         if remaining_tokens > input_seq_len:
-            logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len." \
-                           f"Multimedia prompt has {remaining_tokens} while the input_seq_len is: {input_seq_len}")
+            logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len. " \
+                           f"Multimodal prompt has {remaining_tokens} while the input_seq_len is: {input_seq_len}")
+        ## add + 1 to avoid error: RuntimeError: The max KV cache length of input sequences (X + 1) exceeds the KV cache manager's maximum supported length X.
+        ## at line "/code/tensorrt_llm/tensorrt_llm/_torch/attention_backend/trtllm.py", line 837
+        self._max_seq_len = remaining_tokens + 1
         while remaining_tokens > 0:
             req_mm_input = trtllm.MultimodalInput(
                 multimodal_hashes=multimodal_input.multimodal_hashes,
