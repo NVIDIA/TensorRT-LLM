@@ -393,7 +393,6 @@ class MTPDraftModel(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.layers(
@@ -403,7 +402,6 @@ class MTPDraftModel(nn.Module):
             embed_tokens=self.embed_tokens,
             attn_metadata=attn_metadata,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
         )
 
         return hidden_states
@@ -458,7 +456,6 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
             **kwargs)
         return self.logits_processor.forward(
             output,

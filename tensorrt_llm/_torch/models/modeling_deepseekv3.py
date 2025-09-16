@@ -395,8 +395,7 @@ class DeepseekV3WeightLoader:
                             p.data.copy_(module_weights[n][:])
 
                 if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-                ) and is_sm_100f() and hasattr(
-                        module, "weight_scale"):
+                ) and is_sm_100f() and hasattr(module, "weight_scale"):
                     weight, weight_scale = resmooth_to_fp8_e8m0(
                         module.weight, module.weight_scale)
                     transfromed_scale = transform_sf_into_required_layout(
@@ -805,8 +804,9 @@ class Deepseekv3MoE(nn.Module):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
-    def _compute_shared_expert_tp_size(self, intermediate_size: int,
-                                       block_size: int) -> int:
+    def _compute_shared_expert_tp_size(
+            self, intermediate_size: int,
+            block_size: int) -> tuple[int, float | None]:
         """
         In the case of Deepseek-R1, the TP size of MLP is capped by intermediate_size // block_size.
         For example, when the intermediate_size is 2048 and block scaling size is 128,
@@ -818,7 +818,9 @@ class Deepseekv3MoE(nn.Module):
                 it's 128. For NVFP4, it's 16.
 
         Returns:
-            int: The computed tp_size.
+            tuple[int, float | None]: A tuple containing (shared_tp_size, shared_output_scale).
+                - shared_tp_size: The computed TP size.
+                - shared_output_scale: The output scale factor, or None if not needed.
         """
 
         assert intermediate_size % block_size == 0, "intermediate_size must be divisible by block_size."
