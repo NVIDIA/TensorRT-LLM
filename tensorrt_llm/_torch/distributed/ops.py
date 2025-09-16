@@ -230,26 +230,24 @@ def allgather(
 
 
 def alltoall(
-    inputs: Union[torch.Tensor, List[torch.Tensor]],
+    inputs: List[torch.Tensor],
     group: List[int],
-    dims: Union[int, List[int]] = -1,
-    new_dims: Union[Optional[int], List[Optional[int]]] = None,
-) -> Union[torch.Tensor, List[torch.Tensor]]:
+) -> List[torch.Tensor]:
     '''
-    Add an operation that performs a collective all-to-all across both TP and CP groups.
+    Add an operation that performs a collective all-to-all across a given group.
     The operation is implemented using a torch op that wraps a NCCL group call of a series of
     NCCL send/recv operations to implement the all-to-all. See the following materials for details.
     https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/p2p.html#all-to-all,
     https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/group.html.
     Args:
-        inputs (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
+        inputs (List[Tensor]): The input tensors.
+            Its length must be a multiple of the group size,
+            and all tensors in a group must have the same shape.
         group (List[int]): The group of ranks to participate in the all-to-all.
-        dims (Union[int, List[int]]): Split along given dimension (per tensor). By default -1.
-        new_dims (Union[Optional[int], List[Optional[int]]]): The dimension to stack the splits along (per tensor).
-            If None (default), the splits are concatenated along dimension given by `dims`.
     Returns:
-        The tensor when combining all splits from all participating ranks,
-        or a list of tensors if `inputs` is a list of tensors.
+        The output tensors.
+        For each group of input tensors (of size group size),
+        there is one output tensor with shape (group size, *input shape).
     '''
     n_ranks = len(group)
     if n_ranks == 1:
@@ -257,54 +255,21 @@ def alltoall(
 
     assert n_ranks > 0, "group must be non-empty"
     assert n_ranks == len(set(group)), "group must be unique"
-    is_single_tensor = isinstance(inputs, torch.Tensor)
 
-    if is_single_tensor:
-        assert isinstance(dims, int)
-        assert new_dims is None or isinstance(new_dims, int)
-        inputs = [inputs]
-        new_dims = [new_dims]
-        dims = [dims]
-    assert len(dims) == len(inputs)
-    assert all(isinstance(dim, int) for dim in dims)
-    assert len(new_dims) == len(inputs)
-    assert all(new_dim is None or isinstance(new_dim, int)
-               for new_dim in new_dims)
+    assert len(
+        inputs
+    ) % n_ranks == 0, "inputs length must be a multiple of the group size"
+    num_lists = len(inputs) // n_ranks
+    outputs = []
+    for il in range(num_lists):
+        ref_input = inputs[il * n_ranks]
+        assert all([inputs[i].shape == ref_input.shape for i in range(il * n_ranks + 1, (il + 1) * n_ranks)]),\
+            "all input tensors in a group must have the same shape"
+        outputs.append(ref_input.new_empty((n_ranks, ) + ref_input.shape))
 
-    op_inputs = []
-
-    for inp, dim in zip(inputs, dims):
-        size_per_rank, rem = divmod(inp.shape[dim], n_ranks)
-        assert rem == 0, \
-            f"input.shape[{dim}] must be divisible by n_ranks ({n_ranks}), but got shape {inp.shape}"
-
-        # we split the input into n_ranks equal parts along dimension `dim`
-        # note: the requirement for the C++ op is that all parts have same shape,
-        # dtype and device. If we make sure that size at `dim` evenly divides into
-        # `n_ranks`, all the conditions are met
-        op_inputs.extend(torch.split(inp, size_per_rank, dim=dim))
-
-    # note: we need to ensure that the input tensors are contiguous to provide
-    # the right data pointers to the C++ op
-    op_inputs = [op_inp.contiguous() for op_inp in op_inputs]
-    outputs = torch.ops.trtllm.alltoall(
-        op_inputs,
-        group,
-        num_lists=len(inputs),
-    )
-
-    outputs_split = [
-        outputs[i * n_ranks:(i + 1) * n_ranks] for i in range(len(inputs))
-    ]
-    for i in range(len(inputs)):
-        if new_dims[i] is None:
-            outputs_split[i] = torch.cat(outputs_split[i], dim=dims[i])
-        else:
-            outputs_split[i] = torch.stack(outputs_split[i], dim=new_dims[i])
-    if is_single_tensor:
-        return outputs_split[0]
-    else:
-        return outputs_split
+    output_list = [out[i] for out in outputs for i in range(n_ranks)]
+    torch.ops.trtllm.alltoall(output_list, inputs, group, num_lists)
+    return outputs
 
 
 def reducescatter(

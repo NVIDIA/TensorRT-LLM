@@ -50,8 +50,7 @@ def run_single_rank(single_rank_forward_func, *args, **kwargs):
 
 
 @torch.inference_mode()
-def run_alltoall_op(input_tensors, expected_recv_tensors, group, dims,
-                    new_dims):
+def run_alltoall_op(input_tensors, expected_recv_tensors, group):
     """Run alltoall operation on a single rank."""
     rank = tensorrt_llm.mpi_rank()
     input_tensors = input_tensors[rank]
@@ -59,21 +58,15 @@ def run_alltoall_op(input_tensors, expected_recv_tensors, group, dims,
     torch.cuda.set_device(rank)
 
     # Move input tensors to GPU
-    input_tensors = input_tensors.cuda() if isinstance(
-        input_tensors, torch.Tensor) else [t.cuda() for t in input_tensors]
+    input_tensors = [t.cuda() for t in input_tensors]
 
     # Call alltoall
-    output_tensors = alltoall(input_tensors, group, dims, new_dims)
+    output_tensors = alltoall(input_tensors, group)
 
     # Verify output
-    if isinstance(input_tensors, torch.Tensor):
-        input_tensors = [input_tensors]
-        expected_recv_tensors = [expected_recv_tensors.cuda()]
-        output_tensors = [output_tensors]
-    else:
-        expected_recv_tensors = [t.cuda() for t in expected_recv_tensors]
+    expected_recv_tensors = [t.cuda() for t in expected_recv_tensors]
 
-    assert len(output_tensors) == len(input_tensors)
+    assert len(output_tensors) * len(group) == len(input_tensors)
     assert len(output_tensors) == len(expected_recv_tensors)
 
     for i, output_tensor in enumerate(output_tensors):
@@ -86,37 +79,21 @@ def run_alltoall_op(input_tensors, expected_recv_tensors, group, dims,
     return True
 
 
-def run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape):
+def run_alltoall_test(mpi_pool_executor, dtypes, shapes):
     torch.manual_seed(0)
     world_size = mpi_pool_executor.num_workers
-    dims, new_dims = all_dims
-    assert not isinstance(dims, list) or len(dims) > 1
-    # This is the number of original tensors used in the alltoall op.
-    # They might be of different shape and dtype.
-    num_lists = len(dims) if isinstance(dims, list) else 1
+    num_lists = len(shapes)
 
     # Create input tensors for each rank
     input_tensors = []
-    expected_send_tensors = []
     for rank in range(world_size):
         input_tensors.append([])
-        expected_send_tensors.append([])
-        # For each original tensor, generate the data
         for list_idx in range(num_lists):
-            # Each rank creates a tensor with unique data
-            tensor = torch.randn(*shape, dtype=dtypes[list_idx])
-            input_tensors[-1].append(tensor)
-            d = dims[list_idx] if isinstance(dims, list) else dims
-            send_tensors = []
-            # We keep track of the data sent by this `rank` to all other ranks
-            # `r`: this is simply a split of the original tensor w.r.t. `r`
-            # on the right dimension
+            input_tensors[-1].append([])
             for r in range(world_size):
-                idx = [slice(None)] * len(shape)
-                split = shape[d] // world_size
-                idx[d] = slice(r * split, (r + 1) * split)
-                send_tensors.append(tensor[idx])
-            expected_send_tensors[-1].append(send_tensors)
+                # Each rank creates a tensor with unique data to send to rank `r`
+                tensor = torch.randn(*shapes[list_idx], dtype=dtypes[list_idx])
+                input_tensors[-1].append(tensor)
     expected_recv_tensors = []
     # Given the expected tensors sent by rank `rank` to all other ranks `r`,
     # we can now determine the expected tensors received by each rank `rank`
@@ -126,33 +103,17 @@ def run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape):
         for list_idx in range(num_lists):
             # The received tensors are a transpose of the sent tensors
             recv_tensors = [
-                expected_send_tensors[r][list_idx][rank]
-                for r in range(world_size)
+                input_tensors[r][list_idx][rank] for r in range(world_size)
             ]
-            new_dim = new_dims[list_idx] if isinstance(new_dims,
-                                                       list) else new_dims
-            # Depending on whether new_dim is provided or not, we either
-            # concatenate or stack the tensors received from all other ranks
-            if new_dim is None:
-                new_dim = dims[list_idx] if isinstance(dims, list) else dims
-                expected_recv_tensors[-1].append(
-                    torch.cat(recv_tensors, dim=new_dim))
-            else:
-                expected_recv_tensors[-1].append(
-                    torch.stack(recv_tensors, dim=new_dim))
-    # If we have single tensors, replace the list with a single tensor,
-    # as expected by the `alltoall` interface
-    if num_lists == 1:
-        input_tensors = [t[0] for t in input_tensors]
-        expected_recv_tensors = [t[0] for t in expected_recv_tensors]
+            expected_recv_tensors[-1].append(torch.stack(recv_tensors))
 
     # Create group list
     group = list(range(world_size))
 
     results = mpi_pool_executor.map(
         run_single_rank,
-        *zip(*[(run_alltoall_op, input_tensors, expected_recv_tensors, group,
-                dims, new_dims)] * world_size),
+        *zip(*[(run_alltoall_op, input_tensors, expected_recv_tensors, group)] *
+             world_size),
     )
     for r in results:
         assert r is True
@@ -164,25 +125,23 @@ def run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape):
                          ids=lambda x: f"seqlen:{x}")
 @pytest.mark.parametrize("hidden_size", [128, 2048, 7168],
                          ids=lambda x: f"hidden:{x}")
-@pytest.mark.parametrize(
-    "all_dims", [[0, None], [1, 0], [[0, 1], [None, 0]], [[1, 1], [0, 0]]],
-    ids=lambda x: f"all_dims:{x}")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_alltoall_2gpu(seq_len, hidden_size, all_dims, mpi_pool_executor):
+def test_alltoall_2gpu(seq_len, hidden_size, mpi_pool_executor):
     dtypes = [torch.bfloat16, torch.float]
-    shape = (seq_len, hidden_size)
-    run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape)
+    shapes1 = [(seq_len, hidden_size)]
+    run_alltoall_test(mpi_pool_executor, dtypes, shapes1)
+    shapes2 = [(seq_len, hidden_size), (seq_len + 1, hidden_size + 1)]
+    run_alltoall_test(mpi_pool_executor, dtypes, shapes2)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="Requires at least 4 GPUs for this test")
 @pytest.mark.parametrize("seq_len", [28, 1004], ids=lambda x: f"seqlen:{x}")
 @pytest.mark.parametrize("hidden_size", [36, 6284], ids=lambda x: f"hidden:{x}")
-@pytest.mark.parametrize(
-    "all_dims", [[0, None], [1, 0], [[0, 1], [None, 0]], [[1, 1], [1, None]]],
-    ids=lambda x: f"all_dims:{x}")
 @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
-def test_alltoall_4gpu(seq_len, hidden_size, all_dims, mpi_pool_executor):
+def test_alltoall_4gpu(seq_len, hidden_size, mpi_pool_executor):
     dtypes = [torch.bfloat16, torch.float]
-    shape = (seq_len, hidden_size)
-    run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape)
+    shapes1 = [(seq_len, hidden_size)]
+    run_alltoall_test(mpi_pool_executor, dtypes, shapes1)
+    shapes2 = [(seq_len, hidden_size), (seq_len + 1, hidden_size + 1)]
+    run_alltoall_test(mpi_pool_executor, dtypes, shapes2)
