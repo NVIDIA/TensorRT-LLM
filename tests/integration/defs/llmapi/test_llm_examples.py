@@ -110,7 +110,16 @@ def test_llmapi_example_inference_async_streaming(llm_root, engine_dir,
 
 
 def test_llmapi_example_multilora(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_multilora.py")
+    cmd_line_args = [
+        "--chatbot_lora_dir",
+        f"{llm_models_root()}/llama-models-v2/sft-tiny-chatbot",
+        "--mental_health_lora_dir",
+        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0-mental-health-conversational",
+        "--tarot_lora_dir",
+        f"{llm_models_root()}/llama-models-v2/tinyllama-tarot-v1"
+    ]
+    _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_multilora.py",
+                        *cmd_line_args)
 
 
 def test_llmapi_example_guided_decoding(llm_root, engine_dir, llm_venv):
