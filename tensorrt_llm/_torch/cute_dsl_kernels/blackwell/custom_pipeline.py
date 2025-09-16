@@ -34,7 +34,7 @@ def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
     """
     cute.arch.mbarrier_init_fence()
 
-    print(f"limin: i am in trtllm pipeline_init_wait")
+    # print(f"limin: i am in trtllm pipeline_init_wait")
 
     # limin-todo: questa's opt
     # if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
