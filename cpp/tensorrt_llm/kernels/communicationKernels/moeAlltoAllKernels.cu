@@ -219,20 +219,22 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
             // Busy wait until all source ranks targeting this rank have completed sending
             uint32_t expected_value = *ptrs.flag_val;
-            for (int source_rank = 0; source_rank < ep_size; source_rank++)
-            {
-                uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][source_rank];
-                uint32_t flag_value;
-                do
+            bool all_flags_set;
+            do {
+                all_flags_set = true;
+                for (int source_rank = 0; source_rank < ep_size; source_rank++)
                 {
+                    uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][source_rank];
+                    uint32_t flag_value;
                     // Acquire load to ensure visibility of peer's release-store
                     asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
                     // printf("---Rank %d trying completion flag from rank %d, flag_value: %d, expected_value: %d\n", rank_id, source_rank, flag_value, expected_value);
-                } while (flag_value != expected_value);
-                #if ENABLE_DEBUG_PRINT
-                printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
-                #endif
-            }
+                    #if ENABLE_DEBUG_PRINT
+                    printf("dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][source_rank]: %d address: %p\n", rank_id, source_rank, flag_value, *flag_ptr, flag_ptr);
+                    #endif
+                    all_flags_set = all_flags_set && (flag_value == expected_value);
+                }
+            } while (!all_flags_set);
         }
     }
 }
@@ -503,19 +505,23 @@ __global__ void moeA2ACombineKernel(
     if (threadIdx.x == 0)
     {
         uint32_t expected_value = *ptrs.flag_val;
-        for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
-        {
-            uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-            uint32_t flag_value;
-            do
+        bool all_flags_set;
+
+        do {
+            all_flags_set = true;
+            for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
             {
+                uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+                uint32_t flag_value;
                 // Acquire load to ensure visibility of peer's release-store
                 asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-            } while (flag_value != expected_value);
-            #if ENABLE_DEBUG_PRINT
-            printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][peer_rank]: %d address: %p\n", rank_id, peer_rank, flag_value, *flag_ptr, flag_ptr);
-            #endif
-        }
+                #if ENABLE_DEBUG_PRINT
+                printf("combine: ---Rank %d received completion flag from rank %d, flag_value: %d, completion_flags[rank_id][peer_rank]: %d address: %p\n", rank_id, peer_rank, flag_value, *flag_ptr, flag_ptr);
+                #endif
+                all_flags_set = all_flags_set && (flag_value == expected_value);
+            }
+        } while (!all_flags_set);
+
     }
     __syncthreads();
 
