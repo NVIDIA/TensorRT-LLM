@@ -102,7 +102,8 @@ if __name__ == "__main__":
             continue
 
         # init poetry
-        save_path = os.path.join(FOLDER_SECURITY_SCANNING, Path(file_path).relative_to(curr_path))
+        save_path = os.path.join(FOLDER_SECURITY_SCANNING,
+                                 Path(file_path).relative_to(curr_path))
         os.makedirs(save_path, exist_ok=True)
         print(f"Initializing PyProject.toml in {file_path}")
         project_info = get_project_info(file_path)
@@ -118,7 +119,6 @@ if __name__ == "__main__":
             subprocess.run(f"poetry version {version}",
                            shell=True,
                            cwd=file_path)
-
         output = subprocess.run(f'cat {path}',
                                 shell=True,
                                 capture_output=True,
@@ -163,4 +163,3 @@ if __name__ == "__main__":
                     if package_name in url_mapping:
                         poetry_cmd = f"poetry add '{url_mapping[package_name]}'"
                     subprocess.run(poetry_cmd, shell=True, cwd=save_path)
-
