@@ -439,7 +439,7 @@ def stress_test(config,
         run_performance = False
         run_stress = True
     elif test_mode == "stress-test-with-accuracy":
-        run_performance = False
+        run_performance = True
         run_stress = True
     else:
         pytest.skip(
@@ -485,9 +485,9 @@ def stress_test(config,
             pp_size=test_server_config.pp_size,
             ep_size=8,  # DeepSeek-V3 or DeepSeek-R1 specific ep_size
             max_batch_size=
-            161,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
+            2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
             max_num_tokens=
-            2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens, adjust for accuracy test: 1160 -> 2048
+            2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
             0.7,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
