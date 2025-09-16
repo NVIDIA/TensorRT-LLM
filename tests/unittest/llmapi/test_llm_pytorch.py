@@ -173,6 +173,31 @@ def test_llm_reward_model():
     assert not outputs[0].outputs[0].text
 
 
+def test_llm_logprobs():
+    topk_logprobs = 3
+    max_tokens = 10
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     logprobs=topk_logprobs)
+    outputs = llm.generate(prompts, sampling_params)
+    logprobs = outputs[0].outputs[0].logprobs
+
+    assert len(logprobs) == max_tokens
+    for step_logprobs in logprobs:
+        assert len(step_logprobs) == topk_logprobs
+
+        logprob_items = [(logprob_obj.logprob, logprob_obj.rank)
+                         for logprob_obj in step_logprobs.values()]
+        sorted_by_rank = sorted(logprob_items, key=lambda x: x[1])
+
+        for i in range(len(sorted_by_rank) - 1):
+            current_logprob, current_rank = sorted_by_rank[i]
+            next_logprob, next_rank = sorted_by_rank[i + 1]
+            assert current_logprob >= next_logprob
+            assert current_rank == i + 1
+            assert next_rank == current_rank + 1
+
+
 def test_llm_perf_metrics():
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     sampling_params = SamplingParams(max_tokens=10, return_perf_metrics=True)
