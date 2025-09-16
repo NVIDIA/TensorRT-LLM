@@ -3,6 +3,7 @@ import asyncio
 import os
 import re
 import signal
+import time
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -158,6 +159,14 @@ class OpenAIServer:
         else:
             assert isinstance(self.llm, MultimodalEncoder), "llm must be a MultimodalEncoder for multimodal encoder"
             self.register_mm_encoder_routes()
+
+        @self.app.middleware("http")
+        async def add_process_time_header(raw_request: Request, call_next):
+            start_time = time.monotonic()
+            raw_request.state.server_start_ts = start_time
+            response = await call_next(raw_request)
+            return response
+
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
@@ -322,9 +331,11 @@ class OpenAIServer:
                 # exclude metrics.iter since it is only meaningful when the request is not finished
             }
             metrics_json["timing_metrics"] = {
+                "server_start_ts": metrics_dict.pop("server_start_ts", None),
                 "arrival_time": timing_metrics.arrival_time.total_seconds(),
                 "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds(),
                 "first_token_time": timing_metrics.first_token_time.total_seconds(),
+                "server_first_token_ts":metrics_dict.pop("server_first_token_ts", None),
                 "last_token_time": timing_metrics.last_token_time.total_seconds(),
             }
             metrics_json["kv_cache_metrics"] = {
@@ -359,7 +370,7 @@ class OpenAIServer:
             pass
         return JSONResponse(content=events)
 
-    async def _extract_metrics(self, res: RequestOutput):
+    async def _extract_metrics(self, res: RequestOutput, raw_request: Optional[Request] = None):
         if not res.finished:
             return
         if self.metrics_collector:
@@ -370,6 +381,9 @@ class OpenAIServer:
                 "request_id": res.request_id,
                 "perf_metrics": res.outputs[0].request_perf_metrics
             }
+            if raw_request:
+                item["server_start_ts"] = getattr(raw_request.state, "server_start_ts", None)
+                item["server_first_token_ts"] = getattr(raw_request.state, "server_first_token_ts", None)
             if output.disaggregated_params:
                 item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
             if self.perf_metrics is not None:
@@ -582,7 +596,8 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            await self._extract_metrics(response)
+            raw_request.state.server_first_token_ts = time.monotonic()
+            await self._extract_metrics(response, raw_request)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -619,7 +634,7 @@ class OpenAIServer:
                         pp_result = post_processor(output, args)
                     else:
                         pp_result = output.outputs[0]._postprocess_result
-                    await self._extract_metrics(output)
+                    await self._extract_metrics(output, raw_request)
                     for pp_res in pp_result:
                         yield pp_res
             except:
@@ -646,6 +661,9 @@ class OpenAIServer:
             await asyncio.gather(*tasks)
 
         async def generator_wrapper(generator: AsyncIterator[Any]):
+            first_response = await anext(generator)
+            raw_request.state.server_first_token_ts = time.monotonic()
+            yield first_response
             async for output in generator:
                 yield output
             yield "data: [DONE]\n\n"
