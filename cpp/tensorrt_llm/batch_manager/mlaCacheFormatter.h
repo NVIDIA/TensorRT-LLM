@@ -35,9 +35,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void format(TransferSession& session) override;
+    void format(tensorrt_llm::batch_manager::TransferSession& session) override;
 
-    void unformat(TransferSession& session) override;
+    void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 

@@ -80,6 +80,8 @@ using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
 
+using tensorrt_llm::batch_manager::CacheTransceiverFactory;
+
 namespace tensorrt_llm::batch_manager
 {
 
