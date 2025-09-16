@@ -494,11 +494,14 @@ class RandomDataset(BenchmarkDataset):
 
             # Filter out sequences that are too long or too short
             requests = []
-            for prompt, initial_prompt_len, cached_token_ids in zip(
-                    dataset, prompt_lengths, prompt_token_ids):
-                i = len(requests)
-                if i == num_requests:
-                    break
+            dataset_len = len(dataset)
+
+            for i in range(num_requests):
+                # Use modulo to cycle through the dataset when num_requests > dataset_len
+                dataset_idx = i % dataset_len
+                prompt = dataset[dataset_idx]
+                initial_prompt_len = prompt_lengths[dataset_idx]
+                cached_token_ids = prompt_token_ids[dataset_idx]
 
                 # Skip empty prompt
                 if initial_prompt_len == 0:
@@ -534,9 +537,6 @@ class RandomDataset(BenchmarkDataset):
                         prompt_len=total_input_len,
                         expected_output_len=int(output_lens[i]),
                     ))
-            assert len(requests) == num_requests, (
-                f"Only {len(requests)} requests sampled from sharegpt dataset, {num_requests} requests are needed"
-            )
         else:
             for i in range(num_requests):
                 inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
@@ -1131,6 +1131,7 @@ class VisionArenaDataset(HuggingFaceDataset):
         if parser_fn is None:
             raise ValueError(f"Unsupported dataset path: {self.dataset_path}")
 
+        sampled_requests = []
         for item in self.data:
             if len(prompts) >= num_requests:
                 break
