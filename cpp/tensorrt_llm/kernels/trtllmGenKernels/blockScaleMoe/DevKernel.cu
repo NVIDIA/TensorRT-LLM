@@ -154,7 +154,7 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                 float constexpr E4m3MaxVal{448.f};
 
                 // Compute the absolute max
-                float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cub::Max());
+                float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cuda::maximum<>());
                 if (threadIdx.x == 0)
                 {
                     s_scaleOut = aMax / E4m3MaxVal;
@@ -660,7 +660,7 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
             float constexpr E4m3MaxVal{448.f};
 
             // Compute the absolute max
-            float aMax = BlockReduce(temp_storage).Reduce(fabsf(acc), cub::Max());
+            float aMax = BlockReduce(temp_storage).Reduce(fabsf(acc), cuda::maximum<>());
 
             if (threadIdx.x == 0)
             {

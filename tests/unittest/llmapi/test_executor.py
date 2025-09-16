@@ -399,7 +399,7 @@ def test_ZeroMqQueue_serialization_complicated_dataclass():
     TokenRangeRetentionConfig = tllm.KvCacheRetentionConfig.TokenRangeRetentionConfig
     kvcache_config = tllm.KvCacheRetentionConfig(
         [TokenRangeRetentionConfig(0, 2, 30, datetime.timedelta(seconds=30))],
-        80)
+        80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
 
     sampling_params = SamplingParams(max_tokens=4,
                                      embedding_bias=torch.randn(2, 2))

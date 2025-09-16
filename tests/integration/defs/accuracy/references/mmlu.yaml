@@ -208,10 +208,10 @@ Qwen3/Qwen3-30B-A3B:
     accuracy: 79.53
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 80.65
+    accuracy: 79.53
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 80.65
+    accuracy: 79.53
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 79.78
   - quant_algo: W4A8_MXFP4_MXFP8

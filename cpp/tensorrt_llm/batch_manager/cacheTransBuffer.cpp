@@ -295,17 +295,19 @@ void CacheTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId
 }
 
 std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateSendBuffers(
-    std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
+    std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
     runtime::BufferManager const& bufferManagerToUse)
 {
-    return getOrAllocateBuffers(bufferId, targetNum, targetBufferSize, bufferManagerToUse, mConcurrenceSendResource);
+    return getOrAllocateBuffers(
+        bufferId, targetNum, targetBufferEleSizes, bufferManagerToUse, mConcurrenceSendResource);
 }
 
 std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateRecvBuffers(
-    std::optional<int> bufferId, int targetNum, size_t targetBufferSize,
+    std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
     runtime::BufferManager const& bufferManagerToUse)
 {
-    return getOrAllocateBuffers(bufferId, targetNum, targetBufferSize, bufferManagerToUse, mConcurrenceRecvResource);
+    return getOrAllocateBuffers(
+        bufferId, targetNum, targetBufferEleSizes, bufferManagerToUse, mConcurrenceRecvResource);
 }
 
 runtime::ITensor::SharedPtr CacheTransBufferManager::getSendBuffer(std::optional<int> bufferId)
@@ -332,40 +334,46 @@ runtime::ITensor::SharedPtr CacheTransBufferManager::getRecvBuffer(std::optional
 }
 
 std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBufferManager::getOrAllocateBuffers(
-    std::optional<int> bufferId, int targetNum, size_t targetBufferEleSize,
+    std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
     runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource)
 {
     TLLM_CHECK(bufferId.has_value() || mOnlyUseDynamicBuffer);
+    TLLM_CHECK(targetBufferEleSizes.size() >= static_cast<size_t>(targetNum));
     std::vector<runtime::ITensor::SharedPtr> retSplitCaches;
-    size_t bufferCoverTargetNum = std::min(
-        static_cast<size_t>(targetNum), mTransferBufferSize / (targetBufferEleSize * common::getDTypeSize(mDataType)));
-    TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
-    if (bufferCoverTargetNum < static_cast<size_t>(targetNum))
-    {
-        TLLM_LOG_WARNING(
-            "CacheTransceiver getOrAllocateBuffers: bufferCoverTargetNum:%d < targetNum:%d, may use dynamic buffer, "
-            "it's better to increase MaxTokensInBuffer in cacheTransceiverConfig, otherwise, the performance may "
-            "be degraded",
-            bufferCoverTargetNum, targetNum);
-    }
+
+    size_t bufferCoverTargetNum = 0;
+
     if (bufferId.has_value())
     {
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < concurrenceResource.mBuffers.size());
         TLLM_CHECK(concurrenceResource.mBufferIndexFlag[bufferId.value()] == 1);
-
+        size_t preBufferEleSize = 0;
         for (int i = 0; i < targetNum; i++)
         {
-            if (static_cast<size_t>(i) < bufferCoverTargetNum)
+            // Strict checking.
+            if (preBufferEleSize + targetBufferEleSizes[i] <= mBufferEleSize)
             {
                 auto slice = runtime::ITensor::slice(
-                    concurrenceResource.mBuffers[bufferId.value()], i * targetBufferEleSize, targetBufferEleSize);
+                    concurrenceResource.mBuffers[bufferId.value()], preBufferEleSize, targetBufferEleSizes[i]);
+                preBufferEleSize += targetBufferEleSizes[i];
+                bufferCoverTargetNum++;
                 retSplitCaches.push_back(std::move(slice));
             }
             else
             {
                 retSplitCaches.push_back(bufferManagerToUse.gpu(
-                    runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSize)}), mDataType));
+                    runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), mDataType));
             }
+        }
+        TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
+        if (bufferCoverTargetNum < static_cast<size_t>(targetNum))
+        {
+            TLLM_LOG_WARNING(
+                "CacheTransceiver getOrAllocateBuffers: bufferCoverTargetNum:%d < targetNum:%d, may use dynamic "
+                "buffer, "
+                "it's better to increase MaxTokensInBuffer in cacheTransceiverConfig, otherwise, the performance may "
+                "be degraded",
+                bufferCoverTargetNum, targetNum);
         }
     }
     else
@@ -373,13 +381,11 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
         for (int i = 0; i < targetNum; i++)
         {
             retSplitCaches.push_back(bufferManagerToUse.gpu(
-                runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSize)}), mDataType));
+                runtime::ITensor::makeShape({static_cast<int64_t>(targetBufferEleSizes[i])}), mDataType));
         }
-    }
-    if (mOnlyUseDynamicBuffer)
-    {
         bufferCoverTargetNum = targetNum;
     }
+
     return std::make_tuple(retSplitCaches, bufferCoverTargetNum, mOnlyUseDynamicBuffer);
 }
 

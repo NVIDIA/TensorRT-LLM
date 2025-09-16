@@ -57,7 +57,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         description="The path to the model checkpoint or the model name from the Hugging Face Hub."
     )
 
-    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
+    model_factory: str = Field(
         default="AutoModelForCausalLM",
         description="The model factory to use for loading the model.",
     )
@@ -210,6 +210,17 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         if self.attn_backend == "triton" or self.attn_backend == "torch":
             self.attn_page_size = self.max_seq_len
         return self
+
+    @field_validator("model_factory", mode="after")
+    @classmethod
+    def model_factory_exists(cls, value: str) -> str:
+        if not ModelFactoryRegistry.has(value):
+            raise ValueError(
+                f"'{value}' does not exist in the model factory registry. Available values: "
+                f"{ModelFactoryRegistry.entries()}."
+            )
+
+        return value
 
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:

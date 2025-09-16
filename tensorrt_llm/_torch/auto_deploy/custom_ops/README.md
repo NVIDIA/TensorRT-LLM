@@ -25,7 +25,7 @@ The table below lists the operators ordered by their backend.
 | `torch.ops.auto_deploy.torch_moe_fused` | Fused Mixture of Experts implementation |
 | `torch.ops.auto_deploy.torch_quant_fn` | Generic quantization function that scales, rounds, and clamps input values |
 | `torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce` | Fused FP8 linear layer followed by all-reduce operation |
-| `torch.ops.auto_deploy.torch_quant_fp4_linear` | FP4 quantized linear layer |
+| `torch.ops.auto_deploy.torch_quant_nvfp4_linear` | FP4 quantized linear layer |
 | `torch.ops.auto_deploy.torch_quant_fp8_linear` | FP8 quantized linear layer |
 | `torch.ops.auto_deploy.torch_rope_with_complex_freqs` | RoPE with complex frequencies |
 | `torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin` | RoPE with explicit cosine/sine |

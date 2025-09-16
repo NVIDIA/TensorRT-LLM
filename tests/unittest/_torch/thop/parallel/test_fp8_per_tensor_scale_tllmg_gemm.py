@@ -16,14 +16,14 @@
 import pytest
 import torch
 from _torch.helpers import calc_diff
-from utils.util import getSMVersion
+from utils.util import getSMVersion, isSM100Family
 
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    not isSM100Family(),
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
@@ -104,7 +104,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n, inference_mode):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(

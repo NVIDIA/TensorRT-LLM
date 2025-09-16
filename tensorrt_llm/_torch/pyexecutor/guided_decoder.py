@@ -4,7 +4,6 @@ from queue import Queue
 from typing import Iterable, List, Optional, Tuple
 
 import torch
-import xgrammar
 
 from ..._utils import nvtx_range
 from ...bindings.executor import GuidedDecodingConfig, GuidedDecodingParams
@@ -138,6 +137,7 @@ class GuidedRequests:
 
 class GuidedDecoder:
     bitmask_dtype = torch.int32
+    token_mask_dtype = torch.int32
 
     def __init__(self,
                  guided_decoding_config: GuidedDecodingConfig,
@@ -175,6 +175,13 @@ class GuidedDecoder:
         self.bitmask_host = torch.empty_like(self.bitmask,
                                              device='cpu',
                                              pin_memory=True)
+        self.token_mask = torch.empty(self.max_num_sequences *
+                                      (self.max_num_draft_tokens + 1),
+                                      dtype=self.token_mask_dtype,
+                                      device='cuda')
+        self.token_mask_host = torch.empty_like(self.token_mask,
+                                                device='cpu',
+                                                pin_memory=True)
 
         # The number of tokens accepted by the grammar matcher in a build step.
         self.num_advanced_tokens: List[int] = [0] * self.max_num_sequences
@@ -203,8 +210,7 @@ class GuidedDecoder:
         - call the grammar matcher to fill the bitmask on CPU;
         - asynchronously copy the bitmask to GPU.
         """
-        # TODO: Fuse token-level mask to logits_bitmask.
-        self.bitmask_host[:requests.num_bitmask_tokens].fill_(-1)
+        self.token_mask_host[:requests.num_bitmask_tokens].fill_(0)
 
         for req, offset in requests.valid_requests_with_offsets():
             slot = req.seq_slot
@@ -244,6 +250,7 @@ class GuidedDecoder:
             self.num_advanced_tokens[slot] += 1
             if not matcher.is_terminated():
                 matcher.fill_next_token_bitmask(self.bitmask_host, offset)
+                self.token_mask_host[offset] = 1
                 self.num_guided_tokens[slot] += 1
                 # Process draft tokens
                 for i, tid in enumerate(req.draft_tokens, 1):
@@ -255,6 +262,7 @@ class GuidedDecoder:
                         break
                     matcher.fill_next_token_bitmask(self.bitmask_host,
                                                     offset + i)
+                    self.token_mask_host[offset + i] = 1
                     self.num_guided_tokens[slot] += 1
 
             if req.is_draft:
@@ -262,35 +270,33 @@ class GuidedDecoder:
                 self.num_advanced_draft_tokens[
                     slot] += self.num_advanced_tokens[slot]
 
-    def _copy_bitmask(self, requests: GuidedRequests) -> None:
-        self.bitmask[:requests.num_bitmask_tokens].copy_(
-            self.bitmask_host[:requests.num_bitmask_tokens], non_blocking=True)
+    def _copy_bitmask(self,
+                      requests: GuidedRequests,
+                      num_bitmask_tokens: Optional[int] = None) -> None:
+        if num_bitmask_tokens is None:
+            num_bitmask_tokens = requests.num_bitmask_tokens
+        self.bitmask[:num_bitmask_tokens].copy_(
+            self.bitmask_host[:num_bitmask_tokens], non_blocking=True)
+        self.token_mask[:num_bitmask_tokens].copy_(
+            self.token_mask_host[:num_bitmask_tokens], non_blocking=True)
 
     @torch.inference_mode()
     def _apply_bitmask(self,
                        requests: GuidedRequests,
                        logits: torch.Tensor,
-                       d2t: Optional[torch.Tensor] = None) -> None:
+                       d2t: Optional[torch.Tensor] = None,
+                       num_bitmask_tokens: Optional[int] = None) -> None:
         """Apply the bitmask to the corresponding logits for requests with guided decoding enabled.
 
         This method inplace modifies the logits tensor so that any tokens that violate the grammar constraints are masked out.
         """
-        # TODO: Fuse index_copy and index_select to logits_bitmask.
-        if d2t is not None:
-            draft_logits = logits
-            d2t_mapping = d2t + torch.arange(d2t.size(0), device=d2t.device)
-            logits = torch.empty(draft_logits.size(0),
-                                 self.vocab_size_padded,
-                                 dtype=draft_logits.dtype,
-                                 device=draft_logits.device)
-            logits.index_copy_(-1, d2t_mapping, draft_logits)
-
-        xgrammar.apply_token_bitmask_inplace(
-            logits[:requests.num_bitmask_tokens],
-            self.bitmask[:requests.num_bitmask_tokens])
-
-        if d2t is not None:
-            torch.index_select(logits, -1, d2t_mapping, out=draft_logits)
+        if num_bitmask_tokens is None:
+            num_bitmask_tokens = requests.num_bitmask_tokens
+        torch.ops.trtllm.logits_bitmask(
+            logits[:num_bitmask_tokens],
+            self.bitmask[:num_bitmask_tokens],
+            token_mask=self.token_mask[:num_bitmask_tokens],
+            d2t=d2t)
 
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self, scheduled_requests: ScheduledRequests) -> None:
@@ -302,14 +308,18 @@ class GuidedDecoder:
         self._build(self.requests)
 
     @nvtx_range("GuideDecoder.copy_bitmask")
-    def copy_bitmask(self) -> None:
-        self._copy_bitmask(self.requests)
+    def copy_bitmask(self, num_bitmask_tokens: Optional[int] = None) -> None:
+        self._copy_bitmask(self.requests, num_bitmask_tokens=num_bitmask_tokens)
 
     @nvtx_range("GuidedDecoder.apply_bitmask")
     def apply_bitmask(self,
                       logits: torch.Tensor,
-                      d2t: Optional[torch.Tensor] = None) -> None:
-        self._apply_bitmask(self.requests, logits, d2t=d2t)
+                      d2t: Optional[torch.Tensor] = None,
+                      num_bitmask_tokens: Optional[int] = None) -> None:
+        self._apply_bitmask(self.requests,
+                            logits,
+                            d2t=d2t,
+                            num_bitmask_tokens=num_bitmask_tokens)
 
     def execute(self,
                 logits: torch.Tensor,
@@ -524,8 +534,12 @@ class CapturableGuidedDecoder(GuidedDecoder):
             self.build()
             if draft_step == self.max_num_draft_tokens - 1:
                 self.rollback_draft_tokens()
-            self.copy_bitmask()
+            # Overwrite num_bitmask_tokens since the request might not be updated on CUDA stream yet.
+            self.copy_bitmask(num_bitmask_tokens=len(self.requests))
             self.bitmask_event.record()
 
         torch.cuda.current_stream().wait_event(self.bitmask_event)
-        self.apply_bitmask(logits, d2t=d2t)
+        # Overwrite num_bitmask_tokens since the request might not be updated on CUDA stream yet.
+        self.apply_bitmask(logits,
+                           d2t=d2t,
+                           num_bitmask_tokens=len(self.requests))

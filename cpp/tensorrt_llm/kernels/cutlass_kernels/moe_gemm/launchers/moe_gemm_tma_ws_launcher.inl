@@ -59,8 +59,9 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-namespace cutlass_kernels
+namespace cutlass_kernels_oss
 {
+using namespace tensorrt_llm::kernels::cutlass_kernels;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
 // Constructs an object with specific arguments only if flag is true
@@ -137,6 +138,13 @@ void tma_warp_specialized_generic_moe_gemm_kernelLauncher(TmaWarpSpecializedGrou
         TLLM_THROW("Please recompile with support for blackwell by passing 100-real as an arch to build_wheel.py.");
     }
 #endif
+#ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
+    else if constexpr (ArchTag::kMinComputeCapability == 103)
+    {
+        // fallback sm100f logic is done in dispatchMoeGemmFinalDispatchTmaWarpSpecialized
+        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
+    }
+#endif
 #ifndef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
     else if constexpr (ArchTag::kMinComputeCapability >= 120)
     {
@@ -207,16 +215,21 @@ using namespace cutlass::epilogue;
         constexpr bool IsBlackwell = ArchTag::kMinComputeCapability >= 100;                                                                                                                                                                                                                                                 \
         constexpr bool IsSM100 = ArchTag::kMinComputeCapability >= 100 && ArchTag::kMinComputeCapability < 120;                                                                                                                                                                                                             \
         constexpr bool IsSM120 = ArchTag::kMinComputeCapability == 120 || ArchTag::kMinComputeCapability == 121;                                                                                                                                                                                                            \
+        constexpr bool IsSM103 = ArchTag::kMinComputeCapability == 103;                                                                                                                                                                                                                                                     \
         /* constexpr static bool BIAS = BIAS_; */ /* Always false */                                                                                                                                                                                                                                                        \
         using T = DataType_;                                                                                                                                                                                                                                                                                                \
         using WeightType = WeightType_;                                                                                                                                                                                                                                                                                     \
         using OutputType = OutputType_;                                                                                                                                                                                                                                                                                     \
+        constexpr static bool IsFP4 = cutlass::platform::is_same<T, SafeFP4>::value;                                                                                                                                                                                                                                        \
+        constexpr static bool IsSM103FP4 = IsSM103 && IsFP4;                                                                                                                                                                                                                                                                \
+        /* static_assert(IsSM103 == IsSM103FP4, "SM103 only implemented for fp4"); */                                                                                                                                                                                                                                       \
         using EpilogueTag = tensorrt_llm::cutlass_extensions::EpilogueTag_;                                                                                                                                                                                                                                                 \
         using InputClusterShape = cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>;                                                                                                                                                                                                                     \
         constexpr static bool Is2SM = IsSM100 && cute::size<0>(InputClusterShape{}) == 2;                                                                                                                                                                                                                                   \
         using ClusterShape                                                                                                                                                                                                                                                                                                  \
             = std::conditional_t<DYNAMIC_CGA, cute::Shape<int32_t, int32_t, cute::_1>, InputClusterShape>;                                                                                                                                                                                                                  \
-        using MmaTileShape = cute::Shape<cute::Int<CTA_M_*(Is2SM ? 2 : 1)>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                                                                                                                                                                                                          \
+        using MmaTileShape = cute::Shape<cute::Int<CTA_M_*(Is2SM ? 2 : 1)>, cute::Int<CTA_N_>,                                                                                                                                                                                                                              \
+            cute::Int<CTA_K_*(IsSM103FP4 ? 3 : 1)>>;                                                                                                                                                                                                                                                                        \
         using InputEpilogueSchedule = EpilogueSchedule_;                                                                                                                                                                                                                                                                    \
         if constexpr (!COMPILE_HOPPER_TMA_GROUPED_GEMMS_ENABLED && ArchTag::kMinComputeCapability >= 90                                                                                                                                                                                                                     \
             && ArchTag::kMinComputeCapability < 100)                                                                                                                                                                                                                                                                        \
@@ -248,7 +261,7 @@ using namespace cutlass::epilogue;
             constexpr static bool IsWFP4AFP8 = cutlass::platform::is_same<WeightType, SafeFP4>::value                                                                                                                                                                                                                       \
                 && cutlass::platform::is_same<T, SafeFP8>::value;                                                                                                                                                                                                                                                           \
             constexpr static bool IsFP4 = cutlass::platform::is_same<T, SafeFP4>::value;                                                                                                                                                                                                                                    \
-            static_assert(!IsFP4 || IsBlackwell, "FP4 is only supported by SM100");                                                                                                                                                                                                                                         \
+            static_assert(!IsFP4 || IsBlackwell, "FP4 is only supported by Blackwell");                                                                                                                                                                                                                                     \
                                                                                                                                                                                                                                                                                                                             \
             constexpr static bool IsFP8 = cutlass::platform::is_same<T, SafeFP8>::value;                                                                                                                                                                                                                                    \
                                                                                                                                                                                                                                                                                                                             \
@@ -424,8 +437,13 @@ using namespace cutlass::epilogue;
                     cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100>,                                                                                                                                                                                                                                               \
                 std::conditional_t<IsBlockScaled, KernelSchedule1SmSm100BlockScaled,                                                                                                                                                                                                                                        \
                     cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100>>;                                                                                                                                                                                                                                              \
+            using KernelScheduleSM103 = std::conditional_t<Is2SM,                                                                                                                                                                                                                                                           \
+                cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs16Sm103,                                                                                                                                                                                                                          \
+                cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103>;                                                                                                                                                                                                                         \
+            using KernelScheduleSM10x = std::conditional_t<IsSM103FP4, KernelScheduleSM103, KernelScheduleSM100>;                                                                                                                                                                                                           \
+                                                                                                                                                                                                                                                                                                                            \
             using KernelScheduleSM120 = cutlass ::gemm ::collective::KernelScheduleAuto;                                                                                                                                                                                                                                    \
-            using KernelScheduleBW = std::conditional_t<IsSM120, KernelScheduleSM120, KernelScheduleSM100>;                                                                                                                                                                                                                 \
+            using KernelScheduleBW = std::conditional_t<IsSM120, KernelScheduleSM120, KernelScheduleSM10x>;                                                                                                                                                                                                                 \
                                                                                                                                                                                                                                                                                                                             \
             using KernelSchedule = std::conditional_t<IsBlackwell, KernelScheduleBW, KernelScheduleSM90>;                                                                                                                                                                                                                   \
                                                                                                                                                                                                                                                                                                                             \
@@ -688,6 +706,6 @@ using namespace cutlass::epilogue;
         cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape,                                                                                                                                                                                                                                                      \
         cute::Shape<int32_t, int32_t, cute::_1> fallback_cluster_shape);
 
-} // namespace cutlass_kernels
+} // namespace cutlass_kernels_oss
 } // namespace kernels
 } // namespace tensorrt_llm

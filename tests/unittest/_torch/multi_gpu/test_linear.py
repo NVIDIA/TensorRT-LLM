@@ -22,6 +22,8 @@ MPI.pickle.__init__(
 
 # needed since we reuse the mpi executor pool, first test running will leak a thread
 pytestmark = pytest.mark.threadleak(enabled=False)
+pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5501820",
+            allow_module_level=True)
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):

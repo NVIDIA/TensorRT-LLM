@@ -20,13 +20,13 @@ import pytest
 import torch
 from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
                             per_block_cast_to_fp8_e8m0)
-from utils.util import getSMVersion
+from utils.util import getSMVersion, isSM100Family
 
 from tensorrt_llm._torch.autotuner import autotune
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    not isSM100Family(),
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(

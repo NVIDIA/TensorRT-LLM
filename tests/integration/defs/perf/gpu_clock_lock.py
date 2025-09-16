@@ -189,7 +189,7 @@ class GPUClockLock:
         # Initialize thread
         self._thread = threading.Thread(
             target=self._monitoring_thread,
-            name="TURTLE - GPUMonitor",
+            name="LLM Test - GPUMonitor",
             kwargs={"interval_ms": self._interval_ms})
         self._thread.daemon = True
         self._thread.start()

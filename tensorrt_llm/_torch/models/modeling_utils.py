@@ -482,8 +482,27 @@ class DecoderModelForCausalLM(nn.Module,
         if quant_config is not None:
             if quant_config.exclude_modules is not None:
                 for name, module in self.named_modules():
-                    is_excluded = quant_config.is_module_excluded_from_quantization(
-                        name)
+                    candidates = [name]
+                    if isinstance(module, Linear):
+                        weight_mode = module.weights_loading_config.weight_mode
+                        if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                            # sometimes gate and up proj are not packed in the checkpoint,
+                            # but they still share the same exclusion rule
+                            candidates += [
+                                name.replace('gate_up_proj', 'gate_proj'),
+                                name.replace('gate_up_proj', 'up_proj')
+                            ]
+                        elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+                            # sometimes q_proj, k_proj and v_proj are not packed in the checkpoint,
+                            # but they still share the same exclusion rule
+                            candidates += [
+                                name.replace('qkv_proj', 'q_proj'),
+                                name.replace('qkv_proj', 'k_proj'),
+                                name.replace('qkv_proj', 'v_proj')
+                            ]
+                    is_excluded = any(
+                        quant_config.is_module_excluded_from_quantization(n)
+                        for n in candidates)
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config

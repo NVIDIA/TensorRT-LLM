@@ -594,6 +594,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
             input_ids,
             mm_embedding,
             mm_token_ids=self.mm_token_ids,
+            **kwargs,
         )
 
         output_prob = self.llm.forward(

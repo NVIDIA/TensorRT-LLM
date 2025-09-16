@@ -181,10 +181,19 @@ def get_model_yaml_config(model_label: str,
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:
+        # Derive the requested number of adapters from model_label (segment like "loras:X")
+        lora_count = 1
+        for part in model_label.split('-'):
+            if part.startswith('loras:'):
+                lora_count = max(1, int(part.split(':', 1)[1]))
+                break
+
         lora_config = {
             'lora_config': {
                 'lora_dir': lora_dirs if lora_dirs is not None else [],
-                'max_lora_rank': 64
+                'max_lora_rank': 64,
+                'max_loras': lora_count,
+                'max_cpu_loras': lora_count,
             }
         }
         if 'phi_4_multimodal_instruct' in model_label:

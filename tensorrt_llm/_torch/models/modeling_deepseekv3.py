@@ -40,11 +40,12 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
@@ -468,10 +469,13 @@ class Deepseekv3MoE(nn.Module):
             layer_idx=layer_idx,
             # DS-R1 W4A8 is only supported through custom quantization script from
             # examples/quantization/quantize_mixed_precision_moe.py
-            weight_loading_mode=(MoEWeightLoadingMode.W4A8_CUSTOM
-                                 if model_config.quant_config.quant_mode.
-                                 is_int4_weight_only_per_group() else
-                                 MoEWeightLoadingMode.VANILLA))
+            weight_loading_mode=(
+                MoEWeightLoadingMode.W4A8_CUSTOM
+                if self._get_experts_quant_config(
+                    model_config,
+                    layer_idx).layer_quant_mode.is_int4_weight_only_per_group()
+                else MoEWeightLoadingMode.VANILLA),
+        )
 
         self.mapping = model_config.mapping
 
@@ -536,9 +540,15 @@ class Deepseekv3MoE(nn.Module):
 
         return shared_tp_size, shared_output_scale
 
+    @staticmethod
+    def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
+        if getattr(model_config, "quant_config_dict", None) is None:
+            return model_config.quant_config
+        return model_config.quant_config_dict.get(
+            f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config)
+
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, all_rank_max_num_tokens,
-                              do_finalize):
+                              all_rank_num_tokens, do_finalize):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
@@ -557,7 +567,6 @@ class Deepseekv3MoE(nn.Module):
             do_finalize=do_finalize,
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
         )
 
@@ -568,7 +577,6 @@ class Deepseekv3MoE(nn.Module):
         hidden_states: torch.Tensor,
         hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
         all_rank_num_tokens: Optional[list[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
     ) -> torch.Tensor:
@@ -587,7 +595,6 @@ class Deepseekv3MoE(nn.Module):
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
-                                                       all_rank_max_num_tokens,
                                                        do_finalize)
             return routed_output
 
@@ -657,6 +664,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         quant_config = self._get_decoder_layer_quant_config(
             model_config, layer_idx)
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
+        assert (
+            quant_config.quant_algo
+            is not QuantAlgo.MIXED_PRECISION), "MIXED_PRECISION is ambiguous"
 
         has_tp = mapping.has_tp()
         self.allreduce = AllReduce(mapping=model_config.mapping,
@@ -826,7 +836,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states,
                 hidden_states_fp4,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-                all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
@@ -1014,7 +1023,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -1073,7 +1081,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.mlp(
             hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
@@ -1479,8 +1486,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                             p.data.copy_(module_weights[n][:])
 
                 if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-                ) and get_sm_version() == 100 and hasattr(
-                        module, "weight_scale"):
+                ) and is_sm_100f() and hasattr(module, "weight_scale"):
                     weight, weight_scale = resmooth_to_fp8_e8m0(
                         module.weight, module.weight_scale)
                     transfromed_scale = transform_sf_into_required_layout(

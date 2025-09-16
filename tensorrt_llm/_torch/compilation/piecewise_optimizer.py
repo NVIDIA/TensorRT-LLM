@@ -210,15 +210,9 @@ class PiecewiseRunner(object):
             runtime_input_addresses = [
                 i.data_ptr() for i in args if isinstance(i, torch.Tensor)
             ]
-            runtime_output_addresses = [
-                i.data_ptr() for i in output if isinstance(i, torch.Tensor)
-            ]
 
             assert (entry.input_addresses == runtime_input_addresses
                     ), f"{entry.input_addresses} vs\n {runtime_input_addresses}"
-            assert (
-                entry.output_addresses == runtime_output_addresses
-            ), f"{entry.output_addresses} vs\n {runtime_output_addresses}"
 
         entry.cuda_graph.replay()
 

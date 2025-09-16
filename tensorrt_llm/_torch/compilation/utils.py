@@ -72,7 +72,10 @@ def inplace_info():
         torch.ops.trtllm.flashinfer_apply_rope_with_cos_sin_cache_inplace.default:
         {
             1: "query",
-            2: "key",
+            2: "key"
+        },
+        torch.ops.trtllm.logits_bitmask.default: {
+            1: "logits"
         }
     }
     return inplace_map

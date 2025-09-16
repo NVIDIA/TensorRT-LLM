@@ -138,7 +138,12 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     def run_command(cmd):
         try:
-            llm_venv.run_cmd(cmd, cwd=test_root)
+            pythonpath = os.environ.get("PYTHONPATH", "")
+            llm_venv.run_cmd(
+                cmd,
+                cwd=test_root,
+                env={'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"},
+            )
         except CalledProcessError:
             return False
         return True
