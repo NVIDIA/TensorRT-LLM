@@ -52,8 +52,11 @@ class MoERunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-            lambda x: min(last_positive_power_of_2(x), 8192)), ),
+            0,
+            0,
+            get_last_power_of_2_num_tokens_buckets(8192),
+            lambda x: min(last_positive_power_of_2(x), 8192),
+        ), ),
         tune_max_num_tokens=8192,
     )
 
@@ -95,19 +98,31 @@ class MoERunner(TunableRunner):
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
         self.use_fused_finalize = use_fused_finalize
-        self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
+        self.unpadded_hidden_size = (unpadded_hidden_size
+                                     if unpadded_hidden_size is not None else 0)
 
-        instance_key = (x_dtype, weight_dtype, output_dtype,
-                        use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                        use_int8_woq_per_channel, use_mxfp8_act_scaling)
+        instance_key = (
+            x_dtype,
+            weight_dtype,
+            output_dtype,
+            use_deepseek_fp8_block_scale,
+            use_w4_group_scaling,
+            use_int8_woq_per_channel,
+            use_mxfp8_act_scaling,
+        )
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
-                    x_dtype, weight_dtype, output_dtype,
-                    use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                    use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                    use_fused_finalize)
+                    x_dtype,
+                    weight_dtype,
+                    output_dtype,
+                    use_deepseek_fp8_block_scale,
+                    use_w4_group_scaling,
+                    use_int8_woq_per_channel,
+                    use_mxfp8_act_scaling,
+                    use_fused_finalize,
+                )
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -121,7 +136,13 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+        (
+            x,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
+        ) = inputs
         self.fused_moe_runner.run_gemm_profile(
             x,
             fc1_expert_weights,
@@ -221,8 +242,11 @@ def fused_moe(
         [moe_runner],
         MoERunner.tuning_config,
         [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
+            tuner_input,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
         ],
         gemm_idx=1,
     )
@@ -232,13 +256,17 @@ def fused_moe(
         [moe_runner],
         MoERunner.tuning_config,
         [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
+            tuner_input,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
         ],
         gemm_idx=2,
     )
 
-    run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
+    run_moe = (moe_runner.fused_moe_runner.run_moe_min_latency
+               if min_latency_mode else moe_runner.fused_moe_runner.run_moe)
     output = run_moe(
         input,
         token_selected_experts,
@@ -334,7 +362,8 @@ class FP8RowwiseGemmRunner(TunableRunner):
         constraint_specs=(
             ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),
             ConstraintSpec(3, 0, lambda shapes: shapes[1][0]),
-        ))
+        ),
+    )
 
     def __init__(
         self,
@@ -345,9 +374,8 @@ class FP8RowwiseGemmRunner(TunableRunner):
         self.output_dtype = output_dtype
         instance_key = (output_dtype, )
         if instance_key not in FP8RowwiseGemmRunner.runner_dict:
-            FP8RowwiseGemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP8RowwiseGemmRunner(
-                    output_dtype)
+            FP8RowwiseGemmRunner.runner_dict[instance_key] = (
+                torch.classes.trtllm.FP8RowwiseGemmRunner(output_dtype))
         self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
             instance_key]
 
@@ -411,11 +439,12 @@ def _(
 
 class FP4GemmRunner(TunableRunner):
     runner_dict = dict()
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-        0, 0, get_last_power_of_2_num_tokens_buckets,
-        last_positive_power_of_2), ),
-                                 constraint_specs=(ConstraintSpec(
-                                     2, 0, fp4_scale_infer_shape), ))
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+    )
 
     def __init__(
         self,
@@ -428,9 +457,9 @@ class FP4GemmRunner(TunableRunner):
         self.to_userbuffers = to_userbuffers
         instance_key = (output_dtype, int(fp4_gemm_type))
         if instance_key not in FP4GemmRunner.runner_dict:
-            FP4GemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP4GemmRunner(
-                    output_dtype, int(fp4_gemm_type))
+            FP4GemmRunner.runner_dict[instance_key] = (
+                torch.classes.trtllm.FP4GemmRunner(output_dtype,
+                                                   int(fp4_gemm_type)))
         self.fp4_gemm_runner = FP4GemmRunner.runner_dict[instance_key]
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -501,9 +530,14 @@ class FP8BatchedGemmRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = None
 
-    def __init__(self, output_dtype: torch.dtype, use_deep_seek_fp8: bool,
-                 low_latency_kernel: bool, tile_size: int,
-                 epilogue_tile_m: int):
+    def __init__(
+        self,
+        output_dtype: torch.dtype,
+        use_deep_seek_fp8: bool,
+        low_latency_kernel: bool,
+        tile_size: int,
+        epilogue_tile_m: int,
+    ):
 
         self.output_dtype = output_dtype
         self.use_deep_seek_fp8 = use_deep_seek_fp8
@@ -513,14 +547,23 @@ class FP8BatchedGemmRunner(TunableRunner):
         FP8BatchedGemmRunner.tuning_config = FP8BatchedGemmRunner.get_tuning_config(
             use_deep_seek_fp8, tile_size)
 
-        instance_key = (output_dtype, use_deep_seek_fp8, low_latency_kernel,
-                        tile_size, epilogue_tile_m)
+        instance_key = (
+            output_dtype,
+            use_deep_seek_fp8,
+            low_latency_kernel,
+            tile_size,
+            epilogue_tile_m,
+        )
 
         if instance_key not in FP8BatchedGemmRunner.runner_dict:
-            FP8BatchedGemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP8BatchedGemmRunner(
-                    output_dtype, use_deep_seek_fp8, low_latency_kernel,
-                    tile_size, epilogue_tile_m)
+            FP8BatchedGemmRunner.runner_dict[instance_key] = (
+                torch.classes.trtllm.FP8BatchedGemmRunner(
+                    output_dtype,
+                    use_deep_seek_fp8,
+                    low_latency_kernel,
+                    tile_size,
+                    epilogue_tile_m,
+                ))
 
         self.kernel_runner = FP8BatchedGemmRunner.runner_dict[instance_key]
 
@@ -529,8 +572,7 @@ class FP8BatchedGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: int = -1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run the batched GEMM operation with the given inputs and tactic.
-        """
+        """Run the batched GEMM operation with the given inputs and tactic."""
 
         mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c = inputs
 
@@ -580,8 +622,7 @@ class FP8BatchedGemmRunner(TunableRunner):
     @classmethod
     def get_constraint_specs(cls, use_deep_seek_fp8: bool,
                              tile_size: int) -> Tuple[ConstraintSpec, ...]:
-        """Get the constraint specs for the dynamic tensors for use with the AutoTuner.
-        """
+        """Get the constraint specs for the dynamic tensors for use with the AutoTuner."""
 
         # When using deepseek fp8, the dq_sfs_a and dq_sfs_b tensors are expected to
         # have specific dimensions. As we are only tuning M, we need only constrain
@@ -634,14 +675,16 @@ def fp8_batched_gemm_trtllmgen(
     dq_sfs_a: Optional[torch.Tensor] = None,
     dq_sfs_b: Optional[torch.Tensor] = None,
     scale_c: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = torch.half
+    out_dtype: Optional[torch.dtype] = torch.half,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-    kernel_runner = FP8BatchedGemmRunner(output_dtype=out_dtype,
-                                         use_deep_seek_fp8=use_deep_seek_fp8,
-                                         low_latency_kernel=low_latency,
-                                         tile_size=tile_size,
-                                         epilogue_tile_m=epilogue_tile_m)
+    kernel_runner = FP8BatchedGemmRunner(
+        output_dtype=out_dtype,
+        use_deep_seek_fp8=use_deep_seek_fp8,
+        low_latency_kernel=low_latency,
+        tile_size=tile_size,
+        epilogue_tile_m=epilogue_tile_m,
+    )
 
     tuner = AutoTuner.get()
 
@@ -673,7 +716,7 @@ def _(
     dq_sfs_a: Optional[torch.Tensor] = None,
     dq_sfs_b: Optional[torch.Tensor] = None,
     scale_c: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None
+    out_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     b = mat1.size(0)
@@ -753,9 +796,9 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         self.to_userbuffers = to_userbuffers
         instance_key = (activation_dtype, weight_dtype)
         if instance_key not in WeightOnlyQuantGemmRunner.runner_dict:
-            WeightOnlyQuantGemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.WeightOnlyQuantGemmRunner(
-                    activation_dtype, weight_dtype)
+            WeightOnlyQuantGemmRunner.runner_dict[instance_key] = (
+                torch.classes.trtllm.WeightOnlyQuantGemmRunner(
+                    activation_dtype, weight_dtype))
         self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
             instance_key]
 
@@ -828,22 +871,24 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
                  quant_mode: int):
         instance_key = (activation_dtype, output_dtype, quant_mode)
         if instance_key not in FinegrainedMixedDtypeGemm._runner_dict:
-            FinegrainedMixedDtypeGemm._runner_dict[
-                instance_key] = torch.classes.trtllm.finegrainedMixedDtypeGemmRunner(
-                    activation_dtype, output_dtype, quant_mode)
-        self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
-            instance_key]
+            FinegrainedMixedDtypeGemm._runner_dict[instance_key] = (
+                torch.classes.trtllm.finegrainedMixedDtypeGemmRunner(
+                    activation_dtype, output_dtype, quant_mode))
+        self._finegrained_mixed_dtype_gemm_runner = (
+            FinegrainedMixedDtypeGemm._runner_dict[instance_key])
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(
             range(self._finegrained_mixed_dtype_gemm_runner.get_num_configs()))
 
-    def forward(self,
-                inputs: List[torch.Tensor],
-                tactic: int = -1,
-                do_preparation: bool = False,
-                **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
 
         if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
             raise ValueError(
@@ -855,36 +900,51 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
         alpha = 1.0 if kwargs.get("alpha") is None else kwargs["alpha"]
 
         return self._finegrained_mixed_dtype_gemm_runner.run_gemm(
-            activation, weights_packed, scales, kwargs["group_size"], tactic,
-            kwargs["bias"], kwargs["zeros"], alpha)
+            activation,
+            weights_packed,
+            scales,
+            kwargs["group_size"],
+            tactic,
+            kwargs["bias"],
+            kwargs["zeros"],
+            alpha,
+        )
 
 
 @torch.library.custom_op("trtllm::finegrained_mixed_dtype_gemm",
                          mutates_args=())
 def finegrained_mixed_dtype_gemm(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        scales: torch.Tensor,
-        group_size: int,
-        has_zero_point: bool,
-        output_dtype: torch.dtype,
-        alpha: Optional[float] = None,
-        bias: Optional[torch.Tensor] = None,
-        zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    has_zero_point: bool,
+    output_dtype: torch.dtype,
+    alpha: Optional[float] = None,
+    bias: Optional[torch.Tensor] = None,
+    zeros: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
 
-    assert not has_zero_point or zeros is not None, "Expected 'zeros' tensor when has_zero_point is True"
+    assert (not has_zero_point or zeros
+            is not None), "Expected 'zeros' tensor when has_zero_point is True"
 
     tuner = AutoTuner.get()
 
     tuning_config = TuningConfig(dynamic_tensor_specs=(
         # For tensor index 0 (input A), tune dimension 0 (M dimension)
-        DynamicTensorSpec(0, 0, (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32,
-                                 16, 8, 4, 2, 1), last_positive_power_of_2), ))
+        DynamicTensorSpec(
+            0,
+            0,
+            (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
+            last_positive_power_of_2,
+        ), ))
 
     # NOTE: qunant_mode equals 0 it means we use scale only (FINEGRAINED_SCALE_ONLY), zeros is not used, else we use scale and zero point
     quant_mode = 1 if has_zero_point else 0
     if quant_mode == 0:
-        assert zeros is None, "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
+        assert (
+            zeros is None
+        ), "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
 
     finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm(
         input.dtype, output_dtype, quant_mode)
@@ -898,8 +958,11 @@ def finegrained_mixed_dtype_gemm(
 
     _, best_tactic = tuner.choose_one(
         "trtllm::finegrained_mixed_dtype_gemm::gemm",
-        [finegrained_mixed_dtype_gemm_runner], tuning_config,
-        [input, weight, scales], **kwargs)
+        [finegrained_mixed_dtype_gemm_runner],
+        tuning_config,
+        [input, weight, scales],
+        **kwargs,
+    )
 
     return finegrained_mixed_dtype_gemm_runner(inputs=[input, weight, scales],
                                                tactic=best_tactic,
@@ -1015,9 +1078,11 @@ def _(
 
 
 @torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())
-def silu_and_mul(x: torch.Tensor,
-                 scale: Optional[torch.Tensor] = None,
-                 dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+def silu_and_mul(
+    x: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
     b, n = x.shape
 
     assert n % 2 == 0
@@ -1101,10 +1166,25 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
         b_major = "k"
 
         # full shamoo
-        mma_tiler_mn_candidates = [(256, 128), (128, 128), (128, 256),
-                                   (256, 256), (256, 64), (128, 64)]
-        cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2),
-                                       (2, 4), (4, 1), (4, 2), (4, 4)]
+        mma_tiler_mn_candidates = [
+            (256, 128),
+            (128, 128),
+            (128, 256),
+            (256, 256),
+            (256, 64),
+            (128, 64),
+        ]
+        cluster_shape_mn_candidates = [
+            (1, 1),
+            (1, 2),
+            (1, 4),
+            (2, 1),
+            (2, 2),
+            (2, 4),
+            (4, 1),
+            (4, 2),
+            (4, 4),
+        ]
         swap_ab_candidates = [True, False]
 
         valid_tactics = []
@@ -1121,21 +1201,22 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
                         kernel_n = n
 
                     if Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-                        cutlass.Float4E2M1FN,  # ab_dtype,
-                        cutlass.Float8E4M3FN,  # sf_dtype
-                        sf_vec_size,  # sf_vec_size,
-                        cutlass.BFloat16,  # c_dtype,
-                        mma_tiler_mn,
-                        cluster_shape_mn,
-                        kernel_m,
-                        kernel_n,
-                        real_k,
-                        batch_size,
-                        a_major,
-                        b_major,
-                        c_major,
+                            cutlass.Float4E2M1FN,  # ab_dtype,
+                            cutlass.Float8E4M3FN,  # sf_dtype
+                            sf_vec_size,  # sf_vec_size,
+                            cutlass.BFloat16,  # c_dtype,
+                            mma_tiler_mn,
+                            cluster_shape_mn,
+                            kernel_m,
+                            kernel_n,
+                            real_k,
+                            batch_size,
+                            a_major,
+                            b_major,
+                            c_major,
                     ):
-                        valid_tactics.append((mma_tiler_mn, cluster_shape_mn, swap_ab))
+                        valid_tactics.append(
+                            (mma_tiler_mn, cluster_shape_mn, swap_ab))
 
         return valid_tactics
 
@@ -1274,8 +1355,21 @@ class CuteDSLNVFP4BlackwellLinear(TunableRunner):
             compiled_gemm = CuteDSLNVFP4BlackwellLinear.kernel_dict[CACHE_KEY]
 
         # launch gemm kernel
-        compiled_gemm(kernel_m, kernel_n, real_k, kernel_sf_m // 128, kernel_sf_n // 128, sf_k // 4, kernel_a_ptr,
-                      kernel_b_ptr, kernel_a_sf_ptr, kernel_b_sf_ptr, c_ptr, self.alpha, stream)
+        compiled_gemm(
+            kernel_m,
+            kernel_n,
+            real_k,
+            kernel_sf_m // 128,
+            kernel_sf_n // 128,
+            sf_k // 4,
+            kernel_a_ptr,
+            kernel_b_ptr,
+            kernel_a_sf_ptr,
+            kernel_b_sf_ptr,
+            c_ptr,
+            self.alpha,
+            stream,
+        )
 
         if swap_ab:
             c_tensor = c_tensor.permute(1, 0)
@@ -1334,6 +1428,7 @@ def _(
 
 def get_event(event_idx: int):
     from ..utils import get_model_extra_attrs
+
     extra_attrs = get_model_extra_attrs()
     assert "events" in extra_attrs, "Missing Event Book"
     return extra_attrs["events"]()[event_idx]
@@ -1341,6 +1436,7 @@ def get_event(event_idx: int):
 
 def get_stream(stream_id: int):
     from ..utils import get_model_extra_attrs
+
     extra_attrs = get_model_extra_attrs()
     if stream_id == 0:
         return extra_attrs["global_stream"]
