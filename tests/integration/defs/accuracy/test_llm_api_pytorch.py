@@ -1718,13 +1718,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     @parametrize_with_ids("kv_cache_reuse", [True, False])
-    @parametrize_with_ids(
-        "quant_dtype",
-        [
-            pytest.param("none", marks=skip_pre_hopper),
-            # pytest.param("fp8", marks=skip_pre_hopper),
-            pytest.param("nvfp4", marks=skip_pre_blackwell)
-        ])
+    @parametrize_with_ids("quant_dtype", [
+        pytest.param("none", marks=skip_pre_hopper),
+        pytest.param("fp8", marks=skip_pre_hopper),
+        pytest.param("nvfp4", marks=skip_pre_blackwell)
+    ])
     # currently, chunked prefill is not supported for fp8 and nvfp4
     def test_chunked_prefill(self, quant_dtype, kv_cache_reuse, fp8kv,
                              overlap_scheduler):
@@ -2020,7 +2018,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size):
-        if get_sm_version() == 100:
+        if get_sm_version() == 100 or get_sm_version() == 103:
             moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:

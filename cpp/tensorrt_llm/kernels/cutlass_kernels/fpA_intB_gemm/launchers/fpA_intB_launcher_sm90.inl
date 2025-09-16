@@ -51,8 +51,9 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-namespace cutlass_kernels
+namespace cutlass_kernels_oss
 {
+using namespace tensorrt_llm::kernels::cutlass_kernels;
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
@@ -295,6 +296,6 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
 #endif // COMPILE_HOPPER_TMA_GEMMS
 }
 
-} // namespace cutlass_kernels
+} // namespace cutlass_kernels_oss
 } // namespace kernels
 } // namespace tensorrt_llm
