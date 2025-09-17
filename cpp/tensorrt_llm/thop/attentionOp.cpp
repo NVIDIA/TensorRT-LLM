@@ -359,13 +359,15 @@ public:
         common_enqueue_params.workspace = workspace_ptr;
         if (softmax_stats_tensor.has_value())
         {
+            TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().scalar_type() == at::ScalarType::Float,
+                "softmax_stats_tensor must have float type");
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().size(0) >= num_tokens,
-                "softmax_stats_tensor must be a float tensor with first dimension >= num_tokens");
+                "softmax_stats_tensor must have first dimension >= num_tokens");
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().size(1) >= op.mNumHeads,
-                "softmax_stats_tensor must be a float tensor with second dimension >= num_heads");
-            TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().size(2) == 2,
-                "softmax_stats_tensor must be a float tensor with third dimension == 2");
-            common_enqueue_params.softmax_stats = static_cast<float2*>(softmax_stats_tensor.value().data_ptr<float>());
+                "softmax_stats_tensor must have second dimension >= num_heads");
+            TLLM_CHECK_WITH_INFO(
+                softmax_stats_tensor.value().size(2) == 2, "softmax_stats_tensor must have third dimension == 2");
+            common_enqueue_params.softmax_stats = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
         }
 
         if (is_context) // context stage
