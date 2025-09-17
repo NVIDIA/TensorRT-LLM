@@ -625,7 +625,7 @@ def create_py_executor_instance(
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules,
-            lora_config.swap_gate_up_proj_lora_b_weight)
+            lora_config.lora_weights_converters)
 
     max_num_sequences = max_batch_size * mapping.pp_size
 
