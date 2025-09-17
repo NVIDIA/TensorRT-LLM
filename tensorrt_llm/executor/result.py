@@ -260,6 +260,10 @@ class GenerationResultBase:
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
                 assert len(output.logprobs) == output.length
+            if response_tensors.top_log_probs is not None:
+                for logprob_idx in range(len(output.logprobs)):
+                    output.logprobs[logprob_idx].update(
+                        response_tensors.top_log_probs[src_idx][logprob_idx])
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
