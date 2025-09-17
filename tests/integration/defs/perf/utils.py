@@ -368,7 +368,7 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                           shell=True) as server_proc):
                 self.wait_for_endpoint_ready(
                     f"http://localhost:8000/health",
-                    timeout=3600)  # 60 minutes for large models
+                    timeout=1800)  # 30 minutes for large models
                 check_output(self.client_cmd, env=venv._new_env)
                 output += check_output(self.benchmark_cmd, env=venv._new_env)
         finally:
