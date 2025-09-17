@@ -1035,24 +1035,6 @@ def _(
     return x.new_empty((b, d), dtype=o_dtype)
 
 
-@torch.library.register_fake("trtllm::cute_dsl_nvfp4_gemm_blackwell")
-def _(
-    mat_a: torch.Tensor,
-    mat_b: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: float,
-    output_dtype: torch.dtype,
-):
-    # [m, k]
-    shape = list(mat_a.shape)
-    # [n, k]
-    shape[-1] = mat_b.shape[-2]
-    # output is fixed as bf16
-    ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
-    return ret
-
-
 def get_event(event_idx: int):
     from ..utils import get_model_extra_attrs
     extra_attrs = get_model_extra_attrs()

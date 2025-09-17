@@ -231,10 +231,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
 
-        if not HAS_CUTLASS_DSL:
-            raise RuntimeError(
-                "nvidia-cutlass-dsl 4.1.0 requires Python >=3.12")
-
         tuner = AutoTuner.get()
 
         cute_dsl_nvfp4_gemm_blackwell_runner = CuteDSLNVFP4BlackwellLinear(
@@ -249,3 +245,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs=[input, weight, input_scale, weight_scale],
             tactic=best_tactic,
         )
+
+    @torch.library.register_fake("trtllm::cute_dsl_nvfp4_gemm_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: float,
+        output_dtype: torch.dtype,
+    ):
+        # [m, k]
+        shape = list(mat_a.shape)
+        # [n, k]
+        shape[-1] = mat_b.shape[-2]
+        # output is fixed as bf16
+        ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
+        return ret
