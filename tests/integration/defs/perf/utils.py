@@ -18,6 +18,7 @@ import copy
 import io
 import os
 import re
+import socket
 import subprocess
 import time
 from datetime import datetime
@@ -91,8 +92,43 @@ class MultiNodeProbe(object):
     '''
 
     @staticmethod
+    def get_nodelist():
+        """Get list of nodes from SLURM environment"""
+        return os.environ.get("SLURM_NODELIST", "").split(',')
+
+    @staticmethod
     def is_multi_node():
-        pass
+        # return whether the test is running on multi-node or not
+        return len(MultiNodeProbe.get_nodelist()) > 1
+
+    @staticmethod
+    def is_first_node():
+        if not MultiNodeProbe.is_multi_node():
+            return False
+        return int(os.environ.get("SLURM_NODEID", 0)) == 0
+
+    @staticmethod
+    def is_second_node():
+        if not MultiNodeProbe.is_multi_node():
+            return False
+        return int(os.environ.get("SLURM_NODEID", 0)) == 1
+
+    @staticmethod
+    def is_first_process():
+        """Check if this is rank 0 process on current node (should start servers)"""
+        if not MultiNodeProbe.is_multi_node():
+            return False
+        rank = int(os.environ.get("SLURM_PROCID", 0))
+        ntasks_per_node = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
+        return (rank % ntasks_per_node) == 0
+
+    @staticmethod
+    def get_other_node_ip():
+        if not MultiNodeProbe.is_multi_node():
+            return "localhost"
+        nodelist = MultiNodeProbe.get_nodelist()
+        current = socket.gethostname()
+        return next((node for node in nodelist if node != current), "localhost")
 
 
 class PerfMetricType(str, Enum):
