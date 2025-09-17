@@ -154,7 +154,7 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                 float constexpr E4m3MaxVal{448.f};
 
                 // Compute the absolute max
-                float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cub::Max());
+                float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cuda::maximum<>());
                 if (threadIdx.x == 0)
                 {
                     s_scaleOut = aMax / E4m3MaxVal;
@@ -516,11 +516,11 @@ __global__ void finalizeKernel(KernelParams params)
                 if (params.expertWeightsPtr != nullptr)
                 {
                     TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
-                    data += float{scale} * float{params.inPtr[permutedIdx * params.hiddenDim + hiddenIdx]};
+                    data += float{scale} * float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
                 }
                 else
                 {
-                    data += float{params.inPtr[permutedIdx * params.hiddenDim + hiddenIdx]};
+                    data += float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
                 }
             }
 
@@ -549,7 +549,9 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     using Type = typename KernelParams::Type;
     using TypeExpW = typename KernelParams::TypeExpW;
 
+    int const hiddenDimPaddedBits = params.hiddenDimPadded * cutlass::sizeof_bits<Type>::value;
     int const hiddenDimBits = params.hiddenDim * cutlass::sizeof_bits<Type>::value;
+    assert(hiddenDimPaddedBits % 128 == 0);
     assert(hiddenDimBits % 128 == 0);
 
     // Load 128-bits per thread, according to the smallest data type we read/write
@@ -561,6 +563,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     int64_t const tokenIdx = blockIdx.x;
     int64_t const startOffset = threadIdx.x;
     int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+    int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
     int64_t const numElemsInCol = params.hiddenDim / FINALIZE_ELEM_PER_THREAD;
 
     auto const offset = tokenIdx * params.hiddenDim;
@@ -592,7 +595,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
             float const scale
                 = (params.expertWeightsPtr != nullptr) ? static_cast<float>(params.expertWeightsPtr[expandedIdx]) : 1.f;
 
-            auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInCol;
+            auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
 
             float4 input = vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
             InputElem inputPermutedElem = *reinterpret_cast<InputElem const*>(&input);
@@ -650,14 +653,14 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
                 float const expertProb = (float) params.expertWeightsPtr[tokenIdx * params.topK + k];
 
                 float const scale = expertProb * blockScale;
-                acc += scale * static_cast<float>(params.inPtr[permutedIdx * params.hiddenDim + hiddenIdx]);
+                acc += scale * static_cast<float>(params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]);
             }
 
             // The largest (finite) value that can be represented using E4m3.
             float constexpr E4m3MaxVal{448.f};
 
             // Compute the absolute max
-            float aMax = BlockReduce(temp_storage).Reduce(fabsf(acc), cub::Max());
+            float aMax = BlockReduce(temp_storage).Reduce(fabsf(acc), cuda::maximum<>());
 
             if (threadIdx.x == 0)
             {

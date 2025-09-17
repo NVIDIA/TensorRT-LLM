@@ -339,7 +339,9 @@ def mergeWaiveList(pipeline, globalVars)
     LLM_TOT_ROOT = "llm-tot"
     targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
     echo "Target branch: ${targetBranch}"
-    trtllm_utils.checkoutSource(LLM_REPO, targetBranch, LLM_TOT_ROOT, true, true)
+    withCredentials([string(credentialsId: 'default-sync-llm-repo', variable: 'DEFAULT_SYNC_LLM_REPO')]) {
+        trtllm_utils.checkoutSource(DEFAULT_SYNC_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, false)
+    }
     targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
     echo "Target branch TOT commit: ${targetBranchTOTCommit}"
     sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
@@ -347,12 +349,15 @@ def mergeWaiveList(pipeline, globalVars)
     // Get waive list diff in current MR
     def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
 
+    // Write diff to a temporary file to avoid shell escaping issues
+    writeFile file: 'diff_content.txt', text: diff
+
     // Merge waive lists
     sh """
         python3 mergeWaiveList.py \
         --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
         --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
-        --diff='${diff}' \
+        --diff-file=diff_content.txt \
         --output-file=waives.txt
     """
     trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
@@ -381,30 +386,11 @@ def launchReleaseCheck(pipeline)
             -y""")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
-        // Step 1: cloning tekit source code
+        // Step 1: Clone TRT-LLM source codes
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
 
-        // Step 2: build tools
-        withEnv(['GONOSUMDB=*.nvidia.com']) {
-            withCredentials([
-                gitUsernamePassword(
-                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                    gitToolName: 'git-tool'
-                ),
-                string(
-                    credentialsId: 'default-git-url',
-                    variable: 'DEFAULT_GIT_URL'
-                )
-            ]) {
-                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
-            }
-        }
-        // Step 3: Run license check
-        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
-
-        // Step 4: Run guardwords scan
+        // Step 2: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
         if (env.alternativeTRT || isOfficialPostMergeJob) {
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
@@ -429,6 +415,26 @@ def launchReleaseCheck(pipeline)
                 echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
             }
         }
+
+        // Step 3: Run pre-commit checks
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
+
+        // Step 4: Run license check
+        withEnv(['GONOSUMDB=*.nvidia.com']) {
+            withCredentials([
+                gitUsernamePassword(
+                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                    gitToolName: 'git-tool'
+                ),
+                string(
+                    credentialsId: 'default-git-url',
+                    variable: 'DEFAULT_GIT_URL'
+                )
+            ]) {
+                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
+            }
+        }
+        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
@@ -585,6 +591,12 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
 }
 
 def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set changed file diff to empty string.")
+        return ""
+    }
+
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
     def diff = ""
 
@@ -617,6 +629,7 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     }
     def specialFileToTagMap = [
         "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
+        "cpp/kernels/fmha_v2/": ["-FMHA-"],
     ]
     for (file in changedFileList) {
         for (String key : specialFileToTagMap.keySet()) {
@@ -678,9 +691,9 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/thop/allgatherOp.cpp",
         "cpp/tensorrt_llm/thop/allreduceOp.cpp",
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
-        "cpp/tests/executor/",
-        "cpp/tests/kernels/allReduce/",
-        "cpp/tests/runtime/mpiUtilsTest.cpp",
+        "cpp/tests/e2e_tests/batch_manager/",
+        "cpp/tests/e2e_tests/executor/",
+        "cpp/tests/unit_tests/multi_gpu/",
         "jenkins/L0_Test.groovy",
         "tensorrt_llm/_ipc_utils.py",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
@@ -847,7 +860,7 @@ def collectTestResults(pipeline, testFilter)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
             sh """
-                python3 llm/jenkins/test_rerun.py \
+                python3 llm/jenkins/scripts/test_rerun.py \
                 generate_rerun_report \
                 --output-file=rerun/rerun_report.xml \
                 --input-files=${inputfiles}
@@ -1217,7 +1230,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'branch': branch,
                         'action': "push",
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'runSanityCheck': true,
+                        'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
                     ]
 
                     launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
@@ -1234,6 +1247,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
         echo "Will run Build-Docker-Images job"
+        stages.remove("x86_64-linux")
+        stages.remove("SBSA-linux")
+        echo "Build-Docker-Images job is set explicitly. Both x86_64-linux and SBSA-linux sub-pipelines will be disabled."
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {

@@ -19,6 +19,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/operators.h>
 #include <nanobind/stl/bind_vector.h>
+#include <nanobind/stl/chrono.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -34,11 +35,14 @@
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
+#include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
+#include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -50,7 +54,6 @@
 
 namespace nb = nanobind;
 namespace tb = tensorrt_llm::batch_manager;
-namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tpb = tensorrt_llm::nanobind::batch_manager;
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
@@ -125,9 +128,13 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
+    auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
+    auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
+    tensorrt_llm::nanobind::common::initExceptionsBindings(mExceptions);
+    tensorrt_llm::nanobind::thop::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
@@ -164,6 +171,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("FP8", nvinfer1::DataType::kFP8)
         .value("BF16", nvinfer1::DataType::kBF16)
         .value("INT64", nvinfer1::DataType::kINT64)
+        .value("NVFP4", nvinfer1::DataType::kFP4)
         .export_values();
 
     nb::enum_<tr::ModelConfig::ModelVariant>(m, "GptModelVariant")
@@ -242,16 +250,22 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("has_per_group_scaling", &tc::QuantMode::hasPerGroupScaling)
         .def_prop_ro("has_static_activation_scaling", &tc::QuantMode::hasStaticActivationScaling)
         .def_prop_ro("has_int8_kv_cache", &tc::QuantMode::hasInt8KvCache)
+        .def_prop_ro("has_fp4_kv_cache", &tc::QuantMode::hasFp4KvCache)
         .def_prop_ro("has_fp8_kv_cache", &tc::QuantMode::hasFp8KvCache)
         .def_prop_ro("has_fp8_qdq", &tc::QuantMode::hasFp8Qdq)
         .def_prop_ro("has_nvfp4", &tc::QuantMode::hasNvfp4)
         .def_prop_ro("has_w4a8_mxfp4_fp8", &tc::QuantMode::hasW4a8Mxfp4Fp8)
+
+        .def_prop_ro("has_w4a8_mxfp4_mxfp8", &tc::QuantMode::hasW4a8Mxfp4Mxfp8)
+        .def_prop_ro("has_w4a16_mxfp4", &tc::QuantMode::hasW4a16Mxfp4)
+
         .def_prop_ro("has_kv_cache_quant", &tc::QuantMode::hasKvCacheQuant)
         .def_static("from_description", &tc::QuantMode::fromDescription, nb::arg("quantize_weights"),
             nb::arg("quantize_activations"), nb::arg("per_token"), nb::arg("per_channel"), nb::arg("per_group"),
             nb::arg("use_int4_weights"), nb::arg("use_int8_kv_cache"), nb::arg("use_fp8_kv_kache"),
             nb::arg("use_fp8_qdq"), nb::arg("use_fp8_rowwise"), nb::arg("use_w4a8_qserve"), nb::arg("use_nvfp4"),
-            nb::arg("use_fp8_block_scales"), nb::arg("use_w4a8_mxfp4_fp8"))
+            nb::arg("use_fp8_block_scales"), nb::arg("use_w4a8_mxfp4_fp8"), nb::arg("use_w4a8_mxfp4_mxfp8"),
+            nb::arg("use_w4a16_mxfp4"))
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, nb::arg("per_token") = false,
             nb::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, nb::arg("use_int4_weights") = false,
@@ -461,7 +475,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("DISAGG_CONTEXT_COMPLETE", tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE)
         .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
-        .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
+        .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS)
+        .value("DISAGG_TRANS_ERROR", tb::LlmRequestState::kDISAGG_TRANS_ERROR);
 
     nb::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, nb::rv_policy::reference)
@@ -473,6 +488,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);
+
+    tb::kv_cache_manager::KVCacheManagerConnectorBindings::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
@@ -495,4 +512,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, nb::rv_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
+
+    m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
 }

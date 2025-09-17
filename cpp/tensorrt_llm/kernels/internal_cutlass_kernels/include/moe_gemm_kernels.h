@@ -39,11 +39,6 @@
 
 namespace tensorrt_llm
 {
-template <class T>
-constexpr auto transpose_stride(T const& t)
-{
-    return cute::prepend(cute::prepend(cute::take<2, cute::rank_v<T>>(t), cute::get<0>(t)), cute::get<1>(t));
-}
 
 // Note update moe.py to match
 enum class ActivationType
@@ -53,6 +48,7 @@ enum class ActivationType
     Silu,
     Swiglu,
     Geglu,
+    SwigluBias,
     Identity,
     InvalidType
 };
@@ -86,8 +82,6 @@ struct GroupedGemmInput
 
 struct TmaWarpSpecializedGroupedGemmInput
 {
-    template <class T>
-    using TransposeStride = decltype(transpose_stride<T>(T{}));
     template <class Tag>
     using TransposeLayoutTag = std::conditional_t<std::is_same_v<Tag, cutlass::layout::RowMajor>,
         cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
@@ -100,6 +94,7 @@ struct TmaWarpSpecializedGroupedGemmInput
     using LayoutA = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for A matrix operand
     using LayoutB = TransposeLayoutTag<cutlass::layout::ColumnMajor>; // Layout type for B matrix operand
     using LayoutC = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for C matrix operand
+    using LayoutD = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for D matrix operand
 
     constexpr static int NVFP4BlockScaleVectorSize = 16;
     constexpr static int MXFPXBlockScaleVectorSize = 32;
@@ -121,6 +116,7 @@ struct TmaWarpSpecializedGroupedGemmInput
     using StrideB
         = std::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutB*>>; // Use A because they will be swapped
     using StrideC = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutC*>>;
+    using StrideD = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD*>>;
 
 #ifdef ENABLE_FP8
     template <class T>
@@ -147,37 +143,26 @@ struct TmaWarpSpecializedGroupedGemmInput
     StrideC* stride_c = nullptr;
     void const** ptr_c = nullptr;
 
-    struct DefaultEpilogue
-    {
-        using LayoutD = TransposeLayoutTag<cutlass::layout::RowMajor>; // Layout type for D matrix operand
-        using StrideD = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD*>>;
-
-        StrideD* stride_d = nullptr;
-        void** ptr_d = nullptr;
-    };
+    // D is used in all cases except fused finalize
+    StrideD* stride_d = nullptr;
+    void** ptr_d = nullptr;
 
     struct FusedFinalizeEpilogue
     {
-        using StrideFinalOutput = DefaultEpilogue::StrideD;
-        using StrideBias = TransposeStride<cute::Stride<cute::_0, cute::_1, int>>;
-        using StrideRouterScales = TransposeStride<cute::Stride<cute::_1, cute::_0>>;
+        using StrideFinalOutput = cutlass::detail::TagToStrideC_t<LayoutD>;
 
         void* ptr_final_output = nullptr;
         StrideFinalOutput stride_final_output{};
 
-        void const* ptr_bias = nullptr;
-        StrideBias stride_bias{};
+        void const** ptr_bias = nullptr;
+        float const** ptr_router_scales = nullptr;
 
-        float const* ptr_router_scales = nullptr;
-        StrideRouterScales stride_router_scales{};
+        int const** ptr_source_token_index = nullptr;
+        int num_rows_in_final_output = 0;
 
-        int64_t const* ptr_expert_first_token_offset = nullptr;
-        int const* ptr_source_token_index = nullptr;
-
-        size_t num_rows_in_final_output = 0;
+        bool use_reduction = true;
     };
 
-    DefaultEpilogue default_epilogue;
     FusedFinalizeEpilogue fused_finalize_epilogue;
 
     enum class EpilogueFusion
@@ -210,7 +195,8 @@ struct TmaWarpSpecializedGroupedGemmInput
 
     struct INT4GroupwiseParams
     {
-        constexpr static int group_size = 128; // Unused, hard-coded to 128
+        constexpr static int int4_group_size = 128;
+        constexpr static int wfp4a16_group_size = 32;
         bool enabled = false;
         using SFA = __nv_bfloat16;
         using SFB = __nv_bfloat16; // Unused
@@ -233,7 +219,7 @@ struct TmaWarpSpecializedGroupedGemmInput
     uint8_t* gemm_workspace = nullptr;
     size_t gemm_workspace_size = 0;
 
-    static std::array<size_t, 17> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
+    static std::array<size_t, 20> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
     static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 
@@ -245,16 +231,15 @@ struct TmaWarpSpecializedGroupedGemmInput
         return stride_a != nullptr && ptr_a != nullptr;
     }
 
-    void setFinalizeFusionParams(void* final_output, float const* router_scales,
-        int64_t const* expert_first_token_offset, int const* source_token_index, void const* bias, int hidden_size,
-        int num_output_tokens);
+    void setFinalizeFusionParams(void* final_output, int hidden_size, int num_output_tokens, bool use_reduction);
 
     std::string toString() const;
 };
 
 constexpr bool isGatedActivation(ActivationType activation_type)
 {
-    return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu;
+    return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu
+        || activation_type == ActivationType::SwigluBias;
 }
 
 template <typename T,                   /*The type used for activations/scales/compute*/
@@ -280,7 +265,6 @@ public:
 #else
     static constexpr bool use_fp8 = false;
     static constexpr bool use_w4afp8 = false;
-    static constexpr bool use_wfp4afp4 = false;
 #endif
 
 #if defined(ENABLE_FP4)
@@ -306,9 +290,9 @@ public:
 
     [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
     [[nodiscard]] bool supportsTmaWarpSpecialized() const;
-    [[nodiscard]] bool isFusedGatedActivation(
-        cutlass_extensions::CutlassGemmConfig gemm_config, bool is_gated_activation, int gemm_n, int gemm_k) const;
-    [[nodiscard]] bool supportsFusedGatedActivation(bool is_gated_activation, int gemm_n, int gemm_k) const;
+    [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
+        ActivationType activation_type, int gemm_n, int gemm_k) const;
+    [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n, int gemm_k) const;
 
     size_t getMaxWorkspaceSize(int num_experts) const;
 

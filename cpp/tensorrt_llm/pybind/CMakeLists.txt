@@ -6,8 +6,8 @@ set(TRTLLM_PYBIND_MODULE
 set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
-    batch_manager/buffers.cpp
     batch_manager/cacheTransceiver.cpp
+    batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
     executor/bindings.cpp
@@ -15,10 +15,14 @@ set(SRCS
     executor/executorConfig.cpp
     executor/request.cpp
     runtime/bindings.cpp
+    runtime/hostfunc.cpp
+    common/tllmExceptions.cpp
     testing/modelSpecBinding.cpp
     runtime/moeBindings.cpp
+    testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
+    thop/bindings.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
@@ -44,7 +48,9 @@ target_link_libraries(
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
          torch_python
-         ${CUDA_NVML_LIB})
+         ${CUDA_DRV_LIB}
+         ${CUDA_NVML_LIB}
+         th_common)
 target_compile_definitions(
   ${TRTLLM_PYBIND_MODULE} PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE}
                                  PYBIND11_DETAILED_ERROR_MESSAGES=1)
@@ -54,6 +60,6 @@ if(NOT WIN32)
     ${TRTLLM_PYBIND_MODULE}
     PROPERTIES
       LINK_FLAGS
-      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' -Wl,-rpath,'${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/stubs' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
+      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
   )
 endif()

@@ -1,19 +1,21 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 -c constraints.txt
-accelerate>=0.25.0
+accelerate>=1.7.0
 build
 colored
-cuda-python # Do not override the custom version of cuda-python installed in the NGC PyTorch image.
+# cuda-python>=12,<13  # <For CUDA 12.9>
+cuda-python>=12
 diffusers>=0.27.0
 lark
 mpi4py
 numpy<2
-onnx>=1.12.0
+onnx>=1.18.0
 onnx_graphsurgeon>=0.5.2
 openai
 polygraphy
 psutil
-nvidia-ml-py>=12,<13
+# nvidia-ml-py>=12,<13  # <For CUDA 12.9>
+nvidia-ml-py>=12
 # Just a wrapper since nvidia-modelopt requires pynvml
 pynvml==12.0.0
 pulp
@@ -21,14 +23,20 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.11.0
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-05.html#rel-25-05 uses 2.8.0a0.
-torch>=2.7.1,<=2.8.0a0
+# tensorrt>=10.11.0,<=10.13.0  # <For CUDA 12.9>
+tensorrt~=10.13.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.8.0a0.
+# torch>=2.7.1,<=2.8.0a0  # <For CUDA 12.9>
+torch>=2.8.0a0,<=2.8.0
 torchvision
 nvidia-modelopt[torch]~=0.33.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.27.7
 nvidia-nccl-cu12
-nvidia-cuda-nvrtc-cu12
-transformers==4.53.1
+# nvidia-cuda-nvrtc-cu12  # <For CUDA 12.9>
+nvidia-cuda-nvrtc
+transformers==4.55.0
+prometheus_client
+prometheus_fastapi_instrumentator
 pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf
@@ -49,9 +57,11 @@ setuptools<80
 ordered-set
 peft
 einops
-flashinfer-python==0.2.5
+flashinfer-python>=0.3.0
 opencv-python-headless
-xgrammar==0.1.19
+xgrammar==0.1.21
+llguidance==0.7.29
+jsonschema
 backoff
 nvtx
 matplotlib # FIXME: this is added to make nvtx happy
@@ -59,5 +69,9 @@ meson
 ninja
 etcd3
 blake3
-llguidance==0.7.29
 soundfile
+triton==3.3.1; platform_machine == "x86_64"
+tiktoken
+blobfile
+openai-harmony==0.0.4
+nvidia-cutlass-dsl==4.1.0; python_version >= "3.12"

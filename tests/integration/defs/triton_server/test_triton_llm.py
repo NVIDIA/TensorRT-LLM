@@ -1,16 +1,18 @@
 import os
+import re
 import sys
 
 import pytest
 import torch
 import yaml
 
-sys.path.append(os.path.join(os.environ["LLM_ROOT"], "triton_backend"))
-
 from .build_engines import *
 from .common import *
-from .conftest import venv_check_call, venv_check_output
+from .conftest import find_repo_root, venv_check_call, venv_check_output
 from .trt_test_alternative import call, check_call, print_info
+
+LLM_ROOT = os.environ.get("LLM_ROOT", find_repo_root())
+sys.path.append(os.path.join(LLM_ROOT, "triton_backend"))
 
 
 @pytest.fixture(autouse=True)
@@ -91,7 +93,7 @@ def test_llama_v2_7b_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENGINE_PATH = prepare_llama_v2_7b_engine("ifb",
                                              tensorrt_llm_llama_example_root,
@@ -216,7 +218,7 @@ def test_mistral_v1_7b_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH = prepare_mistral_v1_7b_engine("ifb",
                                                tensorrt_llm_llama_example_root,
@@ -333,7 +335,7 @@ def test_mistral_v1_multi_models(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH = prepare_mistral_v1_7b_engine("ifb",
                                                tensorrt_llm_llama_example_root,
@@ -402,8 +404,7 @@ def test_mistral_v1_7b_python_backend(
     tensorrt_llm_llama_example_root,
     llm_backend_venv,
 ):
-    llm_backend_repo_root = os.path.join(os.environ["LLM_ROOT"],
-                                         "triton_backend")
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH = prepare_mistral_v1_7b_engine("python_backend",
                                                tensorrt_llm_llama_example_root,
@@ -520,7 +521,7 @@ def test_llama_v2_70b_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH = prepare_llama_v2_70b_engine("ifb",
                                               tensorrt_llm_llama_example_root,
@@ -640,7 +641,7 @@ def test_llama_v2_70b_ifb_lad(
     if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
         pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
 
     # Build Engine
     ENGINE_PATH = prepare_llama_v2_70b_engine("ifb",
@@ -765,7 +766,7 @@ def test_medusa_vicuna_7b_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH = prepare_medusa_vicuna_7b_engine(
         tensorrt_llm_medusa_example_root, vicuna_7b_model_root,
@@ -890,7 +891,7 @@ def test_eagle_vicuna_7b_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH = prepare_eagle_vicuna_7b_engine(
         tensorrt_llm_eagle_example_root, vicuna_7b_model_root,
@@ -967,7 +968,7 @@ def test_gpt_350m_python_backend(
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENGINE_PATH = prepare_gpt_350m_engine(
         "python_backend",
@@ -1096,7 +1097,7 @@ def test_gpt_350m_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENGINE_PATH = prepare_gpt_350m_engine(
         "ifb",
@@ -1232,7 +1233,7 @@ def test_t5_small_enc_dec_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENCODER_ENGINE_DIR, ENGINE_DIR = prepare_t5_small_engine(
         tensorrt_llm_enc_dec_example_root, t5_small_model_root)
@@ -1353,7 +1354,7 @@ def test_whisper_large_v3_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENCODER_ENGINE_DIR, ENGINE_DIR = prepare_whisper_large_engine(
         tensorrt_llm_whisper_example_root, whisper_large_model_root)
@@ -1489,7 +1490,7 @@ def test_gpt_gather_logits_ifb(
     if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
         pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENGINE_PATH = prepare_gpt_gather_logits_engine(
         "ifb",
@@ -1616,7 +1617,7 @@ def test_gpt_350m_speculative_decoding(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     CONTROL_ENGINE_DIR = prepare_gpt_350m_engine(
         "medium_control_ifb",
@@ -1806,7 +1807,7 @@ def test_gpt_350m_speculative_decoding_return_logits(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     CONTROL_ENGINE_DIR = prepare_gpt_350m_engine(
         "medium_control_ifb",
@@ -1999,7 +2000,7 @@ def test_gpt_speculative_decoding_bls(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     CONTROL_ENGINE_DIR = prepare_gpt_350m_engine(
         "medium_control_ifb",
@@ -2159,7 +2160,7 @@ def test_llama_v3_speculative_decoding_bls(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     DRAFT_ENGINE_DIR = prepare_llama_v3_8b_engine(
         tensorrt_llm_example_root,
@@ -2324,7 +2325,7 @@ def test_gpt_175b_dummyWeights_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH = prepare_gpt_175b_engine("ifb", tensorrt_llm_gpt_example_root,
                                           tensorrt_llm_example_root)
@@ -2440,7 +2441,7 @@ def test_llava(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH, MULTIMODAL_ENGINE_DIR = prepare_llava_engine(
         tensorrt_llm_multimodal_example_root, tensorrt_llm_llama_example_root,
@@ -2576,7 +2577,7 @@ def test_llava_onevision(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH, MULTIMODAL_ENGINE_DIR = prepare_llava_onevision_engine(
         tensorrt_llm_multimodal_example_root, tensorrt_llm_qwen_example_root,
@@ -2735,7 +2736,7 @@ def test_mllama(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH, MULTIMODAL_ENGINE_DIR = prepare_mllama_engine(
         tensorrt_llm_multimodal_example_root, tensorrt_llm_mllama_example_root,
@@ -2910,7 +2911,7 @@ def test_gpt_next_ptuning_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENGINE_PATH, output_model_dir = prepare_gpt_next_ptuning_engine(
         "ifb", tensorrt_llm_gpt_example_root, gpt_next_ptuning_model_root)
@@ -3088,7 +3089,7 @@ def test_gpt_2b_lora_ifb(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     weight_streaming = float(GPU_WEIGHTS_PERCENT) < 1.0
     ENGINE_PATH = prepare_gpt_2b_lora_engine("ifb",
@@ -3239,7 +3240,7 @@ def test_tiny_llama_1b_guided_decoding(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
 
     # Build engine
     ENGINE_PATH, XGRAMMAR_TOKENIZER_INFO_PATH = prepare_tiny_llama_1b_engine(
@@ -3388,7 +3389,7 @@ def test_gpt_disaggregated_serving_bls(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENGINE_PATH = prepare_gpt_350m_engine(
         "ifb",
@@ -3556,7 +3557,7 @@ def test_benchmark_core_model(
     llm_backend_venv,
 ):
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build Engine
     ENGINE_PATH = model_setup["prepare_engine_fn"](
         "ifb", model_setup["example_root"], model_setup["tokenizer_path"])
@@ -3632,7 +3633,7 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                         TENSOR_PARALLEL_SIZE,
                         llm_backend_inflight_batcher_llm_root, llm_backend_venv,
                         llm_backend_dataset_root):
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
 
     if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
         pytest.skip("Skipping. Not enough GPUs.")
@@ -3726,6 +3727,12 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
             output = venv_check_output(llm_backend_venv, run_cmd)
             assert 'Request is cancelled' in output
 
+            # Test request cancellation for non-existing request and completed request
+            run_cmd = [
+                f"{llm_backend_repo_root}/tools/tests/test_llmapi_cancel.py"
+            ]
+            output = venv_check_output(llm_backend_venv, run_cmd)
+
 
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
 @pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
@@ -3789,7 +3796,7 @@ def test_tiny_llama_ifb_token_counts(
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
     # Build engine
     ENGINE_PATH, _ = prepare_tiny_llama_1b_engine(
         type="ifb",
@@ -3887,3 +3894,198 @@ def test_tiny_llama_ifb_token_counts(
     print_info(
         f"Successfully tested token count functionality for {TOKEN_COUNT_TEST} mode"
     )
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
+@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
+@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
+@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
+@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
+                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.7"])
+@pytest.mark.parametrize("CROSS_KV_CACHE_FRACTION", [""])
+@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
+                         ids=["disableTrtOverlap"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
+@pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
+                         ids=["enableDecoupleMode", "disableDecoupleMode"])
+@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["1"])
+@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
+@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
+@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
+@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
+@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
+@pytest.mark.parametrize("DECODING_MODE", [""])
+@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
+@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
+@pytest.mark.parametrize("PROMPT_EMBEDDING_TABLE_DTYPE",
+                         ["TYPE_BF16"])  # allow override later
+@pytest.mark.parametrize("ENCODER_INPUT_FEATURES_DTYPE",
+                         ["TYPE_FP16"])  # pixtral uses fp16 vision by default
+def test_mistral_small_3_1_24b_pixtral(
+    E2E_MODEL_NAME,
+    MAX_TOKENS_IN_KV_CACHE,
+    MAX_ATTENTION_WINDOW_SIZE,
+    BATCH_SCHEDULER_POLICY,
+    KV_CACHE_FREE_GPU_MEM_FRACTION,
+    CROSS_KV_CACHE_FRACTION,
+    ENABLE_TRT_OVERLAP,
+    BATCHING_STRATEGY,
+    DECOUPLED_MODE,
+    TRITON_MAX_BATCH_SIZE,
+    MAX_QUEUE_DELAY_MICROSECONDS,
+    MAX_BEAM_WIDTH,
+    ENABLE_KV_CACHE_REUSE,
+    NORMALIZE_LOG_PROBS,
+    ENABLE_CHUNKED_CONTEXT,
+    GPU_DEVICE_IDS,
+    DECODING_MODE,
+    PREPROCESSING_INSTANCE_COUNT,
+    POSTPROCESSING_INSTANCE_COUNT,
+    ACCUMULATE_TOKEN,
+    BLS_INSTANCE_COUNT,
+    EXCLUDE_INPUT_IN_OUTPUT,
+    PROMPT_EMBEDDING_TABLE_DTYPE,
+    ENCODER_INPUT_FEATURES_DTYPE,
+    tensorrt_llm_multimodal_example_root,
+    tensorrt_llm_llama_example_root,
+    mistral_small_3_1_24b_model_root,
+    llm_backend_multimodal_example_root,
+    llm_backend_venv,
+    llm_root,
+):
+    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
+        pytest.skip("Skipping. V1 doesn't support max_utilization.")
+
+    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+
+    # Build Engines (LLM + vision)
+    ENGINE_PATH, MULTIMODAL_ENGINE_DIR = prepare_mistral3_pixtral_engine(
+        tensorrt_llm_multimodal_example_root, tensorrt_llm_llama_example_root,
+        mistral_small_3_1_24b_model_root)
+
+    # Prepare model repo
+    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
+    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
+
+    # Prepare multimodal specific repo
+    prepare_multimodal_model_repo(llm_backend_repo_root, new_model_repo,
+                                  "ensemble")
+    prepare_multimodal_model_repo(llm_backend_repo_root, new_model_repo,
+                                  "multimodal_encoders")
+
+    # Modify config.pbtxt
+    TOKENIZER_PATH = mistral_small_3_1_24b_model_root
+    modify_ib_config_pbtxt(
+        new_model_repo,
+        ENGINE_PATH,
+        TOKENIZER_PATH,
+        llm_backend_repo_root,
+        DECOUPLED_MODE,
+        MAX_TOKENS_IN_KV_CACHE,
+        MAX_ATTENTION_WINDOW_SIZE,
+        BATCH_SCHEDULER_POLICY,
+        BATCHING_STRATEGY,
+        KV_CACHE_FREE_GPU_MEM_FRACTION,
+        EXCLUDE_INPUT_IN_OUTPUT,
+        ENABLE_TRT_OVERLAP,
+        TRITON_MAX_BATCH_SIZE,
+        MAX_QUEUE_DELAY_MICROSECONDS,
+        MAX_BEAM_WIDTH,
+        ENABLE_KV_CACHE_REUSE,
+        NORMALIZE_LOG_PROBS,
+        ENABLE_CHUNKED_CONTEXT,
+        GPU_DEVICE_IDS,
+        DECODING_MODE,
+        PREPROCESSING_INSTANCE_COUNT,
+        POSTPROCESSING_INSTANCE_COUNT,
+        ACCUMULATE_TOKEN,
+        BLS_INSTANCE_COUNT,
+        MULTIMODAL_ENGINE_PATH=MULTIMODAL_ENGINE_DIR,
+        ENCODER_INPUT_FEATURES_DTYPE=ENCODER_INPUT_FEATURES_DTYPE,
+        PROMPT_EMBEDDING_TABLE_DTYPE=PROMPT_EMBEDDING_TABLE_DTYPE,
+    )
+
+    # Launch Triton Server
+    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
+                                    "launch_triton_server.py")
+    check_call(
+        f"PMIX_MCA_gds=hash python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo}",
+        shell=True)
+    check_server_ready()
+
+    image_merlion = os.path.join(
+        llm_root,
+        "tests/integration/test_input_files/merlion.png",
+    )
+    image_football = os.path.join(
+        llm_root,
+        "tests/integration/test_input_files/pexels-franco-monsalvo-252430633-32285228.jpg",
+    )
+    image_hockey = os.path.join(
+        llm_root,
+        "tests/integration/test_input_files/pexels-ron-lach-8975010.jpg",
+    )
+    image_basketball = os.path.join(
+        llm_root,
+        "tests/integration/test_input_files/pexels-maxim-shklyaev-1511525-2914194.jpg",
+    )
+
+    test_cases = [
+        {
+            "text": "What is the capital of England?",
+            "image": "",
+            "match": re.compile("london", re.IGNORECASE)
+        },
+        {
+            "text": "In as few words as possible, what city is this?",
+            "image": image_merlion,
+            "match": re.compile("singapore", re.IGNORECASE)
+        },
+        {
+            "text":
+            "In as few words as possible, what sports are depicted in the images?",
+            "image":
+            ",".join([image_football, image_hockey]),
+            "match":
+            re.compile("(football|soccer).*hockey", re.IGNORECASE | re.DOTALL)
+        },
+        {
+            "text":
+            "In as few words as possible, what sports are depicted in the images?",
+            "image":
+            ",".join([image_football, image_hockey, image_basketball]),
+            "match":
+            re.compile("(football|soccer).*hockey.*basket",
+                       re.IGNORECASE | re.DOTALL)
+        },
+    ]
+
+    for test_case in test_cases:
+        TEXT = test_case["text"]
+        IMAGE = test_case["image"]
+        MATCH = test_case["match"]
+
+        # Run Test: use multimodal client; set model_type to pixtral
+        run_cmd = [
+            f"{llm_backend_multimodal_example_root}/client.py",
+            "--model_type=pixtral",
+            f"--text={TEXT}",
+            f"--image={IMAGE}",
+            "--request-output-len=128",
+            "--end-id=2",
+        ]
+        if DECOUPLED_MODE == "True":
+            run_cmd += ["--streaming"]
+
+            if E2E_MODEL_NAME == "tensorrt_llm_bls":
+                run_cmd += ["--use_bls"]
+
+        output = venv_check_output(llm_backend_venv, run_cmd)
+
+        assert MATCH.search(
+            output), f"Test failed for input: {TEXT=}, {IMAGE=}, {output=}"

@@ -80,6 +80,8 @@ using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
 
+using tensorrt_llm::batch_manager::CacheTransceiverFactory;
+
 namespace tensorrt_llm::batch_manager
 {
 
@@ -693,7 +695,7 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
-        false, kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse());
+        kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse());
 
     reshapeKvTensors(kvCacheManager->getOffsetTableDimensions());
 
@@ -1866,9 +1868,9 @@ void TrtGptModelInflightBatching::setupDecoderStep(
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
         auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
-            = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests,
-                mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
-                *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.mMedusaBuffers);
+            = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests, logitsType,
+                inputBuffers, *mDecoderState, mRuntime->getStream(), *mDecoder->getDecoderStream(), getMaxSequenceLen(),
+                mOperatingBeamWidth, buffers.mMedusaBuffers);
 
         auto const localBatchSize = batchSlots->getSize();
         if (localBatchSize > 0)

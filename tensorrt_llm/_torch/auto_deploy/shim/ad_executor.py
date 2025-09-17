@@ -1,6 +1,6 @@
-from itertools import chain
+from collections import defaultdict
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch._prims_common import DeviceLikeType
@@ -9,7 +9,6 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 
 from ...._utils import mpi_rank, mpi_world_size
-from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
 from ...distributed import MPIDist
@@ -94,6 +93,12 @@ class ADEngine(ModelEngine):
             f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}"
         )
 
+        # update device to contain the current default device if it's in cuda
+        device = torch.device(ad_config.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        device = str(device)
+
         # initialize seq info object
         seq_info = SequenceInfo(
             max_seq_len=max_seq_len,
@@ -102,16 +107,17 @@ class ADEngine(ModelEngine):
             max_num_tokens=max_num_tokens,
         )
 
-        # update device to contain the current default device if it's in cuda
-        device = torch.device(ad_config.device)
-        if device.type == "cuda" and device.index is None:
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        device = str(device)
+        factory = ad_config.create_factory()
+
+        # pass in extra arguments defined by the model factory
+        for name, (none_input, dynamic_shape_callback) in factory.get_extra_inputs().items():
+            seq_info.add_extra_arg(name, none_input, dynamic_shape_callback)
+
+        # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
+        # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(
-            factory=ad_config.create_factory(), ad_config=ad_config
-        )
+        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
 
         # construct engine
         return cls(build_and_optimize, seq_info, device, max_beam_width)
@@ -132,6 +138,10 @@ class ADEngine(ModelEngine):
         self.pytorch_backend_config.enable_iter_perf_stats = False
         self.pytorch_backend_config.enable_iter_req_stats = False
         self.pytorch_backend_config.stream_interval = 1
+        self.pytorch_backend_config.attention_dp_enable_balance = False
+        self.pytorch_backend_config.attention_dp_time_out_iters = 50
+        self.pytorch_backend_config.attention_dp_batching_wait_iters = 10
+        self.pytorch_backend_config.batch_wait_timeout_ms = 0
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
@@ -167,15 +177,15 @@ class ADEngine(ModelEngine):
         context_requests = scheduled_requests.context_requests
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
 
-        # new_tokens is a tensor on the device, we need to convert it to a list of lists.
-        # can we avoid this additional gpu->cpu transfer?
-        new_tokens_list = new_tokens.flatten().cpu().tolist() if new_tokens is not None else None
-
         # info to be extracted
         input_ids: List[List[int]] = []
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
+        flat_gather_idx: List[int] = []
+        extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+        dummy_token = -1
 
         # look at context requests first
         for request in context_requests:
@@ -186,35 +196,54 @@ class ADEngine(ModelEngine):
             request.py_batch_idx = request.seq_slot
             last_logit_only.append(True)
 
+            # get cache indices
+            cache_indices = kv_cache_manager.get_cache_indices(request)
+            page_assignments.append(cache_indices)
+
+            # store extra arguments
+            if request.py_multimodal_data is not None:
+                for k, v in request.py_multimodal_data.items():
+                    extra_args[k].append(v)
+
         # look at generate requests next
         # TODO: we should also handle extend requests (for speculative decoding) here
         for request in gen_requests:
             # new_tokens are provided when the overlap scheduler is enabled.
-            if new_tokens_list is None or request.is_dummy or request.py_batch_idx is None:
+            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
                 input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
                 input_pos.append(request.max_beam_num_tokens - 1)
             else:
-                input_ids.append([new_tokens_list[request.py_batch_idx]])
+                input_ids.append([dummy_token])
                 input_pos.append(request.max_beam_num_tokens)
+                flat_gather_idx.append(request.py_batch_idx)
 
             request.py_batch_idx = request.seq_slot
 
             # return all logits
             last_logit_only.append(False)
 
-        # extract cache information for all requests
-        for request in chain(context_requests, gen_requests):
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
 
         # update the sequence info object now
-        si = self.cache_seq_interface.info
-        si.nest_sequences(input_ids)
-        si.update_pos(input_pos, reset=True)
-        si.assign_cache_loc(page_assignments)
+        self.cache_seq_interface.info.nest_sequences(
+            input_ids,
+            input_pos=input_pos,
+            page_assignments=page_assignments,
+            **extra_args,
+        )
+        # scatter the new tokens into the input_ids tensor if provided
+        if new_tokens is not None:
+            self.cache_seq_interface.info.rescatter_input_ids(
+                ungathered_input_ids=new_tokens.flatten(),  # ensure it's flattened
+                gather_idx=flat_gather_idx,
+                scatter_ref=dummy_token,
+            )
+
         return last_logit_only
 
+    @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(*self.cache_seq_interface.args)[0]
@@ -231,13 +260,13 @@ class ADEngine(ModelEngine):
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
-        new_tokens_device: Optional[torch.Tensor] = None,
+        new_tensors_device: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
-        new_tokens = getattr(new_tokens_device, "new_tokens", None)
+        new_tokens = getattr(new_tensors_device, "new_tokens", None)
         last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
 
         # compute all logits
@@ -252,7 +281,7 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
-def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: str = None):
+def create_autodeploy_executor(ad_config: LlmArgs):
     """Create an AutoDeploy executor from the given configuration and checkpoint directory.
 
     This is the entrypoint API to the _autodeploy backend.
@@ -269,8 +298,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
 
     # some config
     msg = "pytorch_backend_config must be an AD LlmArgs object"
-    assert isinstance(executor_config.pytorch_backend_config, LlmArgs), msg
-    ad_config: LlmArgs = executor_config.pytorch_backend_config
+    assert isinstance(ad_config, LlmArgs), msg
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
     max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size

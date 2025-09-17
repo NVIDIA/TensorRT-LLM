@@ -9,6 +9,8 @@ import torch
 from blake3 import blake3
 from torchvision.transforms import ToPILImage
 
+from tensorrt_llm.logger import logger
+
 # Default hasher
 default_hasher = blake3
 
@@ -22,16 +24,17 @@ class MultimodalInput:
     """
 
     multimodal_positions: List[int]
-    """Starting positions of each multimodal chunk in the token sequence.
+    """Starting positions of each contiguous multimodal token chunk in the token sequence.
 
     Contains only the start position of each chunk, not all positions of multimodal tokens.
     This is different from mm_positions elsewhere which contains all positions.
     """
 
     multimodal_lengths: List[int]
-    """Length (number of tokens) of each multimodal item.
+    """Length of each contiguous multimodal token chunk, including any special tokens.
 
-    Combined with multimodal_positions, this defines the token spans for each multimodal item.
+    Each span is unique to its multimodal item and may include special tokens for some models,
+    (e.g., image_end_token, image_break_token for mistral3) mixed with the actual multimodal tokens.
     """
 
     def __post_init__(self):
@@ -87,37 +90,51 @@ class MultimodalRuntimeData:
     """Runtime data for tracking multimodal token caching and reuse per request sequence.
 
     This class tracks which multimodal tokens are cached vs. need to be processed
-    for each request sequence during KV cache reuse scenarios.
+    for each request sequence during both KV cache reuse and chunked prefill scenarios.
 
     Attributes:
-        num_cached_tokens: Total number of cached tokens for this sequence
+        past_seen_token_num: Total number of tokens seen in previous iterations (cached)
         mm_token_lengths: Length of each multimodal token chunk
         mm_token_positions: Starting positions of each multimodal token chunk
-        prompt_tokens: Current iteration of prompt tokens for this sequence (optional). Need it for chunk prefill if enabled (#TODO)
-        num_cached_mm_tokens: Number of multimodal tokens that are cached in this iteration (computed)
-        total_mm_tokens: Total number of multimodal tokens in this sequence (computed)
+        chunk_end_pos: End position of the current chunk for chunked prefill
+        special_token_offsets: Starting positions of special tokens in the union of all multimodal token chunks (optional, depending on the model)
+
+        num_unseen_mm_tokens: Number of multimodal tokens that are cached (computed)
+        num_mm_tokens_in_chunk: Number of multimodal tokens in the current chunk (computed)
+        total_mm_tokens_in_request: Total number of multimodal tokens in the request sequence (computed)
+
+        num_unseen_special_tokens: Number of special tokens that are cached (computed)
+        num_special_tokens_in_chunk: Number of special tokens in the current chunk (computed)
+        total_special_tokens_in_request: Total number of special tokens in the request sequence (computed)
     """
-    num_cached_tokens: int
+    past_seen_token_num: int
     mm_token_lengths: List[int]
     mm_token_positions: List[int]
+    chunk_end_pos: int
+    special_token_offsets: List[int]
 
-    # TODO: support chunk prefill for multimodal
-    # When chunk prefill is enabled, we need to pass the prompt tokens for current chunk and mask to find the included mm tokens
-    prompt_tokens: Optional[List[int]] = None
+    num_unseen_mm_tokens: Optional[int] = None
+    num_mm_tokens_in_chunk: Optional[int] = None
+    total_mm_tokens_in_request: Optional[int] = None
 
-    num_cached_mm_tokens: Optional[int] = None
-    total_mm_tokens: Optional[int] = None
+    num_unseen_special_tokens: Optional[int] = 0
+    num_special_tokens_in_chunk: Optional[int] = 0
+    total_special_tokens_in_request: Optional[int] = 0
+
+    # TODO: fine-grained control of encoder runner/cache to each mm_item
 
     def __post_init__(self):
         # Validate input data
+        if self.total_mm_tokens_in_request is None:
+            self.total_mm_tokens_in_request = sum(self.mm_token_lengths)
         if len(self.mm_token_positions) != len(self.mm_token_lengths):
             raise ValueError(
                 f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
             )
 
-        if self.num_cached_tokens < 0:
+        if self.past_seen_token_num < 0:
             raise ValueError(
-                f"num_cached_tokens must be non-negative, got {self.num_cached_tokens}"
+                f"past_seen_token_num must be non-negative, got {self.past_seen_token_num}"
             )
 
         if any(length <= 0 for length in self.mm_token_lengths):
@@ -130,22 +147,49 @@ class MultimodalRuntimeData:
                 f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
             )
 
-        if self.num_cached_mm_tokens is None:
+        if self.num_unseen_mm_tokens is None or self.num_mm_tokens_in_chunk is None:
             # Compute cached multimodal tokens based on positions and cached tokens
-            self.num_cached_mm_tokens = 0
+            self.num_unseen_mm_tokens = 0
+            self.num_mm_tokens_in_chunk = 0
+            remainder = 0
             for pos, length in zip(self.mm_token_positions,
                                    self.mm_token_lengths):
-                if pos + length <= self.num_cached_tokens:
-                    self.num_cached_mm_tokens += length
-                elif pos < self.num_cached_tokens:
+                if pos + length <= self.past_seen_token_num:
+                    self.num_unseen_mm_tokens += length
+                elif pos < self.past_seen_token_num:
                     # Partial overlap - only count the cached portion
-                    self.num_cached_mm_tokens += self.num_cached_tokens - pos
+                    self.num_unseen_mm_tokens += self.past_seen_token_num - pos
+                    self.num_mm_tokens_in_chunk += min(
+                        self.chunk_end_pos,
+                        pos + length) - self.past_seen_token_num
+                else:
+                    if pos + length > self.chunk_end_pos:
+                        # Partial overlap - only count the cached portion
+                        if pos < self.chunk_end_pos:
+                            self.num_mm_tokens_in_chunk += self.chunk_end_pos - pos
+                        else:
+                            remainder += length
+                    else:
+                        # Full overlap - count the entire mm item chunk
+                        self.num_mm_tokens_in_chunk += length
 
-        if self.num_cached_mm_tokens > self.num_cached_tokens:
+        if len(self.special_token_offsets) > 0:
+            self.num_unseen_special_tokens = sum(
+                1 for offset in self.special_token_offsets
+                if offset < self.num_unseen_mm_tokens)
+            mm_tokens_end_pos = self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk
+            self.num_special_tokens_in_chunk = sum(
+                1 for offset in self.special_token_offsets
+                if self.num_unseen_mm_tokens <= offset < mm_tokens_end_pos)
+
+            self.total_special_tokens_in_request = len(
+                self.special_token_offsets)
+
+        if self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk + remainder > sum(
+                self.mm_token_lengths):
             raise ValueError(
-                f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to "
-                f"num_cached_tokens ({self.num_cached_tokens})")
-        self.total_mm_tokens = sum(self.mm_token_lengths)
+                f"num_unseen_mm_tokens ({self.num_unseen_mm_tokens}) + num_mm_tokens_in_chunk ({self.num_mm_tokens_in_chunk}) + remainder ({remainder}) must be less than or equal to sum of mm_token_lengths ({sum(self.mm_token_lengths)})"
+            )
 
 
 @dataclass
@@ -159,6 +203,10 @@ class MultimodalParams:
         multimodal_input: Multimodal input data with hashing information.
         multimodal_data: Processed multimodal data containing embeddings, configurations,
                         and modality-specific data organized by type.
+        multimodal_runtime: Runtime data for tracking multimodal token caching and reuse
+                           during KV cache scenarios. Contains information about cached
+                           tokens, multimodal token positions, and lengths for efficient
+                           processing during inference.
 
     Structure of multimodal_data:
         {
@@ -177,6 +225,7 @@ class MultimodalParams:
                 "video_height": torch.Tensor | List[int],
                 "video_width": torch.Tensor | List[int],
             },
+            "special_token_offsets": List[int],          # List of starting positions of special tokens in the union of all multimodal token chunks, if available
             # ... other modalities
         }
     """
@@ -190,6 +239,168 @@ class MultimodalParams:
         if self.multimodal_data is None:
             self.multimodal_data = {}
 
+    def _is_shared_tensor_dict(self, obj: Any) -> bool:
+        """Check if an object is a shared tensor dictionary.
+
+        Args:
+            obj: Object to check
+
+        Returns:
+            True if the object is a shared tensor dictionary, False otherwise
+        """
+        if not isinstance(obj, dict):
+            return False
+
+        # Check for required keys that uniquely identify a shared tensor dict
+        required_keys = {'method_key'}
+        if not required_keys.issubset(obj.keys()):
+            return False
+
+        # Additional validation based on method_key
+        method_key = obj.get('method_key')
+
+        # Import here to avoid circular imports
+        from tensorrt_llm._torch.shared_tensor import \
+            _SharedTensorRebuildMethodRegistry
+
+        if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
+            cuda_keys = {'tensor_size', 'storage_handle', 'storage_device'}
+            return cuda_keys.issubset(obj.keys())
+        elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
+            cpu_keys = {'tensor_size', 'storage_handle', 'manager_handle'}
+            return cpu_keys.issubset(obj.keys())
+
+        return False
+
+    def _apply_tensor_operation(
+            self, input_data: Union[torch.Tensor, List, dict, None],
+            operation: str, **kwargs) -> Union[torch.Tensor, List, dict, None]:
+        """Apply tensor operations recursively to nested data structures.
+
+        This method handles three types of operations:
+        - "to_handle": Convert tensors to shared tensor dictionaries
+        - "to_tensor": Convert shared tensor dictionaries back to tensors
+        - "to_device": Move tensors to specified device
+
+        Args:
+            input_data: Input data structure (tensor, list, dict, or None)
+            operation: Operation to apply
+            **kwargs: Additional arguments for the operation
+
+        Returns:
+            Transformed data structure
+        """
+        # Handle None case
+        if input_data is None:
+            return None
+
+        # Handle list case - recursively process each element
+        if isinstance(input_data, list):
+            return [
+                self._apply_tensor_operation(item, operation, **kwargs)
+                for item in input_data
+            ]
+
+        # Handle dictionary case
+        if isinstance(input_data, dict):
+            if operation == "to_tensor" and self._is_shared_tensor_dict(
+                    input_data):
+                # Convert shared tensor dict back to tensor
+                try:
+                    # Import here to avoid circular imports
+                    from tensorrt_llm._torch.shared_tensor import \
+                        SharedTensorContainer
+
+                    return SharedTensorContainer.from_dict(
+                        input_data).get_local_view()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to restore tensor from shared tensor dict: {e}"
+                    )
+            else:
+                # Regular dictionary - recursively process values
+                return {
+                    key: self._apply_tensor_operation(value, operation,
+                                                      **kwargs)
+                    for key, value in input_data.items()
+                }
+
+        # Handle tensor case
+        if isinstance(input_data, torch.Tensor):
+            if operation == "to_handle":
+                try:
+                    # Import here to avoid circular imports
+                    from tensorrt_llm._torch.shared_tensor import \
+                        SharedTensorContainer
+                    return SharedTensorContainer.from_tensor(
+                        input_data).dump_to_dict()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to convert tensor to shared tensor: {e}")
+            elif operation == "to_device":
+                device = kwargs.get('device')
+                if device is None:
+                    raise ValueError(
+                        "Device must be specified for 'to_device' operation")
+
+                pin_memory = kwargs.get('pin_memory', False)
+                try:
+                    if pin_memory and input_data.device.type == 'cpu':
+                        return input_data.pin_memory().to(device,
+                                                          non_blocking=True)
+                    else:
+                        return input_data.to(device, non_blocking=True)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to move tensor to device {device}: {e}")
+
+        # For any other type, return as-is
+        return input_data
+
+    def to_handle(self, element: str) -> None:
+        """Move specified multimodal data element to shared tensor.
+
+        Args:
+            element: Element to move (only "multimodal_data" is supported)
+
+        Raises:
+            ValueError: If element is not "multimodal_data"
+            RuntimeError: If tensor conversion fails
+        """
+        if element != "multimodal_data":
+            raise ValueError(
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
+
+        data = getattr(self, element)
+        if data is None:
+            return  # Nothing to convert
+
+        transformed_data = self._apply_tensor_operation(data, "to_handle")
+        setattr(self, element, transformed_data)
+
+    def to_tensor(self, element: str) -> None:
+        """Move specified multimodal data element from shared tensor.
+
+        Args:
+            element: Element to restore (only "multimodal_data" is supported)
+
+        Raises:
+            ValueError: If element is not "multimodal_data"
+            RuntimeError: If tensor restoration fails
+        """
+        if element != "multimodal_data":
+            raise ValueError(
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
+
+        data = getattr(self, element)
+        if data is None:
+            return  # Nothing to restore
+
+        restored_data = self._apply_tensor_operation(data, "to_tensor")
+        setattr(self, element, restored_data)
+
     def to_device(self,
                   element: str,
                   device: str,
@@ -197,230 +408,47 @@ class MultimodalParams:
         """Move specified multimodal data element to target device.
 
         Args:
-            element: Element to move ("multimodal_data" or "multimodal_input")
+            element: Element to move (only "multimodal_data" is supported)
             device: Target device (e.g., "cuda", "cpu")
             pin_memory: Whether to pin memory for faster transfers
+
+        Raises:
+            ValueError: If element is not "multimodal_data" or device is invalid
+            RuntimeError: If device transfer fails
         """
-
-        def _to_device(
-            input_tensor: Union[torch.Tensor, List, dict, None],
-            pin_memory: bool = False,
-        ) -> Union[torch.Tensor, List, dict, None]:
-            if input_tensor is None:
-                return None
-            elif isinstance(input_tensor, list):
-                return [_to_device(item, pin_memory) for item in input_tensor]
-            elif isinstance(input_tensor, dict):
-                return {
-                    key: _to_device(value, pin_memory)
-                    for key, value in input_tensor.items()
-                }
-            elif isinstance(input_tensor, torch.Tensor):
-                if pin_memory and input_tensor.device.type == 'cpu':
-                    return input_tensor.pin_memory().to(device,
-                                                        non_blocking=True)
-                else:
-                    return input_tensor.to(device, non_blocking=True)
-            else:
-                return input_tensor
-
-        if element == "multimodal_data":
-            self.multimodal_data = _to_device(self.multimodal_data, pin_memory)
-        elif element == "multimodal_input":
-            self.multimodal_input = _to_device(self.multimodal_input,
-                                               pin_memory)
-        else:
-            print(
-                f"MultimodalParams: Unsupported element '{element}' to move to device. "
-                f"Supported elements: 'multimodal_data', 'multimodal_input'")
-
-    def to_handle(self, element: str, key: Optional[str] = None) -> None:
-        """Convert multimodal data to tensor handle.
-
-        Converts torch.Tensor objects to SharedTensorContainer handles (serializable dictionaries)
-        for efficient IPC. This function is a in-place operation.
-
-        Args:
-            element: Element to convert ("multimodal_data" or "multimodal_input")
-            key: Specific key to convert. If None, converts all tensor values in multimodal_data.
-                 Defaults to None.
-
-        Example:
-            # Convert all tensors in multimodal_data to handles
-            params.to_handle("multimodal_data", key=None)
-
-            # Convert only multimodal_embedding section tensors to handles
-            params.to_handle("multimodal_data", key="multimodal_embedding")
-        """
-        # Lazy import to avoid circular dependency
-        from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-
-        def _to_tensor_handle(data):
-            for k, v in data.items():
-                if isinstance(v, torch.Tensor):
-                    # Convert tensor to handle
-                    handle = SharedTensorContainer.from_tensor(v).dump_to_dict()
-                    data[k] = handle
-                elif isinstance(v, dict):
-                    _to_tensor_handle(v)
-                elif isinstance(v, list):
-                    for i, item in enumerate(v):
-                        if isinstance(item, torch.Tensor):
-                            handle = SharedTensorContainer.from_tensor(
-                                item).dump_to_dict()
-                            v[i] = handle
-
-        if element == "multimodal_data":
-            if self.multimodal_data is None:
-                return
-            if key is None:
-                _to_tensor_handle(self.multimodal_data)
-            else:
-                if key not in self.multimodal_data:
-                    return  # no-op if key not found
-
-                value = self.multimodal_data[key]
-                if isinstance(value, torch.Tensor):
-                    handle = SharedTensorContainer.from_tensor(
-                        value).dump_to_dict()
-                    self.multimodal_data[key] = handle
-                elif isinstance(value, dict):
-                    _to_tensor_handle(value)
-                else:
-                    raise ValueError(
-                        f"Unsupported value type for multimodal_data: {type(value)}"
-                    )
-        elif element == "multimodal_input":
-            # No-op for multimodal_input
-            return
-        else:
+        if element != "multimodal_data":
             raise ValueError(
-                f"Unsupported element '{element}' to convert to handle.")
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
 
-    def to_tensor(self, element: str, key: Optional[str] = None) -> None:
-        """Convert multimodal tensor handles back to tensors. This is the dual operation to to_handle.
+        data = getattr(self, element)
+        if data is None:
+            return  # Nothing to move
 
-        Converts SharedTensorContainer handles (serializable dictionaries) back to torch.Tensor objects
-        for local computation. This function performs in-place modifications to the multimodal_data.
-
-        Args:
-            element: Element to convert ("multimodal_data" or "multimodal_input")
-            key: Specific key to convert. If None, converts all tensor handles in multimodal_data.
-                 Defaults to None.
-
-        Example:
-            # Convert all handles back to tensors
-            params.to_tensor("multimodal_data", key=None)
-
-            # Convert only multimodal_embedding section handles back to tensors
-            params.to_tensor("multimodal_data", key="multimodal_embedding")
-        """
-        # Lazy import to avoid circular dependency
-        from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-
-        def _to_tensor(data):
-            for k, v in data.items():
-                if isinstance(v, dict) and 'method_key' in v:
-                    # This is a tensor handle (dict with method_key)
-                    try:
-                        tensor = SharedTensorContainer.from_dict(
-                            v).get_local_view()
-                        data[k] = tensor
-                    except Exception as e:
-                        raise ValueError(
-                            f"Failed to convert handle to tensor for key '{k}': {e}"
-                        )
-                elif isinstance(v, dict):
-                    _to_tensor(v)
-                elif isinstance(v, list):
-                    for i, item in enumerate(v):
-                        if isinstance(item, dict) and 'method_key' in item:
-                            try:
-                                tensor = SharedTensorContainer.from_dict(
-                                    item).get_local_view()
-                                v[i] = tensor
-                            except Exception as e:
-                                raise ValueError(
-                                    f"Failed to convert handle to tensor in list at index {i}: {e}"
-                                )
-
-        if element == "multimodal_data":
-            if self.multimodal_data is None:
-                return
-
-            if key is None:
-                _to_tensor(self.multimodal_data)
-            else:
-                if key not in self.multimodal_data:
-                    return  # no-op if key not found
-
-                value = self.multimodal_data[key]
-                if isinstance(
-                        value, dict
-                ) and 'method_key' in value:  # This is a tensor handle
-                    try:
-                        tensor = SharedTensorContainer.from_dict(
-                            value).get_local_view()
-                        self.multimodal_data[key] = tensor
-                    except Exception as e:
-                        raise ValueError(
-                            f"Failed to convert handle to tensor for key '{key}': {e}"
-                        )
-                elif isinstance(value, dict):
-                    _to_tensor(value)
-                else:
-                    raise ValueError(
-                        f"Unsupported value type for multimodal_data: {type(value)}"
-                    )
-
-        elif element == "multimodal_input":
-            # No-op for multimodal_input
-            return
-        else:
-            raise ValueError(
-                f"Unsupported element '{element}' to convert to tensor.")
-
-    def strip_for_context(self) -> None:
-        """Strip multimodal data for context processing.
-
-        Removes only mrope_position_deltas while keeping all other multimodal data
-        (embeddings, images, etc.) needed for context phase processing.
-        """
-        if not (self.multimodal_data
-                and 'mrope_config' in self.multimodal_data):
-            return
-
-        mrope_config = self.multimodal_data['mrope_config']
-        if 'mrope_position_deltas' in mrope_config:
-            del mrope_config['mrope_position_deltas']
-
-            # Clean up empty mrope_config
-            if not mrope_config:
-                del self.multimodal_data['mrope_config']
+        transformed_data = self._apply_tensor_operation(data,
+                                                        "to_device",
+                                                        device=device,
+                                                        pin_memory=pin_memory)
+        setattr(self, element, transformed_data)
 
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_position_deltas and removes all other multimodal data
+        Keeps only mrope_config and removes all other multimodal data
         (embeddings, images, etc.) as they're not needed during generation.
         """
         if not self.multimodal_data:
             return
 
-        # Extract mrope_position_deltas before clearing
-        mrope_position_deltas = None
+        # Extract mrope_config before clearing
+        mrope_config = None
         if 'mrope_config' in self.multimodal_data:
             mrope_config = self.multimodal_data['mrope_config']
-            if isinstance(mrope_config,
-                          dict) and 'mrope_position_deltas' in mrope_config:
-                mrope_position_deltas = mrope_config['mrope_position_deltas']
 
-        # Clear all data and restore only position deltas if they exist
+        # Clear all data and restore only mrope_config if it exists
         self.multimodal_data = {}
-        if mrope_position_deltas is not None:
-            self.multimodal_data['mrope_config'] = {
-                'mrope_position_deltas': mrope_position_deltas
-            }
+        if mrope_config is not None:
+            self.multimodal_data['mrope_config'] = mrope_config
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
@@ -452,13 +480,22 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
     """Apply hashing to multimodal data items."""
 
     def _hash_image(image):
-        # only support single modality w/ PIL.Image.Image for now
         # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
         hasher = hash_lib()
         if isinstance(image, torch.Tensor):
-            # TODO: Device tensor hashing is an open issue. Limited hashing to CPU for now.
-            image = image.cpu()
-        hasher.update(serialize_item(image))
+            # Ensure tensor is on CPU and contiguous for consistent hashing
+            image = image.detach().cpu().contiguous()
+            hasher.update(serialize_item(image))
+        elif isinstance(image, list):
+            # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
+            for frame in image:
+                hasher.update(b"<frame>")
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.detach().cpu().contiguous()
+                hasher.update(serialize_item(frame))
+        else:
+            hasher.update(serialize_item(image))
+
         return hasher.hexdigest()
 
     mm_items = {
@@ -491,7 +528,13 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
 
 def find_mm_token_lengths(mm_data: Dict[str, Any],
                           input_processor: Any) -> List[int]:
-    """Get multimodal token lengths from multimodal data items. """
+    """Get the maximum contiguous multimodal token lengths from multimodal data items.
+
+    Returns the total token count for each multimodal item, including any special tokens
+    (e.g., image_begin, image_end, image_break) that may be mixed with the actual
+    multimodal content tokens. This mm_token_lengths represents the full contiguous chunk from beginning
+    to end, not just pure image/video/audio tokens.
+    """
 
     mm_items = {
         modality: items if isinstance(items, list) else [items]
@@ -500,54 +543,70 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
     num_mm_tokens = {}
 
     for modality, items in mm_items.items():
-        if modality != "image":
-            #TODO: support other modalities
-            raise ValueError(
-                f"Unsupported modality: {modality}. Only 'image' modality is currently supported for hashing."
-            )
-        if not hasattr(input_processor, "get_num_tokens_per_image"):
-            #TODO: backward compatibility for models that don't yet have get_num_tokens_per_image implemented
-            #TODO: only support qwen2_vl for now
+        if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
             raise AttributeError(
-                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_image' method required for multimodal hashing."
+                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
             )
 
         modality_token_lengths = []
         for item in items:
-            if isinstance(item, torch.Tensor):
-                item = ToPILImage()(item)
-            num_tokens = input_processor.get_num_tokens_per_image(
-                image_width=item.width,
-                image_height=item.height,
-            )
-            modality_token_lengths.append(num_tokens)
+            if modality == "image":
+                if isinstance(item, torch.Tensor):
+                    item = ToPILImage()(item)
+                num_tokens = input_processor.get_num_tokens_per_image(
+                    image=item, )
+                modality_token_lengths.append(num_tokens)
+            elif modality == "video":
+                assert isinstance(item, list), "Video must be a list of frames"
+                if isinstance(item[0], torch.Tensor):
+                    item = [ToPILImage()(frame) for frame in item]
+                num_tokens = input_processor.get_num_tokens_per_video(
+                    video=item, )
+                modality_token_lengths.append(num_tokens)
+            else:
+                # TODO: add audio support if needed
+                raise ValueError(f"Unsupported modality: {modality}")
 
         num_mm_tokens[modality] = modality_token_lengths
 
-    return num_mm_tokens['image']  # flatten all mm instances to a single list
+    return num_mm_tokens  # flatten all mm instances to a single list
 
 
-def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
-                                             np.ndarray],
-                            num_mm_tokens: List[int],
-                            vocab_size: int,
-                            mm_token_ids: torch.Tensor = None) -> List[int]:
-    """Get multimodal token positions using IDs > vocab_size and known lengths.
+def find_mm_token_positions(
+    input_ids: Union[torch.Tensor, List[int], np.ndarray],
+    num_mm_tokens: List[int],
+    vocab_size: Optional[int] = None,
+    mm_token_ids: Optional[torch.Tensor] = None,
+    mm_special_token_ids: Optional[torch.Tensor] = None
+) -> Tuple[List[int], List[int]]:
+    """Get starting positions of contiguous multimodal token chunks using known lengths.
 
-    This function finds multimodal tokens (with IDs > vocab_size) and uses the
-    provided lengths in num_mm_tokens to identify where each chunk starts.
-    This works even when there are no gaps between different image sequences
-    (e.g., when all images use the same token IDs).
+    This function finds multimodal tokens (with IDs > vocab_size or matching mm_token_ids)
+    and uses the provided lengths in num_mm_tokens to identify where each contiguous chunk starts.
+    Each chunk in num_mm_tokens is assumed to be a contiguous block of multimodal tokens for each multimodal item, and may include special tokens (e.g., image_begin, image_end, image_break) within the chunk.
+
+    Note: at least one of vocab_size or mm_token_ids must be provided. If mm_token_ids
+    is provided, vocab_size is ignored.
 
     Args:
         input_ids: Token sequence (tensor, list, or numpy array)
-        num_mm_tokens: List of lengths for each multimodal token chunk
-        vocab_size: Size of the model's vocabulary
-        mm_token_ids (optional): possible token ids for multimodal tokens
+        num_mm_tokens: List of contiguous chunk lengths for each multimodal item
+        vocab_size: Size of the model's vocabulary (used to identify tokens > vocab_size)
+        mm_token_ids: Specific token IDs that represent multimodal tokens
 
     Returns:
-        List of starting positions for each multimodal token chunk
+        List of starting positions for each contiguous multimodal token
+        (Optional) List of starting positions of special tokens in the union of all multimodal token chunks
     """
+    if mm_token_ids is None and vocab_size is None:
+        raise ValueError(
+            "Provide either mm_token_ids or vocab_size to find multimodal token positions"
+        )
+    if mm_token_ids is not None and vocab_size is not None:
+        logger.warning(
+            "Both mm_token_ids and vocab_size are provided, using mm_token_ids and ignoring vocab_size"
+        )
+
     # Convert input_ids to tensor if needed
     if not isinstance(input_ids, torch.Tensor):
         if isinstance(input_ids, list):
@@ -559,6 +618,9 @@ def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
     if mm_token_ids is None:
         mm_mask = input_ids >= vocab_size
     else:
+        if mm_token_ids.ndim != 1:
+            raise ValueError("mm_token_ids must be a 1D tensor")
+        mm_token_ids = torch.unique(mm_token_ids)
         mm_mask = torch.isin(input_ids, mm_token_ids)
 
     # If no multimodal tokens found, return empty list
@@ -583,7 +645,15 @@ def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
             # Move to the next chunk
             current_position += length
 
-    return start_positions
+    start_special_token_positions = []
+    if mm_special_token_ids is not None:
+        mm_token_ids = input_ids[mm_positions]
+        special_token_mask_in_mm = torch.isin(mm_token_ids,
+                                              mm_special_token_ids)
+        start_special_token_positions = torch.where(
+            special_token_mask_in_mm)[0].tolist()
+
+    return start_positions, start_special_token_positions
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],

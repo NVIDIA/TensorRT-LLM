@@ -15,7 +15,6 @@ l0_l40s:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_mllama"
-  - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_siglip"
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
@@ -31,8 +30,7 @@ l0_l40s:
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[audio]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image]
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image_audio]
-  - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
-  - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  - accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
 - condition:
     ranges:
       system_gpu_count:
@@ -109,3 +107,17 @@ l0_l40s:
   - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] TIMEOUT (90)
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-v3-8b-instruct-hf]
   - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*l40s*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: fmha
+  tests:
+  - test_fmha.py::test_fmha

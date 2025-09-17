@@ -24,7 +24,11 @@ import sys
 
 import psutil
 import pynvml
-from cuda import cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
 
 # Logger
 logger = logging.getLogger(__name__)

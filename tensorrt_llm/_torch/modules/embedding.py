@@ -9,6 +9,7 @@ from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed import allgather
+from ..utils import create_lm_head_tp_mapping
 from .linear import Linear, TensorParallelMode
 
 
@@ -35,6 +36,11 @@ class LMHead(Linear):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
         mapping = mapping or Mapping()
+        self.enable_lm_head_tp_in_adp = mapping.enable_attention_dp and \
+            getattr(mapping, 'enable_lm_head_tp_in_adp', False)
+        if self.enable_lm_head_tp_in_adp:
+            mapping = create_lm_head_tp_mapping(mapping)
+
         tp_size = mapping.tp_size
 
         # Attention DP doesn't work with embedding parallelization.
@@ -72,6 +78,18 @@ class LMHead(Linear):
         self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
         self.register_parameter("bias", None)
 
+        # For LM head TP in ADP, we need to slice the weight for the LM head
+        self.lm_head_slice_obj = None
+        if self.enable_lm_head_tp_in_adp:
+            tp_rank = self.mapping.tp_rank
+            tp_size = self.mapping.tp_size
+            slice_width = math.ceil(self.out_features / tp_size)
+            slice_start = tp_rank * slice_width
+            slice_end = min((tp_rank + 1) * slice_width, self.out_features)
+            slice_obj = [slice(None)] * len(self.weight.shape)
+            slice_obj[0] = slice(slice_start, slice_end)
+            self.lm_head_slice_obj = tuple(slice_obj)
+
     @property
     def vocab_size_padded(self) -> int:
         if self.tp_mode == TensorParallelMode.COLUMN and self.gather_output:
@@ -80,12 +98,16 @@ class LMHead(Linear):
             return self.out_features
 
     def forward(
-            self,
-            input: torch.Tensor,
-            *,
-            all_reduce_params: Optional[AllReduceParams] = None
+        self,
+        input: torch.Tensor,
+        *,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        is_spec_decoding_head: bool = False,
     ) -> torch.Tensor:
-        output = super().forward(input, all_reduce_params=all_reduce_params)
+        if is_spec_decoding_head and self.enable_lm_head_tp_in_adp:
+            output = F.linear(input, self.weight[self.lm_head_slice_obj], None)
+        else:
+            output = super().forward(input, all_reduce_params=all_reduce_params)
         if (self.tp_mode == TensorParallelMode.COLUMN and self.gather_output
                 and self.padding_size > 0):
             output = output[..., :-self.padding_size]
@@ -126,8 +148,6 @@ def get_masked_input_and_mask(
     return input_, ~vocab_mask.unsqueeze(-1)
 
 
-# We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
-@torch.compile(options={"max-autotune": True})
 def pre_comm_embedding_ops(
     input_: torch.Tensor,
     weight: torch.Tensor,
@@ -140,25 +160,23 @@ def pre_comm_embedding_ops(
     padding_size: int,
 ):
     # Generate the mask for the input if needed.
-    if tp_size > 1:
-        if tp_mode == TensorParallelMode.COLUMN:
-            input_, input_mask = get_masked_input_and_mask(
-                input_,
-                vocab_start_index,
-                vocab_end_index,
-            )
+    if tp_mode == TensorParallelMode.COLUMN:
+        input_, input_mask = get_masked_input_and_mask(
+            input_,
+            vocab_start_index,
+            vocab_end_index,
+        )
 
     # Get the embeddings.
     output = F.embedding(input_, weight)
 
     # Mask or pad the output if needed.
-    if tp_size > 1:
-        if tp_mode == TensorParallelMode.COLUMN:
-            output.masked_fill_(input_mask, 0)
-        elif tp_mode == TensorParallelMode.ROW:
-            if gather_output:
-                if tp_rank == tp_size - 1 and padding_size > 0:
-                    output = F.pad(output, (0, padding_size))
+    if tp_mode == TensorParallelMode.COLUMN:
+        output.masked_fill_(input_mask, 0)
+    elif tp_mode == TensorParallelMode.ROW:
+        if gather_output:
+            if tp_rank == tp_size - 1 and padding_size > 0:
+                output = F.pad(output, (0, padding_size))
 
     return output
 
@@ -184,6 +202,7 @@ class Embedding(LMHead):
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
+        enable_torch_compile_for_embedding: Optional[bool] = False,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
@@ -193,6 +212,9 @@ class Embedding(LMHead):
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
         )
+
+        self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding
+
         if self.tp_size > 1:
             slice_width = math.ceil(num_embeddings / self.tp_size)
             self.vocab_start_index = self.tp_rank * slice_width
@@ -203,12 +225,21 @@ class Embedding(LMHead):
             self.vocab_end_index = num_embeddings
 
     def forward(self, input):
-        # Run the ops before all_reduce/all_gather.
-        output = pre_comm_embedding_ops(input, self.weight, self.tp_size,
-                                        self.tp_rank, self.tp_mode,
-                                        self.vocab_start_index,
-                                        self.vocab_end_index,
-                                        self.gather_output, self.padding_size)
+        if self.tp_size > 1:
+            # Run the ops before all_reduce/all_gather.
+            # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
+            embedding_ops_func = torch.compile(
+                pre_comm_embedding_ops,
+                options={"max-autotune": True},
+                disable=not self.enable_torch_compile_for_embedding)
+        else:
+            # Skip torch.compile when TP size is 1 to avoid unnecessary host overhead
+            embedding_ops_func = pre_comm_embedding_ops
+        output = embedding_ops_func(input, self.weight, self.tp_size,
+                                    self.tp_rank, self.tp_mode,
+                                    self.vocab_start_index,
+                                    self.vocab_end_index, self.gather_output,
+                                    self.padding_size)
 
         # Run the all_reduce/all_gather.
         if self.tp_size > 1:

@@ -63,6 +63,12 @@ class MockTritonTensor:
         else:
             return False
 
+    def to_dlpack(self):
+        if self.is_cpu():
+            return self._tensor.__dlpack__()
+        else:
+            return self._tensor.to_dlpack()
+
 
 @dataclass
 class MockTritonError:

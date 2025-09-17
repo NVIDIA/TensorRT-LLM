@@ -20,11 +20,9 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
-#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
@@ -34,6 +32,7 @@
 
 #include <ATen/ATen.h>
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/tuple.h>
@@ -189,6 +188,9 @@ void initBindings(nb::module_& m)
         .def_prop_ro("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_prop_ro("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
         .def_prop_ro("llm_request_type", &GenLlmReq::getLlmRequestType)
+        .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
+        .def_prop_ro("is_child", &GenLlmReq::isChild)
+        .def_prop_ro("cache_salt_id", &GenLlmReq::getCacheSaltID)
         .def_prop_ro("multimodal_hashes",
             [](GenLlmReq& self)
             {
@@ -248,7 +250,8 @@ void initBindings(nb::module_& m)
                 }
             })
         .def_prop_rw("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
-        .def_prop_ro("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics);
+        .def_prop_ro("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
+        .def_prop_rw("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
 
     nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
         .def(
@@ -286,7 +289,9 @@ void initBindings(nb::module_& m)
                 std::optional<executor::GuidedDecodingParams> guided_decoding_params,
                 std::optional<tb::LlmRequest::SizeType32> language_adapter_uid,
                 std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
-                std::optional<executor::ContextPhaseParams> context_phase_params)
+                std::optional<executor::ContextPhaseParams> context_phase_params,
+                std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
+                std::optional<tb::LlmRequest::TimePoint> arrival_time)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                 {
@@ -315,7 +320,6 @@ void initBindings(nb::module_& m)
                 auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
                 auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
-                // 49 parameters
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr, stop_words_list_tensor_ptr,
                     position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
@@ -327,7 +331,8 @@ void initBindings(nb::module_& m)
                     encoder_input_tokens, return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
                     encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
-                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params};
+                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
+                    arrival_time};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
@@ -352,12 +357,16 @@ void initBindings(nb::module_& m)
             nb::arg("eagle_config") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
-            nb::arg("context_phase_params") = std::nullopt)
+            nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
+            nb::arg("arrival_time") = std::nullopt)
+        .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
+        .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
             nb::arg("max_draft_len"), nb::arg("vocab_size_padded"), nb::arg("max_endocer_input_len") = std::nullopt,
             nb::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, nb::arg("use_fast_logits") = false,
             nb::arg("mpi_world_rank") = 0)
+        .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
         .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,
             nb::arg("mpi_world_rank") = 0)
         .def("create_serialized_result",
@@ -372,7 +381,8 @@ void initBindings(nb::module_& m)
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, nb::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, nb::arg("finish_reason"))
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
-        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"));
+        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"))
+        .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors);
 
     nb::class_<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(nb::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), nb::arg("max_num_slots"),
@@ -418,13 +428,6 @@ void initBindings(nb::module_& m)
         .def_rw("log_probs", &tb::SlotDecoderBuffers::logProbs)
         .def_rw("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
         .def_rw("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
-
-    nb::class_<tb::MedusaBuffers>(m, "MedusaBuffers")
-        .def(nb::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&,
-                 runtime::ModelConfig const&, runtime::WorldConfig const&, executor::DecodingConfig const&,
-                 runtime::TllmRuntime const&>(),
-            nb::arg("max_beam_width"), nb::arg("max_seq_len"), nb::arg("buffer_manager"), nb::arg("model_config"),
-            nb::arg("world_config"), nb::arg("decoding_config"), nb::arg("runtime"));
 
     m.def(
         "add_new_tokens_to_requests",

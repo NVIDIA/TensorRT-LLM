@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,11 +19,11 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
-#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
@@ -194,6 +194,9 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_property_readonly("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
         .def_property_readonly("llm_request_type", &GenLlmReq::getLlmRequestType)
+        .def_property_readonly("parent_request_id", &GenLlmReq::getParentRequestId)
+        .def_property_readonly("is_child", &GenLlmReq::isChild)
+        .def_property_readonly("cache_salt_id", &GenLlmReq::getCacheSaltID)
         .def_property_readonly("multimodal_hashes",
             [](GenLlmReq& self)
             {
@@ -253,10 +256,11 @@ void initBindings(pybind11::module_& m)
                 }
             })
         .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
-        .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics);
+        .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
+        .def_property("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
-        .def(py::init(
+        .def(py::init<>(
                  [](tb::LlmRequest::RequestIdType request_id, tb::LlmRequest::SizeType32 max_new_tokens,
                      std::vector<tb::LlmRequest::TokenIdType> input_tokens, runtime::SamplingConfig sampling_config,
                      bool is_streaming, std::optional<tb::LlmRequest::SizeType32> end_id,
@@ -290,7 +294,9 @@ void initBindings(pybind11::module_& m)
                      std::optional<executor::GuidedDecodingParams> guided_decoding_params,
                      std::optional<tb::LlmRequest::SizeType32> language_adapter_uid,
                      std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
-                     std::optional<executor::ContextPhaseParams> context_phase_params)
+                     std::optional<executor::ContextPhaseParams> context_phase_params,
+                     std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
+                     std::optional<tb::LlmRequest::TimePoint> arrival_time)
                  {
                      auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                      {
@@ -319,7 +325,6 @@ void initBindings(pybind11::module_& m)
                      auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
                      auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
-                     // 49 parameters
                      return tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                          end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr,
                          stop_words_list_tensor_ptr, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size,
@@ -332,7 +337,7 @@ void initBindings(pybind11::module_& m)
                          encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
                          llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
                          skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
-                         language_adapter_uid, allotted_time_ms, context_phase_params};
+                         language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id, arrival_time};
                  }),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
@@ -358,12 +363,16 @@ void initBindings(pybind11::module_& m)
             py::arg("eagle_config") = std::nullopt, py::arg("skip_cross_attn_blocks") = std::nullopt,
             py::arg("return_perf_metrics") = false, py::arg("guided_decoding_params") = std::nullopt,
             py::arg("language_adapter_uid") = std::nullopt, py::arg("allotted_time_ms") = std::nullopt,
-            py::arg("context_phase_params") = std::nullopt)
+            py::arg("context_phase_params") = std::nullopt, py::arg("cache_salt_id") = std::nullopt,
+            py::arg("arrival_time") = std::nullopt)
+        .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, py::arg("vocab_size"))
+        .def(py::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
             py::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
+        .def("create_child_request", &tb::LlmRequest::createChildRequest, py::arg("child_id"))
         .def("create_result", &tb::LlmRequest::createResult, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
         .def("create_serialized_result",
@@ -378,7 +387,8 @@ void initBindings(pybind11::module_& m)
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"))
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
-        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"));
+        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"))
+        .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors);
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),
@@ -424,13 +434,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("log_probs", &tb::SlotDecoderBuffers::logProbs)
         .def_readwrite("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
-
-    py::class_<tb::MedusaBuffers>(m, "MedusaBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&,
-                 runtime::ModelConfig const&, runtime::WorldConfig const&, executor::DecodingConfig const&,
-                 runtime::TllmRuntime const&>(),
-            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"), py::arg("model_config"),
-            py::arg("world_config"), py::arg("decoding_config"), py::arg("runtime"));
 
     m.def(
         "add_new_tokens_to_requests",

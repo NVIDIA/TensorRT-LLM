@@ -30,8 +30,12 @@ def extract_decode_logprobs(result: RequestOutput,
     return get_logprobs(token_ids, logits)
 
 
-def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
-                          max_batch_size):
+def create_nemotron_h_llm(use_cuda_graph,
+                          disable_overlap_scheduler,
+                          max_batch_size,
+                          mamba_ssm_cache_dtype=None,
+                          enable_chunked_prefill=False,
+                          max_num_tokens=None):
     """Create LLM with specific overlap scheduler setting"""
     model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
     return LLM(
@@ -40,14 +44,21 @@ def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
         max_batch_size=max_batch_size,
         cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
-        enable_trtllm_sampler=True,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="auto"
+            if mamba_ssm_cache_dtype is None else mamba_ssm_cache_dtype),
+        sampler_type="TRTLLMSampler",
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_tokens=max_num_tokens,
     )
 
 
 @skip_gpu_memory_less_than(
     (2 * 8 + 1) * 2**30)  # 8B, bf16, plus 1 GB for good measure
-def test_nemotron_h_correctness():
+@pytest.mark.parametrize("mamba_ssm_cache_dtype", [None, "float32"],
+                         ids=lambda n: f"mamba_ssm_cache_dtype:{n}")
+def test_nemotron_h_correctness(mamba_ssm_cache_dtype):
     # This test is close to memory limit on A30 (with 24GB), so empty cache first
     torch.cuda.empty_cache()
 
@@ -57,9 +68,11 @@ def test_nemotron_h_correctness():
     ]
     num_prompts = len(text_prompts)
 
-    nemotron_h = create_nemotron_h_llm(use_cuda_graph=False,
-                                       disable_overlap_scheduler=False,
-                                       max_batch_size=num_prompts)
+    nemotron_h = create_nemotron_h_llm(
+        use_cuda_graph=False,
+        disable_overlap_scheduler=False,
+        max_batch_size=num_prompts,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
 
     expected_completions = [
         " bright, with endless possibilities for innovation and growth",
@@ -238,15 +251,15 @@ def test_nemotron_h_correctness():
         nemotron_h.shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5404046")
 def test_nemotron_h_cuda_graph_overlap_scheduler():
     prompts = [
-        "Tell me something I don't know about the future of AI",
-        "The president of the United States is",
-        "The capital of France is",
-        "Hello, this is a beautiful day and I'm eager to start my day and",
+        "The sky is blue because",
+        "The sum of two and two is",
+        "The largest mammal is the",
+        "The chemical symbol for water is",
     ]
-    sampling_config = SamplingParams(max_tokens=12,
+
+    sampling_config = SamplingParams(max_tokens=10,
                                      temperature=0.0,
                                      return_generation_logits=True)
 
@@ -273,32 +286,116 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
             prompts, sampling_params=sampling_config, use_tqdm=True)
 
     # Verify outputs are consistent
-    for (no_cg_no_overlap, with_cg_no_overlap,
-         with_cg_with_overlap) in zip(outputs_no_cg_no_overlap,
-                                      outputs_with_cg_no_overlap,
-                                      outputs_with_cg_with_overlap):
+    for i, (no_cg_no_overlap, with_cg_no_overlap,
+            with_cg_with_overlap) in enumerate(
+                zip(outputs_no_cg_no_overlap, outputs_with_cg_no_overlap,
+                    outputs_with_cg_with_overlap)):
 
-        assert (no_cg_no_overlap.outputs[0].text ==
-                with_cg_no_overlap.outputs[0].text)
-        assert (with_cg_no_overlap.outputs[0].text ==
-                with_cg_with_overlap.outputs[0].text)
+        assert (
+            no_cg_no_overlap.outputs[0].text ==
+            with_cg_no_overlap.outputs[0].text
+        ), f"Prompt {i}: no CG no overlap generated text != with CG no overlap generated text"
+        assert (
+            with_cg_no_overlap.outputs[0].text ==
+            with_cg_with_overlap.outputs[0].text
+        ), f"Prompt {i}: with CG no overlap generated text != with CG with overlap generated text"
 
         # similar to other unittests comparing with / without CG, compare logits of first generation step (2nd generated token)
         torch.testing.assert_close(
             no_cg_no_overlap.outputs[0].generation_logits[1, :],
             with_cg_no_overlap.outputs[0].generation_logits[1, :],
             atol=0.2,
-            rtol=0.2)
+            rtol=0.2,
+            msg=lambda x:
+            f"Prompt {i}: with/without CG (no overlap) logits for first generated step {x}"
+        )
 
         # compare logprobs of all generated tokens
-        torch.testing.assert_close(extract_decode_logprobs(no_cg_no_overlap),
-                                   extract_decode_logprobs(with_cg_no_overlap),
-                                   atol=0.2,
-                                   rtol=0.2)
+        torch.testing.assert_close(
+            extract_decode_logprobs(no_cg_no_overlap),
+            extract_decode_logprobs(with_cg_no_overlap),
+            atol=0.2,
+            rtol=0.2,
+            msg=lambda x:
+            f"Prompt {i}: with/without CG (no overlap) logprobs for all selected tokens {x}"
+        )
 
+        # Similar comparison for with / without overlap scheduler, compare logits of first generation step (2nd generated token)
         # overlap scheduler should have no effect on all logits - low tolerance
         torch.testing.assert_close(
-            with_cg_no_overlap.outputs[0].generation_logits,
-            with_cg_with_overlap.outputs[0].generation_logits,
+            with_cg_no_overlap.outputs[0].generation_logits[1, :],
+            with_cg_with_overlap.outputs[0].generation_logits[1, :],
             atol=0.05,
-            rtol=0.05)
+            rtol=0.05,
+            msg=lambda x:
+            f"Prompt {i}: with/without overlap scheduler (with CG) logits for first generated step {x}"
+        )
+
+        # compare logprobs of all generated tokens
+        torch.testing.assert_close(
+            extract_decode_logprobs(with_cg_no_overlap),
+            extract_decode_logprobs(with_cg_with_overlap),
+            atol=0.05,
+            rtol=0.05,
+            msg=lambda x:
+            f"Prompt {i}: with/without overlap scheduler (with CG) logprobs for all selected tokens {x}"
+        )
+
+
+def test_nemotron_h_chunked_prefill():
+    # Long prompts (~100 tokens) to make sure chunked prefill is enabled
+    # (At the time of development, tokens_per_block isn't configurable from the LLM API,
+    # and max_tokens (i.e. chunk size) needs to be a multiple of tokens_per_block)
+    prompts = [
+        "Artificial Intelligence in Healthcare: Artificial intelligence (AI) is transforming healthcare by improving diagnostics, treatment plans, and patient care. AI algorithms can analyze medical images with high accuracy, assist in early disease detection, and personalize treatment plans based on patient data. Additionally, AI-powered chatbots and virtual assistants provide support to patients, enhancing accessibility and efficiency in healthcare services. As AI technology continues to advance, its integration into healthcare systems promises to deliver better outcomes and reduce costs. With continuous research and development, AI in healthcare is poised to",
+        "The Role of Cloud Computing: Cloud computing has revolutionized the way businesses operate by providing scalable, on-demand access to computing resources. This technology allows organizations to store and process data remotely, reducing the need for physical infrastructure and enabling greater flexibility. Cloud services facilitate collaboration, enhance data security, and support the deployment of innovative applications. As businesses increasingly adopt cloud solutions, they benefit from improved efficiency, cost savings, and the ability to rapidly adapt to changing market conditions. Companies leveraging cloud computing are better positioned to",
+        "Advancements in Renewable Energy: Renewable energy technologies, such as solar and wind power, are crucial for addressing climate change and reducing dependence on fossil fuels. Advances in energy storage, grid integration, and efficiency are making renewable energy sources more viable and cost-effective. Innovations in materials science and engineering are also driving the development of next-generation renewable technologies. As global efforts to combat climate change intensify, the continued advancement of renewable energy will play a pivotal role in achieving a sustainable future. Governments and industries are increasingly investing in",
+        "The Importance of Cybersecurity: In today's digital age, cybersecurity has become essential to protect sensitive information and maintain the integrity of systems. With the rise of cyber threats such as hacking, phishing, and ransomware, organizations must implement robust security measures to safeguard their data. Cybersecurity involves a combination of technologies, processes, and practices designed to defend against unauthorized access and attacks. By staying vigilant and updating security protocols, businesses can mitigate risks and ensure the safety of their digital assets. Proactive cybersecurity strategies are crucial in",
+        "The Impact of Artificial Intelligence on Education: Artificial intelligence is reshaping education by providing personalized learning experiences and automating administrative tasks. AI-driven educational tools can adapt to individual student needs, offering tailored feedback and resources to enhance learning outcomes. Additionally, AI can streamline administrative processes, allowing educators to focus more on teaching and student engagement. As AI continues to evolve, its role in education will expand, offering new opportunities for innovation and efficiency. The integration of AI in classrooms promises to revolutionize how students learn and how educators manage their",
+    ]
+    sampling_config = SamplingParams(max_tokens=10,
+                                     temperature=0.0,
+                                     return_context_logits=True,
+                                     return_generation_logits=True)
+
+    with create_nemotron_h_llm(use_cuda_graph=False,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16) as llm:
+        outputs = llm.generate(prompts,
+                               sampling_params=sampling_config,
+                               use_tqdm=True)
+
+    with create_nemotron_h_llm(use_cuda_graph=False,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16,
+                               enable_chunked_prefill=True,
+                               max_num_tokens=64) as llm:
+        chunked_prefill_outputs = llm.generate(prompts,
+                                               sampling_params=sampling_config,
+                                               use_tqdm=True)
+
+    for i, (output, chunked_prefill_output) in enumerate(
+            zip(outputs, chunked_prefill_outputs)):
+        assert output.outputs[0].text == chunked_prefill_output.outputs[0].text
+
+        # assert same prefill logprobs. Same atol as diff between mcore and initial impl
+        prefill_logprobs = extract_prefill_logprobs(output)
+        chunked_prefill_logprobs = extract_prefill_logprobs(
+            chunked_prefill_output)
+        torch.testing.assert_close(
+            prefill_logprobs,
+            chunked_prefill_logprobs,
+            atol=0.3,
+            rtol=0.05,
+            msg=lambda x: f"Prompt {i} prefill logprobs {x}")
+
+        # Decode logprobs shouldn't be affected by chunked prefill - tolerance like batching tolerance
+        decode_logprobs = extract_decode_logprobs(output)
+        chunked_decode_logprobs = extract_decode_logprobs(
+            chunked_prefill_output)
+        torch.testing.assert_close(
+            decode_logprobs,
+            chunked_decode_logprobs,
+            atol=0.2,
+            rtol=0.05,
+            msg=lambda x: f"Prompt {i} decode logprobs {x}")

@@ -1,6 +1,9 @@
 import asyncio
 import time
 
+import pytest
+from utils.util import skip_single_gpu
+
 import tensorrt_llm
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -9,6 +12,7 @@ from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.scheduling_params import SchedulingParams
 
 from .test_llm import get_model_path
 
@@ -71,7 +75,8 @@ def test_kv_cache_event_data_serialization():
     flush_events(kv_cache_manager)
     events = kv_cache_manager.get_latest_events(10)
     serialized_event = KVCacheEventSerializer.serialize(events)
-    assert len(serialized_event) == 1 and serialized_event[0]["event_id"] == 0
+    assert len(serialized_event) == 1 and serialized_event[0][
+        "event_id"] == 0 and serialized_event[0]["window_size"] == 256
     assert serialized_event[0]["data"]["type"] == "created"
     assert len(serialized_event[0]["data"]["num_blocks_per_cache_level"]) == 2
 
@@ -144,61 +149,129 @@ def test_kv_cache_event_async_api():
     asyncio.run(main())
 
 
+def check_events(llm,
+                 requests,
+                 sampling_params,
+                 scheduling_params=None,
+                 attention_dp_rank=None):
+
+    _ = llm.generate(requests[0],
+                     sampling_params=sampling_params,
+                     scheduling_params=scheduling_params)
+    time.sleep(1)
+    events = llm.get_kv_cache_events(5)
+    # Created or stored event
+    total_stored_blocks = 0
+    if attention_dp_rank is None:
+        event = events.pop(0)  # created event
+        assert event["event_id"] == 0
+        assert event["data"]["type"] == "created"
+        while events:
+            event = events.pop(0)
+            if event:
+                assert event["data"]["type"] == "stored"
+                assert event["event_id"] > 0
+                total_stored_blocks += len(event["data"]["blocks"])
+    else:
+        while events:
+            event = events.pop(0)
+            if not event:
+                continue
+            assert "attention_dp_rank" in event
+            if event["attention_dp_rank"] == attention_dp_rank:
+                assert event["data"]["type"] in ["created", "stored"]
+                if event["data"]["type"] == "created":
+                    assert event["event_id"] == 0
+                if event["data"]["type"] == "stored":
+                    assert event["event_id"] > 0
+                    total_stored_blocks += len(event["data"]["blocks"])
+
+    assert total_stored_blocks == 5  # Should have 5 blocks in total
+
+    _ = llm.generate(requests[1],
+                     sampling_params=sampling_params,
+                     scheduling_params=scheduling_params)
+    time.sleep(1)
+    events2 = llm.get_kv_cache_events(5)
+
+    total_stored_blocks = 0
+    has_removed_event = False
+    while events2:
+        event = events2.pop(0)
+        if event and (attention_dp_rank is None
+                      or event.get("attention_dp_rank") == attention_dp_rank):
+            if event["data"]["type"] == "removed":
+                has_removed_event = True
+                assert event["data"]["block_hashes"]
+            # stored events
+            elif event["data"]["type"] == "stored":
+                total_stored_blocks += len(event["data"]["blocks"])
+
+    assert total_stored_blocks == 5  # Should have 5 blocks in total
+    assert has_removed_event
+
+    _ = llm.generate(requests[2],
+                     sampling_params=sampling_params,
+                     scheduling_params=scheduling_params)
+    time.sleep(1)
+    events3 = llm.get_kv_cache_events(5)
+
+    total_stored_blocks = 0
+    has_removed_event = False
+    while events3:
+        event = events3.pop(0)
+        if event and (attention_dp_rank is None
+                      or event.get("attention_dp_rank") == attention_dp_rank):
+
+            if event["data"]["type"] == "removed":
+                has_removed_event = True
+                assert event["data"]["block_hashes"]
+            elif event["data"]["type"] == "stored":
+                total_stored_blocks += len(event["data"]["blocks"])
+
+    assert total_stored_blocks == 5  # Should have 5 blocks in total
+    assert has_removed_event
+
+    # no more events after request is finished
+    assert not llm.get_kv_cache_events(5)
+
+
 def test_llm_kv_events_api():
     llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+    sampling_params = SamplingParams(max_tokens=6,
+                                     temperature=0.01,
+                                     ignore_eos=True)
 
     requests = []
     for i in range(3):
         input_tokens = list(range(127 + i))[i:]
         requests.append(input_tokens)
 
-    _ = llm.generate(requests[0], sampling_params=sampling_params)
-    events1 = llm.get_kv_cache_events(5)
+    check_events(llm, requests, sampling_params)
 
-    # Should have 1 stored event and 1 created event
-    event = events1.pop(0)  # created event
-    while events1:
-        event = events1.pop(0)
-        if event:
-            assert event["event_id"] == 1
-            assert event["data"]["type"] == "stored"
-            assert len(event["data"]["blocks"]) == 5
 
-    _ = llm.generate(requests[1], sampling_params=sampling_params)
-    events2 = llm.get_kv_cache_events(5)
+@skip_single_gpu
+@pytest.mark.threadleak(enabled=False)
+def test_llm_api_attention_dp_kv_events():
 
-    while events2:
-        event = events2.pop(0)
-        if event:
-            if event["event_id"] == 2:
-                # 2 removed events needed
-                # should be a removed event to make space for context block
-                assert event["data"]["type"] == "removed"
-                assert event["data"]["block_hashes"]
-            elif event["event_id"] == 3:
-                assert event["data"]["type"] == "removed"
-                assert event["data"]["block_hashes"]
-            # stored event for 2nd request
-            elif event["event_id"] == 4:
-                assert event["data"]["type"] == "stored"
-                assert len(event["data"]["blocks"]) == 5
+    llm = LLM(model=llama_model_path,
+              tensor_parallel_size=2,
+              enable_attention_dp=True,
+              kv_cache_config=global_kvcache_config,
+              enable_autotuner=False)
 
-    _ = llm.generate(requests[2], sampling_params=sampling_params)
-    events3 = llm.get_kv_cache_events(5)
+    sampling_params = SamplingParams(max_tokens=6,
+                                     temperature=0.01,
+                                     ignore_eos=True)
 
-    while events3:
-        event = events3.pop(0)
-        if event:
-            if event["event_id"] == 5:
-                assert event["data"]["type"] == "removed"
-                assert event["data"]["block_hashes"]
-            elif event["event_id"] == 6:
-                assert event["data"]["type"] == "removed"
-                assert event["data"]["block_hashes"]
-            elif event["event_id"] == 7:
-                assert event["data"]["type"] == "stored"
-                assert len(event["data"]["blocks"]) == 5
+    for attention_dp_rank in range(2):
+        requests = []
+        for i in range(3):
+            input_tokens = list(range(127 + i))[i:]
+            requests.append(input_tokens)
 
-    # no more events after request is finished
-    assert not llm.get_kv_cache_events(5)
+        scheduling_params = SchedulingParams(
+            attention_dp_rank=attention_dp_rank, attention_dp_relax=False)
+
+        check_events(llm, requests, sampling_params, scheduling_params,
+                     attention_dp_rank)

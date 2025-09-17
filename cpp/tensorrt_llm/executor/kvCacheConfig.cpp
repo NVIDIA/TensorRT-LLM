@@ -27,7 +27,8 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     std::optional<size_t> const& hostCacheSize, bool onboardBlocks,
     std::optional<FloatType> const& crossKvCacheFraction, std::optional<RetentionPriority> secondaryOffloadMinPriority,
     size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
-    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults)
+    SizeType32 attentionDpEventsGatherPeriodMs,
+    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults, uint64_t const& maxGpuTotalBytes)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
     , mOnboardBlocks(onboardBlocks)
@@ -36,6 +37,8 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
     , mUseUvm{useUvm}
+    , mAttentionDpEventsGatherPeriodMs(attentionDpEventsGatherPeriodMs)
+    , mMaxGpuTotalBytes{maxGpuTotalBytes}
 {
     if (maxTokens)
     {
@@ -61,6 +64,12 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     {
         fillEmptyFieldsFromRuntimeDefaults(runtimeDefaults.value());
     }
+    if (maxGpuTotalBytes)
+    {
+        setMaxGpuTotalBytes(maxGpuTotalBytes);
+    }
+    TLLM_CHECK_WITH_INFO(
+        mAttentionDpEventsGatherPeriodMs > 0, "Attention DP events gather period must be greater than 0");
 }
 
 bool KvCacheConfig::getEnableBlockReuse() const
@@ -128,6 +137,16 @@ bool KvCacheConfig::getUseUvm() const
     return mUseUvm;
 }
 
+SizeType32 KvCacheConfig::getAttentionDpEventsGatherPeriodMs() const
+{
+    return mAttentionDpEventsGatherPeriodMs;
+}
+
+uint64_t KvCacheConfig::getMaxGpuTotalBytes() const
+{
+    return mMaxGpuTotalBytes;
+}
+
 void KvCacheConfig::setEnableBlockReuse(bool enableBlockReuse)
 {
     mEnableBlockReuse = enableBlockReuse;
@@ -143,9 +162,12 @@ void KvCacheConfig::setCopyOnPartialReuse(bool copyOnPartialReuse)
     mCopyOnPartialReuse = copyOnPartialReuse;
 }
 
-void KvCacheConfig::setMaxTokens(SizeType32 maxTokens)
+void KvCacheConfig::setMaxTokens(std::optional<SizeType32> maxTokens)
 {
-    TLLM_CHECK(maxTokens > 0);
+    if (maxTokens)
+    {
+        TLLM_CHECK(maxTokens.value() > 0);
+    }
     mMaxTokens = maxTokens;
 }
 
@@ -202,6 +224,17 @@ void KvCacheConfig::setEventBufferMaxSize(size_t eventBufferMaxSize)
 void KvCacheConfig::setUseUvm(bool useUvm)
 {
     mUseUvm = useUvm;
+}
+
+void KvCacheConfig::setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs)
+{
+    TLLM_CHECK(attentionDpEventsGatherPeriodMs > 0);
+    mAttentionDpEventsGatherPeriodMs = attentionDpEventsGatherPeriodMs;
+}
+
+void KvCacheConfig::setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes)
+{
+    mMaxGpuTotalBytes = maxGpuTotalBytes;
 }
 
 void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults)

@@ -1,7 +1,20 @@
 import argparse
 import enum
 import os
-from itertools import product
+from itertools import chain, product
+
+file_to_patch = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "../../../../../3rdparty/cutlass/python/cutlass_library/heuristics_provider.py"
+    ))
+# replace "from library import" to "from cutlass_library.library import"
+with open(file_to_patch, "r") as f:
+    file_contents = f.read()
+with open(file_to_patch, "w") as f:
+    f.write(
+        file_contents.replace("from library import",
+                              "from cutlass_library.library import"))
 
 from cutlass_library import *
 
@@ -111,7 +124,10 @@ CudaTypeName = {
     DataType.e4m3: "__nv_fp8_e4m3",
     DataType.bf16: "__nv_bfloat16",
     DataType.f16: "half",
-    DataType.f32: "float"
+    DataType.f32: "float",
+    DataType.e2m1: "__nv_fp4_e2m1",
+    DataType.ue8m0: "cutlass::float_ue8m0_t",
+    DataType.u4: "cutlass::uint4b_t"
 }
 
 
@@ -136,7 +152,9 @@ class TrtLlm_GemmLauncher:
                  mainloop_schedule,
                  epi_schedule,
                  epi_fusion=None,
-                 is_mx_fpx=False):
+                 is_mx_fpx=False,
+                 dynamic_cga=False,
+                 swap_ab=False):
         self.gemm_kind = gemm_kind
         self.arch = arch
         self.act_type = act_type
@@ -150,10 +168,12 @@ class TrtLlm_GemmLauncher:
         self.warp_shape = warp_shape
         self.stages = stages
         self.cga_shape = cga_shape
+        self.dynamic_cga = dynamic_cga
         self.mainloop_schedule = mainloop_schedule
         self.epi_schedule = epi_schedule
         self.epi_fusion = epi_fusion
         self.is_mx_fpx = is_mx_fpx
+        self.swap_ab = swap_ab
 
     def __repr__(self):
         kernel_prefix = "{}_sm{}_{}_{}_{}_{}_{}_{}_{}_{}x{}x{}_{}x{}x{}_{}".format(
@@ -167,11 +187,13 @@ class TrtLlm_GemmLauncher:
             self.cta_shape[2], self.warp_shape[0], self.warp_shape[1],
             self.warp_shape[2], self.stages)
 
-        hopper_suffix = "_{}x{}x{}{}{}{}".format(
+        hopper_suffix = "_{}x{}x{}{}{}{}{}{}".format(
             self.cga_shape[0], self.cga_shape[1], self.cga_shape[2],
             KernelScheduleSuffixes[self.mainloop_schedule],
             EpilogueScheduleSuffixes[self.epi_schedule],
-            EpiFusionSuffixes[self.epi_fusion])
+            EpiFusionSuffixes[self.epi_fusion],
+            "_mxfpx_" if self.is_mx_fpx else "",
+            "_swap_ab" if self.swap_ab else "")
 
         if self.arch >= 90:
             return kernel_prefix + hopper_suffix
@@ -198,7 +220,9 @@ def instantiate_operation_tma_warp_specialized(operation):
     cute_cga_shape = tuple_to_cute_shape(operation.cga_shape)
 
     kernel_sched = KernelScheduleTag[operation.mainloop_schedule]
-    epi_sched = EpilogueScheduleTag[operation.epi_schedule]
+    epi_sched = "void"
+    if operation.epi_schedule is not None:
+        epi_sched = EpilogueScheduleTag[operation.epi_schedule]
 
     if operation.gemm_kind == GemmKind.Gemm:
         weight_tag = DataTypeTag[operation.weight_type]
@@ -209,14 +233,13 @@ template void sm90_generic_mixed_gemm_kernelLauncher<{act_tag}, {weight_tag}, {s
 {kernel_sched}, {epi_sched}> (
 const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zero_tag}*, const {bias_tag}*, const float,
 {out_tag}*, int, int, int, const int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig, char*, size_t, cudaStream_t, int*
-);
-"""
+);"""
     elif operation.gemm_kind == GemmKind.Grouped:
         if operation.act_type != operation.weight_type and (
                 operation.act_type != DataType.e4m3
                 or operation.weight_type != e2m1):
             # Mixed MoE GEMM
-            weight_tag = DataTypeTag[operation.weight_type]
+            weight_tag = CudaTypeName[operation.weight_type]
             instantiation = f"""
 template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
 {epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
@@ -228,18 +251,21 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
                 KernelScheduleType.TmaWarpSpecializedCooperative,
                 KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum
             ]
-            assert operation.epi_schedule == EpilogueScheduleType.NoSmemWarpSpecialized
             kernel_sched.replace("::Kernel", "::KernelGrouped")
-            epi_sched += "Grouped"
-
+            # epi_sched += "Grouped"
             # arch_tag = f"cutlass::arch::Sm{operation.arch}"
             arch_tag = f"Sm{operation.arch}"
             weight_tag = CudaTypeName[operation.weight_type]
             assert operation.epi_fusion is not None
             epi_fusion = EpiFusion[operation.epi_fusion]
 
+            # We need to remove the '::' because this will break the instantiation macro
             epi_fusion = epi_fusion.split(':')[-1]
             epi_tag = epi_tag.split(':')[-1]
+            epi_sched = epi_sched.split(':')[-1]
+            epi_sched = epi_sched.replace(
+                "1Sm",
+                "")  # Hack to WAR missing `PtrArrayTmaWarpSpecialized` type
 
             guard_map = {
                 e2m1: "defined(ENABLE_FP4)",
@@ -258,11 +284,9 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             #                 (TmaWarpSpecializedGroupedGemmInput, int, int, cudaStream_t, int*, size_t*);
             # """
             instantiation = f"""
-#if {guard_act} && {guard_weight}\n
-        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag},
-                {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, false);\n
-#endif
-"""
+#if {guard_act} && {guard_weight}
+        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag}, {epi_sched}, {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, {"true" if operation.dynamic_cga else "false"}, false, {"true" if operation.swap_ab else "false"});
+#endif"""
     return instantiation
 
 
@@ -273,8 +297,7 @@ def instantiate_operation_sm80(operation):
 
     instantiation = f"""
             template void sm80_generic_fused_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.stage}, {epi_tag}>
-                    ({act_tag} const* A, {weight_tag} const* B, {act_tag} const* biases, bool bias_is_broadcast, {act_tag}* C, int64_t const* total_tokens_including_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts, int multi_processor_count, cudaStream_t stream, int* kernel_occupancy);
-    """
+                    ({act_tag} const* A, {weight_tag} const* B, {act_tag} const* biases, bool bias_is_broadcast, {act_tag}* C, int64_t const* total_tokens_including_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts, int multi_processor_count, cudaStream_t stream, int* kernel_occupancy);"""
     return instantiation
 
 
@@ -302,12 +325,12 @@ namespace tensorrt_llm
 {{
 namespace kernels
 {{
-namespace cutlass_kernels
+namespace cutlass_kernels_oss
 {{
 
 {instantiations}
 
-}} // namespace cutlass_kernels
+}} // namespace cutlass_kernels_oss
 }} // namespace kernels
 }} // namespace tensorrt_llm
 """
@@ -337,17 +360,22 @@ def write_file(launcher_inl_files, operations, output_file):
         f.write(content)
 
 
-from operator import mul, truediv
-
-
-def elementwise(x, y, f):
-    return tuple(f(a, b) for (a, b) in zip(x, y))
-
-
 def is_gemm_op_valid_sm100(op):
     # TODO These are much more restricted than theory dictates, investigate if more can be enabled in future
-    tile_m, tile_n, _ = elementwise(op.cta_shape, op.cga_shape, truediv)
-    cga_m, cga_n, _ = op.cga_shape
+    tile_m, tile_n, _ = op.cta_shape
+    cga_m, cga_n, cga_k = op.cga_shape
+
+    if op.epi_fusion == TrtLlm_EpilogueFusion.epilogue_fusion_finalize and op.epi_schedule != EpilogueScheduleType.PtrArrayTmaWarpSpecialized1Sm:
+        return False
+
+    # We use a runtime cluster shape for SM100, so we only use cluster shapes to distinguish between 1SM and 2SM variants.
+    if cga_m > 2 or cga_n != 1 or cga_k != 1:
+        return False
+
+    if op.arch == 103:
+        return op.act_type == e2m1 and op.weight_type == e2m1 and tile_m == 128 and tile_n in [
+            128, 256
+        ]
 
     # Default shapes
     # This is epilogue tile size. For two CTA this is actually size 128/256 for the MMA
@@ -356,20 +384,18 @@ def is_gemm_op_valid_sm100(op):
 
     # FP4 Has some much more limited sizes
     if op.act_type == e2m1 or op.weight_type == e2m1:
-        # TODO 128x256x256 FP4 compiles but crashes
-        # if tile_n % 64 != 0 or tile_n < 128:
-        #     return False
         if tile_n not in [64, 128, 256] or tile_m != 128:
+            return False
+        # TODO Revert this once cutlass adds support for blockscaled + no smem
+        if op.arch == 100 and op.epi_schedule == EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm:
             return False
 
     # Shapes for fp8 small N shapes
-    if (op.act_type == DataType.e4m3 and (tile_n == 16 or tile_n == 8)
-            and (cga_m == 1 and cga_n == 1)):
-        # todo: double check why this is disable in CUTLASS backend. @yuhan
-        if tile_m == 128 and tile_n == 8:
-            return False
-        else:
-            return True
+    if (op.act_type == DataType.e4m3) and (tile_n == 16
+                                           or tile_n == 8) and (cga_m == 1
+                                                                and cga_n == 1):
+        # todo: double check why tile_n = 8 is disabled in CUTLASS backend. @yuhan
+        return tile_m != 128 or tile_n % 16 == 0
 
     # Default alignment requirements
     if tile_n % 32 != 0 or tile_n < 32 or tile_n > 256:
@@ -408,7 +434,7 @@ def is_grouped_gemm_op_valid(op):
     if op.epi_tag != TrtLlm_EpilogueTag.epilogue_op_default:
         return False
 
-    if op.epi_schedule != EpilogueScheduleType.NoSmemWarpSpecialized:
+    if op.epi_schedule is not None and op.epi_schedule != EpilogueScheduleType.NoSmemWarpSpecialized:
         return False
 
     if op.mainloop_schedule not in [
@@ -509,29 +535,44 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
         TrtLlm_EpilogueFusion.epilogue_fusion_finalize
     ]
 
+    swap_ab = [True, False]
+
     cga_shapes = product([1, 2], [1, 2], [1])
 
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mn, cga_shapes)
+                           cta_shapes_mn, cga_shapes, swap_ab)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape, swap_ab in partial_args:
         max_k_bits = 128 * 8
         cta_shape_k = max_k_bits // GetDataTypeBits(dtype)
         cta_shape_mnk = cta_shape_mn + (cta_shape_k, )
 
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative if dtype != DataType.e4m3 else KernelScheduleType.TmaWarpSpecializedCooperativeFP8FastAccum
-        epi_schedule = EpilogueScheduleType.NoSmemWarpSpecialized
+        epi_schedule = None
 
         otypes = [dtype]
         if dtype == DataType.e4m3:
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cta_shape_mnk, warp_shape, stages, cga_shape,
-                mainloop_schedule, epi_schedule, epi_fusion)
+            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
+                                                     arch,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     otype,
+                                                     quant_op,
+                                                     epi_tag,
+                                                     cta_shape_mnk,
+                                                     warp_shape,
+                                                     stages,
+                                                     cga_shape,
+                                                     mainloop_schedule,
+                                                     epi_schedule,
+                                                     epi_fusion,
+                                                     swap_ab=swap_ab)
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
@@ -542,9 +583,17 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 90
-    supported_dtypes = [
+
+    # act_type, weight_type, scalezero_type, bias_type, output_type
+    supported_dtypes_int4 = [
         (DataType.e4m3, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.e4m3, DataType.u4, DataType.bf16, DataType.bf16,
+         DataType.bf16),
+    ]
+    supported_dtypes_fp4 = [
+        (DataType.f16, DataType.e2m1, DataType.ue8m0, DataType.f16,
+         DataType.f16),
+        (DataType.bf16, DataType.e2m1, DataType.ue8m0, DataType.bf16,
          DataType.bf16),
     ]
 
@@ -555,15 +604,24 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
     N_TILES = [16, 32, 64, 128]
     K_TILES = [128, 256, 512]
-    cta_shapes_mnk = list(product(M_TILES, N_TILES, K_TILES))
+    cta_shapes_mnk_int4 = list(product(M_TILES, N_TILES, K_TILES))
+
+    M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
+    N_TILES = [16, 32, 64]
+    K_TILES = [128, 256]
+    cta_shapes_mnk_fp4 = list(product(M_TILES, N_TILES, K_TILES))
+    cta_shapes_mnk_fp4.append((128, 128, 128))
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
 
-    cga_shapes = product([1, 2], [1, 2], [1])
+    cga_shapes = list(product([1, 2], [1, 2], [1]))
 
-    partial_args = product(supported_dtypes, quant_ops, epi_tags,
-                           cta_shapes_mnk, cga_shapes)
+    partial_args_int4 = product(supported_dtypes_int4, quant_ops, epi_tags,
+                                cta_shapes_mnk_int4, cga_shapes)
+    partial_args_fp4 = product(supported_dtypes_fp4, quant_ops, epi_tags,
+                               cta_shapes_mnk_fp4, cga_shapes)
+    partial_args = chain(partial_args_int4, partial_args_fp4)
 
     operations = list()
     for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in partial_args:
@@ -597,8 +655,6 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
     cta_shape_k = max_k_bits // GetDataTypeBits(dtype)
     if dtype == DataType.e4m3 and (cta_shape_mn[1] == 8):
         cta_shape_k = 256
-    if dtype == DataType.e4m3 and (cta_shape_mn[1] == 16):
-        cta_shape_k = 128
     return cta_shape_mn + (cta_shape_k, )
 
 
@@ -618,31 +674,45 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
 
     epi_fusions = [
         TrtLlm_EpilogueFusion.epilogue_fusion_none,
-        # TrtLlm_EpilogueFusion.epilogue_fusion_finalize
+        TrtLlm_EpilogueFusion.epilogue_fusion_finalize
     ]
 
     cga_shapes = [[1, 1, 1]]
 
+    swap_ab = [True, False]
+
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mnk, cga_shapes)
+                           cta_shapes_mnk, cga_shapes, swap_ab)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape in partial_args:
-        cga_tile_shape_mnk = elementwise(cta_shape_mnk, cga_shape, mul)
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape, swap_ab in partial_args:
 
         # Ignored
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
-        epi_schedule = EpilogueScheduleType.NoSmemWarpSpecialized
+        epi_schedule = None
 
         otypes = [dtype]
         if dtype in [DataType.e4m3, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cga_tile_shape_mnk, warp_shape, stages,
-                cga_shape, mainloop_schedule, epi_schedule, epi_fusion)
+            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
+                                                     arch,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     dtype,
+                                                     otype,
+                                                     quant_op,
+                                                     epi_tag,
+                                                     cta_shape_mnk,
+                                                     warp_shape,
+                                                     stages,
+                                                     cga_shape,
+                                                     mainloop_schedule,
+                                                     epi_schedule,
+                                                     epi_fusion,
+                                                     swap_ab=swap_ab)
 
             operations.append(moe_gemm_operation)
     return operations
@@ -653,10 +723,9 @@ def generate_sm120_operations(is_arch_enabled):
     return operations
 
 
-def generate_sm100_grouped_gemm_operations(is_arch_enabled):
+def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
     if not is_arch_enabled:
         return []
-    arch = 100
     supported_dtypes = [
         DataType.f16, DataType.bf16, DataType.f32, DataType.e4m3, e2m1,
         (DataType.e4m3, e2m1)
@@ -664,7 +733,7 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_m = [64, 128]
-    cta_shapes_n = [8, 16, 32, 64, 128, 256]
+    cta_shapes_n = [8, 16, 32, 64, 128, 192, 256]
     cta_shapes_mn = product(cta_shapes_m, cta_shapes_n)
 
     warp_shape = [0, 0, 0]  # ignored except for naming
@@ -672,27 +741,37 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
 
     epi_fusions = [
         TrtLlm_EpilogueFusion.epilogue_fusion_none,
-        # TrtLlm_EpilogueFusion.epilogue_fusion_finalize
+        TrtLlm_EpilogueFusion.epilogue_fusion_finalize
     ]
 
-    cga_shapes = list(product([1, 2], [1, 2], [1]))
+    # Some shapes for SM100 are better with NoSmem, note the kernel will internally map to the 1 or 2 SM variants based on the cga_shape[0]
+    epi_schedules = [
+        EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm,
+        EpilogueScheduleType.PtrArrayTmaWarpSpecialized1Sm
+    ]
+
+    # We will use dynamic cluster shapes for SM100, so we only need to indicate if we are using 1 or 2 SM version
+    cga_shapes = [(1, 1, 1), (2, 1, 1)]
+
+    swap_ab = [True, False]
+
+    dynamic_cga = [True, False]
 
     partial_args = product(supported_dtypes, quant_ops, epi_tags, epi_fusions,
-                           cta_shapes_mn, cga_shapes)
+                           cta_shapes_mn, cga_shapes, epi_schedules,
+                           dynamic_cga, swap_ab)
 
     operations = list()
-    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
+    for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape, epi_schedule, dynamic_cga, swap_ab in partial_args:
         if isinstance(dtype, tuple):
             dtype, weight_type = dtype
         else:
             weight_type = dtype
 
         cta_shape_mnk = calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype)
-        cga_tile_shape_mnk = elementwise(cta_shape_mnk, cga_shape, mul)
 
         # Ignored
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
-        epi_schedule = EpilogueScheduleType.NoSmemWarpSpecialized
 
         otypes = [dtype]
         if dtype in [DataType.e4m3, e2m1]:
@@ -709,22 +788,29 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
                 otype,
                 quant_op,
                 epi_tag,
-                cga_tile_shape_mnk,
+                cta_shape_mnk,
                 warp_shape,
                 stages,
                 cga_shape,
                 mainloop_schedule,
                 epi_schedule,
                 epi_fusion,
-                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1))
+                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1),
+                dynamic_cga=dynamic_cga,
+                swap_ab=swap_ab)
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
     return operations
 
 
+def generate_sm103_operations(is_arch_enabled):
+    operations = generate_sm100_grouped_gemm_operations(is_arch_enabled, 103)
+    return operations
+
+
 def generate_sm100_operations(is_arch_enabled):
-    operations = generate_sm100_grouped_gemm_operations(is_arch_enabled)
+    operations = generate_sm100_grouped_gemm_operations(is_arch_enabled, 100)
     return operations
 
 
@@ -804,18 +890,20 @@ if __name__ == "__main__":
         (GemmKind.Gemm, 90): [fpA_intB_inl],
         (GemmKind.Grouped, 90): [moe_gemm_inl],
         (GemmKind.Grouped, 100): [moe_gemm_inl],
+        (GemmKind.Grouped, 103): [moe_gemm_inl],
         (GemmKind.Grouped, 120): [moe_gemm_inl],
         (GemmKind.Grouped, 80): [sm80_moe_gemm_inl]
     }
 
     def has_arch(sm):
-        return f"{sm}" in arches or f"{sm}-real" in arches
+        return f"{sm}" in arches or f"{sm}-real" in arches or f"{sm}f-real" in arches or f"{sm}f" in arches
 
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
     operations = []
     operations += generate_sm120_operations(has_arch(120) or has_arch(121))
-    operations += generate_sm100_operations(has_arch(100))
+    operations += generate_sm103_operations(has_arch(103))
+    operations += generate_sm100_operations(has_arch(100) or has_arch(103))
     operations += generate_sm90_operations(has_arch(90))
     operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 

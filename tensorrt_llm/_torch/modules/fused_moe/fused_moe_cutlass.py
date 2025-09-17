@@ -1,15 +1,24 @@
+import os
+from functools import cached_property
 from typing import Dict, List, Optional, Union
 
 import torch
 
-from ...distributed import allgather, reducescatter
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+
+from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import EventType, Fp4QuantizedTensor, ceil_div, swizzle_sf
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
 from .interface import MoE
-from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
-                           FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
-                           NVFP4CutlassFusedMoEMethod,
-                           UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
+
+# isort: off
+from .quantization import (
+    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
+    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
+    INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
+    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
+    WInt4AFP8FusedMoEMethod)
+# isort: on
 from .routing import BaseMoeRoutingMethod
 
 
@@ -22,7 +31,7 @@ class CutlassFusedMoE(MoE):
         top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
-        aux_stream (Optional[torch.cuda.Stream]): Auxiliary CUDA stream to overlap chunks.
+        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
@@ -51,11 +60,16 @@ class CutlassFusedMoE(MoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        bias: bool = False,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
     ):
 
         super().__init__(
@@ -67,9 +81,21 @@ class CutlassFusedMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            bias=bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            layer_idx=layer_idx,
         )
 
-        self.layer_idx = layer_idx
+        # Store original hidden size before any potential padding
+        self.unpadded_hidden_size = self.hidden_size
+
+        if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
+        ):
+            self.hidden_size = ((self.hidden_size + 127) // 128) * 128
+            self.intermediate_size_per_partition = (
+                (self.intermediate_size_per_partition + 127) // 128) * 128
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -85,15 +111,15 @@ class CutlassFusedMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
-        max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        if self.use_dp:
-            max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or max_num_tokens
+        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
-            self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
-            )
+        if self.moe_max_num_tokens < moe_max_num_tokens:
+            self.aux_stream = aux_stream_dict[
+                AuxStreamType.
+                MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
+                )
             self.event_dict = {
                 key: torch.cuda.Event()
                 for key in [EventType.Main, EventType.MoeChunkingOverlap]
@@ -112,8 +138,21 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
 
+        # TODO: AlltoAll code is largely duplicated with WideEPMoE. Consider refactor and reuse in the future.
+        self.alltoall_workspace = None
+        self.alltoall_prepare_workspace = None
+        if self.enable_alltoall:
+            MnnvlMemory.initialize()
+            self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                model_config.mapping)
+            self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                model_config.mapping)
+
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
+
+        # Finalize fusion should be disabled if Lora is used.
+        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -130,8 +169,10 @@ class CutlassFusedMoE(MoE):
             if not (self.quant_config.quant_mode.has_nvfp4()
                     | self.quant_config.quant_mode.has_fp8_block_scales()
                     | self.quant_config.quant_mode.has_fp8_qdq()
-                    | self.quant_config.quant_mode.
-                    is_int4_weight_only_per_group()):
+                    | self.quant_config.quant_mode.is_weight_only()
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()
+                    | self.quant_config.quant_mode.has_w4a16_mxfp4()
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -141,6 +182,19 @@ class CutlassFusedMoE(MoE):
         assert self._weights_created
         return self.quant_config and self.quant_config.quant_mode.is_int4_weight_only_per_group(
         )
+
+    @property
+    def has_int8_woq_per_channel(self):
+        return self.quant_config.layer_quant_mode.is_int8_weight_only(
+        ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
+
+    @cached_property
+    def enable_alltoall(self):
+        return (self.mapping.moe_ep_size > self.routing_method.experts_per_token
+                and self.mapping.enable_attention_dp
+                and self.mapping.tp_size > 1
+                and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"
+                and MnnvlMemory.supports_mnnvl())
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -154,6 +208,14 @@ class CutlassFusedMoE(MoE):
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):
                 return WInt4AFP8FusedMoEMethod()
+            elif self.has_int8_woq_per_channel:
+                return INT8WoqPerChannelFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+                return W4A8MXFP4FP8CutlassFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
+                return WFP4A16FusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
+                return W4A8MXFP4MXFP8CutlassFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -170,24 +232,6 @@ class CutlassFusedMoE(MoE):
 
         self._weights_created = True
         self._check_configs()
-
-    def reducescatter_or_allreduce(
-        self,
-        inputs,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-    ):
-        outputs = inputs
-        if self.parallel_size > 1:
-            if self.use_dp:
-                outputs = reducescatter(
-                    inputs,
-                    self.mapping,
-                    dim=0,
-                    sizes=None if use_dp_padding else all_rank_num_tokens)
-            elif self.reduce_results:
-                outputs = self.all_reduce(inputs)
-        return outputs
 
     def forward_chunk(
         self,
@@ -222,20 +266,31 @@ class CutlassFusedMoE(MoE):
         run_post_quant_allgather = self.use_dp and self.parallel_size > 1
         # quantize inputs
         use_deepseek_fp8_block_scale = False
-        use_w4a8_group_scaling = False
+        use_w4_group_scaling = False
+        use_int8_woq_per_channel = False
+        use_mxfp8_act_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
+        x_row = x.shape[0]
+        x_col = x.shape[1]
         if self.has_any_quant:
-            if self.has_fp8_qdq:
+            if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
-                use_w4a8_group_scaling = True
+                use_w4_group_scaling = True
                 weight_dtype = torch.quint4x2
+            elif self.has_w4a16_mxfp4:
+                pad_size = self.hidden_size - x.shape[1]
+                x = torch.nn.functional.pad(x, (0, pad_size))
+                use_w4_group_scaling = True
+                weight_dtype = torch.uint8
+            elif self.has_int8_woq_per_channel:
+                use_int8_woq_per_channel = True
             elif self.has_nvfp4:
-                if run_post_quant_allgather:
+                if run_post_quant_allgather or self.enable_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                         x_row = x.shape[0]
@@ -253,40 +308,103 @@ class CutlassFusedMoE(MoE):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False, True)
+            elif self.has_w4a8_mxfp4_mxfp8:
+                use_mxfp8_act_scaling = True
+                if run_post_quant_allgather or self.enable_alltoall:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, False, alignment=self.quant_method.weight_alignment)
+                else:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, True, alignment=self.quant_method.weight_alignment)
+                # Update x_row and x_col to the padded shape
+                x_row, x_col = x.shape[0], x.shape[1]
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
-        # gather inputs for attention dp
-        if run_post_quant_allgather:
+        # Prepare additional information for profiling in case padding is applied when using alltoall.
+        # Only the non-alltoall case is considered for profiling in the warmup phase.
+        # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
+        if self.enable_alltoall:
+            if all_rank_num_tokens is not None:
+                tuner_num_tokens = sum(all_rank_num_tokens)
+            else:
+                tuner_num_tokens = x.shape[0] * self.mapping.tp_size
+            tuner_top_k = token_selected_experts.shape[1]
+        else:
+            tuner_num_tokens = None
+            tuner_top_k = None
+
+        # Alltoall or allgather for attention DP
+        token_count = x.shape[0]
+        alltoall_info = None  # Store for later combine
+        is_sf_swizzled = True  # In case of post-quant communication, scaling factors will not be swizzled before communication, and swizzling after communication is merged into MoE.
+        if self.enable_alltoall:
+            assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
+            # Prepare alltoall indices
+            top_k = self.routing_method.experts_per_token
+            max_num_token = max(
+                all_rank_num_tokens) if all_rank_num_tokens else token_count
+
+            # Handle case where token_final_scales might be None (when apply_router_weight_on_input=True)
+            if token_final_scales is None:
+                token_final_scales = torch.ones_like(token_selected_experts,
+                                                     dtype=torch.float32)
+
+            assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
+            alltoall_info, _ = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                token_selected_experts, None, self.alltoall_prepare_workspace,
+                max_num_token, self.ep_rank, self.ep_size, self.num_experts,
+                self.num_experts, top_k)
+
+            if x_sf is not None:
+                x_sf = x_sf.view(x_row, ceil_div(x_col,
+                                                 self.scaling_vector_size))
+                is_sf_swizzled = False
+
+            # Dispatch x, x_sf, token_selected_experts, token_final_scales in one alltoall kernel
+            x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
+                [x, x_sf, token_selected_experts, token_final_scales],
+                alltoall_info, self.alltoall_workspace, self.ep_rank,
+                self.ep_size)
+
+            torch.ops.trtllm.memset_expert_ids(
+                token_selected_experts, alltoall_info.recv_rank_count_cumsum,
+                max_num_token, top_k, self.num_experts, self.ep_size)
+
+        elif run_post_quant_allgather:
+            # Original allgather logic
             if x_sf is not None:
                 x_sf = x_sf.view(x_row, ceil_div(x_col,
                                                  self.scaling_vector_size))
                 assert len(
                     x_sf.shape
                 ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
+                is_sf_swizzled = False
+
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
-            # Fp4 gemm has extra scaling factor
-            if x_sf is not None:
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
             self.w3_w1_weight.view(weight_dtype),
-            None,  # fc1_expert_biases
+            self.w3_w1_bias,
             self.w2_weight.view(weight_dtype),
-            None,  # fc2_expert_biases
+            self.w2_bias,
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
+            swizzled_input_sf=is_sf_swizzled,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
@@ -295,15 +413,32 @@ class CutlassFusedMoE(MoE):
             cluster_rank=self.cluster_rank,
             enable_alltoall=self.enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_int8_woq_per_channel=use_int8_woq_per_channel,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=False,
+            use_fused_finalize=self.use_fused_finalize,
             tune_max_num_tokens=self.tune_max_num_tokens,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
+            unpadded_hidden_size=self.unpadded_hidden_size,
         )
-
         # Custom op requires all inputs are in the same type.
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
+
+        # Combine results if using alltoall
+        if self.enable_alltoall and alltoall_info is not None:
+            top_k = self.routing_method.experts_per_token
+            final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                final_hidden_states,
+                alltoall_info,
+                self.alltoall_workspace,
+                ep_rank=self.ep_rank,
+                ep_size=self.ep_size,
+                top_k=top_k,
+                token_count=token_count)
 
         return final_hidden_states
 
@@ -314,18 +449,19 @@ class CutlassFusedMoE(MoE):
             split_num_chunks - val_mod)
         return split_chunk_size_list
 
-    def forward(
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        *,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
-        all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
-        if self.use_dp:
+        if self.use_dp and self.parallel_size > 1:
             assert all_rank_num_tokens is not None
             assert use_dp_padding is not None
             num_rows = sum(all_rank_num_tokens)
@@ -337,7 +473,7 @@ class CutlassFusedMoE(MoE):
                       1) // self.moe_max_num_tokens
 
         if use_dp_padding:
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
                                           ] * len(all_rank_num_tokens)
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
@@ -420,7 +556,7 @@ class CutlassFusedMoE(MoE):
 
             outputs = torch.cat(outputs_list)
 
-        if self.use_dp:
+        if self.use_dp and self.parallel_size > 1:
             rank = self.mapping.tp_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs

@@ -3,8 +3,8 @@ import json
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, Any, Callable, List, Literal, NamedTuple,
-                    Optional, TypeAlias, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
+                    NamedTuple, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
 import torch
@@ -15,6 +15,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
+from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -50,14 +51,18 @@ class LogProbsResult(NamedTuple):
 
 
 class ResponseWrapper:
-    """Wrapper of runtime response with optional outputs computed post runtime.
+    """
+    1. Wrapper of runtime response with optional outputs computed post runtime.
+    2. A workaround to pass around RequestPerfMetrics.
     """
 
     def __init__(self,
                  response: Union["PostprocWorker.Output", tllm.Response],
-                 logprobs: Optional[LogProbsResult] = None):
+                 logprobs: Optional[LogProbsResult] = None,
+                 request_perf_metrics: Optional[dict[str, float]] = None):
         self._response = response
         self.logprobs = logprobs
+        self.request_perf_metrics = request_perf_metrics
 
     @property
     def _is_llm_response(self):
@@ -67,6 +72,14 @@ class ResponseWrapper:
     def __getattr__(self, name):
         response = object.__getattribute__(self, '_response')
         return getattr(response, name)
+
+    def __getstate__(self):
+        return (self._response, self.logprobs, self.request_perf_metrics)
+
+    def __setstate__(self, state):
+        self._response = state[0]
+        self.logprobs = state[1]
+        self.request_perf_metrics = state[2]
 
 
 @dataclass(slots=True)
@@ -78,7 +91,7 @@ class CompletionOutput:
         text (str): The generated output text. Defaults to "".
         token_ids (List[int], optional): The token ids of the generated output text. Defaults to [].
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
-        logprobs (TokenLogprobs, optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
+        logprobs (TokenLogprobs | List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
         prompt_logprobs (TokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.
         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
@@ -89,14 +102,15 @@ class CompletionOutput:
     Attributes:
         length (int): The number of generated tokens.
         token_ids_diff (List[int]): Newly generated token ids.
-        logprobs_diff (List[float]): Logprobs of newly generated tokens.
+        logprobs_diff (TokenLogprobs | List[float]): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
     """
     index: int
     text: str = ""
     token_ids: Optional[List[int]] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
-    logprobs: Optional[TokenLogprobs] = field(default_factory=list)
+    logprobs: Optional[TokenLogprobs
+                       | List[float]] = field(default_factory=list)
     prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
@@ -128,7 +142,7 @@ class CompletionOutput:
         return self.token_ids[self._last_token_ids_len:]
 
     @property
-    def logprobs_diff(self) -> List[float]:
+    def logprobs_diff(self) -> TokenLogprobs | List[float]:
         return self.logprobs[self._last_logprobs_len:]
 
 
@@ -145,7 +159,11 @@ class GenerationResultBase:
         self.postproc_params = postproc_params
         self.disaggregated_params = None
         self.decoding_iter = 0
+        # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
+        # None indicates not yet available (e.g., before first step/stream).
+        self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
+        self.metrics_dict = {}
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -161,6 +179,7 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
+        self._mm_embedding_handle: Optional[Dict[str, Any]] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -197,11 +216,17 @@ class GenerationResultBase:
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
 
+    @property
+    def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
+        return self._mm_embedding_handle
+
     def _handle_sequence(self,
                          finish_reasons,
                          response_tensors,
                          sequence_index,
-                         logprobs_result=None):
+                         logprobs_result=None,
+                         req_perf_metrics_dict: Optional[dict[str,
+                                                              float]] = None):
         """ Handle a single sequence in the response. """
 
         seq_idx = sequence_index
@@ -220,10 +245,12 @@ class GenerationResultBase:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
         if logprobs_result:
+            # update logprobs from ResponseWrapper (TRT top logprobs WAR)
+            output._last_logprobs_len = len(output.logprobs)
             output.prompt_logprobs = logprobs_result.prompt
-            output.logprobs = logprobs_result.generation
-
-        if response_tensors.log_probs is not None:
+            output.logprobs += logprobs_result.generation
+        elif response_tensors.log_probs is not None:
+            # handle logprobs directly from response tensors
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs = response_tensors.log_probs[src_idx]
             # overcome some WAR in the cpp executor
@@ -271,6 +298,7 @@ class GenerationResultBase:
             else:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
+            self.record_stats(output, req_perf_metrics_dict)
 
     @nvtx_range_debug("handle_response",
                       color="red",
@@ -278,7 +306,9 @@ class GenerationResultBase:
     def _handle_response(self,
                          response: Union["PostprocWorker.Output", tllm.Response,
                                          ResponseWrapper, ErrorResponse]):
+        req_perf_metrics_dict = None
         if isinstance(response, ResponseWrapper):
+            req_perf_metrics_dict = response.request_perf_metrics
             logprobs_result = response.logprobs
             response = response._response
         else:
@@ -291,6 +321,8 @@ class GenerationResultBase:
                 self._outputs[0] = response.res
             else:
                 self._outputs[0]._postprocess_result = response.res
+            if response.metrics:
+                self.metrics_dict = response.metrics
 
             if response.error:
                 if self._background_error_handler is not None and (
@@ -303,12 +335,14 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
-            if hasattr(response_result, "_result"):
+            if hasattr(response_result, "_result") and isinstance(
+                    response_result._result, bytes):
                 response_result.deserialize()
 
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
+            self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             if context_phase_params is not None:
                 self.disaggregated_params = DisaggregatedParams(
                     request_type="context_only",
@@ -322,14 +356,19 @@ class GenerationResultBase:
             if self.sampling_params.use_beam_search:
                 for beam_idx, _ in enumerate(response_result.output_token_ids):
                     self._handle_sequence(finish_reasons, response_result,
-                                          beam_idx, logprobs_result)
+                                          beam_idx, logprobs_result,
+                                          req_perf_metrics_dict)
             else:
                 self._handle_sequence(finish_reasons, response_result,
                                       response_result.sequence_index,
-                                      logprobs_result)
+                                      logprobs_result, req_perf_metrics_dict)
 
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
+
+            if hasattr(response_result, 'mm_embedding_handle'
+                       ) and response_result.mm_embedding_handle is not None:
+                self._mm_embedding_handle = response_result.mm_embedding_handle
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -341,6 +380,29 @@ class GenerationResultBase:
                 handler(response.error_msg)
         else:
             raise ValueError(f"Unknown response type: {response}")
+
+    def record_stats(self,
+                     output: CompletionOutput,
+                     stats: Optional[dict[str, float]] = None) -> None:
+        """Record the stats of the generation result.
+
+        Args:
+            output (CompletionOutput): The output of the generation result.
+            stats (Optional[dict[str, float]]): The stats of the generation result. Defaults to None.
+        """
+        if not stats:
+            return
+        metrics_stats = {}
+        if output.finish_reason:
+            metrics_stats.update({
+                MetricsCollector.labelname_finish_reason:
+                output.finish_reason
+            })
+        processed_metrics_stat = _process_req_perf_metrics(
+            stats, len(output.token_ids), self.sampling_params.n > 1)
+        if processed_metrics_stat:
+            metrics_stats.update(processed_metrics_stat)
+        self.metrics_dict = metrics_stats
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
@@ -556,7 +618,7 @@ class GenerationResult(GenerationResultBase):
     def _repr_fields(self):
         return [
             'request_id', 'prompt_token_ids', 'outputs', 'finished',
-            "context_logits"
+            "context_logits", "mm_embedding_handle"
         ]
 
     def __repr__(self) -> str:
@@ -688,3 +750,30 @@ def compute_logprobs(
 
     return LogProbsResult(prompt=prompt_logprobs,
                           generation=generation_logprobs)
+
+
+def _process_req_perf_metrics(
+        req_perf_metrics_dict: Optional[dict[str, float]],
+        output_length: int,
+        is_multiple_response: bool = False) -> dict[MetricNames, float]:
+    stat = {}
+    if not req_perf_metrics_dict:
+        return stat
+    ttft = req_perf_metrics_dict.get(RequestEventTiming.FIRST_TOKEN_TIME, 0) - \
+           req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
+    e2e = req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME, 0) - \
+          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
+    request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
+                         req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
+    stat = {
+        MetricNames.TTFT: ttft,
+        MetricNames.E2E: e2e,
+        MetricNames.REQUEST_QUEUE_TIME: request_queue_time
+    }
+    if output_length > 1 and not is_multiple_response:
+        tpot = (req_perf_metrics_dict.get(
+            RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
+                RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
+        stat.update({MetricNames.TPOT: tpot})
+    stat = dict(filter(lambda item: item[1] > 0, stat.items()))
+    return stat

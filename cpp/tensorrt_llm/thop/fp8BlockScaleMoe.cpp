@@ -30,41 +30,52 @@ namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 
-at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor const& routing_bias,
+at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, std::optional<at::Tensor> const& routing_bias,
     at::Tensor const& hidden_states, at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights,
     at::Tensor const& gemm1_weights_scale, at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale,
-    int64_t const num_experts, int64_t const top_k, int64_t const n_group, int64_t const topk_group,
-    int64_t const intermediate_size, int64_t const local_expert_offset, int64_t const local_num_experts,
-    double const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
-    MoeRunnerType& moe_runner, int64_t moeConfigIndex)
+    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type, MoeRunnerType& moe_runner, int64_t moeConfigIndex)
 {
-    auto const sm = tensorrt_llm::common::getSMVersion();
-    TORCH_CHECK(sm == 100, "Only SM100 is supported by FP8 block scale MOE");
+    TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP8 block scale MOE");
     TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
     TORCH_CHECK(routing_logits.sizes()[0] == hidden_states.sizes()[0],
         "routing_logits and hidden_states must have the same number of tokens.");
     TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits dim1 must match num_experts.");
-    TORCH_CHECK(
-        routing_bias.scalar_type() == at::ScalarType::BFloat16 || routing_bias.scalar_type() == at::ScalarType::Float,
-        "routing_bias must be bfloat16 or float.");
-    TORCH_CHECK(routing_bias.dim() == 1, "routing_bias must be 1D.");
-    TORCH_CHECK(routing_bias.sizes()[0] == num_experts, "routing_bias has incorrect shape.");
 
-    if (n_group <= 0 || topk_group <= 0)
+    if (routing_bias.has_value())
     {
-        TORCH_CHECK(top_k == 1, "Current routing kernel (no groups) only supports top_k=1.");
+        TORCH_CHECK(routing_bias.value().scalar_type() == at::ScalarType::BFloat16, "routing_bias must be bfloat16.");
+        TORCH_CHECK(routing_bias.value().dim() == 1, "routing_bias must be 1D.");
+        TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
     }
-    else
+
+    if (n_group.has_value() && n_group.value() != 0)
     {
-        TORCH_CHECK(top_k <= 8, "Current routing kernel (with groups) only supports top_k<=8.");
-        TORCH_CHECK(topk_group <= 4, "Current routing kernel (with groups) only supports topk_group<=4.");
-        TORCH_CHECK(topk_group <= n_group, "n_group must not be smaller than topk_group.");
-        TORCH_CHECK(num_experts % n_group == 0, "num_experts must be divisible by n_group");
+        TORCH_CHECK(static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3,
+            "Routing kernel with groups implies DeepSeekV3 routing method.");
+        TORCH_CHECK(topk_group.has_value(), "if n_group is given, topk_group must be given");
+        TORCH_CHECK(num_experts % n_group.value() == 0, "num_experts must be divisible by n_group");
+        TORCH_CHECK(top_k <= 8 && top_k > 0, "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.");
+        TORCH_CHECK(topk_group.value() <= 4 && topk_group.value() > 0,
+            "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.");
+        TORCH_CHECK(topk_group.value() <= n_group.value(), "n_group must not be smaller than topk_group.");
         // This check ensures we have enough experts in the selected groups to handle the top_k routing
-        TORCH_CHECK(top_k < (topk_group * num_experts / n_group),
+        TORCH_CHECK(top_k < (topk_group.value() * num_experts / n_group.value()),
             "top_k must be less than total number of experts in selected groups");
     }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
+        || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
+    {
+        TORCH_CHECK(false, "Don't support this routing method type Renormalize(Naive).");
+    }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
+    {
+        TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
+    }
+
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
 
@@ -74,9 +85,12 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
     // setup args
     // note: the assumption is that output data type is always Bfloat16 (the default)
     args.mDtypeElt = btg::Dtype::E4m3;
-    args.mDtypeExpW = routing_bias.scalar_type() == at::ScalarType::BFloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
+    auto const routing_bias_dtype
+        = routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
+    args.mDtypeExpW = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+
     args.routing_logits = routing_logits.data_ptr<float>();
-    args.routing_bias = routing_bias.data_ptr();
+    args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
     args.hidden_states = hidden_states.data_ptr();
     args.hidden_states_scale = hidden_states_scale.data_ptr<float>();
     args.gemm1_weights = gemm1_weights.data_ptr();
@@ -87,11 +101,11 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
     args.num_experts = num_experts;
     args.hidden_size = hidden_states.sizes()[1];
     args.top_k = top_k;
-    args.n_group = n_group;
-    args.topk_group = topk_group;
+    args.n_group = n_group.value_or(0);
+    args.topk_group = topk_group.value_or(0);
     args.local_expert_offset = local_expert_offset;
     args.local_num_experts = local_num_experts;
-    args.routed_scaling_factor = routed_scaling_factor;
+    args.routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args.intermediate_size = intermediate_size;
     args.mUseDeepSeekFp8 = true;
 
@@ -108,7 +122,7 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_weights = at::detail::empty_cuda(
-        {args.num_tokens, args.top_k}, routing_bias.scalar_type(), routing_logits.device(), std::nullopt);
+        {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
@@ -139,7 +153,7 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(routing_logits.get_device());
-    routing_runner.run(routing_logits.data_ptr<float>(), routing_bias.data_ptr(), args.num_tokens, args.num_experts,
+    routing_runner.run(routing_logits.data_ptr<float>(), args.routing_bias, args.num_tokens, args.num_experts,
         args.top_k, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
         args.routed_scaling_factor, expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(),
         total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(),
@@ -241,12 +255,13 @@ public:
         return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
     }
 
-    [[nodiscard]] at::Tensor run(at::Tensor const& routing_logits, at::Tensor const& routing_bias,
+    [[nodiscard]] at::Tensor run(at::Tensor const& routing_logits, std::optional<at::Tensor> const& routing_bias,
         at::Tensor const& hidden_states, at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights,
         at::Tensor const& gemm1_weights_scale, at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale,
-        int64_t num_experts, int64_t top_k, int64_t n_group, int64_t topk_group, int64_t intermediate_size,
-        int64_t local_expert_offset, int64_t local_num_experts, double routed_scaling_factor,
-        int64_t routing_method_type, int64_t moeConfigIndex)
+        int64_t num_experts, int64_t top_k, std::optional<int64_t> const n_group,
+        std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+        int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t routing_method_type,
+        int64_t moeConfigIndex)
     {
 
         // Autotuner has requested a default or 'fallback' config index

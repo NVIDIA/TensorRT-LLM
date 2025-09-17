@@ -17,6 +17,7 @@ from ..modules.fused_moe import DefaultMoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..utils import AuxStreamType
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -53,7 +54,7 @@ class QwenMoE(nn.Module):
             routing_method=DefaultMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
-            aux_stream=aux_stream,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
             model_config=model_config,
@@ -83,13 +84,11 @@ class QwenMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
 
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=False)
 
         shared_expert_output = self.shared_expert(hidden_states)

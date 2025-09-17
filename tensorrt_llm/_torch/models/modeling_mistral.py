@@ -14,8 +14,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_pixtral
-from tensorrt_llm._torch.models.modeling_multimodal_utils import \
-    fuse_input_embeds
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    find_input_mm_embeds, fuse_input_embeds, get_multimodal_embeddings)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
@@ -27,9 +27,14 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative import SpecMetadata
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs import (ExtraProcessedInputs, InputProcessor,
-                                 TextPrompt, register_input_processor)
+from tensorrt_llm.inputs import (BaseMultimodalInputProcessor,
+                                 ExtraProcessedInputs, InputProcessor,
+                                 MultimodalPlaceholderMetadata,
+                                 MultimodalPlaceholderPlacement, TextPrompt,
+                                 register_input_processor)
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
 
@@ -209,7 +214,7 @@ class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
         )
 
 
-class Mistral3InputProcessor(InputProcessor):
+class Mistral3InputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(
         self,
@@ -256,21 +261,64 @@ class Mistral3InputProcessor(InputProcessor):
         if pixel_values is not None:
             # We have no use for the `attention_mask`.
             processed.pop("attention_mask")
+            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
+            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
+            # reaching the model forward. Since its values are used to infer the amount of padding
+            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
+            # list here to avoid this.
+            processed["image_sizes"] = processed["image_sizes"].tolist()
             # NOTE: `processed` is a dict-like object, but not actually a dict.
             extra_processed_inputs = {
                 "multimodal_data": {
                     "image": {
                         **processed
                     }
-                },
+                }
             }
 
         return input_ids, extra_processed_inputs
 
+    def get_vocab_size(self) -> int:
+        """Return the vocab size of the model."""
+        # Unlike some other VLMs, mistral3's vocab size is stored in its `text_config`, not the top-level
+        # config.
+        return self.model_config.text_config.vocab_size
+
+    def get_mm_token_ids(self) -> torch.Tensor:
+        """Get the IDs of all multimodal tokens (placeholders and special tokens alike)."""
+        return torch.tensor([
+            # This is the `[IMG]` token id inserted into the prompt that should be replaced with image
+            # embeddings.
+            self._processor.image_token_id,
+            # This is the `[IMG_BREAK]` token id at the end of every "row".
+            self._processor.image_break_token_id,
+            # This is the `[IMG_END]` token id to signify the end of an image.
+            self._processor.image_end_token_id,
+        ])
+
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        """Get the IDs of special multimodal tokens (placeholders not included)."""
+        return torch.tensor([
+            self._processor.image_break_token_id,
+            self._processor.image_end_token_id,
+        ])
+
 
 @register_auto_model("Mistral3ForConditionalGeneration")
-# The below informs the registry which input registry to create for this in `tensorrt_llm/llmapi/llm.py`.
-@register_input_processor(Mistral3InputProcessor, model_type="mistral3")
+@register_input_processor(
+    Mistral3InputProcessor,
+    model_type="mistral3",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "[IMG]",
+        },
+        # NOTE: for mistral3 multimodal models, it does not strictly have to be before the text.
+        # Ref: https://github.com/mistralai/mistral-common/blob/039465db2bdc0486df36365c9bdb428188482a18/
+        #      src/mistral_common/tokens/tokenizers/base.py#L326
+        # However, accuracy tests show that the model generates higher quality output when the image
+        # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Mistral3VLM(PreTrainedModel):
     """Mistral3VLM implementation for TRTLLM.
 
@@ -300,8 +348,10 @@ class Mistral3VLM(PreTrainedModel):
         self.llm = MistralForCausalLM(llm_model_config)
 
         self._device = "cuda"
-        vision_model_config = self._get_sub_model_config(
-            model_config, "vision_config")
+        # NOTE: current `modelopt` does not support quantizing the vision portion.
+        vision_model_config = self._get_sub_model_config(model_config,
+                                                         "vision_config",
+                                                         quant_config=None)
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
         self._multi_modal_projector = Mistral3MultiModalProjector(model_config)
@@ -357,33 +407,21 @@ class Mistral3VLM(PreTrainedModel):
         mm_embeds = []
         multimodal_params_len = len(multimodal_params)
         if multimodal_params_len > 0:
-            pixel_values = [
-                x.multimodal_data["image"]["pixel_values"]
-                for x in multimodal_params
-            ]
-            image_sizes = [
-                x.multimodal_data["image"]["image_sizes"]
-                for x in multimodal_params
-            ]
-            if not (len(pixel_values) == len(image_sizes) ==
-                    multimodal_params_len):
-                raise ValueError(
-                    f"Expected as many `pixel_values` ({len(pixel_values)}) and "
-                    f"`image_sizes` ({len(image_sizes)}) as number of multimodal parameters "
-                    f"({multimodal_params_len}).")
-            batched_pixel_values, batched_image_sizes = self._batch_pixel_values(
-                pixel_values=pixel_values, image_sizes=image_sizes)
-            mm_embeds = [
-                self._get_image_features(pixel_values=batched_pixel_values,
-                                         image_sizes=batched_image_sizes)
-            ]
+            mm_embeds = get_multimodal_embeddings(
+                encoder_forward_fn=self._vision_forward,
+                multimodal_params=multimodal_params[:num_context_requests],
+            )
+            mm_embeds = find_input_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
 
-        input_ids, inputs_embeds = fuse_input_embeds(
-            embedding_layer=self.llm.model.embed_tokens,
-            input_ids=input_ids,
-            mm_embeds=mm_embeds,
-            mm_token_ids=self._image_token_ids,
-        )
+        with nvtx_range("[mistral] Fuse input embeds"):
+            input_ids, inputs_embeds = fuse_input_embeds(
+                embedding_layer=self.llm.model.embed_tokens,
+                input_ids=input_ids,
+                mm_embeds=mm_embeds,
+                mm_token_ids=self._image_token_ids,
+                **kwargs,
+            )
 
         return self.llm.forward(
             attn_metadata=attn_metadata,
@@ -397,12 +435,14 @@ class Mistral3VLM(PreTrainedModel):
     def _get_sub_model_config(
         model_config: ModelConfig[MistralConfig],
         name: str,
+        **changes,
     ) -> ModelConfig:
         # Extract the subconfig from the `transformers` config and shove it into our own
         # `ModelConfig` class.
         sub_model_config: ModelConfig[MistralConfig] = dataclasses.replace(
             model_config,
             pretrained_config=getattr(model_config.pretrained_config, name),
+            **changes,
         )
         # Make sure some fields that are not explicitly included in the sub config, but present
         # in the top-level config, are replicated.
@@ -412,6 +452,34 @@ class Mistral3VLM(PreTrainedModel):
 
         return sub_model_config
 
+    # NOTE: this is defined as a separate method with this specific signature in order to be compatible
+    # with `get_multimodal_embeddings`.
+    def _vision_forward(
+            self,
+            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        multimodal_params_len = len(multimodal_params)
+        pixel_values = [
+            x.multimodal_data["image"]["pixel_values"]
+            for x in multimodal_params
+        ]
+        image_sizes = [
+            x.multimodal_data["image"]["image_sizes"] for x in multimodal_params
+        ]
+        if not (len(pixel_values) == len(image_sizes) == multimodal_params_len):
+            raise ValueError(
+                f"Expected as many `pixel_values` ({len(pixel_values)}) and "
+                f"`image_sizes` ({len(image_sizes)}) as number of multimodal parameters "
+                f"({multimodal_params_len}).")
+        image_sizes = [torch.tensor(x) for x in image_sizes]
+        batched_pixel_values, batched_image_sizes = self.batch_pixel_values(
+            pixel_values=pixel_values, image_sizes=image_sizes)
+        mm_embeds = [
+            self._get_image_features(pixel_values=batched_pixel_values,
+                                     image_sizes=batched_image_sizes)
+        ]
+
+        return mm_embeds
+
     # Original implementation:
     # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/mistral3/
     # modeling_mistral3.py#L341
@@ -420,13 +488,15 @@ class Mistral3VLM(PreTrainedModel):
         pixel_values: torch.Tensor,
         image_sizes: torch.Tensor,
     ):
-        image_outputs = self._vision_tower(
-            pixel_values=pixel_values,
-            image_sizes=image_sizes,
-        )
+        with nvtx_range("[mistral] ViT"):
+            image_outputs = self._vision_tower(
+                pixel_values=pixel_values,
+                image_sizes=image_sizes,
+            )
 
-        image_features = self._multi_modal_projector(image_outputs.squeeze(0),
-                                                     image_sizes)
+        with nvtx_range("[mistral] MM projector"):
+            image_features = self._multi_modal_projector(
+                image_outputs.squeeze(0), image_sizes)
         return image_features
 
     # Original HF implementation:
@@ -436,23 +506,45 @@ class Mistral3VLM(PreTrainedModel):
     # (the transformers one expected numpy arrays).
     @staticmethod
     @torch.inference_mode()
-    def _batch_pixel_values(
+    @nvtx_range("[mistral] Batch images")
+    def batch_pixel_values(
         pixel_values: List[torch.Tensor],
         image_sizes: List[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # NOTES:
+        # * `pixel_values` is a list of `[B_idx, C, H_idx, W_idx]` tensors, i.e. a batch of images as
+        #   padded + batched by the input processor.
+        #   The height (H_idx) and width (W_idx) of each element need not coincide.
+        # * Similarly, each element in `image_sizes` describes the original image sizes prior to
+        #   padding for the corresponding element in `pixel_values`.
+
+        # The below creates a single `[sum(B_idx), 2]` tensor describing all image sizes, and then
+        # calculates the maximum height / width across all of them.
         batched_image_sizes = torch.cat(image_sizes)
         max_shape = batched_image_sizes.max(dim=0).values
+
+        # This next step then pads the pixel values potentially a second time by using the `max_shape`
+        # computed above. Note that as far as this function is concerned, the original sizes for
+        # batching purposes can be deduced from looking at the tensors in `pixel_values`, NOT in
+        # `image_sizes`.
         pixel_values = [
             torchvision.transforms.v2.functional.pad(
                 image,
                 # Per torchvision docs, this should be in LTRB order if it's a sequence of 4 numbers.
-                padding=[0, 0, max_shape[1] - size[1], max_shape[0] - size[0]],
+                padding=[
+                    0, 0, max_shape[1] - image.shape[-1],
+                    max_shape[0] - image.shape[-2]
+                ],
                 # Values extracted from HF implementation.
                 fill=0.0,
                 padding_mode="constant",
-            ) for image, size in zip(pixel_values, batched_image_sizes)
+            ) for image in pixel_values
         ]
         return torch.cat(pixel_values), batched_image_sizes
+
+    @property
+    def mm_token_ids(self):
+        return self._image_token_ids
 
 
 # Original implementation:
@@ -475,6 +567,7 @@ class Mistral3PatchMerger(torch.nn.Module):
             out_features=hidden_size,
             bias=False,
             dtype=config.torch_dtype,
+            mapping=model_config.mapping,
         )
 
     @torch.inference_mode()
@@ -539,6 +632,7 @@ class Mistral3MultiModalProjector(torch.nn.Module):
             out_features=config.text_config.hidden_size,
             bias=config.multimodal_projector_bias,
             dtype=dtype,
+            mapping=model_config.mapping,
         )
         self.act = ACT2FN[config.projector_hidden_act]
         self.linear_2 = Linear(
@@ -546,6 +640,7 @@ class Mistral3MultiModalProjector(torch.nn.Module):
             out_features=config.text_config.hidden_size,
             bias=config.multimodal_projector_bias,
             dtype=dtype,
+            mapping=model_config.mapping,
         )
 
     @torch.inference_mode()

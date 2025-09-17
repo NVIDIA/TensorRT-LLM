@@ -1,6 +1,7 @@
 import glob
 import multiprocessing
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List
 
 import psutil
@@ -12,7 +13,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
-from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
+from tensorrt_llm._utils import (local_mpi_barrier, local_mpi_rank,
+                                 local_mpi_size)
 from tensorrt_llm.logger import logger
 
 
@@ -24,6 +26,14 @@ class HfWeightLoader(BaseWeightLoader):
 
     def load_weights(self, checkpoint_dir: str) -> dict[str, Any]:
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
+        # Some model checkpoint directories contain not only the sharded safetensors, but one
+        # consolidated tensor. In the presence of both, we favor the former, as there really is no need
+        # to prefetch the (usually) ridiculously large consolidated tensor into memory in such a case.
+        filtered_weight_files = [
+            x for x in weight_files if "consolidated" not in os.path.split(x)[1]
+        ]
+        if len(filtered_weight_files) > 0:
+            weight_files = filtered_weight_files
         if weight_files:
             # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
             # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
@@ -38,6 +48,8 @@ class HfWeightLoader(BaseWeightLoader):
                     f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
                 )
                 self.prefetch_files(weight_files)
+                # Ensure that all local ranks have finished prefetching before loading weights
+                local_mpi_barrier()
 
             return self._load_weights_in_parallel(
                 weight_files, self._load_safetensors_file,
@@ -117,7 +129,7 @@ class HfWeightLoader(BaseWeightLoader):
         if len(local_file_names) == 0:
             return
 
-        max_processes = min(multiprocessing.cpu_count() * 2, 16,
-                            len(local_file_names))
-        with multiprocessing.Pool(processes=max_processes) as pool:
-            pool.map(self._prefetch_one_file, local_file_names)
+        max_workers = min(multiprocessing.cpu_count() * 2, 16,
+                          len(local_file_names))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(self._prefetch_one_file, local_file_names))

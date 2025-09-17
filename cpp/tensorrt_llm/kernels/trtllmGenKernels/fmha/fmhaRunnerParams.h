@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 
 namespace tensorrt_llm
@@ -143,10 +145,14 @@ enum class TileScheduler
 
 enum class MultiCtasKvMode
 {
-    // No multiCtasKvMode.
+    // Disable the multiCtasKvMode.
     Disabled = 0,
     // Do the reduction through the global memory and atomic counters.
     GmemReduction,
+    // Same as GmemReduction, but use a separate kernel for the reduction.
+    // It is only supported/needed for 2-CTA or 1-CTA keepsMmaAbForGeneration MLA kernels with large
+    // reduction tiles.
+    GmemReductionWithSeparateKernel,
     // Do the reduction through the CGA remote shared memory.
     CgaSmemReduction
 };
@@ -167,6 +173,7 @@ inline bool isMultiCtasKvEnabled(MultiCtasKvMode multiCtasKvMode)
 
 MULTI_CTAS_KV_MODE_FUNCTION(Disabled)
 MULTI_CTAS_KV_MODE_FUNCTION(GmemReduction)
+MULTI_CTAS_KV_MODE_FUNCTION(GmemReductionWithSeparateKernel)
 MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
 
 #undef MULTI_CTAS_KV_MODE_FUNCTION
@@ -192,12 +199,12 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Packed KV scaling factor buffer
+    void const* kvSfPtr;
     // Packed QKV buffer
     void const* qkvPtr;
-    // The scaling factor pointer of K.
-    void const* kSfBasePtr;
-    // The scaling factor pointer of V.
-    void const* vSfBasePtr;
+    // The attention sinks pointer (additional value per head in the denominator of the softmax).
+    float const* attentionSinksPtr;
     // The custom mask ptr.
     uint32_t const* customMaskPtr;
     // The packed custom mask's offsets of each sequence.
@@ -236,6 +243,8 @@ struct TllmGenFmhaRunnerParams
     int mHeadDimQk;
     // Head dimension for V.
     int mHeadDimV;
+    // Head dimension for Q/K non-RoPE part, only used for MLA now.
+    int mHeadDimQkNope;
     // Number of heads for Q and K/V.
     int mNumHeadsQ, mNumHeadsKv, mNumHeadsQPerKv;
     // The batch size.
@@ -267,9 +276,6 @@ struct TllmGenFmhaRunnerParams
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
     // batching is enabled.
     int mSfStartTokenIdx;
-
-    // The SF scale for Kv.
-    float mScaleSfKv;
     // The cuda stream.
     cudaStream_t stream;
 

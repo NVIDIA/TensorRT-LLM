@@ -4,12 +4,18 @@ import pytest
 from .test_llm import tinyllama_logits_processor_test_harness
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from .lora_test_utils import check_llama_7b_multi_lora_from_request_test_harness
 from .test_llm_pytorch import llama_7b_lora_from_dir_test_harness
+from .test_llm import _test_llm_capture_request_error
 # isort: on
 
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+
+@pytest.mark.gpu2
+def test_llm_capture_request_error():
+    _test_llm_capture_request_error(pytorch_backend=True, tp_size=2)
 
 
 @pytest.mark.gpu4

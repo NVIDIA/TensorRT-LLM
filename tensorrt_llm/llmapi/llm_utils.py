@@ -395,10 +395,10 @@ class ModelLoader:
                     )
             else:
                 if quant_config.kv_cache_quant_algo not in [
-                        None, QuantAlgo.FP8
+                        None, QuantAlgo.FP8, QuantAlgo.NVFP4
                 ]:
                     raise ValueError(
-                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                     )
 
             for key, value in hf_quant_config.items():
@@ -426,6 +426,15 @@ class ModelLoader:
                             "weight_block_size"):
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                     quant_config.exclude_modules = ["*eh_proj"]
+                elif hf_quant_config.get("quant_method") == "mxfp4":
+                    from .._torch.model_config import ModelConfig
+                    quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                        self.llm_args.moe_config.backend)
+                    quant_config.group_size = 32
+                    quant_config.exclude_modules = [
+                        'block.*.attn.out', 'block.*.mlp.gate',
+                        'block.*.attn.qkv', 'embedding', 'unembedding'
+                    ]
                 else:
                     raise NotImplementedError(
                         f"Unsupported quantization_config: {hf_quant_config}.")
@@ -568,12 +577,12 @@ class ModelLoader:
         self._engine = Engine.from_dir(self._model_dir)
 
     @staticmethod
-    def load_hf_tokenizer(
-            model_dir,
-            trust_remote_code: bool = True,
-            use_fast: bool = True) -> Optional[TransformersTokenizer]:
+    def load_hf_tokenizer(model_dir,
+                          trust_remote_code: bool = True,
+                          use_fast: bool = True,
+                          **kwargs) -> Optional[TransformersTokenizer]:
         if (tokenizer := load_hf_tokenizer(model_dir, trust_remote_code,
-                                           use_fast)) is not None:
+                                           use_fast, **kwargs)) is not None:
             return tokenizer
         else:
             logger.warning(f"Failed to load tokenizer from {model_dir}")

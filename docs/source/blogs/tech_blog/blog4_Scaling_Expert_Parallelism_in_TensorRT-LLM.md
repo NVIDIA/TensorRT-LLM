@@ -1,9 +1,9 @@
-# Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)
+# Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)
 
-By NVIDIA TensorRT-LLM Team
+By NVIDIA TensorRT LLM Team
 
 ## Table of Contents
-- [Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)](#scaling-expert-parallelism-in-tensorrt-llm-part-1-design-and-implementation-of-large-scale-ep)
+- [Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)](#scaling-expert-parallelism-in-tensorrt-llm-part-1-design-and-implementation-of-large-scale-ep)
   - [Table of Contents](#table-of-contents)
   - [Motivation for large-scale EP](#motivation-for-large-scale-ep)
     - [Observations over one machine translation dataset](#observations-over-one-machine-translation-dataset)
@@ -39,7 +39,7 @@ In the past, we have shared TensorRT-LLM’s optimization experience to [push th
 
 The DeepSeek team has also shared their valuable experience and practice on how to optimize this kind of large-scale Expert Parallelism (EP) model, including [DeepEP](https://github.com/deepseek-ai/DeepEP) and [EPLB](https://github.com/deepseek-ai/EPLB). Also, the DeepSeek team has shared their concrete design considerations in [this](https://arxiv.org/abs/2412.19437) tech report. On top of those great sharings, there are also nice community efforts to implement large-scale EP in other inference engines, such as [this](https://lmsys.org/blog/2025-05-05-large-scale-ep/) effort from the SGLang team.
 
-In this tech blog, we will introduce the details of the design and implementation to support E2E large-scale EP in TensorRT-LLM. This blog post mainly covers the following:
+In this tech blog, we will introduce the details of the design and implementation to support E2E large-scale EP in TensorRT LLM . This blog post mainly covers the following:
 
 * How to leverage NVIDIA GB200 Multi-Node NVLink (MNNVL) HW features to implement high-performance communication kernels.
 * How to design and implement an online expert workload balancer to dynamically balance the expert load distribution and adapt to the changes of online traffic patterns. We present:
@@ -48,16 +48,16 @@ In this tech blog, we will introduce the details of the design and implementatio
   * The design and implementation of the replication/placement strategy.
   * The MoE weight load/re-distributer to balance the online workload across multiple GPUs.
   * The changes needed to the MoE router and computation module to adapt to the expert load balancer needs.
-  * Some preliminary data demonstrating the effectiveness of the current implementation in TensorRT-LLM.
+  * Some preliminary data demonstrating the effectiveness of the current implementation in TensorRT LLM .
 
 In future tech blogs, we will also cover the following topics:
-* The introduction of performance tuning and optimization for TensorRT-LLM large-scale EP GB200 implementation.
+* The introduction of performance tuning and optimization for TensorRT LLM large-scale EP GB200 implementation.
 * How to implement efficient large-scale EP support for B200/Hopper and other NVIDIA GPUs without MNNVL.
 * The best practices to leverage large-scale EP and get performance gains.
 * How to combine large-scale EP with other system optimization techniques.
 
 
-Even if, in this tech blog, we focus on TensorRT-LLM, we believe the core ideas and implementation can also be applied to other inference engines to help the inference performance on NVIDIA GPUs. Also, with the help of the community, we would like to figure out how to better modularize the current TensorRT-LLM large-scale EP implementation and make it more easily reusable by the community.
+Even if, in this tech blog, we focus on TensorRT LLM , we believe the core ideas and implementation can also be applied to other inference engines to help the inference performance on NVIDIA GPUs. Also, with the help of the community, we would like to figure out how to better modularize the current TensorRT LLM large-scale EP implementation and make it more easily reusable by the community.
 
 Finally, in this tech blog, there are implementation details which are targeted towards the GB200 system, such as the communication components leveraging the GB200 MNNVL inter-GPU connection, and the MoE weight load/re-distributer module leveraging the high bandwidth C2C connection between Grace CPU and Blackwell GPU. Nevertheless, the overall design principle and software architecture can still apply to non-GB200 NVIDIA GPU systems. To facilitate the extension to other non-GB200 system, we have, on purpose, paid attention to the generalization of the design and implementation. These changes should be easily composable with other existing components.
 
@@ -82,7 +82,7 @@ Firstly let’s have an overview of the overall imbalance issues across layers:
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture1.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture1.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: The routed token count from rank 0 to all the ranks(including rank 0), for decode iteration 1950, and all the MoE layers</em></sub></p>
@@ -93,7 +93,7 @@ If we zoom on the MoE in the layer 36 and record its activated expert rank distr
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture2.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture2.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: The tokens received for each expert rank for layer 36</em></sub></p>
@@ -102,7 +102,7 @@ If we flatten the data to see the routed tokens for each expert, we can see that
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture3.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture3.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: The tokens received for each expert for layer 36</em></sub></p>
@@ -111,7 +111,7 @@ It is also interesting to see that this kind of imbalance issue is very stable a
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture4.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture4.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: The accumulated token counts received for each expert for layer 36, within 50 decode steps, and the local batch size=256.</em></sub></p>
@@ -121,7 +121,7 @@ We have also done the duration-based analysis for local batch size=1 which corre
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture5.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture5.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: The accumulated token counts received for each expert  for layer 36, within 400 decode iterations, and the local batch size \= 1\.</em></sub></p>
@@ -139,7 +139,7 @@ And another natural question is whether the above observation can change signifi
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture6.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture6.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: The routed token count from rank 0 to all the ranks, for iteration 1950, and all the MoE layers</em></sub></p>
@@ -148,7 +148,7 @@ In Figure 6, compared with Figure 1, it can be seen that for GSM8K, the hot laye
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture7.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture7.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7: routed token counts from EP rank 0 to other EP ranks, still taking the iteration 1950, MoE layer 36 as the example</em></sub></p>
@@ -158,7 +158,7 @@ Based on Figure 8, it can be observed that the workload imbalance is relatively 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture8.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture8.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 8: The accumulated token counts sent from EP Rank 0 to all the ranks, for MoE layer 57 within 50 decode steps, local batch size=256</em></sub></p>
@@ -167,7 +167,7 @@ If we flatten the EP rank level data to expert-level data, we can have the follo
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture9.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture9.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 9: The accumulated token counts received for each expert for layer 57, within 50 decode steps, and the local batch size=256.</em></sub></p>
@@ -176,7 +176,7 @@ The similar imbalance pattern also exists for a single request.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture10.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture10.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 10: The accumulated token counts received for each expert for layer 57, within 400 decode steps, for a single request</em></sub></p>
@@ -185,7 +185,7 @@ If we use another request, then we can still observe the expert imbalance issue,
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture11.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture11.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 11: The accumulated token counts received for each expert for layer 57, within 400 decode steps, for a single request</em></sub></p>
@@ -218,10 +218,10 @@ To make sure large-scale EP can run well, careful considerations are needed to m
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture12.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture12.png">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 12: the high-level design of TensorRT-LLM large-scale EP</em></sub></p>
+<p align="center"><sub><em>Figure 12: the high-level design of TensorRT LLM large-scale EP</em></sub></p>
 
 In this design, there are both CPU and GPU side logics:
 
@@ -247,7 +247,7 @@ For the **Update Weights \& Placemen**t component, we identified two design choi
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture13.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture13.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 13: One example of the layer-wise MoE weight re-distribution</em></sub></p>
@@ -258,7 +258,7 @@ Let’s use GB200 as an example. In Figure 14, we illustrate the communication b
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture14.png" width="500" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture14.png" width="500" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 14: high-level topology of GB200 system</em></sub></p>
@@ -270,7 +270,7 @@ Let's assume that we target **50ms** inter-token-latency (ITL) as our main laten
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture15.png" width="300" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture15.png" width="300" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 15: The theoretical expert count to be updated for each iteration with following 50ms ITL constraints, by using different HW as pools to store the full MoE weight</em></sub></p>
@@ -306,7 +306,7 @@ The current technical decision is:
 
  The considerations are:
 
-* DeepEP is a great piece of work done by the DeepSeek team. When we started the TensorRT-LLM large-scale EP efforts, our first focus was on GB200. We chose to implement our own custom EP communication kernels as it was easier to introduce optimizations requiring the GB200 MNNVL capability. Also, based on our current evaluation, DeepEP does not provide CUDA graph compatibility for all the scenarios. We believe that CUDA graph is needed for the scenario we are interested in.
+* DeepEP is a great piece of work done by the DeepSeek team. When we started the TensorRT LLM large-scale EP efforts, our first focus was on GB200. We chose to implement our own custom EP communication kernels as it was easier to introduce optimizations requiring the GB200 MNNVL capability. Also, based on our current evaluation, DeepEP does not provide CUDA graph compatibility for all the scenarios. We believe that CUDA graph is needed for the scenario we are interested in.
 * When we started the efforts to enable large-scale EP on Hopper, we concluded that DeepEP could be adapted and meet our needs on this platform. We plan to extend DeepEP to work for B200 in the future.
 
 We are also actively evaluating the possibility of consolidating GB200 and non-GB200 EP communication kernels into a single solution to make the system simpler, and we will keep the community posted on the status.
@@ -333,7 +333,7 @@ More details can be found in [PR 3504](https://github.com/NVIDIA/TensorRT-LLM/pu
 
 ## EP Load Balancer
 
-TensorRT-LLM implements a set of functionalities to achieve EP Load Balancing. There are several key components:
+TensorRT LLM implements a set of functionalities to achieve EP Load Balancing. There are several key components:
 
 ### Python Interface
 
@@ -364,7 +364,7 @@ The GPU core logic contains the following components:
 
 There are GPU/CPU synchronization components implemented. More details can be found in [PR 4384](https://github.com/NVIDIA/TensorRT-LLM/pull/4384) and [PR 4495](https://github.com/NVIDIA/TensorRT-LLM/pull/4495).
 
-Based on these core utilities, there are two versions of EP Load Balancer in TensorRT-LLM: Offline EP Load Balancer and Online EP Load Balancer.
+Based on these core utilities, there are two versions of EP Load Balancer in TensorRT LLM : Offline EP Load Balancer and Online EP Load Balancer.
 
 ### Online EP Load Balancer
 
@@ -407,14 +407,14 @@ As shown by Figure 1, on the machine translation dataset, MoE layer 36 suffers f
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture16.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture16.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 16: The routed token count by receiving ranks (x-axis) and iterations (y-axis) at layer 36 (No EPLB)</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture17.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture17.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 17: The routed token count by experts (x-axis) and iterations (y-axis) at layer 36 (No EPLB)</em></sub></p>
@@ -425,14 +425,14 @@ With the above statistics, we can perform offline EPLB. One potential strategy i
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture18.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture18.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 18: The routed token count by receiving ranks (x-axis) and iterations (y-axis) at layer 36 (EPLB with 9 per-rank slots and EP 32)</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture19.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture19.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 19: The routed token count by experts (x-axis) and iterations (y-axis) at layer 36 (EPLB with 9 per-rank slots and EP 32)</em></sub></p>
@@ -441,14 +441,14 @@ Another EPLB strategy is to maintain 8 expert slots per rank while increasing ex
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture20.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture20.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 20: The routed token count by receiving ranks (x-axis) and iterations (y-axis) at layer 36 (EPLB with 8 per-rank slots and EP 36)</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture21.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture21.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 21: The routed token count by experts (x-axis) and iterations (y-axis) at layer 36 (EPLB with 8 per-rank slots and EP 36)</em></sub></p>
@@ -473,7 +473,7 @@ Let’s still use the machine translation dataset, DeepSeek R1 model,  layer 36 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture22.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture22.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 22: The token count sent from rank 0 to all the ranks, run on GB200, with EP32, local batch size=256, with 256 slots(no replication), so each rank hosts 8 experts</em></sub></p>
@@ -484,7 +484,7 @@ In Figure 22, only placement adjustment has been done by the Online EPLB. If we 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture23.png" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture23.png" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 23: The token count sent from rank 0 to all the ranks, run on GB200, with EP32, local batch size=256, with 288 slots(with replication), so each rank hosts 9 experts</em></sub></p>
@@ -498,24 +498,24 @@ Note: all the representative workloads illustrated in this section are from the 
 Let's use some representative workloads to illustrate the performance impact with large-scale EP.
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture24.png" width="500" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture24.png" width="500" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 24: EP impact over MoE Group GEMM and EP communication</em></sub></p>
 In Figure 24, it can be observed that by increasing the EP size from 4 to 72, the MoE Group GEMM computation time gets reduced, while the EP communication time (for EP4/EP8 Reduce/Scatter is used, while for EP>8 All2All is used) stays almost constant.
-When the EP size increases from 18 to 32, the speed-up diminishes. We are working on optimizing it.
+When the EP size increases from 18 to 72, the speed-up diminishes. We are working on optimizing it.
 
 Next, let's use some representative workloads to understand the performance impact with EPLB.
 <div align="center">
 <figure>
-  <img src="../media/tech_blog4_Picture25.png" width="500" >
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog4_Picture25.png" width="500" >
 </figure>
 </div>
 <p align="center"><sub><em>Figure 25: EPLB performance impact</em></sub></p>
 Clearly in Figure 25, we can see that EPLB brings a clear performance improvement when the EP size increases, for both MoE GroupGEMM and EP communication times.
 
 ## Reproducing steps
-Currently to run through the reproducing steps described in this section, please, use this [feature branch](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/tensorrt_llm). It will get merged to the main branch soon.
+The code and scripts required in the reproducing steps described in this section have been merged to the main branch.
 
 ### The effect of EP Load Balancer
 
@@ -687,14 +687,14 @@ Based on our current performance analysis, when you plan to apply large-scale EP
 
 **Please use your own judgement to decide whether to use large-scale EP into your system or not, and when you use it, what is the suitable EP size and concrete deployment settings suitable for your own requirements.**
 
-The current TensorRT-LLM large-scale EP implementation is not perfect and there are still known limitations (community contributions are welcome to help us improve). For example, we need:
+The current TensorRT LLM large-scale EP implementation is not perfect and there are still known limitations (community contributions are welcome to help us improve). For example, we need:
 
 * More platforms coverage
   * Extending the support to cover other non-GB200 NVIDIA GPU HWs. **We are actively working on this now.**
   * Currently the large-EP support only covers NVFP4 data precision, incremental efforts are needed to cover FP8 and INT8/INT4 data precision.
 * Performance
   * Further performance tuning and optimizations. **We are actively working on this now.**
-  * More validation with workloads close to production traffic. **Here we highly welcome the community’s feedback to help us calibrate TensorRT-LLM large-scale EP implementation based on more concrete workloads.**
+  * More validation with workloads close to production traffic. **Here we highly welcome the community’s feedback to help us calibrate TensorRT LLM large-scale EP implementation based on more concrete workloads.**
   * The thorough validation of combination with other inference core features, such as dis-aggregated serving, speculative decoding, validation on more MoE model families, etc. **We are actively working on this now.**
 * Ease-of-use
   * Easy customization
@@ -707,10 +707,11 @@ The current TensorRT-LLM large-scale EP implementation is not perfect and there 
   * Because large-scale EP deployment solution may lead to an increased fault ratio of the online deployment system, it may increase the need for cross-layer interactions with multiple components of the E2E LLM inference system on NVIDIA GPUs. This includes the low-level communication kernel, the cluster-level orchestrator and scheduler, etc. We are actively working with various NVIDIA engineering teams to push forward on this.
 
 
-We believe the current implementation can be viewed as a reasonable E2E large-scale EP implementation and we encourage the community to try new ideas and performance validation. We encourage the community to share feedback to help us move fast in this area.  We are actively tracking the TensorRT-LLM large-scale EP execution in [this](https://github.com/NVIDIA/TensorRT-LLM/issues/4127) GitHub issue to ensure transparency to the community.
+We believe the current implementation can be viewed as a reasonable E2E large-scale EP implementation and we encourage the community to try new ideas and performance validation. We encourage the community to share feedback to help us move fast in this area.  We are actively tracking the TensorRT LLM large-scale EP execution in [this](https://github.com/NVIDIA/TensorRT-LLM/issues/4127) GitHub issue to ensure transparency to the community.
 
 
 ## Acknowledgement
 
-The large-scale EP work is another great team effort, spanning kernel-level optimizations, runtime enhancements, and systematic performance analysis and tuning. While we cannot individually acknowledge every contributor, we are proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in terms of performance in TensorRT-LLM.
+The large-scale EP work is another great team effort, spanning kernel-level optimizations, runtime enhancements, and systematic performance analysis and tuning. While we cannot individually acknowledge every contributor, we are proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in terms of performance in TensorRT LLM .
+
 Through this collaborative endeavor, we have developed valuable insights to allow us improve GPU utilization for large language model inference. We hope that the techniques and the experience shared in this blog will help the developer community to better leverage NVIDIA GPU capabilities in their mission-critical LLM inference applications.

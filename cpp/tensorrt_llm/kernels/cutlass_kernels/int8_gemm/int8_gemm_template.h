@@ -57,7 +57,6 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
-
 template <typename T, typename arch, typename ThreadblockShape, typename WarpShape, int Stages>
 void genericInt8GemmKernelLauncher(int8_t const* A, int8_t const* B, tk::QuantMode quantOption, float const* alphaCol,
     float const* alphaRow, T* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspace,

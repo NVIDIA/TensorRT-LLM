@@ -22,6 +22,7 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod,
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
+from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
@@ -107,7 +108,7 @@ class Qwen3MoE(nn.Module):
             routing_method=self.gate.routing_method,
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
-            aux_stream=aux_stream,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
@@ -126,7 +127,6 @@ class Qwen3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
 
         if not do_finalize:
             assert not self.enable_attention_dp
@@ -143,7 +143,6 @@ class Qwen3MoE(nn.Module):
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
         )
@@ -214,7 +213,9 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-
+        if spec_metadata is not None and spec_metadata.is_layer_capture(
+                self.layer_idx):
+            self.fusion_config.POST_MOE_FUSION = False
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -257,9 +258,6 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
-                if spec_metadata:
-                    spec_metadata.maybe_capture_hidden_states(
-                        self.layer_idx, hidden_states, residual)
                 hidden_states, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
@@ -289,12 +287,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 hidden_states, residual = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params)
 
-                if spec_metadata:
-                    spec_metadata.maybe_capture_hidden_states(
-                        self.layer_idx, hidden_states, residual)
-
         else:
-            if spec_metadata:
+            if spec_metadata and spec_metadata.is_layer_capture(self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(
                     self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:

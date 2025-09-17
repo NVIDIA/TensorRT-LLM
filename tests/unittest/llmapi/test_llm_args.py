@@ -162,7 +162,8 @@ def test_KvCacheConfig_declaration():
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
                            enable_partial_reuse=True,
-                           copy_on_partial_reuse=True)
+                           copy_on_partial_reuse=True,
+                           attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
     assert pybind_config.enable_block_reuse == True
@@ -177,6 +178,7 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.event_buffer_max_size == 0
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
+    assert pybind_config.attention_dp_events_gather_period_ms == 10
 
 
 def test_KvCacheConfig_default_values():
@@ -223,10 +225,6 @@ def test_SchedulerConfig_declaration():
                                       config.dynamic_batch_config._to_pybind())
 
 
-def test_PeftCacheConfig_default_values():
-    check_defaults(PeftCacheConfig, tle.PeftCacheConfig)
-
-
 def test_PeftCacheConfig_declaration():
     config = PeftCacheConfig(num_host_module_layer=1,
                              num_device_module_layer=1,
@@ -254,6 +252,67 @@ def test_PeftCacheConfig_declaration():
     assert pybind_config.device_cache_percent == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.lora_prefetch_dir == "."
+
+
+def test_PeftCacheConfig_from_pybind():
+    pybind_config = tle.PeftCacheConfig(num_host_module_layer=1,
+                                        num_device_module_layer=1,
+                                        optimal_adapter_size=64,
+                                        max_adapter_size=128,
+                                        num_put_workers=1,
+                                        num_ensure_workers=1,
+                                        num_copy_streams=1,
+                                        max_pages_per_block_host=24,
+                                        max_pages_per_block_device=8,
+                                        device_cache_percent=0.5,
+                                        host_cache_size=1024,
+                                        lora_prefetch_dir=".")
+
+    config = PeftCacheConfig.from_pybind(pybind_config)
+    assert config.num_host_module_layer == 1
+    assert config.num_device_module_layer == 1
+    assert config.optimal_adapter_size == 64
+    assert config.max_adapter_size == 128
+    assert config.num_put_workers == 1
+    assert config.num_ensure_workers == 1
+    assert config.num_copy_streams == 1
+    assert config.max_pages_per_block_host == 24
+    assert config.max_pages_per_block_device == 8
+    assert config.device_cache_percent == 0.5
+    assert config.host_cache_size == 1024
+    assert config.lora_prefetch_dir == "."
+
+
+def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
+):
+    pybind_config = tle.PeftCacheConfig(num_host_module_layer=1,
+                                        num_device_module_layer=1,
+                                        optimal_adapter_size=64,
+                                        max_adapter_size=128,
+                                        num_put_workers=1,
+                                        num_ensure_workers=1,
+                                        num_copy_streams=1,
+                                        max_pages_per_block_host=24,
+                                        max_pages_per_block_device=8,
+                                        device_cache_percent=None,
+                                        host_cache_size=None,
+                                        lora_prefetch_dir=".")
+
+    config = PeftCacheConfig.from_pybind(pybind_config)
+    assert config.num_host_module_layer == 1
+    assert config.num_device_module_layer == 1
+    assert config.optimal_adapter_size == 64
+    assert config.max_adapter_size == 128
+    assert config.num_put_workers == 1
+    assert config.num_ensure_workers == 1
+    assert config.num_copy_streams == 1
+    assert config.max_pages_per_block_host == 24
+    assert config.max_pages_per_block_device == 8
+    assert config.device_cache_percent == PeftCacheConfig.model_fields[
+        "device_cache_percent"].default
+    assert config.host_cache_size == PeftCacheConfig.model_fields[
+        "host_cache_size"].default
+    assert config.lora_prefetch_dir == "."
 
 
 def test_update_llm_args_with_extra_dict_with_nested_dict():
@@ -369,23 +428,22 @@ class TestTorchLlmArgs:
 
     @print_traceback_on_error
     def test_runtime_sizes(self):
-        llm = TorchLLM(
-            llama_model_path,
-            max_beam_width=1,
-            max_num_tokens=256,
-            max_seq_len=128,
-            max_batch_size=8,
-        )
+        with TorchLLM(llama_model_path,
+                      max_beam_width=1,
+                      max_num_tokens=256,
+                      max_seq_len=128,
+                      max_batch_size=8) as llm:
+            assert llm.args.max_beam_width == 1
+            assert llm.args.max_num_tokens == 256
+            assert llm.args.max_seq_len == 128
+            assert llm.args.max_batch_size == 8
 
-        assert llm.args.max_beam_width == 1
-        assert llm.args.max_num_tokens == 256
-        assert llm.args.max_seq_len == 128
-        assert llm.args.max_batch_size == 8
-
-        assert llm._executor_config.max_beam_width == 1
-        assert llm._executor_config.max_num_tokens == 256
-        assert llm._executor_config.max_seq_len == 128
-        assert llm._executor_config.max_batch_size == 8
+            executor_config = llm.args.get_executor_config(
+                llm._hf_model_dir, llm.tokenizer)
+            assert executor_config.max_beam_width == 1
+            assert executor_config.max_num_tokens == 256
+            assert executor_config.max_seq_len == 128
+            assert executor_config.max_batch_size == 8
 
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
@@ -607,15 +665,15 @@ class TestStrictBaseModelArbitraryArgs:
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""
         # Valid arguments should work
-        config = CacheTransceiverConfig(backend="ucx",
+        config = CacheTransceiverConfig(backend="UCX",
                                         max_tokens_in_buffer=1024)
-        assert config.backend == "ucx"
+        assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            CacheTransceiverConfig(backend="ucx", invalid_config="should_fail")
+            CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
 
     def test_torch_compile_config_arbitrary_args(self):

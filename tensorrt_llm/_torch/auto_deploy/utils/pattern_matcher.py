@@ -43,11 +43,13 @@ def _patch_unsupported_input_tensor():
     """
     original_fn = lowering.unsupported_input_tensor
 
-    def patched_fn(t: torch.Tensor, parent=None, node=None):
+    def patched_fn(t: torch.Tensor, *args, **kwargs):
         """Bypass meta tensor check."""
         if t.is_meta:
             return False
-        return original_fn(t, parent, node)
+        return original_fn(
+            t, *args, **kwargs
+        )  # a generic pass-through of the arguments to accommodate torch side change
 
     lowering.unsupported_input_tensor = patched_fn
     try:
@@ -153,6 +155,8 @@ def register_ad_pattern(
     5. register_replacement can auto-generate `search_fn_pattern` if you input `example_inputs`,
         but that approach will fail when symbolic shapes are involved. Here
         we explicitly trace & convert via `fx_to_pattern`.
+    6. The PatternMatcherPass would check num_users of the nodes, meaning that the pattern is required
+        to be functionally isolated, no intermediate nodes are shared with the rest of the graph.
 
     """
     argnames = list(inspect.signature(search_fn).parameters.keys())

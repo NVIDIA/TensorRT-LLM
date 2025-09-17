@@ -31,6 +31,7 @@ option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
+option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
@@ -44,6 +45,10 @@ option(ENABLE_MULTI_DEVICE
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
 option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
+option(CUBLAS_DYNAMIC_LINKING
+       "Link against the dynamic cublas/cublasLt libraries" ON)
+option(CURAND_DYNAMIC_LINKING "Link against the dynamic curand library" ON)
+
 option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
 option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
        "Using open sourced Cutlass low latency gemm kernel" ON)
@@ -68,7 +73,7 @@ add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
 set(BINDING_TYPE
-    "pybind"
+    "nanobind"
     CACHE STRING
           "Binding type of Python bindings for C++ runtime and batch manager")
 
@@ -152,25 +157,54 @@ enable_language(C CXX CUDA)
 # after that CMake handles it just fine.
 setup_cuda_architectures()
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
-                                                  cublas cublasLt curand nvml)
-
-set(CUBLAS_LIB CUDA::cublas)
-set(CUBLASLT_LIB CUDA::cublasLt)
-set(CURAND_LIB CUDA::curand)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
 set(NVPTX_LIB CUDA::nvptxcompiler_static)
-set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
+set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml nvptxcompiler_static)
+
+if(CUBLAS_DYNAMIC_LINKING)
+  set(CUBLAS_LIB CUDA::cublas)
+  set(CUBLASLT_LIB CUDA::cublasLt)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS cublas cublasLt)
+else()
+  if(WIN32)
+    message(FATAL_ERROR "Static cublas not available on windows")
+  endif()
+  message(DEBUG "Linking with static cublas libs")
+
+  set(CUBLAS_LIB CUDA::cublas_static)
+  set(CUBLASLT_LIB CUDA::cublasLt_static)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS cublas_static cublasLt_static)
+endif()
+
+if(CURAND_DYNAMIC_LINKING)
+  set(CURAND_LIB CUDA::curand)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS curand)
+else()
+  if(WIN32)
+    message(FATAL_ERROR "Static curand not available on windows")
+  endif()
+  message(DEBUG "Linking with static curand lib")
+
+  set(CURAND_LIB CUDA::curand_static)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS curand_static)
+endif()
 
 if(NVRTC_DYNAMIC_LINKING)
   set(NVRTC_LIB CUDA::nvrtc)
   set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc nvrtc_builtins)
 else()
   set(NVRTC_LIB CUDA::nvrtc_static)
   set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
 endif()
+
+find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+
+set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
 
@@ -199,7 +233,9 @@ set(TRT_LIB TensorRT::NvInfer)
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
-if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+if(BINDING_TYPE STREQUAL "pybind"
+   OR BUILD_DEEP_EP
+   OR BUILD_DEEP_GEMM)
   add_subdirectory(${3RDPARTY_DIR}/pybind11
                    ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
 endif()
@@ -212,13 +248,16 @@ endif()
 include_directories(
   SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
+  ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${3RDPARTY_DIR}/cutlass/include
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include)
-if(BINDING_TYPE STREQUAL "pybind" OR BUILD_DEEP_EP)
+if(BINDING_TYPE STREQUAL "pybind"
+   OR BUILD_DEEP_EP
+   OR BUILD_DEEP_GEMM)
   include_directories(${3RDPARTY_DIR}/pybind11/include)
 endif()
 if(BINDING_TYPE STREQUAL "nanobind")
@@ -472,7 +511,6 @@ print(os.path.dirname(torch.__file__),end='');"
       endif()
     endif()
   endif()
-
 else()
   if(NOT WIN32)
     if(NOT USE_CXX11_ABI)
@@ -490,6 +528,17 @@ if(ENABLE_UCX)
   if(NOT ${ucx_FOUND})
     set(ENABLE_UCX 0)
   else()
+    if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
+      if(EXISTS "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake")
+        file(READ "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" FILE_CONTENTS)
+        string(
+          REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
+                  "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
+                  FILE_CONTENTS "${FILE_CONTENTS}")
+        file(WRITE "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" "${FILE_CONTENTS}")
+        message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
+      endif()
+    endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
     # error, thus using their installation script to isolate the installation
     # process until the issue is understood. And always trigger the build so

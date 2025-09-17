@@ -334,12 +334,14 @@ void MixtureOfExpertsPlugin::init()
             static_cast<int>(mType), static_cast<int>(mWeightType), static_cast<int>(mOutputType));
     }
 
-    mMOERunner->use_deterministic_hopper_reduce_ = mExpertsPerToken > 2 && mUseDeterministicKernels;
+    // Finalize fusion should be disabled if Lora is used.
+    mMOERunner->use_fused_finalize_
+        = (mExpertsPerToken < 3 || !mUseDeterministicKernels) && !getEnvMOEDisableFinalizeFusion() && !hasLora();
 
     mGemmId1 = GemmIDMoe{1, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
-        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, !mMOERunner->use_fused_finalize_};
     mGemmId2 = GemmIDMoe{2, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
-        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, !mMOERunner->use_fused_finalize_};
     mGemmProfiler->setMaxProfileM(16384 * mNumExperts / mExpertsPerToken);
 
     if (hasLora())
@@ -534,9 +536,9 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
     }
 
     mGemmId1 = GemmIDMoe{1, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
-        mGroupSize, mActivationType, mType, mWeightType, mQuantMode};
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, !mMOERunner->use_fused_finalize_};
     mGemmId2 = GemmIDMoe{2, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
-        mGroupSize, mActivationType, mType, mWeightType, mQuantMode};
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, !mMOERunner->use_fused_finalize_};
 
     if (hasLora())
     {
@@ -945,8 +947,8 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> gemm2;
     if (common::getEnvForceDeterministicMOE())
     {
-        gemm1 = mMOERunner->getTactics()[0];
-        gemm2 = mMOERunner->getTactics()[0];
+        gemm1 = mMOERunner->getTactics(MoeGemmId::GEMM_1)[0];
+        gemm2 = mMOERunner->getTactics(MoeGemmId::GEMM_2)[0];
     }
     else
     {
@@ -957,23 +959,26 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     MoeMinLatencyParams min_latency_params{};
     mMOERunner->setTactic(gemm1, gemm2);
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr, true,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
-        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
-        inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
-        mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
+        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
+        ActivationParams(mActivationType), inputs[getExpertWeights2Index()],
+        hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens, mExpertHiddenSize,
+        mExpertHiddenSize /*TRT does not support padding, safe to assume padded/unpadded hidden sizes are the same*/,
+        mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig,
         /*enable_alltoall=*/false, hasLora(), lora_params, /*use_deepseek_fp8_block_scale=*/false,
         /*min_latency_mode=*/false, min_latency_params, stream);
 #else
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr, true,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
-        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
-        inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
-        mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
+        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
+        ActivationParams(mActivationType), inputs[getExpertWeights2Index()],
+        hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens, mExpertHiddenSize,
+        mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig, hasLora(),
         lora_params, /*use_deepseek_fp8_block_scale=*/false,
@@ -1275,7 +1280,7 @@ void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, MixtureOfExper
 auto MixtureOfExpertsGemmProfiler::getTactics(int m, int n, int k) const -> std::vector<Config>
 {
     assert(mRunner);
-    return mRunner->mMOERunner->getTactics();
+    return mRunner->mMOERunner->getTactics(backend.mGemmToProfile);
 }
 
 void MixtureOfExpertsGemmProfiler::initTmpData(
@@ -1296,7 +1301,8 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     auto& plugin = *mRunner;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
-        plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
+        plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize,
+        plugin.mExpertHiddenSize /*TRT backend does not support unpadded hidden size*/, plugin.mExpertInterSize,
         plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*min_latency_mode=*/false,
         /*need_weights=*/true, plugin.getParallelismConfig(), /*enable_alltoall=*/false);
 #else

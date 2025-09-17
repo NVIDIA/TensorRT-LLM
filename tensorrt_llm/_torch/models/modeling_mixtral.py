@@ -15,6 +15,7 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
+from ..utils import AuxStreamType
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -49,7 +50,7 @@ class MixtralMoE(nn.Module):
             routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
             intermediate_size=self.ffn_dim,
-            aux_stream=aux_stream,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
             model_config=model_config,
@@ -61,13 +62,11 @@ class MixtralMoE(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            all_rank_max_num_tokens=all_rank_max_num_tokens,
             use_dp_padding=False)
         return final_hidden_states
 
@@ -160,6 +159,8 @@ class MixtralModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
+            enable_torch_compile_for_embedding=model_config.
+            enable_torch_compile_for_embedding,
         )
 
         self.layers = nn.ModuleList([

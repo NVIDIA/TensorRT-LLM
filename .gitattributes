@@ -7,3 +7,8 @@
 triton_backend/tools/gpt/input_data.json filter=lfs diff=lfs merge=lfs -text
 *cubin.cpp filter=lfs diff=lfs merge=lfs -text
 docs/source/blogs/media/tech_blog3_mla_absorb.png filter=lfs diff=lfs merge=lfs -text
+tests/integration/test_input_files/*.png filter=lfs diff=lfs merge=lfs -text
+tests/integration/test_input_files/*.jpg filter=lfs diff=lfs merge=lfs -text
+docs/source/blogs/media/tech_blog10_baseline_performance_detail.png filter=lfs diff=lfs merge=lfs -text
+docs/source/blogs/media/tech_blog10_full_strategy_performance.png filter=lfs diff=lfs merge=lfs -text
+docs/source/blogs/media/tech_blog10_context_wait_performance.png  filter=lfs diff=lfs merge=lfs -text

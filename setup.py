@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -107,10 +107,12 @@ else:
         'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
         'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
-        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*"
+        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
+        'deep_gemm/LICENSE', 'deep_gemm/include/**/*', 'deep_gemm_cpp_tllm.*.so'
     ]
 
 package_data += [
+    'bindings.pyi',
     'bindings/*.pyi',
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
@@ -119,14 +121,14 @@ package_data += [
 ]
 
 
-def download_precompiled(workspace: str) -> str:
+def download_precompiled(workspace: str, version: str) -> str:
     import glob
     import subprocess
 
     from setuptools.errors import SetupError
 
     cmd = [
-        "pip", "download", f"tensorrt_llm={get_version()}",
+        "python3", "-m", "pip", "download", f"tensorrt_llm=={version}",
         f"--dest={workspace}", "--no-deps",
         "--extra-index-url=https://pypi.nvidia.com"
     ]
@@ -200,17 +202,18 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
             wheel.extract(file)
 
 
-use_precompiled: bool = os.getenv("TRTLLM_USE_PRECOMPILED") == "1"
-precompiled_location: str = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
-
-if precompiled_location:
-    use_precompiled = True
+precompiled: str | None = os.getenv("TRTLLM_USE_PRECOMPILED")
+precompiled_location: str | None = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
+use_precompiled: bool = (precompiled is not None
+                         and precompiled != "0") or (precompiled_location
+                                                     is not None)
 
 if use_precompiled:
     from tempfile import TemporaryDirectory
     with TemporaryDirectory() as tempdir:
         if not precompiled_location:
-            precompiled_location = download_precompiled(tempdir)
+            version = precompiled if precompiled != "1" else get_version()
+            precompiled_location = download_precompiled(tempdir, version)
         extract_from_precompiled(precompiled_location, package_data, tempdir)
 
 sanity_check()

@@ -10,6 +10,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
+from ..scheduling_params import SchedulingParams
 from .postproc_worker import PostprocParams
 
 __all__ = [
@@ -95,6 +96,9 @@ class GenerationRequest:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
+        cache_salt_id: Optional[int] = None,
+        arrival_time: Optional[float] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -119,6 +123,9 @@ class GenerationRequest:
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
+        self.scheduling_params = scheduling_params
+        self.cache_salt_id = cache_salt_id
+        self.arrival_time = arrival_time
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

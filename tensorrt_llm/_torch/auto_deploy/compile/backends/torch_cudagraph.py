@@ -18,15 +18,15 @@ class CapturedGraph(nn.Module):
         model: nn.Module,
         in_spec: TreeSpec,
         out_spec: TreeSpec,
-        max_batch_size: int,
-        cuda_graph_batch_sizes: List[int] = None,
+        cuda_graph_batch_sizes: List[int],
         num_batched_inputs: Optional[int] = 1,  # number of batched, dynamic inputs...
     ):
         super().__init__()
         self._in_spec = in_spec
         self._out_spec = out_spec
         self.model = model
-        self.max_batch_size = max_batch_size
+        self.max_batch_size = max(cuda_graph_batch_sizes)
+        ad_logger.info(f"Setting max batch size to {self.max_batch_size}")
         self.num_batched_inputs = num_batched_inputs if num_batched_inputs is not None else 1
         self.graphs: Dict[Tuple[int, ...], CUDAGraph] = {}
         self._input_buffers: List[torch.Tensor] = [
@@ -34,11 +34,7 @@ class CapturedGraph(nn.Module):
         ]
         self._out_buffer_flat: List[torch.Tensor] = None
         self._args_hash: Optional[Tuple[int, ...]] = None
-        self.cuda_graph_batch_sizes = (
-            sorted(cuda_graph_batch_sizes, reverse=True)
-            if cuda_graph_batch_sizes is not None
-            else self._get_graph_batch_sizes(self.max_batch_size)
-        )
+        self.cuda_graph_batch_sizes = sorted(cuda_graph_batch_sizes, reverse=True)
         self._cuda_graph_mem_pool = None
 
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
@@ -76,20 +72,6 @@ class CapturedGraph(nn.Module):
         torch.cuda.synchronize()
         self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
         return graph
-
-    @staticmethod
-    def _get_graph_batch_sizes(
-        max_bs: int, extra: Optional[List[int]] = None, multiplier: int = 128
-    ) -> List[int]:
-        """Heuristic to set batch sizes for graph capture."""
-        # do 1, max_bs, and extra as special batch sizes
-        batch_sizes = {1, max_bs, *(extra or [])}
-
-        # add all multiples of multiplier up to max_bs
-        batch_sizes.update(range(multiplier, max_bs + 1, multiplier))
-
-        # return as sorted list
-        return sorted(batch_sizes, reverse=True)
 
     def capture_graph(self, *args, **kwargs):
         """Capture and pre-fetch the graph for variable batch size."""
@@ -162,7 +144,7 @@ class CapturedGraph(nn.Module):
 
         # copy inputs to input buffers
         for i, input_tensor in enumerate(args_batched):
-            self._input_buffers[i][: input_tensor.shape[0]] = input_tensor
+            self._input_buffers[i][: input_tensor.shape[0]].copy_(input_tensor, non_blocking=True)
 
         # run forward pass via graph
         self.graphs[combined_shape].replay()
@@ -177,6 +159,27 @@ class CapturedGraph(nn.Module):
 class TorchCudagraphCompiler(BackendCompiler):
     """Compiler that uses only CUDA graphs."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        requested = self.compiler_kwargs.get("cuda_graph_batch_sizes")
+        if not requested:
+            # Use heuristic which includes commonly-used sizes like 1 and max_bs
+            self.cuda_graph_batch_sizes = self._get_graph_batch_sizes(self.max_batch_size)
+            ad_logger.info(f"Using heuristic cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}")
+        else:
+            # Sanitize user-provided sizes: clamp to [1, max_batch_size], dedupe, sort desc
+            effective = {
+                min(max(1, int(b)), int(self.max_batch_size))
+                for b in requested
+                if isinstance(b, (int, float)) and b > 0
+            }
+            self.cuda_graph_batch_sizes = sorted(effective, reverse=True)
+            ad_logger.info(
+                f"Using explicit cuda_graph_batch_sizes: requested={requested}"
+                f" -> effective={self.cuda_graph_batch_sizes}"
+                f" (clamped to [1, {self.max_batch_size}])"
+            )
+
     def _init_captured_graph(
         self, gm: nn.Module, in_spec: TreeSpec, out_spec: TreeSpec
     ) -> CapturedGraph:
@@ -184,8 +187,7 @@ class TorchCudagraphCompiler(BackendCompiler):
             gm,
             in_spec=in_spec,
             out_spec=out_spec,
-            max_batch_size=self.max_batch_size,
-            cuda_graph_batch_sizes=self.compiler_kwargs.get("cuda_graph_batch_sizes"),
+            cuda_graph_batch_sizes=self.cuda_graph_batch_sizes,
             num_batched_inputs=self.compiler_kwargs.get("num_batched_inputs"),
         )
 
@@ -198,3 +200,17 @@ class TorchCudagraphCompiler(BackendCompiler):
             captured_model.capture_graph(*self.args, **self.kwargs)
 
         return captured_model
+
+    @staticmethod
+    def _get_graph_batch_sizes(
+        max_bs: int, extra: Optional[List[int]] = None, multiplier: int = 128
+    ) -> List[int]:
+        """Heuristic to set batch sizes for graph capture."""
+        # do 1, max_bs, and extra as special batch sizes
+        batch_sizes = {1, max_bs, *(extra or [])}
+
+        # add all multiples of multiplier up to max_bs
+        batch_sizes.update(range(multiplier, max_bs + 1, multiplier))
+
+        # return as sorted list
+        return sorted(batch_sizes, reverse=True)

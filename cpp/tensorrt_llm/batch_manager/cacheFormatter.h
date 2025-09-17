@@ -18,11 +18,12 @@
 #pragma once
 
 #include "cacheTransBuffer.h"
-#include "dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -30,9 +31,24 @@
 #include <NvInferRuntimeBase.h>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <vector>
+
+// Forward declare TransferSession in the correct global namespace scope
+namespace tensorrt_llm::batch_manager
+{
+class TransferSession;
+}
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using Connection = tensorrt_llm::executor::kv_cache::Connection;
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
+using CacheTransBufferManager = kv_cache_manager::CacheTransBufferManager;
+using BlockRange = kv_cache_manager::BlockRange;
 
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
 
@@ -42,16 +58,15 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
 class BaseCacheFormatter
 {
 public:
-    using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using CacheState = executor::kv_cache::CacheState;
 
     /// @brief Format the cache data into bytes for sending.
     /// @param session The transfer session.
-    virtual void format(TransferSession& session) = 0;
+    virtual void format(tensorrt_llm::batch_manager::TransferSession& session) = 0;
 
     /// @brief Unformat the cache data from received bytes.
     /// @param session The transfer session.
-    virtual void unformat(TransferSession& session) = 0;
+    virtual void unformat(tensorrt_llm::batch_manager::TransferSession& session) = 0;
 
     /// @brief Determine whether the sender is applicable to the source and target.
     /// @param selfConfig Source data arrangement.
@@ -76,15 +91,6 @@ public:
 
     /// @brief Destructor.
     virtual ~BaseCacheFormatter() = default;
-
-    // TODO: better way for context/generation tagging
-    void markAsSender(bool isSender)
-    {
-        kvCacheMeasureHelper.markAsSender(isSender);
-    }
-
-protected:
-    KvCacheMeasureHelper kvCacheMeasureHelper{common::getEnvKVCacheTransferOutputPath()};
 };
 
 // Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
@@ -100,9 +106,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void format(TransferSession& session) override;
+    void format(tensorrt_llm::batch_manager::TransferSession& session) override;
 
-    void unformat(TransferSession& session) override;
+    void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 

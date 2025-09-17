@@ -7,6 +7,9 @@ from unittest import mock
 import pytest
 import torch
 import transformers
+import transformers.models.mistral3
+from _torch.helpers import create_mock_engine
+from PIL import Image
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -15,9 +18,12 @@ from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
-from tensorrt_llm._torch.pyexecutor import cuda_graph_runner, resource_manager
+from tensorrt_llm._torch.pyexecutor import resource_manager
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.models import modeling_utils
+
+_PATCH_SIZE = 14
 
 
 @pytest.fixture
@@ -62,7 +68,7 @@ def mistral_small_3_1_24b_config():
             "num_attention_heads": 16,
             "num_channels": 3,
             "num_hidden_layers": 24,
-            "patch_size": 14,
+            "patch_size": _PATCH_SIZE,
             "rope_theta": 10000.0,
         },
         "vision_feature_layer": -1,
@@ -398,6 +404,11 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
+        graph_runner = None
+        if use_cuda_graph:
+            mock_engine = create_mock_engine(1)
+            graph_runner = CUDAGraphRunner(mock_engine)
+
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
             if not use_cuda_graph:
@@ -405,22 +416,18 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
                     input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
                 )
             else:
-                graph_runner = cuda_graph_runner.DecodingCUDAGraphRunner(
-                    attn_metadata.max_num_requests, "cuda", attn_metadata
-                )
-                graph_runner.capture(lambda inputs: mistral.forward(**inputs))
+                inputs = {
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                    "attn_metadata": attn_metadata,
+                }
+                graph_runner.capture(1, lambda inputs: mistral.forward(**inputs), inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.run(
-                        {
-                            "input_ids": input_ids,
-                            "position_ids": position_ids,
-                            "attn_metadata": attn_metadata,
-                        }
-                    )
+                    logits = graph_runner.replay(1, inputs)
                 return logits
 
         if use_cuda_graph:
@@ -438,3 +445,97 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
             )
 
         torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
+        if graph_runner is not None:
+            graph_runner.clear()
+
+
+@pytest.mark.parametrize(
+    "in_shapes, image_sizes, expected_out_shape",
+    [
+        (
+            [(2, 3, 100, 150), (1, 3, 200, 100), (3, 3, 120, 180)],
+            [
+                [[92, 150], [100, 73]],
+                [[200, 100]],
+                [[37, 130], [120, 83], [73, 180]],
+            ],
+            [6, 3, 200, 180],
+        ),
+        # Single batch, single image.
+        (
+            [(1, 3, 64, 128)],
+            [[[64, 128]]],
+            [1, 3, 64, 128],
+        ),
+        # Same max size across batches.
+        (
+            [(2, 3, 59, 59), (1, 3, 59, 59), (5, 3, 59, 59)],
+            [
+                [[13, 59], [59, 17]],
+                [[59, 59]],
+                [[19, 29], [59, 31], [17, 54], [13, 59], [11, 37]],
+            ],
+            [8, 3, 59, 59],
+        ),
+    ],
+)
+def test_batch_pixel_values(in_shapes, image_sizes, expected_out_shape):
+    # Test case 1: Basic functionality with different sized images
+    pixel_values = [torch.randn(*shape) for shape in in_shapes]
+    image_sizes = [torch.tensor(size) for size in image_sizes]
+
+    batched_pixels, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
+        pixel_values, image_sizes
+    )
+
+    # Check output shapes
+    assert list(batched_pixels.shape) == expected_out_shape
+    assert list(batched_sizes.shape) == [expected_out_shape[0], 2]
+
+    # Check that the original image data is preserved (with padding).
+    start_idx = 0
+    for original_values in pixel_values:
+        batch_size = original_values.shape[0]
+        end_idx = start_idx + batch_size
+        orig_h, orig_w = original_values.shape[-2:]
+        padded_values = batched_pixels[start_idx:end_idx, :, :orig_h, :orig_w]
+        torch.testing.assert_close(padded_values, original_values)
+
+        start_idx += batch_size
+
+
+@pytest.mark.parametrize("height, width", [(37, 91), (128, 256), (512, 512)])
+@torch.no_grad()
+def test_processor_get_num_tokens_per_image(
+    tmp_path,
+    mistral_small_3_1_24b_config,
+    height,
+    width,
+):
+    # NOTES:
+    # 1. Setting up a fake model checkpoint that `AutoTokenizer.from_pretrained` /
+    #    `AutoProcessor.from_pretrained` is too involved (need at least several config JSONs, as well
+    #    as tokenizer files like vocab files, etc.).
+    # 2. On the other hand, using an actual model checkpoint for what should be a simple unit test
+    #    feels overkill.
+    # We therefore settle for this intermediate approach where we check that the expected calls are
+    # are made by mocking the auto classes out.
+
+    mistral_3_config = transformers.Mistral3Config.from_dict(mistral_small_3_1_24b_config)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.AutoProcessor"
+    ) as mocked_auto_processor:
+        input_processor = modeling_mistral.Mistral3InputProcessor(
+            model_path=str(tmp_path),
+            model_config=mistral_3_config,
+            tokenizer=mock.MagicMock(),
+        )
+
+    input_processor.get_num_tokens_per_image(
+        image=Image.new("RGB", (width, height), color=(255, 128, 0))
+    )
+
+    mocked_auto_processor.from_pretrained.return_value._get_num_multimodal_tokens.assert_called_once_with(
+        [(height, width)]
+    )

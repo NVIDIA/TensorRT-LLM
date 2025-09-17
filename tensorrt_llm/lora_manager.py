@@ -1,9 +1,11 @@
 import io
 import json
+import logging
 import re
 import tarfile
+import warnings
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
@@ -14,13 +16,52 @@ import yaml
 
 from tensorrt_llm.bindings import internal as tb_internal
 
-from ._utils import DictConversion, pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_numpy
+from ._utils import pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_numpy
 from .layers.linear import ColumnLinear
+from .lora_helper import (
+    LoraConfig,
+    get_default_trtllm_modules_to_hf_modules,
+    get_missing_qkv_modules_from_lora_modules,
+)
 from .mapping import Mapping
 from .models.convert_utils import get_model_path, load_state_dict, split_matrix_tp
 
 if TYPE_CHECKING:
     from .runtime import ModelConfig
+
+NEMO_SUPPORTED_LORA_MODULES = {"attn_qkv"}
+
+logger = logging.getLogger(__name__)
+
+
+def _check_lora_in_out(
+    layer_idx: int, lora_module: str, available_matrices: Dict, source_identifier: str
+) -> None:
+    """Check that 'in' and 'out' matrices are present."""
+    missing = []
+    if "in" not in available_matrices:
+        missing.append("'in' matrix (lora_A equivalent)")
+    if "out" not in available_matrices:
+        missing.append("'out' matrix (lora_B equivalent)")
+
+    if missing:
+        raise ValueError(
+            f"Layer {layer_idx} is missing required {' and '.join(missing)} for {lora_module} "
+            f"in LoRA weights from {source_identifier}. "
+            f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
+            f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
+        )
+
+
+def _is_moe_module_weights(module_weights: Dict) -> bool:
+    """Check if module weights represent MoE (integer expert indices with nested dicts)."""
+    if not module_weights:
+        return False
+
+    # All keys should be integers (expert indices) and values should be dicts
+    return all(isinstance(k, int) for k in module_weights.keys()) and all(
+        isinstance(v, dict) for v in module_weights.values()
+    )
 
 
 def get_all_nemo_lora_weights(
@@ -197,31 +238,12 @@ def norm_dora_magnitude(
 
 
 @dataclass
-class LoraConfig(DictConversion):
-    lora_dir: List[str] = field(default_factory=list)
-    lora_ckpt_source: str = "hf"
-    max_lora_rank: int = 64
-    lora_target_modules: List[str] = field(default_factory=list)
-    trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
-    max_loras: int = 4
-    max_cpu_loras: int = 4
-
-    def __post_init__(self):
-        assert self.lora_ckpt_source in ["hf", "nemo"], (
-            f"lora_ckpt_source must be one of 'hf' or 'nemo', got {self.lora_ckpt_source}"
-        )
-
-    @property
-    def missing_qkv_modules(self) -> List[str]:
-        return LoraManager.get_missing_qkv_modules(self.lora_target_modules)
-
-
-@dataclass
 class LoraModelConfig:
     lora_target_modules: list[str]
     trtllm_modules_to_hf_modules: dict[str, str]
     hidden_size: int
     dtype: str
+    swap_gate_up_proj_lora_b_weight: bool = True
 
 
 class HfLoraLoader:
@@ -370,8 +392,7 @@ class NemoLoraLoader:
             if not path.exists():
                 raise ValueError(f"{path} does not exist")
         self.is_valid = True
-        # Hardcoded since LoraManager only supports this case now
-        self.lora_target_modules = ["attn_qkv"]
+        self.lora_target_modules = list(NEMO_SUPPORTED_LORA_MODULES)
 
     def get_target_modules(self):
         """Get target modules for NeMo LoRA.
@@ -395,23 +416,6 @@ def load_nemo_lora(model, lora_config: LoraConfig):
         lora_config.lora_target_modules = lora_loader.lora_target_modules
 
 
-def get_default_trtllm_modules_to_hf_modules():
-    return {
-        "attn_q": "q_proj",
-        "attn_k": "k_proj",
-        "attn_v": "v_proj",
-        "attn_dense": "o_proj",
-        "mlp_h_to_4h": "gate_proj",
-        "mlp_4h_to_h": "down_proj",
-        "mlp_gate": "up_proj",
-        "mlp_gate_up": "gate_up_proj",
-        "moe_h_to_4h": "w1",
-        "moe_4h_to_h": "w2",
-        "moe_gate": "w3",
-        "moe_router": "gate",
-    }
-
-
 def load_torch_hf_lora(lora_config: LoraConfig):
     """This is a shortned version of load_hf_lora that is used for torch models.
 
@@ -419,7 +423,8 @@ def load_torch_hf_lora(lora_config: LoraConfig):
     pivot model config is the transformer's one.
     """
     # TODO smor- need to comibe with load_hf_lora
-    lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
+    if not lora_config.trtllm_modules_to_hf_modules:
+        lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
     lora_loader = HfLoraLoader(lora_config.lora_dir)
@@ -474,11 +479,10 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
             "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
         )
 
-    supported_modules = {"attn_qkv"}
-    unsupported_modules = set(lora_config.lora_target_modules) - supported_modules
+    unsupported_modules = set(lora_config.lora_target_modules) - NEMO_SUPPORTED_LORA_MODULES
     if unsupported_modules:
         raise ValueError(
-            f"NeMo LoRA only supports {supported_modules} modules, "
+            f"NeMo LoRA only supports {NEMO_SUPPORTED_LORA_MODULES} modules, "
             f"but got unsupported modules: {unsupported_modules}. "
             f"NeMo LoRA does not support embedding, lm_head, or MLP adapters."
         )
@@ -592,19 +596,6 @@ def load_hf_lora(
                 mapping.tp_rank,
                 dim=0,
             ).to(torch_dtype)
-
-
-def use_lora(
-    model,
-    lora_config: LoraConfig,
-    trtllm_modules_to_hf_modules: Optional[Dict[str, str]] = None,
-):
-    if lora_config.lora_ckpt_source == "nemo":
-        load_nemo_lora(model, lora_config)
-    elif lora_config.lora_ckpt_source == "hf":
-        load_hf_lora(model, lora_config, trtllm_modules_to_hf_modules)
-    else:
-        raise ValueError(f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
 
 
 def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.Tensor]]:
@@ -728,21 +719,8 @@ class LoraManager(object):
         )
 
     @staticmethod
-    def get_missing_qkv_modules(lora_target_modules):
-        # In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or
-        # all disabled at the same time.
-        # However, some lora checkpoint (e.g. BART) only contain two of them, so we use zero tensor
-        # to fill the missing ones.
-        missing_qkv_modules = []
-        if any(x in lora_target_modules for x in ["attn_q", "attn_k", "attn_v"]):
-            for lora_module in ["attn_q", "attn_k", "attn_v"]:
-                if lora_module not in lora_target_modules:
-                    missing_qkv_modules.append(lora_module)
-        if any(x in lora_target_modules for x in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]):
-            for lora_module in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]:
-                if lora_module not in lora_target_modules:
-                    missing_qkv_modules.append(lora_module)
-        return missing_qkv_modules
+    def get_missing_qkv_modules(lora_target_modules: List[str]) -> List[str]:
+        return get_missing_qkv_modules_from_lora_modules(lora_target_modules)
 
     @property
     def missing_qkv_modules(self) -> List[str]:
@@ -831,11 +809,24 @@ class LoraManager(object):
                 self._lora_weights_pointers_list[uid][layer_idx] = {}
 
                 for lora_module in self.lora_target_modules:
-                    if lora_module != "attn_qkv":
+                    if lora_module not in NEMO_SUPPORTED_LORA_MODULES:
+                        warnings.warn(
+                            f"LoRA module '{lora_module}' not supported in NeMo loading for "
+                            f"layer {layer_idx}, skipping. NeMo LoRA currently only supports "
+                            f"{NEMO_SUPPORTED_LORA_MODULES} modules."
+                        )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
 
                     if lora_module == "attn_qkv":
+                        # Validate required matrices are present
+                        _check_lora_in_out(
+                            layer_idx=layer_idx,
+                            lora_module=lora_module,
+                            available_matrices=all_lora_weights[layer_idx],
+                            source_identifier=f"file {model_file}",
+                        )
+
                         t_in = all_lora_weights[layer_idx]["in"]
                         t_out = all_lora_weights[layer_idx]["out"]
                         assert t_out.shape[0] % tp_size == 0
@@ -883,6 +874,8 @@ class LoraManager(object):
             load_from_model_file(uid, model_file)
             release_gc()
 
+        if new_uids:
+            logger.info(f"Successfully loaded NeMo LoRA adapters with UIDs: {new_uids}")
         return new_uids
 
     def load_from_hf(
@@ -977,16 +970,17 @@ class LoraManager(object):
         )
         hf_modules = set(hf_modules_to_trtllm_modules.keys())
 
-        def preprocess_lora_weights(lora_model):
+        def preprocess_lora_weights(lora_model, model_config):
             # Swap weights of gate_up_proj
-            for key, value in lora_model.items():
-                if "gate_up_proj.lora_B.weight" in key:
-                    original_weights = value.contiguous().clone()
-                    half_split = original_weights.shape[0] // 2
-                    first_half = original_weights[:half_split, :]
-                    second_half = original_weights[half_split:, :]
-                    value = torch.cat((second_half, first_half), dim=0)
-                    lora_model[key] = value
+            if getattr(model_config, "swap_gate_up_proj_lora_b_weight", True):
+                for key, value in lora_model.items():
+                    if "gate_up_proj.lora_B.weight" in key:
+                        original_weights = value.contiguous().clone()
+                        half_split = original_weights.shape[0] // 2
+                        first_half = original_weights[:half_split, :]
+                        second_half = original_weights[half_split:, :]
+                        value = torch.cat((second_half, first_half), dim=0)
+                        lora_model[key] = value
             return lora_model
 
         def load_from_model_dir(uid, model_dir, hf_config):
@@ -998,7 +992,7 @@ class LoraManager(object):
             lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
-            lora_model = preprocess_lora_weights(lora_model)
+            lora_model = preprocess_lora_weights(lora_model, model_config)
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules, component)
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))
@@ -1022,29 +1016,45 @@ class LoraManager(object):
                 for hf_module, module_weights in layer_weights.items():
                     lora_module = hf_modules_to_trtllm_modules[hf_module]
                     if lora_module not in self.lora_target_modules:
+                        warnings.warn(
+                            f"LoRA module '{lora_module}' not in target modules {self.lora_target_modules}, skipping."
+                        )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
-                    if "in" not in module_weights:
-                        is_moe = True
-                        t_in = torch.stack(
-                            [
-                                module_weights[expert_idx]["in"]
-                                for expert_idx in sorted(module_weights.keys())
-                            ]
-                        )
-                        t_out = torch.stack(
-                            [
-                                module_weights[expert_idx]["out"]
-                                for expert_idx in sorted(module_weights.keys())
-                            ]
-                        )
+
+                    has_expert_indices = _is_moe_module_weights(module_weights)
+
+                    if has_expert_indices:  # MoE
+                        # Validate and extract matrices in one pass
+                        expert_indices = sorted(module_weights.keys())
+                        t_in_list, t_out_list = [], []
+                        for expert_idx in expert_indices:
+                            expert_weights = module_weights[expert_idx]
+                            _check_lora_in_out(
+                                layer_idx=layer_idx,
+                                lora_module=f"{lora_module}_expert_{expert_idx}",
+                                available_matrices=expert_weights,
+                                source_identifier=f"directory {model_dir}",
+                            )
+                            t_in_list.append(expert_weights["in"])
+                            t_out_list.append(expert_weights["out"])
+
+                        t_in = torch.stack(t_in_list)
+                        t_out = torch.stack(t_out_list)
                         for weights in module_weights.values():
                             if "mag" in weights:
                                 # TODO(oargov): this might work, but I had no MoE DoRA models to test
                                 raise ValueError("DoRA with MoE is not supported")
                         t_mag = None
                     else:
-                        is_moe = False
+                        # Not MoE - validate required matrices are present
+                        _check_lora_in_out(
+                            layer_idx=layer_idx,
+                            lora_module=lora_module,
+                            available_matrices=module_weights,
+                            source_identifier=f"directory {model_dir}",
+                        )
+
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
                         t_mag = module_weights.get("magnitude", None)
@@ -1062,14 +1072,14 @@ class LoraManager(object):
                         "moe_4h_to_h",
                     ]:
                         # split by row
-                        dim = 2 if is_moe else 1
+                        dim = 2 if has_expert_indices else 1
                         assert t_in.shape[dim] % tp_size == 0
                         t_in = torch.split(t_in, t_in.shape[dim] // tp_size, dim=dim)[
                             tp_rank
                         ].contiguous()
                     else:
                         # split by column
-                        dim = 1 if is_moe else 0
+                        dim = 1 if has_expert_indices else 0
                         assert t_out.shape[dim] % tp_size == 0
                         t_out = torch.split(t_out, t_out.shape[dim] // tp_size, dim=dim)[
                             tp_rank
@@ -1079,7 +1089,7 @@ class LoraManager(object):
                                 tp_rank
                             ].contiguous()
 
-                    rank_dim = 1 if is_moe else 0
+                    rank_dim = 1 if has_expert_indices else 0
                     effective_rank = t_in.shape[rank_dim]
 
                     t_in = t_in.cuda().contiguous()

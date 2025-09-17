@@ -2,15 +2,12 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from _graph_test_helpers import run_test
+from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MoEOpModel
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.transformations.library.fused_moe import (
-    fuse_moe,
-    match_moe_pattern,
-)
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
 
@@ -136,7 +133,7 @@ class BlockSparseTop2MLPFP4(nn.Module):
 
     def forward(self, hidden_states):
         x = hidden_states
-        w1_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+        w1_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
             x,
             self.w1_fp4,
             bias=None,
@@ -144,7 +141,7 @@ class BlockSparseTop2MLPFP4(nn.Module):
             weight_scale=self.w1_weight_scale,
             alpha=self.w1_alpha,
         )
-        w3_out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+        w3_out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
             x,
             self.w3_fp4,
             bias=None,
@@ -153,7 +150,7 @@ class BlockSparseTop2MLPFP4(nn.Module):
             alpha=self.w3_alpha,
         )
         fused = self.act_fn(w1_out) * w3_out
-        out = torch.ops.auto_deploy.torch_quant_fp4_linear(
+        out = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
             fused,
             self.w2_fp4,
             bias=None,
@@ -277,7 +274,7 @@ class MoEPatternModel(nn.Module):
         ),
         pytest.param(
             "NVFP4",
-            torch.ops.auto_deploy.torch_quant_fp4_moe,
+            torch.ops.auto_deploy.torch_quant_nvfp4_moe,
             0.05,
             0.01,
             marks=[
@@ -304,11 +301,26 @@ def test_moe_matching(quant_type, expected_op, atol, rtol):
             model.block_sparse_moe.gate = model.block_sparse_moe.gate.to(dtype=torch.bfloat16)
 
         x = model.get_input(device=device)
+        gm = torch_export_to_gm(model, args=(x,), clone=True)
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "match_moe_pattern": {
+                    "stage": "pattern_matcher",
+                },
+                "match_fp8_moe_pattern": {
+                    "stage": "pattern_matcher",
+                },
+                "match_nvfp4_moe_pattern": {
+                    "stage": "pattern_matcher",
+                },
+            },
+        )(None, gm)
 
-        _ = run_test(
+        run_test_transformed_gm(
             model,
             x,
-            match_moe_pattern,
+            gm_transformed,
             lambda gm: any(is_op(n, expected_op) for n in gm.graph.nodes),
             lambda num: num,
             atol=atol,
@@ -322,11 +334,20 @@ def test_moe_fusion():
     device = "cuda"
     model = MoEOpModel().to(device=device, dtype=torch.bfloat16)
     x = model.get_input(device=device, dtype=torch.bfloat16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_moe": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
 
-    fused_gm_transformed = run_test(
+    run_test_transformed_gm(
         model,
         x,
-        fuse_moe,
+        gm_transformed,
         lambda gm: any(
             is_op(
                 n, {torch.ops.auto_deploy.torch_moe_fused, torch.ops.auto_deploy.trtllm_moe_fused}
@@ -342,7 +363,7 @@ def test_moe_fusion():
 
     # expert weights are fused and stacked in fusion
     num_param_nodes = len(list(model.named_parameters()))
-    num_param_nodes_fused = len(list(fused_gm_transformed.named_parameters()))
+    num_param_nodes_fused = len(list(gm_transformed.named_parameters()))
     assert (
         num_param_nodes_fused < num_param_nodes
     ), f"""number of parameter nodes after fusion {num_param_nodes_fused} <

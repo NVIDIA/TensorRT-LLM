@@ -37,11 +37,6 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
-template <class T>
-constexpr auto transpose_stride(T const& t)
-{
-    return cute::prepend(cute::prepend(cute::take<2, cute::rank_v<T>>(t), cute::get<0>(t)), cute::get<1>(t));
-}
 
 template <typename AType, typename BType, typename BScaleType, typename OType>
 struct GroupedGemmInput
@@ -72,8 +67,6 @@ struct GroupedGemmInput
 
 struct TmaWarpSpecializedGroupedGemmInput
 {
-    template <class T>
-    using TransposeStride = decltype(transpose_stride<T>(T{}));
     template <class Tag>
     using TransposeLayoutTag = std::conditional_t<std::is_same_v<Tag, cutlass::layout::RowMajor>,
         cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
@@ -81,11 +74,24 @@ struct TmaWarpSpecializedGroupedGemmInput
     static_assert(std::is_same_v<cutlass::layout::RowMajor, TransposeLayoutTag<cutlass::layout::ColumnMajor>>);
     static_assert(std::is_same_v<cutlass::layout::ColumnMajor, TransposeLayoutTag<cutlass::layout::RowMajor>>);
 
-    // Layout for A and B is transposed and then swapped in the implementation
-    // This uses B^T * A^T = (A * B)^T to get a better layout for the GEMM
-    using LayoutA = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for A matrix operand
-    using LayoutB = TransposeLayoutTag<cutlass::layout::ColumnMajor>; // Layout type for B matrix operand
-    using LayoutC = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for C matrix operand
+    // These are always the layout of A & B matrices, activations and weights will be assigned to either A or B based on
+    // swap_ab
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+
+    // When using Swap A&B we need to transpose the output matrix
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+    using LayoutC_T = TransposeLayoutTag<LayoutC>;
+    using LayoutD_T = TransposeLayoutTag<LayoutD>;
+
+    using StrideA = std::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutA*>>;
+    using StrideB = std::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
+
+    using StrideC = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutC*>>;
+    using StrideD = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD*>>;
+    using StrideC_T = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutC_T*>>;
+    using StrideD_T = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD_T*>>;
 
     constexpr static int NVFP4BlockScaleVectorSize = 16;
     constexpr static int MXFPXBlockScaleVectorSize = 32;
@@ -116,12 +122,6 @@ struct TmaWarpSpecializedGroupedGemmInput
         return (dim + alignment - 1) / alignment * alignment;
     }
 
-    using StrideA
-        = std::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutA*>>; // Use B because they will be swapped
-    using StrideB
-        = std::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutB*>>; // Use A because they will be swapped
-    using StrideC = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutC*>>;
-
 #ifdef ENABLE_FP8
     template <class T>
     constexpr static bool IsFP8_v = std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
@@ -136,48 +136,41 @@ struct TmaWarpSpecializedGroupedGemmInput
 
     using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int64_t, int64_t, int64_t>>;
 
+    bool swap_ab = false;
     ProblemShape shape_info{};
-    StrideA* stride_a = nullptr;
-    StrideB* stride_b = nullptr;
+    void* stride_act = nullptr;
+    void* stride_weight = nullptr;
 
-    void const** ptr_a = nullptr;
-    void const** ptr_b = nullptr;
+    void const** ptr_act = nullptr;
+    void const** ptr_weight = nullptr;
 
     // C is currently the same in both epilogues
-    StrideC* stride_c = nullptr;
+    void* stride_c = nullptr;
     void const** ptr_c = nullptr;
 
-    struct DefaultEpilogue
-    {
-        using LayoutD = TransposeLayoutTag<cutlass::layout::RowMajor>; // Layout type for D matrix operand
-        using StrideD = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD*>>;
-
-        StrideD* stride_d = nullptr;
-        void** ptr_d = nullptr;
-    };
+    // D is used in all cases except fused finalize
+    void* stride_d = nullptr;
+    void** ptr_d = nullptr;
 
     struct FusedFinalizeEpilogue
     {
-        using StrideFinalOutput = DefaultEpilogue::StrideD;
-        using StrideBias = TransposeStride<cute::Stride<cute::_0, cute::_1, int>>;
-        using StrideRouterScales = TransposeStride<cute::Stride<cute::_1, cute::_0>>;
+        using StrideFinalOutput_T = cutlass::detail::TagToStrideC_t<LayoutD_T>;
+        using StrideFinalOutput = cutlass::detail::TagToStrideC_t<LayoutD>;
 
         void* ptr_final_output = nullptr;
+        StrideFinalOutput_T stride_final_output_transposed{};
         StrideFinalOutput stride_final_output{};
 
-        void const* ptr_bias = nullptr;
-        StrideBias stride_bias{};
+        void const** ptr_bias = nullptr;
+        float const** ptr_router_scales = nullptr;
 
-        float const* ptr_router_scales = nullptr;
-        StrideRouterScales stride_router_scales{};
+        int const** ptr_source_token_index = nullptr;
+        int num_rows_in_final_output = 0;
+        int shape_override = -1;
 
-        int64_t const* ptr_expert_first_token_offset = nullptr;
-        int const* ptr_source_token_index = nullptr;
-
-        size_t num_rows_in_final_output = 0;
+        bool use_reduction = true;
     };
 
-    DefaultEpilogue default_epilogue;
     FusedFinalizeEpilogue fused_finalize_epilogue;
 
     enum class EpilogueFusion
@@ -194,11 +187,11 @@ struct TmaWarpSpecializedGroupedGemmInput
     using ElementSF = uint8_t;
     using MXFPXElementSF = ElementSF; // Just an alias for now
     using NVFP4ElementSF = ElementSF; // Just an alias for now
-    ElementSF const** fpX_block_scaling_factors_A = nullptr;
-    ElementSF const** fpX_block_scaling_factors_B = nullptr;
+    ElementSF const** fpX_block_scaling_factors_act = nullptr;
+    ElementSF const** fpX_block_scaling_factors_weight = nullptr;
 
-    void* fpX_block_scaling_factors_stride_A = nullptr;
-    void* fpX_block_scaling_factors_stride_B = nullptr;
+    void* fpX_block_scaling_factors_stride_act = nullptr;
+    void* fpX_block_scaling_factors_stride_weight = nullptr;
 
     enum class FpXBlockScalingType
     {
@@ -210,8 +203,10 @@ struct TmaWarpSpecializedGroupedGemmInput
 
     struct INT4GroupwiseParams
     {
-        constexpr static int group_size = 128; // Unused, hard-coded to 128
+        constexpr static int int4_group_size = 128;
+        constexpr static int wfp4a16_group_size = 32;
         bool enabled = false;
+        bool use_wfp4a16 = false;
         using SFA = __nv_bfloat16;
         using SFB = __nv_bfloat16; // Unused
         using ProblemShapeInt = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
@@ -233,7 +228,7 @@ struct TmaWarpSpecializedGroupedGemmInput
     uint8_t* gemm_workspace = nullptr;
     size_t gemm_workspace_size = 0;
 
-    static std::array<size_t, 17> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
+    static std::array<size_t, 20> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
     static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 
@@ -242,19 +237,18 @@ struct TmaWarpSpecializedGroupedGemmInput
 
     bool isValid() const
     {
-        return stride_a != nullptr && ptr_a != nullptr;
+        return stride_act != nullptr && ptr_act != nullptr;
     }
 
-    void setFinalizeFusionParams(void* final_output, float const* router_scales,
-        int64_t const* expert_first_token_offset, int const* source_token_index, void const* bias, int hidden_size,
-        int num_output_tokens);
+    void setFinalizeFusionParams(void* final_output, int hidden_size, int num_output_tokens, bool use_reduction);
 
     std::string toString() const;
 };
 
 constexpr bool isGatedActivation(ActivationType activation_type)
 {
-    return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu;
+    return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu
+        || activation_type == ActivationType::SwigluBias;
 }
 
 template <typename T,                   /*The type used for activations/scales/compute*/
@@ -267,6 +261,12 @@ class MoeGemmRunner
 public:
     MoeGemmRunner();
 
+#if defined(ENABLE_BF16)
+    static constexpr bool use_wfp4a16
+        = std::is_same_v<WeightType, __nv_fp4_e2m1> && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
+#else
+    static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+#endif
 #if defined(ENABLE_FP8)
     static constexpr bool use_fp8
         = (std::is_same_v<T, __nv_fp8_e4m3>
@@ -280,15 +280,15 @@ public:
 #else
     static constexpr bool use_fp8 = false;
     static constexpr bool use_w4afp8 = false;
-    static constexpr bool use_wfp4afp4 = false;
 #endif
+    static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
 #if defined(ENABLE_FP4)
     static constexpr bool use_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
-    static constexpr bool use_wfp4afp4 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+    static constexpr bool use_wfp4afp8 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
 #else
     static constexpr bool use_fp4 = false;
-    static constexpr bool use_wfp4afp4 = false;
+    static constexpr bool use_wfp4afp8 = false;
 #endif
 
     void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
@@ -297,18 +297,23 @@ public:
     void moeGemm(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
         TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
-    std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(int sm);
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getBlackwellConfigs(int sm);
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getHopperConfigs(int sm);
+    std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(bool supports_finalize_fusion) const;
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm, bool supports_finalize_fusion);
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(
+        int sm, bool supports_finalize_fusion);
     static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
 
     [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
-    [[nodiscard]] bool supportsTmaWarpSpecialized() const;
-    [[nodiscard]] bool isFusedGatedActivation(
-        cutlass_extensions::CutlassGemmConfig gemm_config, bool is_gated_activation, int gemm_n, int gemm_k) const;
-    [[nodiscard]] bool supportsFusedGatedActivation(bool is_gated_activation, int gemm_n, int gemm_k) const;
+
+    [[nodiscard]] bool supportsTmaWarpSpecialized() const
+    {
+        return supportsTmaWarpSpecialized(sm_);
+    }
+
+    [[nodiscard]] static bool supportsTmaWarpSpecialized(int sm);
+    [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
+        ActivationType activation_type, int gemm_n, int gemm_k) const;
+    [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n, int gemm_k) const;
 
     size_t getMaxWorkspaceSize(int num_experts) const;
 

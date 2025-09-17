@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <optional>
 #include <set>
 #include <sstream>
 
@@ -31,23 +32,30 @@
 #else
 #include <iostream>
 
+template <typename T>
+void printArgs(T arg)
+{
+#ifdef TLLM_GEN_DEBUG
+    std::cout << arg;
+#endif
+}
+
 template <typename T, typename... Args>
 void printArgs(T first, Args... args)
 {
-#ifdef TLLM_GEN_DEBUG
-    std::cout << first;
+    printArgs(first);
     if constexpr (sizeof...(args) > 0)
     {
-        std::cout << " ";
+        printArgs(", ");
         printArgs(args...);
     }
-#endif
 }
 
 #define TLLM_CHECK_ERROR(cond, ...)                                                                                    \
     if (!(cond))                                                                                                       \
     {                                                                                                                  \
         printArgs(__VA_ARGS__);                                                                                        \
+        printArgs("\n");                                                                                               \
         return false;                                                                                                  \
     }
 
@@ -59,6 +67,7 @@ void printArgs(T first, Args... args)
     if (!(cond))                                                                                                       \
     {                                                                                                                  \
         printArgs(__VA_ARGS__);                                                                                        \
+        printArgs("\n");                                                                                               \
         return false;                                                                                                  \
     }
 
@@ -66,7 +75,7 @@ void printArgs(T first, Args... args)
 
 #define TLLM_LOG_INFO(...) TLLM_CHECK_WARNING(false, __VA_ARGS__)
 
-#endif
+#endif // TLLM_GEN_EXPORT_INTERFACE
 
 namespace batchedGemm
 {
@@ -103,8 +112,9 @@ struct GemmOptions
         bool patchF2fp, bool useShuffledMatrixA, bool sliceK, SplitK splitK, bool transposeMmaOutput, int tileM,
         int tileN, int tileK, bool useUnrollLoop2xForMma, bool useCustomMmaSchedule,
         bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB,
-        bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
-        tg::SfLayout sfLayoutC, int sfReshapeFactor, TileScheduler tileScheduler)
+        bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, std::optional<int32_t> sfBlockSizeA,
+        tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int sfReshapeFactor,
+        TileScheduler tileScheduler)
         : mAllReduceAlgo{allReduceAlgo}
         , mBiasType{biasType}
         , mBlockK(blockK)
@@ -167,6 +177,7 @@ struct GemmOptions
         , mUseTmaStore{useTmaStore}
         , mUseTwoTmaLoadWarps{useTwoTmaLoadWarps}
         , mUseTwoMmaWarps{useTwoMmaWarps}
+        , mSfBlockSizeA{sfBlockSizeA}
         , mSfLayoutA{sfLayoutA}
         , mSfLayoutB{sfLayoutB}
         , mSfLayoutC{sfLayoutC}
@@ -313,6 +324,8 @@ struct GemmOptions
     bool mUseTwoTmaLoadWarps{false};
     // Use two different warps for MMA tasks. Applicable only to DeepSeek FP8.
     bool mUseTwoMmaWarps{false};
+    // Block size of A. For dtypeA == E2m1 and dtypeB == E4m3.
+    std::optional<int32_t> mSfBlockSizeA{std::nullopt};
     // Scale factors layout for A.
     tg::SfLayout mSfLayoutA{tg::SfLayout::R128c4};
     // Scale factors layout for B.
@@ -334,8 +347,17 @@ struct GemmOptions
 enum class SmVersion
 {
     Sm90a,
-    Sm100a
+    Sm100a,
+    Sm100f,
+    Sm103a
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+bool isSmVersionBlackwell(SmVersion smVersion)
+{
+    return smVersion == SmVersion::Sm100a || smVersion == SmVersion::Sm100f || smVersion == SmVersion::Sm103a;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -354,6 +376,7 @@ struct GemmConfig
     uint32_t const mSharedMemSize{0};
     char const* mFunctionName{nullptr};
     uint32_t const mNumThreadsPerCTA{0};
+    char const* mHash{nullptr};
 #else
     trtllm::gen::CudaRunner* mCudaRunner{nullptr};
 #endif
@@ -477,6 +500,16 @@ inline std::string dumpOptions(GemmOptions const& options)
     ss << "mUseTmaStore=" << options.mUseTmaStore << "," << std::endl;
     ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
     ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
+    if (options.mSfBlockSizeA.has_value())
+    {
+        ss << "mSfBlockSizeA=" << options.mSfBlockSizeA.value() << "," << std::endl;
+    }
+    else
+    {
+        ss << "mSfBlockSizeA="
+           << "std::nullopt"
+           << ", " << std::endl;
+    }
     ss << "mSfLayoutA="
        << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")"
        << "," << std::endl;
@@ -526,6 +559,7 @@ inline int32_t getShuffleBlockSize(int epilogueTileM)
 inline bool checkAndUpdateGemmOptions(
     GemmOptions& options, bool isBlackwell, int /* tpGrpSize */, bool updateOptions = true)
 {
+
     if (options.mDtypeB == tg::Dtype::Void)
     {
         if (updateOptions)
@@ -566,7 +600,8 @@ inline bool checkAndUpdateGemmOptions(
     // Currently, we only support {MxFp4, NvFp4} -> Bf16.
     TLLM_CHECK_ERROR((options.mDtypeA == options.mDtypeMmaA)
             || ((options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::E2m1)
-                && options.mDtypeMmaA == tg::Dtype::Bfloat16),
+                && options.mDtypeMmaA == tg::Dtype::Bfloat16)
+            || (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3),
         "Unsupported cast for A: ", tg::dtypeToString(options.mDtypeA), " -> ", tg::dtypeToString(options.mDtypeMmaA));
 
     // Check that the B cast is supported.
@@ -715,7 +750,20 @@ inline bool checkAndUpdateGemmOptions(
     {
         TLLM_CHECK_ERROR(isBlackwell, "Block scaling is only supported on Blackwell");
 
-        int const mmaK = (options.mMmaKind == tg::MmaKind::MxFp4NvFp4) ? 64 : 32;
+        int mmaK = 32;
+        if (options.mMmaKind == tg::MmaKind::MxFp4NvFp4)
+        {
+            if (options.mMmaK == 96)
+            {
+                mmaK = 96;
+                TLLM_CHECK_ERROR(options.mTileK == 768, "When mmaK == 96, only tileK == 768 is supported");
+                TLLM_CHECK_ERROR(options.mTileN <= 128, "When mmaK == 96, only tileN <= 128 is supported");
+            }
+            else
+            {
+                mmaK = 64;
+            }
+        }
         if (options.mMmaK != mmaK)
         {
             int newTileK = mmaK * divUp(options.mTileK, mmaK);
@@ -736,9 +784,27 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mMmaN >= 64 || options.mMmaN == options.mTileN, "MmaN (", options.mMmaN,
             ") must be >= 64 or equal to TileN (", options.mTileN, ")");
     }
+
+    if (options.mSfBlockSizeA.has_value())
+    {
+        // Only E2m1 x E4m3 is tested. MxE2m1 x bf16 may also work.
+        TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeB == tg::Dtype::E4m3,
+            "sfBlockSizeA is only supported for E2m1 and E4m3 types. Found dtypeA=", tg::dtypeToString(options.mDtypeA),
+            " dtypeB=", tg::dtypeToString(options.mDtypeB));
+
+        // sfBlockSizeA must be 16 or 32.
+        // SfBlockSizeA can also support 64 and 128, although they are not officially supported Nvida
+        // format. Note that the type conversion needs to happen before TCs.
+        // For example, convert e2m1 to e4m3 inside TmemCastA.
+        // If we want to support sfBlockSizeA=8, we can write another version of convertE2m1ToSfE4m3,
+        // which only packs 8 e2m1 elements.
+        TLLM_CHECK_ERROR(options.mSfBlockSizeA.value() == 16 || options.mSfBlockSizeA.value() == 32, "SfBlockSizeA (",
+            options.mSfBlockSizeA.value(), ") must be 16 or 32.");
+    }
+
     if (tg::dtypeIsBlockFmt(options.mDtypeA))
     {
-        int numEltsPerSfA = tg::dtypeNumEltsPerSf(options.mDtypeA);
+        int numEltsPerSfA = options.mSfBlockSizeA.value_or(tg::dtypeNumEltsPerSf(options.mDtypeA));
         TLLM_CHECK_ERROR(options.mTileK % (4 * numEltsPerSfA) == 0, "TileK (", options.mTileK,
             ") must be a multiple of ", (4 * numEltsPerSfA), " for typeA ", gemm::toString(options.mDtypeA));
         auto const numEltsPerSfAInK = options.mK / numEltsPerSfA;
@@ -1292,8 +1358,8 @@ inline bool checkAndUpdateGemmOptions(
     {
         // Init kernel traits.
         options.mKernelTraits = KernelTraits(options.mDtypeA, options.mDtypeB, options.mDtypeC, options.mDtypeAcc,
-            options.mDtypeMmaA, options.mDtypeMmaB, options.mMmaKind, options.mTileM, options.mTileN, options.mTileK,
-            options.mEpilogueTileM, options.mEpilogueTileN, options.mNumStages, options.mNumStagesMma,
+            options.mDtypeMmaA, options.mDtypeMmaB, options.mMmaKind, options.mMmaK, options.mTileM, options.mTileN,
+            options.mTileK, options.mEpilogueTileM, options.mEpilogueTileN, options.mNumStages, options.mNumStagesMma,
             options.mNumSlicesForSplitK, options.mNumSlicesForSliceK, options.mSplitK, options.mUseTmaStore,
             options.mTransposeMmaOutput, options.mAllReduceAlgo, options.mTileScheduler == TileScheduler::Persistent,
             options.mUseDeepSeekFp8, options.mUsePerTokenSfA, options.mUsePerTokenSfB, options.mBiasType);

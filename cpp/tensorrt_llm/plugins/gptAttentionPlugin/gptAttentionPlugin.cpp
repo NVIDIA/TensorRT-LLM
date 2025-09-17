@@ -703,8 +703,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             = static_cast<bool>(reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_USE)])[0]);
         changeSpecDecodingMode = mUseSpecDecoding != useSpecDecoding;
         mUseSpecDecoding = useSpecDecoding;
-        // change mMultiBlockMode to default
-        mMultiBlockMode = mUseSpecDecoding ? false : true;
     }
 
     [[maybe_unused]] MlaParams<T> mla_params;
@@ -1048,6 +1046,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         enqueue_params.host_block_offsets = host_block_offsets;
         enqueue_params.batch_size = batch_size;
         enqueue_params.mrope_rotary_cos_sin = mrope_rotary_cos_sin;
+        enqueue_params.total_kv_len = enqueue_params.num_tokens;
 
         if (isCrossAttention())
         {

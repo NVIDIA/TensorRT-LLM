@@ -44,6 +44,7 @@ using TokenIdType = std::int32_t;
 using LoraTaskIdType = std::uint64_t;
 using TokenExtraIdType = std::uint64_t;
 using VecTokenExtraIds = std::vector<TokenExtraIdType>;
+using CacheSaltIDType = std::uint64_t;
 
 struct UniqueToken
 {

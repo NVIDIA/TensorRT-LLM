@@ -1,19 +1,21 @@
-import multiprocessing
 import os
-import sys
-import time
 import unittest
 from contextlib import contextmanager
 from difflib import SequenceMatcher
-from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Callable, Generator, Mapping, Tuple
+from typing import Any, Generator
 
 import pynvml
 import pytest
 import tensorrt as trt
 import torch
-from cuda import cuda, nvrtc
+
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
+except ImportError:
+    from cuda import cuda, nvrtc
+
 from parameterized import parameterized
 
 import tensorrt_llm
@@ -72,6 +74,11 @@ def getCUDAVersion():
         print(f"Error getting CUDA version: {e}")
 
 
+def isSM100Family():
+    sm = getSMVersion()
+    return sm == 100 or sm == 103
+
+
 skip_pre_ada = pytest.mark.skipif(
     getSMVersion() < 89,
     reason="This test is not supported in pre-Ada architecture")
@@ -82,7 +89,7 @@ skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 skip_blackwell = pytest.mark.skipif(
-    getSMVersion() == 100,
+    getSMVersion() == 100 or getSMVersion() == 103,
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
     getSMVersion() == 120, reason="This test is not supported on SM 120")
@@ -125,9 +132,8 @@ def skip_fp8_pre_ada(use_fp8):
 
 
 def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
-    if getSMVersion() == 100 and (head_size not in [32, 64, 128]
-                                  and context_fmha_type
-                                  != ContextFMHAType.disabled):
+    if (isSM100Family()) and (head_size not in [32, 64, 128] and
+                              context_fmha_type != ContextFMHAType.disabled):
         pytest.skip(
             "Context FMHA only supports head sizes [32, 64, 128] currently on blackwell."
         )
@@ -179,14 +185,14 @@ def skip_gpu_memory_less_than(required_memory: int):
     )
 
 
-skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1000 * 1000 *
+                                                           1000)
 
-skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1024 * 1024 *
-                                                           1024)
+skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1000 * 1000 *
+                                                           1000)
 
-skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1024 * 1024 *
-                                                            1024)
+skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1000 * 1000 *
+                                                            1000)
 
 
 def modelopt_installed():
@@ -427,88 +433,16 @@ def duplicate_list_to_length(list: list[Any], target_length: int) -> list[Any]:
     return duplicated_list
 
 
-def _target_wrapper(target: Callable, stdout_pipe: Connection,
-                    stderr_pipe: Connection, *args, **kwargs) -> None:
-
-    class PipeWriter:
-
-        def __init__(self, conn: Connection):
-            self.conn = conn
-
-        def write(self, s: str):
-            self.conn.send_bytes(s.encode("UTF8"))
-
-        def flush(self):
-            pass
-
-    sys.stdout = PipeWriter(stdout_pipe)
-    sys.stderr = PipeWriter(stderr_pipe)
-    target(*args, **kwargs)
-
-
-def run_function_in_sub_process(target: Callable,
-                                args: tuple,
-                                kwargs: Mapping[str, Any],
-                                stop_waiting_criteria: Callable,
-                                poll_interval_seconds: int = 5,
-                                timeout_seconds: int = 240) -> Tuple[str, str]:
-    multiprocessing.set_start_method("spawn", force=True)
-    parent_stdout_pipe, child_stdout_pipe = multiprocessing.Pipe()
-    parent_stderr_pipe, child_stderr_pipe = multiprocessing.Pipe()
-    child_process = multiprocessing.Process(
-        target=_target_wrapper,
-        args=[target, child_stdout_pipe, child_stderr_pipe] + list(args),
-        kwargs=kwargs)
-    child_process.start()
-    child_stdout_pipe.close()
-    child_stderr_pipe.close()
-
-    def _read_from_pipe(pipe: Connection):
-        out = ""
-        while pipe.poll(timeout=0.1):
-            try:
-                out += pipe.recv_bytes().decode("UTF8")
-            except Exception:
-                break
-        return out
-
-    child_stdout = ""
-    child_stderr = ""
-    try:
-        total_waiting_seconds = 0
-        while child_process.is_alive(
-        ) and total_waiting_seconds < timeout_seconds:
-            child_stdout += _read_from_pipe(parent_stdout_pipe)
-            child_stderr += _read_from_pipe(parent_stderr_pipe)
-            if stop_waiting_criteria(child_stdout, child_stderr):
-                break
-            time.sleep(poll_interval_seconds)
-            total_waiting_seconds += poll_interval_seconds
-    finally:
-        parent_stdout_pipe.close()
-        parent_stderr_pipe.close()
-        if child_process.is_alive():
-            child_process.terminate()
-
-    assert total_waiting_seconds < timeout_seconds, "Reached timeout while waiting for target"
-    return child_stdout, child_stderr
-
-
-class EnvVarsContextManager:
-
-    def __init__(self, new_env_vars: dict[str, str]):
-        self._env_vars = new_env_vars
-        self._original_value = None
-
-    def __enter__(self):
-        self._original_vars = {
-            var_name: os.environ[var_name]
-            for var_name in self._env_vars.keys() if var_name in os.environ
-        }
-        os.environ.update(self._env_vars)
-
-    def __exit__(self, type, value, traceback):
-        os.environ.update(self._original_vars)
-        for var_name in self._env_vars.keys():
-            if var_name not in self._original_vars:
-                os.environ.pop(var_name)
+# Check a certain percentage of elements in two tensors are within a tolerance
+def check_accuracy(a, b, atol, rtol, percent):
+    assert a.shape == b.shape
+    assert a.dtype == b.dtype
+    a = a.to(torch.float32)
+    b = b.to(torch.float32)
+    left = torch.abs(a - b)
+    right = atol + rtol * torch.abs(b)
+    count = torch.sum(left > right)
+    mismatch_percent = count / a.numel()
+    if not (mismatch_percent < 1 - percent):
+        raise Exception("Mismatch percentage is %f for rtol %f" %
+                        (mismatch_percent, rtol))

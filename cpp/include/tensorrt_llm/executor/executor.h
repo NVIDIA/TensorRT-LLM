@@ -582,14 +582,13 @@ public:
     explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
         RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt,
-        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM,
-        std::optional<std::string> directory = std::nullopt);
+        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
     [[nodiscard]] KvCacheTransferMode getTransferMode() const;
-    [[nodiscard]] std::optional<std::string> getDirectory() const;
+    [[nodiscard]] std::string const& getDirectory() const;
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
@@ -616,7 +615,7 @@ private:
     /// @brief The transfer mode for the block.
     KvCacheTransferMode mTransferMode;
     /// @brief Name of the directory if transfer mode is GDS or POSIX_DEBUG_FALLBACK.
-    std::optional<std::string> mDirectory;
+    std::string mDirectory;
 };
 
 /// @brief A class that holds information about the request
@@ -670,7 +669,7 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
-    // 34 parameters
+    /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -697,7 +696,8 @@ public:
         std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt);
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -745,6 +745,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
+    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
 
     void setStreaming(bool streaming);
@@ -780,6 +781,7 @@ public:
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
+    void setCacheSaltID(CacheSaltIDType cacheSaltID);
 
 private:
     friend class Serialization;
@@ -859,6 +861,10 @@ struct Result
     /// In speculative decoding, might be less than maximum length of the beam in outputTokenIds as more than
     /// one token can be generated per iteration. Used for speculative decoding statistics.
     SizeType32 decodingIter{0};
+
+    /// @brief The average number of decoded tokens per iteration. For standard model it is 1.
+    /// For speculative decoding model >= 1 -- number of draft tokens accepted per step + 1.
+    float avgDecodedTokensPerIter{0.0f};
 
     /// @brief The index of the output sequence of this result where 0 <= sequenceIndex < numReturnSequences.
     /// In beam search (beamWidth > 1), this index will be always zero because all beams to be returned are included
@@ -1001,7 +1007,9 @@ public:
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
-        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
+        SizeType32 attentionDpEventsGatherPeriodMs = 5,
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
+        uint64_t const& maxGpuTotalBytes = 0);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] bool getEnablePartialReuse() const;
@@ -1016,11 +1024,13 @@ public:
     [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
     [[nodiscard]] size_t getEventBufferMaxSize() const;
     [[nodiscard]] bool getUseUvm() const;
+    [[nodiscard]] SizeType32 getAttentionDpEventsGatherPeriodMs() const;
+    [[nodiscard]] uint64_t getMaxGpuTotalBytes() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
     void setCopyOnPartialReuse(bool copyOnPartialReuse);
-    void setMaxTokens(SizeType32 maxTokens);
+    void setMaxTokens(std::optional<SizeType32> maxTokens);
     void setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentionWindowVec);
     void setSinkTokenLength(SizeType32 sinkTokenLength);
     void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
@@ -1030,6 +1040,8 @@ public:
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
+    void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
+    void setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1085,6 +1097,13 @@ private:
 
     /// @brief Whether to use UVM for the KV cache.
     bool mUseUvm;
+
+    /// @brief The period in milliseconds to gather attention DP events across ranks
+    SizeType32 mAttentionDpEventsGatherPeriodMs;
+    /// @brief The maximum size in bytes of GPU memory that can be allocated for the KV cache.
+    /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
+    /// be allocated.
+    uint64_t mMaxGpuTotalBytes;
 };
 
 /// @brief Configuration class for the runtime perf knobs
@@ -1702,6 +1721,12 @@ struct KVCacheUpdatedData
     explicit KVCacheUpdatedData(IdType blockHash)
         : blockHash{blockHash} {};
 
+    explicit KVCacheUpdatedData(IdType blockHash, std::optional<KVCacheEventDiff<SizeType32>> cacheLevel,
+        std::optional<KVCacheEventDiff<SizeType32>> priority)
+        : blockHash{blockHash}
+        , cacheLevel{cacheLevel}
+        , priority{priority} {};
+
     KVCacheUpdatedData& cacheLevelUpdated(SizeType32 oldValue, SizeType32 newValue)
     {
         cacheLevel = KVCacheEventDiff<SizeType32>{oldValue, newValue};
@@ -1726,8 +1751,8 @@ using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVC
 
 struct KVCacheEvent
 {
-
-    KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize);
+    KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize,
+        std::optional<SizeType32> attentionDpRank = std::nullopt);
 
     /// @brief The unique id of this event
     IdType eventId;
@@ -1735,6 +1760,8 @@ struct KVCacheEvent
     KVCacheEventData data;
     /// @brief The sliding window size
     SizeType32 windowSize;
+    /// @brief The attention DP rank of the event, if applicable
+    std::optional<SizeType32> attentionDpRank;
 };
 
 /// @brief Exposes a limited set of KV cache manager functionalities

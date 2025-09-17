@@ -65,6 +65,8 @@ public:
         T const* qkv_bias = nullptr;
         // Attention mask input, which has shape of [batch_size, attention_mask_stride].
         bool const* attention_mask = nullptr;
+        // Attention sinks with shape of [num_heads_q] float.
+        float const* attention_sinks = nullptr;
         // Rotary inv_freq cache buffer to avoid re-computing.
         float const* rotary_inv_freq = nullptr;
         // Rotary cos sin cache buffer to avoid re-computing.
@@ -92,7 +94,10 @@ public:
         kernels::KVBlockArray::DataType* block_offsets = nullptr;
         void* host_primary_pool_pointer = nullptr;
         void* host_secondary_pool_pointer = nullptr;
+        void* host_primary_block_scale_pool_pointer = nullptr;
+        void* host_secondary_block_scale_pool_pointer = nullptr;
         int32_t num_tokens = 0;
+        int32_t total_kv_len = 0;
         int32_t max_blocks_per_sequence = 0;
         int32_t const* sequence_lengths = nullptr;
         int32_t const* context_lengths = nullptr;
@@ -126,6 +131,9 @@ public:
 
         // For MLA chunked prefill
         void* softmaxStatsPtr = nullptr;
+        // optional for separate QKV input, currently only used for context MLA
+        T const* k_ptr = nullptr;
+        T const* v_ptr = nullptr;
 
         std::string enqueueContextParamsToString() const
         {
@@ -167,6 +175,7 @@ public:
             ss << "host_secondary_pool_pointer: " << this->host_secondary_pool_pointer << std::endl;
             ss << "batch_size: " << this->batch_size << std::endl;
             ss << "num_tokens: " << this->num_tokens << std::endl;
+            ss << "total_kv_len: " << this->total_kv_len << std::endl;
             ss << "max_blocks_per_sequence: " << this->max_blocks_per_sequence << std::endl;
             ss << "workspace: " << this->workspace << std::endl;
             ss << "logn_scaling_ptr: " << this->logn_scaling_ptr << std::endl;
@@ -177,6 +186,8 @@ public:
             ss << "encoder_input_lengths: " << this->encoder_input_lengths << std::endl;
             ss << "num_encoder_tokens: " << this->num_encoder_tokens << std::endl;
             ss << "softmaxStatsPtr: " << this->softmaxStatsPtr << std::endl;
+            ss << "k_ptr: " << this->k_ptr << std::endl;
+            ss << "v_ptr: " << this->v_ptr << std::endl;
             return ss.str();
         }
     };
@@ -222,6 +233,20 @@ public:
         int sm_cnt = mMultiProcessorCount;
         int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
         return num_sm_parts;
+    }
+
+    template <typename T>
+    int getKvCacheElemSizeInBits() const
+    {
+        if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
+        {
+            return 8;
+        }
+        else if (mKVCacheQuantMode.hasFp4KvCache())
+        {
+            return 4;
+        }
+        return sizeof(T) * 8;
     }
 
     // Called in configurePlugin().
@@ -386,11 +411,15 @@ public:
     bool mPosShiftEnabled = false;
     bool mPagedContextFMHA = false;
     bool mFP8ContextFMHA = false;
+    bool mFP8AttenOutput = false;
+    bool mFP8ContextMLA = false;
     bool mFP8GenerationMLA = false;
+    size_t mChunkPrefillBufferBatchSize = 1;
     bool mDenseContextFMHA = false;
     bool mHasFullAttentionMask = false;
     bool mIsSpecDecodingEnabled = false;
     bool mUseSpecDecoding = false;
+    bool mIsSpecDecTree = true;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;
@@ -439,13 +468,13 @@ public:
             (int8_t) mPositionEmbeddingType, mUseLognScaling, mRemovePadding, (int32_t) mMaskType,
             mBlockSparseParams.data(), mPagedKVCache, mTokensPerBlock, mKVCacheQuantMode.value(), mTpSize, mTpRank,
             mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention, mMaxDistance,
-            mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
-            mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mMLAParams.data(),
-            mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
-            mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode,
-            mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores,
-            mAttentionChunkSize.value_or(-1));
+            mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mChunkPrefillBufferBatchSize, mFP8AttenOutput,
+            mDenseContextFMHA, mHasFullAttentionMask, mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree,
+            mSpecDecodingIsGenerationLengthVariable, mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA,
+            mUseGenFlashMLA, mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads,
+            mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast,
+            mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
+            mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1));
     };
 
 private:

@@ -81,7 +81,10 @@ enum class AttentionInputLayout
     // Q has contiguous [B, S, H, D] layout, while paged KV has [B, 2, Max_blocks_per_seq] layout
     // that contains paged block indices. The indices indicate the block offset to the pool ptr in
     // global memory
-    Q_PAGED_KV
+    Q_PAGED_KV,
+    // Q has contiguous [B, S, H, D] layout, while K has contiguous [B, S, H_kv, D] layout, and V has
+    // contiguous [B, S, H_kv, D_v] layout. Only used for context MLA now.
+    SEPARATE_Q_K_V,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -115,6 +118,8 @@ struct MHARunnerFixedParams
     int headSize;
     // The head size of V.
     int headSizeV = 0;
+    // The head size of Q/K non-RoPE part, only used for MLA now.
+    int headSizeQkNope = 0;
     // The scaling applied to bmm1_scale.
     float qScaling;
     // The attention logit softcapping scale.
@@ -166,6 +171,7 @@ struct MHARunnerFixedParams
         case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
+        case AttentionInputLayout::SEPARATE_Q_K_V: output += "separate_q_k_v"; break;
         default: output += std::to_string(static_cast<int>(attentionInputLayout)) + " (unknown)"; break;
         }
 
@@ -255,14 +261,22 @@ struct MHARunnerParams
     void const* qPtr;
     // The contiguous Kv buffer ptr;
     void const* kvPtr;
+    // The K buffer ptr (for separate K input).
+    void const* kPtr;
+    // The V buffer ptr (for separate V input).
+    void const* vPtr;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
+    // The paged kv cache array for scaling factor.
+    KVBlockArray pagedKvSfCache;
     // The output buffer ptr.
     void* outputPtr;
     // The output scaling factor buffer ptr. (only used for FP4 output)
     void* outputSfPtr;
     // The softmax_status ptr for RingAttention.
     void* softmaxStatsPtr;
+    // The attention sinks ptr.
+    float const* attentionSinksPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
@@ -352,6 +366,8 @@ struct Fused_multihead_attention_params_v2
     KVBlockArrayForContextFMHA paged_kv_cache;
     // The mask to implement drop-out.
     void const* packed_mask_ptr;
+    // The attention sinks.
+    float const* attention_sinks_ptr;
     // The O matrix (output).
     void* o_ptr;
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max

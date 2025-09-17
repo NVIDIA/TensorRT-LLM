@@ -26,6 +26,9 @@ add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu)
 
 # If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(mixtureOfExpertsTest
+                             PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+
   add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
   remove_compile_definition(mixtureOfExpertsInternalTest
                             USING_OSS_CUTLASS_MOE_GEMM)
@@ -42,16 +45,7 @@ add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
 add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
 
-if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
-  add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
-  add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
-  add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
-  if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
-    target_link_libraries(gemmAllReduceTest PRIVATE ar_gemm_src)
-    target_compile_definitions(gemmAllReduceTest
-                               PRIVATE USING_OSS_CUTLASS_ALLREDUCE_GEMM)
-  endif()
-endif()
+add_gtest(fusedMoeCommKernelTest fusedMoeCommKernelTest.cpp)
 
 add_gtest(
   gemmSwigluRunnerTest
@@ -86,11 +80,13 @@ set(SAMPLING_KERNEL_TEST_SRC
     sampling/samplingTest.cpp sampling/samplingTopKTest.cpp
     sampling/samplingTopPTest.cpp sampling/samplingAirTopPTest.cpp
     sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
-
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 
 set(ROUTING_KERNEL_TEST_SRC
     routing/routingTest.cpp routing/routingLlama4Test.cpp
     routing/routingRenormalizeTest.cpp routing/routingDeepSeekTest.cpp)
-
 add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
+
+add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
+
+add_gtest(eaglePackDataTest eaglePackDataTest.cpp)

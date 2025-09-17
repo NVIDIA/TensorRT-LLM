@@ -34,8 +34,14 @@ namespace tensorrt_llm::batch_manager
 
 class ContextProgress;
 class BaseCacheTransceiver;
-class DataResponder;
-class DataRequester;
+
+namespace kv_cache_manager
+{
+class BaseKVCacheManager;
+} // namespace kv_cache_manager
+
+class CacheSender;
+class CacheReceiver;
 
 class CacheTransceiverFactory
 {
@@ -72,20 +78,20 @@ class CacheTransceiver : public BaseCacheTransceiver
 public:
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
         executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-        nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt);
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
-        nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt)
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            dataType, attentionType, cacheTransceiverConfig)
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig)
     {
     }
 
@@ -110,9 +116,9 @@ private:
 
     void setContextState(LlmRequest* llmRequest);
 
-    std::unique_ptr<DataResponder> mDataResponder;
-    std::unique_ptr<DataRequester> mDataRequester;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mResponderFutures;
+    std::unique_ptr<CacheSender> mCacheSender;
+    std::unique_ptr<CacheReceiver> mCacheReceiver;
+    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const *mMpiGroupComm{nullptr}, *mMpiWorldComm{nullptr};
     std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm, mMpiGroupDataComm,

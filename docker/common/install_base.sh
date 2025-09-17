@@ -44,6 +44,9 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
+  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
+  apt remove -y ibverbs-providers libibverbs1
+  apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
     ccache \
     gdb \
@@ -53,14 +56,15 @@ init_ubuntu() {
     llvm \
     libclang-rt-dev \
     libffi-dev \
-    libibverbs-dev \
+    libstdc++-14-dev \
     libnuma1 \
     libnuma-dev \
     python3-dev \
     python3-pip \
     python-is-python3 \
     wget \
-    pigz
+    pigz \
+    libzmq3-dev
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
@@ -128,6 +132,7 @@ install_gcctoolset_rockylinux() {
     openmpi-devel \
     pigz \
     rdma-core-devel \
+    zeromq-devel \
     -y
   echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"

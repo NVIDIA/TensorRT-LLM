@@ -19,3 +19,107 @@ transforms:
     stage: post_export
   cleanup_input_constraints:
     stage: post_export
+  ############################################################################################
+  # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
+  ############################################################################################
+  match_moe_pattern:
+    stage: pattern_matcher
+  match_repeat_kv:
+    stage: pattern_matcher
+  match_eager_attention:
+    stage: pattern_matcher
+  match_grouped_attention:
+    stage: pattern_matcher
+  match_attention_layout:
+    stage: pattern_matcher
+  match_rope_pattern:
+    stage: pattern_matcher
+  match_rope_layout:
+    stage: pattern_matcher
+  ############################################################################################
+  # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
+  ############################################################################################
+  eliminate_redundant_transposes:
+    stage: pattern_matcher
+  # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
+  # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
+  optimize_rope:
+    stage: pattern_matcher
+  quantize_fp8_linear_from_config:
+    stage: pattern_matcher
+  quantize_nvfp4_linear_from_config:
+    stage: pattern_matcher
+  quantize_fp8_bmm_from_config:
+    stage: pattern_matcher
+  quantize_fp8_from_graph:
+    stage: pattern_matcher
+  quantize_nvfp4_from_graph:
+    stage: pattern_matcher
+  quantize_fp8_moe:
+    stage: pattern_matcher
+  quantize_nvfp4_moe:
+    stage: pattern_matcher
+  # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
+  detect_sharding:
+    stage: sharding
+    simple_shard_only: false
+    use_sharding_from_factory: false
+    sharding_dims: ['tp', 'ep', 'bmm']
+  # TODO: (hg) need to ensure run_shape_prop after sharding.
+  sharding_transform_executor:
+    stage: sharding
+    run_shape_prop: true
+  ############################################################################################
+  # MOVE MODEL AND LOAD WEIGHTS
+  ############################################################################################
+  load_weights:
+    stage: weight_load
+  ############################################################################################
+  # RUN POST-LOAD FUSION AND OPTIMIZATIONS
+  ############################################################################################
+  fuse_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_fp4_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_fp8_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_fp8_linear:
+    stage: post_load_fusion
+    backend: torch
+  fuse_nvfp4_linear:
+    stage: post_load_fusion
+    backend: trtllm
+  fuse_moe:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_allreduce_residual_rmsnorm:
+    stage: post_load_fusion
+  fuse_collectives:
+    stage: post_load_fusion
+  fuse_rmsnorm:
+    # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+    # check if we can fuse rmsnorm
+    stage: post_load_fusion
+    backend: flashinfer
+  ############################################################################################
+  # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
+  ############################################################################################
+  update_in_out_nodes:
+    stage: cache_init
+  insert_cached_attention:
+    stage: cache_init
+  insert_cached_mla_attention:
+    stage: cache_init
+    attn_backend: MultiHeadLatentAttention
+  initialize_cache:
+    stage: cache_init
+  resize_kv_cache:
+    stage: cache_init
+  ############################################################################################
+  # COMPILE MODEL
+  ############################################################################################
+  compile_model:
+    stage: compile
