@@ -565,6 +565,7 @@ class KVCacheManager(BaseResourceManager):
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
 
+    @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig,
                                  executor_config: ExecutorConfig,
                                  mapping: Mapping):
@@ -605,6 +606,23 @@ class KVCacheManager(BaseResourceManager):
         mem_per_token *= kv_factor
         return mem_per_token
 
+    def get_cache_bytes_per_token(self):
+        cache_size_per_token = self.kv_factor * sum(
+            self.num_kv_heads_per_layer) * self.head_dim
+
+        if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
+                              DataType.FLOAT, DataType.NVFP4):
+            raise ValueError(f'Cannot support {self.dtype} KV cache.')
+
+        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
+                                                       self.dtype)
+        if self.dtype == DataType.NVFP4:
+            cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
+                cache_size_per_token,
+                quant_vector_size=16,
+                scaling_factor_dtype=DataType.FP8)
+        return cache_size_bytes_per_token
+
     def calculate_max_num_blocks(self,
                                  kv_cache_config: KvCacheConfigCpp,
                                  head_dim: int,
@@ -616,20 +634,7 @@ class KVCacheManager(BaseResourceManager):
                              if kv_cache_config.free_gpu_memory_fraction
                              is not None else 0.9)
 
-        cache_size_per_token = kv_factor * sum(
-            self.num_kv_heads_per_layer) * head_dim
-
-        if dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                         DataType.FLOAT, DataType.NVFP4):
-            raise ValueError(f'Cannot support {dtype} KV cache.')
-
-        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
-                                                       dtype)
-        if dtype == DataType.NVFP4:
-            cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
-                cache_size_per_token,
-                quant_vector_size=16,
-                scaling_factor_dtype=DataType.FP8)
+        cache_size_bytes_per_token = self.get_cache_bytes_per_token()
 
         free_mem, total_mem = torch.cuda.mem_get_info()
 

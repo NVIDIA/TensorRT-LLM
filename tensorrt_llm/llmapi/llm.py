@@ -905,7 +905,6 @@ class _TrtLLM(BaseLLM):
 
         if self.args.decoding_config is not None:
             self._executor_config.decoding_config = self.args.decoding_config
-
         if self.args.guided_decoding_backend == 'xgrammar':
             self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
                 backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.

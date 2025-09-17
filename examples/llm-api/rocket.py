@@ -41,7 +41,7 @@ def parse_arguments():
                         help="The maximum sequence length.")
     parser.add_argument("--max_batch_size",
                         type=int,
-                        default=4,
+                        default=256,
                         help="The maximum batch size.")
     parser.add_argument("--max_new_tokens",
                         type=int,
@@ -59,7 +59,7 @@ def parse_arguments():
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
 
-    parser.add_argument("--kv_cache_fraction", type=float, default=0.7)
+    parser.add_argument("--kv_cache_fraction", type=float, default=None)
 
     parser.add_argument('--num_samples', type=int, default=1)
 
