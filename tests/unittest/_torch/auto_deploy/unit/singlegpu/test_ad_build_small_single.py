@@ -65,6 +65,11 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             attn_backend="triton",
             compile_backend="torch-simple",
         ),
+        get_small_model_config_pytest_param(
+            "microsoft/Phi-3-mini-4k-instruct",
+            attn_backend="torch",
+            compile_backend="torch-simple",
+        ),
         # disabled due to https://nvbugspro.nvidia.com/bug/5505835
         get_small_model_config_pytest_param(
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
@@ -77,11 +82,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         get_small_model_config_pytest_param(
             "deepseek-ai/DeepSeek-V3",
             attn_backend="triton",
-            compile_backend="torch-simple",
-        ),
-        get_small_model_config_pytest_param(
-            "microsoft/Phi-3-mini-4k-instruct",
-            attn_backend="torch",
             compile_backend="torch-simple",
         ),
         get_small_model_config_pytest_param(
@@ -98,8 +98,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
 )
 def test_build_ad(experiment_config: Dict, mode: str):
     if (
-        experiment_config["args"]["model"]
-        in ["microsoft/Phi-3-mini-4k-instruct", "deepseek-ai/DeepSeek-V3"]
+        "DeepSeek-V3" in experiment_config["args"]["model"]
+        or "Phi-3-mini-4k-instruct" in experiment_config["args"]["model"]
         and mode == "transformers"
     ):
         pytest.skip(f"{experiment_config['args']['model']} is not supported in transformers mode")
