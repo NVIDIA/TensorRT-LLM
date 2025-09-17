@@ -216,7 +216,7 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        self.block_reuse_enabled = self.kv_cache_manager.enable_block_reuse
+        self.block_reuse_enabled = True if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse else False
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
 
