@@ -1,4 +1,6 @@
+import importlib.util
 import logging
+import os
 import re
 from dataclasses import dataclass
 from itertools import chain, groupby
@@ -338,6 +340,29 @@ def generate_llmapi():
         content += "\n".join(options) + "\n\n"
     with open(doc_path, "w+") as f:
         f.write(content)
+
+
+def update_version():
+    version_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__),
+                     "../../tensorrt_llm/version.py"))
+    spec = importlib.util.spec_from_file_location("version_module",
+                                                  version_path)
+    version_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(version_module)
+    version = version_module.__version__
+    file_list = [
+        "docs/source/quick-start-guide.md",
+        "docs/source/commands/trtllm-serve/run-benchmark-with-trtllm-serve.md"
+    ]
+    for file in file_list:
+        file_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../" + file))
+        with open(file_path, "r") as f:
+            content = f.read()
+        content = content.replace("x.y.z", version)
+        with open(file_path, "w") as f:
+            f.write(content)
 
 
 if __name__ == "__main__":

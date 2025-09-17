@@ -8,7 +8,7 @@ This is the starting point to try out TensorRT LLM. Specifically, this Quick Sta
 ## Launch Docker on a node with NVIDIA GPUs deployed
 
 ```bash
-docker run --ipc host --gpus all -p 8000:8000 -it nvcr.io/nvidia/tensorrt-llm/release
+docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:x.y.z
 ```
 
 
