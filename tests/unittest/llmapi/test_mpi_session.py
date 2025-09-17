@@ -54,11 +54,13 @@ def run_client(server_addr, values_to_process):
         return f"Error in client: {str(e)}"
 
 
-@pytest.mark.skip(reason="https://nvbugs/5351244")
 @pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
 def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
-    command = ["bash", "_test_remote_mpi_session.sh", task_type]
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    test_file = os.path.join(cur_dir, "_test_remote_mpi_session.sh")
+    assert os.path.exists(test_file), f"Test file {test_file} does not exist"
+    command = ["bash", test_file, task_type]
     print(' '.join(command))
 
     with Popen(command,
