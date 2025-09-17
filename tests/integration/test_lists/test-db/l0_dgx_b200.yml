@@ -15,6 +15,7 @@ l0_dgx_b200:
       backend: pytorch
   tests:
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
+  - unittest/_torch/multi_gpu_modeling/test_llama3.py::test_llama_3_3
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=FLASHINFER-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[pp4-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]

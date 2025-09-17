@@ -560,7 +560,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 # Adjust the scale and fusion pattern.
                 if self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale
+                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
+                        self.next_attn.qkv_proj, 'input_scale') else None
                 else:
                     self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                     scale = None
@@ -769,7 +770,8 @@ class LlamaDecoderLayer(DecoderLayer):
                 # Adjust the scale and fusion pattern.
                 if self.next_attn is not None and (self.is_nvfp4
                                                    or self.is_fp8_quant):
-                    scale = self.next_attn.qkv_proj.input_scale
+                    scale = self.next_attn.qkv_proj.input_scale if hasattr(
+                        self.next_attn.qkv_proj, 'input_scale') else None
                 else:
                     self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
                     scale = None
