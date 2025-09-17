@@ -29,7 +29,6 @@ dump*/
 *.log
 *.pkl
 *.hdf5
-*.lock
 config.json
 /*.svg
 cpp/cmake-build-*

@@ -2530,22 +2530,22 @@ int AttentionOp::initialize() noexcept
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120 || mSM == 121,
-            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100, sm_120 or sm_121.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 103 || mSM == 120 || mSM == 121,
+            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100f, sm_120 or sm_121.");
     }
 
     // Pre-Check of FP8 Generation MLA.
     if (mFP8GenerationMLA)
     {
         TLLM_CHECK_WITH_INFO(mIsMLAEnabled, "FP8 Generation MLA cannot be enabled because MLA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120 || mSM == 121,
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 103 || mSM == 120 || mSM == 121,
             "FP8 Generation MLA is supported on Ada, Hopper or Blackwell architecture.");
     }
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100 || mSM == 120 || mSM == 121,
-        "fuse_fp4_quant only supports SM100 or SM120 or SM121 devices.");
+    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || (mSM == 100 || mSM == 103) || mSM == 120 || mSM == 121,
+        "fuse_fp4_quant only supports SM100f or SM120 or SM121 devices.");
 
     // Check requirements for FP4 KV cache.
     TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA,
