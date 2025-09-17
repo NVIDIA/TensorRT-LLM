@@ -130,6 +130,7 @@ MODEL_PATH_DICT = {
     "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
+    "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {

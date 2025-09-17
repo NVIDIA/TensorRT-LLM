@@ -2,6 +2,7 @@ import copy
 import os
 from typing import Any, Dict, Optional
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -286,11 +287,12 @@ def generate_dynamic_shapes(max_batch_size, max_seq_len):
 
 
 def _hf_model_dir_or_hub_id(
-    hf_model_dir: str,
+    hf_model_subdir: str,
     hf_hub_id: str,
 ) -> str:
-    if os.path.isdir(hf_model_dir):
-        return hf_model_dir
+    llm_models_path = llm_models_root()
+    if llm_models_path and os.path.isdir((model_fullpath := llm_models_path / hf_model_subdir)):
+        return str(model_fullpath)
     else:
         return hf_hub_id
 
@@ -350,10 +352,7 @@ def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 _SMALL_MODEL_CONFIGS = {
     "meta-llama/Meta-Llama-3.1-8B-Instruct": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
-            "meta-llama/Meta-Llama-3.1-8B-Instruct",
-        ),
+        "llm_models_subdir": "llama-3.1-model/Llama-3.1-8B-Instruct",
         "model_kwargs": {
             "num_hidden_layers": 1,
             "hidden_size": 64,
@@ -363,10 +362,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "mistralai/Mixtral-8x7B-Instruct-v0.1": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        ),
+        "llm_models_subdir": "Mixtral-8x7B-Instruct-v0.1",
         "model_kwargs": {
             "num_hidden_layers": 2,
             "intermediate_size": 256,
@@ -377,10 +373,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "Qwen/Qwen3-30B-A3B": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B",
-            "Qwen/Qwen3-30B-A3B",
-        ),
+        "llm_models_subdir": "Qwen3/Qwen3-30B-A3B",
         "model_kwargs": {
             "num_hidden_layers": 2,
             "intermediate_size": 256,
@@ -391,10 +384,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "microsoft/Phi-3-mini-4k-instruct": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
-            "microsoft/Phi-3-mini-4k-instruct",
-        ),
+        "llm_models_subdir": "Phi-3/Phi-3-mini-4k-instruct",
         "model_kwargs": {
             "num_hidden_layers": 2,
             "hidden_size": 128,
@@ -404,10 +394,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-        ),
+        "llm_models_subdir": "Llama-4-Scout-17B-16E-Instruct",
         "model_factory": "AutoModelForImageTextToText",
         "model_kwargs": {
             "text_config": {
@@ -426,10 +413,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "deepseek-ai/DeepSeek-V3": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/DeepSeek-V3",
-            "deepseek-ai/DeepSeek-V3",
-        ),
+        "llm_models_subdir": "DeepSeek-V3",
         "model_kwargs": {
             "first_k_dense_replace": 1,
             "num_hidden_layers": 2,
@@ -448,16 +432,13 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "Qwen/Qwen2.5-3B-Instruct": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/Qwen/Qwen2.5-3B-Instruct",
-            "Qwen/Qwen2.5-3B-Instruct",
-        ),
+        "llm_models_subdir": "Qwen2.5-3B-Instruct",
         "model_kwargs": {
             "num_hidden_layers": 2,
         },
     },
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
-        "model": f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503",
+        "llm_models_subdir": "Mistral-Small-3.1-24B-Instruct-2503",
         "model_factory": "Mistral3VLM",
         "compile_backend": "torch-simple",
         "model_kwargs": {
@@ -487,6 +468,9 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
 
     llm_args = copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id])
 
+    # check if should use llm_models_root or hf_hub_id
+    llm_args["model"] = _hf_model_dir_or_hub_id(llm_args.pop("llm_models_subdir"), model_hub_id)
+
     # add some defaults to llm_args
     llm_args["skip_loading_weights"] = True  # No weight loading to speed up things
     llm_args["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
@@ -507,3 +491,13 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
     }
 
     return experiment_config
+
+
+def get_small_model_config_pytest_param(
+    model_hub_id: str, pytest_param_kwargs=None, **llm_args_kwargs
+):
+    return pytest.param(
+        get_small_model_config(model_hub_id, **llm_args_kwargs),
+        id=model_hub_id,
+        **(pytest_param_kwargs or {}),
+    )

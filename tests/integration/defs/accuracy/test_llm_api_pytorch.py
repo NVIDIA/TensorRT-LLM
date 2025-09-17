@@ -2004,6 +2004,75 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             assert llm.args.moe_config.backend == moe_backend
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
+    def test_nvfp4_multi_gpus_corner_case(self):
+        """
+        This test is used to test the corner case of the NVFP4 model.
+        When using the same value for max_seq_len and max_num_tokens, there will be no
+        enough kv block for the dummy requests in CUDA graph warmup when creating
+        the py_executor before estimating kv cache. Then CUDA graph capture will be
+        triggered when estimating kv cache. This may cause some errors.
+        More info in https://nvbugs/5485325.
+        """
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80,
+                                        dtype="fp8",
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              cuda_graph_config=CudaGraphConfig(
+                                  enable_padding=True, max_batch_size=1024),
+                              moe_config=MoeConfig(backend="TRTLLM"))
+
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=1)
+        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
+                 tensor_parallel_size=8,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=8,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=False,
+                 speculative_config=mtp_config,
+                 max_seq_len=5120,
+                 max_num_tokens=5120) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_nvfp4_multi_gpus_corner_case(self):
+        """
+        This test is used to test the corner case of the NVFP4 model.
+        When using the same value for max_seq_len and max_num_tokens, there will be no
+        enough kv block for the dummy requests in CUDA graph warmup when creating
+        the py_executor before estimating kv cache. Then CUDA graph capture will be
+        triggered when estimating kv cache. This may cause some errors.
+        More info in https://nvbugs/5485325.
+        """
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80,
+                                        dtype="fp8",
+                                        enable_block_reuse=False)
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              cuda_graph_config=CudaGraphConfig(
+                                  enable_padding=True, max_batch_size=1024),
+                              moe_config=MoeConfig(backend="TRTLLM"))
+
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=1)
+        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
+                 tensor_parallel_size=8,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=8,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=False,
+                 speculative_config=mtp_config,
+                 max_seq_len=5120,
+                 max_num_tokens=5120) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 

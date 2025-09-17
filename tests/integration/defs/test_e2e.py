@@ -1735,11 +1735,16 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-def test_trtllm_benchmark_serving(llm_root, llm_venv):
+@pytest.mark.parametrize(
+    "model_name", ["llama-3.1-model/Meta-Llama-3.1-8B", "gpt_oss/gpt-oss-20b"])
+def test_trtllm_benchmark_serving(llm_venv, model_name):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_trtllm_serve_benchmark.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root /
+            f"_test_trtllm_serve_benchmark.py::test_trtllm_serve_benchmark[{model_name}]"
+            )
+    ])
 
 
 def test_build_time_benchmark_sanity(llm_root, llm_venv):
