@@ -24,8 +24,9 @@ TensorRT LLM distributes the pre-built container on [NGC Catalog](https://catalo
 You can launch the container using the following command:
 
 ```bash
-docker run --rm --ipc host -p 8000:8000 --gpus all -it nvcr.io/nvidia/tensorrt-llm/release
+docker run --rm -it --ipc host -p 8000:8000 --gpus all --ulimit memlock=-1 --ulimit stack=67108864 nvcr.io/nvidia/tensorrt-llm/release:x.y.z
 ```
+
 
 ## Start the trtllm-serve service
 > [!WARNING]
