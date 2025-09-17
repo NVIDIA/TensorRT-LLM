@@ -59,7 +59,7 @@ class ZeroMqQueue:
         self.socket = self.context.socket(socket_type)
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
-        self._last_identity = None if socket_type == zmq.ROUTER else None
+        self._last_identity = None
 
         self.hmac_key = address[1] if address is not None else None
         self.use_hmac_encryption = use_hmac_encryption
