@@ -92,7 +92,9 @@ def pad_up(x, pad_size):
                                  (128, 2112, 7168), (128, 4096, 7168),
                                  (128, 7168, 2048), [127, 1024, 3200]])
 def test_fp4_linear_cute_dsl(dtype, mnk):
-
+    pytest.skip(
+        "This test requires nvidia-cutlass-dsl==4.1.0. Please install the dependency to run this test locally."
+    )
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 
