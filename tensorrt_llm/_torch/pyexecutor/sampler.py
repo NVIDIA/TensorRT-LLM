@@ -974,8 +974,10 @@ class TorchSampler(Sampler):
                 request.py_target_probs = softmax.clone()
             if log_probs_host:
                 assert BEAM_0 == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
-                req.py_topk_logprobs_vals = topk_vals[input_slice]
-                req.py_topk_logprobs_indices = topk_indices[input_slice]
+                req.py_topk_logprobs_vals = topk_vals[
+                    input_slice, :request.py_num_logprobs]
+                req.py_topk_logprobs_indices = topk_indices[
+                    input_slice, :request.py_num_logprobs]
 
             offset += steps
 
