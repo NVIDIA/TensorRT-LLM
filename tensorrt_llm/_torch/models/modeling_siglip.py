@@ -77,6 +77,13 @@ class SiglipVisionModel(nn.Module):
         self.model_config = model_config
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=
+            8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_requests
+            max_num_tokens=
+            8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_tokens
+            kv_cache_manager=None,
+        )
 
     def prepare_attn_metadata(self, batch_size):
         """
@@ -86,18 +93,17 @@ class SiglipVisionModel(nn.Module):
         seq_len = (self.config.image_size // self.config.patch_size)**2
         request_ids = list(range(1, batch_size + 1))
         prompt_lens = [seq_len] * batch_size
-        attn_metadata = self.metadata_cls(
-            seq_lens=torch.tensor([seq_len] * batch_size, dtype=torch.int),
-            num_contexts=batch_size,
-            max_num_requests=batch_size,
-            max_num_tokens=seq_len * batch_size,
-            kv_cache_manager=None,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-        )
-        attn_metadata.max_seq_len = seq_len * batch_size
-        attn_metadata.prepare()
-        return attn_metadata
+        seq_lens = torch.tensor([seq_len] * batch_size,
+                                dtype=torch.int,
+                                pin_memory=True)
+
+        self.attn_metadata.num_contexts = batch_size
+        self.attn_metadata.request_ids = request_ids
+        self.attn_metadata.prompt_lens = prompt_lens
+        self.attn_metadata.seq_lens = seq_lens
+        self.attn_metadata.max_seq_len = seq_len
+        self.attn_metadata.prepare()
+        return self.attn_metadata
 
     @property
     def dtype(self):
