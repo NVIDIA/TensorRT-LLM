@@ -391,21 +391,17 @@ if __name__ == "__main__":
     fp4_linear_perf_test(torch.bfloat16, 128, 4096, 7168)
     fp4_linear_perf_test(torch.bfloat16, 128, 7168, 2048)
 
-    # # group-1 test cases
-    # for tokens in [128, 8192]:
-    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
-    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 24576, 1536)
-    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
-    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
-    #     nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
+    # group-1 test cases
+    for tokens in [128, 8192]:
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 24576, 1536)
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
 
     # group-2 test cases
-    # for m in [128, 256, 512]:
-    #     # 128, 131584, 7168
-    #     # 128, 7168, 65792
-    #     # 128, 227368, 2560
-    #     # 128, 2560, 113664
-    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 131584, 7168)
-    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
-    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
-    #     nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)
+    for m in [128, 256, 512]:
+        nvfp4_gemm_perf_test(torch.bfloat16, m, 131584, 7168)
+        nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
+        nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
+        nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)

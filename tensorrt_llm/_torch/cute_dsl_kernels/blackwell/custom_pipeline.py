@@ -53,8 +53,13 @@ from cutlass.pipeline import (CooperativeGroup, PipelineAsync, PipelineOp,
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
-    """
-    Fences the mbarrier init and syncs the threadblock or cluster
+    """Initializes the mbarrier and synchronizes the threadblock or cluster.
+
+    This function places a fence on the mbarrier initialization to ensure
+    proper synchronization across the threadblock or cluster.
+
+    Args:
+        cta_layout_vmnk (Optional[cute.Layout]): The CTA layout for VMNK. Defaults to None.
     """
     cute.arch.mbarrier_init_fence()
 
@@ -66,8 +71,13 @@ def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
 
 @dataclass(frozen=True)
 class PipelineTmaUmma(PipelineAsync):
-    """
-    PipelineTmaUmma is used for TMA producers and UMMA consumers (e.g. Blackwell mainloops).
+    """PipelineTmaUmma is used for TMA producers and UMMA consumers.
+
+    This class is typically used in scenarios such as Blackwell mainloops, where TMA (Tensor Memory Access) producers interact with UMMA (Universal Matrix Multiply Accumulate) consumers.
+
+    Attributes:
+        is_leader_cta (bool): Indicates if the current CTA is the leader.
+        cta_group (cute.nvgpu.tcgen05.CtaGroup): The CTA group associated with the pipeline.
     """
 
     is_leader_cta: bool
@@ -76,8 +86,10 @@ class PipelineTmaUmma(PipelineAsync):
     @staticmethod
     def _compute_mcast_arrival_mask(cta_layout_vmnk: cute.Layout,
                                     mcast_mode_mn: tuple[int, int]):
-        """
-        Computes a mask for signaling arrivals to multicasting threadblocks.
+        """Computes a mask for signaling arrivals to multicasting threadblocks.
+
+        Returns:
+            The computed mask for multicasting threadblocks.
         """
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster())
@@ -113,6 +125,12 @@ class PipelineTmaUmma(PipelineAsync):
     def _compute_is_leader_cta(cta_layout_vmnk: cute.Layout):
         """
         Computes leader threadblocks for 2CTA kernels. For 1CTA, all threadblocks are leaders.
+
+        Args:
+            cta_layout_vmnk (cute.Layout): Layout of the cluster shape.
+
+        Returns:
+            bool: True if the current threadblock is a leader, False otherwise.
         """
         bidx, bidy, _ = cute.arch.block_idx()
 
@@ -137,20 +155,18 @@ class PipelineTmaUmma(PipelineAsync):
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaUmma.
-        :param barrier_storage: Pointer to the smem address for this pipeline's mbarriers
-        :type barrier_storage: cute.Pointer
-        :param num_stages: Number of buffer stages for this pipeline
-        :type num_stages: Int32
-        :param producer_group: `CooperativeGroup` for the producer agent
-        :type producer_group: CooperativeGroup
-        :param consumer_group: `CooperativeGroup` for the consumer agent
-        :type consumer_group: CooperativeGroup
-        :param tx_count: Number of bytes expected to be written to the transaction barrier for one stage
-        :type tx_count: int
-        :param cta_layout_vmnk: Layout of the cluster shape
-        :type cta_layout_vmnk: cute.Layout | None
-        :param mcast_mode_mn: Tuple of two integers, specifying whether mcast is enabled for the m and n modes. At least one of the two integers must be 1.
-        :type mcast_mode_mn: tuple[int, int]
+
+        Args:
+            barrier_storage (cute.Pointer): Pointer to the smem address for this pipeline's mbarriers.
+            num_stages (int): Number of buffer stages for this pipeline.
+            producer_group (CooperativeGroup): `CooperativeGroup` for the producer agent.
+            consumer_group (CooperativeGroup): `CooperativeGroup` for the consumer agent.
+            tx_count (int): Number of bytes expected to be written to the transaction barrier for one stage.
+            cta_layout_vmnk (cute.Layout | None): Layout of the cluster shape.
+            mcast_mode_mn (tuple[int, int]): Tuple of two integers, specifying whether mcast is enabled for the m and n modes. At least one of the two integers must be 1.
+
+        Returns:
+            PipelineTmaUmma: An instance of PipelineTmaUmma with all necessary attributes computed.
         """
         if not isinstance(barrier_storage, cute.Pointer):
             raise ValueError(
@@ -201,6 +217,13 @@ class PipelineTmaUmma(PipelineAsync):
     def consumer_release(self, state: PipelineState):
         """
         UMMA consumer release buffer empty, cta_group needs to be provided.
+
+        Google style:
+        Args:
+            state (PipelineState): The current pipeline state.
+
+        Returns:
+            None
         """
         self.sync_object_empty.arrive(state.index, self.consumer_mask,
                                       self.cta_group)
@@ -209,7 +232,17 @@ class PipelineTmaUmma(PipelineAsync):
                          state: PipelineState,
                          try_acquire_token: Optional[Boolean] = None):
         """
-        TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
+        Conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
+
+        Google style:
+        This method is used by the TMA producer to conditionally wait for the buffer to be empty and, for leader threadblocks, to set the transaction barrier.
+
+        Args:
+            state (PipelineState): The current pipeline state.
+            try_acquire_token (Optional[Boolean]): Optional token to control conditional acquire.
+
+        Returns:
+            None
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
@@ -224,22 +257,25 @@ class PipelineTmaUmma(PipelineAsync):
     def producer_commit(self, state: PipelineState):
         """
         TMA producer commit is a noop since TMA instruction itself updates the transaction count.
+
+        Google style:
+        This method does nothing because the TMA instruction automatically updates the transaction count.
+
+        Args:
+            state (PipelineState): The current pipeline state.
+
+        Returns:
+            None
         """
 
 
 @dataclass(frozen=True)
 class PipelineUmmaAsync(PipelineAsync):
-    """
-    PipelineUmmaAsync is used for UMMA producers and AsyncThread consumers (e.g. Blackwell accumulator pipelines).
-    """
 
     cta_group: cute.nvgpu.tcgen05.CtaGroup
 
     @staticmethod
     def _compute_tmem_sync_mask(cta_layout_vmnk: cute.Layout):
-        """
-        Computes a mask to signal completion of tmem buffers for 2CTA kernels.
-        """
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster())
         cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(
@@ -250,9 +286,6 @@ class PipelineUmmaAsync(PipelineAsync):
 
     @staticmethod
     def _compute_peer_cta_rank():
-        """
-        Computes a mask to signal release of tmem buffers for 2CTA kernels.
-        """
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster())
         return cta_rank_in_cluster // 2 * 2
@@ -268,16 +301,16 @@ class PipelineUmmaAsync(PipelineAsync):
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineUmmaAsync.
-        :param barrier_storage: Pointer to the smem address for this pipeline's mbarriers
-        :type barrier_storage: cute.Pointer
-        :param num_stages: Number of buffer stages for this pipeline
-        :type num_stages: Int32
-        :param producer_group: `CooperativeGroup` for the producer agent
-        :type producer_group: CooperativeGroup
-        :param consumer_group: `CooperativeGroup` for the consumer agent
-        :type consumer_group: CooperativeGroup
-        :param cta_layout_vmnk: Layout of the cluster shape
-        :type cta_layout_vmnk: cute.Layout | None
+
+        Args:
+            barrier_storage (cute.Pointer): Pointer to the smem address for this pipeline's mbarriers.
+            num_stages (int): Number of buffer stages for this pipeline.
+            producer_group (CooperativeGroup): CooperativeGroup for the producer agent.
+            consumer_group (CooperativeGroup): CooperativeGroup for the consumer agent.
+            cta_layout_vmnk (cute.Layout or None): Layout of the cluster shape.
+
+        Returns:
+            PipelineUmmaAsync: An instance of PipelineUmmaAsync.
         """
         if not isinstance(barrier_storage, cute.Pointer):
             raise ValueError(
@@ -325,21 +358,10 @@ class PipelineUmmaAsync(PipelineAsync):
         )
 
     def producer_commit(self, state: PipelineState):
-        """
-        UMMA producer commit buffer full, cta_group needs to be provided.
-        """
         self.sync_object_full.arrive(state.index, self.producer_mask,
                                      self.cta_group)
 
     def producer_tail(self, state: PipelineState):
-        """
-        Make sure the last used buffer empty signal is visible to producer.
-        Producer tail is usually executed by producer before exit, to avoid dangling
-        mbarrier arrive signals after kernel exit.
-
-        :param state: The pipeline state that points to next useful buffer
-        :type state: PipelineState
-        """
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster())
         is_leader_cta = cta_rank_in_cluster % 2 == 0
