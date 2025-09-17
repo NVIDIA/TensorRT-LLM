@@ -328,6 +328,8 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                     return
             except Exception as err:
                 print(f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
@@ -353,7 +355,9 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as server_proc):
-                self.wait_for_endpoint_ready(f"http://localhost:8000/health")
+                self.wait_for_endpoint_ready(
+                    f"http://localhost:8000/health",
+                    timeout=3600)  # 60 minutes for large models
                 check_output(self.client_cmd, env=venv._new_env)
                 output += check_output(self.benchmark_cmd, env=venv._new_env)
         finally:

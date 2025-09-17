@@ -2006,7 +2006,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f'{self._working_dir}/server_config.yaml', '-p',
             f'{client_dir}/prompts.json', '--ignore-eos',
             '--server-start-timeout',
-            str(1800)
+            str(3600)
         ]
         return client_cmd
 
