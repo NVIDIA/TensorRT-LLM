@@ -23,11 +23,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from datasets import load_dataset
-from tokenizer import get_tokenizer
 from torch.utils.data import DataLoader
+from whisper import log_mel_spectrogram, load_audio
 from whisper.normalizers import EnglishTextNormalizer
-from whisper_utils import (log_mel_spectrogram, store_transcripts,
-                           write_error_stats)
+from whisper.tokenizer import get_tokenizer
+from whisper_utils import store_transcripts, write_error_stats
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
@@ -439,13 +439,10 @@ def decode_wav_file(
         batch_size=1,
         num_beams=1,
         normalizer=None,
-        mel_filters_dir=None,
         padding_strategy="longest"):
-    mel, total_duration = log_mel_spectrogram(input_file_path,
-                                              model.n_mels,
-                                              device='cuda',
-                                              return_duration=True,
-                                              mel_filters_dir=mel_filters_dir)
+    audio = load_audio(input_file_path)
+    total_duration = audio.shape[-1] / 16000.0
+    mel = log_mel_spectrogram(audio, model.n_mels, device='cuda')
     mel = mel.type(str_dtype_to_torch(dtype))
     mel = mel.unsqueeze(0)
     # repeat the mel spectrogram to match the batch size
@@ -525,8 +522,7 @@ def decode_dataset(
             log_mel_spectrogram(wave,
                                 model.n_mels,
                                 padding=longest_duration - wave.shape[-1],
-                                device='cuda',
-                                mel_filters_dir=mel_filters_dir).unsqueeze(0)
+                                device='cuda').unsqueeze(0)
             for wave in waveforms
         ]
 
