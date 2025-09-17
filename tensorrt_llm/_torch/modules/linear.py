@@ -23,6 +23,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..custom_ops import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
 
@@ -766,7 +767,8 @@ class NVFP4LinearMethod(LinearMethodBase):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
-        if module.use_cute_dsl_nvfp4_blockscaling_mm:
+        if IS_CUTLASS_DSL_AVAILABLE and module.use_cute_dsl_nvfp4_blockscaling_mm:
+            # from ..custom_ops import cutlass_dsl_nvfp4_gemm_blackwell
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)

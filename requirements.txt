@@ -3,8 +3,8 @@
 accelerate>=1.7.0
 build
 colored
-# cuda-python>=12,<13  # <For CUDA 12.9>
-cuda-python>=12
+cuda-python>=12,<13  # <For CUDA 12.9>
+# cuda-python>=12
 diffusers>=0.27.0
 lark
 mpi4py
@@ -14,8 +14,8 @@ onnx_graphsurgeon>=0.5.2
 openai
 polygraphy
 psutil
-# nvidia-ml-py>=12,<13  # <For CUDA 12.9>
-nvidia-ml-py>=12
+nvidia-ml-py>=12,<13  # <For CUDA 12.9>
+# nvidia-ml-py>=12
 # Just a wrapper since nvidia-modelopt requires pynvml
 pynvml==12.0.0
 pulp
@@ -23,17 +23,17 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-# tensorrt>=10.11.0,<=10.13.0  # <For CUDA 12.9>
-tensorrt~=10.13.0
+tensorrt>=10.11.0,<=10.13.0  # <For CUDA 12.9>
+# tensorrt~=10.13.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.8.0a0.
-# torch>=2.7.1,<=2.8.0a0  # <For CUDA 12.9>
-torch>=2.8.0a0,<=2.8.0
+torch>=2.7.1,<=2.8.0a0  # <For CUDA 12.9>
+# torch>=2.8.0a0,<=2.8.0
 torchvision
 nvidia-modelopt[torch]~=0.33.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-08.html#rel-25-08 uses 2.27.7
 nvidia-nccl-cu12
-# nvidia-cuda-nvrtc-cu12  # <For CUDA 12.9>
-nvidia-cuda-nvrtc
+nvidia-cuda-nvrtc-cu12  # <For CUDA 12.9>
+# nvidia-cuda-nvrtc
 transformers==4.55.0
 prometheus_client
 prometheus_fastapi_instrumentator
@@ -74,4 +74,4 @@ triton==3.3.1; platform_machine == "x86_64"
 tiktoken
 blobfile
 openai-harmony==0.0.4
-nvidia-cutlass-dsl==4.1.0; python_version >= "3.12"
+# nvidia-cutlass-dsl==4.1.0; python_version >= "3.12"
