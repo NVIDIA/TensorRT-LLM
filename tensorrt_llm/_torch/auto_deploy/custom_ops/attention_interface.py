@@ -274,6 +274,7 @@ class SequenceInfo:
             if self.max_batch_size > 1:
                 bs_seq_len_shape[0] = Dim("batch_size", max=self.max_batch_size)
             bs_seq_len_shape[1] = Dim("seq_len", max=self.max_seq_len)
+            # bs_seq_len_shape[1] = Dim.AUTO
             self._dynamic_shapes = {k: bs_seq_len_shape for k in self._uncached_arg_names}
             # cached args are static
             self._dynamic_shapes.update({k: {} for k in self._cached_arg_names})

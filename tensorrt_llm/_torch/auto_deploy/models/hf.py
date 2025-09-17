@@ -115,14 +115,18 @@ class AutoModelForCausalLMFactory(ModelFactory):
         return AutoModelForCausalLM.from_config
 
     @staticmethod
-    def _simple_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
+    def _simple_forward(
+        model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor, *args, **kwargs
+    ):
         """A simple forward pass for the model to functionalize the args.
 
         This follows the standard function signature as expected by factory.py. We do _not_ use the
         model.forward method directly to create the patch. Instead we use the type of the model to
         get the forward method to keep the patch composable with other forward patches.
         """
-        return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
+        return type(model).forward(
+            model, input_ids=input_ids, position_ids=position_ids, *args, **kwargs
+        )
 
     def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
         """
