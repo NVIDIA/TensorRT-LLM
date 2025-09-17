@@ -114,6 +114,7 @@ def test_additional_model_outputs_integration():
               max_seq_len=128,
               max_num_tokens=5,
               kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+              disable_overlap_scheduler=True,
               checkpoint_loader=HfCheckpointLoader(
                   weight_loader=DummyWeightLoader(),
                   config_loader=DummyConfigLoader()))
