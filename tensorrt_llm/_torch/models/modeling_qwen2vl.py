@@ -990,8 +990,21 @@ class Qwen2VLModel(Qwen2VLModelBase):
         self.llm.load_weights(weights, weight_mapper)
 
 
+def getSMVersion():
+    prop = torch.cuda.get_device_properties(0)
+    sm_version = prop.major * 10 + prop.minor
+    return sm_version
+
+
+get_sm_version = getSMVersion()
+if get_sm_version >= 100:
+    QWEN2_5_VL_VISION_MODEL_CLASS = Qwen2_5_VisionTransformerPretrainedModel
+else:
+    QWEN2_5_VL_VISION_MODEL_CLASS = Qwen2_5_VisionModel
+
+
 @register_vision_encoder(Qwen2VisionModelBase,
-                         vlm_base_model=Qwen2_5_VisionModel)
+                         vlm_base_model=QWEN2_5_VL_VISION_MODEL_CLASS)
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
 @register_input_processor(
     Qwen2VLInputProcessorBase,
@@ -1007,27 +1020,37 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
-        kwargs['vision_model_class'] = Qwen2_5_VisionModel
+        kwargs['vision_model_class'] = QWEN2_5_VL_VISION_MODEL_CLASS
         kwargs[
             'disable_fuse_rope'] = False  # TODO: Make this ModelConfig's argument
         super().__init__(model_config, *args, **kwargs)
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:
-        return [
-            "image.pixel_values", "video.pixel_values_videos",
-            "multimodal_embedding", "mrope_config.mrope_position_ids"
-        ]
+        if get_sm_version >= 100:
+            return [
+                "image.pixel_values", "video.pixel_values_videos",
+                "image.image_grid_thw", "video.video_grid_thw",
+                "multimodal_embedding", "mrope_config.mrope_position_ids"
+            ]
+        else:
+            return [
+                "image.pixel_values", "video.pixel_values_videos",
+                "multimodal_embedding", "mrope_config.mrope_position_ids"
+            ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if not DISAGG:
-            # Process vision encoder weights
-            weight_name_mapping = {
-                "attn.proj.weight": "attn.o_proj.weight",
-                "attn.proj.bias": "attn.o_proj.bias",
-                "attn.qkv.weight": "attn.qkv_proj.weight",
-                "attn.qkv.bias": "attn.qkv_proj.bias"
-            }
+            if get_sm_version >= 100:
+                weight_name_mapping = None
+            else:
+                # Process vision encoder weights
+                weight_name_mapping = {
+                    "attn.proj.weight": "attn.o_proj.weight",
+                    "attn.proj.bias": "attn.o_proj.bias",
+                    "attn.qkv.weight": "attn.qkv_proj.weight",
+                    "attn.qkv.bias": "attn.qkv_proj.bias"
+                }
             vision_weights = process_weights(weights, "visual",
                                              weight_name_mapping)
             self.mm_encoder.load_state_dict(vision_weights, strict=True)

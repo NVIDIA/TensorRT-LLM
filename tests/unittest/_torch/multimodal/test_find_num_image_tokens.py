@@ -4,7 +4,6 @@ import pytest
 import requests
 from PIL import Image
 from transformers import AutoConfig, AutoTokenizer
-from utils.util import getSMVersion
 
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.models.modeling_llava_next import \
@@ -53,12 +52,7 @@ def multimodal_model_configs():
 
 @pytest.mark.parametrize("model_key", [
     "llava-v1.6-mistral-7b-hf",
-    pytest.param(
-        "qwen2.5-vl",
-        marks=pytest.mark.skipif(
-            getSMVersion() >= 100,
-            reason="qwen2.5-vl head_dim=80 is not supported on SM 100 and above"
-        )),
+    "qwen2.5-vl",
 ])
 def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
     """Test that get_num_tokens_per_image predicts the correct number of tokens.
@@ -165,12 +159,7 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
 
 
 @pytest.mark.parametrize("model_key", [
-    pytest.param(
-        "qwen2.5-vl",
-        marks=pytest.mark.skipif(
-            getSMVersion() >= 100,
-            reason="qwen2.5-vl head_dim=80 is not supported on SM 100 and above"
-        )),
+    "qwen2.5-vl",
 ])
 def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
     """Test that get_num_tokens_per_video predicts the correct number of tokens.
