@@ -347,11 +347,15 @@ def add_token(request: LlmRequest,
               new_tokens: torch.Tensor,
               *,
               beam: int,
-              step: int = 0) -> int:
+              step: int = 0,
+              cache: dict[LlmRequest, List[int]] = None) -> int:
     seq_slot = request.py_seq_slot
     assert seq_slot is not None
     new_token = int(new_tokens[step, seq_slot, beam])
-    request.add_new_token(new_token, beam)
+    if cache is not None:
+        cache.setdefault(request, []).append(new_token)
+    else:
+        request.add_new_token(new_token, beam)
     return new_token
 
 
@@ -481,25 +485,20 @@ class TorchSampler(Sampler):
     def _process_draft_tokens_greedy(self, request: LlmRequest, *,
                                      new_tokens: torch.Tensor,
                                      finish_reasons: FinishReasons) -> int:
-        new_token = add_token(request, new_tokens, beam=BEAM_0)
-        stop = self.finish_if_reason(request, finish_reasons, step=0)
-        if stop or get_draft_token_length(request) == 0:
-            return 0
         num_accepted = 0
-
-        for draft_token in request.py_draft_tokens:
-            if draft_token != new_token:
-                # Reject.
-                break
-
-            num_accepted += 1
+        while True:
             new_token = add_token(request,
                                   new_tokens,
                                   beam=BEAM_0,
-                                  step=num_accepted)
-            if self.finish_if_reason(request, finish_reasons,
-                                     step=num_accepted):
+                                  step=num_accepted,
+                                  cache=self._cached_tokens)
+            if self.finish_if_reason(request, finish_reasons, step=0):
                 break
+            if len(request.py_draft_tokens
+                   ) <= num_accepted or request.py_draft_tokens[
+                       num_accepted] != new_token:
+                break
+            num_accepted += 1
         return num_accepted
 
     def _process_draft_tokens_rejection_sampling(
@@ -525,7 +524,11 @@ class TorchSampler(Sampler):
         for i in range(num_accepted):
             new_token = request.py_draft_tokens[i]
             new_tokens[i, request.seq_slot, BEAM_0] = new_token
-            request.add_new_token(new_token, BEAM_0)
+            add_token(request,
+                      new_tokens,
+                      beam=BEAM_0,
+                      step=i,
+                      cache=self._cached_tokens)
             if handle_stop_single_beam(request,
                                        new_token,
                                        max_seq_len=self.max_seq_len):
@@ -535,7 +538,11 @@ class TorchSampler(Sampler):
             new_token = sample_rejected(draft_probs, target_probs, generator,
                                         num_accepted)
             new_tokens[num_accepted, request.seq_slot, BEAM_0] = new_token
-            request.add_new_token(new_token, BEAM_0)
+            add_token(request,
+                      new_tokens,
+                      beam=BEAM_0,
+                      step=num_accepted,
+                      cache=self._cached_tokens)
             handle_stop_single_beam(request,
                                     new_token,
                                     max_seq_len=self.max_seq_len)
@@ -543,7 +550,8 @@ class TorchSampler(Sampler):
             new_token = add_token(request,
                                   new_tokens,
                                   beam=BEAM_0,
-                                  step=num_accepted)
+                                  step=num_accepted,
+                                  cache=self._cached_tokens)
             handle_stop_single_beam(request,
                                     new_token,
                                     max_seq_len=self.max_seq_len)
@@ -556,11 +564,12 @@ class TorchSampler(Sampler):
             state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons[:, :, BEAM_0].T.tolist()
+        self._cached_tokens = {}
 
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
-            add_token(req, new_tokens, beam=BEAM_0)
+            add_token(req, new_tokens, beam=BEAM_0, cache=self._cached_tokens)
             self.finish_if_reason(req, finish_reasons, step=0)
             self.handle_logprobs(req, state, beam=BEAM_0, count=1)
             req.py_decoding_iter += 1
@@ -581,6 +590,10 @@ class TorchSampler(Sampler):
             processed += num_accepted
             self.handle_logprobs(req, state, beam=BEAM_0, count=processed)
             req.py_decoding_iter += 1
+
+        # Commit adding tokens
+        add_new_tokens_to_requests(list(self._cached_tokens.keys()),
+                                   list(self._cached_tokens.values()), BEAM_0)
 
     def log_probs_host(self, scheduled_requests: ScheduledRequests):
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
@@ -1286,9 +1299,8 @@ class TRTLLMSampler(Sampler):
         ]
 
         # Add new tokens
-        new_tokens = [
-            new_tokens_host[r.py_seq_slot] for r in reqs_with_new_tokens
-        ]
+        new_tokens = [[new_tokens_host[r.py_seq_slot]]
+                      for r in reqs_with_new_tokens]
         add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
 
         # Log probs

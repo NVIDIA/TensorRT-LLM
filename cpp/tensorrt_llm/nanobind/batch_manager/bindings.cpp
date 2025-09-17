@@ -432,13 +432,17 @@ void initBindings(nb::module_& m)
     m.def(
         "add_new_tokens_to_requests",
         [](std::vector<std::shared_ptr<tb::LlmRequest>>& requests,
-            std::vector<tb::LlmRequest::TokenIdType> const& tokens, int beam_idx)
+            std::vector<std::vector<tb::LlmRequest::TokenIdType>> const& tokens, int beam_idx)
         {
-            TLLM_CHECK_WITH_INFO(requests.size() == tokens.size(), "Expected the same number of requests and tokens.");
+            TLLM_CHECK_WITH_INFO(
+                requests.size() == tokens.size(), "Expected the same number of requests and token containers.");
 
             for (int i = 0; i < requests.size(); ++i)
             {
-                requests[i]->addNewToken(tokens[i], beam_idx);
+                for (const auto& token : tokens[i])
+                {
+                    requests[i]->addNewToken(token, beam_idx);
+                }
             }
         },
         nb::arg("requests"), nb::arg("tokens"), nb::arg("beam_idx"),
