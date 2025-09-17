@@ -32,6 +32,7 @@ from .pytorch_model_config import get_model_yaml_config
 from .utils import (AbstractPerfScriptTestClass, MultiNodeProbe,
                     PerfBenchScriptTestCmds, PerfDisaggScriptTestCmds,
                     PerfMetricType, PerfScriptTestCmds, generate_test_nodes,
+                    multi_node_disagg_server_command_wrapper,
                     multi_node_llm_command_wrapper)
 
 if not hasattr(re, "Pattern"):
@@ -1958,6 +1959,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         return ctx_config, gen_config
 
     def _gen_disagg_server_config(self):
+        if MultiNodeProbe.is_multi_node():
+            hostname = MultiNodeProbe.get_other_node_ip()
+        else:
+            hostname = 'localhost'
+
         server_config = {
             'hostname': 'localhost',
             'port': 8000,
@@ -1968,7 +1974,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             },
             'generation_servers': {
                 'num_instances': 1,
-                'urls': ['localhost:8002']
+                'urls': [f'{hostname}:8002']
             }
         }
         return server_config
@@ -1988,20 +1994,31 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_path = MODEL_PATH_DICT[self._config.model_name]
         model_dir = os.path.join(llm_models_root(), model_path)
 
-        ctx_gpu_list = ",".join(
-            [str(i) for i in range(self._config.ctx_server_workers)])
+        llm_api_cmd = ""
+        # Multi-node: each node has its own responsibility for either ctx of gen server
+        if MultiNodeProbe.is_multi_node():
+            llm_api_cmd = "trtllm-llmapi-launch"
+            ctx_gpu_list = ",".join(
+                [str(i) for i in range(self._config.ctx_server_workers)])
 
-        gen_gpu_list = ",".join([
-            str(i) for i in range(
-                self._config.ctx_server_workers,
-                self._config.ctx_server_workers +
-                self._config.gen_server_workers)
-        ])
+            gen_gpu_list = ",".join(
+                [str(i) for i in range(self._config.gen_server_workers)])
+        else:  # Single-node: all ctx and gen servers are on the same node
+            ctx_gpu_list = ",".join(
+                [str(i) for i in range(self._config.ctx_server_workers)])
 
-        ctx_cmd = f'CUDA_VISIBLE_DEVICES={ctx_gpu_list} trtllm-serve {model_dir} --host localhost --port 8001 --extra_llm_api_options {ctx_config_path}'
-        gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} trtllm-serve {model_dir} --host localhost --port 8002 --extra_llm_api_options {gen_config_path}'
+            gen_gpu_list = ",".join([
+                str(i) for i in range(
+                    self._config.ctx_server_workers,
+                    self._config.ctx_server_workers +
+                    self._config.gen_server_workers)
+            ])
+
+        ctx_cmd = f'CUDA_VISIBLE_DEVICES={ctx_gpu_list} {llm_api_cmd} trtllm-serve {model_dir} --host localhost --port 8001 --extra_llm_api_options {ctx_config_path}'
+        gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} {llm_api_cmd} trtllm-serve {model_dir} --host localhost --port 8002 --extra_llm_api_options {gen_config_path}'
         return ctx_cmd, gen_cmd
 
+    @multi_node_disagg_server_command_wrapper
     def _get_disagg_server_deploy_command(self):
         server_config = self._gen_disagg_server_config()
         server_config_path = os.path.join(self._working_dir,
@@ -2010,6 +2027,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             yaml.dump(server_config, f)
         return f'trtllm-serve disaggregated -c {server_config_path} -t 3600 -r 3600'
 
+    @multi_node_disagg_server_command_wrapper
     def _get_disagg_client_command(self):
         client_dir = os.path.join(self._llm_root,
                                   "examples/disaggregated/clients")
@@ -2022,6 +2040,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         ]
         return client_cmd
 
+    @multi_node_disagg_server_command_wrapper
     def _get_disagg_benchmark_command(self):
         benchmark_script = os.path.join(self._llm_root, "tensorrt_llm", "serve",
                                         "scripts", "benchmark_serving.py")
@@ -2070,14 +2089,27 @@ def run_perf_test(perf_case_name, trt_performance_cache_fpath,
     The actual test definition for TensorRT LLM perf test.
     """
     # Run the command in single-node environment OR in multi-node environment but only on first process
-    if not MultiNodeProbe.is_multi_node() or \
-        (MultiNodeProbe.is_first_node() and MultiNodeProbe.is_first_process()):
+    if not MultiNodeProbe.is_multi_node() or MultiNodeProbe.is_first_process():
         working_dir = llm_venv.get_working_directory()
         test_runner = MultiMetricPerfTest(perf_case_name)
-        test_runner.set_runtime_configs(llm_root, working_dir,
-                                        trt_performance_cache_fpath)
-        test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,
-                                llm_session_data_writer, output_dir)
+        if not MultiNodeProbe.is_multi_node():
+            # Single node, only support single process, multi-gpu, multi-process supported by mpi run
+            should_run = True
+        elif test_runner._config.runtime == "disagg_server":
+            # multi-node + disagg_server：run on both node0,process0 and node1,process0
+            should_run = MultiNodeProbe.is_first_process() and (
+                MultiNodeProbe.is_first_node()
+                or MultiNodeProbe.is_second_node())
+        else:
+            # multi-node + other runtime：only run onnode0,process0
+            should_run = MultiNodeProbe.is_first_node(
+            ) and MultiNodeProbe.is_first_process()
+
+        if should_run:
+            test_runner.set_runtime_configs(llm_root, working_dir,
+                                            trt_performance_cache_fpath)
+            test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,
+                                    llm_session_data_writer, output_dir)
 
 
 def generate_perf_tests(session, config, items):

@@ -172,6 +172,31 @@ def multi_node_llm_command_wrapper(func):
     return wrapper
 
 
+def multi_node_disagg_server_command_wrapper(func):
+    '''
+    decorator: add trtllm-llmapi-launch prefix to test command in multi-node env
+    '''
+
+    def wrapper(self, *args, **kwargs):
+        # Get the original result
+        result = func(self, *args, **kwargs)
+        # Use trtllm-api-launch prefix if running on multi-node env
+        if MultiNodeProbe.is_multi_node():
+            if isinstance(result, str):
+                return "trtllm-llmapi-launch " + result
+            elif isinstance(result, list):
+                return ["trtllm-llmapi-launch"] + result
+            else:
+                print(
+                    f"Warning: Fallback: Unknown return format from {func.__name__}: {type(result)}"
+                )
+                return result
+
+        return result
+
+    return wrapper
+
+
 class PerfMetricType(str, Enum):
     """
     An string-enum type to define what kind of perf metric it is. It is used by QA to
@@ -419,7 +444,7 @@ class PerfDisaggScriptTestCmds(NamedTuple):
         print_error(
             f"Endpoint {url} did not become ready within {timeout} seconds")
 
-    def run_cmd(self, cmd_idx: int, venv) -> str:
+    def run_cmd_on_single_node(self, cmd_idx: int, venv) -> str:
         output = ""
         try:
             with (  # Start ctx workers
@@ -456,6 +481,87 @@ class PerfDisaggScriptTestCmds(NamedTuple):
             ctx_workers_proc.wait()
             gen_workers_proc.wait()
         return output
+
+    def run_cmd_on_multi_node(self, cmd_idx: int, venv) -> str:
+        output = ""
+        # Initialize variables to None for safe cleanup
+        output_ctx = None
+        output_gen = None
+        output_server = None
+        ctx_workers_proc = None
+        gen_workers_proc = None
+        server_proc = None
+
+        try:
+            if MultiNodeProbe.is_first_node(
+            ) and MultiNodeProbe.is_first_process():
+                # Start ctx workers
+                output_ctx = open('output_ctx.log', 'w')
+                ctx_workers_proc = popen(self.ctx_cmd,
+                                         stdout=output_ctx,
+                                         stderr=subprocess.STDOUT,
+                                         env=venv._new_env,
+                                         shell=True)
+
+            if MultiNodeProbe.is_second_node(
+            ) and MultiNodeProbe.is_first_process():
+                # Start gen workers
+                output_gen = open('output_gen.log', 'w')
+                gen_workers_proc = popen(self.gen_cmd,
+                                         stdout=output_gen,
+                                         stderr=subprocess.STDOUT,
+                                         env=venv._new_env,
+                                         shell=True)
+
+            if MultiNodeProbe.is_first_node(
+            ) and MultiNodeProbe.is_first_process():
+                # Start server
+                output_server = open('output_server.log', 'w')
+                server_proc = popen(self.server_cmd,
+                                    stdout=output_server,
+                                    stderr=subprocess.STDOUT,
+                                    env=venv._new_env,
+                                    shell=True)
+                # wait for server to be ready
+                self.wait_for_endpoint_ready(
+                    f"http://localhost:8000/health",
+                    timeout=1800)  # 30 minutes for large models
+                # start disaggregated client
+                check_output(self.client_cmd, env=venv._new_env)
+                # start benchmark
+                output += check_output(self.benchmark_cmd, env=venv._new_env)
+        finally:
+            # Safely terminate processes
+            if server_proc is not None:
+                server_proc.terminate()
+            if ctx_workers_proc is not None:
+                ctx_workers_proc.terminate()
+            if gen_workers_proc is not None:
+                gen_workers_proc.terminate()
+
+            # Wait for processes to finish
+            if server_proc is not None:
+                server_proc.wait()
+            if ctx_workers_proc is not None:
+                ctx_workers_proc.wait()
+            if gen_workers_proc is not None:
+                gen_workers_proc.wait()
+
+            # Close file handles
+            if output_ctx is not None:
+                output_ctx.close()
+            if output_gen is not None:
+                output_gen.close()
+            if output_server is not None:
+                output_server.close()
+
+        return output
+
+    def run_cmd(self, cmd_idx: int, venv) -> str:
+        if MultiNodeProbe.is_multi_node():
+            return self.run_cmd_on_multi_node(cmd_idx, venv)
+        else:
+            return self.run_cmd_on_single_node(cmd_idx, venv)
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
         return ["disaggregated server tests, please check config files"]
@@ -633,10 +739,14 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 # Stop the timer
                 self._end_timestamp = datetime.utcnow()
 
-                # Write results to output csv and/or yaml files.
-                self._write_result(full_test_name, session_data_writer,
-                                   output_dir, outputs, original_test_name,
-                                   cmd_idx)
+                #For multinode - Only perform write result on first node and first process
+                #For single node - Not care this one, assume its single CPU process
+                if not MultiNodeProbe.is_multi_node() or \
+                    (MultiNodeProbe.is_first_node() and MultiNodeProbe.is_first_process()):
+                    # Write results to output csv and/or yaml files.
+                    self._write_result(full_test_name, session_data_writer,
+                                       output_dir, outputs, original_test_name,
+                                       cmd_idx)
 
         return outputs
 
