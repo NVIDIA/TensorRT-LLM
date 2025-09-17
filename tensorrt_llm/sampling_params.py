@@ -478,6 +478,12 @@ class SamplingParams:
         else:
             config_kwargs["return_log_probs"] = self._return_log_probs
 
+        if config_kwargs.get("additional_model_outputs") is not None:
+            config_kwargs["additional_model_outputs"] = [
+                tllme.AdditionalModelOutput(name=output.name, gather_context=output.gather_context)
+                for output in config_kwargs["additional_model_outputs"]
+            ]
+
         return tllme.OutputConfig(**config_kwargs)
 
     def _get_guided_decoding_params(self) -> tllme.GuidedDecodingParams:
