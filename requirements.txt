@@ -34,7 +34,7 @@ nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu12
 # nvidia-cuda-nvrtc-cu12  # <For CUDA 12.9>
 nvidia-cuda-nvrtc
-transformers==4.55.0
+transformers==4.56.0
 prometheus_client
 prometheus_fastapi_instrumentator
 pydantic>=2.9.1
