@@ -52,6 +52,7 @@ testCmdLines=(
     "$llmapiLaunchScript"
     "pytest"
     "-v"
+    "-s"
     "--timeout-method=thread"
     "--timeout=$pytestTestTimeout"
     "--test-list=$testListPathNode"
