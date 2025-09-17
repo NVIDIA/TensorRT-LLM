@@ -158,7 +158,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             output_dir,
             f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
         parallel_command = command + [
-            "-n", f"{num_workers}", f"--junitxml={parallel_output_xml}"
+            "-n", f"{num_workers}", "--dist=loadfile",
+            f"--junitxml={parallel_output_xml}"
         ]
         passed = run_command(parallel_command)
 
