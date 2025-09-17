@@ -448,20 +448,34 @@ def register_input_processor(
     return wrapper
 
 
-def create_input_processor(model_path_or_dir: str, tokenizer):
-    """
-    Create an input processor for a specific model.
+def create_input_processor(
+    model_path_or_dir: str,
+    tokenizer,
+    checkpoint_format: Optional[str] = "HF",
+) -> InputProcessor:
+    """Create an input processor for a specific model.
+
+    Args:
+        model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
+        tokenizer: Tokenizer instance.
+        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
+            config loading; any other value skips HF config loading. Default is "HF".
+
+    Returns:
+        An InputProcessor implementation (model-specific if registered; otherwise DefaultInputProcessor).
     """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import get_model_architecture
 
     model_config = None
-    try:
-        config = ModelConfig.from_pretrained(model_path_or_dir,
-                                             trust_remote_code=True)
-        model_config = config.pretrained_config
-    except (ValueError, EnvironmentError):
-        config = None
+
+    if checkpoint_format == "HF":
+        try:
+            config = ModelConfig.from_pretrained(model_path_or_dir,
+                                                 trust_remote_code=True)
+            model_config = config.pretrained_config
+        except (ValueError, EnvironmentError):
+            config = None
 
     if model_config is not None:
         try:
