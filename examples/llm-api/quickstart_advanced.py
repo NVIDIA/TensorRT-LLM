@@ -6,6 +6,7 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
+from tensorrt_llm.sampling_params import AdditionalModelOutput
 
 example_prompts = [
     "Hello, my name is",
@@ -157,6 +158,15 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--logprobs', default=False, action='store_true')
+
+    parser.add_argument('--additional_model_outputs',
+                        type=str,
+                        default=None,
+                        nargs='+')
+    parser.add_argument('--additional_model_outputs_gather_context',
+                        default=False,
+                        action='store_true')
+
     return parser
 
 
@@ -269,6 +279,15 @@ def setup_llm(args, **kwargs):
 
     assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be less or equal to n: {args.n}"
 
+    additional_model_outputs = None
+    if args.additional_model_outputs:
+        additional_model_outputs = []
+        for output in args.additional_model_outputs:
+            additional_model_outputs.append(
+                AdditionalModelOutput(name=output,
+                                      gather_context=args.
+                                      additional_model_outputs_gather_context))
+
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -279,7 +298,8 @@ def setup_llm(args, **kwargs):
         logprobs=args.logprobs,
         n=args.n,
         best_of=best_of,
-        use_beam_search=use_beam_search)
+        use_beam_search=use_beam_search,
+        additional_model_outputs=additional_model_outputs)
     return llm, sampling_params
 
 
