@@ -3,7 +3,7 @@
 from typing import Dict
 
 import pytest
-from _model_test_utils import get_small_model_config
+from _model_test_utils import get_small_model_config_pytest_param
 from build_and_run_ad import ExperimentConfig, main
 
 
@@ -12,7 +12,7 @@ from build_and_run_ad import ExperimentConfig, main
 @pytest.mark.parametrize(
     "experiment_config",
     [
-        get_small_model_config(
+        get_small_model_config_pytest_param(
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             attn_backend="flashinfer",
             compile_backend="torch-opt",

@@ -40,7 +40,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
@@ -66,7 +66,8 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+                     create_lm_head_tp_mapping)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
@@ -145,6 +146,12 @@ class DeepseekV3MTPHead(nn.Module):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
+        if self.model_config.mapping.enable_attention_dp and \
+            getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
+            self.mapping_lm_head_tp = create_lm_head_tp_mapping(
+                self.model_config.mapping)
+        else:
+            self.mapping_lm_head_tp = self.model_config.mapping
 
     @torch.compile(options={"max-autotune": True})
     def get_last_token_states(self, hidden_states, attn_metadata):
@@ -167,10 +174,21 @@ class DeepseekV3MTPHead(nn.Module):
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
-        if not (self.model_config.mapping.enable_attention_dp):
+        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+        enable_lm_head_tp_in_adp = self.model_config.mapping.enable_lm_head_tp_in_adp
+
+        # Add pre-lm gather logic
+        if enable_lm_head_tp_in_adp:
+            # ADP + LM TP mode: perform All-Gather before LM_head
+            hidden_states = allgather(hidden_states,
+                                      self.mapping_lm_head_tp,
+                                      dim=0)
+
+        # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = False
-        logits = lm_head(hidden_states)
-        if not (self.model_config.mapping.enable_attention_dp):
+        logits = lm_head(hidden_states, is_spec_decoding_head=True)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = True
         return logits
 
@@ -771,12 +789,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.mapping.tp_size,
             )
 
-            if tp > self.mapping.gpus_per_node and not self.allreduce.is_mnnvl(
-            ):
+            if tp > self.mapping.gpus_per_node:
                 mlp_tp_size = math.gcd(
                     tp,
                     self.mapping.gpus_per_node,
-                )  # Avoid costly inter-node TP when MNNVL is not supported
+                )  # Avoid costly inter-node TP
             else:
                 mlp_tp_size = tp
         return mlp_tp_size
@@ -1486,8 +1503,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                             p.data.copy_(module_weights[n][:])
 
                 if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-                ) and get_sm_version() == 100 and hasattr(
-                        module, "weight_scale"):
+                ) and is_sm_100f() and hasattr(module, "weight_scale"):
                     weight, weight_scale = resmooth_to_fp8_e8m0(
                         module.weight, module.weight_scale)
                     transfromed_scale = transform_sf_into_required_layout(

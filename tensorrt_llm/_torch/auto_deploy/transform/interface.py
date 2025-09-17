@@ -274,6 +274,7 @@ class BaseTransform(ABC):
 
         # log the result of the transform
         log_msgs = [
+            f"enabled={self.config.enabled}",
             "skipped=True" if info.skipped else f"num_matches={info.num_matches}",
             f"is_clean={info.is_clean}",
             f"has_valid_shapes={info.has_valid_shapes}",
