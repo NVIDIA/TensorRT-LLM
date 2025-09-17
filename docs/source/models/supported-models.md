@@ -45,11 +45,11 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 
 | Model Architecture/Feature         | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Modality |
 | ---------------------------------- | ----------------- | ---------- | --------------- | ------------- | ---------------- | -------------- | --------------------- | ------------------------- | -------- |
-| Gemma3ForConditionalGeneration     | Yes               | Yes        | N/A             | Yes           | Yes              | N/A            | Yes                   | No                        | L + I    |   
+| Gemma3ForConditionalGeneration     | Yes               | Yes        | N/A             | Yes           | Yes              | N/A            | Yes                   | No                        | L + I    |
 | HCXVisionForCausalLM               | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I    |
 | LlavaLlamaModel (VILA)             | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I + V |
 | LlavaNextForConditionalGeneration  | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I    |
-| Llama4ForConditionalGeneration     | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I    |
+| Llama4ForConditionalGeneration     | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | No                        | L + I    |
 | Mistral3ForConditionalGeneration   | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I    |
 | Phi4MMForCausalLM                  | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I + A |
 | Qwen2VLForConditionalGeneration    | Yes               | Yes        | No              | Yes           | Yes              | Yes            | Yes                   | No                        | L + I + V |

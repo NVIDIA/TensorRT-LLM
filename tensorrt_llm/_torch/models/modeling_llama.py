@@ -7,7 +7,10 @@ from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, Llama4Config, Llama4VisionModel,
                           LlamaConfig)
+from transformers.image_utils import SizeDict
 from transformers.modeling_utils import load_sharded_checkpoint
+from transformers.models.llama4.image_processing_llama4_fast import (
+    find_supported_resolutions, get_best_fit)
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
@@ -21,8 +24,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
@@ -41,7 +44,8 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
@@ -1031,7 +1035,7 @@ class Llama4VisionEncoder(nn.Module):
         return [image_features]
 
 
-class Llama4InputProcessor(InputProcessor):
+class Llama4InputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path,
@@ -1046,11 +1050,97 @@ class Llama4InputProcessor(InputProcessor):
         self.model_config = model_config
         self.tokenizer = tokenizer
         self.vocab_size = model_config.text_config.vocab_size
+        self.fake_image_token = self.processor.fake_image_token  # <image>
+        self.image_token = self.processor.img_patch_token  # <image_patch>
         self.image_token_index = model_config.image_token_index
-        self.fake_image_token = self.processor.fake_image_token
-        self.image_token = self.processor.img_patch_token
-        self.image_token_start_index = self.model_config.boi_token_index
-        self.image_token_end_index = self.model_config.eoi_token_index
+        self.image_size = self.model_config.vision_config.image_size
+        special_tokens = [
+            self.processor.start_of_img_token, self.processor.end_of_img_token,
+            self.processor.tile_token, self.processor.tile_global_token,
+            self.fake_image_token
+        ]
+        self.special_token_ids = self.processor.tokenizer.convert_tokens_to_ids(
+            special_tokens)
+
+    def get_vocab_size(self) -> int:
+        " Return the tokenizer/model vocabulary size for Llama4. "
+        return self.vocab_size
+
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        " Return multimodal special token ids for Llama4. "
+        return torch.tensor(self.special_token_ids)
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image: Image,
+        **kwargs,
+    ):
+
+        def _choose_grid_like_hf(image_height: int,
+                                 image_width: int) -> tuple[int, int]:
+            " Choose the grid like HF does "
+            patch_size_height = self.processor.image_processor.size["height"]
+            patch_size_width = self.processor.image_processor.size["width"]
+            patch_size = SizeDict(height=patch_size_height,
+                                  width=patch_size_width)
+            canvases = find_supported_resolutions(
+                self.processor.image_processor.max_patches, patch_size)
+            canvases = torch.tensor(canvases)
+            canvas_h, canvas_w = get_best_fit(
+                (image_height, image_width), canvases,
+                self.processor.image_processor.resize_to_max_canvas)
+            return canvas_h // self.image_size, canvas_w // self.image_size  # (grid_h, grid_w)
+
+        def _calculate_patches_per_chunk(chunk_height: int,
+                                         chunk_width: int) -> int:
+            """
+            Calculate patches per chunk using HF's formula.
+
+            Args:
+                chunk_height: Height of the chunk/tile
+                chunk_width: Width of the chunk/tile
+
+            Returns:
+                Number of patches in the chunk
+            """
+            downsample_ratio = int(
+                round(1.0 /
+                      (self.model_config.vision_config.pixel_shuffle_ratio**2)))
+            num_patches_per_chunk = int(
+                (chunk_height // self.model_config.vision_config.patch_size) *
+                (chunk_width // self.model_config.vision_config.patch_size) //
+                downsample_ratio)
+            return num_patches_per_chunk
+
+        ratio_h, ratio_w = _choose_grid_like_hf(image.height, image.width)
+        # Calculate patches per chunk/tile using HF's formula
+        num_patches_per_chunk = _calculate_patches_per_chunk(
+            self.image_size, self.image_size)
+
+        # Count tokens based on the _prompt_split_image logic
+        total_tokens = 0
+        total_tokens += 1  # <|image_start|>
+
+        # Local tiles (if more than 1 tile)
+        if ratio_h * ratio_w > 1:
+            for yy in range(ratio_h):
+                for xx in range(ratio_w):
+                    # Patches for this tile (these are MM tokens, not special tokens)
+                    total_tokens += num_patches_per_chunk
+                    # X separator (except last in row)
+                    if xx < ratio_w - 1:
+                        total_tokens += 1  # <|tile_x_separator|>
+                # Y separator (after each row)
+                total_tokens += 1  # <|tile_y_separator|>
+
+        # Global tile
+        total_tokens += 1  # <|image|>
+        total_tokens += num_patches_per_chunk  # Global tile patches
+
+        # End token
+        total_tokens += 1  # <|image_end|>
+        return total_tokens
 
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt, multimodal_embedding: Dict[str,
@@ -1266,12 +1356,15 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         mm_embeds = []
         if len(multimodal_params) > 0:
             if not DISAGG:
-                mm_embeds = self.mm_encoder.forward(multimodal_params)
+                mm_embeds = get_multimodal_embeddings(
+                    encoder_forward_fn=self.mm_encoder.forward,
+                    multimodal_params=multimodal_params)
             else:
-                mm_embeds = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "Llama4ForConditionalGeneration does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
+            mm_embeds = find_input_mm_embeds(mm_embeds, multimodal_params)
 
         input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
                                                      input_ids, mm_embeds,
