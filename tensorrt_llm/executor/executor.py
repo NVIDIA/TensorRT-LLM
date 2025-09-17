@@ -125,6 +125,7 @@ class GenerationExecutor(ABC):
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt_id: Optional[int] = None,
+        arrival_time: Optional[float] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -149,7 +150,8 @@ class GenerationExecutor(ABC):
             disaggregated_params=disaggregated_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id)
+            cache_salt_id=cache_salt_id,
+            arrival_time=arrival_time)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):

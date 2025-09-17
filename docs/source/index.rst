@@ -78,64 +78,11 @@ Welcome to TensorRT LLM's Documentation!
    :maxdepth: 2
    :caption: Developer Guide
 
-   architecture/overview.md
+   developer-guide/overview.md
    developer-guide/perf-analysis.md
    developer-guide/perf-benchmarking.md
    developer-guide/ci-overview.md
    developer-guide/dev-containers.md
-
-
-.. .. toctree::
-..    :maxdepth: 2
-..    :caption: Architecture
-..    :name: Architecture
-
-..    architecture/overview.md
-..    architecture/core-concepts.md
-..    architecture/checkpoint.md
-..    architecture/workflow.md
-..    architecture/add-model.md
-
-.. .. toctree::
-..    :maxdepth: 2
-..    :caption: Advanced
-..    :name: Advanced
-
-..    advanced/gpt-attention.md
-..    advanced/gpt-runtime.md
-..    advanced/executor.md
-..    advanced/graph-rewriting.md
-..    advanced/inference-request.md
-..    advanced/lora.md
-..    advanced/expert-parallelism.md
-..    advanced/kv-cache-management.md
-..    advanced/kv-cache-reuse.md
-..    advanced/speculative-decoding.md
-..    advanced/disaggregated-service.md
-
-.. .. toctree::
-..    :maxdepth: 2
-..    :caption: Performance
-..    :name: Performance
-
-..    performance/perf-overview.md
-..    Benchmarking <performance/perf-benchmarking.md>
-..    performance/performance-tuning-guide/index
-..    performance/perf-analysis.md
-
-
-.. .. toctree::
-..    :maxdepth: 2
-..    :caption: Reference
-..    :name: Reference
-
-..    reference/troubleshooting.md
-..    reference/support-matrix.md
-
-..    .. reference/upgrading.md
-
-..    reference/precision.md
-..    reference/memory.md
 
 
 .. toctree::
@@ -148,7 +95,6 @@ Welcome to TensorRT LLM's Documentation!
    blogs/H200launch.md
    blogs/XQA-kernel.md
    blogs/H100vsA100.md
-
 
 
 .. toctree::
