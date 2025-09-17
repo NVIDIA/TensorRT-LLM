@@ -280,31 +280,11 @@ def gemma_example_root(llm_root, llm_venv):
     "Get gemma example root"
 
     example_root = os.path.join(llm_root, "examples", "models", "core", "gemma")
-    # https://nvbugs/4559583 Jax dependency broke the entire pipeline in TRT container
-    # due to the dependency incompatibility with torch, which forced reinstall everything
-    # and caused pipeline to fail. We manually install gemma dependency as a WAR.
-    llm_venv.run_cmd(["-m", "pip", "install", "safetensors~=0.4.1", "nltk"])
-    # Install Jax because it breaks dependency
-    google_extension = [
-        "-f",
-        "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
-    ]
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
 
-    # WAR the new posting of "nvidia-cudnn-cu12~=9.0".
-    # "jax[cuda12_pip]~=0.4.19" specifies "nvidia-cudnn-cu12>=8.9" but actually requires "nvidia-cudnn-cu12~=8.9".
-    if "x86_64" in platform.machine():
-        llm_venv.run_cmd(["-m", "pip", "install", "nvidia-cudnn-cu12~=8.9"])
-
-    if "Windows" in platform.system():
-        llm_venv.run_cmd([
-            "-m", "pip", "install", "jax~=0.4.19", "jaxlib~=0.4.19", "--no-deps"
-        ] + google_extension)
-    else:
-        llm_venv.run_cmd([
-            "-m", "pip", "install", "jax[cuda12_pip]~=0.4.19",
-            "jaxlib[cuda12_pip]~=0.4.19", "--no-deps"
-        ] + google_extension)
-    llm_venv.run_cmd(["-m", "pip", "install", "flax~=0.8.0"])
     return example_root
 
 
