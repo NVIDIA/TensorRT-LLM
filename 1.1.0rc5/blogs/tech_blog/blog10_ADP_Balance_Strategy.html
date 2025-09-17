@@ -1,0 +1,1095 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>ADP Balance Strategy &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog10_ADP_Balance_Strategy';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)" href="blog11_GPT_OSS_Eagle3.html" />
+    <link rel="prev" title="Using Dev Containers" href="../../developer-guide/dev-containers.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.1.0rc5" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">ADP Balance Strategy</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="adp-balance-strategy">
+<h1>ADP Balance Strategy<a class="headerlink" href="#adp-balance-strategy" title="Link to this heading">#</a></h1>
+<p>By NVIDIA TensorRT LLM team</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#adp-balance-strategy">ADP Balance Strategy</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#motivation-and-background">Motivation and Background</a></p></li>
+<li><p><a class="reference internal" href="#theoretical-analysis-and-modeling">Theoretical Analysis and Modeling</a></p>
+<ul>
+<li><p><a class="reference internal" href="#mathematical-modeling">Mathematical Modeling</a></p></li>
+<li><p><a class="reference internal" href="#scheduling-strategies-for-load-balancing">Scheduling Strategies for Load Balancing</a></p>
+<ul>
+<li><p><a class="reference internal" href="#baseline-round-robin-token-distribution">Baseline: Round-Robin Token Distribution</a></p></li>
+<li><p><a class="reference internal" href="#adp-balance-strategy-coordinated-waiting-mechanism">ADP Balance Strategy: Coordinated Waiting Mechanism</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#performance-analysis-baseline-vs-adp-balance">Performance Analysis: Baseline vs. ADP Balance</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#experiments">Experiments</a></p>
+<ul>
+<li><p><a class="reference internal" href="#setting">Setting</a></p>
+<ul>
+<li><p><a class="reference internal" href="#dataset-configuration">Dataset Configuration</a></p></li>
+<li><p><a class="reference internal" href="#hardware-and-model-configuration">Hardware and Model Configuration</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#performance-results">Performance Results</a></p>
+<ul>
+<li><p><a class="reference internal" href="#performance-summary">Performance Summary</a></p></li>
+<li><p><a class="reference internal" href="#baseline-performance">Baseline Performance</a></p></li>
+<li><p><a class="reference internal" href="#adp-balance-with-context-wait-implementation">ADP Balance with Context Wait Implementation</a></p></li>
+<li><p><a class="reference internal" href="#adp-balance-with-full-strategy-implementation">ADP Balance with Full Strategy Implementation</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#pareto-analysis-throughput-latency-trade-off-optimization">Pareto Analysis: Throughput-Latency Trade-off Optimization</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#conclusion">Conclusion</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgement">Acknowledgement</a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="motivation-and-background">
+<h2>Motivation and Background<a class="headerlink" href="#motivation-and-background" title="Link to this heading">#</a></h2>
+<p>In DeepSeek MLA + MoE architectures under maximum-throughput scenarios, an Attention Data Parallel (ADP) + MoE Expert Parallel (EP) strategy is commonly employed to eliminate redundant KV cache storage, and utilize disaggregated serving to prevent ADP imbalances. However, certain deployment scenarios still favor In-Flight Batching (IFB) inference, including:</p>
+<ul class="simple">
+<li><p><strong>System complexity reduction</strong>: Avoiding the operational overhead and maintenance costs associated with disaggregated architectures</p></li>
+<li><p><strong>Specific workload patterns</strong>: Scenarios with short input sequence lengths (ISL) and long output sequence lengths (OSL)</p></li>
+<li><p><strong>Offline inference</strong>: Batch processing environments where Time-To-First-Token (TTFT) and Time-To-Output-Token (TPOT) requirements are more relaxed</p></li>
+</ul>
+<p>However, IFB introduces significant load imbalance challenges within the Attention module that severely impact system performance. The core issue arises when different ranks simultaneously handle heterogeneous workloads within the same iteration. For instance, some ranks may be processing computationally intensive context phases while others execute generation phases, creating substantial disparities in token processing loads. This bottlenecks the overall system throughput, as the iteration time is dominated by the slowest rank.</p>
+<p>To address this critical performance limitation, we introduce the <strong>ADP (Attention Data Parallel) Balance Strategy</strong>—a novel scheduling optimization designed to achieve optimal load distribution across DP ranks and maximize system utilization.</p>
+</section>
+<section id="theoretical-analysis-and-modeling">
+<h2>Theoretical Analysis and Modeling<a class="headerlink" href="#theoretical-analysis-and-modeling" title="Link to this heading">#</a></h2>
+<p><strong>Optimization Objective</strong>: Minimize load imbalance across different GPU ranks to maximize overall system throughput.</p>
+<section id="mathematical-modeling">
+<h3>Mathematical Modeling<a class="headerlink" href="#mathematical-modeling" title="Link to this heading">#</a></h3>
+<p>We model and quantify the performance impact of load imbalance in Attention DP. Since workloads across ranks can be heterogeneous, the execution time for the Attention module in any given iteration is bounded by the rank with the highest workload:</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>time_i = \max_{0 \leq m &lt; N} time_{i,m}
+</pre></div>
+</div>
+<p>where $time_{i,m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.</p>
+<p>To quantify load balance and theoretical performance bounds, we define two key metrics:</p>
+<section id="balance-ratio">
+<h4>1. Balance Ratio<a class="headerlink" href="#balance-ratio" title="Link to this heading">#</a></h4>
+<p>The $balance\_ratio$ measures the load distribution across ranks within the Attention module for each iteration:</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>balance\_ratio = \frac{avg\_tokens}{max\_tokens}
+</pre></div>
+</div>
+<p>where:</p>
+<ul class="simple">
+<li><p>$avg\_tokens$ represents the average number of tokens across all ranks</p></li>
+<li><p>$max\_tokens$ represents the maximum number of tokens across all ranks</p></li>
+<li><p>$tokens_i$ represents the number of tokens processed by rank $i$</p></li>
+</ul>
+<p>Note: MoE module load balancing is handled separately by the Expert Parallel Load Balancer (EPLB) module and is not considered during the early scheduling phase.</p>
+</section>
+<section id="speed-of-light-throughput-sol-tps">
+<h4>2. Speed-of-Light Throughput (SOL TPS)<a class="headerlink" href="#speed-of-light-throughput-sol-tps" title="Link to this heading">#</a></h4>
+<p>The $sol\_tps$ represents the theoretical upper-bound throughput achievable with perfect load balancing:</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>sol\_time = \sum_{i=0}^{\infty} time_i * balance\_ratio_i
+</pre></div>
+</div>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>sol\_tps = \frac{elapsed\_time}{sol\_time} \times actual\_tps
+</pre></div>
+</div>
+<p>where:</p>
+<ul class="simple">
+<li><p>$time_i$: Measured execution time of iteration $i$</p></li>
+<li><p>$elapsed\_time$: Total empirically measured end-to-end execution time</p></li>
+<li><p>$actual\_tps$: Observed throughput in tokens per second</p></li>
+<li><p>$sol\_tps$: Theoretical maximum throughput under perfect load balance</p></li>
+</ul>
+<p>This theoretical framework enables us to quantify the performance gap between current and optimal system utilization, providing clear targets for optimization.</p>
+</section>
+</section>
+<section id="scheduling-strategies-for-load-balancing">
+<h3>Scheduling Strategies for Load Balancing<a class="headerlink" href="#scheduling-strategies-for-load-balancing" title="Link to this heading">#</a></h3>
+<p>The fundamental challenge in Attention DP is that ranks can process vastly different token loads within the same iteration, causing the overall execution time to be bottlenecked by the most heavily loaded rank.</p>
+<section id="baseline-round-robin-token-distribution">
+<h4>Baseline: Round-Robin Token Distribution<a class="headerlink" href="#baseline-round-robin-token-distribution" title="Link to this heading">#</a></h4>
+<p>The conventional approach employs a global load balancing strategy that sorts incoming requests by <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> and distributes them across ranks using round-robin scheduling, as illustrated in Figure 1. This method achieves reasonable token distribution from a cumulative perspective and effectively reduces token count disparities when all ranks are simultaneously processing context requests.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_baseline_round_robin_strategy.png">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1: Baseline round-robin strategy balances context request tokens across ranks through sorting and cyclic distribution</em></sub></p>
+<p><strong>Limitations</strong>: While effective globally, this approach fails to guarantee per-iteration load balance. A critical scenario arises when some ranks process context phases, while others handle generation (decode), creating severe load imbalances that dominate overall execution time.</p>
+</section>
+<section id="adp-balance-strategy-coordinated-waiting-mechanism">
+<h4>ADP Balance Strategy: Coordinated Waiting Mechanism<a class="headerlink" href="#adp-balance-strategy-coordinated-waiting-mechanism" title="Link to this heading">#</a></h4>
+<p>To address the per-iteration load imbalance problem, we propose the <strong>ADP Balance Strategy</strong>, which employs a sophisticated waiting mechanism to synchronize context processing across ranks. The core principle is strategic delay: instead of immediately scheduling context requests to available ranks, the system waits strategically to ensure multiple ranks have similar workloads before proceeding.</p>
+<p><strong>Algorithm Design</strong>: The strategy introduces two complementary control parameters:</p>
+<p><strong>1. Context Synchronization (<code class="docutils literal notranslate"><span class="pre">timeout_iters</span></code>)</strong></p>
+<ul class="simple">
+<li><p><strong>Purpose</strong>: Ensures temporal alignment of context processing across ranks</p></li>
+<li><p><strong>Mechanism</strong>: When a rank becomes available for context processing while others remain in generation phases, it waits up to <code class="docutils literal notranslate"><span class="pre">timeout_iters</span></code> iterations until all other ranks have context tasks</p></li>
+<li><p><strong>Benefit</strong>: Prevents the scenario where one rank processes context tasks while others handle generation tasks</p></li>
+</ul>
+<p><strong>2. Batch Equilibration (<code class="docutils literal notranslate"><span class="pre">batching_wait_iters</span></code>)</strong></p>
+<ul class="simple">
+<li><p><strong>Purpose</strong>: Balances the number of accumulated context batches across ranks</p></li>
+<li><p><strong>Mechanism</strong>: After initial synchronization, ranks with fewer accumulated context batches wait up to <code class="docutils literal notranslate"><span class="pre">batching_wait_iters</span></code> additional iterations to accumulate more batches</p></li>
+<li><p><strong>Benefit</strong>: Prevents load imbalances caused by uneven context batch accumulation, where some ranks may have multiple batches while others have only one</p></li>
+</ul>
+</section>
+</section>
+<section id="performance-analysis-baseline-vs-adp-balance">
+<h3>Performance Analysis: Baseline vs. ADP Balance<a class="headerlink" href="#performance-analysis-baseline-vs-adp-balance" title="Link to this heading">#</a></h3>
+<p>To illustrate the effectiveness of our approach, consider a simplified scenario where:</p>
+<ul class="simple">
+<li><p>All ranks have equal-length contexts and M ongoing requests</p></li>
+<li><p>N new requests arrive sequentially over N iterations.</p></li>
+<li><p>Context processing time: <code class="docutils literal notranslate"><span class="pre">time(ctx)</span></code> &gt;&gt; Generation processing time: <code class="docutils literal notranslate"><span class="pre">time(gen)</span></code></p></li>
+</ul>
+<p><strong>Baseline Behavior:</strong>
+In the traditional approach, contexts are processed sequentially across ranks, resulting in severe load imbalances:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>iter_i:     [*C0*, g01, ..., g0M], [g10, g11, ..., g1M], ..., [gN0, gN1, ..., gNM]
+iter_i+1:   [g00, g01, ..., g0M], [*C1*, g11, ..., g1M], ..., [gN0, gN1, ..., gNM]
+...
+iter_i+N-1: [g00, g01, ..., g0M], [g10, g11, ..., g1M], ..., [*CN*, gN1, ..., gNM]
+</pre></div>
+</div>
+<p><em>Legend: <code class="docutils literal notranslate"><span class="pre">*Ci*</span></code> = context request i, <code class="docutils literal notranslate"><span class="pre">gij</span></code> = generation request j on rank i</em></p>
+<ul class="simple">
+<li><p><strong>Per-iteration time</strong>: <code class="docutils literal notranslate"><span class="pre">time(ctx)</span></code> (dominated by context processing)</p></li>
+<li><p><strong>Total execution time</strong>: <code class="docutils literal notranslate"><span class="pre">time(ctx)</span> <span class="pre">×</span> <span class="pre">N</span></code></p></li>
+<li><p><strong>Balance ratio</strong>: <code class="docutils literal notranslate"><span class="pre">(ctx_len</span> <span class="pre">+</span> <span class="pre">(M-1)</span> <span class="pre">+</span> <span class="pre">M</span> <span class="pre">×</span> <span class="pre">(N-1))</span> <span class="pre">/</span> <span class="pre">(N</span> <span class="pre">×</span> <span class="pre">ctx_len)</span></code> (poor balance)</p></li>
+</ul>
+<p><strong>ADP Balance Strategy:</strong>
+Our method synchronizes context processing by strategic waiting:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>iter_i:     [g00, g01, ..., g0M], [g10, g11, ..., g1M], ..., [gN0, gN1, ..., gNM]
+iter_i+1:   [g00, g01, ..., g0M], [g10, g11, ..., g1M], ..., [gN0, gN1, ..., gNM]
+...
+iter_i+N-1: [*C0*, g01, ..., g0M], [*C1*, g11, ..., g1M], ..., [*CN*, gN1, ..., gNM]
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><strong>Per-iteration time</strong>: <code class="docutils literal notranslate"><span class="pre">time(gen)</span></code> for first N-1 iterations, <code class="docutils literal notranslate"><span class="pre">time(ctx)</span></code> for final iteration</p></li>
+<li><p><strong>Total execution time</strong>: <code class="docutils literal notranslate"><span class="pre">time(gen)</span> <span class="pre">×</span> <span class="pre">(N-1)</span> <span class="pre">+</span> <span class="pre">time(ctx)</span></code></p></li>
+<li><p><strong>Balance ratio</strong>: 1.0 (perfect balance)</p></li>
+<li><p><strong>Time savings</strong>: <code class="docutils literal notranslate"><span class="pre">(time(ctx)</span> <span class="pre">-</span> <span class="pre">time(gen))</span> <span class="pre">×</span> <span class="pre">(N-1)</span></code></p></li>
+</ul>
+<p><strong>Trade-offs:</strong></p>
+<ul class="simple">
+<li><p>✅ <strong>Throughput improvement</strong> due to optimal load balancing</p></li>
+<li><p>✅ <strong>Maximized GPU utilization</strong> across all ranks</p></li>
+<li><p>⚠️ <strong>Increased TTFT</strong> due to strategic waiting mechanism</p></li>
+<li><p>📋 <strong>Best suited for</strong> throughput-oriented scenarios where TTFT is not critical</p></li>
+</ul>
+</section>
+</section>
+<section id="experiments">
+<h2>Experiments<a class="headerlink" href="#experiments" title="Link to this heading">#</a></h2>
+<section id="setting">
+<h3>Setting<a class="headerlink" href="#setting" title="Link to this heading">#</a></h3>
+<section id="dataset-configuration">
+<h4>Dataset Configuration<a class="headerlink" href="#dataset-configuration" title="Link to this heading">#</a></h4>
+<p>We evaluate our approach using a comprehensive dataset comprising 16,000 inference requests with the following characteristics:</p>
+<ul class="simple">
+<li><p><strong>Request volume</strong>: 16,000 total requests</p></li>
+<li><p><strong>Average input length</strong>: 803 tokens</p></li>
+<li><p><strong>Average output length</strong>: 3,653 tokens</p></li>
+<li><p><strong>Token distribution</strong>: Figure 2 illustrates the distribution patterns for both input and output sequences</p></li>
+</ul>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_dataset_token_distribution.png">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2: Distribution of input and output token lengths</em></sub></p>
+<p><strong>Dataset Characteristics</strong>: The dataset exhibits significant diversity in sequence lengths, with output tokens following a pronounced long-tail distribution. This heterogeneity presents substantial challenges for load balancing, as it becomes difficult to co-schedule multiple context requests within the same iteration while minimizing computational bubbles—making it an ideal testbed for evaluating our scheduling strategy.</p>
+</section>
+<section id="hardware-and-model-configuration">
+<h4>Hardware and Model Configuration<a class="headerlink" href="#hardware-and-model-configuration" title="Link to this heading">#</a></h4>
+<p><strong>Infrastructure</strong>:</p>
+<ul class="simple">
+<li><p><strong>Platform</strong>: NVIDIA Blackwell GB200 system</p></li>
+<li><p><strong>GPU Count</strong>: 8 × GB200 GPUs</p></li>
+<li><p><strong>Model</strong>: DeepSeek V3</p></li>
+<li><p><strong>Parallelization Strategy</strong>:</p>
+<ul>
+<li><p>Attention module: Data Parallel (DP) size = 8</p></li>
+<li><p>MoE module: Expert Parallel (EP) size = 8</p></li>
+</ul>
+</li>
+</ul>
+</section>
+</section>
+<section id="performance-results">
+<h3>Performance Results<a class="headerlink" href="#performance-results" title="Link to this heading">#</a></h3>
+<p>We evaluate three distinct configurations to demonstrate the progressive benefits of our ADP Balance strategy:</p>
+<ol class="arabic simple">
+<li><p><strong>Baseline</strong>: Round-robin scheduling</p></li>
+<li><p><strong>ADP Balance (Context Wait)</strong>: Implementing <code class="docutils literal notranslate"><span class="pre">timeout_iters</span></code> parameter only</p></li>
+<li><p><strong>ADP Balance (Full Strategy)</strong>: Complete implementation with both <code class="docutils literal notranslate"><span class="pre">timeout_iters</span></code> and <code class="docutils literal notranslate"><span class="pre">batching_wait_iters</span></code></p></li>
+</ol>
+<section id="performance-summary">
+<h4>Performance Summary<a class="headerlink" href="#performance-summary" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Configuration</p></th>
+<th class="head"><p>Actual TPS</p></th>
+<th class="head"><p>Avg Balance Ratio</p></th>
+<th class="head"><p>SOL TPS</p></th>
+<th class="head"><p>Speedup</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Baseline</p></td>
+<td><p>25,664</p></td>
+<td><p>54.11%</p></td>
+<td><p>39,552</p></td>
+<td><p>1.00×</p></td>
+</tr>
+<tr class="row-odd"><td><p>ADP Balance (Context Wait)</p></td>
+<td><p>33,499</p></td>
+<td><p>84.33%</p></td>
+<td><p>38,312</p></td>
+<td><p>1.31×</p></td>
+</tr>
+<tr class="row-even"><td><p>ADP Balance (Full Strategy)</p></td>
+<td><p>34,140</p></td>
+<td><p>87.70%</p></td>
+<td><p>37,912</p></td>
+<td><p>1.33×</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Key Observations</strong>:</p>
+<ul class="simple">
+<li><p>Context Wait alone delivers a substantial <strong>31% throughput improvement</strong></p></li>
+<li><p>Full strategy achieves <strong>33% total speedup</strong> with near-optimal balance (87.70%)</p></li>
+<li><p>Balance ratio improvement: <strong>54% → 87%</strong> represents a dramatic reduction in load imbalance</p></li>
+</ul>
+<p><em>Note: The decrease in SOL TPS with waiting mechanisms occurs because the strategic delays in context scheduling increase the total number of iterations required to complete all requests. Since SOL TPS calculation only accounts for load imbalance effects within each iteration, it doesn’t reflect the iteration count increase caused by delayed context entry, leading to an apparent reduction despite overall system efficiency improvements.</em></p>
+</section>
+<section id="baseline-performance">
+<h4>Baseline Performance<a class="headerlink" href="#baseline-performance" title="Link to this heading">#</a></h4>
+<p>Figure 3 provides comprehensive insight into baseline system behavior, displaying both average tokens across ranks (top) and the corresponding balance ratio (bottom) by iteration. The balance ratio serves as a key indicator: values approaching 1.0 represent optimal balance, while values near 0.0 indicate severe imbalances.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_baseline_performance_overview.png">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3: Baseline performance overview showing token distribution and balance ratios across all iterations</em></sub></p>
+<p><strong>Critical Insights</strong>:</p>
+<ul class="simple">
+<li><p><strong>Imbalance window</strong>: Most severe imbalances occur within the first 12,000 iterations, as evidenced by the average token distribution showing that all context processing phases occur within this critical interval</p></li>
+<li><p><strong>Performance gap</strong>: SOL TPS of 39,552 vs. actual TPS of 25,664 reveals a <strong>35% efficiency loss</strong></p></li>
+<li><p><strong>System behavior</strong>: After iteration 12,000, all requests transition to generation phase, naturally reducing imbalances</p></li>
+</ul>
+<p>Figure 4 zooms into the critical imbalance period [100-12,000], revealing the dramatic instability in load distribution:</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_baseline_performance_detail.png">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 4: Detailed baseline analysis for iterations 100-12,000 showing severe balance fluctuations</em></sub></p>
+<p><strong>Performance Bottlenecks</strong>:</p>
+<ul class="simple">
+<li><p>Balance ratio frequently drops to <strong>0.4 or lower</strong>, indicating 60%+ load imbalance</p></li>
+<li><p>Theoretical improvement potential of <strong>70.23%</strong> within the critical window</p></li>
+<li><p>Extreme volatility in load distribution creates unpredictable performance characteristics</p></li>
+</ul>
+</section>
+<section id="adp-balance-with-context-wait-implementation">
+<h4>ADP Balance with Context Wait Implementation<a class="headerlink" href="#adp-balance-with-context-wait-implementation" title="Link to this heading">#</a></h4>
+<p>The Context Wait mechanism (<code class="docutils literal notranslate"><span class="pre">timeout_iters=50</span></code>) demonstrates the effectiveness of our first optimization component, achieving substantial performance improvements through context synchronization.</p>
+<p><strong>Performance Achievements</strong>:</p>
+<ul class="simple">
+<li><p><strong>Throughput</strong>: 33,499 TPS (1.31× speedup)</p></li>
+<li><p><strong>Balance improvement</strong>: 84.33% average (vs. 54.11% baseline)</p></li>
+<li><p><strong>Efficiency</strong>: Actual TPS significantly closer to theoretical SOL TPS (38,312)</p></li>
+</ul>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_context_wait_performance.png">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 5: Context Wait performance showing improved balance stability for iterations 100-12,000</em></sub></p>
+<p><strong>Remaining Challenges</strong>:
+Despite significant improvements, residual imbalances persist due to:</p>
+<ol class="arabic simple">
+<li><p><strong>Timeout scenarios</strong>: Some ranks exceed the waiting threshold when context requests don’t arrive uniformly</p></li>
+<li><p><strong>Batch accumulation disparity</strong>: Longer-waiting ranks accumulate multiple context batches while recently-freed ranks process single batches</p></li>
+<li><p><strong>Partial synchronization</strong>: While initial synchronization succeeds, subsequent load variations still occur</p></li>
+</ol>
+<p>This analysis motivated the development of our second optimization component: batch equilibration.</p>
+</section>
+<section id="adp-balance-with-full-strategy-implementation">
+<h4>ADP Balance with Full Strategy Implementation<a class="headerlink" href="#adp-balance-with-full-strategy-implementation" title="Link to this heading">#</a></h4>
+<p>The complete ADP Balance strategy combines both context synchronization and batch equilibration mechanisms, delivering optimal load balancing performance.</p>
+<p><strong>Configuration</strong>: <code class="docutils literal notranslate"><span class="pre">timeout_iters=50</span></code> + <code class="docutils literal notranslate"><span class="pre">batching_wait_iters=10</span></code></p>
+<p><strong>Performance Optimization Results</strong>:</p>
+<ul class="simple">
+<li><p><strong>Peak throughput</strong>: 34,140 TPS (1.33× speedup)</p></li>
+<li><p><strong>Optimal balance</strong>: 87.70% average balance ratio</p></li>
+<li><p><strong>Near-theoretical efficiency</strong>: Actual TPS (34,140) approaches SOL TPS (37,912)</p></li>
+<li><p><strong>System stability</strong>: Dramatically reduced load variance across iterations</p></li>
+</ul>
+<p><strong>Production Configuration</strong>:
+Users can enable the full ADP Balance strategy by adding the following configuration:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_dp_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">enable_balance</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">batching_wait_iters</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span>
+<span class="w">    </span><span class="nt">timeout_iters</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">50</span>
+</pre></div>
+</div>
+<p>The effectiveness of our complete ADP Balance implementation is clearly demonstrated in Figure 6. The visualization reveals how the combination of context synchronization and batch equilibration mechanisms achieves near-optimal load balancing throughout the critical execution window.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_full_strategy_performance.png">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6: Full ADP Balance strategy demonstrating superior balance stability for iterations 100-12,000</em></sub></p>
+<p><strong>Key Improvements Over Context Wait</strong>:</p>
+<ul class="simple">
+<li><p><strong>Enhanced stability</strong>: Balance ratio maintains consistently higher values with reduced volatility</p></li>
+<li><p><strong>Residual imbalance mitigation</strong>: Batch equilibration addresses the remaining load disparities</p></li>
+<li><p><strong>System predictability</strong>: More uniform performance characteristics across iterations</p></li>
+</ul>
+<p><strong>Implementation Trade-offs</strong>:</p>
+<ul class="simple">
+<li><p>✅ <strong>Maximum throughput improvement</strong>: 33% gain over baseline</p></li>
+<li><p>✅ <strong>Near-optimal load balancing</strong>: 87.70% average balance ratio</p></li>
+<li><p>⚠️ <strong>Iteration overhead</strong>: Waiting mechanisms increase total iteration count</p></li>
+<li><p>⚠️ <strong>TTFT impact</strong>: Strategic delays affect time-to-first-token metrics</p></li>
+</ul>
+</section>
+</section>
+<section id="pareto-analysis-throughput-latency-trade-off-optimization">
+<h3>Pareto Analysis: Throughput-Latency Trade-off Optimization<a class="headerlink" href="#pareto-analysis-throughput-latency-trade-off-optimization" title="Link to this heading">#</a></h3>
+<p>Understanding the performance trade-offs inherent in our ADP Balance strategy is crucial for production deployment decisions. Figure 7 presents a comprehensive Pareto frontier analysis that maps the relationship between system throughput (TPS per GPU) and Time-To-First-Token (TTFT) across varying workload intensities and parameter configurations.</p>
+<p><strong>Experimental Design</strong>: The analysis evaluates multiple configurations of <code class="docutils literal notranslate"><span class="pre">timeout_iters</span></code> (TO) and <code class="docutils literal notranslate"><span class="pre">batching_wait_iters</span></code> (BW) parameters under different system load conditions, revealing how parameter tuning affects the fundamental throughput-latency trade-off.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog10_tps_ttft_pareto_curve.png">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7: Pareto frontier analysis showing throughput-latency trade-offs across different ADP Balance configurations</em></sub></p>
+<p><strong>Key Findings</strong>:</p>
+<ol class="arabic simple">
+<li><p><strong>Universal Throughput Gains</strong>: ADP Balance consistently delivers superior TPS/GPU performance across the entire operational spectrum, from latency-sensitive to throughput-maximized deployments</p></li>
+<li><p><strong>Scalability Benefits</strong>: Performance improvements become increasingly pronounced under higher system loads, where load imbalance penalties are most severe</p></li>
+<li><p><strong>TTFT Trade-off</strong>: Throughput gains necessitate increased first-token latency due to the strategic waiting mechanisms, with higher parameter values yielding greater throughput at the cost of longer response initiation</p></li>
+<li><p><strong>Configuration Guidance</strong>:</p>
+<ul class="simple">
+<li><p><strong>Low-load scenarios</strong>: <code class="docutils literal notranslate"><span class="pre">batching_wait_iters</span></code> provides minimal benefit while adding latency overhead</p></li>
+<li><p><strong>High-throughput scenarios</strong>: Both parameters contribute significantly to performance optimization</p></li>
+<li><p><strong>Balanced deployments</strong>: Moderate parameter values offer optimal throughput-latency balance</p></li>
+</ul>
+</li>
+</ol>
+<p><strong>Production Implications</strong>: This analysis empowers system operators to make data-driven configuration decisions based on specific deployment requirements—whether optimizing for minimum response latency or maximum system throughput.</p>
+</section>
+</section>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
+<p>Load imbalance in Attention Data Parallel processing represents a fundamental bottleneck in large language model inference systems, particularly under In-Flight Batching scenarios where heterogeneous workloads create severe performance penalties. This work introduces the <strong>ADP Balance Strategy</strong>—a sophisticated scheduling optimization that addresses this critical challenge through coordinated waiting mechanisms.</p>
+<p><strong>Technical Contributions</strong>:
+Our approach employs two complementary optimization components: context synchronization (<code class="docutils literal notranslate"><span class="pre">timeout_iters</span></code>) and batch equilibration (<code class="docutils literal notranslate"><span class="pre">batching_wait_iters</span></code>). These mechanisms work in concert to achieve temporal alignment of computationally intensive context processing across data parallel ranks, effectively eliminating the performance bottlenecks caused by rank-level load imbalances.</p>
+<p><strong>Experimental Validation</strong>:
+Comprehensive evaluation on the DeepSeek V3 architecture demonstrates compelling performance improvements:</p>
+<ul class="simple">
+<li><p><strong>33% throughput increase</strong>: From 25,664 to 34,140 TPS</p></li>
+<li><p><strong>87% load balance achievement</strong>: Dramatic improvement from 54% baseline</p></li>
+<li><p><strong>Near-theoretical efficiency</strong>: Actual performance approaching speed-of-light throughput bounds</p></li>
+</ul>
+<p><strong>Production Readiness</strong>:
+The Pareto frontier analysis provides critical insights for real-world deployment, revealing that while the strategy introduces TTFT trade-offs, it consistently delivers superior throughput across diverse operational scenarios. The configurable parameter framework enables operators to optimize for their specific performance requirements, whether prioritizing response latency or system throughput.</p>
+</section>
+<section id="acknowledgement">
+<h2>Acknowledgement<a class="headerlink" href="#acknowledgement" title="Link to this heading">#</a></h2>
+<p>The ADP Balance strategy was a great team effort, covering system performance analysis and optimization. While we cannot thank every contributor individually, we are proud to acknowledge the dedicated team of engineers whose collective expertise has propelled TensorRT LLM to new heights of performance. Through this collaborative effort, we have gained valuable insights into improving GPU utilization for large language model inference. We hope the techniques and experiences shared in this blog post will empower the developer community to better leverage the performance of NVIDIA GPUs in their mission-critical LLM inference applications.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../../developer-guide/dev-containers.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Using Dev Containers</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog11_GPT_OSS_Eagle3.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#motivation-and-background">Motivation and Background</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#theoretical-analysis-and-modeling">Theoretical Analysis and Modeling</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mathematical-modeling">Mathematical Modeling</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#balance-ratio">1. Balance Ratio</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#speed-of-light-throughput-sol-tps">2. Speed-of-Light Throughput (SOL TPS)</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#scheduling-strategies-for-load-balancing">Scheduling Strategies for Load Balancing</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#baseline-round-robin-token-distribution">Baseline: Round-Robin Token Distribution</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#adp-balance-strategy-coordinated-waiting-mechanism">ADP Balance Strategy: Coordinated Waiting Mechanism</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-analysis-baseline-vs-adp-balance">Performance Analysis: Baseline vs. ADP Balance</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#experiments">Experiments</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#setting">Setting</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dataset-configuration">Dataset Configuration</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#hardware-and-model-configuration">Hardware and Model Configuration</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-results">Performance Results</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-summary">Performance Summary</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#baseline-performance">Baseline Performance</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#adp-balance-with-context-wait-implementation">ADP Balance with Context Wait Implementation</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#adp-balance-with-full-strategy-implementation">ADP Balance with Full Strategy Implementation</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#pareto-analysis-throughput-latency-trade-off-optimization">Pareto Analysis: Throughput-Latency Trade-off Optimization</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#acknowledgement">Acknowledgement</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 15, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

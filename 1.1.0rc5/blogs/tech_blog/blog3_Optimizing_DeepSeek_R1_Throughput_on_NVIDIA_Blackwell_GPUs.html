@@ -1,0 +1,917 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html" />
+    <link rel="prev" title="DeepSeek R1 MTP Implementation and Optimization" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.1.0rc5" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-gpt-oss-on-trtllm.html">Quick Start Recipe for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog5_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog6_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog7_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog9_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="optimizing-deepseek-r1-throughput-on-nvidia-blackwell-gpus-a-deep-dive-for-developers">
+<h1>Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers<a class="headerlink" href="#optimizing-deepseek-r1-throughput-on-nvidia-blackwell-gpus-a-deep-dive-for-developers" title="Link to this heading">#</a></h1>
+<p>By NVIDIA TensorRT LLM team</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#optimizing-deepseek-r1-throughput-on-nvidia-blackwell-gpus-a-deep-dive-for-developers">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#introduction">Introduction</a></p></li>
+<li><p><a class="reference internal" href="#precision-strategy">Precision strategy</a></p></li>
+<li><p><a class="reference internal" href="#parallel-strategy">Parallel strategy</a></p>
+<ul>
+<li><p><a class="reference internal" href="#weights-absorb-and-mqa">Weights absorb and MQA</a></p></li>
+<li><p><a class="reference internal" href="#data-parallel-for-attention-module-adp">Data Parallel for Attention module (ADP)</a></p></li>
+<li><p><a class="reference internal" href="#expert-parallel-for-moe-ep">Expert parallel for MoE (EP)</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#mla-layers-optimizations">MLA Layers Optimizations</a></p></li>
+<li><p><a class="reference internal" href="#moe-layers-optimizations">MoE Layers Optimizations</a></p></li>
+<li><p><a class="reference internal" href="#runtime-optimizations">Runtime Optimizations</a></p></li>
+<li><p><a class="reference internal" href="#how-to-reproduce">How to reproduce</a></p></li>
+<li><p><a class="reference internal" href="#future-works">Future Works</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgment">Acknowledgment</a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="introduction">
+<h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
+<p>The open source DeepSeek R1 model’s innovative architecture including the multi-head latent attention (MLA) and large sparse Mixture-of-Experts (MoE) significantly improved the inference efficiency of the LLM models. However, harnessing the full potential of such an innovative structure requires equally important hardware/software co-optimization. This post delves into the optimization strategies for DeepSeek R1 throughput oriented scenarios (TPS/GPU), developed by NVIDIA within TensorRT LLM on NVIDIA’s Blackwell B200 GPUs. We will explore the rationale behind each enhancement. <a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html"><span class="std std-doc">The other min-latency optimization blog</span></a> explained in detail how TensorRT LLM optimizes the R1 performance to achieve the best of the TPS/USER.</p>
+<p>These optimizations have significantly boosted DeepSeek R1 throughput on Blackwell. Performance increased from approximately 2000 TPS/GPU in February to 4600 TPS/GPU on ISL/OSL 1K/2K dataset. The optimizations are general and applicable to other ISL/OSL configs too. These optimization items were broadly categorized into three areas: MLA layers, MoE layers, and runtime.</p>
+</section>
+<section id="precision-strategy">
+<h2>Precision strategy<a class="headerlink" href="#precision-strategy" title="Link to this heading">#</a></h2>
+<p>The mixed precision recipe for DeepSeek R1 throughput scenario is almost the same as <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md#precision-strategy">what</a> is used for latency oriented scenario, with the following differences:</p>
+<ul class="simple">
+<li><p>FP8 KV cache and FP8 attention, rather than BF16 precision.</p></li>
+<li><p>FP4 Allgather for better communication bandwidth utilization.</p></li>
+</ul>
+<p>The checkpoint used in this blog is hosted in <a class="reference external" href="https://huggingface.co/nvidia/DeepSeek-R1-FP4">nvidia/DeepSeek-R1-FP4</a>, generated by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">NVIDIA Model Optimizer</a>. The accuracy score of common dataset on this FP4 checkpoint and TensorRT LLM implementations are:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Precision</p></th>
+<th class="head text-left"><p>GPQA Diamond</p></th>
+<th class="head text-left"><p>MATH-500</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>TensorRT LLM FP8</p></td>
+<td class="text-left"><p>0.697</p></td>
+<td class="text-left"><p>0.954</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>TensorRT LLM FP4</p></td>
+<td class="text-left"><p>0.705</p></td>
+<td class="text-left"><p>0.96</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>** Note there are some run-to-run variance for these evaluations, so FP4 data is slight higher here. We think FP4 has comparable accuracy with FP8 on these datasets.</p>
+<p>The MoE layers inside this checkpoint have been quantized into FP4. Quantizing the MoE layer weights into FP4 has the following benefits:</p>
+<ul class="simple">
+<li><p>Fully utilize the 5th generation Tensor Core FLOPS of the NVIDIA Blackwell GPUs</p></li>
+<li><p>Reduce the memory load needs of the weights by almost half for MoE. Since the MoE parts are still memory bound for the decoding phase for the scenario, and 97% of the weights in the DeepSeek R1 model are from MoE layers.</p></li>
+<li><p>Reduce the memory footprint of the model weights, thus freeing more GPU memories for KV cache and then increasing the max concurrency. <a class="reference external" href="https://huggingface.co/deepseek-ai/DeepSeek-R1">The original FP8 model checkpoint of the DeepSeek R1 model</a> is about 640GB, while the NVIDIA provided <a class="reference external" href="https://huggingface.co/nvidia/DeepSeek-R1-FP4">DeepSeek R1 FP4 quantized model</a> is only about 400 GB.</p></li>
+</ul>
+<p>The precision of FP8 KV cache and FP8 attention kernels are evaluated on the GSM8K dataset, with no obvious accuracy drops. For the accuracy numbers, please see the table in the FP8 KV cache section. Users can still opt-out to use BF16 KV cache and attention if on their dataset some accuracy differences are observed.</p>
+</section>
+<section id="parallel-strategy">
+<h2>Parallel strategy<a class="headerlink" href="#parallel-strategy" title="Link to this heading">#</a></h2>
+<p>The parallelism strategy for DeepSeek R1 throughput scenario is different from what is used for latency-oriented scenarios.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Components</p></th>
+<th class="head text-left"><p>Parallel Patterns</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Attention Modules</p></td>
+<td class="text-left"><p>Data Parallelism 8 (DP8)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>MoE Sparse Experts</p></td>
+<td class="text-left"><p>Expert Parallelism 8 (EP8)</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>MoE Shared Experts</p></td>
+<td class="text-left"><p>DP8</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Fuse_A GEMM</p></td>
+<td class="text-left"><p>DP8</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Router GEMM</p></td>
+<td class="text-left"><p>DP8</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>In the following sections we will explain the rationale why DP and EP are chosen and not using tensor parallel (TP).</p>
+<section id="weights-absorb-and-mqa">
+<h3>Weights absorb and MQA<a class="headerlink" href="#weights-absorb-and-mqa" title="Link to this heading">#</a></h3>
+<p>The core idea of MLA is the low-rank joint compression for the attention keys and values to reduce KV-cache size during the inference. Based on the MLA formulas, the down-projected KV latent is up-projected to multiple heads and combined with the up-projected Q to establish a normal multi-head attention (MHA). Due to the nature of the matrix multiplication, the up projection weights matrix of the K (W^UK) can be multiplied by the up-projection weights matrix of Q (W^Q) firstly, the computed results of these 2 can be then multiplied to Q. The up-projection weights matrix of V (W^UV) and the attention output projection matrix W^O can also be multiplied after the attention output. The DeepSeek-V2 technical report calls this technique “absorb”. After the weights are absorbed, the MLA is equivalent to multiple query attention(MQA). Please see the <a class="reference external" href="https://arxiv.org/pdf/2405.04434">original DeepSeek-V2 technical paper</a> for the detailed formulas and explanations, the following block diagram shows the computational flow of weights absorbed MLA in TensorRT LLM.
+<img alt="Weights Absorb" src="../../_images/tech_blog3_mla_absorb.png" /></p>
+<p>For the decoding phase, the weights absorb significantly reduces the math FLOPS needed to up project the K and V, since the FLOPs needed for these up projections of KV are linear to the KV cache length, while length of Q vector is always 1 in the decoding phase. The longer the KV cache history is, the more FLOPs are needed, and the up projections are repeated for every decoded token since only the projected KV latent were saved, which further increases the FLOPs needed.
+For the prefill phase, the weights absorbed version changes the dimensions of Q and KV thus increasing the number of FLOPs for attention. Based on roofline analysis, non absorbed version is beneficial for the prefill phase with input length 256 or larger
+The TensorRT LLM MLA implementation chooses different highly optimized kernels for prefill and decoding, see <a class="reference download internal" download="" href="../../_downloads/b509390ba70e52fabb10dbd9d15d5118/attention.py"><span class="xref download myst">MLA</span></a>.</p>
+</section>
+<section id="data-parallel-for-attention-module-adp">
+<h3>Data Parallel for Attention module (ADP)<a class="headerlink" href="#data-parallel-for-attention-module-adp" title="Link to this heading">#</a></h3>
+<p>The intuition of choosing attention DP is that doing TP for the MQA (where different GPUs compute different attention Q heads) will duplicate the KV cache memory, which limits the concurrency being achieved by the system. The duplication factor is equal to the TP group size, thus 8x for TP8. Small concurrency will hurt the throughput for the powerful system like NVIDIA DGX B200.</p>
+<p>For DeepSeek R1 FP4 checkpoint with 8 B200 GPUs, the weights and activation occupies about 80 GB memory for each GPU, and the free KV cache per GPU will be 100GB. Assuming ISL 1K, OSL 2K, each request will consume about 200MB KV cache, which results in a per GPU max concurrency of 500. A single node 8xGPU system has a global concurrency of 4000. When using attention TP, the global concurrency will become just 500.</p>
+<p>Silicon experiments show the attention DP technique provides a significant <strong>400% speedup</strong> in the max throughput cases, when keeping all other factors the same.</p>
+</section>
+<section id="expert-parallel-for-moe-ep">
+<h3>Expert parallel for MoE (EP)<a class="headerlink" href="#expert-parallel-for-moe-ep" title="Link to this heading">#</a></h3>
+<p>The DeepSeek R1 MoE design features 256 small sparse experts and 1 shared expert, the GEMM problem size of these experts are as follows.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>GEMM</p></th>
+<th class="head text-left"><p>group</p></th>
+<th class="head text-left"><p>GEMM N</p></th>
+<th class="head text-left"><p>GEMM K</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>shared_fc1</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>4096</p></td>
+<td class="text-left"><p>7168</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>shared_fc2</p></td>
+<td class="text-left"><p>1</p></td>
+<td class="text-left"><p>7168</p></td>
+<td class="text-left"><p>2048</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>sparse_fc1</p></td>
+<td class="text-left"><p>256</p></td>
+<td class="text-left"><p>4096</p></td>
+<td class="text-left"><p>7168</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>sparse_fc2</p></td>
+<td class="text-left"><p>256</p></td>
+<td class="text-left"><p>7168</p></td>
+<td class="text-left"><p>2048</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>These experts can be done in either Tensor-Parallelism or Expert-Parallelism ways. Our current ablation study reveals that Expert-Parallelism achieves better GEMM FLOPS because it has better GEMM problem sizes. And Expert-Parallelism can save GPU communication bandwidth compared to AllReduce, because the tokens only need to be sent to GPUs where the active experts for this token are located, while TP needs an AllReduce for all the tokens between all the GPUs. Also to be noted that, to scale the DeepSeek R1 inference to systems like GB200 NVL72 fully utilizing the aggregated memory bandwidth and tensor core flops, large EPs are needed. We are actively working on implementing it.</p>
+<p>Silicon performance measurements show that Expert-Parallelism can provide 142% speedup for 1K/2K max throughput case, when keeping other factors the same.</p>
+</section>
+</section>
+<section id="mla-layers-optimizations">
+<h2>MLA Layers Optimizations<a class="headerlink" href="#mla-layers-optimizations" title="Link to this heading">#</a></h2>
+<p>Other than the parallel strategy and precision strategy we explained above, we have done the following optimizations for layers/kernels inside the MLA module.</p>
+<ul>
+<li><p>Attention Kernels Optimization</p>
+<p>This provided a <strong>20% E2E speedup</strong> compared to February baseline implementation. It involved implementing <strong>high-throughput generation MLA kernels</strong>. Techniques include using 2CTA Group variant of the Tensor Core 5th MMA instructions of Blackwell GPUs, overlapping MLA with softmax using interleaved tiles, and fine-tuning kernel selection heuristics for the DeepSeek R1 problem size.</p>
+</li>
+<li><p>FP8 KV Cache</p>
+<p>An important optimization that yielded a <strong>6% E2E throughput increase</strong> when assuming the concurrency was identical. Another benefit of FP8 KV cache is <strong>compressing the KV cache size by half</strong>, which <strong>allows for larger concurrency</strong>. It also enables the use of faster FP8 attention kernels compared to BF16. We recommend that users always turn on FP8 KV cache to get better performance. In the context phase, KV is quantized to FP8 and saved to the KV cache pool. In the generation phase, both Q and KV are quantized to FP8, and FP8 Multi-Query Attention (MQA) is used. Evaluation on GSM8k showed <strong>no meaningful accuracy drop</strong>. The quantization typically uses static per-tensor FP8 with a scaling factor defaulting to 1.0, but KV cache scaling factor can also be generated by calibrating on a target dataset. Below are the accuracy metrics of different combinations on the GSM8K dataset.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>KV Cache Type</p></th>
+<th class="head text-left"><p>FP8 Checkpoint</p></th>
+<th class="head text-left"><p>FP4 Checkpoint</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>BF16 MLA and KV cache</p></td>
+<td class="text-left"><p>0.9629</p></td>
+<td class="text-left"><p>0.9606</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>FP8 MLA and KV cache</p></td>
+<td class="text-left"><p>0.9613</p></td>
+<td class="text-left"><p>0.9606</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</li>
+<li><p>Manual GEMM tactics tuning</p>
+<p>This optimization addresses cases where the default heuristic algorithm in cuBLAS is not performing best for specific GEMM shapes existing in the model. We built an internal tool to find the best algorithm for these specific shapes offline and then used the <code class="docutils literal notranslate"><span class="pre">cublasLtMatmul</span></code> API to apply this specific, optimized algorithm at runtime. This is a necessary system optimization when general-purpose heuristics don’t find the most efficient kernel for all specific cases. We are also working actively with the cuBLAS team to further enhance the heuristics such that the best performance can always be achieved OOTB. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/thop/cublasScaledMM.cpp#L54">cublasScaledMM.cpp</a> for the tuning details.</p>
+</li>
+<li><p>Horizontal Fusions</p>
+<p>This involves fusing GEMM operations of down projection of Q/KV and rope dimensions of K tensor. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L1305">modeling_deepseekv3.py</a> for details. Horizontal fusion reduces the kernel launch overhead and increases the GEMM problem sizes which can achieve better HW utilization. It is a common technique shared by both min-latency and throughput optimizations.</p>
+</li>
+<li><p>2-stream optimizations</p>
+<p>There are some small operations which can be run in parallel like the Q norm and KV norm inside the MLA. These operations cannot fully utilize the GPU math flops and the memory bandwidth, thus running in parallel CUDA streams can bring speed-up.</p>
+</li>
+</ul>
+</section>
+<section id="moe-layers-optimizations">
+<h2>MoE Layers Optimizations<a class="headerlink" href="#moe-layers-optimizations" title="Link to this heading">#</a></h2>
+<p>The following optimizations are already done for MoE layers.</p>
+<ul>
+<li><p>Mix I/O data type for the router GEMM</p>
+<p>Achieved a <strong>4% E2E speedup</strong> by avoiding casting operations and performing the GEMM using a mixture of input and output data types (e.g., BF16 input and FP32 output) directly. This eliminates the need to explicitly cast inputs to the output type and saves memory bandwidth.</p>
+</li>
+<li><p>Top-K Kernels Fusions</p>
+<p>Resulted in a <strong>7.4% E2E speedup</strong>. For DeepSeek R1, selecting the top 8 experts from 256 is done in a two-phase approach: first selecting top groups, then finding the top 8 within those groups. DeepSeek R1 uses some additional techniques for better expert load balance which involves adding bias and scales to the topK complications. All these operations resulted in 18 PyTorch ops when not fused, see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L213">Deepseekv3RoutingImpl</a>. Fusing the multiple kernels involved in these Top-K calculations significantly reduces the overall computation time. Compared to using 18 native PyTorch ops, fusion can reduce the operation to as few as 2 kernels. Based on the measurement on B200, fusing these kernels can reduce the kernel time from 252us to 15us in the target setting.</p>
+</li>
+<li><p>FP4 AllGather Optimizations</p>
+<p>Showed a <strong>4% E2E speedup</strong>. This optimization replaces the BF16 AllGather operation with an FP4 version. Using a lower precision for this communication primitive reduces the amount of data transferred over the network, significantly improving communication efficiency. Also, since the original BF16 Tensor to be transferred will get cast into FP4 format after the AllGather communication, this optimization will not bring any impact to the accuracy. At the kernel level, we are seeing about 3x when switching from BF16 to FP4 AllGather.</p>
+</li>
+<li><p>CUTLASS Group GEMM optimizations</p>
+<p>Provided a <strong>1.3% E2E speedup</strong>. There are some CUTLASS level optimizations shared by both min-latency and throughput cases. Just updating CUTLASS to the latest version gives us 13% kernel improvement for the MoE groupGemm, and resulted in +1.3% E2E TPS/GPU.</p>
+</li>
+<li><p>Multi-stream optimizations
+Running the shared and routed experts in 2 streams combined with other multi-streaming optimizations in the MLA modules, contributing a <strong>5.3% E2E speedup</strong>.</p></li>
+</ul>
+</section>
+<section id="runtime-optimizations">
+<h2>Runtime Optimizations<a class="headerlink" href="#runtime-optimizations" title="Link to this heading">#</a></h2>
+<p>These optimizations target the overall execution flow, scheduling, and resource management within the inference system. They are shared between DeepSeek R1 models and other models supported in the TensorRT LLM, here we are sharing some ablation study for the performance benefits on DeepSeek R1 on B200.</p>
+<ul>
+<li><p>CUDA Graph</p>
+<p>This had a significant <strong>22% E2E performance impact</strong> for throughput scenarios.</p>
+<p>CUDA Graphs allow capturing a sequence of CUDA operations and launching them as a single unit, drastically reducing kernel launch overheads. This is particularly beneficial for models with many small kernels, and particularly on the PyTorch flow, because the python host code normally executes slower than C++. Since the CUDA Graph freezes the kernel launch parameters, which is normally associated with the tensor shapes, it can only be safely used with static shape, meaning that different CUDA graphs need to be captured for different batch sizes. Each graph will have some cost of memory usage, and capturing time, thus we cannot capture every possible CUDA graph for all possible batches. For the non-captured batch sizes, PyTorch eager mode code will be executed.</p>
+<p>There is a feature called CUDA Graph padding in TensorRT LLM, which is a good trade-off between the number of CUDA Graphs and the CUDA Graph hit ratio; it tries to pad a batch to the nearest one with a captured CUDA Graph. Normally you should enable the CUDA Graph padding feature to increase the CUDA Graph hit rate, but the padding itself has some overhead due to wasted tokens computation.</p>
+<p>Users can opt-out the CUDA Graph padding feature to see the perf benefits, by setting the <code class="docutils literal notranslate"><span class="pre">cuda_graph_config:\n</span>&#160; <span class="pre">enable_padding:</span> <span class="pre">False</span></code>, see API here <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/config.py#L41">Pytorch backend config</a></p>
+</li>
+<li><p>Overlap Scheduler:</p>
+<p>Showed a <strong>4% E2E performance impact</strong> and should generally <strong>always be used</strong>. This scheduler manages the execution of different operations (like computation and communication) to overlap them effectively on the GPU and network. The intuition is to hide latency by performing computation while waiting for data transfers or vice versa, improving overall hardware utilization. The overlap schedule is already defaulted on in TensorRT LLM by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/commit/b4e5df0ee0024eda3eeb83a6ba822245a30ab428#diff-3c4f29d6594b37af0f1fbb97f5291b18e49f3f2510f9d296c7adb2829e9da0bf">commit</a>. In case there are corner cases where it does not work, users can still opt-out this feature by set <em>disable_overlap_scheduler</em> to true.</p>
+</li>
+<li><p>Memory Optimizations</p>
+<p>Resulted in a <strong>4GB improvement</strong>. This includes techniques like chunked MoE (specifically for Hopper) and fixing a cuda context init bug. These methods reduce the memory footprint of the model weights or intermediate tensors, allowing for larger batch sizes or sequence lengths, and preventing Out-of-Memory (OOM) errors.</p>
+</li>
+</ul>
+</section>
+<section id="how-to-reproduce">
+<h2>How to reproduce<a class="headerlink" href="#how-to-reproduce" title="Link to this heading">#</a></h2>
+<p>See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md#b200-max-throughput">Perf practices</a></p>
+</section>
+<section id="future-works">
+<h2>Future Works<a class="headerlink" href="#future-works" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Large EP</p></li>
+<li><p>Chunked context</p></li>
+<li><p>More communication overlap</p></li>
+</ul>
+</section>
+<section id="acknowledgment">
+<h2>Acknowledgment<a class="headerlink" href="#acknowledgment" title="Link to this heading">#</a></h2>
+<p>The substantial throughput advancements for DeepSeek R1 on Blackwell GPUs, as detailed in this post, are the fruit of a dedicated and collaborative engineering effort. Achieving nearly a 2.3x increase in TPS/GPU required a deep dive into MLA layers, MoE layers, and runtime optimizations. We extend our sincere appreciation to all the engineers involved in this intensive optimization process. Their collective expertise in pushing the boundaries of throughput performance within TensorRT LLM has been instrumental. We trust that sharing these specific strategies for maximizing throughput will prove beneficial to the developer community as they tackle demanding LLM inference workloads on NVIDIA hardware.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">DeepSeek R1 MTP Implementation and Optimization</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#precision-strategy">Precision strategy</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#parallel-strategy">Parallel strategy</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#weights-absorb-and-mqa">Weights absorb and MQA</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#data-parallel-for-attention-module-adp">Data Parallel for Attention module (ADP)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallel-for-moe-ep">Expert parallel for MoE (EP)</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mla-layers-optimizations">MLA Layers Optimizations</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-layers-optimizations">MoE Layers Optimizations</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-optimizations">Runtime Optimizations</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-reproduce">How to reproduce</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#future-works">Future Works</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#acknowledgment">Acknowledgment</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 15, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
