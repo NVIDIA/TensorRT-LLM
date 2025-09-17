@@ -176,7 +176,6 @@ Note that the CUDA graph increases the tensor twice, and it is replayed for ten 
 
 As the final step, we implements a variant of `GuidedDecoder` -- [`CapturableGuidedDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L405). It reuses most logics from `GuidedDecoder`, but the grammar computation and some auxilirary methods are decorated by `hostfunc`, making it capturable by CUDA graph.
 
-
 ### CUDA Graph Compatibility: Grammar Computation
 
 Once captured, CUDA graph can be launched to run the same GPU kernels as many times as needed. Note that the replayed kernels are always executed using the fixed input and output memory addresses. By filling input buffers with new data, we can run the same work on new data. This pattern also applies to CUDA callback, except that the input and output buffers are on CPU. 
@@ -200,13 +199,29 @@ Note that currently CUDA graph is enabled for the generation phase only, and the
 
 Some requests may have no grammar constraints. For such requests, we can fill the corresponding masks as all ones (allowed by grammar) so the logits will not be modified by the kernel, but this causes unnecessary computation. To resolve this, a token-level mask tensor is introduced. The tensor values are filled with zeros for requests without grammar constraints. The kernel reads this mask values and skips the rows with mask values being zero.
 
-
 ### Trouble Shooting: Data Race between Host and CUDA Callback
 
+Similar to GPU kernels, CUDA callbacks are asynchronously executed on CUDA streams. Note that both normal host functions and CUDA callbacks can access the same CPU memory addresses, so it can easily cause data race.
 
+In the initial implementation, `CapturableGuidedDecoder` directly reads request states from [`ScheduledRequests`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/scheduler.py#L18). However, the `ScheduledRequests` is shared through an executor iteration and thus probably modified by other executor components. This creates a potential data race scenario:
 
+* Guided decoder launches A CUDA callback, which will read some request states from `ScheduledRequests`;
+* Some other executor components inplace modify `ScheduledRequests`;
+* The CUDA callback is executed, reading some modified request states from `ScheduledRequests`.
+
+Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class -- [`GuidedRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20). It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then only accessed via CUDA callbacks only. This prevents potential data race within an executor iteration.
+
+When overlap scheduler is enabled, another data race scenario exits between executor iterations:
+
+* Iteration $i$ launches CUDA callbacks, which will read request states from a fixed address;
+* Iteration $i+1$ updates the request states;
+* Iteration $i$'s CUDA callbacks are executed, reading request states updated by iteration $i+1$.
+
+Again, the CUDA callbacks may read unexpected data. A straightforward solution is letting the request state update wait for CUDA callback execution, but this effectively disables overlap scheduling. To resolve this issue and also unblock overlap scheduling, a [queue](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L417) is introduced. For each iteration, a new batch of request states is put into the queue; then, a CUDA callback is launched to fetch a new batch of request states from the queue, and all the subsequent CUDA callbacks access the newly fetched request states. This allows the co-existance of the request snapshots of two (or even more) iterations, which prevents potential data race between iterations.
 
 ### Trouble Shooting: Deadlock by GIL and CUDA Mutex
+
+
 
 
 ## Performance Analysis
