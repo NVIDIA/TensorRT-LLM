@@ -46,6 +46,7 @@ l0_a10:
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_additional_model_outputs.py
   # executor
   - unittest/executor/test_rpc.py
 - condition:
