@@ -2964,6 +2964,89 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
     print("All answers are correct!")
 
 
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-4-Scout-17B-16E-Instruct",
+     "llama4-models/Llama-4-Scout-17B-16E-Instruct"),
+])
+def test_ptp_quickstart_multimodal_4gpu(llm_root, llm_venv, model_name,
+                                        model_path):
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+
+    print(f"Accuracy test {model_name} image mode with example inputs.")
+
+    # Define accuracy inputs for image modality
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe the natural environment in the image.",
+                "Describe the object and the weather condition in the image.",
+                "Describe the traffic condition on the road in the image.",
+                "Describe the natural environment in the image.",
+            ],
+            "media": [
+                str(test_data_root / "seashore.png"),
+                str(test_data_root / "inpaint.png"),
+                str(test_data_root / "61.jpg"),
+                str(test_data_root / "seashore.png"
+                    ),  # repeat the same image for testing kv cache reuse
+            ],
+        }
+    }
+
+    # Define expected keywords for each model
+    expected_keywords = {
+        "Llama-4-Scout-17B-16E-Instruct": {
+            "image": [
+                ["ocean", "turbulent", "choppy", "waves", "sky", "cloudy"],
+                ["large", "rock", "Yosemite", "sunny", "clouds", "cliff"],
+                [
+                    "light", "moderate", "vehicles", "highway", "congested",
+                    "steady"
+                ],
+                ["ocean", "turbulent", "choppy", "waves", "sky", "cloudy"],
+            ],
+        },
+    }
+
+    # Build command for image modality
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        "image",
+        "--prompt",
+        *accuracy_inputs["image"]["prompt"],
+        "--media",
+        *accuracy_inputs["image"]["media"],
+        "--tp_size",
+        "4",
+        "--enable_chunked_prefill",
+        "--max_num_tokens=256",
+    ]
+
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+
+    # Set match ratio based on model
+    match_ratio = 4.0 / 6  # 4 out of 6 keywords matched to compensate for indeterminism
+
+    # Sanity check for output text
+    for prompt_output, prompt_keywords in zip(
+            parse_output(output), expected_keywords[model_name]["image"]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        print("prompt_output:", prompt_output)
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+
+    print("All answers are correct!")
+
+
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
