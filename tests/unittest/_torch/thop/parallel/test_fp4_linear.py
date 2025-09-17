@@ -86,7 +86,10 @@ def pad_up(x, pad_size):
 
 @pytest.mark.skipif(sys.version_info < (3, 12),
                     reason="cutlass-dsl 4.1.0 requires Python 3.12+")
-@skip_pre_blackwell
+@pytest.mark.skipif(
+    get_sm_version() != 100,
+    reason="This test is only supported in Blackwell architecture",
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536),
                                  (128, 2112, 7168), (128, 4096, 7168),
