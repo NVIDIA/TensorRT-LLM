@@ -148,6 +148,10 @@ def get_llm_args(model: str,
         fail_fast_on_attention_window_too_large,
     }
 
+    # pop build_config to avoid it overriding the LlmArgs parameters
+    if backend == "pytorch":
+        llm_args.pop("build_config", None)
+
     return llm_args, llm_args_extra_dict
 
 
@@ -317,6 +321,13 @@ def serve(
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_extra_dict = yaml.safe_load(f)
+    if not isinstance(llm_args_extra_dict, dict):
+        raise ValueError("llm_args_extra_dict must be a valid yaml file")
+    if backend == "pytorch" and "build_config" in llm_args_extra_dict:
+        raise ValueError(
+            "build_config is not allowed to be set for pytorch backend, please specify the knobs directly"
+        )
+
     llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
     metadata_server_cfg = parse_metadata_server_config_file(
