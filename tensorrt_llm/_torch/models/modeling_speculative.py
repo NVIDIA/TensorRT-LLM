@@ -45,6 +45,7 @@ class Eagle3Attention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
+        self.is_eagle3 = True
 
         tp_size = model_config.mapping.tp_size
         # Override the QKV projection. The number of input features

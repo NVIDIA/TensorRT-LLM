@@ -17,35 +17,36 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,fp8_target",
     [
-        [True, "TRTLLM", True, False, False, False, True],
-        [True, "TRTLLM", True, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True],
-        [False, "TRTLLM", True, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, True],
-        [False, "FLASHINFER", True, False, False, False, True],
-        [False, "TRTLLM", False, True, True, False, True],
-        [True, "TRTLLM", False, True, True, False, True],
-        [True, "TRTLLM", True, False, True, True, True],
-        [True, "TRTLLM", True, False, True, False, True],
+        [True, "TRTLLM", True, False, False, False, True, False],
+        [True, "TRTLLM", True, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, True, False],
+        [False, "TRTLLM", True, False, False, False, False, False],
+        [True, "FLASHINFER", True, False, False, False, True, False],
+        [False, "FLASHINFER", True, False, False, False, True, False],
+        [False, "TRTLLM", False, True, True, False, True, False],
+        [True, "TRTLLM", False, True, True, False, True, False],
+        [True, "TRTLLM", True, False, True, True, True, False],
+        [True, "TRTLLM", True, False, True, False, True, False],
         # TODO: nvbugs/5461761
-        # [True, "TRTLLM", True, False, False, True, True],
-        [True, "TRTLLM", False, False, False, False, True],
-        [False, "TRTLLM", False, False, False, False, True],
-        [True, "TRTLLM", False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, True, True],
-        [True, "TRTLLM", False, False, False, True, False],
+        # [True, "TRTLLM", True, False, False, True, True, False],
+        [True, "TRTLLM", False, False, False, False, True, False],
+        [False, "TRTLLM", False, False, False, False, True, False],
+        [True, "TRTLLM", False, False, False, False, False, False],
+        [False, "TRTLLM", False, False, False, False, False, False],
+        [True, "TRTLLM", False, False, False, True, True, False],
+        [True, "TRTLLM", False, False, False, True, False, False],
         # TODO: nvbugs/5522851
-        # [True, "FLASHINFER", False, False, False, False, True],
-        [False, "FLASHINFER", False, False, False, False, True],
+        # [True, "FLASHINFER", False, False, False, False, True, False],
+        [False, "FLASHINFER", False, False, False, False, True, False],
+        [True, "TRTLLM", True, True, True, True, True, True],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
-                      use_chain_drafter: bool):
+                      use_chain_drafter: bool, fp8_target: bool):
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -54,13 +55,18 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     models_path = llm_models_root()
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    kv_cache_dtype = 'auto'
+    if fp8_target:
+        target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        kv_cache_dtype = 'fp8'
 
     # bs > 1 gives non-deterministic when doing IFB. There are slight chances
     # that ref and spec does not match 100%
     max_batch_size = 1
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
+                                    max_tokens=8192,
+                                    dtype=kv_cache_dtype)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
 

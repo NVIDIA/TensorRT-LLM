@@ -609,11 +609,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
     op->mAttentionChunkSize = attention_chunk_size;
 
-    TORCH_CHECK(spec_decoding_bool_params.size() == 3,
-        "Expecting 3 bools for spec-dec mode, is_spec_decoding_enabled, use_spec_decoding, and is_spec_dec_tree.");
+    TORCH_CHECK(spec_decoding_bool_params.size() == 4,
+        "Expecting 4 bools for spec-dec mode, is_spec_decoding_enabled, use_spec_decoding, is_spec_dec_tree, and "
+        "is_eagle3.");
     op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
+    op->mIsEagle3 = spec_decoding_bool_params[3];              // is_eagle3
 
     if (is_mla_enable)
     {
