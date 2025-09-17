@@ -466,15 +466,27 @@ __device__ void warp_vectorized_sum(void* dst, void const* src, int size, int la
     }
 }
 
+
+// Accumulate across all valid ranks into registers, then store once per segment
 template <int VEC_SIZE, typename T>
-__device__ void warp_vectorized_fill_impl(void* dst, T value, int size, int lane_id)
+__device__ void warp_vectorized_combine_impl(
+    T* dst_typed_base,
+    int size_per_token,
+    int lane_id,
+    int ep_size,
+    int local_token_idx,
+    int rank_id,
+    int max_tokens_per_rank,
+    CombineKernelPointers const& ptrs)
 {
+    constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
     using flashinfer::vec_t;
 
-    uint8_t* dst_ptr = static_cast<uint8_t*>(dst);
+    uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst_typed_base);
+
     int const stride = warpSize * VEC_SIZE;
     int const initial_offset = lane_id * VEC_SIZE;
-    int remaining = size - initial_offset;
+    int remaining = size_per_token - initial_offset;
     if (remaining <= 0)
     {
         return;
@@ -483,19 +495,7 @@ __device__ void warp_vectorized_fill_impl(void* dst, T value, int size, int lane
     int num_iters = (remaining + stride - 1) / stride;
     int unrolled_iters = (num_iters / 4) * 4;
 
-    // Prepare a filled vector once
-    vec_t<uint8_t, VEC_SIZE> filled_vec;
-    {
-        T* vec_as_T = reinterpret_cast<T*>(&filled_vec);
-        constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
-        #pragma unroll
-        for (int i = 0; i < elems_per_vec; i++)
-        {
-            vec_as_T[i] = value;
-        }
-    }
-
-    // Unrolled main loop (factor 4)
+    // Unrolled loop processing 4 segments per lane
     for (int i = 0; i < unrolled_iters; i += 4)
     {
         int o0 = initial_offset + (i + 0) * stride;
@@ -503,45 +503,127 @@ __device__ void warp_vectorized_fill_impl(void* dst, T value, int size, int lane
         int o2 = initial_offset + (i + 2) * stride;
         int o3 = initial_offset + (i + 3) * stride;
 
-        filled_vec.store(dst_ptr + o0);
-        filled_vec.store(dst_ptr + o1);
-        filled_vec.store(dst_ptr + o2);
-        filled_vec.store(dst_ptr + o3);
+        vec_t<uint8_t, VEC_SIZE> acc0;
+        vec_t<uint8_t, VEC_SIZE> acc1;
+        vec_t<uint8_t, VEC_SIZE> acc2;
+        vec_t<uint8_t, VEC_SIZE> acc3;
+
+        // Zero accumulators
+        {
+            T* a0 = reinterpret_cast<T*>(&acc0);
+            T* a1 = reinterpret_cast<T*>(&acc1);
+            T* a2 = reinterpret_cast<T*>(&acc2);
+            T* a3 = reinterpret_cast<T*>(&acc3);
+            
+            #pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j) { a0[j] = T(0); a1[j] = T(0); a2[j] = T(0); a3[j] = T(0); }
+        }
+
+        // Combine: Pull and accumulate from peer ranks
+        for (int target_rank = 0; target_rank < ep_size; ++target_rank)
+        {
+            // Check if the token was dispatched to target_rank
+            int dst_idx = ptrs.send_indices[local_token_idx * ep_size + target_rank];
+            if (dst_idx < 0) continue;
+
+            uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+            int base = rank_id * max_tokens_per_rank + dst_idx;
+            int token_base = base * size_per_token;
+
+            vec_t<uint8_t, VEC_SIZE> s0, s1, s2, s3;
+            s0.load(recv_buffer + token_base + o0);
+            s1.load(recv_buffer + token_base + o1);
+            s2.load(recv_buffer + token_base + o2);
+            s3.load(recv_buffer + token_base + o3);
+
+            T* a0 = reinterpret_cast<T*>(&acc0);
+            T* a1 = reinterpret_cast<T*>(&acc1);
+            T* a2 = reinterpret_cast<T*>(&acc2);
+            T* a3 = reinterpret_cast<T*>(&acc3);
+            T const* v0 = reinterpret_cast<T const*>(&s0);
+            T const* v1 = reinterpret_cast<T const*>(&s1);
+            T const* v2 = reinterpret_cast<T const*>(&s2);
+            T const* v3 = reinterpret_cast<T const*>(&s3);
+            #pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j) { a0[j] += v0[j]; a1[j] += v1[j]; a2[j] += v2[j]; a3[j] += v3[j]; }     
+        }
+
+        // Store accumulated results once
+        acc0.store(dst_bytes + o0);
+        acc1.store(dst_bytes + o1);
+        acc2.store(dst_bytes + o2);
+        acc3.store(dst_bytes + o3);
     }
 
-    // Remainder loop
+    // Remainder
     for (int i = unrolled_iters; i < num_iters; ++i)
     {
         int o = initial_offset + i * stride;
-        filled_vec.store(dst_ptr + o);
+
+        vec_t<uint8_t, VEC_SIZE> acc;
+        {
+            T* a = reinterpret_cast<T*>(&acc);
+            #pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j) { a[j] = T(0); }
+        }
+
+        for (int target_rank = 0; target_rank < ep_size; ++target_rank)
+        {
+            int dst_idx = ptrs.send_indices[local_token_idx * ep_size + target_rank];
+            if (dst_idx < 0) continue;
+            uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+            int base = rank_id * max_tokens_per_rank + dst_idx;
+            int token_base = base * size_per_token;
+            vec_t<uint8_t, VEC_SIZE> s;
+            s.load(recv_buffer + token_base + o);
+            T* a = reinterpret_cast<T*>(&acc);
+            T const* v = reinterpret_cast<T const*>(&s);
+            #pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j) { a[j] += v[j]; }
+        }
+
+        acc.store(dst_bytes + o);
     }
 }
 
+// Wrapper that selects vector width based on size_per_token alignment
 template <typename T>
-__device__ void warp_vectorized_fill(void* dst, T value, int size, int lane_id)
+__device__ void warp_vectorized_combine(
+    T* dst_typed_base,
+    int size_per_token,
+    int lane_id,
+    int ep_size,
+    int local_token_idx,
+    int rank_id,
+    int max_tokens_per_rank,
+    CombineKernelPointers const& ptrs)
 {
-    if (size % 16 == 0)
+    if (size_per_token % 16 == 0)
     {
-        warp_vectorized_fill_impl<16, T>(dst, value, size, lane_id);
+        warp_vectorized_combine_impl<16, T>(dst_typed_base, size_per_token, lane_id, ep_size,
+            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
     }
-    else if (size % 8 == 0)
+    else if (size_per_token % 8 == 0)
     {
-        warp_vectorized_fill_impl<8, T>(dst, value, size, lane_id);
+        warp_vectorized_combine_impl<8, T>(dst_typed_base, size_per_token, lane_id, ep_size,
+            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
     }
-    else if (size % 4 == 0)
+    else if (size_per_token % 4 == 0)
     {
-        warp_vectorized_fill_impl<4, T>(dst, value, size, lane_id);
+        warp_vectorized_combine_impl<4, T>(dst_typed_base, size_per_token, lane_id, ep_size,
+            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
     }
-    else if (size % 2 == 0)
+    else if (size_per_token % 2 == 0)
     {
-        warp_vectorized_fill_impl<2, T>(dst, value, size, lane_id);
+        warp_vectorized_combine_impl<2, T>(dst_typed_base, size_per_token, lane_id, ep_size,
+            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
     }
     else
     {
-        warp_vectorized_fill_impl<1, T>(dst, value, size, lane_id);
+        warp_vectorized_combine_impl<1, T>(dst_typed_base, size_per_token, lane_id, ep_size,
+            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
     }
 }
-
 
 // Copy payload to recv buffer using warp-based vectorized copy (one warp per token)
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uint8_t* payload_bytes, 
@@ -649,49 +731,9 @@ __global__ void moeA2ACombineKernel(
     // Get output location for this token (using src_data_ptrs[0] as output)
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
 
-    // Zero initialize output using vectorized fill
-    warp_vectorized_fill(token_output, T(0), size_per_token, lane_id);
-    
-
-    // For each possible target rank, check if this token was sent there
-    for (int target_rank = 0; target_rank < ep_size; target_rank++)
-    {
-        // Check if this token was sent to target_rank
-        int dst_idx = ptrs.send_indices[local_token_idx * ep_size + target_rank];
-        if (dst_idx < 0)
-            continue; // Wasn't sent to this rank
-
-        // Get received data location from target rank's buffer
-        // Using payload 0 (the only payload for combine)
-        uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
-        uint8_t const* recv_ptr = recv_buffer + (rank_id * max_tokens_per_rank + dst_idx) * size_per_token;
-
-        #if ENABLE_DEBUG_PRINT
-        if (lane_id == 0)
-        {
-            float vals[5];
-            for (int i = 0; i < 5; ++i)
-            {
-                uint16_t bf16_val = *(reinterpret_cast<uint16_t const*>(recv_ptr) + i);
-                vals[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 const*>(&bf16_val));
-            }
-            int send_indices_vals[4];
-            for (int i = 0; i < 4; ++i)
-            {
-                send_indices_vals[i] = ptrs.send_indices[local_token_idx * ep_size + i];
-            }
-            printf(
-                "Rank %d token %d retrieved from rank %d, recv_ptr[0..4]=[%f, %f, %f, %f, %f] send_indices[0...3]=[%d, "
-                "%d, %d, %d]\n",
-                rank_id, local_token_idx, target_rank, vals[0], vals[1], vals[2], vals[3], vals[4],
-                send_indices_vals[0], send_indices_vals[1], send_indices_vals[2], send_indices_vals[3]);
-        }
-        #endif
-
-        // Sum into output (distributed across warp)
-        warp_vectorized_sum<T>(token_output, reinterpret_cast<T const*>(recv_ptr), size_per_token, lane_id);
-        
-    }
+    // Accumulate across ranks in registers, then store once per segment
+    warp_vectorized_combine<T>(token_output, size_per_token, lane_id, ep_size,
+        local_token_idx, rank_id, max_tokens_per_rank, ptrs);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
