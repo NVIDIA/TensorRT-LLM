@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc4" />
+  <meta name="docsearch:version" content="1.1.0rc5" />
 
 
   </head>
@@ -1088,7 +1088,7 @@ after prompts have been submitted.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">token_ids:</span> <span class="pre">~typing.List[int]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cumulative_logprob:</span> <span class="pre">float</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">logprobs:</span> <span class="pre">list[dict[int</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">~tensorrt_llm.executor.result.Logprob]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">~tensorrt_llm.executor.result.Logprob]]</span> <span class="pre">|</span> <span class="pre">~typing.List[float]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">prompt_logprobs:</span> <span class="pre">list[dict[int</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">~tensorrt_llm.executor.result.Logprob]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">finish_reason:</span> <span class="pre">~typing.Literal['stop'</span></span></em>,</dd>
@@ -1112,7 +1112,7 @@ after prompts have been submitted.</p>
 <li><p><strong>text</strong> (<em>str</em>) – The generated output text. Defaults to “”.</p></li>
 <li><p><strong>token_ids</strong> (<em>List</em><em>[</em><em>int</em><em>]</em><em>, </em><em>optional</em>) – The token ids of the generated output text. Defaults to [].</p></li>
 <li><p><strong>cumulative_logprob</strong> (<em>float</em><em>, </em><em>optional</em>) – The cumulative log probability of the generated output text. Defaults to None.</p></li>
-<li><p><strong>logprobs</strong> (<em>TokenLogprobs</em><em>, </em><em>optional</em>) – The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.</p></li>
+<li><p><strong>logprobs</strong> (<em>TokenLogprobs</em><em> | </em><em>List</em><em>[</em><em>float</em><em>]</em><em>, </em><em>optional</em>) – The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.</p></li>
 <li><p><strong>prompt_logprobs</strong> (<em>TokenLogprobs</em><em>, </em><em>optional</em>) – The log probabilities per prompt token. Defaults to None.</p></li>
 <li><p><strong>finish_reason</strong> (<em>Literal</em><em>[</em><em>'stop'</em><em>, </em><em>'length'</em><em>, </em><em>'timeout'</em><em>, </em><em>'cancelled'</em><em>]</em><em>, </em><em>optional</em>) – The reason why the sequence is finished. Defaults to None.</p></li>
 <li><p><strong>stop_reason</strong> (<em>int</em><em>, </em><em>str</em><em>, </em><em>optional</em>) – The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.</p></li>
@@ -1150,7 +1150,7 @@ after prompts have been submitted.</p>
 <dd><p>Logprobs of newly generated tokens.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>List[float]</p>
+<dd class="field-odd"><p>TokenLogprobs | List[float]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1176,7 +1176,7 @@ after prompts have been submitted.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">token_ids:</span> <span class="pre">~typing.List[int]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cumulative_logprob:</span> <span class="pre">float</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">logprobs:</span> <span class="pre">list[dict[int</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">~tensorrt_llm.executor.result.Logprob]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">~tensorrt_llm.executor.result.Logprob]]</span> <span class="pre">|</span> <span class="pre">~typing.List[float]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">prompt_logprobs:</span> <span class="pre">list[dict[int</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">~tensorrt_llm.executor.result.Logprob]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">finish_reason:</span> <span class="pre">~typing.Literal['stop'</span></span></em>,</dd>
@@ -1225,12 +1225,12 @@ after prompts have been submitted.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.CompletionOutput.logprobs">
-<span class="sig-name descname"><span class="pre">logprobs</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">list</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Logprob</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.CompletionOutput.logprobs" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">logprobs</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">list</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Logprob</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.CompletionOutput.logprobs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
 <dt class="sig sig-object py" id="id3">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">logprobs_diff</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#id3" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">logprobs_diff</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">list</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Logprob</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#id3" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -5157,7 +5157,7 @@ a subset of the possible backends.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -20893,9 +20893,9 @@ If rebuilding _was_ required, returns <cite>True</cite> if rebuilding was succes
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 09, 2025.</p>
+  <p>Last updated on September 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/62b564a">62b564a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
   
 </div></div>
       

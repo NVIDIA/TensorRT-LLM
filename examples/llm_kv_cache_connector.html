@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc4" />
+  <meta name="docsearch:version" content="1.1.0rc5" />
 
 
   </head>
@@ -511,7 +511,7 @@
 <span class="linenos"> 12</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.kv_cache_connector</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
 <span class="linenos"> 13</span>    <span class="n">KvCacheConnectorScheduler</span><span class="p">,</span> <span class="n">KvCacheConnectorWorker</span><span class="p">,</span> <span class="n">SchedulerOutput</span><span class="p">)</span>
 <span class="linenos"> 14</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings.internal.batch_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlmRequest</span>
-<span class="linenos"> 15</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConnectorConfig</span>
+<span class="linenos"> 15</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConnectorConfig</span><span class="p">,</span> <span class="n">TorchLlmArgs</span>
 <span class="linenos"> 16</span>
 <span class="linenos"> 17</span><span class="c1"># This is a simple example of the use of the KV cache connector.</span>
 <span class="linenos"> 18</span><span class="c1"># It persists KV cache contents into a folder, and can load them back on subsequent runs.</span>
@@ -529,8 +529,8 @@
 <span class="linenos"> 30</span>
 <span class="linenos"> 31</span><span class="k">class</span><span class="w"> </span><span class="nc">PersistentKvCacheConnectorWorker</span><span class="p">(</span><span class="n">KvCacheConnectorWorker</span><span class="p">):</span>
 <span class="linenos"> 32</span>
-<span class="linenos"> 33</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<span class="linenos"> 34</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos"> 33</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">llm_args</span><span class="p">:</span> <span class="n">TorchLlmArgs</span><span class="p">):</span>
+<span class="linenos"> 34</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">llm_args</span><span class="p">)</span>
 <span class="linenos"> 35</span>
 <span class="linenos"> 36</span>        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_tensor</span> <span class="o">=</span> <span class="kc">None</span>
 <span class="linenos"> 37</span>
@@ -576,10 +576,10 @@
 <span class="linenos"> 77</span>
 <span class="linenos"> 78</span><span class="k">class</span><span class="w"> </span><span class="nc">PersistentKvCacheConnectorLeader</span><span class="p">(</span><span class="n">KvCacheConnectorScheduler</span><span class="p">):</span>
 <span class="linenos"> 79</span>
-<span class="linenos"> 80</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens_per_block</span><span class="p">):</span>
-<span class="linenos"> 81</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos"> 80</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">llm_args</span><span class="p">:</span> <span class="n">TorchLlmArgs</span><span class="p">):</span>
+<span class="linenos"> 81</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">llm_args</span><span class="p">)</span>
 <span class="linenos"> 82</span>
-<span class="linenos"> 83</span>        <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="n">tokens_per_block</span>
+<span class="linenos"> 83</span>        <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_llm_args</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">tokens_per_block</span>
 <span class="linenos"> 84</span>        <span class="bp">self</span><span class="o">.</span><span class="n">pending_loads</span> <span class="o">=</span> <span class="p">{}</span>
 <span class="linenos"> 85</span>
 <span class="linenos"> 86</span>        <span class="bp">self</span><span class="o">.</span><span class="n">cache_folder</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">CONNECTOR_CACHE_FOLDER_KEY</span><span class="p">,</span>
@@ -873,9 +873,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 09, 2025.</p>
+  <p>Last updated on September 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/62b564a">62b564a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
   
 </div></div>
       
