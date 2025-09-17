@@ -136,13 +136,16 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     print(f"Running unit test:'{command}'")
 
-    def run_command(cmd):
+    def run_command(cmd, num_workers=1):
         try:
             pythonpath = os.environ.get("PYTHONPATH", "")
+            env = {'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"}
+            if num_workers > 1:
+                env['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
             llm_venv.run_cmd(
                 cmd,
                 cwd=test_root,
-                env={'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"},
+                env=env,
             )
         except CalledProcessError:
             return False
@@ -157,7 +160,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         parallel_output_xml = os.path.join(
             output_dir,
             f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
-        parallel_command = ["TORCHINDUCTOR_COMPILE_THREADS=1"] + command + [
+        parallel_command = command + [
             "-n", f"{num_workers}", f"--junitxml={parallel_output_xml}"
         ]
         passed = run_command(parallel_command)
