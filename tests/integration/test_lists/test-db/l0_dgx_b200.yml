@@ -76,6 +76,21 @@ l0_dgx_b200:
 - condition:
     ranges:
       system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus_corner_case TIMEOUT (180)
+- condition:
+    ranges:
+      system_gpu_count:
         gte: 4
         lte: 4
     wildcards:
