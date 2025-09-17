@@ -111,6 +111,10 @@ public:
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
         int64_t const* runtime_perf_knobs = nullptr;
+        // optional when compute attention stats (MLA chunked prefill or Helix parallelism)
+        // this is a buffer of size [num_tokens, num_heads_q] with each element
+        // representing the max and LSE/denominator of the softmax values
+        float2* softmax_stats = nullptr;
     };
 
     template <typename T>
@@ -129,8 +133,6 @@ public:
         int32_t num_encoder_tokens = 0;
         kernels::MlaParams<T>* mla_param = nullptr;
 
-        // For MLA chunked prefill
-        void* softmaxStatsPtr = nullptr;
         // optional for separate QKV input, currently only used for context MLA
         T const* k_ptr = nullptr;
         T const* v_ptr = nullptr;
@@ -185,7 +187,7 @@ public:
             ss << "cross_kv_length: " << this->cross_kv_length << std::endl;
             ss << "encoder_input_lengths: " << this->encoder_input_lengths << std::endl;
             ss << "num_encoder_tokens: " << this->num_encoder_tokens << std::endl;
-            ss << "softmaxStatsPtr: " << this->softmaxStatsPtr << std::endl;
+            ss << "softmaxStatsPtr: " << this->softmax_stats << std::endl;
             ss << "k_ptr: " << this->k_ptr << std::endl;
             ss << "v_ptr: " << this->v_ptr << std::endl;
             return ss.str();
