@@ -517,6 +517,9 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
         arg_line = f"{indent}    {field_name} ({type_str}): "
         if status := field_info.get("status", None):
             arg_line += f":tag:`{status}` "
+        elif LABEL_STABLE_APIS:
+            arg_line += f":tag:`stable` "
+
         if field_description:
             arg_line += field_description.split('\n')[0]  # First line with type
 
@@ -548,6 +551,10 @@ def get_type_repr(cls):
     if module_name == 'builtins':  # Special case for built-in types
         return cls.__qualname__
     return f"{module_name}.{cls.__qualname__}"
+
+
+LABEL_STABLE_APIS: bool = True
+""" Whether to label the stable APIs with `stable` tags. """
 
 
 class ApiParamTagger:
