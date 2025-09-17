@@ -35,8 +35,8 @@ class AllreduceResidualNorm(torch.nn.Module):
         self.norm = RMSNorm(hidden_size, 1e-5, dtype)
 
     def forward(self, x, residual):
-        x = torch.ops.auto_deploy.torch_dist_all_reduce(x)
-        y = x + residual
+        x = torch.ops.auto_deploy.torch_dist_all_reduce.default(x)
+        y = residual + x
         normed = self.norm(y)
         return normed, y
 

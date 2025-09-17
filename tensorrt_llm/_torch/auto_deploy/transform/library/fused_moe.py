@@ -494,7 +494,7 @@ class MatchSimpleMoePattern(MatchMoePattern):
         return torch.ops.auto_deploy.torch_linear_simple
 
     def moe_op(self):
-        return torch.ops.auto_deploy.torch_moe
+        return torch.ops.auto_deploy.torch_moe.default
 
     def scale_arg_indices(self) -> Dict[str, int]:
         return {}
@@ -511,7 +511,7 @@ class MatchFP8MoePattern(MatchMoePattern):
         return torch.ops.auto_deploy.torch_quant_fp8_linear
 
     def moe_op(self):
-        return torch.ops.auto_deploy.torch_quant_fp8_moe
+        return torch.ops.auto_deploy.torch_quant_fp8_moe.default
 
     def scale_arg_indices(self) -> Dict[str, int]:
         return {"input_scale": 3, "weight_scale": 4}
@@ -528,7 +528,7 @@ class MatchNVFP4MoePattern(MatchMoePattern):
         return torch.ops.auto_deploy.torch_quant_nvfp4_linear
 
     def moe_op(self):
-        return torch.ops.auto_deploy.torch_quant_nvfp4_moe
+        return torch.ops.auto_deploy.torch_quant_nvfp4_moe.default
 
     def scale_arg_indices(self) -> Dict[str, int]:
         return {"input_scale": 3, "weight_scale": 4, "alpha": 5}
