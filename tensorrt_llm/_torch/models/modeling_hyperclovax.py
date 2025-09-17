@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from einops import rearrange
+from PIL import Image
 from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
                           PretrainedConfig, PreTrainedModel)
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -15,8 +16,8 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -24,14 +25,14 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import register_auto_model
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def select_best_resolution(original_size: tuple,
                            possible_resolutions: list) -> tuple:
     original_height, original_width = original_size
@@ -57,7 +58,6 @@ def select_best_resolution(original_size: tuple,
     return best_fit
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def unpad_image(tensor: torch.Tensor,
                 original_size: Tuple[int, int]) -> torch.Tensor:
     original_width, original_height = original_size
@@ -80,7 +80,6 @@ def unpad_image(tensor: torch.Tensor,
     return unpadded_tensor
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def get_anyres_image_grid_shape(
     image_size: Tuple[int, int],
     grid_pinpoints: Union[str, List[Tuple[int, int]]],
@@ -96,7 +95,6 @@ def get_anyres_image_grid_shape(
     return width // patch_size, height // patch_size
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def reshape_and_unpad_image_features(
     image_feature: torch.Tensor,
     height: int,
@@ -140,7 +138,6 @@ def reshape_and_unpad_image_features(
     return image_feature
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def anyres_postprocessing(
     image_forward_outs: torch.FloatTensor,
     split_sizes: List[int],
@@ -191,7 +188,6 @@ def anyres_postprocessing(
     return image_features
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def adaptive_anyres_postprocessing(
     image_forward_outs: torch.FloatTensor,
     image_sizes: List[List[int]],
@@ -241,7 +237,6 @@ def adaptive_anyres_postprocessing(
     return image_features
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def compute_adaptive_params(
     pixel_values: Optional[List[List[torch.FloatTensor]]] = None,
     num_queries_vis_abstractors: Optional[List[List[int]]] = None,
@@ -388,7 +383,6 @@ def compute_adaptive_params(
     return num_queries_vis_abstractors, num_grids, image_sizes, is_videos, group_ids
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def determine_non_vision_query_lengths(input_ids: torch.LongTensor, pad_id: int,
                                        img_start_id: int) -> List[int]:
     non_vision_query_lengths = []
@@ -409,7 +403,6 @@ def determine_non_vision_query_lengths(input_ids: torch.LongTensor, pad_id: int,
     return non_vision_query_lengths
 
 
-# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 class HCXVisionCAbstractor(nn.Module):
     """
     This module is based on C-Abstractor, whose license is under apache-2.0.
@@ -572,7 +565,7 @@ class HCXVisionCAbstractor(nn.Module):
         return nn.Sequential(*layers)
 
 
-class HCXVisionInputProcessor(InputProcessor):
+class HCXVisionInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -594,6 +587,20 @@ class HCXVisionInputProcessor(InputProcessor):
             use_fast=self.use_fast)
         self.tllm_multimodal_token_id = self.pretrained_config.language_config[
             "vocab_size"] + 1
+        self.vision_query_lengths = None
+
+    def get_vocab_size(self):
+        return self.pretrained_config.language_config["vocab_size"]
+
+    def get_num_tokens_per_image(
+        self,
+        image: Image.Image,
+        **kwargs,
+    ):
+        return self.vision_query_lengths[0].pop(0)
+
+    def get_mm_token_ids(self):
+        return torch.tensor([self.tllm_multimodal_token_id])
 
     def _post_process(self,
                       input_ids: torch.Tensor,
@@ -668,6 +675,8 @@ class HCXVisionInputProcessor(InputProcessor):
                 is_video_list=is_video_list,
                 **mm_processor_kwargs,
             )
+            self.vision_query_lengths = preprocessed_image.get(
+                "vision_query_lengths", None)
 
         input_ids = self.tokenizer.encode(text_prompt,
                                           add_special_tokens=False,
@@ -699,9 +708,8 @@ class HCXVisionInputProcessor(InputProcessor):
         multimodal_data = {}
         multimodal_data["image"] = {
             "pixel_values":
-            torch.stack(preprocessed_image['pixel_values'][0], dim=0).to(
-                torch.bfloat16
-            ),  #TODO change the pixel_values into the Shared Tensor
+            torch.stack(preprocessed_image['pixel_values'][0],
+                        dim=0).to(torch.bfloat16),
             "image_sizes":
             preprocessed_image.get('image_sizes', None),
             "is_videos":
@@ -970,14 +978,14 @@ class HCXVisionModel:
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
             "image":
-            ('<im_end>\n<|im_start|>user (mime) \n'
-             '{"type": "image/jpeg", "filename": ""}<|im_end|>\n'
-             '<|im_start|>user (vector)\n<|dummy3|><|im_end|>\n'
-             '<|im_start|>image/aux\n'
-             '다음 중 ocr은 사진에서 검출된 글자이고, lens_keyword는 사진에서 추출된 '
-             'keyword와 bbox 위치입니다.bbox는 0~1 사이로 정규화된 [x1, y1, x2, y2]의 '
-             '형태입니다. 참고하여 답변하세요. '
-             '{"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}')
+            '<im_end>\n<|im_start|>user (mime) \n'
+            '{{"type": "image/jpeg", "filename": ""}}<|im_end|>\n'
+            '<|im_start|>user (vector)\n<|dummy3|><|im_end|>\n'
+            '<|im_start|>image/aux\n'
+            '다음 중 ocr은 사진에서 검출된 글자이고, lens_keyword는 사진에서 추출된 '
+            'keyword와 bbox 위치입니다.bbox는 0~1 사이로 정규화된 [x1, y1, x2, y2]의 '
+            '형태입니다. 참고하여 답변하세요. '
+            '{{"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}}'
         },
         placeholder_placement=MultimodalPlaceholderPlacement.AFTER_TEXT,
     ))
@@ -1045,12 +1053,16 @@ class HCXVisionForCausalLM(PreTrainedModel):
         mm_embeds = []
         if len(multimodal_params) > 0:
             if not DISAGG:
-                mm_embeds = self.mm_encoder.forward(multimodal_params)
+                mm_embeds = get_multimodal_embeddings(
+                    encoder_forward_fn=self.mm_encoder.forward,
+                    multimodal_params=multimodal_params[:num_context_requests])
             else:
-                mm_embeds = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "HCXVisionForCausalLM does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
+            mm_embeds = find_input_mm_embeds(
+                mm_embeds, multimodal_params[:num_context_requests])
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds,
