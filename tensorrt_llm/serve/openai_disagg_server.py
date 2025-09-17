@@ -4,6 +4,7 @@ import copy
 import itertools
 import os
 import signal
+import time
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -12,7 +13,7 @@ from typing import Callable, Optional, Type, Union
 
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
@@ -55,7 +56,7 @@ class OpenAIDisaggServer:
         self.perf_metrics_max_requests = config.perf_metrics_max_requests
         if self.perf_metrics_max_requests > 0:
             # record corresponding keys of context and generation servers for perf metrics
-            # (ctx_server, gen_server, ctx_request_id)
+            # (ctx_server, gen_server, ctx_request_id, server_start_ts, server_first_token_ts)
             self.perf_metrics_keys = deque(maxlen=self.perf_metrics_max_requests)
             self.perf_metrics_keys_lock = asyncio.Lock()
             # server_key -> {ctx_request_id: perf_metrics}
@@ -132,6 +133,13 @@ class OpenAIDisaggServer:
 
         self.app = FastAPI(lifespan=lifespan)
 
+        @self.app.middleware("http")
+        async def add_process_time_header(raw_request: Request, call_next):
+            start_time = time.monotonic()
+            raw_request.state.server_start_ts = start_time
+            response = await call_next(raw_request)
+            return response
+
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
             return JSONResponse(status_code=400, content={"error": str(exc)})
@@ -185,9 +193,9 @@ class OpenAIDisaggServer:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
 
-    async def _add_perf_metrics_keys(self, ctx_server: str, gen_server: str, ctx_request_id: int):
+    async def _add_perf_metrics_keys(self, ctx_server: str, gen_server: str, ctx_request_id: int, raw_request: Request):
         async with self.perf_metrics_keys_lock:
-            self.perf_metrics_keys.append((ctx_server, gen_server, ctx_request_id))
+            self.perf_metrics_keys.append((ctx_server, gen_server, ctx_request_id, raw_request.state.server_start_ts, raw_request.state.server_first_token_ts))
 
     async def perf_metrics(self) -> JSONResponse:
         if self.perf_metrics_keys is None:
@@ -224,50 +232,26 @@ class OpenAIDisaggServer:
                 raise exc
 
             remain_keys = []
-            for ctx_server, gen_server, ctx_request_id in self.perf_metrics_keys:
+            for ctx_server, gen_server, ctx_request_id, server_start_ts, server_first_token_ts in self.perf_metrics_keys:
                 gen_perf_metrics = self.server_perf_metrics[gen_server].pop(ctx_request_id, None)
                 if gen_perf_metrics is None:
                     # generation not finished
-                    remain_keys.append((ctx_server, gen_server, ctx_request_id))
+                    remain_keys.append((ctx_server, gen_server, ctx_request_id, server_start_ts, server_first_token_ts))
                     continue
                 ctx_perf_metrics = self.server_perf_metrics[ctx_server].pop(ctx_request_id, None)
                 return_metrics.append({
                     "ctx_server": ctx_server,
                     "gen_server": gen_server,
+                    "disagg_server_start_ts": server_start_ts,
+                    "disagg_server_first_token_ts": server_first_token_ts,
                     "ctx_perf_metrics": ctx_perf_metrics,
                     "gen_perf_metrics": gen_perf_metrics})
             self.perf_metrics_keys = deque(remain_keys, maxlen=self.perf_metrics_max_requests)
 
         return JSONResponse(content=return_metrics)
 
-    async def merge_streaming_responses(self, ctx_response,
-                                        gen_server: str,
-                                        gen_req: Union[CompletionRequest, ChatCompletionRequest]):
-        try:
-            if ctx_response is not None and len(ctx_response.choices) != 1:
-                raise ValueError("Context server did not return a single choice. This is not expected")
 
-            #If request finished after first token not due to length, return right away and skip gen
-            if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
-                yield "data: [DONE]\n\n".encode('utf-8')
-            else:
-                # Then yield the generation responses
-                await self._increment_metric("gen_total_requests")
-                if isinstance(gen_req, CompletionRequest):
-                    gen_response = await self.send_completion_request(gen_server, gen_req)
-                elif isinstance(gen_req, ChatCompletionRequest):
-                    gen_response = await self.send_chat_request(gen_server, gen_req)
-                else:
-                    raise TypeError("Invalid request type: {type(gen_req).__name__}")
-
-                async for chunk in gen_response.body_iterator:
-                    yield chunk
-                await self._increment_metric("gen_completed_requests")
-
-        finally:
-            await self.gen_router.finish_request(gen_req)
-
-    async def openai_completion(self, req: CompletionRequest) -> Response:
+    async def openai_completion(self, req: CompletionRequest, raw_request: Request) -> Response:
         try:
             if not isinstance(req.prompt, str):
                 # Check if it's a list and contains integers
@@ -276,15 +260,15 @@ class OpenAIDisaggServer:
                 elif not isinstance(req.prompt, list) or not all(isinstance(x, int) for x in req.prompt):
                     raise ValueError("Disaggregated server currently only supports single string prompt or list of integers in request")
 
-            return await self._send_disagg_request(req)
+            return await self._send_disagg_request(req, raw_request)
 
         except Exception as e:
             await self._handle_exception(e)
 
-    async def openai_chat_completion(self, req: ChatCompletionRequest) -> Response:
+    async def openai_chat_completion(self, req: ChatCompletionRequest, raw_request: Request) -> Response:
 
         try:
-            return await self._send_disagg_request(req)
+            return await self._send_disagg_request(req, raw_request)
         except Exception as e:
             await self._handle_exception(e)
 
@@ -326,9 +310,44 @@ class OpenAIDisaggServer:
 
         return ctx_response
 
-    async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest]):
+    async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest], raw_request: Request):
+        ctx_server = None
         gen_server = None
+        ctx_request_id = None
         need_ctx = False
+
+        async def _merge_streaming_responses(ctx_response,
+                                            gen_req: Union[CompletionRequest, ChatCompletionRequest]):
+            try:
+                if ctx_response is not None and len(ctx_response.choices) != 1:
+                    raise ValueError("Context server did not return a single choice. This is not expected")
+
+                #If request finished after first token not due to length, return right away and skip gen
+                if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
+                    yield "data: [DONE]\n\n".encode('utf-8')
+                else:
+                    # Then yield the generation responses
+                    await self._increment_metric("gen_total_requests")
+                    if isinstance(gen_req, CompletionRequest):
+                        gen_response = await self.send_completion_request(gen_server, gen_req)
+                    elif isinstance(gen_req, ChatCompletionRequest):
+                        gen_response = await self.send_chat_request(gen_server, gen_req)
+                    else:
+                        raise TypeError("Invalid request type: {type(gen_req).__name__}")
+
+                    first_response = await anext(gen_response.body_iterator)
+                    raw_request.state.server_first_token_ts = time.monotonic()
+                    yield first_response
+                    async for chunk in gen_response.body_iterator:
+                        yield chunk
+                    await self._increment_metric("gen_completed_requests")
+                    if need_ctx and self.perf_metrics_keys is not None:
+                        asyncio.create_task(self._add_perf_metrics_keys(
+                            ctx_server, gen_server, ctx_request_id, raw_request))
+
+
+            finally:
+                await self.gen_router.finish_request(gen_req)
         try:
             # Determine if need context server
             condition = self.conditional_disagg_config
@@ -366,6 +385,7 @@ class OpenAIDisaggServer:
                 # Append disaggregates parameters to generation request
                 req.disaggregated_params = ctx_response.choices[0].disaggregated_params
                 req.disaggregated_params.request_type = "generation_only"
+                ctx_request_id = req.disaggregated_params.ctx_request_id
 
                 # Replace the string prompt with prompt_tokens_ids
                 if isinstance(req, CompletionRequest):
@@ -381,10 +401,6 @@ class OpenAIDisaggServer:
             if gen_server is None:
                 gen_server, _ = await self.gen_router.get_next_server(req)
             logger.debug("Sending request to gen server: %s", gen_server)
-
-            if need_ctx and self.perf_metrics_keys is not None:
-                asyncio.create_task(self._add_perf_metrics_keys(
-                    ctx_server, gen_server, req.disaggregated_params.ctx_request_id))
 
             if not req.stream:
                 try:
@@ -408,7 +424,7 @@ class OpenAIDisaggServer:
             else:
                 # Return a streaming response that combines both context and generation responses
                 return StreamingResponse(
-                    self.merge_streaming_responses(ctx_response, gen_server, req),
+                    _merge_streaming_responses(ctx_response, req),
                     media_type="text/event-stream"
                 )
         except:
