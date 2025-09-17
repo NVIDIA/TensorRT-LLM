@@ -1,4 +1,3 @@
-import sys
 from functools import lru_cache
 from typing import List, Mapping, Optional, Tuple
 
@@ -17,20 +16,6 @@ from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
-
-try:
-    if sys.version_info >= (3, 12):
-        HAS_CUTLASS_DSL = True
-
-    else:
-        HAS_CUTLASS_DSL = False
-except ImportError:
-    HAS_CUTLASS_DSL = False
-
-try:
-    pass
-except ImportError:
-    pass
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.

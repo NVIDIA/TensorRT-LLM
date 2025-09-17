@@ -23,7 +23,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
-from ..custom_ops import IS_CUTLASS_DSL_AVAILABLE
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
 
