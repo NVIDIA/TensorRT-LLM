@@ -108,7 +108,7 @@ if __name__ == "__main__":
         print(f"Initializing PyProject.toml in {file_path}")
         project_info = get_project_info(file_path)
         name = project_info["name"]
-        author = '"TensorRT LLM [svc_tensorrt_llm@nvidia.com]"'
+        author = '"TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"'
         version = project_info["version"]
         py_version = '">=3.10,<3.13"'
         poetry_init_cmd = f'poetry init --no-interaction --name {name} --author {author} --python {py_version}'
