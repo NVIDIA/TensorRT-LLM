@@ -84,17 +84,14 @@ class DummyConfigLoader(BaseConfigLoader):
         Returns:
             ModelConfig object containing parsed configuration
         """
-        return ModelConfig(pretrained_config=DummyConfig(),
-                           # Add other ModelConfig parameters as needed
-                           )
+        return ModelConfig(pretrained_config=DummyConfig())
 
 
 @pytest.mark.part0
 def test_additional_model_outputs_integration():
-    """Real integration test for additional_model_outputs.
+    """Integration test for additional_model_outputs.
 
-    This test can be run when a model is available by setting the LLM_MODEL_PATH
-    environment variable to point to a valid model directory.
+    This test uses a dummy model to test the additional_model_outputs feature.
     """
     # Create sampling params with additional outputs
     additional_outputs = [
@@ -102,8 +99,10 @@ def test_additional_model_outputs_integration():
         AdditionalModelOutput(name="generation_output", gather_context=False),
     ]
 
+    num_generated_tokens = 5
+
     sampling_params = SamplingParams(
-        max_tokens=5,
+        max_tokens=num_generated_tokens,
         temperature=0.0,  # Deterministic for testing
         end_id=-1,  # Use -1 to indicate that the end token is not used
         additional_model_outputs=additional_outputs)
@@ -113,51 +112,57 @@ def test_additional_model_outputs_integration():
               backend='pytorch',
               max_batch_size=2,
               max_seq_len=128,
+              max_num_tokens=5,
               kv_cache_config=KvCacheConfig(enable_block_reuse=False),
               checkpoint_loader=HfCheckpointLoader(
                   weight_loader=DummyWeightLoader(),
                   config_loader=DummyConfigLoader()))
 
     # Test prompts
-    prompts = [[1, 2, 3]]
+    prompts = [[1, 2, 3], [4, 5, 6]]
+    num_prompts = len(prompts)
+    prompt_lens = [len(prompt) for prompt in prompts]
+
+    config = DummyConfig()
+    max_beam_width = 1
 
     # Generate outputs
     outputs = llm.generate(prompts, sampling_params=sampling_params)
 
     # Verify outputs
-    assert len(outputs) == 1
-    output = outputs[0]
-    assert len(output.outputs) == 1
-    sequence = output.outputs[0]
+    assert len(outputs) == num_prompts
+    for i in range(num_prompts):
+        output = outputs[i]
+        assert len(output.outputs) == 1
+        sequence = output.outputs[0]
 
-    # Check that additional outputs are present
-    assert sequence.additional_context_outputs is not None
-    assert sequence.additional_generation_outputs is not None
+        # Check that additional outputs are present
+        assert sequence.additional_context_outputs is not None
+        assert sequence.additional_generation_outputs is not None
 
-    # Check that the requested outputs are present
-    assert "context_output" in sequence.additional_context_outputs
-    assert "generation_output" in sequence.additional_generation_outputs
+        # Check that the requested outputs are present
+        assert "context_output" in sequence.additional_context_outputs
+        assert "generation_output" in sequence.additional_generation_outputs
 
-    # Verify tensor shapes are reasonable
-    context_output = sequence.additional_context_outputs["context_output"]
-    generation_output = sequence.additional_generation_outputs[
-        "generation_output"]
+        # Verify tensor shapes are reasonable
+        context_output = sequence.additional_context_outputs["context_output"]
+        generation_output = sequence.additional_generation_outputs[
+            "generation_output"]
 
-    assert context_output.dim(
-    ) >= 2  # Should have at least [seq_len, hidden_size]
-    assert generation_output.dim(
-    ) >= 2  # Should have at least [batch, hidden_size]
+        # Verify that the outputs are tensors
+        assert isinstance(context_output, torch.Tensor)
+        assert isinstance(generation_output, torch.Tensor)
 
-    # Verify that the outputs are tensors
-    assert isinstance(context_output, torch.Tensor)
-    assert isinstance(generation_output, torch.Tensor)
+        # Verify context output shape
+        assert context_output.dim() == 2
+        assert context_output.shape[0] == prompt_lens[i]
+        assert context_output.shape[1] == config.hidden_size
 
-    print(
-        f"Integration test passed! context_output shape: {context_output.shape}"
-    )
-    print(
-        f"Integration test passed! generation_output shape: {generation_output.shape}"
-    )
+        # Verify generation output shape
+        assert generation_output.dim() == 3
+        assert generation_output.shape[0] == num_generated_tokens
+        assert generation_output.shape[1] == max_beam_width
+        assert generation_output.shape[2] == config.hidden_size
 
 
 if __name__ == "__main__":

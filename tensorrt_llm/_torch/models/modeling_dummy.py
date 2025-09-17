@@ -3,6 +3,9 @@ from typing import Dict, List, Optional
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import (ModelConfig,
                                                        register_auto_model)
 
@@ -39,18 +42,48 @@ class DummyModel(torch.nn.Module):
     def config(self):
         return self.model_config.pretrained_config
 
-    def forward(self, *args, **kwargs) -> torch.Tensor:
-        input_ids = kwargs["input_ids"]
-        self.recorded_position_ids = kwargs["position_ids"]
-        batch_size = input_ids.size(0)
+    def forward(self,
+                *args,
+                input_ids: torch.Tensor,
+                attn_metadata: AttentionMetadata,
+                return_context_logits: bool = False,
+                **kwargs) -> torch.Tensor:
+        num_batch_tokens = input_ids.size(0)
+
+        vocab_size = self.config.vocab_size
+        hidden_size = self.config.hidden_size
+
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda,
+            dim=0,
+            dtype=torch.long,
+        ) - 1
+
+        # Logits: fixed values for testing
+        logits = torch.ones((num_batch_tokens, vocab_size), device='cuda') * 0.1
+
+        # Logits shape depends on return_context_logits flag
+        if not return_context_logits:
+            # For context logits, return logits for all positions
+            logits = logits[last_tokens]
+
+        # Context output: fixed values for testing, one output per input token
+        context_output = torch.ones(
+            (num_batch_tokens, hidden_size), device='cuda') * 0.2
+
+        # Generation output: fixed values for testing, one output per sequence
+        generation_output = torch.ones(
+            (num_batch_tokens, hidden_size), device='cuda') * 0.3
+        generation_output = generation_output[last_tokens]
+
         return {
-            "logits": torch.randn((batch_size, 10), device='cuda'),
-            "context_output": torch.randn((batch_size, 10), device='cuda'),
-            "generation_output": torch.randn((batch_size, 10), device='cuda')
+            "logits": logits,
+            "context_output": context_output,
+            "generation_output": generation_output
         }
 
     def load_weights(self,
                      weights: Dict,
-                     weight_mapper: Optional["BaseWeightMapper"] = None,
+                     weight_mapper: Optional[BaseWeightMapper] = None,
                      skip_modules: List[str] = []):
         pass
