@@ -619,11 +619,17 @@ def find_mm_token_positions(
     if mm_token_ids is None:
         mm_mask = input_ids >= vocab_size
         if mm_special_token_ids is not None:
+            mm_special_token_ids = mm_special_token_ids.to(
+                device=input_ids.device, dtype=input_ids.dtype)
             mm_mask = mm_mask | torch.isin(input_ids, mm_special_token_ids)
     else:
+        mm_token_ids = mm_token_ids.to(device=input_ids.device,
+                                       dtype=input_ids.dtype)
         if mm_token_ids.ndim != 1:
             raise ValueError("mm_token_ids must be a 1D tensor")
         if mm_special_token_ids is not None:
+            mm_special_token_ids = mm_special_token_ids.to(
+                device=input_ids.device, dtype=input_ids.dtype)
             mm_token_ids = torch.unique(
                 torch.cat([mm_token_ids, mm_special_token_ids]))
         else:
