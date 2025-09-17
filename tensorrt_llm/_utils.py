@@ -691,6 +691,13 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+@lru_cache(maxsize=1)
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 100 or sm_version == 103
+
+
 def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":

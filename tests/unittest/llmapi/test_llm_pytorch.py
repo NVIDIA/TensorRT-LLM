@@ -529,6 +529,7 @@ def test_nemotron_nas_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
+@pytest.mark.skip(reason="https://nvbugs/5521949")
 def test_codellama_fp8_with_bf16_lora() -> None:
     model_dir = f"{llm_models_root()}/codellama/CodeLlama-7b-Instruct-hf/"
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
@@ -589,6 +590,7 @@ def test_codellama_fp8_with_bf16_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
+@pytest.mark.skip(reason="https://nvbugs/5521949")
 def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
     model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
 
