@@ -582,7 +582,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_states, ssm_states, num_decodes, cu_seqlens,
         **kwargs,
     ):
-        print(f"call forward_decode")
         mixed_qkv = kwargs["mixed_qkv"]
         conv_weights = kwargs["conv_weights"]
         bias = kwargs["bias"]
@@ -648,7 +647,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_states, ssm_states,
         **kwargs,
     ):
-        print(f"call forward_extend")
         mixed_qkv = kwargs["mixed_qkv"]
         conv_weights = kwargs["conv_weights"]
         bias = kwargs["bias"]
