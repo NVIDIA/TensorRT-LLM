@@ -297,6 +297,12 @@ public:
         mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim);
     }
 
+    [[nodiscard]] std::vector<int64_t> getValidConfigs(
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    {
+        return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+    }
+
     [[nodiscard]] std::vector<torch::Tensor> run(torch::Tensor const& routing_logits,
         torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
         torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
@@ -326,12 +332,6 @@ public:
             output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group, topk_group,
             intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, mTileTokensDim,
             routing_method_type, do_finalize, *mRunner, moeConfigIndex);
-    }
-
-    [[nodiscard]] std::vector<int64_t> getValidConfigs(
-        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
-    {
-        return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
     }
 
 private:

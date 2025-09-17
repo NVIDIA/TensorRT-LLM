@@ -109,6 +109,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2), (1, 4)],
                              ids=["tp4", "tp2pp2", "pp4"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, attn_backend,
@@ -167,6 +168,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     @parametrize_with_ids("fp8kv", [False, True])
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2), (1, 4)],
                              ids=["tp4", "tp2pp2", "pp4"])
     def test_fp8_4gpus(self, tp_size, pp_size, fp8kv, attn_backend,
