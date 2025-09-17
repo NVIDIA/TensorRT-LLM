@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.1.0rc4" />
+  <meta name="docsearch:version" content="1.1.0rc5" />
 
 
   </head>
@@ -587,7 +587,7 @@
 <span class="sd">        text (str): The generated output text. Defaults to &quot;&quot;.</span>
 <span class="sd">        token_ids (List[int], optional): The token ids of the generated output text. Defaults to [].</span>
 <span class="sd">        cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.</span>
-<span class="sd">        logprobs (TokenLogprobs, optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.</span>
+<span class="sd">        logprobs (TokenLogprobs | List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.</span>
 <span class="sd">        prompt_logprobs (TokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.</span>
 <span class="sd">        finish_reason (Literal[&#39;stop&#39;, &#39;length&#39;, &#39;timeout&#39;, &#39;cancelled&#39;], optional): The reason why the sequence is finished. Defaults to None.</span>
 <span class="sd">        stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.</span>
@@ -598,14 +598,15 @@
 <span class="sd">    Attributes:</span>
 <span class="sd">        length (int): The number of generated tokens.</span>
 <span class="sd">        token_ids_diff (List[int]): Newly generated token ids.</span>
-<span class="sd">        logprobs_diff (List[float]): Logprobs of newly generated tokens.</span>
+<span class="sd">        logprobs_diff (TokenLogprobs | List[float]): Logprobs of newly generated tokens.</span>
 <span class="sd">        text_diff (str): Newly generated tokens.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">index</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">text</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
     <span class="n">token_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">cumulative_logprob</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">logprobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenLogprobs</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">logprobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenLogprobs</span>
+                       <span class="o">|</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">prompt_logprobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenLogprobs</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">finish_reason</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;stop&#39;</span><span class="p">,</span> <span class="s1">&#39;length&#39;</span><span class="p">,</span> <span class="s1">&#39;timeout&#39;</span><span class="p">,</span>
                                     <span class="s1">&#39;cancelled&#39;</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -637,7 +638,7 @@
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_ids</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_token_ids_len</span><span class="p">:]</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">logprobs_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">logprobs_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TokenLogprobs</span> <span class="o">|</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="p">:]</span></div>
 
 
@@ -741,10 +742,12 @@
             <span class="n">output</span><span class="o">.</span><span class="n">cumulative_logprob</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">cum_log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
 
         <span class="k">if</span> <span class="n">logprobs_result</span><span class="p">:</span>
+            <span class="c1"># update logprobs from ResponseWrapper (TRT top logprobs WAR)</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
             <span class="n">output</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="o">=</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">prompt</span>
-            <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">generation</span>
-
-        <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">+=</span> <span class="n">logprobs_result</span><span class="o">.</span><span class="n">generation</span>
+        <span class="k">elif</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># handle logprobs directly from response tensors</span>
             <span class="n">output</span><span class="o">.</span><span class="n">_last_logprobs_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
             <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span>
             <span class="c1"># overcome some WAR in the cpp executor</span>
@@ -1382,9 +1385,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on September 09, 2025.</p>
+  <p>Last updated on September 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/62b564a">62b564a</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0c9430e">0c9430e</a>.</p>
   
 </div></div>
       
