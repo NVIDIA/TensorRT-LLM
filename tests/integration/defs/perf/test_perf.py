@@ -2097,9 +2097,7 @@ def run_perf_test(perf_case_name, trt_performance_cache_fpath,
             should_run = True
         elif test_runner._config.runtime == "disagg_server":
             # multi-node + disagg_server：run on both node0,process0 and node1,process0
-            should_run = MultiNodeProbe.is_first_process() and (
-                MultiNodeProbe.is_first_node()
-                or MultiNodeProbe.is_second_node())
+            should_run = MultiNodeProbe.is_first_process()
         else:
             # multi-node + other runtime：only run onnode0,process0
             should_run = MultiNodeProbe.is_first_node(
