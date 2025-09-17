@@ -998,6 +998,7 @@ def getSMVersion():
 
 get_sm_version = getSMVersion()
 if get_sm_version >= 100:
+    # NOTE: Qwen2.5-VL with SM 100 and above uses HF's implementation due to lacking of TRT-LLM's Attention kernel.
     QWEN2_5_VL_VISION_MODEL_CLASS = Qwen2_5_VisionTransformerPretrainedModel
 else:
     QWEN2_5_VL_VISION_MODEL_CLASS = Qwen2_5_VisionModel
