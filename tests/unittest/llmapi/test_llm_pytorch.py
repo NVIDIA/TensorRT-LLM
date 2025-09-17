@@ -244,6 +244,7 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
     vocab_size_padded = 32000
     embedding_bias = torch.zeros(vocab_size_padded)
     embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+    max_top_logprobs = 0
 
     sampling_kwargs = {
         "max_tokens": 6,
@@ -252,6 +253,7 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
 
     if enable_logprobs:
         sampling_kwargs["logprobs"] = 1
+        max_top_logprobs = 1
     # All test cases use greedy sampling for simplicity
 
     sampling_params = SamplingParams(**sampling_kwargs)
@@ -260,7 +262,8 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
                      prompts, ["Z Z Z Z Z Z"],
                      sampling_params=sampling_params,
                      backend="pytorch",
-                     enable_mixed_sampler=enable_mixed_sampler)
+                     enable_mixed_sampler=enable_mixed_sampler,
+                     max_top_logprobs=max_top_logprobs)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:

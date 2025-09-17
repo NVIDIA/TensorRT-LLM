@@ -36,7 +36,7 @@ def llm_torch(input_prompts):
 
 
 @force_ampere  # Save H100 resource
-@pytest.mark.parametrize("top_logprobs", [0, 2, 4])
+@pytest.mark.parametrize("top_logprobs", [0, 1, 4])
 @pytest.mark.parametrize("top_k", [None, 2])
 @pytest.mark.parametrize("top_p", [None, 0.5])
 @pytest.mark.threadleak(enabled=False)
@@ -45,8 +45,10 @@ def test_generate_with_top_logprobs(top_logprobs: int, top_k: int, top_p: float,
     max_tokens = 8
     is_topk = top_k is not None and top_k > 1
     is_topp = top_p is not None and top_p > 0.0 and not is_topk
-    is_valid_setup = (is_topk
-                      and top_logprobs <= top_k) or is_topp or top_logprobs == 0
+    is_greedy = not (is_topk or is_topp)
+    is_valid_setup = (is_topk and top_logprobs
+                      <= top_k) or is_topp or top_logprobs == 0 or (
+                          is_greedy and top_logprobs == 1)
     if is_valid_setup:
         # passing testcases
         sampling_params = SamplingParams(max_tokens=max_tokens,
