@@ -1,21 +1,136 @@
 import pathlib as _pl
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import pytest
 import torch
+from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
     BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
-from tensorrt_llm._torch.models.modeling_dummy import DummyConfig
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import (
-    register_checkpoint_weight_loader, register_config_loader)
+    ModelConfig, register_auto_model, register_checkpoint_weight_loader,
+    register_config_loader)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.sampling_params import AdditionalModelOutput
+
+
+class DummyConfig(PretrainedConfig):
+
+    def __init__(self):
+        self.architectures: list[str] = ["DummyModel"]
+        self.torch_dtype: torch.dtype = torch.float16
+        self.num_key_value_heads: int = 16
+        self.num_attention_heads: int = 16
+        self.hidden_size: int = 256
+        self.vocab_size: int = 1000
+        self.num_hidden_layers: int = 1
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+
+@register_auto_model("DummyModel")
+class DummyModel(torch.nn.Module):
+
+    def __init__(self, model_config: ModelConfig):
+        super().__init__()
+        self.dtype = model_config.pretrained_config.torch_dtype
+        self.model_config = model_config
+        self.recorded_position_ids = None
+
+    def infer_max_seq_len(self):
+        return 2048
+
+    @property
+    def config(self):
+        return self.model_config.pretrained_config
+
+    def forward(self,
+                *args,
+                input_ids: torch.Tensor,
+                attn_metadata: AttentionMetadata,
+                return_context_logits: bool = False,
+                **kwargs) -> torch.Tensor:
+        num_batch_tokens = input_ids.size(0)
+
+        vocab_size = self.config.vocab_size
+        hidden_size = self.config.hidden_size
+
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda,
+            dim=0,
+            dtype=torch.long,
+        ) - 1
+
+        # Logits: fixed values for testing
+        logits = torch.ones((num_batch_tokens, vocab_size), device='cuda') * 0.1
+
+        # Logits shape depends on return_context_logits flag
+        if not return_context_logits:
+            # For context logits, return logits for all positions
+            logits = logits[last_tokens]
+
+        # Context output: fixed values for testing, one output per input token
+        context_output = torch.ones(
+            (num_batch_tokens, hidden_size), device='cuda') * 0.2
+
+        # Generation output: fixed values for testing, one output per sequence
+        generation_output = torch.ones(
+            (num_batch_tokens, hidden_size), device='cuda') * 0.3
+        generation_output = generation_output[last_tokens]
+
+        return {
+            "logits": logits,
+            "context_output": context_output,
+            "generation_output": generation_output
+        }
+
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: Optional[BaseWeightMapper] = None,
+                     skip_modules: List[str] = []):
+        pass
+
+
+@register_checkpoint_weight_loader("DUMMY_FORMAT")
+class DummyWeightLoader(BaseWeightLoader):
+
+    def load_weights(self, checkpoint_dir: str, **kwargs) -> dict[str, Any]:
+        """Load weights from your dummy format.
+
+        Args:
+            checkpoint_dir: Directory containing checkpoint files
+            **kwargs: Additional loading parameters
+        Returns:
+            Dictionary mapping parameter names to tensors
+        """
+        weights = {}
+
+        return weights
+
+
+@register_config_loader("DUMMY_FORMAT")
+class DummyConfigLoader(BaseConfigLoader):
+
+    def load(self, checkpoint_dir: str, **kwargs) -> ModelConfig:
+        """Load and parse configuration from your dummy format.
+
+        Args:
+            checkpoint_dir: Directory containing configuration files
+            **kwargs: Additional loading parameters
+        Returns:
+            ModelConfig object containing parsed configuration
+        """
+        return ModelConfig(pretrained_config=DummyConfig())
 
 
 @pytest.mark.part0
@@ -53,38 +168,6 @@ def test_additional_model_outputs_no_outputs():
 
     # Verify that no additional outputs are configured
     assert sampling_params.additional_model_outputs is None
-
-
-@register_checkpoint_weight_loader("DUMMY_FORMAT")
-class DummyWeightLoader(BaseWeightLoader):
-
-    def load_weights(self, checkpoint_dir: str, **kwargs) -> dict[str, Any]:
-        """Load weights from your dummy format.
-
-        Args:
-            checkpoint_dir: Directory containing checkpoint files
-            **kwargs: Additional loading parameters
-        Returns:
-            Dictionary mapping parameter names to tensors
-        """
-        weights = {}
-
-        return weights
-
-
-@register_config_loader("DUMMY_FORMAT")
-class DummyConfigLoader(BaseConfigLoader):
-
-    def load(self, checkpoint_dir: str, **kwargs) -> ModelConfig:
-        """Load and parse configuration from your dummy format.
-
-        Args:
-            checkpoint_dir: Directory containing configuration files
-            **kwargs: Additional loading parameters
-        Returns:
-            ModelConfig object containing parsed configuration
-        """
-        return ModelConfig(pretrained_config=DummyConfig())
 
 
 @pytest.mark.part0
