@@ -143,7 +143,6 @@ class Qwen3DecoderLayer(DecoderLayer):
         hidden_states = self.mlp(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_allreduce),
             cutlass_min_latency_mode=False,
