@@ -157,7 +157,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         parallel_output_xml = os.path.join(
             output_dir,
             f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
-        parallel_command = command + [
+        parallel_command = ["TORCHINDUCTOR_COMPILE_THREADS=1"] + command + [
             "-n", f"{num_workers}", f"--junitxml={parallel_output_xml}"
         ]
         passed = run_command(parallel_command)
