@@ -156,6 +156,21 @@ static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
     return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
 }
 
+namespace fs = std::filesystem;
+
+static fs::path getTransferOutputPath(char const* tag)
+{
+    auto outputPath = common::getEnvKVCacheTransferOutputPath();
+    if (!outputPath.empty())
+    {
+        auto rank = mpi::MpiComm::world().getRank();
+        auto path = fs::path(outputPath);
+        fs::create_directories(path);
+        return path / ("rank_" + std::to_string(rank) + "_" + tag + ".csv");
+    }
+    return {};
+}
+
 struct ReceiveCacheResource
 {
     runtime::BufferManager mBufferManager;
@@ -282,6 +297,17 @@ public:
         auto it = mRequestToSession.find(requestId);
         TLLM_CHECK(it != mRequestToSession.end());
         std::unique_lock<std::mutex> lk(mMtxForMap);
+        if (!common::getEnvKVCacheTransferOutputPath().empty())
+        {
+            if (!mMeasuresFile.is_open())
+            {
+                auto outputPath = getTransferOutputPath("send");
+                mMeasuresFile.open(outputPath);
+                TLLM_CHECK_WITH_INFO(
+                    mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
+            }
+            it->second.exportMeasure(mMeasuresFile, true);
+        }
         mRequestToSession.erase(it);
     }
 
@@ -331,7 +357,8 @@ public:
             if (it == mRequestToSession.end())
             {
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager);
+                    DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager, nullptr,
+                    !common::getEnvKVCacheTransferOutputPath().empty());
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
@@ -527,6 +554,7 @@ private:
     std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
+    std::ofstream mMeasuresFile;
 };
 
 class CacheReceiver::Impl
@@ -587,6 +615,18 @@ public:
     void receiveSync(TransferSession& session)
     {
         mFormatter->unformat(session);
+        if (!common::getEnvKVCacheTransferOutputPath().empty())
+        {
+            std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
+            if (!mMeasuresFile.is_open())
+            {
+                auto outputPath = getTransferOutputPath("recv");
+                mMeasuresFile.open(outputPath);
+                TLLM_CHECK_WITH_INFO(
+                    mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
+            }
+            session.exportMeasure(mMeasuresFile, false);
+        }
     }
 
     TransferSession sendRequestInfo(LlmRequest const& llmRequest)
@@ -652,7 +692,7 @@ public:
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
-            contextState, resource->mBufferManager, &llmRequest);
+            contextState, resource->mBufferManager, &llmRequest, !common::getEnvKVCacheTransferOutputPath().empty());
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -831,6 +871,8 @@ private:
     std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
     std::mutex mProcessIoResouceMutex;
     runtime::BufferManager mBufferManager;
+    std::ofstream mMeasuresFile;
+    std::mutex mMeasuresFileMutex;
 };
 
 void CacheSender::ImplDeleter::operator()(Impl* ptr)

@@ -586,6 +586,52 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
+                                            disaggregated_example_root,
+                                            llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    run_disaggregated_test(disaggregated_example_root,
+                           "perf_metrics",
+                           env=llm_venv._new_env
+                           | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
+                           cwd=llm_venv.get_working_directory())
+    assert os.path.isdir(output_path)
+    send_file = os.path.join(output_path, "rank_0_send.csv")
+    recv_file = os.path.join(output_path, "rank_1_recv.csv")
+    assert os.path.exists(send_file)
+    assert os.path.exists(recv_file)
+    with open(send_file, "r") as f:
+        lines = f.readlines()
+        assert len(lines) > 1
+        assert lines[0].startswith(
+            "RequestID,Delay(ms),Duration(ms),Bandwidth(Gbps)")
+        # get a send sample and match the recv
+        sample = lines[1].split(',')
+        assert len(sample) >= 4
+    with open(recv_file, "r") as f:
+        lines = f.readlines()
+        assert len(lines) > 1
+        matched = False
+        for line in lines:
+            sample_recv = line.split(',')
+            if sample_recv[0] == sample[0]:
+                matched = True
+                assert float(sample_recv[1]) <= float(sample[1])
+                break
+        assert matched
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
                                       disaggregated_example_root,
                                       llama_model_root):
