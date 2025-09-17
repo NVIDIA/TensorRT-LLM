@@ -84,6 +84,17 @@ def collect_and_clean_myelin_time(log: str):
     return log
 
 
+class MultiNodeProbe(object):
+    '''
+        class to probe if the test is running on multi-node,
+        or if the test is running on the 1st node/2nd node, etc.
+    '''
+
+    @staticmethod
+    def is_multi_node():
+        pass
+
+
 class PerfMetricType(str, Enum):
     """
     An string-enum type to define what kind of perf metric it is. It is used by QA to
