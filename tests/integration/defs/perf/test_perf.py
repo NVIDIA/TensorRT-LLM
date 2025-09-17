@@ -29,9 +29,10 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
 from .pytorch_model_config import get_model_yaml_config
-from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
-                    PerfDisaggScriptTestCmds, PerfMetricType,
-                    PerfScriptTestCmds, generate_test_nodes)
+from .utils import (AbstractPerfScriptTestClass, MultiNodeProbe,
+                    PerfBenchScriptTestCmds, PerfDisaggScriptTestCmds,
+                    PerfMetricType, PerfScriptTestCmds, generate_test_nodes,
+                    multi_node_llm_command_wrapper)
 
 if not hasattr(re, "Pattern"):
     re.Pattern = type(re.compile(""))
@@ -981,6 +982,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._perf_cache_fpath = perf_cache_fpath
         self._llm_root = llm_root
 
+    @multi_node_llm_command_wrapper
     def get_convert_weights_command(self, model_dir, engine_dir) -> str:
         """
         Get the convert checkpoint command.
@@ -1018,6 +1020,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         return command, checkpoint_dir
 
+    @multi_node_llm_command_wrapper
     def get_convert_lora_weights_command(self, model_dir, engine_dir) -> str:
         script = os.path.join(self._llm_root, "examples", "hf_lora_convert.py")
         checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
@@ -1029,6 +1032,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         return command, checkpoint_dir
 
+    @multi_node_llm_command_wrapper
     def get_trtllm_build_command(self, engine_dir, checkpoint_dir) -> list:
         build_cmd = [
             self._build_script, f"--output_dir={engine_dir}",
@@ -1090,6 +1094,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 MODEL_PATH_DICT[self._config.model_name.split('_hf')[0]])
         return model_dir
 
+    @multi_node_llm_command_wrapper
     def get_trtllm_bench_build_command(self, engine_dir) -> list:
         model_dir = self.get_trtllm_bench_model()
         if model_dir == "":
@@ -1121,6 +1126,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             build_cmd.append(f"--trust_remote_code=True")
         return build_cmd
 
+    @multi_node_llm_command_wrapper
     def get_benchmark_build_command(self, engine_dir) -> list:
         mode_flag = self._config.mode.replace("_", "-")
         build_cmd = [
@@ -1159,6 +1165,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             build_cmd.append(f"--output_timing_cache={timing_cache}")
         return build_cmd
 
+    @multi_node_llm_command_wrapper
     def get_prepare_data_command(self, engine_dir, input_len,
                                  output_len) -> list:
         data_cmd = []
@@ -1260,6 +1267,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         return data_cmd
 
+    @multi_node_llm_command_wrapper
     def get_python_runtime_benchmark_command(self, engine_dir, bs, input_len,
                                              output_len):
         benchmark_cmd = [
@@ -1293,6 +1301,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd.append(f"--enable_cuda_graph")
         return benchmark_cmd
 
+    @multi_node_llm_command_wrapper
     def get_gpt_session_runtime_benchmark_command(self, engine_dir, bs,
                                                   input_len, output_len):
         benchmark_cmd = [
@@ -1332,6 +1341,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd.append(f"--input_len={input_len}")
         return benchmark_cmd
 
+    @multi_node_llm_command_wrapper
     def get_trtllm_bench_command(self, engine_dir):
         model_dir = self.get_trtllm_bench_model()
         model_name = self._config.model_name
@@ -1386,6 +1396,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
         return benchmark_cmd
 
+    @multi_node_llm_command_wrapper
     def get_gpt_manager_runtime_benchmark_command(self, engine_dir, bs,
                                                   input_len):
         benchmark_cmd = [
@@ -1701,6 +1712,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
                 # Run the command or reuse the existing output logs.
                 print_info(f"Running command for {metric.metric_name}")
+
                 outputs = self.run_ex(
                     metric.metric_name,
                     llm_venv,
@@ -2057,12 +2069,15 @@ def run_perf_test(perf_case_name, trt_performance_cache_fpath,
     """
     The actual test definition for TensorRT LLM perf test.
     """
-    working_dir = llm_venv.get_working_directory()
-    test_runner = MultiMetricPerfTest(perf_case_name)
-    test_runner.set_runtime_configs(llm_root, working_dir,
-                                    trt_performance_cache_fpath)
-    test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,
-                            llm_session_data_writer, output_dir)
+    # Run the command in single-node environment OR in multi-node environment but only on first process
+    if not MultiNodeProbe.is_multi_node() or \
+        (MultiNodeProbe.is_first_node() and MultiNodeProbe.is_first_process()):
+        working_dir = llm_venv.get_working_directory()
+        test_runner = MultiMetricPerfTest(perf_case_name)
+        test_runner.set_runtime_configs(llm_root, working_dir,
+                                        trt_performance_cache_fpath)
+        test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,
+                                llm_session_data_writer, output_dir)
 
 
 def generate_perf_tests(session, config, items):

@@ -131,6 +131,47 @@ class MultiNodeProbe(object):
         return next((node for node in nodelist if node != current), "localhost")
 
 
+def multi_node_llm_command_wrapper(func):
+    '''
+    decorator: add trtllm-api-launch prefix to test command in multi-node env
+    Handles two return patterns:
+    1. tuple (command, checkpoint_dir) - wraps command only
+    2. list build_cmd - wraps the entire list
+    '''
+
+    def wrapper(self, *args, **kwargs):
+        # Get the original result
+        result = func(self, *args, **kwargs)
+
+        # Use trtllm-api-launch prefix if running on multi-node env
+        if MultiNodeProbe.is_multi_node():
+            # Case 1: tuple (command, checkpoint_dir)
+            if isinstance(result, tuple) and len(result) == 2:
+                command, checkpoint_dir = result
+                if isinstance(command, list):
+                    wrapped_command = ["trtllm-llmapi-launch"] + command
+                    return wrapped_command, checkpoint_dir
+                else:
+                    print(
+                        f"Warning: Case 1: Unknown return format from {func.__name__}: {type(result)}"
+                    )
+                    return result
+            # Case 2: list build_cmd
+            elif isinstance(result, list):
+                return ["trtllm-llmapi-launch"] + result
+
+            # Fallback: unknown format, return as-is
+            else:
+                print(
+                    f"Warning: Fallback: Unknown return format from {func.__name__}: {type(result)}"
+                )
+                return result
+
+        return result
+
+    return wrapper
+
+
 class PerfMetricType(str, Enum):
     """
     An string-enum type to define what kind of perf metric it is. It is used by QA to
