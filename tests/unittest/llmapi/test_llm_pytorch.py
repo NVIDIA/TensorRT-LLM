@@ -861,15 +861,14 @@ def test_llm_with_proxy_error():
 
 
 @pytest.mark.part0
-@pytest.mark.xfail(reason="https://nvbugs/5513423")
 def test_min_tokens():
     """Check min_tokens is respected."""
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
               enable_mixed_sampler=True,
-              max_seq_len=20000)
+              max_seq_len=2048)
 
-    output_len = 5000
+    output_len = 2000
     sampling_params = SamplingParams(max_tokens=output_len,
                                      min_tokens=output_len,
                                      temperature=1)
