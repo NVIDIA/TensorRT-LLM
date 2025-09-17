@@ -71,7 +71,9 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str,
 
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
-        assert similar(text_spec, text_ref)
+        # Skip the reference check for non-greedy sampling as the output is not deterministic
+        if use_greedy_sampling:
+            assert similar(text_spec, text_ref)
 
 
 if __name__ == "__main__":

@@ -220,13 +220,12 @@ class CompletionRequest(OpenAIBaseModel):
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
     temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    top_p: Optional[float] = Field(None)
     user: Optional[str] = None
     lora_request: Optional[LoRARequest] = None
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
-    top_k: int = 0
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
@@ -279,7 +278,6 @@ class CompletionRequest(OpenAIBaseModel):
 
             # completion-sampling-params
             use_beam_search=self.use_beam_search,
-            top_k=self.top_k,
             top_p_min=self.top_p_min if self.top_p_min > 0 else None,
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
@@ -510,7 +508,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    top_p: Optional[float] = Field(None)
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
@@ -527,7 +525,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
     use_beam_search: bool = False
-    top_k: int = 0
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
@@ -618,7 +615,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-sampling-params
             best_of=self.best_of,
             use_beam_search=self.use_beam_search,
-            top_k=self.top_k,
             top_p=self.top_p,
             top_p_min=self.top_p_min if self.top_p_min > 0 else None,
             min_p=self.min_p,
