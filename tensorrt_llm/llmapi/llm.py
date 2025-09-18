@@ -211,6 +211,8 @@ class BaseLLM:
                 self._workspace = None
 
             self._hf_model_dir: Optional[Path] = None
+            self._hf_model_config = None
+            self._generation_config = None
 
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
