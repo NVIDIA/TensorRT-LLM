@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
@@ -255,6 +256,7 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
 
     // Setup dispatch parameters
     MoeA2ADispatchParams params{};
+    params.one_block_per_token = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken();  // TODO: Decide this based on the workload
     params.token_selected_experts = tokenSelectedExperts.data_ptr<int32_t>();
     params.num_payloads = static_cast<int32_t>(payloadDescriptors.size());
     std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), &params.payloads[0]);
@@ -414,6 +416,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
 
     // Setup combine parameters
     MoeA2ACombineParams params{};
+    params.one_block_per_token = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken();  // TODO: Decide this based on the workload
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.local_num_tokens = static_cast<int>(localNumTokens);

@@ -462,4 +462,15 @@ bool getEnvDisableChunkedAttentionInGenPhase()
     return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
 }
 
+bool getEnvMoeA2AOneBlockPerToken()
+{
+    // Default true; return false only if env set to "0"
+    static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
+    if (!val.has_value())
+    {
+        return true;
+    }
+    return val.value() != 0;
+}
+
 } // namespace tensorrt_llm::common

@@ -74,6 +74,9 @@ struct CombineKernelPointers
 // Dispatch phase parameters
 struct MoeA2ADispatchParams
 {
+    bool one_block_per_token; // True: one block per token, False: one warp per token
+
+    // Threading policy
     // EP configuration
     int ep_size; // Number of EP ranks
     int ep_rank; // Current EP rank
@@ -115,6 +118,8 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 // Combine phase parameters
 struct MoeA2ACombineParams
 {
+    bool one_block_per_token; // True: one block per token, False: one warp per token
+
     // EP configuration
     int ep_size; // Number of EP ranks
     int ep_rank; // Current EP rank

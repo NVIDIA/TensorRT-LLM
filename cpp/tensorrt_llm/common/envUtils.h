@@ -116,4 +116,7 @@ bool getEnvDisaggBenchmarkGenOnly();
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
 
+// Whether to use one block per token for MoE A2A kernels (default true).
+bool getEnvMoeA2AOneBlockPerToken();
+
 } // namespace tensorrt_llm::common

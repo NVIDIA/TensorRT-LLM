@@ -49,16 +49,48 @@ __device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank)
 // Helper Functions for Vectorized Memory Operations
 // ============================================================================
 
-template <int VEC_SIZE>
-__device__ void warp_vectorized_copy_impl(void* dst, void const* src, int size, int lane_id)
+struct WarpPolicy
+{
+    __device__ static int stride() { return warpSize; }
+    __device__ static int offset() { return (threadIdx.x % warpSize); }
+    __device__ static int thread_idx() { return threadIdx.x % warpSize; }
+    __device__ static int token_idx() { return (blockIdx.x * blockDim.x + threadIdx.x) / warpSize; }
+    __device__ static void sync() { __syncwarp(); }
+    __device__ static int broadcast_int(int value)
+    {
+        return __shfl_sync(0xffffffff, value, 0);
+    }
+};
+
+struct BlockPolicy
+{
+    __device__ static int stride() { return blockDim.x; }
+    __device__ static int offset() { return threadIdx.x; }
+    __device__ static int thread_idx() { return threadIdx.x; }
+    __device__ static int token_idx() { return blockIdx.x; }
+    __device__ static void sync() { __syncthreads(); }
+    __device__ static int broadcast_int(int value)
+    {
+        __shared__ int shared_value;
+        if (threadIdx.x == 0)
+        {
+            shared_value = value;
+        }
+        __syncthreads();
+        return shared_value;
+    }
+};
+
+template <int VEC_SIZE, typename ThreadingPolicy>
+__device__ void vectorized_copy_impl(void* dst, void const* src, int size)
 {
     using flashinfer::vec_t;
 
     uint8_t* dst_ptr = static_cast<uint8_t*>(dst);
     uint8_t const* src_ptr = static_cast<uint8_t const*>(src);
 
-    int const stride = warpSize * VEC_SIZE;
-    int const initial_offset = lane_id * VEC_SIZE;
+    int const stride = ThreadingPolicy::stride() * VEC_SIZE;
+    int const initial_offset = ThreadingPolicy::offset() * VEC_SIZE;
     int remaining = size - initial_offset;
     if (remaining <= 0)
     {
@@ -68,7 +100,6 @@ __device__ void warp_vectorized_copy_impl(void* dst, void const* src, int size, 
     int num_iters = (remaining + stride - 1) / stride;
     int unrolled_iters = (num_iters / 4) * 4;
 
-    // Unrolled main loop (factor 4)
     for (int i = 0; i < unrolled_iters; i += 4)
     {
         int o0 = initial_offset + (i + 0) * stride;
@@ -92,7 +123,6 @@ __device__ void warp_vectorized_copy_impl(void* dst, void const* src, int size, 
         v3.store(dst_ptr + o3);
     }
 
-    // Remainder loop
     for (int i = unrolled_iters; i < num_iters; ++i)
     {
         int o = initial_offset + i * stride;
@@ -102,27 +132,28 @@ __device__ void warp_vectorized_copy_impl(void* dst, void const* src, int size, 
     }
 }
 
-__device__ void warp_vectorized_copy(void* dst, void const* src, int size, int lane_id)
+template <typename ThreadingPolicy>
+__device__ void vectorized_copy(void* dst, void const* src, int size)
 {
     if (size % 16 == 0)
     {
-        warp_vectorized_copy_impl<16>(dst, src, size, lane_id);
+        vectorized_copy_impl<16, ThreadingPolicy>(dst, src, size);
     }
     else if (size % 8 == 0)
     {
-        warp_vectorized_copy_impl<8>(dst, src, size, lane_id);
+        vectorized_copy_impl<8, ThreadingPolicy>(dst, src, size);
     }
     else if (size % 4 == 0)
     {
-        warp_vectorized_copy_impl<4>(dst, src, size, lane_id);
+        vectorized_copy_impl<4, ThreadingPolicy>(dst, src, size);
     }
     else if (size % 2 == 0)
     {
-        warp_vectorized_copy_impl<2>(dst, src, size, lane_id);
+        vectorized_copy_impl<2, ThreadingPolicy>(dst, src, size);
     }
     else
     {
-        warp_vectorized_copy_impl<1>(dst, src, size, lane_id);
+        vectorized_copy_impl<1, ThreadingPolicy>(dst, src, size);
     }
 }
 
@@ -159,21 +190,16 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* send_indice
 // - Better GPU utilization and reduced synchronization overhead
 // ============================================================================
 
+template <typename ThreadingPolicy>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, top_k]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int top_k, int num_experts_per_rank)
 {
-    // Constants
-    constexpr int WARPS_PER_BLOCK = 8; // 256 threads / 32 threads per warp
-    constexpr int WARP_SIZE = 32;
 
-    // Determine which warp this thread belongs to and which token it handles
-    int warp_id_in_block = threadIdx.x / WARP_SIZE;
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id_in_block;
-    int local_token_idx = global_warp_id;
+    int thread_idx = ThreadingPolicy::thread_idx();
+    int local_token_idx = ThreadingPolicy::token_idx();
 
     if (local_token_idx >= local_num_tokens)
     {
@@ -192,14 +218,14 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         // Only one thread per warp should increment the counter
         int dst_token_idx;
-        if (lane_id == 0)
+        if (thread_idx == 0)
         {
             dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
 
             ptrs.send_indices[local_token_idx * ep_size + target_rank] = dst_token_idx;
         }
-        // Broadcast the index to all threads in the warp
-        dst_token_idx = __shfl_sync(0xffffffff, dst_token_idx, 0);
+        // Broadcast the index to all participating threads per token
+        dst_token_idx = ThreadingPolicy::broadcast_int(dst_token_idx);
 
         for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
         {
@@ -212,17 +238,17 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             uint8_t* dst_ptr = dst_data + (rank_id * max_tokens_per_rank + dst_token_idx) * bytes_per_token;
             uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-            warp_vectorized_copy(dst_ptr, src_ptr, bytes_per_token, lane_id);
+            vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
         }
 
         already_copied |= 1ULL << target_rank;
     }
 
     // (A) __syncwarp guarantees: If lane0's sent data are visible, then all lanes' sent data are visible
-    __syncwarp();
+    ThreadingPolicy::sync();
 
     // Finished sending this token. Check if we're the last token to complete.
-    if (lane_id == 0)
+    if (thread_idx == 0)
     {
         int cnt;
         // (B) .release guarantees: If increment of local_token_counter is visible, then lane0's sent data are visible
@@ -296,12 +322,6 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     TLLM_CHECK(params.local_num_tokens > 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
 
-    // Configure kernel launch
-    constexpr int kBlockSize = 256;
-    constexpr int kWarpSize = 32;
-    constexpr int kWarpsPerBlock = kBlockSize / kWarpSize;
-    int grid_size = ceilDiv(params.local_num_tokens,kWarpsPerBlock);
-
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {}; // Zero-initialize
 
@@ -333,148 +353,39 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     // Copy communication tracking pointers
     kernel_ptrs.send_counters = params.send_counters;
     kernel_ptrs.send_indices = params.send_indices;
-    kernel_ptrs.local_token_counter = params.local_token_counter;
+    kernel_ptrs.local_token_counter = params.local_token_counter;     
 
-    moeA2ADispatchKernel<<<grid_size, kBlockSize, 0, params.stream>>>(params.token_selected_experts, kernel_ptrs,
-        params.num_payloads, params.max_tokens_per_rank,
-        params.local_num_tokens, params.ep_rank, params.ep_size, params.top_k, params.num_experts_per_rank);
-}
+    constexpr int kBlockSize = 256;
+    constexpr int kWarpSize = 32;
+    constexpr int kWarpsPerBlock = kBlockSize / kWarpSize;
 
-// ============================================================================
-// Helper Functions for Vectorized Summation
-// ============================================================================
-
-template <int VEC_SIZE, typename T>
-__device__ void warp_vectorized_sum_impl(void* dst, void const* src, int size, int lane_id)
-{
-    using flashinfer::vec_t;
-
-    uint8_t* dst_ptr = static_cast<uint8_t*>(dst);
-    uint8_t const* src_ptr = static_cast<uint8_t const*>(src);
-
-    int const stride = warpSize * VEC_SIZE;
-    int const initial_offset = lane_id * VEC_SIZE;
-    int remaining = size - initial_offset;
-    if (remaining <= 0)
+    // Configure kernel launch
+    if (params.one_block_per_token)
     {
-        return;
-    }
-
-    int num_iters = (remaining + stride - 1) / stride;
-    int unrolled_iters = (num_iters / 4) * 4;
-
-    // Unrolled main loop (factor 4)
-    for (int i = 0; i < unrolled_iters; i += 4)
-    {
-        int o0 = initial_offset + (i + 0) * stride;
-        int o1 = initial_offset + (i + 1) * stride;
-        int o2 = initial_offset + (i + 2) * stride;
-        int o3 = initial_offset + (i + 3) * stride;
-
-        vec_t<uint8_t, VEC_SIZE> src0;
-        vec_t<uint8_t, VEC_SIZE> src1;
-        vec_t<uint8_t, VEC_SIZE> src2;
-        vec_t<uint8_t, VEC_SIZE> src3;
-        vec_t<uint8_t, VEC_SIZE> dst0;
-        vec_t<uint8_t, VEC_SIZE> dst1;
-        vec_t<uint8_t, VEC_SIZE> dst2;
-        vec_t<uint8_t, VEC_SIZE> dst3;
-
-        // Load all inputs first
-        src0.load(src_ptr + o0); dst0.load(dst_ptr + o0);
-        src1.load(src_ptr + o1); dst1.load(dst_ptr + o1);
-        src2.load(src_ptr + o2); dst2.load(dst_ptr + o2);
-        src3.load(src_ptr + o3); dst3.load(dst_ptr + o3);
-
-        // Compute
-        constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
-        {
-            T* d = reinterpret_cast<T*>(&dst0);
-            T const* s = reinterpret_cast<T const*>(&src0);
-            #pragma unroll
-            for (int j = 0; j < elems_per_vec; j++) d[j] += s[j];
-        }
-        {
-            T* d = reinterpret_cast<T*>(&dst1);
-            T const* s = reinterpret_cast<T const*>(&src1);
-            #pragma unroll
-            for (int j = 0; j < elems_per_vec; j++) d[j] += s[j];
-        }
-        {
-            T* d = reinterpret_cast<T*>(&dst2);
-            T const* s = reinterpret_cast<T const*>(&src2);
-            #pragma unroll
-            for (int j = 0; j < elems_per_vec; j++) d[j] += s[j];
-        }
-        {
-            T* d = reinterpret_cast<T*>(&dst3);
-            T const* s = reinterpret_cast<T const*>(&src3);
-            #pragma unroll
-            for (int j = 0; j < elems_per_vec; j++) d[j] += s[j];
-        }
-
-        // Store all outputs
-        dst0.store(dst_ptr + o0);
-        dst1.store(dst_ptr + o1);
-        dst2.store(dst_ptr + o2);
-        dst3.store(dst_ptr + o3);
-    }
-
-    // Remainder loop
-    for (int i = unrolled_iters; i < num_iters; ++i)
-    {
-        int o = initial_offset + i * stride;
-        vec_t<uint8_t, VEC_SIZE> src_vec;
-        vec_t<uint8_t, VEC_SIZE> dst_vec;
-        src_vec.load(src_ptr + o);
-        dst_vec.load(dst_ptr + o);
-        T* dst_typed = reinterpret_cast<T*>(&dst_vec);
-        T const* src_typed = reinterpret_cast<T const*>(&src_vec);
-        constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
-        #pragma unroll
-        for (int j = 0; j < elems_per_vec; j++)
-        {
-            dst_typed[j] += src_typed[j];
-        }
-        dst_vec.store(dst_ptr + o);
-    }
-}
-
-template <typename T>
-__device__ void warp_vectorized_sum(void* dst, void const* src, int size, int lane_id)
-{
-    // Choose vector size based on type alignment, but process as bytes
-    if (size % 16 == 0)
-    {
-        warp_vectorized_sum_impl<16, T>(dst, src, size, lane_id);
-    }
-    else if (size % 8 == 0)
-    {
-        warp_vectorized_sum_impl<8, T>(dst, src, size, lane_id);
-    }
-    else if (size % 4 == 0)
-    {
-        warp_vectorized_sum_impl<4, T>(dst, src, size, lane_id);
-    }
-    else if (size % 2 == 0)
-    {
-        warp_vectorized_sum_impl<2, T>(dst, src, size, lane_id);
+        int grid_size = params.local_num_tokens;
+        moeA2ADispatchKernel<BlockPolicy><<<grid_size, kBlockSize, 0, params.stream>>>(params.token_selected_experts, kernel_ptrs,
+            params.num_payloads, params.max_tokens_per_rank,
+            params.local_num_tokens, params.ep_rank, params.ep_size, params.top_k, params.num_experts_per_rank);
     }
     else
     {
-        warp_vectorized_sum_impl<1, T>(dst, src, size, lane_id);
+        int grid_size = ceilDiv(params.local_num_tokens,kWarpsPerBlock);
+        moeA2ADispatchKernel<WarpPolicy><<<grid_size, kBlockSize, 0, params.stream>>>(params.token_selected_experts, kernel_ptrs,
+            params.num_payloads, params.max_tokens_per_rank,
+            params.local_num_tokens, params.ep_rank, params.ep_size, params.top_k, params.num_experts_per_rank);
     }
 }
 
+// ============================================================================
+// Combine kernels
+// ============================================================================
 
 // Accumulate across all valid ranks into registers, then store once per segment
-template <int VEC_SIZE, typename T>
-__device__ void warp_vectorized_combine_impl(
+template <int VEC_SIZE, typename ThreadingPolicy, typename T>
+__device__ void vectorized_combine_impl(
     T* dst_typed_base,
     int size_per_token,
-    int lane_id,
     int ep_size,
-    int local_token_idx,
     int rank_id,
     int max_tokens_per_rank,
     CombineKernelPointers const& ptrs)
@@ -484,8 +395,10 @@ __device__ void warp_vectorized_combine_impl(
 
     uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst_typed_base);
 
-    int const stride = warpSize * VEC_SIZE;
-    int const initial_offset = lane_id * VEC_SIZE;
+    const int stride = ThreadingPolicy::stride() * VEC_SIZE;
+    const int initial_offset = ThreadingPolicy::offset() * VEC_SIZE;
+    const int local_token_idx = ThreadingPolicy::token_idx();
+
     int remaining = size_per_token - initial_offset;
     if (remaining <= 0)
     {
@@ -527,14 +440,14 @@ __device__ void warp_vectorized_combine_impl(
             if (dst_idx < 0) continue;
 
             uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
-            int base = rank_id * max_tokens_per_rank + dst_idx;
-            int token_base = base * size_per_token;
+            size_t base_source_rank = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) + static_cast<size_t>(dst_idx);
+            size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
 
             vec_t<uint8_t, VEC_SIZE> s0, s1, s2, s3;
-            s0.load(recv_buffer + token_base + o0);
-            s1.load(recv_buffer + token_base + o1);
-            s2.load(recv_buffer + token_base + o2);
-            s3.load(recv_buffer + token_base + o3);
+            s0.load(recv_buffer + base_token + o0);
+            s1.load(recv_buffer + base_token + o1);
+            s2.load(recv_buffer + base_token + o2);
+            s3.load(recv_buffer + base_token + o3);
 
             T* a0 = reinterpret_cast<T*>(&acc0);
             T* a1 = reinterpret_cast<T*>(&acc1);
@@ -572,10 +485,10 @@ __device__ void warp_vectorized_combine_impl(
             int dst_idx = ptrs.send_indices[local_token_idx * ep_size + target_rank];
             if (dst_idx < 0) continue;
             uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
-            int base = rank_id * max_tokens_per_rank + dst_idx;
-            int token_base = base * size_per_token;
+            size_t base_source_rank = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) + static_cast<size_t>(dst_idx);
+            size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
             vec_t<uint8_t, VEC_SIZE> s;
-            s.load(recv_buffer + token_base + o);
+            s.load(recv_buffer + base_token + o);
             T* a = reinterpret_cast<T*>(&acc);
             T const* v = reinterpret_cast<T const*>(&s);
             #pragma unroll
@@ -587,55 +500,48 @@ __device__ void warp_vectorized_combine_impl(
 }
 
 // Wrapper that selects vector width based on size_per_token alignment
-template <typename T>
-__device__ void warp_vectorized_combine(
+template <typename ThreadingPolicy, typename T>
+__device__ void vectorized_combine(
     T* dst_typed_base,
     int size_per_token,
-    int lane_id,
     int ep_size,
-    int local_token_idx,
     int rank_id,
     int max_tokens_per_rank,
     CombineKernelPointers const& ptrs)
 {
     if (size_per_token % 16 == 0)
     {
-        warp_vectorized_combine_impl<16, T>(dst_typed_base, size_per_token, lane_id, ep_size,
-            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
+        vectorized_combine_impl<16, ThreadingPolicy, T>(dst_typed_base, size_per_token, ep_size,
+            rank_id, max_tokens_per_rank, ptrs);
     }
     else if (size_per_token % 8 == 0)
     {
-        warp_vectorized_combine_impl<8, T>(dst_typed_base, size_per_token, lane_id, ep_size,
-            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
+        vectorized_combine_impl<8, ThreadingPolicy, T>(dst_typed_base, size_per_token, ep_size,
+            rank_id, max_tokens_per_rank, ptrs);
     }
     else if (size_per_token % 4 == 0)
     {
-        warp_vectorized_combine_impl<4, T>(dst_typed_base, size_per_token, lane_id, ep_size,
-            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
+        vectorized_combine_impl<4, ThreadingPolicy, T>(dst_typed_base, size_per_token, ep_size,
+            rank_id, max_tokens_per_rank, ptrs);
     }
     else if (size_per_token % 2 == 0)
     {
-        warp_vectorized_combine_impl<2, T>(dst_typed_base, size_per_token, lane_id, ep_size,
-            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
+        vectorized_combine_impl<2, ThreadingPolicy, T>(dst_typed_base, size_per_token, ep_size,
+            rank_id, max_tokens_per_rank, ptrs);
     }
     else
     {
-        warp_vectorized_combine_impl<1, T>(dst_typed_base, size_per_token, lane_id, ep_size,
-            local_token_idx, rank_id, max_tokens_per_rank, ptrs);
+        vectorized_combine_impl<1, ThreadingPolicy, T>(dst_typed_base, size_per_token, ep_size,
+            rank_id, max_tokens_per_rank, ptrs);
     }
 }
 
-// Copy payload to recv buffer using warp-based vectorized copy (one warp per token)
+// Copy payload to recv buffer using vectorized copy; supports warp/block token mapping
+template <typename ThreadingPolicy>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uint8_t* payload_bytes, 
     int bytes_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, const int* recv_counters)
-{
-    // One warp per token design
-    constexpr int WARP_SIZE = 32;
-    constexpr int WARPS_PER_BLOCK = 8; // 256 threads / 32
-    
-    int warp_id_in_block = threadIdx.x / WARP_SIZE;
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id_in_block;
+{    
+    int slot_idx = ThreadingPolicy::token_idx();
 
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
@@ -643,45 +549,37 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, const uin
         *flag_val_ptr = *flag_val_ptr + 1;
     }
     
-    int total_tokens = ep_size * max_tokens_per_rank;
-    if (global_warp_id >= total_tokens)
+    int total_slots = ep_size * max_tokens_per_rank;
+    if (slot_idx >= total_slots)
         return;
     
     // Map global token to (source_rank, token_idx)
-    int source_rank = global_warp_id / max_tokens_per_rank;
-    int token_idx   = global_warp_id % max_tokens_per_rank;
+    int source_rank = slot_idx / max_tokens_per_rank;
+    int token_idx   = slot_idx % max_tokens_per_rank;
     
     // Skip invalid tokens beyond per-source recv count
     if (token_idx >= recv_counters[source_rank])
         return;
     
     // Calculate source and destination pointers for this token
-    size_t token_offset = static_cast<size_t>(global_warp_id) * bytes_per_token;
-    uint8_t* dst_ptr = recv_buffer_bytes + token_offset;
-    const uint8_t* src_ptr = payload_bytes + token_offset;
+    size_t slot_offset = static_cast<size_t>(slot_idx) * bytes_per_token;
+    uint8_t* dst_ptr = recv_buffer_bytes + slot_offset;
+    const uint8_t* src_ptr = payload_bytes + slot_offset;
     
-    // Copy one token's data using vectorized copy
-    warp_vectorized_copy(dst_ptr, src_ptr, bytes_per_token, lane_id);
+    // Copy one token's data using vectorized copy with policy
+    vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
 }
 
 // ============================================================================
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T>
+template <typename T, typename ThreadingPolicy>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,                        // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
-    // Constants
-    constexpr int WARPS_PER_BLOCK = 8;
-    constexpr int WARP_SIZE = 32;
-
-    // One warp per token
-    int warp_id_in_block = threadIdx.x / WARP_SIZE;
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id_in_block;
-    int local_token_idx = global_warp_id;
+    int local_token_idx = ThreadingPolicy::token_idx();
     int const size_per_token = elements_per_token * sizeof(T);
 
     if (local_token_idx >= local_num_tokens)
@@ -732,8 +630,8 @@ __global__ void moeA2ACombineKernel(
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
 
     // Accumulate across ranks in registers, then store once per segment
-    warp_vectorized_combine<T>(token_output, size_per_token, lane_id, ep_size,
-        local_token_idx, rank_id, max_tokens_per_rank, ptrs);
+    vectorized_combine<ThreadingPolicy, T>(token_output, size_per_token, ep_size,
+        rank_id, max_tokens_per_rank, ptrs);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
@@ -760,17 +658,32 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     }
     
     int bytes_per_token = params.elements_per_token * element_size;
-    int total_tokens = params.ep_size * params.max_tokens_per_rank;
-    int grid_size = ceilDiv(total_tokens, kWarpsPerBlock);
+    int total_slots = params.ep_size * params.max_tokens_per_rank;
+    int grid_size_warp = ceilDiv(total_slots, kWarpsPerBlock);
+    int grid_size_block = total_slots; // one block per token
     
-    moeA2APrepareCombineKernel<<<grid_size, kBlockSize, 0, params.stream>>>(
-        static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])), 
-        static_cast<const uint8_t*>(params.prepare_payload),
-        bytes_per_token,
-        params.ep_size,
-        params.max_tokens_per_rank,
-        params.flag_val,
-        params.recv_counters);
+    if (params.one_block_per_token)
+    {
+        moeA2APrepareCombineKernel<BlockPolicy><<<grid_size_block, kBlockSize, 0, params.stream>>>(
+            static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])), 
+            static_cast<const uint8_t*>(params.prepare_payload),
+            bytes_per_token,
+            params.ep_size,
+            params.max_tokens_per_rank,
+            params.flag_val,
+            params.recv_counters);
+    }
+    else
+    {
+        moeA2APrepareCombineKernel<WarpPolicy><<<grid_size_warp, kBlockSize, 0, params.stream>>>(
+            static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])), 
+            static_cast<const uint8_t*>(params.prepare_payload),
+            bytes_per_token,
+            params.ep_size,
+            params.max_tokens_per_rank,
+            params.flag_val,
+            params.recv_counters);
+    }
 }
 
 
@@ -789,7 +702,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Configure kernel launch
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32; // warpSize
-    int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
+    int grid_size_warp = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
+    int grid_size_block = params.local_num_tokens;
 
     // Prepare kernel pointers struct for combine
     CombineKernelPointers kernel_ptrs = {}; // Zero-initialize
@@ -817,21 +731,36 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     switch (params.dtype)
     {
     case nvinfer1::DataType::kHALF:
-        moeA2ACombineKernel<half><<<grid_size, kBlockSize, 0, params.stream>>>(kernel_ptrs,
-            params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
-            params.ep_rank, params.ep_size);
+        if (params.one_block_per_token)
+            moeA2ACombineKernel<half, BlockPolicy><<<grid_size_block, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+                params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                params.ep_rank, params.ep_size);
+        else
+            moeA2ACombineKernel<half, WarpPolicy><<<grid_size_warp, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+                params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                params.ep_rank, params.ep_size);
         break;
 
     case nvinfer1::DataType::kBF16:
-        moeA2ACombineKernel<__nv_bfloat16><<<grid_size, kBlockSize, 0, params.stream>>>(kernel_ptrs,
-            params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
-            params.ep_rank, params.ep_size);
+        if (params.one_block_per_token)
+            moeA2ACombineKernel<__nv_bfloat16, BlockPolicy><<<grid_size_block, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+                params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                params.ep_rank, params.ep_size);
+        else
+            moeA2ACombineKernel<__nv_bfloat16, WarpPolicy><<<grid_size_warp, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+                params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                params.ep_rank, params.ep_size);
         break;
 
     case nvinfer1::DataType::kFLOAT:
-        moeA2ACombineKernel<float><<<grid_size, kBlockSize, 0, params.stream>>>(kernel_ptrs,
-            params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
-            params.ep_rank, params.ep_size);
+        if (params.one_block_per_token)
+            moeA2ACombineKernel<float, BlockPolicy><<<grid_size_block, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+                params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                params.ep_rank, params.ep_size);
+        else
+            moeA2ACombineKernel<float, WarpPolicy><<<grid_size_warp, kBlockSize, 0, params.stream>>>(kernel_ptrs,
+                params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                params.ep_rank, params.ep_size);
         break;
 
     default: TLLM_CHECK_WITH_INFO(false, "Unsupported data type for moe_a2a_combine");
