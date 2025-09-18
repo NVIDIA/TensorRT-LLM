@@ -2599,6 +2599,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     [
         ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf", 0.8),
         ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.8),
+        ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct",
+         0.8),
         pytest.param(
             "mistral-small-3.1-24b-instruct",
             "Mistral-Small-3.1-24B-Instruct-2503",
@@ -2617,7 +2619,8 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
         os.path.join(llm_models_root(), "multimodals", "test_data"))
     print(f"Accuracy test {model_name} {modality} mode with example inputs.")
     if modality == "video" and model_name in {
-            "llava-v1.6-mistral-7b", "mistral-small-3.1-24b-instruct"
+            "llava-v1.6-mistral-7b", "mistral-small-3.1-24b-instruct",
+            "phi4-multimodal-instruct"
     }:
         pytest.skip(f"Skipping video modality test for {model_name}")
 
@@ -2663,6 +2666,14 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
                 ],
             ] * num_same_requests,
         },
+        "phi4-multimodal-instruct": {
+            "image": [
+                [
+                    "image", "depicts", "natural", "environment", "ocean",
+                    "water", "waves", "sky"
+                ],
+            ] * num_same_requests,
+        },
     }
 
     cmd = [
@@ -2682,6 +2693,12 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
+
+    if model_name == "phi4-multimodal-instruct":
+        cmd.append("--max_seq_len=4096")
+        cmd.append("--load_lora")
+        cmd.append("--auto_model_name")
+        cmd.append("Phi4MMForCausalLM")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
     match_ratio = 4.0 / 5
@@ -2707,6 +2724,8 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     [
         ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf", 0.8),
         ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.8),
+        ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct",
+         0.8),
         pytest.param(
             "mistral-small-3.1-24b-instruct",
             "Mistral-Small-3.1-24B-Instruct-2503",
@@ -2725,10 +2744,10 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
         os.path.join(llm_models_root(), "multimodals", "test_data"))
     print(f"Accuracy test {model_name} {modality} mode with example inputs.")
     if modality == "video" and model_name in {
-            "llava-v1.6-mistral-7b", "mistral-small-3.1-24b-instruct"
+            "llava-v1.6-mistral-7b", "mistral-small-3.1-24b-instruct",
+            "phi4-multimodal-instruct"
     }:
-        pytest.skip("Skipping video modality test for llava-v1.6-mistral-7b")
-
+        pytest.skip(f"Skipping video modality test for {model_name}")
     accuracy_inputs = {
         "image": {
             "prompt": [
@@ -2789,6 +2808,22 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
                 ],
             ],
         },
+        "phi4-multimodal-instruct": {
+            "image": [
+                [
+                    "image", "depicts", "natural", "environment", "ocean",
+                    "water", "waves", "sky"
+                ],
+                [
+                    "object", "mountain", "weather", "condition", "clear",
+                    "visible"
+                ],
+                [
+                    "traffic", "condition", "road", "moderate", "vehicles",
+                    "lanes", "cars", "bus"
+                ],
+            ],
+        },
     }
 
     cmd = [
@@ -2804,6 +2839,11 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
         "--enable_chunked_prefill",
         "--max_num_tokens=256",
     ]
+    if model_name == "phi4-multimodal-instruct":
+        cmd.append("--max_seq_len=4096")
+        cmd.append("--load_lora")
+        cmd.append("--auto_model_name")
+        cmd.append("Phi4MMForCausalLM")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
     for prompt_output, prompt_keywords in zip(
