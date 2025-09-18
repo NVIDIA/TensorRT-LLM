@@ -18,12 +18,15 @@ import copy
 import io
 import os
 import re
+import socket
 import subprocess
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
+import requests
 from _pytest.nodes import Item
 from _pytest.python import Function
 from defs.trt_test_alternative import (check_output, popen, print_error,
@@ -80,6 +83,130 @@ def collect_and_clean_myelin_time(log: str):
     log += "Sub Regions: \n"
     log += log_sorted_time(sub_region_time_list)
     return log
+
+
+class MultiNodeProbe(object):
+    '''
+        class to probe if the test is running on multi-node,
+        or if the test is running on the 1st node/2nd node, etc.
+    '''
+
+    @staticmethod
+    def get_nodelist():
+        """Get list of nodes from SLURM environment"""
+        nodelist_str = os.environ.get("SLURM_NODELIST", "")
+        if not nodelist_str:
+            return []
+
+        # Matched format: prefix-[num1,num2,...]
+        match = re.match(r'(.*?)\[([^\]]+)\]', nodelist_str)
+        if match:
+            prefix = match.group(1)
+            numbers = match.group(2).split(',')
+            return [f"{prefix}{num.strip()}" for num in numbers]
+        else:
+            # If not matched with bracket format, split by comma
+            return nodelist_str.split(',')
+
+    @staticmethod
+    def is_multi_node():
+        # return whether the test is running on multi-node or not
+        return len(MultiNodeProbe.get_nodelist()) > 1
+
+    @staticmethod
+    def is_first_node():
+        if not MultiNodeProbe.is_multi_node():
+            return False
+        return int(os.environ.get("SLURM_NODEID", 0)) == 0
+
+    @staticmethod
+    def is_second_node():
+        if not MultiNodeProbe.is_multi_node():
+            return False
+        return int(os.environ.get("SLURM_NODEID", 0)) == 1
+
+    @staticmethod
+    def is_first_process():
+        """Check if this is rank 0 process on current node (should start servers)"""
+        if not MultiNodeProbe.is_multi_node():
+            return False
+        rank = int(os.environ.get("SLURM_LOCALID", 0))
+        ntasks_per_node = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
+        return (rank % ntasks_per_node) == 0
+
+    @staticmethod
+    def get_other_node_ip():
+        if not MultiNodeProbe.is_multi_node():
+            return "localhost"
+        nodelist = MultiNodeProbe.get_nodelist()
+        current = socket.gethostname()
+        return next((node for node in nodelist if node != current), "localhost")
+
+
+def multi_node_llm_command_wrapper(func):
+    '''
+    decorator: add trtllm-api-launch prefix to test command in multi-node env
+    Handles two return patterns:
+    1. tuple (command, checkpoint_dir) - wraps command only
+    2. list build_cmd - wraps the entire list
+    '''
+
+    def wrapper(self, *args, **kwargs):
+        # Get the original result
+        result = func(self, *args, **kwargs)
+
+        # Use trtllm-api-launch prefix if running on multi-node env
+        if MultiNodeProbe.is_multi_node():
+            # Case 1: tuple (command, checkpoint_dir)
+            if isinstance(result, tuple) and len(result) == 2:
+                command, checkpoint_dir = result
+                if isinstance(command, list):
+                    wrapped_command = ["trtllm-llmapi-launch"] + command
+                    return wrapped_command, checkpoint_dir
+                else:
+                    print(
+                        f"Warning: Case 1: Unknown return format from {func.__name__}: {type(result)}"
+                    )
+                    return result
+            # Case 2: list build_cmd
+            elif isinstance(result, list):
+                return ["trtllm-llmapi-launch"] + result
+
+            # Fallback: unknown format, return as-is
+            else:
+                print(
+                    f"Warning: Fallback: Unknown return format from {func.__name__}: {type(result)}"
+                )
+                return result
+
+        return result
+
+    return wrapper
+
+
+def multi_node_disagg_server_command_wrapper(func):
+    '''
+    decorator: add trtllm-llmapi-launch prefix to test command in multi-node env
+    '''
+
+    def wrapper(self, *args, **kwargs):
+        # Get the original result
+        result = func(self, *args, **kwargs)
+        # Use trtllm-api-launch prefix if running on multi-node env
+        if MultiNodeProbe.is_multi_node():
+            if isinstance(result, str):
+                return "trtllm-llmapi-launch " + result
+            elif isinstance(result, list):
+                return ["trtllm-llmapi-launch"] + result
+            else:
+                print(
+                    f"Warning: Fallback: Unknown return format from {func.__name__}: {type(result)}"
+                )
+                return result
+
+        return result
+
+    return wrapper
 
 
 class PerfMetricType(str, Enum):
@@ -316,7 +443,20 @@ class PerfDisaggScriptTestCmds(NamedTuple):
     client_cmd: List[str]
     benchmark_cmd: List[str]
 
-    def run_cmd(self, cmd_idx: int, venv) -> str:
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 600):
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            try:
+                time.sleep(1)
+                if requests.get(url).status_code == 200:
+                    print(f"endpoint {url} is ready")
+                    return
+            except Exception as err:
+                print(f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
+
+    def run_cmd_on_single_node(self, cmd_idx: int, venv) -> str:
         output = ""
         try:
             with (  # Start ctx workers
@@ -340,6 +480,9 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as server_proc):
+                self.wait_for_endpoint_ready(
+                    f"http://localhost:8000/health",
+                    timeout=1800)  # 30 minutes for large models
                 check_output(self.client_cmd, env=venv._new_env)
                 output += check_output(self.benchmark_cmd, env=venv._new_env)
         finally:
@@ -350,6 +493,85 @@ class PerfDisaggScriptTestCmds(NamedTuple):
             ctx_workers_proc.wait()
             gen_workers_proc.wait()
         return output
+
+    def run_cmd_on_multi_node(self, cmd_idx: int, venv) -> str:
+        output = ""
+        # Initialize variables to None for safe cleanup
+        output_ctx = None
+        output_gen = None
+        output_server = None
+        ctx_workers_proc = None
+        gen_workers_proc = None
+        server_proc = None
+
+        try:
+            if MultiNodeProbe.is_first_node():
+                # Start ctx workers
+                output_ctx = open('output_ctx.log', 'w')
+                ctx_workers_proc = popen(self.ctx_cmd,
+                                         stdout=output_ctx,
+                                         stderr=subprocess.STDOUT,
+                                         env=venv._new_env,
+                                         shell=True)
+
+            if MultiNodeProbe.is_second_node():
+                # Start gen workers
+                output_gen = open('output_gen.log', 'w')
+                gen_workers_proc = popen(self.gen_cmd,
+                                         stdout=output_gen,
+                                         stderr=subprocess.STDOUT,
+                                         env=venv._new_env,
+                                         shell=True)
+
+            if MultiNodeProbe.is_first_node(
+            ) and MultiNodeProbe.is_first_process():
+                # Start server
+                output_server = open('output_server.log', 'w')
+                server_proc = popen(self.server_cmd,
+                                    stdout=output_server,
+                                    stderr=subprocess.STDOUT,
+                                    env=venv._new_env,
+                                    shell=True)
+                # wait for server to be ready
+                self.wait_for_endpoint_ready(
+                    f"http://localhost:8000/health",
+                    timeout=1800)  # 30 minutes for large models
+                # start disaggregated client
+                check_output(self.client_cmd, env=venv._new_env)
+                # start benchmark
+                output += check_output(self.benchmark_cmd, env=venv._new_env)
+        finally:
+            # Safely terminate processes
+            if server_proc is not None:
+                server_proc.terminate()
+            if ctx_workers_proc is not None:
+                ctx_workers_proc.terminate()
+            if gen_workers_proc is not None:
+                gen_workers_proc.terminate()
+
+            # Wait for processes to finish
+            if server_proc is not None:
+                server_proc.wait()
+            if ctx_workers_proc is not None:
+                ctx_workers_proc.wait()
+            if gen_workers_proc is not None:
+                gen_workers_proc.wait()
+
+            # Close file handles
+            if output_ctx is not None:
+                output_ctx.close()
+            if output_gen is not None:
+                output_gen.close()
+            if output_server is not None:
+                output_server.close()
+
+        return output
+
+    def run_cmd(self, cmd_idx: int, venv) -> str:
+        if MultiNodeProbe.is_multi_node():
+            return self.run_cmd_on_multi_node(cmd_idx, venv)
+        else:
+            return self.run_cmd_on_single_node(cmd_idx, venv)
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
         return ["disaggregated server tests, please check config files"]
@@ -527,10 +749,14 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 # Stop the timer
                 self._end_timestamp = datetime.utcnow()
 
-                # Write results to output csv and/or yaml files.
-                self._write_result(full_test_name, session_data_writer,
-                                   output_dir, outputs, original_test_name,
-                                   cmd_idx)
+                #For multinode - Only perform write result on first node and first process
+                #For single node - Not care this one, assume its single CPU process
+                if not MultiNodeProbe.is_multi_node() or \
+                    (MultiNodeProbe.is_first_node() and MultiNodeProbe.is_first_process()):
+                    # Write results to output csv and/or yaml files.
+                    self._write_result(full_test_name, session_data_writer,
+                                       output_dir, outputs, original_test_name,
+                                       cmd_idx)
 
         return outputs
 
