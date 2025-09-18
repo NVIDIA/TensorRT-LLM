@@ -410,7 +410,7 @@ def register_input_processor(
 
 def create_input_processor(model_path_or_dir: str,
                            tokenizer,
-                           checkpoint_format: str = "HF"):
+                           checkpoint_format: Optional[str] = None):
     """Create an input processor for a specific model.
 
     If checkpoint_format is not "HF", fall back to DefaultInputProcessor.
@@ -420,7 +420,7 @@ def create_input_processor(model_path_or_dir: str,
 
     model_config = None
 
-    if checkpoint_format == "HF":
+    if checkpoint_format is None or checkpoint_format == "HF":
         try:
             config = ModelConfig.from_pretrained(model_path_or_dir,
                                                  trust_remote_code=True)
