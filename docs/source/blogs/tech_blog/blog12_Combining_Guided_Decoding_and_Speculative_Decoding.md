@@ -47,10 +47,10 @@ TensorRT LLM has two kinds of speculative decoding implementations, namely the o
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog12_one_model_vs_two_model.png" width="800">
+  <img src="../media/tech_blog12_one_model_vs_two_model.png" width="600">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: The GPU timeline of one-model and tow-model speculative decoding.</em></sub></p>
+<p align="center"><sub><em>Figure 1: The GPU timelines of one-model and tow-model speculative decoding.</em></sub></p>
 
 ### Guided Decoding
 
