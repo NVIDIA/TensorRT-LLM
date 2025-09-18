@@ -277,8 +277,14 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def get_prompt_for_profiling(self):
-        "Send prompt with largest image resolution for profiling the worst case"
+    def get_dummy_text(self, mm_data: dict[str, int]):
+        num_images = mm_data.get("image", 0)
+        img_token = self.processor.image_token
+
+        return img_token * num_images
+
+    def get_dummy_images(self, mm_data: dict[str, int]):
+        num_images = mm_data.get("image", 0)
         max_width = 9999999
         max_height = 9999999
         resized_height, resized_width = smart_resize(
@@ -291,12 +297,13 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         )
         img_tensor = torch.rand([3, resized_width, resized_height],
                                 device="cpu")
-        mm_data = {"image": [img_tensor]}
+        return num_images * [img_tensor]
 
-        text_prompt = TextPrompt(
-            prompt="<|vision_start|><|image_pad|><|vision_end|>",
-            multi_modal_data=mm_data)
-        return text_prompt
+    def get_dummy_prompt(self):
+        mm_reqs = {"image": 1}
+        text = self.get_dummy_text(mm_reqs)
+        images = self.get_dummy_images(mm_reqs)
+        return TextPrompt(text=text, multi_modal_data={"image": images})
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):

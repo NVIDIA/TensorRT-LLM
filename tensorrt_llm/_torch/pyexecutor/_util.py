@@ -149,7 +149,7 @@ class KvCacheCreator:
             "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
             "ViT's encoder")
             return requests
-        text_prompt = input_processor.get_prompt_for_profiling()
+        text_prompt = input_processor.get_dummy_prompt()
         max_beam_width = self._max_beam_width
         input_processor_with_hash = create_input_processor_with_hash(
             input_processor)
