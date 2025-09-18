@@ -877,7 +877,8 @@ class Llama4Model(DecoderModel):
                 lora_params=lora_params,
             )
 
-        return hidden_states
+        # Export residual to avoid residual pp_send get eliminated by torch.compile for pp > 1.
+        return hidden_states, residual
 
 
 class LlamaModel(DecoderModel):
@@ -946,7 +947,7 @@ class LlamaModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params=None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -967,8 +968,8 @@ class LlamaModel(DecoderModel):
                 spec_metadata=spec_metadata,
                 lora_params=lora_params,
             )
-
-        return hidden_states
+        # Export residual to avoid residual pp_send get eliminated by torch.compile for pp > 1.
+        return hidden_states, residual
 
 
 @register_auto_model("LlamaForCausalLM")

@@ -247,7 +247,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
