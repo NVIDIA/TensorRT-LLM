@@ -7,6 +7,8 @@ from itertools import chain, groupby
 from pathlib import Path
 from typing import Optional
 
+import pygit2
+
 
 def underline(title: str, character: str = "=") -> str:
     return f"{title}\n{character * len(title)}"
@@ -82,14 +84,16 @@ def generate_examples():
     llmapi_doc_paths = [
         doc_dir / f"{path.stem}.rst" for path in llmapi_script_paths
     ]
-    llmapi_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api"
+    repo = pygit2.Repository('.')
+    commit_hash = str(repo.head.target)
+    llmapi_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/llm-api"
 
     # Collect source paths for trtllm-serve examples
     serve_script_paths = collect_script_paths("serve")
     serve_doc_paths = [
         doc_dir / f"{path.stem}.rst" for path in serve_script_paths
     ]
-    serve_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve"
+    serve_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/serve"
 
     def _get_lines_without_metadata(filename: str) -> str:
         """Get line ranges that exclude metadata lines.
@@ -147,7 +151,6 @@ def generate_examples():
                 logging.warning(f"Ignoring file: {script_path.name}")
                 continue
             script_url = f"{base_url}/{script_path.name}"
-
             # Determine language based on file extension
             language = "python" if script_path.suffix == ".py" else "bash"
 
