@@ -2088,25 +2088,20 @@ def run_perf_test(perf_case_name, trt_performance_cache_fpath,
     """
     The actual test definition for TensorRT LLM perf test.
     """
-    # Run the command in single-node environment OR in multi-node environment but only on first process
-    if not MultiNodeProbe.is_multi_node() or MultiNodeProbe.is_first_process():
-        working_dir = llm_venv.get_working_directory()
-        test_runner = MultiMetricPerfTest(perf_case_name)
-        if not MultiNodeProbe.is_multi_node():
-            # Single node, only support single process, multi-gpu, multi-process supported by mpi run
-            should_run = True
-        elif test_runner._config.runtime == "disagg_server":
-            # multi-node + disagg_server：run on both node0,process0 and node1,process0
-            should_run = MultiNodeProbe.is_first_process()
-        else:
-            # multi-node + other runtime：only run onnode0,process0
-            should_run = MultiNodeProbe.is_first_node(
-            ) and MultiNodeProbe.is_first_process()
-
-        if should_run:
-            test_runner.set_runtime_configs(llm_root, working_dir,
-                                            trt_performance_cache_fpath)
-            test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,
+    working_dir = llm_venv.get_working_directory()
+    
+    if MultiNodeProbe.is_multi_node():
+        # Add process ID to avoid conflicts in multi-process environment
+        process_id = os.getpid()
+        mpi_rank = os.environ.get("SLURM_PROCID", "0") 
+        process_working_dir = os.path.join(working_dir, f"rank{mpi_rank}-pid{process_id}")
+        os.makedirs(process_working_dir, exist_ok=True)
+        working_dir = process_working_dir
+    
+    test_runner = MultiMetricPerfTest(perf_case_name)
+    test_runner.set_runtime_configs(llm_root, working_dir,
+                                    trt_performance_cache_fpath)
+    test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,
                                     llm_session_data_writer, output_dir)
 
 
