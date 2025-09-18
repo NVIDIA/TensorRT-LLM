@@ -30,7 +30,6 @@ def _resolve_owner_module_and_leaf_attr(
 def _insert_fused_moe_ops(gm: GraphModule) -> int:
     fused_key_counter = 0
     graph = gm.graph
-    original_param_names = set()
 
     for node in list(graph.nodes):
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
@@ -39,11 +38,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = node.args
 
         # Track original parameter names for later safe unregistration.
-        this_fusion_param_names = set()
-        this_fusion_param_names.update([n.target for n in w1_list])
-        this_fusion_param_names.update([n.target for n in w2_list])
-        this_fusion_param_names.update([n.target for n in w3_list])
-        original_param_names.update(this_fusion_param_names)
+        pre_fusion_param_names = {n.target for lst in (w1_list, w2_list, w3_list) for n in lst}
 
         fused_w3_w1_experts = torch.stack(
             [
@@ -81,17 +76,14 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
 
-        _cleanup_unstacked_weights(
-            gm,
-            this_fusion_param_names,
-        )
+        _cleanup_unstacked_weights(gm, pre_fusion_param_names)
 
     return fused_key_counter
 
 
 def _cleanup_unstacked_weights(
     gm,
-    this_fusion_param_names,
+    pre_fusion_param_names,
 ):
     """DCE then unregister any now-unreferenced original params for this fusion"""
     gm.graph.eliminate_dead_code()
@@ -102,7 +94,7 @@ def _cleanup_unstacked_weights(
             used_attr_names_iter.add(getattr(n, "target", None))
 
     names_to_unregister_iter = [
-        name for name in this_fusion_param_names if name not in used_attr_names_iter
+        name for name in pre_fusion_param_names if name not in used_attr_names_iter
     ]
 
     for name in names_to_unregister_iter:
