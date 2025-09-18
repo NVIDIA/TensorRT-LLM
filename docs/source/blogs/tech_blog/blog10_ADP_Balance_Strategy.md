@@ -46,43 +46,43 @@ To address this critical performance limitation, we introduce the **ADP (Attenti
 We model and quantify the performance impact of load imbalance in Attention DP. Since workloads across ranks can be heterogeneous, the execution time for the Attention module in any given iteration is bounded by the rank with the highest workload:
 
 $$
-\mathrm{time\_i} = \max_{0 \leq m < N} \mathrm{time}_{i,m}
+\texttt{time\_i} = \max_{0 \leq m < N} \texttt{time}_{i,m}
 $$
 
-where $\mathrm{time}_{i,m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
+where `time_{i,m}` represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
 
 To quantify load balance and theoretical performance bounds, we define two key metrics:
 
 #### 1. Balance Ratio
-The $\mathrm{balance\_ratio}$ measures the load distribution across ranks within the Attention module for each iteration:
+The `balance_ratio` variable measures the load distribution across ranks within the Attention module for each iteration:
 
 $$
-\mathrm{balance\_ratio} = \frac{\mathrm{avg\_tokens}}{\mathrm{max\_tokens}}
+\texttt{balance\_ratio} = \frac{\texttt{avg\_tokens}}{\texttt{max\_tokens}}
 $$
 
 where:
-- $\mathrm{avg\_tokens}$ represents the average number of tokens across all ranks
-- $\mathrm{max\_tokens}$ represents the maximum number of tokens across all ranks
-- $\mathrm{tokens\_i}$ represents the number of tokens processed by rank $i$
+- `avg_tokens` represents the average number of tokens across all ranks
+- `max_tokens` represents the maximum number of tokens across all ranks
+- `tokens_i` represents the number of tokens processed by rank $i$
 
 Note: MoE module load balancing is handled separately by the Expert Parallel Load Balancer (EPLB) module and is not considered during the early scheduling phase.
 
 #### 2. Speed-of-Light Throughput (SOL TPS)
-The $\mathrm{sol\_tps}$ represents the theoretical upper-bound throughput achievable with perfect load balancing:
+The `sol_tps` variable represents the theoretical upper-bound throughput achievable with perfect load balancing:
 
 $$
-\mathrm{sol\_time} = \sum_{i=0}^{\infty} \mathrm{time\_i} \times \mathrm{balance\_ratio}_i
+\texttt{sol\_time} = \sum_{i=0}^{\infty} \texttt{time\_i} \times \texttt{balance\_ratio}_i
 $$
 
 $$
-\mathrm{sol\_tps} = \frac{\mathrm{elapsed\_time}}{\mathrm{sol\_time}} \times \mathrm{actual\_tps}
+\texttt{sol\_tps} = \frac{\texttt{elapsed\_time}}{\texttt{sol\_time}} \times \texttt{actual\_tps}
 $$
 
 where:
-- $\mathrm{time\_i}$: Measured execution time of iteration $i$
-- $\mathrm{elapsed\_time}$: Total empirically measured end-to-end execution time
-- $\mathrm{actual\_tps}$: Observed throughput in tokens per second
-- $\mathrm{sol\_tps}$: Theoretical maximum throughput under perfect load balance
+- `time_i`: Measured execution time of iteration $i$
+- `elapsed_time`: Total empirically measured end-to-end execution time
+- `actual_tps`: Observed throughput in tokens per second
+- `sol_tps`: Theoretical maximum throughput under perfect load balance
 
 This theoretical framework enables us to quantify the performance gap between current and optimal system utilization, providing clear targets for optimization.
 
