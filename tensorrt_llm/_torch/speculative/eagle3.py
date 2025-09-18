@@ -92,18 +92,18 @@ class Eagle3SpecMetadata(SpecMetadata):
     is_draft_model: bool = False
     is_first_draft: bool = False
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
+    is_mtp_eagle: bool = False
 
     def __post_init__(self):
         if self.is_draft_model:
             self.layers_to_capture = (self.num_layers - 1, )
         elif self.layers_to_capture is None:
-            if self.num_layers == 1:
+            if self.num_layers == 1 or self.is_mtp_eagle:
                 self.layers_to_capture = (self.num_layers - 1, )
             else:
                 if self.num_layers <= 5:
                     raise ValueError(
                         "Not enough hidden layers for default EAGLE3 capture")
-
                 self.layers_to_capture = (1, self.num_layers // 2 - 1,
                                           self.num_layers - 4)
         else:
