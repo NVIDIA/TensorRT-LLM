@@ -2296,8 +2296,9 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
 void KVCacheManager::removeSequence(RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest)
 {
     TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
-    if (mBlockManager.getNumPools() == 1
-        && llmRequest->getLlmRequestType() == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY && mEnableBlockReuse)
+    if (mBlockManager.getNumPools() == 1 && llmRequest
+        && llmRequest->getLlmRequestType() == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY && mEnableBlockReuse
+        && !mBlockManager.isVariableWindow())
     {
         pinBlocks(requestId);
     }
