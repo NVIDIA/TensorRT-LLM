@@ -558,6 +558,7 @@ if(ENABLE_UCX)
     find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build
                  NO_DEFAULT_PATH)
   endif()
+  find_package(NIXL)
 endif()
 if(ENABLE_UCX)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=1")

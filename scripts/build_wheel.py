@@ -749,6 +749,17 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+            build_run(
+                f'patchelf --set-rpath \'$ORIGIN/ucx/\' {lib_dir / "libtensorrt_llm_ucx_wrapper.so"}'
+            )
+            if os.path.exists("/usr/local/ucx"):
+                ucx_dir = lib_dir / "ucx"
+                if ucx_dir.exists():
+                    clear_folder(ucx_dir)
+                install_tree("/usr/local/ucx/lib", ucx_dir, dirs_exist_ok=True)
+                build_run(
+                    f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
+                )
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
@@ -757,6 +768,22 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
                 lib_dir / "libtensorrt_llm_nixl_wrapper.so")
+            build_run(
+                f'patchelf --set-rpath \'$ORIGIN/nixl/\' {lib_dir / "libtensorrt_llm_nixl_wrapper.so"}'
+            )
+            if os.path.exists("/opt/nvidia/nvda_nixl"):
+                nixl_dir = lib_dir / "nixl"
+                if nixl_dir.exists():
+                    clear_folder(nixl_dir)
+                nixl_lib_path = "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu"
+                if not os.path.exists(nixl_lib_path):
+                    nixl_lib_path = "/opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu"
+                if not os.path.exists(nixl_lib_path):
+                    nixl_lib_path = "/opt/nvidia/nvda_nixl/lib64"
+                install_tree(nixl_lib_path, nixl_dir, dirs_exist_ok=True)
+                build_run(
+                    f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/nixl:$ORIGIN/../\' {{}} \\;"
+                )
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
