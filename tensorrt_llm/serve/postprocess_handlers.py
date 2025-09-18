@@ -24,9 +24,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionResponseChoice,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaMessage,
-                              FunctionCall, StreamOptions, ToolCall,
-                              UsageInfo, PromptTokensDetails,
-                              to_disaggregated_params)
+                              FunctionCall, PromptTokensDetails, StreamOptions,
+                              ToolCall, UsageInfo, to_disaggregated_params)
 
 # yapf: enable
 
@@ -134,11 +133,13 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         chunk = ChatCompletionStreamResponse(choices=[choice_data],
                                              model=args.model)
         if include_continuous_usage:
-            chunk.usage = UsageInfo(prompt_tokens=num_tokens,
-                                    total_tokens=num_tokens,
-                                    completion_tokens=0,
-                                    prompt_tokens_details=PromptTokensDetails(cached_tokens=rsp.cached_tokens),
-                                    )
+            chunk.usage = UsageInfo(
+                prompt_tokens=num_tokens,
+                total_tokens=num_tokens,
+                completion_tokens=0,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=rsp.cached_tokens),
+            )
         data = chunk.model_dump_json(exclude_none=True)
         return data
 
@@ -208,7 +209,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
                                     total_tokens=output.length + prompt_tokens,
-                                    prompt_tokens_details=PromptTokensDetails(cached_tokens=rsp.cached_tokens))
+                                    prompt_tokens_details=PromptTokensDetails(
+                                        cached_tokens=rsp.cached_tokens))
         data = chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {data}\n\n")
 
@@ -218,7 +220,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=PromptTokensDetails(cached_tokens=rsp.cached_tokens),
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=rsp.cached_tokens),
         )
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
@@ -284,7 +287,8 @@ def chat_response_post_processor(
         prompt_tokens=num_prompt_tokens,
         completion_tokens=num_generated_tokens,
         total_tokens=num_prompt_tokens + num_generated_tokens,
-        prompt_tokens_details=PromptTokensDetails(cached_tokens=rsp.cached_tokens),
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=rsp.cached_tokens),
     )
     response = ChatCompletionResponse(
         model=args.model,
@@ -346,7 +350,8 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
                                     total_tokens=output.length + prompt_tokens,
-                                    prompt_tokens_details=PromptTokensDetails(cached_tokens=rsp.cached_tokens))
+                                    prompt_tokens_details=PromptTokensDetails(
+                                        cached_tokens=rsp.cached_tokens))
         data = chunk.model_dump_json(exclude_unset=False)
         res.append(f"data: {data}\n\n")
 
@@ -356,7 +361,8 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=PromptTokensDetails(cached_tokens=rsp.cached_tokens),
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=rsp.cached_tokens),
         )
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
@@ -401,7 +407,8 @@ def completion_response_post_processor(
     usage = UsageInfo(prompt_tokens=prompt_tokens,
                       completion_tokens=completion_tokens,
                       total_tokens=completion_tokens + prompt_tokens,
-                      prompt_tokens_details=PromptTokensDetails(cached_tokens=rsp.cached_tokens))
+                      prompt_tokens_details=PromptTokensDetails(
+                          cached_tokens=rsp.cached_tokens))
     response = CompletionResponse(choices=choices,
                                   model=args.model,
                                   usage=usage)

@@ -40,8 +40,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
-                                                ModelList, ResponsesRequest,
-                                                UsageInfo, PromptTokensDetails,
+                                                ModelList, PromptTokensDetails,
+                                                ResponsesRequest, UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
