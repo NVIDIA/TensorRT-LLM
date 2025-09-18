@@ -297,10 +297,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
 
-        if not HAS_CUTLASS_DSL:
-            raise RuntimeError(
-                "nvidia-cutlass-dsl 4.1.0 requires Python >=3.12")
-
         tuner = AutoTuner.get()
 
         cute_dsl_nvfp4_gemm_blackwell_runner = CuteDSLNVFP4BlackwellLinear(
