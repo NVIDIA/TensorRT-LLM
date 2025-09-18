@@ -13,6 +13,24 @@ from ..utils import create_lm_head_tp_mapping
 from .linear import Linear, TensorParallelMode
 
 
+def lmhead_skip_forward_impl(input: torch.Tensor,
+                             num_embeddings: int) -> torch.Tensor:
+    output_shape = input.shape[:-1] + (num_embeddings, )
+    output = input.new_empty(output_shape)
+    return output
+
+
+@torch.library.custom_op("trtllm::lmhead_skip_forward", mutates_args=())
+def lmhead_skip_forward(input: torch.Tensor,
+                        num_embeddings: int) -> torch.Tensor:
+    return lmhead_skip_forward_impl(input, num_embeddings)
+
+
+@lmhead_skip_forward.register_fake
+def _(input, num_embeddings, dtype):
+    return lmhead_skip_forward_impl(input, num_embeddings)
+
+
 class LMHead(Linear):
     """LM head layer.
 
@@ -120,9 +138,7 @@ class LMHead(Linear):
             *,
             all_reduce_params: Optional[AllReduceParams] = None
     ) -> torch.Tensor:
-        output_shape = input.shape[:-1] + (self.num_embeddings, )
-        output = input.new_empty(output_shape)
-        return output
+        return lmhead_skip_forward(input, self.num_embeddings)
 
     def load_weights(self, weights: List[Dict]):
         original_weight = None
@@ -179,6 +195,24 @@ def pre_comm_embedding_ops(
                 output = F.pad(output, (0, padding_size))
 
     return output
+
+
+def embedding_skip_forward_impl(input: torch.Tensor, embedding_dim: int,
+                                dtype: torch.dtype) -> torch.Tensor:
+    output_shape = input.shape[:] + (embedding_dim, )
+    output = input.new_empty(output_shape, dtype=dtype)
+    return output
+
+
+@torch.library.custom_op("trtllm::embedding_skip_forward", mutates_args=())
+def embedding_skip_forward(input: torch.Tensor, embedding_dim: int,
+                           dtype: torch.dtype) -> torch.Tensor:
+    return embedding_skip_forward_impl(input, embedding_dim, dtype)
+
+
+@embedding_skip_forward.register_fake
+def _(input, embedding_dim, dtype):
+    return embedding_skip_forward_impl(input, embedding_dim, dtype)
 
 
 class Embedding(LMHead):
@@ -257,10 +291,4 @@ class Embedding(LMHead):
         return output
 
     def skip_forward(self, input):
-        output_shape = input.shape[:] + (self.embedding_dim, )
-        output = torch.empty(
-            output_shape,
-            dtype=self.dtype,
-            device=input.device,
-        )
-        return output
+        return embedding_skip_forward(input, self.embedding_dim, self.dtype)
