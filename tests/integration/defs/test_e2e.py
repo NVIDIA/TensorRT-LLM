@@ -2354,6 +2354,10 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                  "gemma/gemma-3-27b-it",
                  marks=(pytest.mark.skip_less_device_memory(80000),
                         skip_post_blackwell)),
+    pytest.param(
+        "Nano-v2-VLM",
+        "Nano-v2-VLM",
+        marks=pytest.mark.skip(reason="Nano V2 VLM ckpt is not released yet.")),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
@@ -2400,6 +2404,23 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     }
 
     expected_keywords = {
+        "Nano-v2-VLM": {
+            "image": [
+                ["natural", "ocean", "waves", "stormy", "overcast", "sea"],
+                ["mountain", "rock", "large", "clear", "blue", "sky"],
+                ["road", "lane", "vehicle", "bus", "cars", "traffic"],
+            ],
+            "video": [
+                [
+                    "person", "red", "dress", "walking", "street", "black",
+                    "leather", "jacket"
+                ],
+                ["space", "earth", "black", "frame", "city", "lights", "dark"],
+            ],
+            "mixture_text_image":
+            [["invented", "internet", "person", "people", "computers"],
+             ["large", "rock", "mountain", "center", "sky", "clear", "trees"]]
+        },
         "NVILA-8B-FP16": {
             "image": [
                 ["stormy", "ocean", "waves", "cloudy", "sunlight", "sky"],
@@ -2496,6 +2517,13 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--disable_kv_cache_reuse")
         cmd.append("--kv_cache_fraction=0.5")
         cmd.append("--max_seq_len=1024")
+    # Nano V2 VLM needs smaller max_batch_size to save memory.
+    # Also need to disable kv cache reuse for Nemotron-H architecture.
+    if model_name == "Nano-v2-VLM":
+        cmd.append("--max_batch_size=128")
+        cmd.append("--disable_kv_cache_reuse")
+        if modality == "video":
+            cmd.append("--max_num_tokens=20480")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
