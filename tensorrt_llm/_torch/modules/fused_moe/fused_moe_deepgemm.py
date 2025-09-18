@@ -417,15 +417,21 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
     def get_workspace(self, m_max: int, group_size: int):
 
         def select_buffer_with_more_elements(
-            graph_buffer: Optional[torch.Tensor],
-            runtime_buffer: Optional[torch.Tensor]
+                graph_buffer: Optional[torch.Tensor],
+                runtime_buffer: Optional[torch.Tensor],
+                is_capturing: bool = False
         ) -> tuple[Optional[torch.Tensor], bool]:
+            if is_capturing and graph_buffer is not None:
+                return graph_buffer, True
+
+            if is_capturing == False and runtime_buffer is not None:
+                return runtime_buffer, False
+
             if graph_buffer is None:
                 return runtime_buffer, False
+
             if runtime_buffer is None:
                 return graph_buffer, True
-            use_graph = runtime_buffer.numel() > graph_buffer.numel()
-            return (runtime_buffer if use_graph else graph_buffer, use_graph)
 
         def get_empty(tensor_shape: list[int], dtype: torch.dtype,
                       cache_name: str) -> torch.Tensor:
@@ -437,7 +443,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                     buffer = DeepGemmFusedMoE.allocated_buffer_in_runtime[
                         cache_name]
                     numel_buffer = buffer.numel()
-                    runtime_buffer = buffer if numel_buffer >= numel_like else runtime_buffer
+                    runtime_buffer = buffer if numel_buffer >= numel_like else None
 
                 graph_buffer = None
                 # Safely get the list of candidates. Defaults to an empty list if key is missing.
@@ -454,16 +460,18 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                     return graph_buffer[0:numel_like].view(tensor_shape)
                 else:
                     buffer, use_graph = select_buffer_with_more_elements(
-                        graph_buffer, runtime_buffer)
+                        graph_buffer,
+                        runtime_buffer,
+                        is_capturing=capture_graph)
                     if buffer is not None:
                         if not use_graph and capture_graph:
                             # move the buffer into graph buffers since it's running in graph capturing mode.
+                            DeepGemmFusedMoE.allocated_buffer_in_runtime.pop(
+                                cache_name, None)
                             DeepGemmFusedMoE.allocated_buffer_in_graph_pool.setdefault(
                                 cache_name, []).append(buffer)
-                            del DeepGemmFusedMoE.allocated_buffer_in_runtime[
-                                cache_name]
 
-                        return buffer[0:numel_like].view(tensor_shape)
+                            return buffer[0:numel_like].view(tensor_shape)
 
             # Reach here, no buffer is found. Then, we will use a new buffer to replace the small one. Release the memory first.
             if cache_name in DeepGemmFusedMoE.allocated_buffer_in_runtime:
