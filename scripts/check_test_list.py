@@ -56,10 +56,24 @@ def verify_l0_test_lists(llm_src):
     for line in lines:
         # Remove markers and rest of the line if present
         cleaned_line = line.strip()
+
+        # Handle ISOLATION marker removal (including comma patterns)
+        if 'ISOLATION,' in cleaned_line:
+            # Case: "ISOLATION,OTHER_MARKER" -> remove "ISOLATION,"
+            cleaned_line = cleaned_line.replace('ISOLATION,', '').strip()
+        elif ',ISOLATION' in cleaned_line:
+            # Case: "OTHER_MARKER,ISOLATION" -> remove ",ISOLATION"
+            cleaned_line = cleaned_line.replace(',ISOLATION', '').strip()
+        elif ' ISOLATION' in cleaned_line:
+            # Case: standalone "ISOLATION" -> remove " ISOLATION"
+            cleaned_line = cleaned_line.replace(' ISOLATION', '').strip()
+
+        # Handle other markers (like TIMEOUT) - remove marker and everything after it
         for marker in MARKER_LIST_IN_TEST:
-            if marker in cleaned_line:
+            if marker in cleaned_line and marker != " ISOLATION":
                 cleaned_line = cleaned_line.split(marker, 1)[0].strip()
                 break
+
         if cleaned_line:
             cleaned_lines.add(cleaned_line)
 

@@ -312,8 +312,54 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
 }
 
 def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
-    // List tests in current shard before running pytest
-    echo "Listing tests in current shard (${splitId}/${splits}) before execution..."
+    // Preprocess testDBList to extract ISOLATION markers
+    echo "Preprocessing testDBList to extract ISOLATION markers..."
+
+    def originalTestLines = readFile(file: testDBList).readLines()
+    def cleanedTestLines = []
+    def isolationTestLines = []
+
+    originalTestLines.each { originalLine ->
+        def trimmedLine = originalLine.trim()
+        if (trimmedLine && trimmedLine.contains('ISOLATION')) {
+            // Remove ISOLATION marker and nearby comma from the line
+            def cleanedLine = trimmedLine
+
+            // Handle different comma patterns around ISOLATION
+            if (trimmedLine.contains('ISOLATION,')) {
+                // Case: "ISOLATION,OTHER_MARKER" -> remove "ISOLATION,"
+                cleanedLine = cleanedLine.replace('ISOLATION,', '').trim()
+            } else if (trimmedLine.contains(',ISOLATION')) {
+                // Case: "OTHER_MARKER,ISOLATION" -> remove ",ISOLATION"
+                cleanedLine = cleanedLine.replace(',ISOLATION', '').trim()
+            } else {
+                // Case: standalone "ISOLATION" -> remove " ISOLATION"
+                cleanedLine = cleanedLine.replace(' ISOLATION', '').trim()
+            }
+
+            // Add the cleaned line to isolationTestLines if original line had ISOLATION
+            isolationTestLines.add(cleanedLine)
+            cleanedTestLines.add(cleanedLine)
+
+        } else if (trimmedLine) {
+            // Line doesn't contain ISOLATION, add as-is
+            cleanedTestLines.add(originalLine.trim())
+        }
+    }
+
+    // Create cleaned testDBList file (without ISOLATION markers)
+    def cleanedTestDBList = testDBList.replaceAll('\\.txt$', '_cleaned.txt')
+    if (cleanedTestLines.size() > 0) {
+        def cleanedContent = cleanedTestLines.join('\n')
+        sh "echo '${cleanedContent.replace("'", "'\\''")}' > ${cleanedTestDBList}"
+        echo "Created cleaned testDBList: ${cleanedTestDBList} with ${cleanedTestLines.size()} lines (ISOLATION markers removed)"
+    } else {
+        sh "touch ${cleanedTestDBList}"
+        echo "No tests found, created empty cleaned testDBList: ${cleanedTestDBList}"
+    }
+
+    sh "cat ${cleanedTestDBList}"
+    echo "DEBUG: isolationTestLines contains ${isolationTestLines.size()} tests that had ISOLATION markers"
 
     def shardTestList = []
 
@@ -327,7 +373,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
             "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
             "pytest",
             "--collect-only",
-            "--test-list=${testDBList}",
+            "--test-list=${cleanedTestDBList}",
             "--quiet",
             "--splits ${splits}",
             "--group ${splitId}"
@@ -348,13 +394,10 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
 
             // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
             def lines = pytestOutput.split('\n')
-            echo "DEBUG: Split into ${lines.size()} lines"
-
             def foundRunningLine = false
             def lineIndex = 0
             shardTestList = lines.findAll { line ->
                 lineIndex++
-                echo "DEBUG: Processing line ${lineIndex}: '${line}'"
 
                 if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
                     echo "DEBUG: Found 'Running X items in this shard' or '[pytest-split] Running group' line: '${line}'"
@@ -370,20 +413,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
             }
 
             echo "DEBUG: Filtering complete. shardTestList size: ${shardTestList.size()}"
-            if (shardTestList.size() > 0) {
-                echo "DEBUG: shardTestList contents:"
-                shardTestList.eachWithIndex { test, index ->
-                    echo "  [${index}]: ${test}"
-                }
-            } else {
-                echo "DEBUG: shardTestList is empty"
-            }
         } catch (Exception e) {
             echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
-            echo "DEBUG: Exception details: ${e.class.name}: ${e.message}"
-            if (e.stackTrace) {
-                echo "DEBUG: Stack trace: ${e.stackTrace.take(5).join('\n')}"
-            }
             error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
         }
     }
@@ -393,23 +424,12 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
         def shardRegularTests = []
         def shardIsolateTests = []
 
-        // Read the original test list to check for ISOLATION markers
-        def originalTestLines = readFile(file: testDBList).readLines()
-
         if (perfMode) {
             // In perfMode, put all tests in regular and skip isolation
             echo "Performance mode enabled - all tests will run as regular tests (no isolation)"
-            shardRegularTests = originalTestLines.findAll { it.trim() }
+            shardRegularTests = cleanedTestLines.findAll { it.trim() }
         } else {
-            // Create a map for quick lookup of original test lines (both with and without ISOLATION marker)
-            def originalTestMap = [:]
-            originalTestLines.each { originalLine ->
-                if (originalLine.trim()) {
-                    def cleanLine = originalLine.replaceAll(' ISOLATION', '').trim()
-                    originalTestMap[cleanLine] = originalLine.trim()
-                }
-            }
-
+            // Process each test from shardTestList
             shardTestList.each { test ->
                 def trimmedTest = test.trim()
                 if (trimmedTest) {
@@ -421,14 +441,17 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
                         trimmedTest = trimmedTest.substring(startIndex, endIndex)
                     }
 
-                    // Look up the original test line from testDBList
-                    def originalTestLine = originalTestMap[trimmedTest]
-                    if (originalTestLine) {
-                        if (originalTestLine.contains(' ISOLATION')) {
-                            shardIsolateTests.add(originalTestLine.replaceAll(' ISOLATION', '').trim())
-                        } else {
-                            shardRegularTests.add(originalTestLine)
-                        }
+                    // Check if this test is in the isolation list
+                    if (isolationTestLines.contains(trimmedTest)) {
+                        // This test needs isolation - find the actual line from isolationTestLines
+                        def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
+                        shardIsolateTests.add(isolationTestLine)
+                        echo "DEBUG: Test '${trimmedTest}' found in isolation list, adding to isolate tests"
+                    } else {
+                        // This test is a regular test - find the actual line from cleanedTestLines
+                        def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
+                        shardRegularTests.add(cleanedTestLine)
+                        echo "DEBUG: Test '${trimmedTest}' adding to regular tests"
                     }
                 }
             }
@@ -1994,8 +2017,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Run the isolated tests if exists
         if (preprocessedLists.isolateCount > 0) {
-            echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-            runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
+            try {
+                echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
+                runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
+                if (isRerunFailed) {
+                    error "The tests still failed after rerun attempt."
+                }
+            }
         } else {
             echo "No isolated tests to run for stage ${stageName}"
         }
