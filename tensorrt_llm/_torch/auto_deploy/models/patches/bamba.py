@@ -1,6 +1,6 @@
 """A patch for the Bamba model to make it compatible with torch.export."""
 
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -10,6 +10,9 @@ from transformers.models.bamba.modeling_bamba import (
     BambaPreTrainedModel,
     HybridMambaAttentionDynamicCache,
     apply_mask_to_padding_states,
+    pad_tensor_by_size,
+    reshape_into_chunks,
+    segment_sum,
 )
 
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
@@ -38,50 +41,45 @@ def _bamba_mixer_torch_forward(
         [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
     )
 
-    use_caching = cache_params is not None
+    use_precomputed_states = (
+        cache_params is not None
+        and cache_params.has_previous_state
+        and seq_len == 1
+        and cache_params.conv_states[self.layer_idx].shape[0]
+        == cache_params.ssm_states[self.layer_idx].shape[0]
+        == batch_size
+        and cache_position is not None
+        and cache_position[0] > 0
+    )
 
-    # 2. Convolution sequence transformation (cached/uncached handled inside the op)
-    if use_caching:
-        # Prepare dense metadata for cached flattened op
-        seq_len_t = torch.full((batch_size,), seq_len, device=input_states.device, dtype=torch.int)
-        seq_start_t = torch.arange(
-            0, batch_size * seq_len, seq_len, device=input_states.device, dtype=torch.int
+    # 2. Convolution sequence transformation
+    if use_precomputed_states:
+        cache_params.conv_states[self.layer_idx] = cache_params.conv_states[self.layer_idx].roll(
+            shifts=-1, dims=-1
         )
-        slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
+        cache_params.conv_states[self.layer_idx][:, :, -1] = hidden_states_B_C[:, 0, :].to(
+            cache_params.conv_states[self.layer_idx].device
+        )
 
-    if use_caching:
-        hidden_states_B_C = self.act(
-            torch.ops.auto_deploy.torch_cached_causal_conv1d(
-                # INPUTS
-                hidden_states_B_C,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                # METADATA
-                seq_len_t,
-                seq_start_t,
-                slot_idx_t,
-                # CACHES
-                cache_params.conv_states[self.layer_idx],
-                # CONSTANTS
-                self.conv1d.stride[0],
-                self.conv1d.padding[0],
-                self.conv1d.dilation[0],
-                self.conv1d.groups,
-                self.conv1d.padding_mode,
-            )
-        )
+        # We need to guarantee that anything regarding the cache is on the same device
+        conv_states = cache_params.conv_states[self.layer_idx].to(device=self.conv1d.weight.device)
+
+        hidden_states_B_C = torch.sum(conv_states * self.conv1d.weight.squeeze(1), dim=-1)
+        if self.use_conv_bias:
+            hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
+        hidden_states_B_C = self.act(hidden_states_B_C)
     else:
-        hidden_states_B_C = self.act(
-            torch.ops.auto_deploy.torch_causal_conv1d(
-                hidden_states_B_C,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                self.conv1d.stride[0],
-                self.conv1d.padding[0],
-                self.conv1d.dilation[0],
-                self.conv1d.groups,
-                self.conv1d.padding_mode,
+        # Init cache
+        if cache_params is not None:
+            hidden_states_B_C_transposed = hidden_states_B_C.transpose(1, 2)
+            conv_states = nn.functional.pad(
+                hidden_states_B_C_transposed,
+                (self.conv_kernel_size - hidden_states_B_C_transposed.shape[-1], 0),
             )
+            cache_params.conv_states[self.layer_idx].copy_(conv_states)
+
+        hidden_states_B_C = self.act(
+            self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
         )
 
     hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
@@ -97,42 +95,47 @@ def _bamba_mixer_torch_forward(
 
     # 3. SSM transformation
     A = -torch.exp(self.A_log.float())  # [num_heads]
-
-    if use_caching:
-        # Use new flattened cached op for both cache updates and outputs
-        y = torch.ops.auto_deploy.torch_cached_ssm_transform(
-            # INPUTS
-            hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+    if use_precomputed_states:
+        y, ssm_state = torch.ops.auto_deploy.ssm_transform_cached(
+            hidden_states=hidden_states,
             A=A,
-            B=B.view(batch_size, seq_len, -1, self.ssm_state_size),
-            C=C.view(batch_size, seq_len, -1, self.ssm_state_size),
+            B=B,
+            C=C,
             D=self.D,
             dt=dt,
             dt_bias=self.dt_bias,
-            # METADATA
-            seq_len=seq_len_t,
-            seq_start=seq_start_t,
-            slot_idx=slot_idx_t,
-            # CACHES
-            ssm_state_cache=cache_params.ssm_states[self.layer_idx],
-            # CONSTANTS
+            ssm_state_size=self.ssm_state_size,
             time_step_limit=list(self.time_step_limit),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            head_dim=self.head_dim,
+            num_heads=self.num_heads,
+            n_groups=self.n_groups,
             chunk_size=self.chunk_size,
+            cached_ssm_state=cache_params.ssm_states[self.layer_idx],
         )
     else:
-        y = torch.ops.auto_deploy.torch_ssm_transform(
-            hidden_states=hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+        y, ssm_state = torch.ops.auto_deploy.ssm_transform(
+            hidden_states=hidden_states,
             A=A,
-            B=B.view(batch_size, seq_len, -1, self.ssm_state_size),
-            C=C.view(batch_size, seq_len, -1, self.ssm_state_size),
+            B=B,
+            C=C,
             D=self.D,
             dt=dt,
             dt_bias=self.dt_bias,
+            ssm_state_size=self.ssm_state_size,
             time_step_limit=list(self.time_step_limit),
+            batch_size=batch_size,
+            seq_len=seq_len,
+            head_dim=self.head_dim,
+            num_heads=self.num_heads,
+            n_groups=self.n_groups,
             chunk_size=self.chunk_size,
         )
 
-    y = y.view(batch_size, seq_len, -1)
+    # Init cache
+    if ssm_state is not None and cache_params is not None:
+        cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
 
     scan_output = self.norm(y, gate)
 
@@ -150,16 +153,232 @@ def _bamba_model_update_mamba_mask(self, attention_mask, cache_position):
     return None
 
 
-def _bamba_model_update_causal_mask(
-    self,
-    attention_mask,
-    input_tensor,
-    cache_position,
-    past_key_values,
-    output_attentions,
+@torch.library.custom_op("auto_deploy::ssm_transform", mutates_args={})
+def _ssm_transform(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state_size: int,
+    # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
+    time_step_limit: List[float],
+    batch_size: int,
+    seq_len: int,
+    head_dim: int,
+    num_heads: int,
+    n_groups: int,
+    chunk_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # !! This is the uncached code path from the original implementation.
+    # begin ssd naive implementation without einsums
+    dt = nn.functional.softplus(dt + dt_bias)
+    dt = torch.clamp(dt, time_step_limit[0], time_step_limit[1])
+    hidden_states = hidden_states.reshape(batch_size, seq_len, -1, head_dim).float()
+    B = B.reshape(batch_size, seq_len, -1, ssm_state_size).float()
+    C = C.reshape(batch_size, seq_len, -1, ssm_state_size).float()
+    B = B.repeat_interleave(num_heads // n_groups, dim=2, output_size=num_heads)
+    C = C.repeat_interleave(num_heads // n_groups, dim=2, output_size=num_heads)
+    pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
+
+    D_residual = D[..., None] * pad_tensor_by_size(hidden_states, pad_size)
+
+    # Discretize x and A
+    hidden_states = hidden_states * dt[..., None]
+    A = A.to(hidden_states.dtype) * dt
+
+    # Rearrange into blocks/chunks
+    hidden_states, A, B, C = [
+        reshape_into_chunks(t, pad_size, chunk_size) for t in (hidden_states, A, B, C)
+    ]
+
+    # [bsz, -1, chunk_size, num_heads] -> [bsz, num_heads, -1, chunk_size]
+    A = A.permute(0, 3, 1, 2)
+    A_cumsum = torch.cumsum(A, dim=-1)
+
+    # 1. Compute the output for each intra-chunk (diagonal blocks)
+    # This is the analog of a causal mask
+    L = torch.exp(segment_sum(A))
+
+    # Contraction of C and B to get G (attention-weights like)
+    G_intermediate = C[:, :, :, None, :, :] * B[:, :, None, :, :, :]  # shape: (b, c, l, s, h, n)
+    G = G_intermediate.sum(dim=-1)  # shape: (b, c, l, s, h)
+
+    # Compute M, equivalent to applying attention mask to weights
+    M_intermediate = G[..., None] * L.permute(0, 2, 3, 4, 1)[..., None]
+    M = M_intermediate.sum(dim=-1)
+
+    # Compute Y_diag (apply to values)
+    Y_diag = (M[..., None] * hidden_states[:, :, None]).sum(dim=3)
+
+    # 2. Compute the state for each intra-chunk
+    # (right term of low-rank factorization of off-diagonal blocks; B terms)
+    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+    B_decay = B * decay_states.permute(0, -2, -1, 1)[..., None]
+    states = (B_decay[..., None, :] * hidden_states[..., None]).sum(dim=2)
+
+    # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+    # (middle term of factorization of off-diag blocks; A terms)
+    previous_states = torch.zeros_like(states[:, :1])
+    states = torch.cat([previous_states, states], dim=1)
+    decay_chunk = torch.exp(segment_sum(nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0))))
+    decay_chunk = decay_chunk.transpose(1, 3)
+    new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
+    states, ssm_state = new_states[:, :-1], new_states[:, -1]
+    # states = new_states[:, :-1]
+
+    # 4. Compute state -> output conversion per chunk
+    # (left term of low-rank factorization of off-diagonal blocks; C terms)
+    state_decay_out = torch.exp(A_cumsum)
+    C_times_states = C[..., None, :] * states[:, :, None, ...]
+    state_decay_out_permuted = state_decay_out.permute(0, 2, 3, 1)
+    Y_off = C_times_states.sum(-1) * state_decay_out_permuted[..., None]
+
+    # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+    y = Y_diag + Y_off
+    # [bsz, -1, self.chunk_size, num_heads, head_dim] -> [bsz, (padded) seq_len, num_heads, head_dim]
+    y = y.reshape(batch_size, -1, num_heads, head_dim)
+
+    y = y + D_residual
+    # Cutting off padded chunks
+    if pad_size > 0:
+        y = y[:, :seq_len, :, :]
+    y = y.reshape(batch_size, seq_len, -1)
+
+    return y, ssm_state
+
+
+@_ssm_transform.register_fake
+def _ssm_transform_meta(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state_size: int,
+    # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
+    time_step_limit: List[float],
+    batch_size: int,
+    seq_len: int,
+    head_dim: int,
+    num_heads: int,
+    n_groups: int,
+    chunk_size: int,
 ):
-    # Force attention to use causal mode without explicit masks
-    return None
+    return (
+        torch.empty_like(hidden_states),
+        torch.empty(batch_size, num_heads, head_dim, ssm_state_size, dtype=hidden_states.dtype),
+    )
+
+
+@torch.library.custom_op("auto_deploy::ssm_transform_cached", mutates_args={})
+def _ssm_transform_cached(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state_size: int,
+    # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
+    time_step_limit: List[float],
+    batch_size: int,
+    seq_len: int,
+    head_dim: int,
+    num_heads: int,
+    n_groups: int,
+    chunk_size: int,
+    cached_ssm_state: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # We need to guarantee that anything regarding the cache is on the same device
+    cache_device = cached_ssm_state.device
+
+    # Note: there is no need to pad parameter matrices here, as there is just one new token
+    # for batched generation
+    dt = dt[:, 0, :][:, None, ...]
+    dt = dt.transpose(1, 2).expand(batch_size, dt.shape[-1], head_dim)
+    # [num_heads] -> [num_heads, head_dim]
+    dt_bias = dt_bias[..., None].expand(dt_bias.shape[0], head_dim)
+
+    dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
+    dt = torch.clamp(dt, time_step_limit[0], time_step_limit[1])
+    A = A[..., None, None].expand(num_heads, head_dim, ssm_state_size).to(dtype=torch.float32)
+    # [bsz, num_heads, head_dim, state_size]
+    dA = (torch.exp(dt[..., None] * A)).to(device=cache_device)
+
+    # Discretize B
+    # [bsz, n_groups * state_size] -> [bsz, n_groups, 1, state_size] ->
+    # -> [bsz, n_groups, group to head repetition factor, state_size] -> [bsz, num_heads, state_size]
+    B = B.reshape(batch_size, n_groups, -1)[..., None, :]
+    B = B.expand(batch_size, n_groups, num_heads // n_groups, B.shape[-1]).contiguous()
+    B = B.reshape(batch_size, -1, B.shape[-1])
+    # [bsz, num_heads, head_dim, state_size]
+    dB = dt[..., None] * B[..., None, :]
+
+    # Discretize x into dB
+    # [bsz, intermediate_size] -> [bsz, num_heads, head_dim]
+    hidden_states = hidden_states.reshape(batch_size, -1, head_dim)
+    dBx = (dB * hidden_states[..., None]).to(device=cache_device)
+
+    # State calculation
+    # cached_ssm_state.copy_(cached_ssm_state * dA + dBx)
+    cached_ssm_state = cached_ssm_state * dA + dBx
+
+    # Subsequent output
+    # [bsz, n_groups * state_size] -> [bsz, num_heads, state_size]
+    C = C.reshape(batch_size, n_groups, -1)[..., None, :]
+    C = C.expand(batch_size, n_groups, num_heads // n_groups, C.shape[-1]).contiguous()
+    C = C.reshape(batch_size, -1, C.shape[-1])
+    # [bsz, num_heads, head_dim]
+
+    ssm_states = cached_ssm_state.to(device=C.device, dtype=C.dtype)  # Shape: [b, h, d, n]
+    # Reshape ssm_states to merge the first two dimensions
+    ssm_states_reshaped = ssm_states.view(
+        batch_size * num_heads, head_dim, ssm_state_size
+    )  # Shape: [b*h, d, n]
+    C_reshaped = C.view(batch_size * num_heads, ssm_state_size, 1)  # Shape: [b*h, n, 1]
+    y = torch.bmm(ssm_states_reshaped, C_reshaped)
+    y = y.view(batch_size, num_heads, head_dim)
+
+    # D skip connection
+    # [num_heads] -> [num_heads, head_dim]
+    D = D[..., None].expand(D.shape[0], head_dim)
+    y = (y + hidden_states * D).to(y.dtype)
+
+    # [bsz, num_heads, head_dim] -> [bsz, 1, intermediate_size]
+    y = y.reshape(batch_size, -1)[:, None, ...]
+    return y, cached_ssm_state
+
+
+@_ssm_transform_cached.register_fake
+def _ssm_transform_meta(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state_size: int,
+    # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
+    time_step_limit: List[float],
+    batch_size: int,
+    seq_len: int,
+    head_dim: int,
+    num_heads: int,
+    n_groups: int,
+    chunk_size: int,
+    cached_ssm_state: torch.Tensor,
+):
+    return (
+        torch.empty_like(hidden_states),
+        torch.empty(batch_size, num_heads, head_dim, ssm_state_size, dtype=hidden_states.dtype),
+    )
 
 
 # NOTE: this would need to be applied earlier than other patches, since the `_init_weights` (which
@@ -194,20 +413,17 @@ class BambaModelPatch(BaseExportPatch):
     def _apply_patch(self):
         self.original_values["BambaMixer.torch_forward"] = BambaMixer.torch_forward
         self.original_values["BambaModel._update_mamba_mask"] = BambaModel._update_mamba_mask
-        self.original_values["BambaModel._update_causal_mask"] = BambaModel._update_causal_mask
         # NOTE: there is `HybridMambaAttentionDynamicCache.__bool__` to save.
         # self.original_values["BambaPreTrainedModel._init_weights"] = BambaPreTrainedModel._init_weights
 
         BambaMixer.torch_forward = _bamba_mixer_torch_forward
         BambaModel._update_mamba_mask = _bamba_model_update_mamba_mask
-        BambaModel._update_causal_mask = _bamba_model_update_causal_mask
         HybridMambaAttentionDynamicCache.__bool__ = _cache_bool
         # BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights
 
     def _revert_patch(self):
         BambaMixer.torch_forward = self.original_values["BambaMixer.torch_forward"]
         BambaModel._update_mamba_mask = self.original_values["BambaModel._update_mamba_mask"]
-        BambaModel._update_causal_mask = self.original_values["BambaModel._update_causal_mask"]
         del HybridMambaAttentionDynamicCache.__bool__
         # BambaPreTrainedModel._init_weights = self.original_values[
         #     "BambaPreTrainedModel._init_weights"
