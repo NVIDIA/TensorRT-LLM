@@ -1538,9 +1538,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
         num_tokens = args.hidden_states.shape[0]
 
-        # The hidden size is actually 2 * hidden_size because we pack 2x e2m1
-        # into 1 byte.
-        hidden_size = args.hidden_states.shape[1] * 2
+        hidden_size = args.hidden_states.shape[1]
 
         tactics = self.kernel_runner.get_valid_configs(self.top_k, hidden_size,
                                                        self.intermediate_size,
@@ -1582,10 +1580,9 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
             num_tokens = shapes[HIDDEN_STATES_IDX][NUM_TOKENS_DIM]
 
-            # The hidden size is actually 2 * hidden_size because we pack 2x e2m1
-            hidden_size = shapes[HIDDEN_STATES_IDX][HIDDEN_SIZE_DIM] * 2
+            hidden_size = shapes[HIDDEN_STATES_IDX][HIDDEN_SIZE_DIM]
 
-            sf_linear_size = num_tokens * (hidden_size // 16)
+            sf_linear_size = num_tokens * (hidden_size // 32)
 
             return sf_linear_size
 
@@ -1686,7 +1683,7 @@ def _(routing_logits, routing_bias, hidden_states, gemm1_weights,
       local_expert_offset, local_num_experts, routed_scaling_factor,
       routing_method_type, do_finalize, act_type) -> List[torch.Tensor]:
     num_tokens = hidden_states.shape[0]
-    hidden_size = hidden_states.shape[1] * 2
+    hidden_size = hidden_states.shape[1]
     if do_finalize:
         return [
             hidden_states.new_empty((num_tokens, hidden_size),
