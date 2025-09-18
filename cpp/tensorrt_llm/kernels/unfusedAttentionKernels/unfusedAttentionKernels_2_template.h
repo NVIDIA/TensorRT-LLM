@@ -1741,7 +1741,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
         if (sparse_token_offset < num_sparse_tokens)
         {
             int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
-            int const sparse_idx_offset = global_sparse_idx * params.kv_head_num + kv_head_idx;
+            int const sparse_idx_offset = kv_head_idx * params.num_sparse_kv_tokens + global_sparse_idx;
 
             int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
 
@@ -1766,7 +1766,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
         if (sparse_token_offset < num_sparse_tokens)
         {
             int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
-            int const sparse_idx_offset = global_sparse_idx * params.kv_head_num + kv_head_idx;
+            int const sparse_idx_offset = kv_head_idx * params.num_sparse_kv_tokens + global_sparse_idx;
 
             int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
             int const dst_token_idx = sparse_token_offset;

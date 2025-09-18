@@ -360,6 +360,11 @@ public:
         return mUseSparseAttention && mPagedKVCache && mEnableXQA;
     }
 
+    [[nodiscard]] bool useTllmGenSparseAttention() const
+    {
+        return mUseTllmGenSparseAttention && useSparseAttention();
+    }
+
     [[nodiscard]] int smVersion() const
     {
         return mSM;
@@ -440,6 +445,7 @@ public:
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
     bool mUseSparseAttention = false;
+    bool mUseTllmGenSparseAttention = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
     int mCpSize = 1;
     int mCpRank = 0;

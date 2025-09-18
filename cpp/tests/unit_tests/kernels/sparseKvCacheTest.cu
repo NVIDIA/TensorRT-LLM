@@ -86,18 +86,14 @@ protected:
             {1, 3, 7}  // head 3
         };
 
-        // Flatten in the format: [sparse_token_idx * num_heads + head_idx]
-        for (size_t token = 0; token < batch0_indices[0].size(); ++token)
+        // [num_kv_heads, num_sparse_kv_tokens]
+        for (int head = 0; head < mNumKvHeads; ++head)
         {
-            for (int head = 0; head < mNumKvHeads; ++head)
+            for (size_t token = 0; token < batch0_indices[head].size(); ++token)
             {
                 sparseKvIndicesHost.push_back(batch0_indices[head][token]);
             }
-        }
-
-        for (size_t token = 0; token < batch1_indices[0].size(); ++token)
-        {
-            for (int head = 0; head < mNumKvHeads; ++head)
+            for (size_t token = 0; token < batch1_indices[head].size(); ++token)
             {
                 sparseKvIndicesHost.push_back(batch1_indices[head][token]);
             }
@@ -253,6 +249,7 @@ TEST_F(SparseKvCacheTest, UpdateSparseKvCacheAfterFmha)
     params.size_per_head = mHeadSize;
     params.cache_type = KvCacheDataType::BASE;
     params.rotary_embedding_dim = 0; // No rotary embedding for this test
+    params.num_sparse_kv_tokens = 8; // Total sparse tokens: 5 (batch 0) + 3 (batch 1)
 
     params.setCommonParameters();
 
@@ -373,38 +370,37 @@ void SparseKvCacheTest::performHostSparseMapping(
     // Host-side reference implementation of sparse KV cache mapping
     // This is a naive but correct implementation for verification
 
-    // Sparse indices from the test setup - matching the actual flattened format
-    std::vector<std::vector<std::vector<int>>> sparseIndices = {// Batch 0
-        {
-            {1, 2, 3, 4, 5},                                    // head 0
-            {3, 4, 5, 6, 8},                                    // head 1
-            {0, 1, 3, 5, 8},                                    // head 2
-            {1, 3, 5, 10, 11}                                   // head 3
-        },
-        // Batch 1
-        {
-            {1, 4, 7}, // head 0
-            {0, 2, 3}, // head 1
-            {1, 2, 7}, // head 2
-            {1, 3, 7}  // head 3
-        }};
+    // Read sparse indices from GPU memory to get the actual data being used
+    std::vector<int> hostSparseIndices(8 * mNumKvHeads);
+    TLLM_CUDA_CHECK(cudaMemcpy(hostSparseIndices.data(), mSparseKvIndicesDevice, hostSparseIndices.size() * sizeof(int),
+        cudaMemcpyDeviceToHost));
+
+    std::vector<int> hostSparseOffsets(mBatchSize + 1);
+    TLLM_CUDA_CHECK(cudaMemcpy(hostSparseOffsets.data(), mSparseKvOffsetsDevice, hostSparseOffsets.size() * sizeof(int),
+        cudaMemcpyDeviceToHost));
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
     // Process each batch
     for (int batch = 0; batch < mBatchSize; ++batch)
     {
+        int const sparse_start_idx = hostSparseOffsets[batch];
+        int const sparse_end_idx = hostSparseOffsets[batch + 1];
+        int const num_sparse_tokens = sparse_end_idx - sparse_start_idx;
+
         // Process each head
         for (int head = 0; head < mNumKvHeads; ++head)
         {
-            auto const& indices = sparseIndices[batch][head];
-
             // Process both K and V cache
             for (int kv = 0; kv < 2; ++kv) // 0 = K, 1 = V
             {
-                // For each sparse token
-                for (size_t sparseIdx = 0; sparseIdx < indices.size(); ++sparseIdx)
+                // For each sparse token in this batch
+                for (int sparseTokenOffset = 0; sparseTokenOffset < num_sparse_tokens; ++sparseTokenOffset)
                 {
-                    int originalTokenIdx = indices[sparseIdx];
-                    int continuousTokenIdx = static_cast<int>(sparseIdx);
+                    // Calculate index in new format: [num_kv_heads, num_sparse_kv_tokens]
+                    int const global_sparse_idx = sparse_start_idx + sparseTokenOffset;
+                    int const sparse_idx_offset = head * 8 + global_sparse_idx; // 8 is total sparse tokens
+                    int const originalTokenIdx = hostSparseIndices[sparse_idx_offset];
+                    int const continuousTokenIdx = sparseTokenOffset;
 
                     // Copy from original position to continuous position
                     for (int dim = 0; dim < mHeadSize; ++dim)

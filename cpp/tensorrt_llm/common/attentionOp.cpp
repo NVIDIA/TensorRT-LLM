@@ -291,7 +291,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Parameters for sparse attention
     xqaParams.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
     xqaParams.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
-    xqaParams.use_sparse_attention = useSparseAttention();
+    xqaParams.use_sparse_attention = useTllmGenSparseAttention();
 
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
@@ -920,7 +920,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         size_t const cu_kv_seqlens_size = sizeof(int) * (batch_beam + 1);
         size_t const rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
         // Two workspaces for sparse attention. One for the sequence lengths, and one for kv block offsets.
-        size_t const sparse_attn_cache_size = useSparseAttention()
+        size_t const sparse_attn_cache_size = useTllmGenSparseAttention()
             ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence) * mNumKVHeads
             : 0;
         xqa_workspaces[0] = cu_seqlens_size;

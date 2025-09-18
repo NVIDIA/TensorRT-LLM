@@ -75,7 +75,7 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
             for (int p = 0; p < max_num_pages_per_seq; ++p)
             {
                 int offset = b * 2 * max_num_pages_per_seq + d * max_num_pages_per_seq + p;
-                kv_page_offsets_ptr[offset] = 1000 + b * 100 + d * 10 + p; // Test pattern
+                kv_page_offsets_ptr[offset] = 1000 + b * 100 + d * 10 + p;
             }
         }
     }
@@ -93,7 +93,7 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     {
         for (int head = 0; head < num_head_kv; ++head)
         {
-            int idx = page * num_head_kv + head;
+            int idx = head * num_sparse_pages + page;
             sparse_indices_ptr[idx] = sparse_page_indices[page][head];
         }
     }
@@ -170,7 +170,8 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
                 {
                     // Calculate expected value (from the sparse index)
                     int sparse_idx_global = sparse_indices_offsets_ptr[b] + p;
-                    int src_page_idx = sparse_indices_ptr[sparse_idx_global * num_head_kv + h];
+                    int src_page_idx
+                        = sparse_indices_ptr[h * sparse_indices_offsets_ptr[batch_size] + sparse_idx_global];
 
                     if (src_page_idx == -1)
                     {

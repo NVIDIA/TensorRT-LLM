@@ -150,7 +150,7 @@ struct QKVPreprocessingParams
     int const* cu_kv_seq_lens{nullptr};
     // list of cumulative length of sparse KV indices, of shape {batch_size + 1}
     int const* sparse_kv_offsets{nullptr};
-    // list of sparse KV indices for writing to KV cache, of shape {num_sparse_kv_indices, num_kv_heads}
+    // list of sparse KV indices for writing to KV cache, of shape {num_kv_heads, num_sparse_kv_indices}
     int const* sparse_kv_indices{nullptr};
     // inverse frequencies (angle raised at various powers) from the RoPE formula
     // shape of {batch_size , rotaryEmbeddingDim / 2}
@@ -199,6 +199,8 @@ struct QKVPreprocessingParams
     int q_hidden_size{0};
     int kv_hidden_size{0};
     int hidden_size{0};
+    // Sparse attention
+    int num_sparse_kv_tokens{0};
 
     void setCommonParameters()
     {

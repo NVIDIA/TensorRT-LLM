@@ -231,6 +231,7 @@ public:
         op.mRuntimeSparseAttentionParams.sparse_kv_indices = nullptr;
         op.mRuntimeSparseAttentionParams.sparse_attn_offsets = nullptr;
         op.mRuntimeSparseAttentionParams.sparse_attn_indices = nullptr;
+        op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens = 0;
 
         if (op.useSparseAttention() && num_seqs > 0)
         {
@@ -240,6 +241,8 @@ public:
                 {
                     op.mRuntimeSparseAttentionParams.sparse_kv_indices = sparse_kv_indices.value().data_ptr<int32_t>();
                     op.mRuntimeSparseAttentionParams.sparse_kv_offsets = sparse_kv_offsets.value().data_ptr<int32_t>();
+                    op.mRuntimeSparseAttentionParams.num_sparse_kv_tokens
+                        = sparse_kv_offsets.value().index({num_seqs}).item<int32_t>();
                 }
             }
             else
@@ -695,6 +698,10 @@ void attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optiona
         || (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0))
     {
         op->mUseSparseAttention = true;
+        if (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
+        {
+            op->mUseTllmGenSparseAttention = true;
+        }
     }
 
     if (is_mla_enable)
