@@ -89,7 +89,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     )
 
     # Set the development flag to control use_chain_drafter behavior
-    original_env_value = os.environ.get("TRTLLM_ALLOW_CHAIN_DRAFTER", "0")
+    original_env_value = os.environ.get("TRTLLM_ALLOW_CHAIN_DRAFTER", "1")
     try:
         os.environ[
             "TRTLLM_ALLOW_CHAIN_DRAFTER"] = "1" if use_chain_drafter else "0"

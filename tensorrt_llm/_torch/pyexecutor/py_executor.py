@@ -1198,13 +1198,19 @@ class PyExecutor:
                     previous_tensors = self.previous_batch and self.previous_batch.sample_state
                     target_inputs = None
                     draft_outputs = None
-                    if self.drafter is not None and self.use_spec_decode:
+                    # If there are previous draft tokens, we need to update the target requests to accept some draft tokens.
+                    # When there's any accepted tokens, we can't directly use the previous batch's outputs in this iteration for the target model,
+                    # so we'll set the target model's input to None and skip updating the target requests after target model forward.
+                    update_target_requests_before_forward = self.has_previous_draft_tokens
+                    if self.drafter is not None and (
+                            self.use_spec_decode
+                            or update_target_requests_before_forward):
                         target_inputs, draft_outputs, draft_batch = self._handle_speculative_decoding(
                             scheduled_batch, previous_tensors)
 
                     # Use the draft_model's outputs if we've launched the draft model.
                     # Otherwise, use the previous batch's outputs.
-                    if target_inputs is not None:
+                    if target_inputs is not None or update_target_requests_before_forward:
                         previous_tensors_device = target_inputs
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
@@ -1215,7 +1221,7 @@ class PyExecutor:
                     if target_inputs is not None:
                         self._process_draft_results(scheduled_batch,
                                                     draft_outputs, draft_batch)
-                    elif self.previous_batch is not None:
+                    elif self.previous_batch is not None and not update_target_requests_before_forward:
                         self._update_requests(self.previous_batch.sample_state)
 
                     if self.guided_decoder is not None:
@@ -1973,14 +1979,15 @@ class PyExecutor:
             # If needed, the overlap should happen between the target requests and the draft requests.
             # Otherwise, we can still do overlap between the previous target requests and the current target requests.
             has_draft_batch = (
-                self.previous_batch is not None
+                self.previous_batch is not None and self.use_spec_decode
                 and self.drafter.should_forward_draft_model(scheduled_batch))
 
-            if has_draft_batch:
+            if has_draft_batch or self.has_previous_draft_tokens:
                 self._update_requests(self.previous_batch.sample_state)
                 if self.has_previous_draft_tokens:
                     self._prepare_draft_requests()
 
+            if has_draft_batch:
                 target_inputs, draft_outputs, draft_batch = self.drafter.generate_draft_tokens_with_overlap(
                     scheduled_batch, self.resource_manager,
                     previous_tensors.device if previous_tensors else None)
