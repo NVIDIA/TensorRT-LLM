@@ -6,7 +6,9 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -83,7 +85,12 @@ def test_fp4_linear(dtype):
 
 @pytest.mark.skipif(sys.version_info < (3, 12),
                     reason="cutlass-dsl 4.1.0 requires Python 3.12+")
-@skip_pre_blackwell
+@pytest.mark.skipif(
+    get_sm_version() != 100,
+    reason="This test is only supported in Blackwell architecture",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE,
+                    reason="cutlass-dsl is not available")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mnk", [(128, 7168, 16384), (128, 24576, 1536),
                                  (128, 2112, 7168), (128, 4096, 7168),
