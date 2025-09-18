@@ -1104,10 +1104,10 @@ std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReu
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
     std::vector<BlockKey> blockKeys;
-    for (auto const& blockedUniqueTokens : blockedUniqueTokens)
+    for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
     {
         blockKeys.push_back(blockKey);
-        blockKeys.back().uniqueTokens = blockedUniqueTokens;
+        blockKeys.back().uniqueTokens = blockedUniqueTokensList;
     }
     auto searchRoot = mCachedBlocksRoot;
     for (auto const& blockKey : blockKeys)
