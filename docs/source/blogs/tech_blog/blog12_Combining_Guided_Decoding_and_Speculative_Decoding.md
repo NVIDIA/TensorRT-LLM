@@ -32,7 +32,6 @@ Among all these tasks, combining guided decoding with one-model speulative decod
     - [Trouble Shooting: Data Race between Host and CUDA Callback](#trouble-shooting-data-race-between-host-and-cuda-callback)
     - [Trouble Shooting: Deadlock by GIL and CUDA Mutex](#trouble-shooting-deadlock-by-gil-and-cuda-mutex)
   - [Performance and Analysis](#performance-and-analysis)
-  - [Limitations and Future Work](#limitations-and-future-work)
   - [Acknowledgements](#acknowledgements)
 
 ## Background and Challenges
@@ -53,7 +52,7 @@ TensorRT LLM integrates third-party grammar backends (e.g., [XGrammar](https://g
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog12_constrained_decoding_pipeline_overlap.png">
+  <img src="../media/tech_blog12_constrained_decoding_pipeline_overlap.png" width="600">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Top: guided decoding pipeline without overlapping. Bottom: guided decoding pipeline with overlapping. (The figure is from the XGrammar paper.)</em></sub></p>
@@ -139,7 +138,7 @@ Hence, we can launch grammar computation along with other auxiliary host functio
 
 We surveyed some off-the-shelf Python bindings implementations of `cudaLaunchHostFunc`, but it turned out that they do not work well with CUDA graph (e.g., CUDA-Python [Issue 790](https://github.com/NVIDIA/cuda-python/issues/790), cupy [Issue 9274](https://github.com/cupy/cupy/issues/9274)). The probable reason is that the intermediate wrapper data structures are released once the callback is executed; hence, even though the callback is captured by CUDA graph, it cannot be replayed for multiple times.
 
-We implement our own bindings to `cudaLaunchHostFunc` -- [`launch_hostfunc`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L76). Specifically, `launch_hostfunc` packs the Python function and arguments to an [intermediate data structure](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L33) and calls `cudaLaunchHostFunc` to launch a [trampoline function](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L49) to a CUDA stream. The trampoline function unpacks the intermediate data structure and invokes the Python function with the arguments. Note that `launch_hostfunc` offers great flexibility -- it can launch an arbitrary Python function (without any CUDA API calls) as a CUDA callback. Hence, the grammar computation logics can still be implemented in Python.
+We implement our own bindings to `cudaLaunchHostFunc` — [`launch_hostfunc`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L76). Specifically, `launch_hostfunc` packs the Python function and arguments to an [intermediate data structure](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L33) and calls `cudaLaunchHostFunc` to launch a [trampoline function](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L49) to a CUDA stream. The trampoline function unpacks the intermediate data structure and invokes the Python function with the arguments. Note that `launch_hostfunc` offers great flexibility — it can launch an arbitrary Python function (without any CUDA API calls) as a CUDA callback. Hence, the grammar computation logics can still be implemented in Python.
 
 When CUDA graph is capturing, `launch_hostfunc` does not release the intermediate data structure, so it is accessible during CUDA graph replay. The intermediate data structures can be manually released via [`free_hostfunc_user_data`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L97); otherwise, they are automatically cleaned up when the Python interpreter exists. If CUDA graph is disabled (e.g., prefill phase), the intermediate data structure should be released timely to avoid memory leak. Specifically, the trampoline function automatically release it once the callback finishes execution.
 
@@ -178,7 +177,7 @@ tensor([20, 20, 20, 20, 20, 20, 20, 20, 20, 20], dtype=torch.int32)
 
 Note that the CUDA graph increases the tensor twice, and it is replayed for ten times, so the tensor should be totally increased by 20 times. Clearly, the output validates that the CUDA graph capture and replay are successful.
 
-As the final step, we implements a variant of `GuidedDecoder` -- [`CapturableGuidedDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L405). It reuses most logics from `GuidedDecoder`, but the grammar computation and some auxilirary methods are decorated by `hostfunc`, making it capturable by CUDA graph.
+As the final step, we implements a variant of `GuidedDecoder` — [`CapturableGuidedDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L405). It reuses most logics from `GuidedDecoder`, but the grammar computation and some auxilirary methods are decorated by `hostfunc`, making it capturable by CUDA graph.
 
 ### CUDA Graph Compatibility: Grammar Computation
 
@@ -213,7 +212,7 @@ In the initial implementation, `CapturableGuidedDecoder` directly reads request 
 * Some other executor components inplace modify `ScheduledRequests`;
 * The CUDA callback is executed, reading some modified request states from `ScheduledRequests`.
 
-Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class -- [`GuidedRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20). It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then only accessed via CUDA callbacks only. This prevents potential data race within an executor iteration.
+Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class — [`GuidedRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20). It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then only accessed via CUDA callbacks only. This prevents potential data race within an executor iteration.
 
 When overlap scheduler is enabled, another data race scenario exits between executor iterations:
 
@@ -244,17 +243,62 @@ After all these efforts, the hang issue disappears. It is generally recommended 
 
 ## Performance and Analysis
 
+We benchmark the performance of guided decoding on two datasets [JSON Mode Eval](https://huggingface.co/datasets/NousResearch/json-mode-eval) and [JSON Schema Bench](https://huggingface.co/datasets/epfl-dlab/JSONSchemaBench). The models are [LLaMA 3.1 8B](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) and [LLaMA 3.3 70B](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct), the GPUs are H200 and the grammar backend is XGrammar.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog12_pareto_curve_json_mode_eval_llama_3.1_8b.png" width="600">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 4: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
 
 
+<div align="center">
+<figure>
+  <img src="../media/tech_blog12_pareto_curve_json_mode_eval_llama_3.3_70b.png" width="600">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 5: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
 
-## Limitations and Future Work
+Figures 4 and 5 presents the Pareto curves on JSON Mode Eval for LLaMA 3.1 8B and LLaMA 3.3 70B, respectively. Speculative decoding achieves significant speedup for low-latency or throughput@latency scenarios. In particular, the speedup can be up to ~2x for batch size 1. The one-model EAGLE3 implementation is more performant than the two-model EAGLE3, and this performance gap is amplified for small models. This is reasonable, because the one-model implementation captures more workloads into a single CUDA graph, which results in less (if any) exposed CPU overhead.
 
-### Further Performance Optimization
+Note that although NGram is a two-model implementation, it performs surprisingly well. This is because that JSON Mode Eval is an information extraction task. Each prompt contains the JSON schema and all the information required by the response, so the NGram has a high acceptance rate on this dataset.
 
-We are planning to implement more performance optimizations for the large EP implementation, including optimizing the `concat_qkv` operation for the context phase, quantizing `Wo_GEMM` to FP4, supporting low-precision `All2All` operations, and fusing some `All2All` kernels into one. We will also explore integrating more features such as PDL.
+<div align="center">
+<figure>
+  <img src="../media/tech_blog12_pareto_curve_json_schema_bench_llama_3.1_8b.png" width="600">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog12_pareto_curve_json_schema_bench_llama_3.3_70b.png" width="600">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
+
+Figures 6 and 7 shows the results on JSON Schema Bench. The one-model EAGLE3 achieves the best performance across almost all scenarios. Note that the NGram becomes less performant since the task is not information extraction anymore, although the JSON schemas are still present in the prompts.
+
+
+| Dataset | Model | EAGLE3 | EAGLE3 w/o draft | NGram |
+| :-----: | :---: | :----: | :--------------: | :---: |
+| JSON Mode Eval    | LLaMA 3.1 8B  | 2.86 | 2.65 | 2.59 |
+| JSON Mode Eval    | LLaMA 3.3 70B | 2.72 | 2.60 | 2.44 |
+| JSON Schema Bench | LLaMA 3.1 8B  | 2.55 | 2.33 | 1.89 |
+| JSON Schema Bench | LLaMA 3.3 70B | 2.50 | 2.30 | 1.87 |
+
+*Table 1: Acceptance lengths for EAGLE3 and NGram. The draft length is 3. "EAGLE3 w/o draft" means the draft model does not apply grammar constraints.*
+
+Table 1 lists the acceptance lengths. We perform an ablation experiment where the draft model does not apply grammar constraints. As presented, this does decrease acceptance rates, but by a slighter margin than expected. Note that it introduces extra overheads to apply grammar constraints on the draft model:
+
+* In the drafting loop, the extra mask applying kernels slightly contribute to the GPU time.
+* If the drafting steps are too fast to hide the grammar computation, the exposed CPU time will cause bubbles in the CPU timeline.
+
+These extra overheads could offset the benefits from the improved acceptance.
 
 ## Acknowledgements
 
-This work represents an outstanding example of collaborative engineering excellence within the TensorRT LLM team. The successful implementation and optimization of large-scale Expert Parallelism required coordinated efforts across multiple domains - from low-level CUDA kernel optimizations to high-level system architecture design. The dedication and technical expertise demonstrated by our team members throughout this project has been truly remarkable.
+This work demonstrates an outstanding example of cross-team collaboration between the TensorRT LLM and XGrammar teams. We sincerely appreciate the support from everyone who contributed to making this happen.
 
-Large-scale Expert Parallelism represents one of the important workloads for users productive scenarios, enabling efficient deployment of large MoE models. The performance improvements achieved through this work demonstrate the transformative potential of expert parallelism at scale, and this work opens new possibilities for deploying increasingly sophisticated AI models in production environments.
+We acknowledge that it is built on the top of tremendous existing fundations from the community. In particular, some designs were inspired by vLLM [PR 14702](https://github.com/vllm-project/vllm/pull/14702) and SGLang [PR 6499](https://github.com/sgl-project/sglang/pull/6499). In addition, special thanks goes to the authors proposing the speculative algorithms like EAGLE/MTP, and the grammar backend projects like XGrammar/LLGuidance.
