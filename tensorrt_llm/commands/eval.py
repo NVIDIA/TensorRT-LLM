@@ -112,9 +112,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
 
-    if backend == "tensorrt":
-        backend = None
-
     llm_args = {
         "model": model,
         "tokenizer": tokenizer,
@@ -125,7 +122,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "trust_remote_code": trust_remote_code,
         "build_config": build_config,
         "kv_cache_config": kv_cache_config,
-        "backend": backend,
     }
 
     if extra_llm_api_options is not None:
@@ -135,11 +131,12 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
     profiler.start("trtllm init")
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
-    elif backend is None:  # TensorRT
+    elif backend == 'tensorrt':
         llm = LLM(**llm_args)
     else:
-        raise ValueError(
-            f"Invalid backend: {backend}, check help for available options.")
+        raise click.BadParameter(
+            f"{backend} is not a known backend, check help for available options.",
+            param_hint="backend")
     profiler.stop("trtllm init")
     elapsed_time = profiler.elapsed_time_in_sec("trtllm init")
     logger.info(f"TRTLLM initialization time: {elapsed_time:.3f} seconds.")

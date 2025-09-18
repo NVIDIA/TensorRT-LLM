@@ -172,8 +172,9 @@ def launch_server(host: str,
     elif backend == 'tensorrt':
         llm = LLM(**llm_args)
     else:
-        raise ValueError(
-            f"Invalid backend: {backend}, check help for available options.")
+        raise click.BadParameter(
+            f"{backend} is not a known backend, check help for available options.",
+            param_hint="backend")
 
     server = OpenAIServer(llm=llm,
                           model=model,

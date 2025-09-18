@@ -371,9 +371,9 @@ def throughput_command(
                 f"{metadata.max_sequence_length}. Please rebuild a new engine "
                 "to support this dataset.")
     else:
-        raise RuntimeError(
-            f"Invalid backend: {options.backend}, please use one of the following: "
-            f"{', '.join(ALL_SUPPORTED_BACKENDS)}.")
+        raise click.BadParameter(
+            f"{options.backend} is not a known backend, check help for available options.",
+            param_hint="backend")
 
     exec_settings["model"] = options.model
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
