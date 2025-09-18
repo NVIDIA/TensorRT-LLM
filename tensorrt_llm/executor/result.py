@@ -255,17 +255,20 @@ class GenerationResultBase:
         elif response_tensors.log_probs is not None:  # PyTorch backend
             # handle logprobs directly from response tensors given by sampler
             output._last_logprobs_len = len(output.logprobs)
-            output.logprobs = response_tensors.log_probs[src_idx]
+            # In streaming mode, since out-of-order responses are not possible,
+            # each streamed response_tensors.log_probs[src_idx]
+            # contains a streamwise monotonically growing list of logprobs.
+            # so we need to accumulate only the new ones unique to that particular streamed response
+            output.logprobs += response_tensors.log_probs[src_idx][
+                output._last_logprobs_len:]
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
                 # Check if logprobs is a list (not a dict or other structure)
-                if isinstance(output.logprobs, list) and len(
-                        output.logprobs) > output.length:
+                if len(output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
-                if isinstance(output.logprobs, list):
-                    assert len(output.logprobs) == output.length
+                assert len(output.logprobs) == output.length
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[

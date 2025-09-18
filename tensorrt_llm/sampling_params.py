@@ -456,6 +456,13 @@ class SamplingParams:
                     "internally enabling context logits for prompt logprobs computation. "
                     "context logits will be dropped after computation as the user didn't explicitly request them."
                 )
+                # TODO(venky): Find a more elegant way to do this.
+                # NOTE: This is an internal hack, so we can entirely avoid introducing
+                # `prompt_logprobs` into the executor bindings and further into
+                # model engine / sampler.
+                # This is because, prompt_logprobs is a derived quantity from
+                # context logits, and the capability to post-compute it
+                # already exists in the worker. (see _get_logprobs in worker.py)
                 config_kwargs["return_context_logits"] = True
         else:
             config_kwargs["return_log_probs"] = self._return_log_probs
