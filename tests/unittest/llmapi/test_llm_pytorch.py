@@ -6,7 +6,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -861,12 +861,28 @@ def test_llm_with_proxy_error():
 
 
 @pytest.mark.part0
-def test_min_tokens():
+@pytest.mark.parametrize("use_speculative", [True, False])
+def test_min_tokens(use_speculative: bool):
     """Check min_tokens is respected."""
-    llm = LLM(model=llama_model_path,
-              kv_cache_config=global_kvcache_config,
-              enable_mixed_sampler=True,
-              max_seq_len=2048)
+    llm_common_config = dict(
+        model=llama_model_path,
+        max_batch_size=2,
+        kv_cache_config=global_kvcache_config,
+        max_num_tokens=2048,
+        enable_mixed_sampler=True,
+    )
+
+    if use_speculative:
+        spec_config = NGramDecodingConfig(
+            max_draft_len=4,
+            max_matching_ngram_size=2,
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=True,
+        )
+        llm = LLM(**llm_common_config, speculative_config=spec_config)
+    else:
+        llm = LLM(**llm_common_config)
 
     output_len = 2000
     sampling_params = SamplingParams(max_tokens=output_len,
