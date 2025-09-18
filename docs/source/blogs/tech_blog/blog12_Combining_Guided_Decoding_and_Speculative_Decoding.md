@@ -1,23 +1,12 @@
 # Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly
 
-As part of our effort to bridge gaps in feature combinations, we enabled guided decoding with many important LLM inference features in TensorRT LLM over the last two months:
-
-* Overlap scheduler: [PR 6000](https://github.com/NVIDIA/TensorRT-LLM/pull/6000)
-* CUDA graph padding: [PR 6774](https://github.com/NVIDIA/TensorRT-LLM/pull/6774)
-* Disaggregated serving: [PR 6704](https://github.com/NVIDIA/TensorRT-LLM/pull/6704)
-* Speculative decoding (two-model implementation): [PR 6300](https://github.com/NVIDIA/TensorRT-LLM/pull/6300)
-* Speculative decoding (one-model implementation): [PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948)
-
-More complicated (higher-order) combinations are also supported; for example, we can run DeepSeek-R1 with guided decoding, overlap scheduler, CUDA graph, attention data parallelism (ADP), multiple token prediction (MTP) and disaggregated serving​ all enabled.
-
-Among all these tasks, combining guided decoding with one-model speculative decoding is the most challenging one, and it achieves the best performance for low-latency or throughput@latency scenarios. This blog post shares the overall design, implementation details, and performance analysis.
-
 *By NVIDIA TensorRT LLM Team and XGrammar Team*
 
 ## Table of Contents
 - [Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly](#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly)
   - [Table of Contents](#table-of-contents)
   - [Background and Challenges](#background-and-challenges)
+    - [Motivation](#motivation)
     - [Speculative Decoding](#speculative-decoding)
     - [Guided Decoding](#guided-decoding)
     - [Two Challenges](#two-challenges)
@@ -36,12 +25,32 @@ Among all these tasks, combining guided decoding with one-model speculative deco
 
 ## Background and Challenges
 
+### Motivation
+
+As part of our effort to bridge gaps in feature combinations, we enabled guided decoding with many important LLM inference features in TensorRT LLM over the last two months:
+
+* Overlap scheduler: [PR 6000](https://github.com/NVIDIA/TensorRT-LLM/pull/6000)
+* CUDA graph padding: [PR 6774](https://github.com/NVIDIA/TensorRT-LLM/pull/6774)
+* Disaggregated serving: [PR 6704](https://github.com/NVIDIA/TensorRT-LLM/pull/6704)
+* Speculative decoding (two-model implementation): [PR 6300](https://github.com/NVIDIA/TensorRT-LLM/pull/6300)
+* Speculative decoding (one-model implementation): [PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948)
+
+More complicated (higher-order) combinations are also supported; for example, we can run DeepSeek-R1 with guided decoding, overlap scheduler, CUDA graph, [attention data parallelism (ADP)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog10_ADP_Balance_Strategy.md), [multiple token prediction (MTP)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md) and [disaggregated serving](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md)​ all enabled.
+
+Among all these tasks, combining guided decoding with one-model speculative decoding is the most challenging one, and it achieves the best performance for low-latency or throughput@latency scenarios. This blog post shares the overall design, implementation details, and performance analysis.
+
 ### Speculative Decoding
 
-Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, 
-most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward step. Compared with normal LLM inference where each model forward generates a single token, speculative decoding effectively makes the generation phase less memory-bound.
+Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward step. Compared with normal LLM inference where each model forward generates a single token, speculative decoding effectively makes the generation phase less memory-bound.
 
 TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and is coupled with the modeling code, but it offers the best performance. The two-model implementation decouples the target and draft models into separate CUDA graphs, which is much more flexible and offers better feature coverage.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog12_one_model_vs_two_model.png" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1: The GPU timeline of one-model and tow-model speculative decoding.</em></sub></p>
 
 ### Guided Decoding
 
@@ -56,7 +65,7 @@ TensorRT LLM integrates third-party grammar backends (e.g., [XGrammar](https://g
   <img src="../media/tech_blog12_constrained_decoding_pipeline_overlap.png" width="600">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: Top: guided decoding pipeline without overlapping. Bottom: guided decoding pipeline with overlapping. (The figure is from the XGrammar paper.)</em></sub></p>
+<p align="center"><sub><em>Figure 2: Top: guided decoding pipeline without overlapping. Bottom: guided decoding pipeline with overlapping. (The figure is from the XGrammar paper.)</em></sub></p>
 
 ### Two Challenges
 
@@ -77,10 +86,10 @@ If multi-step forwards are launched by a single CUDA graph, it is not possible t
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps.png">
+  <img src="../media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps.png" width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 2: The CPU-GPU synchronization for multiple generation steps.</em></sub></p>
+<p align="center"><sub><em>Figure 3: The CPU-GPU synchronization for multiple generation steps.</em></sub></p>
 
 
 ## Trace Grammar State for Draft Token Proposal and Rejection
@@ -130,10 +139,10 @@ Hence, we can launch grammar computation along with other auxiliary host functio
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps_by_cuda_callback.png">
+  <img src="../media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps_by_cuda_callback.png" width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3: The CPU-GPU synchronization for multiple generation steps by CUDA callback.</em></sub></p>
+<p align="center"><sub><em>Figure 4: The CPU-GPU synchronization for multiple generation steps by CUDA callback.</em></sub></p>
 
 ### Integration to TensorRT LLM Python Runtime
 
@@ -251,7 +260,7 @@ We benchmark the performance of guided decoding on two datasets [JSON Mode Eval]
   <img src="../media/tech_blog12_pareto_curve_json_mode_eval_llama_3.1_8b.png" width="600">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
+<p align="center"><sub><em>Figure 5: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
 
 
 <div align="center">
@@ -259,9 +268,9 @@ We benchmark the performance of guided decoding on two datasets [JSON Mode Eval]
   <img src="../media/tech_blog12_pareto_curve_json_mode_eval_llama_3.3_70b.png" width="600">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 5: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
+<p align="center"><sub><em>Figure 6: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
 
-Figures 4 and 5 presents the Pareto curves on JSON Mode Eval for LLaMA 3.1 8B and LLaMA 3.3 70B, respectively. Speculative decoding achieves significant speedup for low-latency or throughput@latency scenarios. In particular, the speedup can be up to ~2x for batch size 1. The one-model EAGLE3 implementation is more performant than the two-model EAGLE3, and this performance gap is amplified for small models. This is reasonable, because the one-model implementation captures more workloads into a single CUDA graph, which results in less (if any) exposed CPU overhead.
+Figures 5 and 6 present the Pareto curves on JSON Mode Eval for LLaMA 3.1 8B and LLaMA 3.3 70B, respectively. Speculative decoding achieves significant speedup for low-latency or throughput@latency scenarios. In particular, the speedup can be up to ~2x for batch size 1. The one-model EAGLE3 implementation is more performant than the two-model EAGLE3, and this performance gap is amplified for small models. This is reasonable, because the one-model implementation captures more workloads into a single CUDA graph, which results in less (if any) exposed CPU overhead.
 
 Note that although NGram is a two-model implementation, it performs surprisingly well. This is because JSON Mode Eval is an information extraction task. Each prompt contains the JSON schema and all the information required by the response, so the NGram has a high acceptance rate on this dataset.
 
@@ -270,17 +279,16 @@ Note that although NGram is a two-model implementation, it performs surprisingly
   <img src="../media/tech_blog12_pareto_curve_json_schema_bench_llama_3.1_8b.png" width="600">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 6: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
+<p align="center"><sub><em>Figure 7: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog12_pareto_curve_json_schema_bench_llama_3.3_70b.png" width="600">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 7: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
+<p align="center"><sub><em>Figure 8: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
 
-Figures 6 and 7 shows the results on JSON Schema Bench. The one-model EAGLE3 achieves the best performance across almost all scenarios. Note that the NGram becomes less performant since the task is not information extraction anymore, although the JSON schemas are still present in the prompts.
-
+Figures 7 and 8 show the results on JSON Schema Bench. The one-model EAGLE3 achieves the best performance across almost all scenarios. Note that the NGram becomes less performant since the task is not information extraction anymore, although the JSON schemas are still present in the prompts.
 
 | Dataset | Model | EAGLE3 | EAGLE3 w/o draft | NGram |
 | :-----: | :---: | :----: | :--------------: | :---: |
@@ -289,7 +297,7 @@ Figures 6 and 7 shows the results on JSON Schema Bench. The one-model EAGLE3 ach
 | JSON Schema Bench | LLaMA 3.1 8B  | 2.55 | 2.33 | 1.89 |
 | JSON Schema Bench | LLaMA 3.3 70B | 2.50 | 2.30 | 1.87 |
 
-*Table 1: Acceptance lengths for EAGLE3 and NGram. The draft length is 3. "EAGLE3 w/o draft" means the draft model does not apply grammar constraints.*
+<p align="center"><sub><em>Table 1: Acceptance lengths for EAGLE3 and NGram. The draft length is 3. "EAGLE3 w/o draft" means the draft model does not apply grammar constraints.</em></sub></p>
 
 Table 1 lists the acceptance lengths. We perform an ablation experiment where the draft model does not apply grammar constraints. As presented, this does decrease acceptance rates, but by a slighter margin than expected. Note that it introduces extra overheads to apply grammar constraints on the draft model:
 
