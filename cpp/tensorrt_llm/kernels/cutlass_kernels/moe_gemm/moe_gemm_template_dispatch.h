@@ -593,7 +593,8 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
                                  {
                                      return config.epilogue_fusion_type
                                          == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
-                                         && config.epilogue_schedule != cutlass_extensions::EpilogueScheduleType::TMA;
+                                         && config.epilogue_schedule
+                                         == cutlass_extensions::EpilogueScheduleType::NO_SMEM;
                                  }),
             tma_ws_configs.end());
     }

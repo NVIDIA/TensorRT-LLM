@@ -3508,7 +3508,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     {
         // For NoSmem epilogue schedule, we need to align the output of the GEMM to 256 bits, for gated activation this
         // is automatic if the usual alignment requirement is met
-        if (gemm1_config_->epilogue_schedule != cutlass_extensions::EpilogueScheduleType::TMA
+        if (gemm1_config_->epilogue_schedule == cutlass_extensions::EpilogueScheduleType::NO_SMEM
             && !isGatedActivation(fc1_activation_type))
         {
             TLLM_CHECK_WITH_INFO(inter_size % (256 / sizeof_bits<WeightType>::value) == 0,
@@ -3516,7 +3516,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 (int) (256 / sizeof_bits<WeightType>::value));
         }
 
-        if (gemm2_config_->epilogue_schedule != cutlass_extensions::EpilogueScheduleType::TMA)
+        if (gemm2_config_->epilogue_schedule == cutlass_extensions::EpilogueScheduleType::NO_SMEM)
         {
             TLLM_CHECK_WITH_INFO(gemm2_config_->epilogue_fusion_type
                     != cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE,
