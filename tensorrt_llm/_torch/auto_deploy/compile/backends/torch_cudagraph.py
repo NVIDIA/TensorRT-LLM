@@ -121,9 +121,11 @@ class CapturedGraph(nn.Module):
         # capture graph now for a range of batch sizes
         for bs in self.cuda_graph_batch_sizes:
             ad_logger.info(f"Capturing graph for batch size: {bs}")
-            # capture graph for truncated inputs
-            combined_shape = sum((input.shape for input in inputs_truncated), start=())
-            self.graphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
+            # Truncate inputs to current batch size
+            inputs_bs = [in_buffer[:bs] for in_buffer in self._input_buffers]
+            args_bs, kwargs_bs = self._in_spec.unflatten(inputs_bs + args_static)
+            combined_shape = sum((input.shape for input in inputs_bs), start=())
+            self.graphs[combined_shape] = self._capture_one_graph(*args_bs, **kwargs_bs)
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
