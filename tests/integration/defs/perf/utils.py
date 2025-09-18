@@ -97,7 +97,7 @@ class MultiNodeProbe(object):
         nodelist_str = os.environ.get("SLURM_NODELIST", "")
         if not nodelist_str:
             return []
-        
+
         # Matched format: prefix-[num1,num2,...]
         match = re.match(r'(.*?)\[([^\]]+)\]', nodelist_str)
         if match:
@@ -505,7 +505,7 @@ class PerfDisaggScriptTestCmds(NamedTuple):
         server_proc = None
 
         try:
-            if MultiNodeProbe.is_first_node() :
+            if MultiNodeProbe.is_first_node():
                 # Start ctx workers
                 output_ctx = open('output_ctx.log', 'w')
                 ctx_workers_proc = popen(self.ctx_cmd,
@@ -523,7 +523,8 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                                          env=venv._new_env,
                                          shell=True)
 
-            if MultiNodeProbe.is_first_node() and MultiNodeProbe.is_first_process():
+            if MultiNodeProbe.is_first_node(
+            ) and MultiNodeProbe.is_first_process():
                 # Start server
                 output_server = open('output_server.log', 'w')
                 server_proc = popen(self.server_cmd,
