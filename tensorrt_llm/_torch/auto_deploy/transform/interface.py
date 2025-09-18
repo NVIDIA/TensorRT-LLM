@@ -187,6 +187,7 @@ class BaseTransform(ABC):
     _autodeploy_meta_key: str = "_autodeploy"
     _history_key: str = "transform_history"
     _transform_key: str  # Set by TransformRegistry.register() decorator
+    _stages_key: str = "stages_done"
 
     @classmethod
     def get_transform_key(cls) -> str:
@@ -351,6 +352,13 @@ class BaseTransform(ABC):
         # update + store new meta data
         history[t_name] = info
         autodeploy_meta[self._history_key] = history
+
+        # record this stage as finished
+        stages_done = autodeploy_meta.get(self._stages_key, [])
+        if self.config.stage not in stages_done and self.config.stage.value not in stages_done:
+            stages_done.append(self.config.stage.value)
+        autodeploy_meta[self._stages_key] = stages_done
+
         self._set_autodeploy_meta(gm, autodeploy_meta)
 
         # return the graph module
@@ -396,6 +404,12 @@ class BaseTransform(ABC):
             gm.meta = {}
         gm.meta[self._autodeploy_meta_key] = autodeploy_meta
 
+    def _has_finished_stage(self, gm: GraphModule, stage: Stages) -> bool:
+        """True iff the given stage is recorded as finished in autodeploy meta."""
+        autodeploy_meta = self._get_autodeploy_meta(gm)
+        stages_done = autodeploy_meta.get(self._stages_key, [])
+        return (stage in stages_done) or (stage.value in stages_done)
+
     @final
     def _run_pre_cleanup(self, gm: GraphModule, info: TransformInfo) -> Tuple[bool, bool]:
         """Run graph cleanup before the transform.
@@ -416,11 +430,16 @@ class BaseTransform(ABC):
         is_clean = info.is_clean
         has_valid_shapes = is_clean and info.has_valid_shapes
 
+        use_meta = not self._has_finished_stage(gm, Stages.WEIGHT_LOAD)
+
         # check if run cleanup depending on the config and info
         if self.config.requires_shape_prop and not has_valid_shapes:
             self._log_info("running pre-cleanup with shape_prop")
             canonicalize_graph(gm)
-            with lift_to_meta(gm):
+            if use_meta:
+                with lift_to_meta(gm):
+                    run_shape_prop(gm)
+            else:
                 run_shape_prop(gm)
             is_clean = True
             has_valid_shapes = True
@@ -444,11 +463,18 @@ class BaseTransform(ABC):
         if not self.config.run_graph_cleanup:
             return info
 
+        use_meta = isinstance(gm, GraphModule) and (
+            not self._has_finished_stage(gm, Stages.WEIGHT_LOAD)
+        )
+
         # check if run cleanup depending on the config and info
         if self.config.run_shape_prop and not (info.is_clean and info.has_valid_shapes):
             self._log_info("running post-cleanup with shape_prop")
             canonicalize_graph(gm)
-            with lift_to_meta(gm):
+            if use_meta:
+                with lift_to_meta(gm):
+                    run_shape_prop(gm)
+            else:
                 run_shape_prop(gm)
         elif self.config.run_graph_cleanup and not info.is_clean:
             self._log_info("running post-cleanup (no shape_prop)")
