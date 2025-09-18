@@ -174,7 +174,7 @@ protected:
     using WeightStorage = std::conditional_t<WEIGHT_ELEM_PER_BYTE == 2, uint8_t, WeightType>;
     constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 16;
     constexpr static int64_t MINIMUM_BYTE_ALIGNMENT
-        = MX_QUANT_WEIGHT ? 64 : 256 / 8; // NoSmem requires 256 bits alignment, MX quant requires 64 bytes
+        = MX_QUANT_WEIGHT ? 64 : 128 / 8; // TMA requires 128 bits alignment, MX quant requires 64 bytes
     constexpr static int64_t MINIMUM_ALIGNMENT_CONST
         = MINIMUM_BYTE_ALIGNMENT * WEIGHT_ELEM_PER_BYTE / sizeof(WeightStorage);
     constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT_CONST;
@@ -1127,9 +1127,19 @@ protected:
         return tactics;
     }
 
-    auto selectTacticsForArch(int sm, bool exact_match = false)
+    auto selectTacticsForArch(int sm, bool exact_match = false, bool allow_no_smem = false)
     {
         bool is_tma_warp_specialized = sm >= 90 && !INT_QUANT;
+        auto filter_epi_schd = [sm, allow_no_smem](auto& c)
+        {
+            if (sm >= 100 && sm < 120)
+            {
+                return c.epilogue_schedule
+                    == (allow_no_smem ? tensorrt_llm::cutlass_extensions::EpilogueScheduleType::NO_SMEM
+                                      : tensorrt_llm::cutlass_extensions::EpilogueScheduleType::TMA);
+            }
+            return true;
+        };
         auto epilogue_fusion_type = (is_tma_warp_specialized && mUseFusedFinalize)
             ? tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
             : tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
@@ -1137,13 +1147,13 @@ protected:
         auto tactics1 = getFilteredConfigs(sm, MoeGemmId::GEMM_1);
         auto tactics2 = getFilteredConfigs(sm, MoeGemmId::GEMM_2);
         auto it1 = std::find_if(tactics1.begin(), tactics1.end(),
-            [is_tma_warp_specialized, smExact](auto& c)
-            { return c.is_tma_warp_specialized == is_tma_warp_specialized && smExact(c); });
+            [is_tma_warp_specialized, smExact, filter_epi_schd](auto& c)
+            { return c.is_tma_warp_specialized == is_tma_warp_specialized && smExact(c) && filter_epi_schd(c); });
         auto it2 = std::find_if(tactics2.begin(), tactics2.end(),
-            [is_tma_warp_specialized, epilogue_fusion_type, smExact](auto& c)
+            [is_tma_warp_specialized, epilogue_fusion_type, smExact, filter_epi_schd](auto& c)
             {
                 return c.is_tma_warp_specialized == is_tma_warp_specialized
-                    && c.epilogue_fusion_type == epilogue_fusion_type && smExact(c);
+                    && c.epilogue_fusion_type == epilogue_fusion_type && smExact(c) && filter_epi_schd(c);
             });
         if (it1 == tactics1.end() || it2 == tactics2.end())
         {
@@ -1159,7 +1169,7 @@ protected:
     using ConfigsToTestVec = std::vector<std::pair<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
         tensorrt_llm::cutlass_extensions::CutlassGemmConfig>>;
 
-    auto getAllTileConfigsToTest()
+    auto getAllTileConfigsToTest(bool allow_no_smem = false)
     {
         if (mOverrideSelectedConfig1 && mOverrideSelectedConfig2)
         {
@@ -1168,16 +1178,16 @@ protected:
 
         int sm = getSMVersion();
         bool needs_exact_match = sm == 103 && NVFP4;
-        ConfigsToTestVec tactics = {selectTacticsForArch(sm, needs_exact_match)};
+        ConfigsToTestVec tactics = {selectTacticsForArch(sm, needs_exact_match, allow_no_smem)};
         if (sm == 103 && NVFP4)
         {
             // SM103 NVFP4 should also test SM100f kernels
-            tactics.push_back(selectTacticsForArch(100, true));
+            tactics.push_back(selectTacticsForArch(100, true, allow_no_smem));
         }
         if (sm >= 90 && !ANY_FPX)
         {
             // SM90+ should also grab some configs for SM80 to test them
-            tactics.push_back(selectTacticsForArch(80, true));
+            tactics.push_back(selectTacticsForArch(80, true, allow_no_smem));
         }
         return tactics;
     }
@@ -1530,6 +1540,9 @@ protected:
     void BasicPermuteTest(
         int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4, int64_t num_tokens = 3);
 
+    void BasicPermuteTestInternal(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4,
+        int64_t num_tokens = 3, bool allow_no_smem = false);
+
     std::vector<int> calcPermuteMapExpertParallel(std::vector<int> const& expected_experts);
 
     void ExpertParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4,
@@ -1650,8 +1663,44 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
             return;
         }
     }
+    this->BasicPermuteTestInternal(k, hidden_size, num_experts, num_tokens, false);
+    int sm = getSMVersion();
+    if (sm >= 100 && sm < 120 && (!ANY_FP4 || sm == 103))
+    {
+        // Test NO_SMEM for: SM103 all, or SM100 non-FP4
+        int64_t minimum_byte_alignment
+            = MX_QUANT_WEIGHT ? 64 : 256 / 8; // NO_SMEM requires 256 bits alignment, MX quant requires 64 bytes
+        int64_t minimum_alignment_const = minimum_byte_alignment * WEIGHT_ELEM_PER_BYTE / sizeof(WeightStorage);
+        int64_t default_hidden_size = HIDDEN_SIZE_MULTIPLIER * minimum_alignment_const;
+        int64_t deviceMinimumAlignment
+            = std::max(minimum_alignment_const, int64_t(WEIGHT_ELEM_PER_BYTE * 32 / sizeof(WeightStorage)));
+        int old_hidden_size = hidden_size;
+        if (hidden_size == DEFAULT_HIDDEN_SIZE)
+        {
+            hidden_size = default_hidden_size;
+        }
+        if (hidden_size == mDeviceMinimumAlignment)
+        {
+            hidden_size = deviceMinimumAlignment;
+        }
+        if (hidden_size % minimum_alignment_const != 0)
+        {
+            hidden_size = ((hidden_size / minimum_alignment_const) + 1) * minimum_alignment_const;
+        }
+        if (hidden_size != old_hidden_size)
+        {
+            GTEST_LOG_(INFO) << "Appending NO_SMEM test with hidden size: " << hidden_size
+                             << " (was: " << old_hidden_size << ")";
+        }
+        this->BasicPermuteTestInternal(k, hidden_size, num_experts, num_tokens, true);
+    }
+}
 
-    auto test_archs = getAllTileConfigsToTest();
+template <class TypeParam_>
+void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTestInternal(
+    int k, int64_t hidden_size, int64_t num_experts, int64_t num_tokens, bool allow_no_smem)
+{
+    auto test_archs = getAllTileConfigsToTest(allow_no_smem);
     for (auto [gemm1, gemm2] : test_archs)
     {
         mInternalSelectedConfig1 = gemm1;
