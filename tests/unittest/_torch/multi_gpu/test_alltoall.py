@@ -70,8 +70,8 @@ def run_alltoall_op(input_tensors, expected_recv_tensors, group):
     assert len(output_tensors) == len(expected_recv_tensors)
 
     for i, output_tensor in enumerate(output_tensors):
-        assert output_tensor.dtype == input_tensors[i].dtype
-        assert output_tensor.device == input_tensors[i].device
+        assert output_tensor.dtype == expected_recv_tensors[i].dtype
+        assert output_tensor.device == expected_recv_tensors[i].device
         assert output_tensor.shape == expected_recv_tensors[i].shape
 
         assert torch.allclose(output_tensor, expected_recv_tensors[i])
@@ -85,15 +85,15 @@ def run_alltoall_test(mpi_pool_executor, dtypes, shapes):
     num_lists = len(shapes)
 
     # Create input tensors for each rank
-    input_tensors = []
+    send_tensors = []
     for rank in range(world_size):
-        input_tensors.append([])
+        send_tensors.append([])
         for list_idx in range(num_lists):
-            input_tensors[-1].append([])
+            send_tensors[-1].append([])
             for r in range(world_size):
                 # Each rank creates a tensor with unique data to send to rank `r`
                 tensor = torch.randn(*shapes[list_idx], dtype=dtypes[list_idx])
-                input_tensors[-1].append(tensor)
+                send_tensors[-1][-1].append(tensor)
     expected_recv_tensors = []
     # Given the expected tensors sent by rank `rank` to all other ranks `r`,
     # we can now determine the expected tensors received by each rank `rank`
@@ -103,9 +103,12 @@ def run_alltoall_test(mpi_pool_executor, dtypes, shapes):
         for list_idx in range(num_lists):
             # The received tensors are a transpose of the sent tensors
             recv_tensors = [
-                input_tensors[r][list_idx][rank] for r in range(world_size)
+                send_tensors[r][list_idx][rank] for r in range(world_size)
             ]
             expected_recv_tensors[-1].append(torch.stack(recv_tensors))
+
+    input_tensors = [[x for y in tensors for x in y]
+                     for tensors in send_tensors]
 
     # Create group list
     group = list(range(world_size))
