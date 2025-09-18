@@ -150,12 +150,22 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
         routing_logits.device(), std::nullopt);
 
     // allocate workspace for activation/gemm/finalize kernels
-    at::Tensor gemm1_output = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size / 2},
-        at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
+    at::Tensor gemm1_output;
+    at::Tensor gemm1_output_scale;
+    if (isFp8Fp4)
+    {
+        gemm1_output = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size}, at::ScalarType::Float8_e4m3fn,
+            hidden_states.device(), std::nullopt);
+    }
+    else
+    {
+        gemm1_output = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size / 2},
+            at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
 
-    int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens, intermediate_size / 16);
-    at::Tensor gemm1_output_scale
-        = at::detail::empty_cuda({sf_size}, at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
+        int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens, intermediate_size / 16);
+        gemm1_output_scale
+            = at::detail::empty_cuda({sf_size}, at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
+    }
 
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
@@ -188,7 +198,16 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
     // FC13 (gemm1) + FC2 (gemm2)
     //
 
-    if (!isFp8Fp4)
+    if (isFp8Fp4)
+    {
+        TORCH_CHECK(gemm1_weights.sizes()[2] * 2 == hidden_states.sizes()[1],
+            "the third dimension of weights must be equal to hidden_size.");
+        TORCH_CHECK(
+            gemm1_weights_scale.sizes()[2] == args.hidden_size / 32, "gemm1_weights_scale has incorrect dim 2.");
+        TORCH_CHECK(
+            gemm2_weights_scale.sizes()[2] == intermediate_size / 32, "gemm2_weights_scale has incorrect dim 2.");
+    }
+    else
     {
         TORCH_CHECK(hidden_states.scalar_type() == FLOAT4_E2M1X2, "hidden_states must be byte.");
         TORCH_CHECK(hidden_states_scale.value().scalar_type() == at::ScalarType::Float8_e4m3fn,
@@ -198,16 +217,20 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
         TORCH_CHECK(hidden_states_scale.value().sizes()[0]
                 == tensorrt_llm::computeLinearLayoutSFSize(args.num_tokens, args.hidden_size / 16),
             "hidden_states_scale has incorrect size");
+        // This check passes even though the actual shape of the weights[2] and hidden_states[1] is
+        // 2 times larger due to the fact that 2 e2m1 are packed into 1 byte.
+        TORCH_CHECK(gemm1_weights.sizes()[2] == hidden_states.sizes()[1],
+            "the third dimension of weights must be equal to hidden_size.");
+        TORCH_CHECK(
+            gemm1_weights_scale.sizes()[2] == args.hidden_size / 16, "gemm1_weights_scale has incorrect dim 2.");
+        TORCH_CHECK(
+            gemm2_weights_scale.sizes()[2] == intermediate_size / 16, "gemm2_weights_scale has incorrect dim 2.");
     }
     TORCH_CHECK(gemm1_weights.scalar_type() == FLOAT4_E2M1X2, "gemm1_weights must be byte.");
 
     TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
     TORCH_CHECK(gemm1_weights.sizes()[1] % 2 == 0, "the second dimension of weights must be even.");
     TORCH_CHECK(intermediate_size == gemm1_weights.sizes()[1] / 2, "intermediate_size has incorrect dim 1.");
-    // This check passes even though the actual shape of the weights[2] and hidden_states[1] is
-    // 2 times larger due to the fact that 2 e2m1 are packed into 1 byte.
-    TORCH_CHECK(gemm1_weights.sizes()[2] * 2 == hidden_states.sizes()[1],
-        "the third dimension of weights must be equal to hidden_size.");
 
     TORCH_CHECK(gemm1_weights_scale.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm1_weights_scale must be fp8.");
 
@@ -215,16 +238,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
     TORCH_CHECK(gemm1_weights_scale.sizes()[0] == local_num_experts, "gemm1_weights_scale has incorrect dim 0.");
     TORCH_CHECK(intermediate_size % 16 == 0, "the second dimension of weights must be a multiple of 16.");
     TORCH_CHECK(gemm1_weights_scale.sizes()[1] == 2 * intermediate_size, "gemm1_weights_scale has incorrect dim 1.");
-    if (isFp8Fp4)
-    {
-        TORCH_CHECK(
-            gemm1_weights_scale.sizes()[2] == args.hidden_size / 32, "gemm1_weights_scale has incorrect dim 2.");
-    }
-    else
-    {
-        TORCH_CHECK(
-            gemm1_weights_scale.sizes()[2] == args.hidden_size / 16, "gemm1_weights_scale has incorrect dim 2.");
-    }
 
     TORCH_CHECK(gemm2_weights.scalar_type() == FLOAT4_E2M1X2, "gemm2_weights must be byte.");
 
@@ -238,16 +251,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
     TORCH_CHECK(gemm2_weights_scale.dim() == 3, "gemm2_weights_scale must be 3D.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[0] == local_num_experts, "gemm2_weights_scale has incorrect dim 0.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[1] == args.hidden_size, "gemm2_weights_scale has incorrect dim 1.");
-    if (isFp8Fp4)
-    {
-        TORCH_CHECK(
-            gemm2_weights_scale.sizes()[2] == intermediate_size / 32, "gemm2_weights_scale has incorrect dim 2.");
-    }
-    else
-    {
-        TORCH_CHECK(
-            gemm2_weights_scale.sizes()[2] == intermediate_size / 16, "gemm2_weights_scale has incorrect dim 2.");
-    }
 
     TORCH_CHECK(output1_scales_scalar.scalar_type() == at::ScalarType::Float, "output1_scales_scalar must be float.");
     TORCH_CHECK(output1_scales_scalar.dim() == 1, "output1_scales_scalar must be 1D.");
@@ -284,7 +287,10 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
 
     // gemm1 intermediate ws
     workspace.gemm1_output = gemm1_output.data_ptr();
-    workspace.gemm1_output_scale = reinterpret_cast<float*>(gemm1_output_scale.data_ptr());
+    if (!isFp8Fp4)
+    {
+        workspace.gemm1_output_scale = reinterpret_cast<float*>(gemm1_output_scale.data_ptr());
+    }
 
     // gemm2 intermediate ws
     workspace.gemm2_output = gemm2_output.data_ptr();
@@ -401,8 +407,7 @@ public:
         {
             auto const num_tokens = hidden_states.sizes()[0];
 
-            // 2x FP4 per byte element
-            auto const hidden_size = 2 * hidden_states.sizes()[1];
+            auto const hidden_size = hidden_states.sizes()[1];
 
             moeConfigIndex = mRunner->getDefaultValidConfigIndex(
                 top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
