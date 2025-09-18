@@ -113,124 +113,73 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
 
-        mem_after = _cuda_mem_allocated()
-        delta = (
-            (mem_after - mem_before) if (mem_before is not None and mem_after is not None) else None
+        _cleanup_unstacked_weights(
+            gm,
+            node,
+            mem_before,
+            created_bytes,
+            this_fusion_param_names,
+            total_cuda_delta,
+            total_freed_param_bytes,
         )
-        if delta is not None:
-            total_cuda_delta += max(delta, 0)
-        ad_logger.info(
-            f"[fuse_moe] Fused MoE params for node={getattr(node, 'name', 'unknown')} | "
-            f"CUDA Δ={_fmt_bytes(delta if delta is not None else 0)} | "
-            f"created params={_fmt_bytes(created_bytes)} | "
-            f"CUDA after={_fmt_bytes(mem_after)}"
-        )
-
-        # Per-fusion cleanup: DCE then unregister any now-unreferenced original params for this fusion.
-        try:
-            gm.graph.eliminate_dead_code()
-        except Exception:
-            pass
-
-        used_attr_names_iter = set()
-        for n in gm.graph.nodes:
-            if getattr(n, "op", None) == "get_attr":
-                used_attr_names_iter.add(getattr(n, "target", None))
-
-        names_to_unregister_iter = [
-            name for name in this_fusion_param_names if name not in used_attr_names_iter
-        ]
-
-        freed_param_bytes_iter = 0
-        for name in names_to_unregister_iter:
-            param_obj = None
-            try:
-                # Use GraphModule API to robustly fetch parameter by dotted path
-                param_obj = gm.get_parameter(name)
-            except Exception:
-                param_obj = None
-            if isinstance(param_obj, torch.nn.Parameter):
-                try:
-                    freed_param_bytes_iter += param_obj.element_size() * param_obj.numel()
-                except Exception:
-                    pass
-            # Remove from owning submodule
-            try:
-                owner_mod, leaf = _resolve_owner_module_and_leaf_attr(gm, name)
-                if hasattr(owner_mod, "_parameters") and leaf in owner_mod._parameters:
-                    owner_mod._parameters.pop(leaf, None)
-                if hasattr(owner_mod, leaf):
-                    delattr(owner_mod, leaf)
-            except Exception:
-                pass
-            # Drop local ref
-            del param_obj
-
-        if names_to_unregister_iter:
-            total_freed_param_bytes += freed_param_bytes_iter
-            ad_logger.info(
-                (
-                    f"[fuse_moe] Per-fusion unregistered {len(names_to_unregister_iter)} params | "
-                    f"approx freed={_fmt_bytes(freed_param_bytes_iter)}"
-                )
-            )
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-    # Eliminate dead nodes first, then unregister any original params no longer referenced.
-    try:
-        gm.graph.eliminate_dead_code()
-    except Exception:
-        pass
-
-    used_attr_names = set()
-    for n in gm.graph.nodes:
-        if getattr(n, "op", None) == "get_attr":
-            used_attr_names.add(getattr(n, "target", None))
-
-    names_to_unregister = [name for name in original_param_names if name not in used_attr_names]
-
-    freed_param_bytes = 0
-    for name in names_to_unregister:
-        param_obj = None
-        try:
-            param_obj = gm.get_parameter(name)
-        except Exception:
-            param_obj = None
-        if isinstance(param_obj, torch.nn.Parameter):
-            try:
-                freed_param_bytes += param_obj.element_size() * param_obj.numel()
-            except Exception:
-                pass
-        try:
-            owner_mod, leaf = _resolve_owner_module_and_leaf_attr(gm, name)
-            if hasattr(owner_mod, "_parameters") and leaf in owner_mod._parameters:
-                owner_mod._parameters.pop(leaf, None)
-            if hasattr(owner_mod, leaf):
-                delattr(owner_mod, leaf)
-        except Exception:
-            pass
-        del param_obj
-
-    ad_logger.info(
-        (
-            f"[fuse_moe] Unregistered {len(names_to_unregister)} original parameters | "
-            f"approx freed={_fmt_bytes(freed_param_bytes)} | "
-            f"per-fusion freed total={_fmt_bytes(total_freed_param_bytes)}"
-        )
-    )
-
-    summary_msg = (
-        f"[fuse_moe] Summary: fused={fused_key_counter} | "
-        f"total created params={_fmt_bytes(total_created_param_bytes)} | "
-        f"net CUDA increase (observed)={_fmt_bytes(total_cuda_delta)}"
-    )
-    ad_logger.info(summary_msg)
 
     return fused_key_counter
+
+
+def _cleanup_unstacked_weights(
+    gm,
+    node,
+    mem_before,
+    created_bytes,
+    this_fusion_param_names,
+    total_cuda_delta,
+    total_freed_param_bytes,
+):
+    """DCE then unregister any now-unreferenced original params for this fusion"""
+    mem_after = _cuda_mem_allocated()
+    delta = (mem_after - mem_before) if (mem_before is not None and mem_after is not None) else None
+    if delta is not None:
+        total_cuda_delta += max(delta, 0)
+    ad_logger.info(
+        f"[fuse_moe] Fused MoE params for node={getattr(node, 'name', 'unknown')} | "
+        f"CUDA Δ={_fmt_bytes(delta if delta is not None else 0)} | "
+        f"created params={_fmt_bytes(created_bytes)} | "
+        f"CUDA after={_fmt_bytes(mem_after)}"
+    )
+
+    gm.graph.eliminate_dead_code()
+
+    used_attr_names_iter = set()
+    for n in gm.graph.nodes:
+        if getattr(n, "op", None) == "get_attr":
+            used_attr_names_iter.add(getattr(n, "target", None))
+
+    names_to_unregister_iter = [
+        name for name in this_fusion_param_names if name not in used_attr_names_iter
+    ]
+
+    freed_param_bytes_iter = 0
+    for name in names_to_unregister_iter:
+        param_obj = gm.get_parameter(name)
+        if isinstance(param_obj, torch.nn.Parameter):
+            freed_param_bytes_iter += param_obj.element_size() * param_obj.numel()
+        owner_mod, leaf = _resolve_owner_module_and_leaf_attr(gm, name)
+        if hasattr(owner_mod, "_parameters") and leaf in owner_mod._parameters:
+            owner_mod._parameters.pop(leaf, None)
+        if hasattr(owner_mod, leaf):
+            delattr(owner_mod, leaf)
+        del param_obj
+
+    if names_to_unregister_iter:
+        total_freed_param_bytes += freed_param_bytes_iter
+        ad_logger.info(
+            (
+                f"[fuse_moe] Per-fusion unregistered {len(names_to_unregister_iter)} params | "
+                f"approx freed={_fmt_bytes(freed_param_bytes_iter)}"
+            )
+        )
+        # Flush CUDA cache since we freed large chunks of memory
+        torch.cuda.empty_cache()
 
 
 def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
@@ -560,7 +509,6 @@ class MatchMoePattern(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
-        total_cuda_delta = 0
 
         # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
         boundary_nodes = identify_regions_between_residuals(gm)
@@ -620,7 +568,6 @@ class MatchMoePattern(BaseTransform):
                 continue
 
             # Step 5: Insert the MoE op into the graph.
-            mem_before = _cuda_mem_allocated()
             with graph.inserting_before(final_hidden_state_node):
                 w1_list = expert_weights["w1"]
                 w2_list = expert_weights["w2"]
@@ -650,34 +597,10 @@ class MatchMoePattern(BaseTransform):
             final_hidden_state_node.replace_all_uses_with(fused_moe_node)
             graph.erase_node(final_hidden_state_node)
 
-            mem_after = _cuda_mem_allocated()
-            delta = (
-                mem_after - mem_before
-                if (mem_before is not None and mem_after is not None)
-                else None
-            )
-            if delta is not None:
-                total_cuda_delta += max(delta, 0)
-            ad_logger.info(
-                (
-                    f"[match_moe_pattern] Inserted at node="
-                    f"{getattr(final_hidden_state_node, 'name', 'unknown')} | "
-                    f"CUDA Δ={_fmt_bytes(delta if delta is not None else 0)} | "
-                    f"CUDA after={_fmt_bytes(mem_after)}"
-                )
-            )
-
             while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
                 gm.graph.eliminate_dead_code()
 
             num_moe_patterns += 1
-
-        ad_logger.info(
-            (
-                f"[match_moe_pattern] Summary: inserted={num_moe_patterns} | "
-                f"net CUDA increase (observed)={_fmt_bytes(total_cuda_delta)}"
-            )
-        )
 
         info = TransformInfo(
             skipped=False, num_matches=num_moe_patterns, is_clean=False, has_valid_shapes=False
