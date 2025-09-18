@@ -32,7 +32,8 @@ from ..distributed import MPIDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla)
+                    create_py_executor_instance, instantiate_sampler, is_mla,
+                    validate_feature_combination)
 from .config import PyTorchConfig, _construct_checkpoint_loader
 from .config_utils import is_mla
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -281,13 +282,6 @@ def create_py_executor(
         from tensorrt_llm._torch.speculative import suggest_spec_config
         spec_config = suggest_spec_config(max_batch_size)
 
-    if not pytorch_backend_config.disable_overlap_scheduler and spec_config is not None:
-        if not spec_config.spec_dec_mode.support_overlap_scheduler():
-            logger.warning(
-                f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
-            )
-            pytorch_backend_config.disable_overlap_scheduler = True
-
     if mm_encoder_only:
         pytorch_backend_config.mm_encoder_only = True
         pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
@@ -338,6 +332,9 @@ def create_py_executor(
             lora_config=lora_config,
             checkpoint_loader=checkpoint_loader,
         )
+
+    validate_feature_combination(llm_args, model_engine,
+                                 pytorch_backend_config.sampler_type)
 
     if has_draft_model_engine:
         with mem_monitor.observe_creation_stage(
