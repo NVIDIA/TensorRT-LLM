@@ -174,7 +174,7 @@ protected:
     using WeightStorage = std::conditional_t<WEIGHT_ELEM_PER_BYTE == 2, uint8_t, WeightType>;
     constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 16;
     constexpr static int64_t MINIMUM_BYTE_ALIGNMENT
-        = MX_QUANT_WEIGHT ? 64 : 128 / 8; // TMA requires 128 bits alignment, MX quant requires 64 bytes
+        = MX_QUANT_WEIGHT ? 64 : 256 / 8; // NoSmem requires 256 bits alignment, MX quant requires 64 bytes
     constexpr static int64_t MINIMUM_ALIGNMENT_CONST
         = MINIMUM_BYTE_ALIGNMENT * WEIGHT_ELEM_PER_BYTE / sizeof(WeightStorage);
     constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT_CONST;
@@ -1861,6 +1861,8 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteDeepSeekV3)
 TYPED_TEST(MixtureOfExpertsTest, MinimumAlignment)
 {
     this->mInterSizeFraction = 1;
+    std::cout << "Device minimum alignment: " << this->mDeviceMinimumAlignment << std::endl;
+    std::cout << "DEFAULT_HIDDEN_SIZE: " << this->DEFAULT_HIDDEN_SIZE << std::endl;
     this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE + this->mDeviceMinimumAlignment);
 }
 
