@@ -768,7 +768,6 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input, module.input_scale, module.scaling_vector_size, False)
 
         if IS_CUTLASS_DSL_AVAILABLE and module.use_cute_dsl_nvfp4_blockscaling_mm:
-            # from ..custom_ops import cutlass_dsl_nvfp4_gemm_blackwell
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
