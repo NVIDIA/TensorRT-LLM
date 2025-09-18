@@ -16,7 +16,7 @@ class SaveHiddenStatesDrafter(Drafter):
     def __init__(
         self,
         spec_config: "SaveHiddenStatesDecodingConfig",
-        spec_resource_manager: SaveHiddenStatesResourceManager,
+        spec_resource_manager,
     ):
         super().__init__(spec_config.max_concurrency)
         self.spec_config = spec_config
@@ -29,9 +29,7 @@ class SaveHiddenStatesDrafter(Drafter):
         self.spec_resource_manager = spec_resource_manager
         os.makedirs(self._output_directory, exist_ok=True)
 
-    def _process_request(
-            self, request: LlmRequest,
-            resource_manager: SaveHiddenStatesResourceManager) -> None:
+    def _process_request(self, request: LlmRequest, resource_manager) -> None:
         out_dict = {}
         if local_mpi_rank() == 0:
             input_ids = torch.tensor(list(request.get_tokens(0)),
