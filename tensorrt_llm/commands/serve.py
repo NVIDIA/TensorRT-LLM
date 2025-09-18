@@ -169,8 +169,11 @@ def launch_server(host: str,
         # AutoDeploy does not support cache reuse yet.
         llm_args["kv_cache_config"].enable_block_reuse = False
         llm = AutoDeployLLM(**llm_args)
-    else:
+    elif backend == 'tensorrt':
         llm = LLM(**llm_args)
+    else:
+        raise ValueError(
+            f"Invalid backend: {backend}, check help for available options.")
 
     server = OpenAIServer(llm=llm,
                           model=model,
@@ -210,11 +213,9 @@ def launch_mm_encoder_server(
 @click.option("--port", type=int, default=8000, help="Port of the server.")
 @click.option(
     "--backend",
-    type=click.Choice(["pytorch", "trt", "_autodeploy"]),
+    type=click.Choice(["pytorch", "tensorrt", "_autodeploy"]),
     default="pytorch",
-    help=
-    "Set to 'pytorch' for pytorch path and '_autodeploy' for autodeploy path. Default is pytorch path."
-)
+    help="The backend to use to serve the model. Default is pytorch backend.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',

@@ -52,10 +52,11 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
 )
-@optgroup.option("--backend",
-                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
-                 default="pytorch",
-                 help="The backend to use when running benchmarking.")
+@optgroup.option(
+    "--backend",
+    type=click.Choice(ALL_SUPPORTED_BACKENDS),
+    default="pytorch",
+    help="The backend to use for benchmark. Default is pytorch backend.")
 @optgroup.option(
     "--kv_cache_free_gpu_mem_fraction",
     type=float,
@@ -246,7 +247,7 @@ def latency_command(
     else:
         raise RuntimeError(
             f"Invalid backend: {options.backend}, please use one of the following: "
-            f"{ALL_SUPPORTED_BACKENDS}")
+            f"{', '.join(ALL_SUPPORTED_BACKENDS)}.")
 
     exec_settings["model"] = options.model
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]

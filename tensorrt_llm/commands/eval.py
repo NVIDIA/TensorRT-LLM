@@ -39,10 +39,11 @@ from ..logger import logger, severity_map
               default=None,
               help="Path | Name of the tokenizer."
               "Specify this value only if using TensorRT engine as model.")
-@click.option("--backend",
-              type=click.Choice(["pytorch", "tensorrt"]),
-              default="pytorch",
-              help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+@click.option(
+    "--backend",
+    type=click.Choice(["pytorch", "tensorrt"]),
+    default="pytorch",
+    help="The backend to use for evaluation. Default is pytorch backend.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
@@ -134,8 +135,11 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
     profiler.start("trtllm init")
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
-    else:
+    elif backend is None:  # TensorRT
         llm = LLM(**llm_args)
+    else:
+        raise ValueError(
+            f"Invalid backend: {backend}, check help for available options.")
     profiler.stop("trtllm init")
     elapsed_time = profiler.elapsed_time_in_sec("trtllm init")
     logger.info(f"TRTLLM initialization time: {elapsed_time:.3f} seconds.")
