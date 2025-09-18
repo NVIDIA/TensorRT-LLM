@@ -44,7 +44,10 @@ class LogitsStorage:
     def __init__(self,
                  seq_length: int,
                  use_device_memory=True,
-                 should_exclude_last=False):
+                 should_exclude_last=False,
+                 chunked_mode=False,
+                 streaming=False,
+                 chunk_size=8):
         if should_exclude_last:
             # Exclude last logits is used when overlap scheduler is used, that generates one extra token,
             # so we should make sure there's memory for that extra +1.
@@ -52,12 +55,20 @@ class LogitsStorage:
         self.seq_length = seq_length
         self.use_device_memory = use_device_memory
         self._should_exclude_last = should_exclude_last
+        self.chunked_mode = chunked_mode
+        self.chunk_size = chunk_size
+        self.streaming = streaming
         self._logits_indices = []
 
         # Lazily initialized by _init() upon first append()
         self._storage: torch.Tensor | None = None
         self.beam_width = -1
         self.vocab_size = -1
+
+        # Chunked mode: device-side fragments
+        if chunked_mode:
+            self._device_fragments: List[torch.Tensor] = []
+            self._current_position = 0
 
     def _init(self, logits: torch.Tensor):
         _, self.beam_width, self.vocab_size = logits.shape
@@ -76,30 +87,51 @@ class LogitsStorage:
                 pin_memory=True,
                 requires_grad=False)
 
+    def _init_chunked_storage(self, logits: torch.Tensor):
+        # with chunked mode, we only use cpu memory
+        _, self.beam_width, self.vocab_size = logits.shape
+
+        self._storage = torch.empty(
+            (self.seq_length, self.beam_width, self.vocab_size),
+            dtype=logits.dtype,
+            device='cpu',
+            pin_memory=True,
+            requires_grad=False)
+
     def append(self, logits: torch.Tensor):
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
 
-        if self.beam_width == -1:
-            self._init(logits)
+        if self.chunked_mode:
+            if self.beam_width == -1:
+                self._init_chunked_storage(logits)
+            self._add_fragment(logits)
+        else:
+            if self.beam_width == -1:
+                self._init(logits)
 
-        assert logits.size(1) == self.beam_width, "Beam width mismatch"
+            assert logits.size(1) == self.beam_width, "Beam width mismatch"
 
-        position = 0 if not self._logits_indices else self._logits_indices[-1][1]
-        new_position = logits.size(0) + position
-        if new_position > self.seq_length:
-            raise ValueError(
-                f"LogitsStorage overflow. This storage can only hold {self.seq_length} logits "
-                f"({position} already filled) but trying to append {logits.size(0)} more logits"
-            )
+            position = 0 if not self._logits_indices else self._logits_indices[
+                -1][1]
+            new_position = logits.size(0) + position
+            if new_position > self.seq_length:
+                raise ValueError(
+                    f"LogitsStorage overflow. This storage can only hold {self.seq_length} logits "
+                    f"({position} already filled) but trying to append {logits.size(0)} more logits"
+                )
 
-        self._storage[position:new_position].copy_(logits, non_blocking=True)
-        self._logits_indices.append((position, new_position))
+            self._storage[position:new_position].copy_(logits,
+                                                       non_blocking=True)
+            self._logits_indices.append((position, new_position))
 
     def get(self, all_logits: bool) -> torch.Tensor | None:
         """Returns the used logits storage if there are any, otherwise, returns None.
         When all_logits is True then all set logits are returned, otherwise, only the last logits are returned."""
+        if self._storage is None:
+            return None
+
         try:
             last = -2 if self._should_exclude_last else -1
             start = 0 if all_logits else self._logits_indices[last][0]
@@ -107,6 +139,49 @@ class LogitsStorage:
             return self._storage[start:end]
         except IndexError:
             return None
+
+    def _add_fragment(self, logits: torch.Tensor):
+        """Add a logits fragment to device storage"""
+        self._device_fragments.append(logits.clone())
+
+        # Streaming mode: transfer immediately after each fragment (size=1).
+        # Non-streaming mode: batch transfer every chunk_size steps.
+        if self.streaming:
+            if len(self._device_fragments
+                   ) == 1:  # Only one token at a time in streaming
+                self._transfer_chunk_to_host()
+        else:
+            if len(self._device_fragments) == self.chunk_size:
+                self._transfer_chunk_to_host()
+
+    def _transfer_chunk_to_host(self):
+        """Transfer accumulated fragments to host"""
+        if not self._device_fragments:
+            return
+
+        # Allocate host storage if needed
+        assert self._storage is not None, "Storage should be initialized"
+        # if self._storage is None:
+        #     self._init(self._device_fragments[0])
+
+        # Merge fragments on device first
+        merged_logits = torch.cat(self._device_fragments, dim=0)
+
+        # Copy to host (device-to-host transfer)
+        end_pos = self._current_position + len(self._device_fragments)
+        self._storage[self._current_position:end_pos].copy_(merged_logits,
+                                                            non_blocking=True)
+
+        # Update position and clear fragments
+        self._logits_indices.append((self._current_position, end_pos))
+        self._current_position = end_pos
+        self._device_fragments.clear()
+
+    def finalize_transfer(self):
+        """Force transfer of any remaining fragments to host (for chunked mode)"""
+        if self.chunked_mode and hasattr(
+                self, '_device_fragments') and self._device_fragments:
+            self._transfer_chunk_to_host()
 
     def set_exclude_last(self, should_exclude_last: bool) -> None:
         self._should_exclude_last = should_exclude_last
@@ -165,13 +240,23 @@ class PyResult:
                  return_log_probs: bool = False,
                  return_context_logits: bool = False,
                  return_generation_logits: bool = False,
-                 exclude_last_generation_logits: bool = False):
+                 exclude_last_generation_logits: bool = False,
+                 chunked_mode: bool = False,
+                 chunk_size: int = 8):
         self._streaming = streaming
         self._context_logits = LogitsStorage(
-            prompt_len, use_device_memory) if return_context_logits else None
+            prompt_len,
+            use_device_memory,
+            chunked_mode=chunked_mode,
+            streaming=streaming,
+            chunk_size=chunk_size) if return_context_logits else None
         self._generation_logits = LogitsStorage(
-            max_new_tokens, use_device_memory, exclude_last_generation_logits
-        ) if return_generation_logits else None
+            max_new_tokens,
+            use_device_memory,
+            exclude_last_generation_logits,
+            chunked_mode=chunked_mode,
+            streaming=streaming,
+            chunk_size=chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings = None
 
@@ -192,6 +277,13 @@ class PyResult:
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
         self._mm_embeddings = SharedTensorContainer.from_tensor(
             mm_embeddings).dump_to_dict()
+
+    def post_processing_transfer(self):
+        """Finalize any remaining logits transfers (for chunked mode)"""
+        if self._context_logits:
+            self._context_logits.finalize_transfer()
+        if self._generation_logits:
+            self._generation_logits.finalize_transfer()
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -312,6 +404,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
             is_first_draft: bool = False,
+            use_chunked_logits: bool = False,
+            logits_chunk_size: int = 8,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -369,15 +463,24 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Whether the request is for the first forward of the draft model.
         self.py_is_first_draft = is_first_draft
 
+        # Chunked logits parameters
+        self.py_use_chunked_logits = use_chunked_logits
+        self.py_logits_chunk_size = logits_chunk_size
+
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
         self.py_stop_words_list = stop_words_list
 
-        self.py_result = PyResult(self.py_prompt_len, self.py_max_new_tokens,
-                                  return_logits_device_memory, self.streaming,
-                                  return_log_probs, return_context_logits,
+        self.py_result = PyResult(self.py_prompt_len,
+                                  self.py_max_new_tokens,
+                                  return_logits_device_memory,
+                                  self.streaming,
+                                  return_log_probs,
+                                  return_context_logits,
                                   return_generation_logits,
-                                  exclude_last_generation_logits)
+                                  exclude_last_generation_logits,
+                                  chunked_mode=use_chunked_logits,
+                                  chunk_size=logits_chunk_size)
         self.child_requests = []
 
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
