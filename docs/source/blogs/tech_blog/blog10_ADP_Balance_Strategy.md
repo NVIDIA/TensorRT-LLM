@@ -46,10 +46,10 @@ To address this critical performance limitation, we introduce the **ADP (Attenti
 We model and quantify the performance impact of load imbalance in Attention DP. Since workloads across ranks can be heterogeneous, the execution time for the Attention module in any given iteration is bounded by the rank with the highest workload:
 
 $$
-\text{time}_i = \max_{0 \leq m < N} \text{time}_{i,m}
+time_i = \max_{0 \leq m < N} time_{i,m}
 $$
 
-where $\text{time}_{i,m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
+where $time_{i,m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
 
 To quantify load balance and theoretical performance bounds, we define two key metrics:
 
@@ -57,13 +57,13 @@ To quantify load balance and theoretical performance bounds, we define two key m
 The balance ratio measures the load distribution across ranks within the Attention module for each iteration:
 
 $$
-\text{balance_ratio} = \frac{\text{avg_tokens}}{\text{max_tokens}}
+balance = \frac{tokens_{avg}}{tokens_{max}}
 $$
 
 where:
-- $\text{avg_tokens}$ represents the average number of tokens across all ranks  
-- $\text{max_tokens}$ represents the maximum number of tokens across all ranks
-- $\text{tokens}_i$ represents the number of tokens processed by rank $i$
+- $tokens_{avg}$ represents the average number of tokens across all ranks  
+- $tokens_{max}$ represents the maximum number of tokens across all ranks
+- $tokens_i$ represents the number of tokens processed by rank $i$
 
 Note: MoE module load balancing is handled separately by the Expert Parallel Load Balancer (EPLB) module and is not considered during the early scheduling phase.
 
@@ -71,18 +71,18 @@ Note: MoE module load balancing is handled separately by the Expert Parallel Loa
 The Speed-of-Light throughput represents the theoretical upper-bound throughput achievable with perfect load balancing:
 
 $$
-\text{sol_time} = \sum_{i=0}^{\infty} \text{time}_i \times \text{balance_ratio}_i
+time_{sol} = \sum_{i=0}^{\infty} time_i \times balance
 $$
 
 $$
-\text{sol_tps} = \frac{\text{elapsed_time}}{\text{sol_time}} \times \text{actual_tps}
+tps_{sol} = \frac{time_{elapsed}}{time_{sol}} \times tps_{actual}
 $$
 
 where:
-- $\text{time}_i$: Measured execution time of iteration $i$
-- $\text{elapsed_time}$: Total empirically measured end-to-end execution time
-- $\text{actual_tps}$: Observed throughput in tokens per second
-- $\text{sol_tps}$: Theoretical maximum throughput under perfect load balance
+- $time_i$: Measured execution time of iteration $i$
+- $time_{elapsed}$: Total empirically measured end-to-end execution time
+- $tps_{actual}$: Observed throughput in tokens per second
+- $tps_{sol}$: Theoretical maximum throughput under perfect load balance
 
 This theoretical framework enables us to quantify the performance gap between current and optimal system utilization, providing clear targets for optimization.
 

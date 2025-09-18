@@ -170,8 +170,11 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
 def setup(app):
     from helper import generate_examples, generate_llmapi
 
-    from tensorrt_llm.llmapi.utils import tag_llm_params
-    tag_llm_params()
+    try:
+        from tensorrt_llm.llmapi.utils import tag_llm_params
+        tag_llm_params()
+    except ImportError:
+        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
 
