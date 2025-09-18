@@ -151,7 +151,8 @@ class CutlassFusedMoE(MoE):
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion
+        # Finalize fusion should be disabled if Lora is used.
+        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:

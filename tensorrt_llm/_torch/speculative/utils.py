@@ -19,7 +19,7 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       is_draft_model=False):
-    if spec_config.spec_dec_mode.is_mtp():
+    if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
@@ -39,6 +39,21 @@ def get_spec_metadata(spec_config,
             is_draft_model=is_draft_model,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
+            is_mtp_eagle=False,
+        )
+    if spec_config.spec_dec_mode.is_mtp_eagle():
+        return Eagle3SpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
+            is_draft_model=is_draft_model,
+            eagle3_resource_manager=spec_resource_manager,
+            layers_to_capture=None,
+            is_mtp_eagle=True,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
@@ -70,7 +85,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     max_seq_len = model_engine.max_seq_len
     max_num_tokens = model_engine.max_num_tokens
     spec_dec_mode = spec_config.spec_dec_mode
-    if spec_dec_mode.is_mtp_eagle():
+    if spec_dec_mode.is_mtp_eagle_one_model():
         if spec_config.use_relaxed_acceptance_for_thinking:
             return MTPHiddenStatesManager(
                 spec_config,
@@ -80,15 +95,15 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             )
         else:
             return None
-    if spec_dec_mode.is_mtp():
+    if spec_dec_mode.is_mtp_one_model():
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
         )
-    if spec_dec_mode.is_eagle3():
-        assert draft_model_engine is not None, "Draft model engine is required for Eagle3 two model flow."
+    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
+        assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."
         return Eagle3ResourceManager(
             spec_config,
             draft_model_engine.model.config.torch_dtype,
@@ -106,10 +121,11 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
 
 def get_spec_decoder(sampler_args: TorchSampler.Args,
                      spec_config: "DecodingBaseConfig"):
-    if spec_config.spec_dec_mode.is_mtp():
+    if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSampler(sampler_args,
                           nextn=spec_config.num_nextn_predict_layers)
-    if spec_config.spec_dec_mode.is_eagle3():
+    if spec_config.spec_dec_mode.is_eagle3(
+    ) or spec_config.spec_dec_mode.is_mtp_eagle():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
@@ -132,7 +148,8 @@ def get_spec_drafter(model_engine,
 
     max_num_requests = model_engine.batch_size
     if spec_config.spec_dec_mode.is_draft_target(
-    ) or spec_config.spec_dec_mode.is_eagle3():
+    ) or spec_config.spec_dec_mode.is_eagle3(
+    ) or spec_config.spec_dec_mode.is_mtp_eagle():
         return ModelDrafter(spec_config,
                             draft_model_engine,
                             spec_config.max_draft_len,
@@ -148,7 +165,7 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
-    if spec_config.spec_dec_mode.is_mtp():
+    if spec_config.spec_dec_mode.is_mtp_one_model():
         return spec_config.num_nextn_predict_layers
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         num_eagle_layers = spec_config.num_eagle_layers
@@ -160,7 +177,7 @@ def get_spec_worker(spec_config, model_config, mapping):
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config, model_config)
-    if spec_dec_mode.is_mtp_eagle():
+    if spec_dec_mode.is_mtp_eagle_one_model():
         return MTPEagleWorker(spec_config, model_config)
     if spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping)
@@ -174,14 +191,13 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
-    if spec_config.spec_dec_mode.is_eagle3_one_model(
-    ) or spec_config.spec_dec_mode.is_mtp_eagle():
+    if spec_config.spec_dec_mode.is_eagle3_one_model():
         return spec_config.max_draft_len - 1
     return 0
 
 
 def update_spec_config_from_model_config(spec_config, model_config):
-    if spec_config.spec_dec_mode.is_mtp():
+    if spec_config.spec_dec_mode.is_mtp_one_model():
         # Use `max_draft_len` for several low-level APIs. TODO: Remove this after distinguishing them.
         spec_config.max_draft_len = spec_config.num_nextn_predict_layers
         # Use `num_nextn_predict_layers_from_model_config` to decide decoding mode MTP / MTP_EAGLE.

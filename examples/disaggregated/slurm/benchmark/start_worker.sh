@@ -65,14 +65,14 @@ else
     nsys_file=${nsys_folder}/nsys_worker_proc_${instance_id}_${SLURM_PROCID}
     export TLLM_PROFILE_RECORD_GC=1
     export TLLM_NVTX_DEBUG=1
-    if [ "${role}" = "GEN" ]; then
+    if [ "${role}" = "GEN" ] && [ "$SLURM_PROCID" = "0" ]; then
         export TLLM_PROFILE_START_STOP=200-250
         nsys_prefix="nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
         echo "nsys_prefix: ${nsys_prefix}"
     elif [ "${role}" = "CTX" ]; then
         echo "nsys is not enabled on ctx_gpus"
     fi
-    trtllm-llmapi-launch ${numa_bind_cmd} ${nsys_prefix} \
+    ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
         trtllm-serve ${model_path} \
             --host $(hostname) --port ${port} \
             --extra_llm_api_options ${config_file}

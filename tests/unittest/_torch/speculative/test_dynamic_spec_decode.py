@@ -18,8 +18,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # Example: (logic in tensorrt_llm._torch.speculative.drafter.should_use_spec_decode)
 # At start: len(requests): 3, max_batch_size: 3, token_cap: 1638 -> num_effective_requests: 3, self.max_concurrency: 2 -> spec decode OFF
 # Later: len(requests): 1, max_batch_size: 3, token_cap: 1638 -> num_effective_requests: 1, self.max_concurrency: 2 -> spec decode ON
+@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.high_cuda_memory
-def test_dynamic_spec_decode():
+def test_dynamic_spec_decode(disable_overlap_scheduler: bool):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
@@ -36,7 +37,7 @@ def test_dynamic_spec_decode():
     llm_common_config = dict(
         model=target_model_dir,
         attn_backend="TRTLLM",
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
@@ -68,6 +69,7 @@ def test_dynamic_spec_decode():
     results_spec = llm_spec.generate(prompts, sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
+
 
     llm_ref = LLM(**llm_common_config)
     results_ref = llm_ref.generate(prompts, sampling_params)

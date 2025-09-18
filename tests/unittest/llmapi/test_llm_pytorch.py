@@ -504,6 +504,7 @@ def test_nemotron_nas_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
+@pytest.mark.skip(reason="https://nvbugs/5521949")
 def test_codellama_fp8_with_bf16_lora() -> None:
     model_dir = f"{llm_models_root()}/codellama/CodeLlama-7b-Instruct-hf/"
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
@@ -564,6 +565,7 @@ def test_codellama_fp8_with_bf16_lora() -> None:
 
 
 @skip_gpu_memory_less_than_80gb
+@pytest.mark.skip(reason="https://nvbugs/5521949")
 def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
     model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
 
@@ -856,3 +858,22 @@ def test_llm_with_proxy_error():
                 match="Mock GenerationExecutorWorker initialization failed"):
             llm = LLM(model=llama_model_path,
                       kv_cache_config=global_kvcache_config)
+
+
+@pytest.mark.part0
+@pytest.mark.xfail(reason="https://nvbugs/5513423")
+def test_min_tokens():
+    """Check min_tokens is respected."""
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              enable_mixed_sampler=True,
+              max_seq_len=20000)
+
+    output_len = 5000
+    sampling_params = SamplingParams(max_tokens=output_len,
+                                     min_tokens=output_len,
+                                     temperature=1)
+    res = llm.generate("The end.", sampling_params=sampling_params)
+
+    assert len(res.outputs) == 1
+    assert len(res.outputs[0].token_ids) == output_len

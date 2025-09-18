@@ -90,15 +90,17 @@ class RuntimeConfig(BaseModel):
         if self.backend == "pytorch":
             cuda_graph_config = updated_llm_args.pop(
                 "cuda_graph_config", llm_args["cuda_graph_config"])
-            # Use runtime max_batch_size as cuda_graph_config.max_batch_size
-            # if both max_batch_size and batch_sizes are not set.
-            batch_sizes_set = cuda_graph_config.get("batch_sizes",
-                                                    None) is not None
-            max_batch_size_set = cuda_graph_config.get("max_batch_size",
-                                                       None) is not None
-            if not batch_sizes_set and not max_batch_size_set:
-                cuda_graph_config[
-                    "max_batch_size"] = self.settings_config.max_batch_size
+            if cuda_graph_config:
+                # Use runtime max_batch_size as cuda_graph_config.max_batch_size
+                # if both max_batch_size and batch_sizes are not set.
+                batch_sizes_set = cuda_graph_config.get("batch_sizes",
+                                                        None) is not None
+                max_batch_size_set = cuda_graph_config.get(
+                    "max_batch_size", None) is not None
+                if not batch_sizes_set and not max_batch_size_set:
+                    cuda_graph_config[
+                        "max_batch_size"] = self.settings_config.max_batch_size
+
             updated_llm_args["cuda_graph_config"] = cuda_graph_config
 
         return updated_llm_args

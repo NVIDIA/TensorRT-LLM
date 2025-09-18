@@ -1982,8 +1982,8 @@ def selected_mask_types(kspec):
             custom_mask = '0'
         # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
         elif kspec.input_layout == InputLayout.PACKED_QKV:
-            # NOTE: 72 is added for vision transformer
-            if kspec.head_size not in [32, 64, 72, 128]:
+            # NOTE: 72/80 are added for vision transformer
+            if kspec.head_size not in [32, 64, 72, 80, 128]:
                 padding_mask = '0'
         # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
@@ -3815,124 +3815,126 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
     combinations = product([False, True], \
         [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
          InputLayout.Q_PAGED_KV, InputLayout.SEPARATE_Q_K_V],
-        [False, True])
-    for (alibi, input_layout, enable_attn_logit_softcapping) in combinations:
+        [False, True], [False, True])
+    for (alibi, input_layout, enable_attn_logit_softcapping,
+         return_softmax) in combinations:
         # alibi and bmm1_tanh_scale shouldn't be used together.
         if alibi and enable_attn_logit_softcapping:
             continue
-        # D <= 64: KV_STEP = 256
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[32, 40, 48, 64],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=256,
-                kv_tile_buffers=4,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=
-                False,  # return softmax stats is not supported for fp8 now
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout,
-                sage_block_sizes=sage_block_sizes,
-                output_dtype=output_dtype))
+        # for normal attention, we do not need return softmax for ws fp8 kernels currently.
+        # also fp8 input and bf16 output is only needed for MLA kernel.
+        skip_combination = return_softmax or (output_dtype is not None)
+        # for context mla, we need separate qkv as input layout when returning softmax.
+        skip_mla_combination = return_softmax and input_layout != InputLayout.SEPARATE_Q_K_V
+        if not skip_combination:
+            # D <= 64: KV_STEP = 256
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[32, 40, 48, 64],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=256,
+                    kv_tile_buffers=4,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    sage_block_sizes=sage_block_sizes,
+                    output_dtype=output_dtype))
 
-        # 64 < D <=128: KV_STEP = 128
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[80, 96, 104, 128],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=256,
-                kv_tile_buffers=2,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=
-                False,  # return softmax stats is not supported for fp8 now
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout,
-                sage_block_sizes=sage_block_sizes,
-                output_dtype=output_dtype))
+            # 64 < D <=128: KV_STEP = 128
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[80, 96, 104, 128],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=256,
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    sage_block_sizes=sage_block_sizes,
+                    output_dtype=output_dtype))
 
-        # 128 < D <=256: KV_STEP = 128
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[160, 192, 256],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=
-                128,  # use 128 kv step size to avoid register spilling
-                kv_tile_buffers=2,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=
-                False,  # return softmax stats is not supported for fp8 now
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout,
-                sage_block_sizes=sage_block_sizes,
-                output_dtype=output_dtype))
+            # 128 < D <=256: KV_STEP = 128
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[160, 192, 256],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=
+                    128,  # use 128 kv step size to avoid register spilling
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    sage_block_sizes=sage_block_sizes,
+                    output_dtype=output_dtype))
 
-        # context MLA (192x128)
-        # we could use param 'output_dtype' of enumerate_qgmma_flash_warpspec_kernels(),
-        # but it will generate many unnecessary kernels and they are not easy to filter out.
-        for output_type in [None, 'bf16']:
+        if not skip_mla_combination:
+            # context MLA (192x128)
             specs.append(
                 kernel_spec(
                     sm=sm,
@@ -3962,12 +3964,11 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
                     warp_specialization=True,
                     alibi=alibi,
                     enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                    return_softmax_stats=
-                    False,  # return softmax stats is not supported for fp8 now
+                    return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
-                    output_dtype=output_type))
+                    output_dtype=output_dtype))
 
 
 def enumerate_igmma_kernels(specs, sm=90):
@@ -6215,6 +6216,10 @@ def enumerate_kernels():
     enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16')
     enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='bf16')
     enumerate_qgmma_flash_warpspec_kernels(specs, sm=90, dtype='e4m3')
+    enumerate_qgmma_flash_warpspec_kernels(specs,
+                                           sm=90,
+                                           dtype='e4m3',
+                                           output_dtype="bf16")
 
     # For now SageAttention only needs BF16
     # block_size_q should be divisible by 64

@@ -205,6 +205,7 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
     auto const sm = tensorrt_llm::common::getSMVersion();
     switch (sm)
     {
+    case 103: return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
     case 100: return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
     case 90: return fp8_block_scaling_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale);
     case 89: return fp8_block_scaling_gemm_ada(mat1, mat2, mat1Scale, mat2Scale);

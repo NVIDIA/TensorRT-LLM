@@ -91,7 +91,7 @@ def _mistral_forward(
         pixel_values: torch.Tensor,
         image_sizes: Optional[torch.Tensor],
     ):
-        return inputs_embeds
+        return inputs_embeds.clone()
 
     def _vision_branch(
         # ! The type annotations in the original transformers code are all wrong.

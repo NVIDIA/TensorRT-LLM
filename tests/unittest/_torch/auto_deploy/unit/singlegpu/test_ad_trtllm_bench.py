@@ -11,7 +11,6 @@ import pytest
 import yaml
 from _model_test_utils import _hf_model_dir_or_hub_id
 from utils.cpp_paths import llm_root  # noqa: F401
-from utils.llm_data import llm_models_root
 
 # Tolerance for additional memory reduction after fwd pass (in MB)
 POST_FWD_FREE_MEM_LOWER_SLACK_MB = 2000
@@ -71,7 +70,7 @@ def calculate_robust_stats(values: List[float]) -> Tuple[float, float, int]:
 
 
 def tiny_llama_details():
-    model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
     model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     model_path_or_name = _hf_model_dir_or_hub_id(model_path, model_name)
     return model_path_or_name, model_name, model_path

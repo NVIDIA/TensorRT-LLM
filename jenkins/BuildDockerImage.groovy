@@ -283,7 +283,7 @@ def buildImage(config, imageKeyToTag)
         sh "git config --global --add safe.directory '*'"
 
         withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
         }
 
         withCredentials([
@@ -294,7 +294,7 @@ def buildImage(config, imageKeyToTag)
             ),
             string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
         ]) {
-            sh "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}"
+            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
         }
     }
     def containerGenFailure = null

@@ -3,8 +3,8 @@
 
 import argparse
 
-from tensorrt_llm.scaffolding import (MCTSController,
-                                      NativeGenerationController, PRMController)
+from tensorrt_llm.scaffolding import NativeGenerationController, PRMController
+from tensorrt_llm.scaffolding.contrib.TreeInference import MCTSController
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
 from tensorrt_llm.scaffolding.worker import TRTLLMWorker
 

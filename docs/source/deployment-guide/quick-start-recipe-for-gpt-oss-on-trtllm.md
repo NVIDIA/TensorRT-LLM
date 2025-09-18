@@ -72,7 +72,7 @@ cuda_graph_config:
   max_batch_size: 720
 moe_config:
     backend: TRTLLM
-stream_interval: 10
+stream_interval: 20
 num_postprocess_workers: 4
 EOF
 ```
@@ -89,8 +89,12 @@ cuda_graph_config:
   max_batch_size: 720
 moe_config:
     backend: CUTLASS
-stream_interval: 10
+stream_interval: 20
 num_postprocess_workers: 4
+attention_dp_config:
+    enable_balance: true
+    batching_wait_iters: 50
+    timeout_iters: 1
 EOF
 ```
 

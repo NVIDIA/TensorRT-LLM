@@ -29,7 +29,6 @@ dump*/
 *.log
 *.pkl
 *.hdf5
-*.lock
 config.json
 /*.svg
 cpp/cmake-build-*
@@ -67,6 +66,7 @@ llm-test-workspace/
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu/
+cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.h
 .devcontainer/.env
 
 # User config files
