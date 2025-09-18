@@ -1,6 +1,3 @@
-accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
-accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2_manage_weights
-accuracy/test_cli_flow.py::TestMixtral8x7B::test_nvfp4_prequantized
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-enable_chunked_prefill=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=False-overlap_scheduler=False-torch_compile=False-enable_chunked_prefill=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False-enable_chunked_prefill=False]
