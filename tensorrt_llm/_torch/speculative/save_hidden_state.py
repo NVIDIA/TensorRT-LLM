@@ -16,7 +16,7 @@ class SaveHiddenStatesDrafter(Drafter):
     def __init__(
         self,
         spec_config: "SaveHiddenStatesDecodingConfig",
-        spec_resource_manager: SaveHiddenStatesResourceManager,
+        spec_resource_manager,
     ):
         super().__init__(spec_config.max_concurrency)
         self.spec_config = spec_config
@@ -29,9 +29,7 @@ class SaveHiddenStatesDrafter(Drafter):
         self.spec_resource_manager = spec_resource_manager
         os.makedirs(self._output_directory, exist_ok=True)
 
-    def _process_request(
-            self, request: LlmRequest,
-            resource_manager: SaveHiddenStatesResourceManager) -> None:
+    def _process_request(self, request: LlmRequest, resource_manager) -> None:
         out_dict = {}
         if local_mpi_rank() == 0:
             input_ids = torch.tensor(list(request.get_tokens(0)),
@@ -51,15 +49,15 @@ class SaveHiddenStatesDrafter(Drafter):
             if len(self.spec_config.eagle3_layers_to_capture) > 1:
                 if self.spec_config._last_hidden_in_save:
                     out_dict[
-                        "hidden_state_features"] = resource_manager.hidden_states[:num_tokens, :].cpu(
+                        "aux_hidden_states"] = resource_manager.hidden_states[:num_tokens, :].cpu(
                         ).clone()
                 else:
                     out_dict[
-                        "hidden_state_features"] = resource_manager.hidden_states[:
-                                                                                  num_tokens, :
-                                                                                  -hidden_size].cpu(
-                                                                                  ).clone(
-                                                                                  )
+                        "aux_hidden_states"] = resource_manager.hidden_states[:
+                                                                              num_tokens, :
+                                                                              -hidden_size].cpu(
+                                                                              ).clone(
+                                                                              )
 
             self._saved_state.append(out_dict)
 
@@ -88,13 +86,13 @@ class SaveHiddenStatesDrafter(Drafter):
         resource_manager: Optional[ResourceManager] = None,
         is_warmup: bool = False,
     ) -> None:
+        if is_warmup:
+            return
         for request in sorted(
                 scheduled_requests.context_requests,
                 key=lambda r:
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
-            if is_warmup:
-                continue
             self._process_request(request, self.spec_resource_manager)
             if self._iter % self._write_interval == 0:
                 self._write_to_file()

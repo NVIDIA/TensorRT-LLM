@@ -57,6 +57,11 @@ def get_spec_metadata(spec_config,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
+        if spec_config.eagle3_layers_to_capture is None:
+            spec_config.eagle3_layers_to_capture = {
+                1, model_config.num_hidden_layers // 2 - 1,
+                model_config.num_hidden_layers - 4, -1
+            }
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             spec_dec_mode=spec_config.spec_dec_mode,
@@ -68,6 +73,7 @@ def get_spec_metadata(spec_config,
             is_draft_model=is_draft_model,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
+            max_total_draft_tokens=1,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \

@@ -563,14 +563,14 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     file_prefix: str = "data"
     eagle3_layers_to_capture: Optional[Set[int]] = None
 
-    def __post_init__(self):
+    max_total_draft_tokens: Optional[int] = Field(default=1, init=False)
+    eagle_choices: Optional[List[List[int]]] = Field(default=None, init=False)
+
+    def model_post_init(self, __context):
         self._last_hidden_in_save = True
         if self.eagle3_layers_to_capture is None:
             self._last_hidden_in_save = False
-            self.eagle3_layers_to_capture = {
-                1, self.num_layers // 2 - 1, self.num_layers - 4, -1
-            }
-        if -1 not in self.eagle3_layers_to_capture:
+        elif -1 not in self.eagle3_layers_to_capture:
             self._last_hidden_in_save = False
             self.eagle3_layers_to_capture.add(-1)
 
@@ -596,8 +596,10 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
         """
         Returns the number of layers to capture of the target model.
         If eagle3_layers_to_capture is not None, return the length of the set.
-        Otherwise, assume Eagle3 base set and return 3.
+        Otherwise, assume Eagle3 base set and return 3 + 1 (for post norm last hidden state).
         """
+        if self.eagle3_layers_to_capture is None:
+            return 4
         return len(self.eagle3_layers_to_capture)
 
 
