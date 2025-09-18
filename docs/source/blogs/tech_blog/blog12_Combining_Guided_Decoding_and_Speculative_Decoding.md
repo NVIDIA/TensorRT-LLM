@@ -1,6 +1,6 @@
-# Combining Guided Decoding and Speculative Deocidng: Making CPU and GPU Cooperate Seamlessly
+# Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly
 
-As a part of the efforts to fill the feature combination gaps, we enabled guided decoding with many important LLM inference features in TensorRT LLM over the last two months:
+As part of our effort to bridge gaps in feature combinations, we enabled guided decoding with many important LLM inference features in TensorRT LLM over the last two months:
 
 * Overlap scheduler: [PR 6000](https://github.com/NVIDIA/TensorRT-LLM/pull/6000)
 * CUDA graph padding: [PR 6774](https://github.com/NVIDIA/TensorRT-LLM/pull/6774)
@@ -10,12 +10,12 @@ As a part of the efforts to fill the feature combination gaps, we enabled guided
 
 More complicated (higher-order) combinations are also supported; for example, we can run DeepSeek-R1 with guided decoding, overlap scheduler, CUDA graph, attention data parallelism (ADP), multiple token prediction (MTP) and disaggregated serving​ all enabled.
 
-Among all these tasks, combining guided decoding with one-model speulative decoding is the most challenging one and it achieves the best performance for low-latency or throughput@latency scenarios. This blog shares its overall designs, implementation details, and some performance analysis.
+Among all these tasks, combining guided decoding with one-model speculative decoding is the most challenging one, and it achieves the best performance for low-latency or throughput@latency scenarios. This blog post shares the overall design, implementation details, and performance analysis.
 
 *By NVIDIA TensorRT LLM Team and XGrammar Team*
 
 ## Table of Contents
-- [Combining Guided Decoding and Speculative Deocidng: Making CPU and GPU Cooperate Seamlessly](#combining-guided-decoding-and-speculative-deocidng-making-cpu-and-gpu-cooperate-seamlessly)
+- [Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly](#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly)
   - [Table of Contents](#table-of-contents)
   - [Background and Challenges](#background-and-challenges)
     - [Speculative Decoding](#speculative-decoding)
@@ -38,13 +38,14 @@ Among all these tasks, combining guided decoding with one-model speulative decod
 
 ### Speculative Decoding
 
-Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For a single request, a light-weight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward step. Compared with the normal LLM inference where each model forward generates a single token, speculative decoding effectively makes the generation phase less memory-bound.
+Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, 
+most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward step. Compared with normal LLM inference where each model forward generates a single token, speculative decoding effectively makes the generation phase less memory-bound.
 
-TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and coupled with the modeling code, but offers the best performance. The two-model implementation decouples target and draft models to separate CUDA graphs, which is much more flexible and offers better feature coverage.
+TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and is coupled with the modeling code, but it offers the best performance. The two-model implementation decouples the target and draft models into separate CUDA graphs, which is much more flexible and offers better feature coverage.
 
 ### Guided Decoding
 
-Guided decoding (or interchangeably constrained decoding, structured generation) guarantees that the LLM outputs are amenable to user-specified grammar (e.g., JSON schema), which is particularly useful for LLM agents. For example, guided decoding can help LLM generate function arguments that strictly conforms function signatures. Thus, the LLM can correctly call external tools, and integrate the tool calling results for a better response.
+Guided decoding (or interchangeably constrained decoding, structured generation) guarantees that the LLM outputs are amenable to a user-specified grammar (e.g., JSON schema), which is particularly useful for LLM agents. For example, guided decoding can help an LLM generate function arguments that strictly conform to function signatures. Thus, the LLM can correctly call external tools and integrate the tool calling results for a better response.
 
 For a request at the prefill step, guided decoding creates an initial grammar state (i.e., grammar initialization), and generates a mask tensor indicating which tokens from the vocabulary are allowed for the first generated token (i.e., mask gen). At each generation step, guided decoding advances the grammar state based on the last generated token (i.e., grammar advance), and generates a mask tensor for the next token. The mask will be applied to the logits to mask out the disallowed tokens before sampling (i.e., mask applying), which ensures the next token is amenable to the grammar constraints.
 
@@ -59,10 +60,10 @@ TensorRT LLM integrates third-party grammar backends (e.g., [XGrammar](https://g
 
 ### Two Challenges
 
-When combining guided decoding and speculative decoding, two challenges arise. First, at each generation step, speculative decoding proposes multiple draft tokens, and some of them might be rejected in the verification step. The draft token proposal and rejection are not transparent to guided decoding. Specifically, this can be broken down to two views:
+When combining guided decoding and speculative decoding, two challenges arise. First, at each generation step, speculative decoding proposes multiple draft tokens, and some of them might be rejected in the verification step. The draft token proposal and rejection are not transparent to guided decoding. Specifically, this can be broken down into two views:
 
 * For the target model, guided decoding should advance the grammar state and generate the mask for every draft token. If some draft tokens are rejected, guided decoding should rollback the grammar state to the last accepted token.
-* For the draft model, without grammar constraints, some draft tokens may violate the grammar and thus be forcefully rejected in the verification step. Clearly, this hurts the acceptance rate. Hence, guided decoding should also intervene the logits for every draft token generation if possible.
+* For the draft model, without grammar constraints, some draft tokens may violate the grammar and thus be forcefully rejected in the verification step. Clearly, this hurts the acceptance rate. Hence, guided decoding should also intervene on the logits for every draft token generation if possible.
   * Some speculative algorithms propose draft tokens recurrently by computing logits and sampling (e.g., the standard draft-target model, EAGLE or MTP), similarly to a standard LLM. In that case, guided decoding can apply grammar constraints in a similar mask gen and applying way.
   * Some drafting algorithms work without logits sampling, which require other ways to apply the grammar constraints.
 
@@ -88,7 +89,7 @@ If multi-step forwards are launched by a single CUDA graph, it is not possible t
 
 For a target model forward step, a request should have one new token and multiple draft tokens from the last verification step and drafter, respectively. For each token in the sequence, guided decoding should advance the grammar state and fill the mask tensor. Before sampling, the masks should be applied to the corresponding logits. After verification, the grammar state should be rolled back by the number of rejected tokens.
 
-Compared to guided decoding with non-speculative decoding, the rollback operation is newly introduced. Thankfully, it is built-in supported by grammar backends like [XGrammar](https://github.com/mlc-ai/xgrammar/blob/v0.1.21/python/xgrammar/matcher.py#L341-L350) and [LLGuidance](https://github.com/guidance-ai/llguidance/blob/v1.1.1/python/llguidance/_lib.pyi#L363-L366).
+Compared to guided decoding with non-speculative decoding, the rollback operation is newly introduced. Thankfully, it has built-in support by grammar backends like [XGrammar](https://github.com/mlc-ai/xgrammar/blob/v0.1.21/python/xgrammar/matcher.py#L341-L350) and [LLGuidance](https://github.com/guidance-ai/llguidance/blob/v1.1.1/python/llguidance/_lib.pyi#L363-L366).
 
 Before proceeding to the draft model view, note that the LLM can generate correct outputs as long as we apply grammar constraints on the target model, because any draft tokens violating the grammar will be forcefully rejected by the verification step. However, this hurts the acceptance rate.
 
@@ -98,9 +99,9 @@ As aforementioned, we can apply grammar constraints for draft tokens in a simila
 
 After the drafting process, the grammar state should be rolled back to the original state, so that the subsequent target model forward can have the correct grammar state. If the draft and target models share the same vocabulary, then the grammar computation is exactly the same so the masks can be reused.
 
-One special case is EAGLE3, whose draft model has a [pruned vocabulary](https://github.com/SafeAILab/EAGLE/blob/58d1de099fe315645a82fe002e46586d54efe405/eagle/traineagle3/config.json#L22-L23) compared to the target model. For instance, LLaMA 3.1 has a 128k vocabulary size, while the corresponding EAGLE3 drafter has a vocabulary containing the most frequent 32k tokens. This saves some computation of lm_head GEMM. Note that grammar is built on the target model’s vocabulary, so the produced mask cannot be directly applied to the logits of the draft model. EAGLE3 provides a special [d2t](https://github.com/SafeAILab/EAGLE/blob/d7161f9f94aaa345654d9b4045931145811d4d03/eagle/traineagle3/cnets.py#L673-L681) tensor that maps draft token IDs to target token IDs. [PR 7481](https://github.com/NVIDIA/TensorRT-LLM/pull/7481) fuses this d2t mapping to the mask applying kernel.
+One special case is EAGLE3, whose draft model has a [pruned vocabulary](https://github.com/SafeAILab/EAGLE/blob/58d1de099fe315645a82fe002e46586d54efe405/eagle/traineagle3/config.json#L22-L23) compared to the target model. For instance, LLaMA 3.1 has a 128k vocabulary size, while the corresponding EAGLE3 drafter has a vocabulary containing the most frequent 32k tokens. This saves some computation of the lm_head GEMM. Note that grammar is built on the target model’s vocabulary, so the produced mask cannot be directly applied to the logits of the draft model. EAGLE3 provides a special [d2t](https://github.com/SafeAILab/EAGLE/blob/d7161f9f94aaa345654d9b4045931145811d4d03/eagle/traineagle3/cnets.py#L673-L681) tensor that maps draft token IDs to target token IDs. [PR 7481](https://github.com/NVIDIA/TensorRT-LLM/pull/7481) fuses this d2t mapping to the mask applying kernel.
 
-> **Note:** Here we focus on the chain-based speculative algorithms. A tree-based algorithm will further complicates the implementation; in particular, guided decoding should traverse the drafting tree, advance and rollback grammar states accordingly.
+> **Note:** Here we focus on the chain-based speculative algorithms. A tree-based algorithm would further complicate the implementation; in particular, guided decoding should traverse the drafting tree, advance and rollback grammar states accordingly.
 
 ## Make Grammar Computation Capturable by CUDA Graph
 
@@ -108,7 +109,7 @@ One special case is EAGLE3, whose draft model has a [pruned vocabulary](https://
 
 CUDA graph can help eliminate the CPU overhead, which is an important technique in the LLM inference systems, especially for the generation phase. As aforementioned, the one-model speculative decoding implementation launches a single CUDA graph to compute multi-step draft and target model forwards. This makes the CPU-GPU synchronization challenging: Once the CUDA graph is launched, the CUDA stream cannot wait the events recorded from the host anymore.
 
-CUDA callback [`cudaLaunchHostFunc`](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g05841eaa5f90f27124241baafb3e856f) can launch a host function to a CUDA stream. (The host function should not call any CUDA API) This has two crucial implicatins:
+CUDA callback [`cudaLaunchHostFunc`](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g05841eaa5f90f27124241baafb3e856f) can launch a host function to a CUDA stream. (The host function should not call any CUDA API) This has two crucial implications:
 
 * CUDA events and event waits can be inserted before and after the host functions, which can be used to synchronize the CPU and GPU computation.
 * The host functions can be captured and replayed by CUDA graph.
@@ -142,7 +143,7 @@ We implement our own bindings to `cudaLaunchHostFunc` — [`launch_hostfunc`](ht
 
 When CUDA graph is capturing, `launch_hostfunc` does not release the intermediate data structure, so it is accessible during CUDA graph replay. The intermediate data structures can be manually released via [`free_hostfunc_user_data`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L97); otherwise, they are automatically cleaned up when the Python interpreter exists. If CUDA graph is disabled (e.g., prefill phase), the intermediate data structure should be released timely to avoid memory leak. Specifically, the trampoline function automatically release it once the callback finishes execution.
 
-In Python, we provides a decorator `hostfunc` which casts an arbitrary Python function to a CUDA callback. For example, run the below code snippet:
+In Python, we provide a decorator `hostfunc` which casts an arbitrary Python function to a CUDA callback. For example, run the below code snippet:
 
 ```python
 import torch
@@ -177,7 +178,7 @@ tensor([20, 20, 20, 20, 20, 20, 20, 20, 20, 20], dtype=torch.int32)
 
 Note that the CUDA graph increases the tensor twice, and it is replayed for ten times, so the tensor should be totally increased by 20 times. Clearly, the output validates that the CUDA graph capture and replay are successful.
 
-As the final step, we implements a variant of `GuidedDecoder` — [`CapturableGuidedDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L405). It reuses most logics from `GuidedDecoder`, but the grammar computation and some auxilirary methods are decorated by `hostfunc`, making it capturable by CUDA graph.
+As the final step, we implemented a variant of `GuidedDecoder` — [`CapturableGuidedDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L405). It reuses most logics from `GuidedDecoder`, but the grammar computation and some auxilirary methods are decorated by `hostfunc`, making it capturable by CUDA graph.
 
 ### CUDA Graph Compatibility: Grammar Computation
 
@@ -196,11 +197,11 @@ When the runtime schedules a new batch of requests, the guided decoder updates t
 
 ### CUDA Graph Compatibility: Mask Applying Kernel
 
-The mask applying kernel takes a batch of logits and masks as the input, and inplace modifies the logits. Specifically, the masked-out (disallowed by grammar) token logits are assigned with the negative infinite value, so that they are impossible to be sampled as the next tokens.
+The mask applying kernel takes a batch of logits and masks as the input, and modifies the logits in-place. Specifically, the masked-out (disallowed by grammar) token logits are assigned a value of negative infinity, so that they are impossible to be sampled as the next tokens.
 
-Note that currently CUDA graph is enabled for the generation phase only, and the draft length is fixed for all requests. This greatly simplifies the effort for CUDA graph compatibility. Given `batch_size` and `max_num_draft_tokens`, the logits tensor is of shape `(batch_size * (1 + max_num_draft_tokens), vocab_size)`. Clearly, we can fill the first `(batch_size * (1 + max_num_draft_tokens)` rows of the mask tensor accordingly, and pass the mask tensor address to the kernel.
+Note that currently CUDA graph is enabled for the generation phase only, and the draft length is fixed for all requests. This greatly simplifies the effort for CUDA graph compatibility. Given a `batch_size` and `max_num_draft_tokens`, the logits tensor is of shape `(batch_size * (1 + max_num_draft_tokens), vocab_size)`. Clearly, we can fill the first `(batch_size * (1 + max_num_draft_tokens))` rows of the mask tensor accordingly, and pass the mask tensor address to the kernel.
 
-Some requests may have no grammar constraints. For such requests, we can fill the corresponding masks as all ones (allowed by grammar) so the logits will not be modified by the kernel, but this causes unnecessary computation. To resolve this, a token-level mask tensor is introduced. The tensor values are filled with zeros for requests without grammar constraints. The kernel reads this mask values and skips the rows with mask values being zero.
+Some requests may have no grammar constraints. For such requests, we can fill the corresponding masks with all ones (allowed by grammar) so the logits will not be modified by the kernel, but this causes unnecessary computation. To resolve this, a token-level mask tensor is introduced. The tensor values are filled with zeros for requests without grammar constraints. The kernel reads these mask values and skips the rows with mask values being zero.
 
 ### Trouble Shooting: Data Race between Host and CUDA Callback
 
@@ -214,21 +215,21 @@ In the initial implementation, `CapturableGuidedDecoder` directly reads request 
 
 Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class — [`GuidedRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20). It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then only accessed via CUDA callbacks only. This prevents potential data race within an executor iteration.
 
-When overlap scheduler is enabled, another data race scenario exits between executor iterations:
+When overlap scheduler is enabled, another data race scenario exists between executor iterations:
 
 * Iteration $i$ launches CUDA callbacks, which will read request states from a fixed address;
 * Iteration $i+1$ updates the request states;
 * Iteration $i$'s CUDA callbacks are executed, reading request states updated by iteration $i+1$.
 
-Again, the CUDA callbacks may read unexpected data. A straightforward solution is letting the request state update wait for CUDA callback execution, but this effectively disables overlap scheduling. To resolve this issue and also unblock overlap scheduling, a [queue](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L417) is introduced. For each iteration, a new batch of request states is put into the queue; then, a CUDA callback is launched to fetch a new batch of request states from the queue, and all the subsequent CUDA callbacks access the newly fetched request states. This allows the co-existance of the request snapshots of two (or even more) iterations, which prevents potential data race between iterations.
+Again, the CUDA callbacks may read unexpected data. A straightforward solution is letting the request state update wait for CUDA callback execution, but this effectively disables overlap scheduling. To resolve this issue and also unblock overlap scheduling, a [queue](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L417) is introduced. For each iteration, a new batch of request states is put into the queue; then, a CUDA callback is launched to fetch a new batch of request states from the queue, and all the subsequent CUDA callbacks access the newly fetched request states. This allows the co-existence of the request snapshots of two (or even more) iterations, which prevents potential data race between iterations.
 
 ### Trouble Shooting: Deadlock by GIL and CUDA Mutex
 
-After the first version was implemented, the program intermettently encountered a hang issue when `CapturableGuidedDecoder` is enabled. By checking out the callstack, we found it hanged at completely irrelevant kernel launches or other CUDA API calls. With further investigation, we discovered that the hang issue was caused by a deaklock by the Python GIL and a CUDA mutex.
+After the first version was implemented, the program intermittently encountered a hang issue when `CapturableGuidedDecoder` is enabled. By checking out the callstack, we found it hanged on completely irrelevant kernel launches or other CUDA API calls. With further investigation, we discovered that the hang issue was caused by a deadlock between the Python GIL and a CUDA mutex.
 
-As documented, a CUDA callback must not make any CUDA API calls. This implies that the CUDA callback execution and CUDA API calls compete a same mutex. Note that the trampoline function needs to [acquire the GIL](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L52) before calling the Python code. Hence, when executing Python code by a CUDA callback, it acquires a CUDA mutex and then the GIL. In the meanwhile, the Python main thread may hold the GIL and make CUDA API calls, so it acquires the GIL and then the CUDA mutex. The two threads acquire the two locks in the opposite orders, which creates a deaklock pattern.
+As documented, a CUDA callback must not make any CUDA API calls. This implies that the CUDA callback execution and CUDA API calls compete for the same mutex. Note that the trampoline function needs to [acquire the GIL](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L52) before calling the Python code. Hence, when executing Python code by a CUDA callback, it acquires a CUDA mutex and then the GIL. In the meanwhile, the Python main thread may hold the GIL and make CUDA API calls, so it acquires the GIL and then the CUDA mutex. The two threads acquire the two locks in opposite orders, which creates a deadlock pattern.
 
-This deadlock can be resolved if the Python main thread can release the GIL for CUDA API calls. TensorRT LLM Python runtime is built on PyTorch Thankfully, PyTorch releases the GIL for most CUDA API calls, even including PyTorch custom operators. However, we find an exception in PyTorch 2.8 ([Issue 163062](https://github.com/pytorch/pytorch/issues/163062)). When creating a device tensor using a shape depending on data from another device tensor, it triggers an implicit and synchronized D2H copy, and this D2H copy is executed with GIL being held. This can be reproduced by the below code snippet:
+This deadlock can be resolved if the Python main thread can release the GIL for CUDA API calls. TensorRT LLM Python runtime is built on PyTorch. Thankfully, PyTorch releases the GIL for most CUDA API calls, even including PyTorch custom operators. However, we find an exception in PyTorch 2.8 ([Issue 163062](https://github.com/pytorch/pytorch/issues/163062)). When creating a device tensor using a shape depending on data from another device tensor, it triggers an implicit and synchronized D2H copy, and this D2H copy is executed with GIL being held. This can be reproduced by the below code snippet:
 
 ```python
 import torch
@@ -237,7 +238,7 @@ x = torch.randint(0, 100, (100,), dtype=torch.int64, device='cuda')
 y = torch.zeros(100, x.max(), dtype=torch.int64, device='cuda')
 ```
 
-In addition, some runtime components are implemented in C++ and exposed as Python bindings, and they may make CUDA API calls as well. By default, Python bindings do not release GIL, so this could be another source of deadlock. Hence, we sweep these Python bindings and release GIL properly.
+In addition, some runtime components are implemented in C++ and exposed as Python bindings, and they may make CUDA API calls as well. By default, Python bindings do not release GIL, so this could be another source of deadlock. Hence, we swept these Python bindings and release GIL properly.
 
 After all these efforts, the hang issue disappears. It is generally recommended to release the GIL when calling C++ code from Python; without the context of CUDA callback, this is beneficial for multi-threading performance. However, we have to admit that it is difficult to make sure that every such place has been properly handled, and future code changes do not introduce any such risks.
 
@@ -262,7 +263,7 @@ We benchmark the performance of guided decoding on two datasets [JSON Mode Eval]
 
 Figures 4 and 5 presents the Pareto curves on JSON Mode Eval for LLaMA 3.1 8B and LLaMA 3.3 70B, respectively. Speculative decoding achieves significant speedup for low-latency or throughput@latency scenarios. In particular, the speedup can be up to ~2x for batch size 1. The one-model EAGLE3 implementation is more performant than the two-model EAGLE3, and this performance gap is amplified for small models. This is reasonable, because the one-model implementation captures more workloads into a single CUDA graph, which results in less (if any) exposed CPU overhead.
 
-Note that although NGram is a two-model implementation, it performs surprisingly well. This is because that JSON Mode Eval is an information extraction task. Each prompt contains the JSON schema and all the information required by the response, so the NGram has a high acceptance rate on this dataset.
+Note that although NGram is a two-model implementation, it performs surprisingly well. This is because JSON Mode Eval is an information extraction task. Each prompt contains the JSON schema and all the information required by the response, so the NGram has a high acceptance rate on this dataset.
 
 <div align="center">
 <figure>
@@ -301,4 +302,4 @@ These extra overheads could offset the benefits from the improved acceptance.
 
 This work demonstrates an outstanding example of cross-team collaboration between the TensorRT LLM and XGrammar teams. We sincerely appreciate the support from everyone who contributed to making this happen.
 
-We acknowledge that it is built on the top of tremendous existing fundations from the community. In particular, some designs were inspired by vLLM [PR 14702](https://github.com/vllm-project/vllm/pull/14702) and SGLang [PR 6499](https://github.com/sgl-project/sglang/pull/6499). In addition, special thanks goes to the authors proposing the speculative algorithms like EAGLE/MTP, and the grammar backend projects like XGrammar/LLGuidance.
+We acknowledge that it is built on top of the tremendous existing foundations from the community. In particular, some designs were inspired by vLLM [PR 14702](https://github.com/vllm-project/vllm/pull/14702) and SGLang [PR 6499](https://github.com/sgl-project/sglang/pull/6499). In addition, special thanks goes to the authors who proposed the speculative algorithms like EAGLE/MTP, and the grammar backend projects like XGrammar/LLGuidance.
