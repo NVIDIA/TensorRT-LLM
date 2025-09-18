@@ -1,3 +1,6 @@
+### :title KV Cache Offloading
+### :order 6
+### :section Customization
 '''
 This script demonstrates the effectiveness of KV cache host offloading in TensorRT-LLM.
 
