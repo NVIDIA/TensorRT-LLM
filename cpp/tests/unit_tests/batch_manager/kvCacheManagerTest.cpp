@@ -634,53 +634,21 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
     auto cacheBlockIds = kvCacheManager.getSequence(requestId).getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
 
-    // Print all the block ids fromAllBlockIds
-    auto blockRange = BlockRange::fromAllBlockIds(kvCacheManager, requestId);
-    for (auto& block : blockRange.getBlockIds())
-    {
-        std::cout << block << " ";
-    }
-    std::cout << std::endl;
     kvCacheManager.removeSequence(requestId, llmRequest0);
-    std::cout << "Removed sequence 0" << std::endl;
 
-    requestId = 1;
-    auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
-    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest1);
-    std::cout << "Added sequence 1" << std::endl;
-    cacheBlockIds = kvCacheManager.getSequence(requestId).getCacheBlockIds(maxAttentionWindow).at(beamIdx);
-    std::cout << "Cache Block IDs: ";
-    for (auto& block : cacheBlockIds)
-    {
-        std::cout << block << " ";
-    }
-    std::cout << std::endl;
-    EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
-    auto blockRange2 = BlockRange::fromAllBlockIds(kvCacheManager, requestId);
-    std::cout << "All Block IDs: ";
-    for (auto& block : blockRange2.getBlockIds())
-    {
-        std::cout << block << " ";
-    }
-    std::cout << std::endl;
+    inputTokens->pop_back();
+    BlockKey fullKey{*inputTokens};
+    auto const foundFull = kvCacheManager.findBlocksInReuseTreeByBlockKey(fullKey, maxAttentionWindow);
+    ASSERT_TRUE(foundFull.has_value());
+    ASSERT_NE(foundFull.value(), nullptr);
+    auto const& lastBlock = foundFull.value();
 
-    auto blockRange3 = BlockRange::fromNewlyAllocatedBlockIds(kvCacheManager, requestId);
-    std::cout << "Newly Allocated Block IDs: ";
-    for (auto& block : blockRange2.getBlockIds())
-    {
-        std::cout << block << " ";
-    }
-    std::cout << std::endl;
-
-    // BlockKey emptyKey{};
-    // auto result = blockManager.findBlocksInReuseTreeByBlockKey(emptyKey, maxAttentionWindow);
-    // ASSERT_TRUE(result.has_value());
-    // EXPECT_EQ((*result)->getBlockId(), KVCacheBlock::kCachedBlocksRootId);
-
-    // BlockKey key{BlockKey{block0->getHash()}};
-    // result = blockManager.findBlocksInReuseTreeByBlockKey(key, maxAttentionWindow);
-    // ASSERT_TRUE(result.has_value());
-    // EXPECT_EQ((*result)->getBlockId(), block0->getBlockId());
+    // Check the chain back to previous blocks
+    auto const prev2 = lastBlock->getPrevBlock();
+    ASSERT_NE(prev2, nullptr);
+    auto const prev1 = prev2->getPrevBlock();
+    ASSERT_NE(prev1, nullptr);
+    EXPECT_EQ(prev1->getPrevBlock(), nullptr);
 }
 
 #ifdef ENABLE_FP4
