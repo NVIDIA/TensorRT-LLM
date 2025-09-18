@@ -20,13 +20,13 @@
 namespace tensorrt_llm::kernels
 {
 
-uint32_t getKernelMTileSize(uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit, bool supportQGMMA)
+uint32_t getKernelMTileSize(uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit, bool supportHMMA)
 {
     if (!isSpecDec)
     {
         return headGrpSize;
     }
-    if (isXqaJit && supportQGMMA)
+    if (isXqaJit && !supportHMMA) // HMMA (mha.cu) goes to the heuristic below
     {
         return 64;
     }
@@ -47,9 +47,9 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
     // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
     unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
     // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
-    bool supportQGMMA = jit::supportConfigQGMMA(xqaParams, SM, true);
+    bool supportHMMA = jit::supportConfigHMMA(xqaParams, SM, true);
     unsigned int kernel_m_tilesize
-        = getKernelMTileSize(num_q_heads_over_kv, xqaParams.multi_query_tokens, qSeqLen, isXqaJit, supportQGMMA);
+        = getKernelMTileSize(num_q_heads_over_kv, xqaParams.multi_query_tokens, qSeqLen, isXqaJit, supportHMMA);
 
     // precompiled XQA does not use is_fp8_output as hashing key
     return {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, kernel_m_tilesize,
