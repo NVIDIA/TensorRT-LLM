@@ -34,7 +34,8 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode, create_moe)
+                                 MoEPrefetchProxy, MoEWeightLoadingMode,
+                                 create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -266,6 +267,7 @@ class Llama4MoE(nn.Module):
         tune_max_num_tokens: int = 8192,
         model_config: ModelConfig = ModelConfig(),
         layer_idx: Optional[int] = None,
+        moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None,
     ):
         from tensorrt_llm._torch.distributed import AllReduce
 
@@ -296,7 +298,8 @@ class Llama4MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
             apply_router_weight_on_input=True,
-            layer_idx=layer_idx)
+            layer_idx=layer_idx,
+            moe_prefetch_proxy=moe_prefetch_proxy)
 
         self.router = Linear(
             hidden_size,
@@ -358,6 +361,7 @@ class Llama4DecoderLayer(DecoderLayer):
         model_config: ModelConfig[LlamaConfig],
         layer_idx: int,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         super().__init__()
         config = model_config.pretrained_config
@@ -437,7 +441,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 model_config=model_config,
                 aux_stream=aux_stream,
                 dtype=config.torch_dtype,
-                layer_idx=layer_idx)
+                layer_idx=layer_idx,
+                moe_prefetch_proxy=moe_prefetch_proxy)
 
             self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
             ) and not self.enable_attention_dp and self.enable_fusion
@@ -805,6 +810,8 @@ class Llama4Model(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
         super().__init__(model_config)
+        super().__moe_prefetch_init__(model_config=model_config,
+                                      model_name="Llama4")
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
@@ -836,10 +843,12 @@ class Llama4Model(DecoderModel):
 
         self.layers = nn.ModuleList([
             DecoderLayerClass(
-                model_config,
-                layer_idx,
-                self.aux_stream,
-            ) for layer_idx in range(config.num_hidden_layers)
+                model_config, layer_idx, self.aux_stream,
+                **({
+                    'moe_prefetch_proxy':
+                    self.moe_prefetch_proxy_list[layer_idx]
+                } if DecoderLayerClass == Llama4DecoderLayer else {}))
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
@@ -865,6 +874,10 @@ class Llama4Model(DecoderModel):
 
         hidden_states = inputs_embeds
         residual = None
+
+        if self.use_moe_prefetch:
+            cur_stream = torch.cuda.current_stream()
+            self.moe_prefetch_manager.prefetch_initial_weights(cur_stream)
 
         for idx, decoder_layer in enumerate(
                 self.layers[:self.num_hidden_layers]):
