@@ -29,8 +29,8 @@ Among all these tasks, combining guided decoding with one-model speculative deco
     - [Integration to TensorRT LLM Python Runtime](#integration-to-tensorrt-llm-python-runtime)
     - [CUDA Graph Compatibility: Grammar Computation](#cuda-graph-compatibility-grammar-computation)
     - [CUDA Graph Compatibility: Mask Applying Kernel](#cuda-graph-compatibility-mask-applying-kernel)
-    - [Trouble Shooting: Data Race between Host and CUDA Callback](#trouble-shooting-data-race-between-host-and-cuda-callback)
-    - [Trouble Shooting: Deadlock by GIL and CUDA Mutex](#trouble-shooting-deadlock-by-gil-and-cuda-mutex)
+    - [Troubleshooting: Data Race between Host and CUDA Callback](#trouble-shooting-data-race-between-host-and-cuda-callback)
+    - [Troubleshooting: Deadlock by GIL and CUDA Mutex](#trouble-shooting-deadlock-by-gil-and-cuda-mutex)
   - [Performance and Analysis](#performance-and-analysis)
   - [Acknowledgements](#acknowledgements)
 
@@ -203,7 +203,7 @@ Note that currently CUDA graph is enabled for the generation phase only, and the
 
 Some requests may have no grammar constraints. For such requests, we can fill the corresponding masks with all ones (allowed by grammar) so the logits will not be modified by the kernel, but this causes unnecessary computation. To resolve this, a token-level mask tensor is introduced. The tensor values are filled with zeros for requests without grammar constraints. The kernel reads these mask values and skips the rows with mask values being zero.
 
-### Trouble Shooting: Data Race between Host and CUDA Callback
+### Troubleshooting: Data Race between Host and CUDA Callback
 
 Similar to GPU kernels, CUDA callbacks are asynchronously executed on CUDA streams. Note that both normal host functions and CUDA callbacks can access the same CPU memory addresses, so it can easily cause data race.
 
@@ -223,7 +223,7 @@ When overlap scheduler is enabled, another data race scenario exists between exe
 
 Again, the CUDA callbacks may read unexpected data. A straightforward solution is letting the request state update wait for CUDA callback execution, but this effectively disables overlap scheduling. To resolve this issue and also unblock overlap scheduling, a [queue](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L417) is introduced. For each iteration, a new batch of request states is put into the queue; then, a CUDA callback is launched to fetch a new batch of request states from the queue, and all the subsequent CUDA callbacks access the newly fetched request states. This allows the co-existence of the request snapshots of two (or even more) iterations, which prevents potential data race between iterations.
 
-### Trouble Shooting: Deadlock by GIL and CUDA Mutex
+### Troubleshooting: Deadlock by GIL and CUDA Mutex
 
 After the first version was implemented, the program intermittently encountered a hang issue when `CapturableGuidedDecoder` is enabled. By checking out the callstack, we found it hanged on completely irrelevant kernel launches or other CUDA API calls. With further investigation, we discovered that the hang issue was caused by a deadlock between the Python GIL and a CUDA mutex.
 
