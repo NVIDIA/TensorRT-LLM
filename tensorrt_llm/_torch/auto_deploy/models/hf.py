@@ -3,8 +3,9 @@
 import os
 import re
 import types
+from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,7 @@ from transformers import (
     AutoTokenizer,
     PretrainedConfig,
 )
+from transformers.models.auto.auto_factory import _BaseAutoModelClass
 from transformers.utils import (
     SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
@@ -64,8 +66,29 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
         modeling.load_state_dict = original_load_state_dict
 
 
+# TODO (lucaslie): continue working on the base class
+class AutoModelFactory(ModelFactory):
+    @property
+    @abstractmethod
+    def automodel_cls(self) -> Type[_BaseAutoModelClass]:
+        """Get the AutoModel class for calling from_pretrained and from_config."""
+
+    @staticmethod
+    @abstractmethod
+    def _strict_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
+        """A strict (args-only) forward method for the model that precisely defines the signature.
+
+        The function should contain input_ids and position_ids as positional arguments at a
+        minimum. Other arguments can be added as needed and must follow the correct order.
+        """
+
+    def _set_strict_forward(self, model: nn.Module):
+        """Set the strict (args-only) forward method for the model."""
+        model.forward = types.MethodType(self._strict_forward, model)
+
+
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
-class AutoModelForCausalLMFactory(ModelFactory):
+class AutoModelForCausalLMFactory(AutoModelFactory):
     _tokenizer_defaults = {
         "legacy": False,
         "padding_side": "left",
@@ -106,17 +129,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
         self._checkpoint_conversion_mapping: Optional[Dict[str, str]] = None
 
     @property
-    def autoconfig_from_pretrained(self):
-        return AutoConfig.from_pretrained
-
-    # TODO (@lucaslie): Do we ever want to switch to from_pretrained?
-    @property
-    def automodel_from_config(self):
-        return AutoModelForCausalLM.from_config
+    def automodel_cls(self) -> Type[_BaseAutoModelClass]:
+        return AutoModelForCausalLM
 
     @staticmethod
-    def _simple_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
-        """A simple forward pass for the model to functionalize the args.
+    def _strict_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
+        """A strict (args-only) forward pass for the model to functionalize the args.
 
         This follows the standard function signature as expected by factory.py. We do _not_ use the
         model.forward method directly to create the patch. Instead we use the type of the model to
@@ -124,7 +142,9 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """
         return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
 
-    def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
+    def _recursive_update_config(
+        self, config: PretrainedConfig, update_dict: Dict[str, Any]
+    ) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         """
         Deep-merge a PretrainedConfig object with values from update_dict.
 
@@ -133,11 +153,15 @@ class AutoModelForCausalLMFactory(ModelFactory):
             update_dict: Dictionary with values to update in the config
 
         Returns:
-            The updated PretrainedConfig object
+            A tuple of (updated_config, nested_unused_kwargs) where nested_unused_kwargs captures
+            any keys from update_dict that could not be applied to config, preserving nesting.
         """
+        nested_unused_kwargs: Dict[str, Any] = {}
+
         for key, value_new in update_dict.items():
             # Check if the key exists in config
             if not hasattr(config, key):
+                nested_unused_kwargs[key] = value_new
                 continue
 
             target_value = getattr(config, key)
@@ -145,25 +169,42 @@ class AutoModelForCausalLMFactory(ModelFactory):
             # Handle nested PretrainedConfig objects...
             if isinstance(value_new, dict) and isinstance(target_value, PretrainedConfig):
                 # Recursively update nested configs
-                updated_value = self._recursive_update_config(target_value, value_new)
+                updated_value, child_unused = self._recursive_update_config(target_value, value_new)
                 setattr(config, key, updated_value)
+                if child_unused:
+                    nested_unused_kwargs[key] = child_unused
             else:
                 # Direct update for simple values
                 setattr(config, key, value_new)
 
-        return config
+        return config, nested_unused_kwargs
 
-    def _build_model(self, device: DeviceLikeType) -> nn.Module:
-        """Build the model on the desired device."""
-
+    def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.
-        model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
-        model_config = self._recursive_update_config(model_config, self.model_kwargs)
+        model_config, unused_kwargs = AutoConfig.from_pretrained(
+            self.model, return_unused_kwargs=True, trust_remote_code=True
+        )
+        model_config, nested_unused_kwargs = self._recursive_update_config(
+            model_config, self.model_kwargs
+        )
+        # merge nested unused kwargs into HF's unused kwargs (preserve nesting)
+        merged_unused = deep_merge_dicts(unused_kwargs, nested_unused_kwargs)
+        return model_config, merged_unused
+
+    def _build_model(self, device: DeviceLikeType) -> nn.Module:
+        """Build the model on the desired device."""
+        model_config, unused_kwargs = self._get_model_config()
 
         with (init_empty_weights if device == "meta" else nullcontext)():
-            model = self.automodel_from_config(model_config, trust_remote_code=True)
+            model = self.automodel_cls.from_config(
+                model_config,
+                **{
+                    "trust_remote_code": True,
+                    **unused_kwargs,
+                },
+            )
         if device == "meta":
             # post-init --> this must be called explicitly for HF models the way we initialize them
             # since this "gets lost" with the init_empty_weights context manager.
@@ -175,9 +216,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # if present, initialize sharding config. We need head_dim for colwise sharding.
         self._set_sharding_config(model.config)
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-
-        # patch forward method
-        model.forward = types.MethodType(self._simple_forward, model)
 
         model.eval()
 
@@ -221,6 +259,41 @@ class AutoModelForCausalLMFactory(ModelFactory):
         if self.tokenizer is None:
             return None
         return AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+
+    def build_and_load_model(self, device: DeviceLikeType) -> nn.Module:
+        """Automatically build the model from_pretrained and load the weights.
+
+        Args:
+            device: The device to build the model on.
+
+        Returns:
+            The built model.
+
+        If we skip weight loading, we will fall back to the build_model+load_or_random_init methods.
+        NOTE that there is NO sharding when skip_loading_weights is True.
+        """
+        # only this way can we skip downloading/loading weights
+        if self.skip_loading_weights or "cuda" not in str(device):
+            ad_logger.info("Falling back to build_model+load_or_random_init methods.")
+            model = self.build_model("meta")
+            self.load_or_random_init(model, device)
+            return model
+
+        # full joint loading of weights and model
+        self.prefetch_checkpoint(force=True)  # ensuring weights are downloaded
+        model_config, unused_kwargs = self._get_model_config()
+        model = self.automodel_cls.from_pretrained(
+            self.model,
+            config=model_config,
+            **{
+                "trust_remote_code": True,
+                "tp_plan": "auto",
+                **unused_kwargs,
+                "torch_dtype": "auto",  # takes precedence over unused_kwargs!
+            },
+        )
+        model.eval()
+        return model
 
     @staticmethod
     def _get_ignore_patterns(repo_id: str, skip_prefetch_weights: bool) -> List[str]:
@@ -434,7 +507,6 @@ class _StateDictParamNameConverter:
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     _model_defaults = {
-        "use_cache": False,
         "text_config": {
             "use_cache": False,
         },
@@ -454,8 +526,8 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
                 self._sharding_config["num_hidden_layers"] = text_config.num_hidden_layers
 
     @property
-    def automodel_from_config(self):
-        return AutoModelForImageTextToText.from_config
+    def automodel_cls(self) -> Type[_BaseAutoModelClass]:
+        return AutoModelForImageTextToText
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""
@@ -470,24 +542,26 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             return None
         return AutoProcessor.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
+    # TODO: in theory the signature could be auto-derived but it would probably require some hefty
+    # meta-programming to progmatically generate the functions and signature from something like the
+    # example inputs. And even with that we would still need to figure out how to automatically
+    # infer the dynamic shapes for the extra inputs.
+    # Alternatively, we could try to directly use the HF forward again but I am not sure whether
+    # this will trigger some kind of kwarg-handling inside the graph which I would want to avoid.
     @staticmethod
-    def _simple_forward(
+    def _strict_forward(
         model: nn.Module,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         pixel_values: torch.Tensor,
     ):
-        """A simple forward pass for the model to functionalize the args.
+        """A strict (args-only) forward pass for the model to functionalize the args.
 
-        This follows the standard function signature as expected by factory.py. We do _not_ use the
-        model.forward method directly to create the patch. Instead we use the type of the model to
-        get the forward method to keep the patch composable with other forward patches.
+        It adds pixel_values as a positional argument as expected by most
+        AutoModelForImageTextToText in addition to the required input_ids and position_ids.
         """
         return type(model).forward(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            pixel_values=pixel_values,
+            model, input_ids=input_ids, position_ids=position_ids, pixel_values=pixel_values
         )
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:

@@ -17,7 +17,7 @@
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
 import math
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -99,6 +99,7 @@ def _cache_multimodal_embeddings(
 def get_multimodal_embeddings(
     encoder_forward_fn,
     multimodal_params: List[MultimodalParams],
+    encoder_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[torch.Tensor]:
     """
     High-level utility to get multimodal embeddings from encoder or cached embeddings.
@@ -126,7 +127,9 @@ def get_multimodal_embeddings(
 
     # Step 2: Run encoder forward only on uncached parameters
     if uncached_multimodal_params:
-        encoder_outputs = encoder_forward_fn(uncached_multimodal_params)
+        kwargs = encoder_kwargs or {}
+        encoder_outputs = encoder_forward_fn(uncached_multimodal_params,
+                                             **kwargs)
 
         # TODO: support multiple multimodal modalities per request
         if len(encoder_outputs) > 1:

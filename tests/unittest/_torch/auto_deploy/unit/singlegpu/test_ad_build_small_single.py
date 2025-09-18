@@ -22,7 +22,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
 
     # check that llm_args and experiment_config have the same args
     expected_ad_config: AutoDeployConfig = experiment_config.args
-    expected_llm_args: LlmArgs = expected_ad_config.to_llm_args()
+    expected_llm_args: LlmArgs = LlmArgs(**expected_ad_config.to_llm_kwargs())
     assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"
 
     # check expected parallel config
@@ -41,6 +41,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     )
 
 
+@pytest.mark.parametrize("mode", ["graph", "transformers"])
 @pytest.mark.parametrize(
     "experiment_config",
     [
@@ -64,6 +65,11 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             attn_backend="triton",
             compile_backend="torch-simple",
         ),
+        get_small_model_config_pytest_param(
+            "microsoft/Phi-3-mini-4k-instruct",
+            attn_backend="torch",
+            compile_backend="torch-simple",
+        ),
         # disabled due to https://nvbugspro.nvidia.com/bug/5505835
         get_small_model_config_pytest_param(
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
@@ -79,11 +85,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             compile_backend="torch-simple",
         ),
         get_small_model_config_pytest_param(
-            "microsoft/Phi-3-mini-4k-instruct",
-            attn_backend="torch",
-            compile_backend="torch-simple",
-        ),
-        get_small_model_config_pytest_param(
             "Qwen/Qwen2.5-3B-Instruct",
             attn_backend="triton",
             compile_backend="torch-compile",
@@ -95,9 +96,17 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         ),
     ],
 )
-def test_build_ad(experiment_config: Dict):
+def test_build_ad(experiment_config: Dict, mode: str):
+    if (
+        "DeepSeek-V3" in experiment_config["args"]["model"]
+        or "Phi-3-mini-4k-instruct" in experiment_config["args"]["model"]
+        and mode == "transformers"
+    ):
+        pytest.skip(f"{experiment_config['args']['model']} is not supported in transformers mode")
+
     experiment_config["args"]["runtime"] = "demollm"  # Default runtime set to demollm
     experiment_config["args"]["world_size"] = 0  # Default world_size set to 0
+    experiment_config["args"]["mode"] = mode
     experiment_config = ExperimentConfig(**experiment_config)
     original_init = InferenceOptimizer.__init__
 

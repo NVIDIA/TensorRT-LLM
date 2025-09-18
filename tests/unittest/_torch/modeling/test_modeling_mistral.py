@@ -7,7 +7,9 @@ from unittest import mock
 import pytest
 import torch
 import transformers
+import transformers.models.mistral3
 from _torch.helpers import create_mock_engine
+from PIL import Image
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -20,6 +22,8 @@ from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.models import modeling_utils
+
+_PATCH_SIZE = 14
 
 
 @pytest.fixture
@@ -64,7 +68,7 @@ def mistral_small_3_1_24b_config():
             "num_attention_heads": 16,
             "num_channels": 3,
             "num_hidden_layers": 24,
-            "patch_size": 14,
+            "patch_size": _PATCH_SIZE,
             "rope_theta": 10000.0,
         },
         "vision_feature_layer": -1,
@@ -498,3 +502,40 @@ def test_batch_pixel_values(in_shapes, image_sizes, expected_out_shape):
         torch.testing.assert_close(padded_values, original_values)
 
         start_idx += batch_size
+
+
+@pytest.mark.parametrize("height, width", [(37, 91), (128, 256), (512, 512)])
+@torch.no_grad()
+def test_processor_get_num_tokens_per_image(
+    tmp_path,
+    mistral_small_3_1_24b_config,
+    height,
+    width,
+):
+    # NOTES:
+    # 1. Setting up a fake model checkpoint that `AutoTokenizer.from_pretrained` /
+    #    `AutoProcessor.from_pretrained` is too involved (need at least several config JSONs, as well
+    #    as tokenizer files like vocab files, etc.).
+    # 2. On the other hand, using an actual model checkpoint for what should be a simple unit test
+    #    feels overkill.
+    # We therefore settle for this intermediate approach where we check that the expected calls are
+    # are made by mocking the auto classes out.
+
+    mistral_3_config = transformers.Mistral3Config.from_dict(mistral_small_3_1_24b_config)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.AutoProcessor"
+    ) as mocked_auto_processor:
+        input_processor = modeling_mistral.Mistral3InputProcessor(
+            model_path=str(tmp_path),
+            model_config=mistral_3_config,
+            tokenizer=mock.MagicMock(),
+        )
+
+    input_processor.get_num_tokens_per_image(
+        image=Image.new("RGB", (width, height), color=(255, 128, 0))
+    )
+
+    mocked_auto_processor.from_pretrained.return_value._get_num_multimodal_tokens.assert_called_once_with(
+        [(height, width)]
+    )
