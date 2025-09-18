@@ -49,40 +49,40 @@ $$
 time_i = \max_{0 \leq m < N} time_{i,m}
 $$
 
-where $\text{time}_{i,m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
+where $t_{i,m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
 
 To quantify load balance and theoretical performance bounds, we define two key metrics:
 
 #### 1. Balance Ratio
-The $\text{balance\_ratio}$ measures the load distribution across ranks within the Attention module for each iteration:
+The balance ratio $r$ measures the load distribution across ranks within the Attention module for each iteration:
 
 $$
-\text{balance\_ratio} = \frac{\text{avg\_tokens}}{\text{max\_tokens}}
+r = \frac{\overline{T}}{T_{\max}}
 $$
 
 where:
-- $\text{avg\_tokens}$ represents the average number of tokens across all ranks
-- $\text{max\_tokens}$ represents the maximum number of tokens across all ranks
-- $\mathrm{tokens_i}$ represents the number of tokens processed by rank $i$
+- $\overline{T}$ represents the average number of tokens across all ranks
+- $T_{\max}$ represents the maximum number of tokens across all ranks
+- $T_i$ represents the number of tokens processed by rank $i$
 
 Note: MoE module load balancing is handled separately by the Expert Parallel Load Balancer (EPLB) module and is not considered during the early scheduling phase.
 
 #### 2. Speed-of-Light Throughput (SOL TPS)
-The $\text{sol\_tps}$ represents the theoretical upper-bound throughput achievable with perfect load balancing:
+The Speed-of-Light throughput represents the theoretical upper-bound throughput achievable with perfect load balancing:
 
 $$
-\text{sol\_time} = \sum_{i=0}^{\infty} \text{time}_i \times \text{balance\_ratio}_i
+T_{\text{sol}} = \sum_{i=0}^{\infty} t_i \times r_i
 $$
 
 $$
-\text{sol\_tps} = \frac{\text{elapsed\_time}}{\text{sol\_time}} \times \text{actual\_tps}
+\text{TPS}_{\text{sol}} = \frac{T_{\text{elapsed}}}{T_{\text{sol}}} \times \text{TPS}_{\text{actual}}
 $$
 
 where:
-- $time_i$: Measured execution time of iteration $i$
-- $\text{elapsed\_time}$: Total empirically measured end-to-end execution time
-- $\text{actual\_tps}$: Observed throughput in tokens per second
-- $\text{sol\_tps}$: Theoretical maximum throughput under perfect load balance
+- $t_i$: Measured execution time of iteration $i$
+- $T_{\text{elapsed}}$: Total empirically measured end-to-end execution time
+- $\text{TPS}_{\text{actual}}$: Observed throughput in tokens per second
+- $\text{TPS}_{\text{sol}}$: Theoretical maximum throughput under perfect load balance
 
 This theoretical framework enables us to quantify the performance gap between current and optimal system utilization, providing clear targets for optimization.
 
