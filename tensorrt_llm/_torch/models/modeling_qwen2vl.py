@@ -447,6 +447,7 @@ class Qwen2VLModelBase(PreTrainedModel):
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
+
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
         self.vocab_size = config.vocab_size
         self.model_dtype = getattr(config, "torch_dtype", torch.float16)
@@ -481,6 +482,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         # use llm.config as config for pytorch model engine
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
     def _parse_and_concat_mrope_config(
             self, multimodal_params: List[MultimodalParams],

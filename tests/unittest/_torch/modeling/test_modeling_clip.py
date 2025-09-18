@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -11,6 +12,7 @@ from transformers import CLIPVisionModel as HFCLIPVisionModel
 from tensorrt_llm._torch.model_config import ModelConfig
 # Import TRT-LLM CLIP model
 from tensorrt_llm._torch.models.modeling_clip import CLIPVisionModel
+from tensorrt_llm._torch.utils import model_extra_attrs
 
 # Default CLIP config from HF (https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/clip/configuration_clip.py#L144-L172)
 CLIP_CONFIG = {
@@ -97,10 +99,14 @@ class TestCLIPVisionModel(unittest.TestCase):
 
         # Run TRT-LLM inference
         attn_metadata = tllm_model.prepare_attn_metadata(batch_size)
-        tllm_outputs = tllm_model(
-            pixel_values=pixel_values,
-            attn_metadata=attn_metadata,
-        )
+
+        extra_attrs = deepcopy(tllm_model.model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        with torch.inference_mode(), model_extra_attrs(extra_attrs):
+            tllm_outputs = tllm_model(
+                pixel_values=pixel_values,
+                attn_metadata=attn_metadata,
+            )
 
         # Compare outputs
         rtol, atol = ACCURACY_CONFIG[dtype]

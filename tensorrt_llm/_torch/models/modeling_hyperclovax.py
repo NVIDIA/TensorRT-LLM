@@ -23,6 +23,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..utils import attach_attention_metadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_siglip import SiglipVisionModel
@@ -781,6 +782,8 @@ class HCXVisionModel:
         self.anyres = self.pretrained_config.anyres
         self.possible_resolutions = self._init_possible_resolutions(
             self.pretrained_config)
+        model_config.extra_attrs.update(
+            self.vision_model.model_config.extra_attrs)
 
     def _init_possible_resolutions(self, config: PretrainedConfig):
         possible_resolutions = []
@@ -871,13 +874,15 @@ class HCXVisionModel:
                 chunk = torch.cat([chunk, dummy], dim=0)
             attn_metadata = self.vision_model.prepare_attn_metadata(
                 chunk.shape[0])
-            if self.use_nth_layer == -1:
-                self.vision_model.vision_model.post_layernorm = nn.Identity()
-                outs = self.vision_model(chunk, attn_metadata=attn_metadata)
-                outs = outs[:, visual_token_idx:]
-            else:
-                outs = self.vision_model(chunk, attn_metadata=attn_metadata)
-                outs = outs[self.use_nth_layer][:, visual_token_idx:]
+            with attach_attention_metadata(attn_metadata):
+                if self.use_nth_layer == -1:
+                    self.vision_model.vision_model.post_layernorm = nn.Identity(
+                    )
+                    outs = self.vision_model(chunk, attn_metadata=attn_metadata)
+                    outs = outs[:, visual_token_idx:]
+                else:
+                    outs = self.vision_model(chunk, attn_metadata=attn_metadata)
+                    outs = outs[self.use_nth_layer][:, visual_token_idx:]
             image_forward_outs_chunks.append(outs)
 
         image_forward_outs = torch.cat(image_forward_outs_chunks, dim=0).to(
@@ -1021,6 +1026,7 @@ class HCXVisionForCausalLM(PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        self.model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
 
     @torch.inference_mode()
     def forward(
