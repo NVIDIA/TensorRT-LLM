@@ -296,7 +296,7 @@ Table 1 lists the acceptance lengths. We perform an ablation experiment where th
 * In the drafting loop, the extra mask applying kernels slightly contribute to the GPU time.
 * If the drafting steps are too fast to hide the grammar computation, the exposed CPU time will cause bubbles in the CPU timeline.
 
-These extra overheads could offset the benefits from the improved acceptance.
+These extra overheads could partially offset the benefits from the improved acceptance.
 
 ## Acknowledgements
 
