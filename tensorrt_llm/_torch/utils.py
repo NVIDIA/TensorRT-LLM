@@ -302,3 +302,10 @@ def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
         enable_attention_dp=mapping.enable_attention_dp,
         enable_lm_head_tp_in_adp=mapping.enable_lm_head_tp_in_adp,
     )
+
+
+# Development flag to control chain drafter feature
+def _get_allow_chain_drafter() -> bool:
+    """Get the chain drafter flag from environment variable."""
+    # Use environment variable for cross-process compatibility
+    return os.getenv("TRTLLM_ALLOW_CHAIN_DRAFTER", "0") == "1"

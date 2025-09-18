@@ -1,7 +1,6 @@
 import copy
 import enum
 import importlib
-import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
+from ..utils import _get_allow_chain_drafter
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
 from .config import PyTorchConfig, _construct_checkpoint_loader
@@ -39,13 +39,6 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-
-
-# Development flag to control chain drafter feature
-def _get_allow_chain_drafter() -> bool:
-    """Get the chain drafter flag from environment variable."""
-    # Use environment variable for cross-process compatibility
-    return os.getenv("TRTLLM_ALLOW_CHAIN_DRAFTER", "0") == "1"
 
 
 class _ExecutorCreationStage(enum.Enum):

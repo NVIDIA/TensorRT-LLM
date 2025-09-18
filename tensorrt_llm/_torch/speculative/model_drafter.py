@@ -18,6 +18,7 @@ from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.mtp import SampleStateTensorsMTP
+from ..utils import _get_allow_chain_drafter
 from .drafter import Drafter
 
 if TYPE_CHECKING:
@@ -161,7 +162,6 @@ class ModelDrafter(Drafter):
             request)
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
                                               request.get_tokens(0))
-
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:
             # This is the first time the draft model is seeing this request.
@@ -171,7 +171,8 @@ class ModelDrafter(Drafter):
             return self._create_context_request(request, input_tokens)
 
         # For TRTLLM attention backend, we need to create a generation request for both no tokens accepted and tokens accepted
-        elif issubclass(self.draft_model_engine.attn_backend, TrtllmAttention):
+        elif issubclass(self.draft_model_engine.attn_backend,
+                        TrtllmAttention) and _get_allow_chain_drafter():
             return self._create_accepted_tokens_request_for_trtllm_attn(
                 request, input_tokens, num_accepted_tokens)
 

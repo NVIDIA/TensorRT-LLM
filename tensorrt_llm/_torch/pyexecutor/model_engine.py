@@ -54,7 +54,7 @@ from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
 from ..speculative.drafting_loops import ChainDrafter
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
-from ..utils import (get_model_extra_attrs,
+from ..utils import (_get_allow_chain_drafter, get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
@@ -2356,10 +2356,13 @@ class PyTorchModelEngine(ModelEngine):
                                                        no_cache=kv_cache_manager
                                                        is None)
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
+            is_extend_ctx = self.spec_config.spec_dec_mode.extend_ctx(
+                self.attn_backend)
+            is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
+                spec_resource_manager, self.is_draft_model, self.attn_backend,
+                _get_allow_chain_drafter(), is_extend_ctx)
             attn_metadata.update_spec_dec_param(
-                spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
-                    spec_resource_manager, self.is_draft_model,
-                    self.attn_backend), spec_metadata.is_spec_dec_tree,
+                is_spec_dec_mode, spec_metadata.is_spec_dec_tree,
                 spec_metadata.is_spec_dec_dynamic_tree,
                 self.original_max_draft_len)
         else:
@@ -2420,8 +2423,8 @@ class PyTorchModelEngine(ModelEngine):
                     def capture_postprocess_fn(inputs: Dict[str, Any]):
                         self._postprocess_inputs(inputs)
 
-                    self.cuda_graph_runner.capture(key,
-                                                   capture_forward_fn, inputs,
+                    self.cuda_graph_runner.capture(key, capture_forward_fn,
+                                                   inputs,
                                                    capture_postprocess_fn)
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
