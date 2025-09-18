@@ -21,7 +21,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorkerConfig
+from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
@@ -182,8 +182,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
+            # FIXME: Add type annotations and make 'res' type more homogeneous (e.g.
+            #        include PostprocWorker.Output in is_llm_response and unify is_final APIs).
             if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res, ErrorResponse):
+                    res,
+                    ErrorResponse) or (isinstance(res, PostprocWorker.Output)
+                                       and res.is_final):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
