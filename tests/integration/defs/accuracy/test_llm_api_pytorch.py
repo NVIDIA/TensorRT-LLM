@@ -1130,23 +1130,21 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
 # This class has extensively parameterized test methods, which yield totally 200 test cases.
 # This is because this model requires high test coverage over the feature combinations.
 # Normally we should not parameterize test methods so extensively -- just test on the typical/important feature combinations.
+@skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
     @pytest.mark.skip_less_device_memory(60000)
     # Chunked Prefill for MLA can only be enabled on SM100
-    @parametrize_with_ids(
-        "enable_chunked_prefill",
-        [False, pytest.param(True, marks=skip_pre_hopper)])
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (False, True, True), (True, True, True)])
     # Only Hopper and Blackwell MLA kernel supports MTP
-    @parametrize_with_ids("mtp_nextn",
-                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler, torch_compile, enable_chunked_prefill):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
