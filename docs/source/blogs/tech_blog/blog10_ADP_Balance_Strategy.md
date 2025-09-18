@@ -46,10 +46,10 @@ To address this critical performance limitation, we introduce the **ADP (Attenti
 We model and quantify the performance impact of load imbalance in Attention DP. Since workloads across ranks can be heterogeneous, the execution time for the Attention module in any given iteration is bounded by the rank with the highest workload:
 
 $$
-\mathrm{time\_i} = \max_{0 \leq m < N} \mathrm{time\_i\_m}
+\mathrm{time\_i} = \max_{0 \leq m < N} \mathrm{time}_{i,m}
 $$
 
-where $\mathrm{time\_i\_m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
+where $\mathrm{time}_{i,m}$ represents the execution time of rank $m$ in iteration $i$, and $N$ is the data parallel size.
 
 To quantify load balance and theoretical performance bounds, we define two key metrics:
 
@@ -71,7 +71,7 @@ Note: MoE module load balancing is handled separately by the Expert Parallel Loa
 The $\mathrm{sol\_tps}$ represents the theoretical upper-bound throughput achievable with perfect load balancing:
 
 $$
-\mathrm{sol\_time} = \sum_{i=0}^{\infty} \mathrm{time\_i} \times \mathrm{balance\_ratio\_i}
+\mathrm{sol\_time} = \sum_{i=0}^{\infty} \mathrm{time\_i} \times \mathrm{balance\_ratio}_i
 $$
 
 $$
