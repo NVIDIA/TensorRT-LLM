@@ -144,7 +144,7 @@ class KvCacheCreator:
             self._model_name_or_path)
         input_processor = create_input_processor(self._model_name_or_path,
                                                  self._tokenizer)
-        if not (hasattr(input_processor, "get_prompt_for_profiling")):
+        if not (hasattr(input_processor, "get_dummy_prompt")):
             logger.warning("The input processor of the model does not have the method [get_prompt_for_profiling] implemented." \
             "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
             "ViT's encoder")
