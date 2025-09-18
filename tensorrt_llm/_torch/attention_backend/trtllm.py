@@ -184,6 +184,7 @@ class TrtllmAttentionWrapper:
         is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
         is_spec_dec_tree: bool = False,
+        is_eagle3: bool = False,
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
@@ -271,6 +272,7 @@ class TrtllmAttentionWrapper:
         self.is_spec_decoding_enabled = is_spec_decoding_enabled
         self.use_spec_decoding = use_spec_decoding
         self.is_spec_dec_tree = is_spec_dec_tree
+        self.is_eagle3 = is_eagle3
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
@@ -414,7 +416,7 @@ class TrtllmAttentionWrapper:
         ]
         spec_decoding_bool_params = [
             self.is_spec_decoding_enabled, self.use_spec_decoding,
-            self.is_spec_dec_tree
+            self.is_spec_dec_tree, self.is_eagle3
         ]
         spec_decoding_tensor_params = [
             self.spec_decoding_generation_lengths,
@@ -1237,6 +1239,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # Context MLA uses separate qkv instead of paged_context_fmha
             use_paged_context_fmha = False
 
+        is_eagle3 = kwargs.get("is_eagle3", False)
+
         use_nvfp4_output = False
         if enable_attn_nvfp4_output and self.has_nvfp4 and self.support_nvfp4_output(
         ):
@@ -1287,6 +1291,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
             is_spec_dec_tree=metadata.is_spec_dec_tree,
+            is_eagle3=is_eagle3,
             spec_decoding_position_offsets=metadata.
             spec_decoding_position_offsets,
             spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,

@@ -120,6 +120,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params;
     int32_t const* mrope_position_deltas;
+    bool is_eagle3 = false;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -645,7 +646,8 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.ia3_key_weights = reinterpret_cast<DataType const*>(input_params.ia3_key_weights);
     params.ia3_value_weights = reinterpret_cast<DataType const*>(input_params.ia3_value_weights);
 
-    if (input_params.quant_option.hasStaticActivationScaling() || input_params.fp8_context_fmha)
+    if ((input_params.quant_option.hasStaticActivationScaling() || input_params.fp8_context_fmha)
+        && !input_params.is_eagle3)
     {
         // qkv_scale_out is nullptr currently (no scale).
         params.qkv_scale_quant_orig = input_params.qkv_scale_out;
@@ -2410,6 +2412,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.block_sparse_attention = mMaskType == AttentionMaskType::BLOCKSPARSE;
     dispatch_params.block_sparse_params = mBlockSparseParams;
     dispatch_params.mrope_position_deltas = params.mrope_position_deltas;
+    dispatch_params.is_eagle3 = mIsEagle3;
 
     using DataType = typename SATypeConverter<T>::Type;
     if (!isCrossAttention())
@@ -2617,7 +2620,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.dataTypeOut = mFP8AttenOutput ? DATA_TYPE_E4M3 : data_type;
 
         // FP8 FMHA should be used with fp8 workflow together.
-        if (mFP8ContextFMHA || mFP8ContextMLA)
+        if ((mFP8ContextFMHA || mFP8ContextMLA) && !mIsEagle3)
         {
             data_type = DATA_TYPE_E4M3;
         }
@@ -2627,7 +2630,7 @@ int AttentionOp::initialize() noexcept
         // The KV input data type. The default is same as dataType.
         fmhaParams.dataTypeKv = fmhaParams.dataType;
         // If the kernel must read from KV cache, set the dtype correctly.
-        if (mPagedKVCache && mPagedContextFMHA)
+        if (mPagedKVCache && mPagedContextFMHA && !mIsEagle3)
         {
             if (mKVCacheQuantMode.hasFp8KvCache())
             {

@@ -396,7 +396,8 @@ class Attention(nn.Module):
             enable_attn_nvfp4_output=enable_attn_nvfp4_output,
             output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
-            attention_sinks=attention_sinks)
+            attention_sinks=attention_sinks,
+            is_eagle3=getattr(self, "is_eagle3", False))
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
