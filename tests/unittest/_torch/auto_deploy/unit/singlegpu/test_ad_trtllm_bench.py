@@ -6,8 +6,9 @@ import pytest
 import yaml
 from _model_test_utils import _hf_model_dir_or_hub_id
 from click.testing import CliRunner
-from tensorrt_llm.commands.bench import main
 from utils.cpp_paths import llm_root  # noqa: F401
+
+from tensorrt_llm.commands.bench import main
 
 
 def tiny_llama_details():
