@@ -107,7 +107,7 @@ transforms:
     backend: trtllm
   fuse_moe:
     stage: post_load_fusion
-    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+    enabled: true
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   fuse_collectives:
