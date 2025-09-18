@@ -77,6 +77,8 @@ transforms:
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true
+  ep_sharding_mxfp4:
+    stage: sharding
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
