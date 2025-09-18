@@ -303,7 +303,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         mm_reqs = {"image": 1}
         text = self.get_dummy_text(mm_reqs)
         images = self.get_dummy_images(mm_reqs)
-        return TextPrompt(text=text, multi_modal_data={"image": images})
+        return TextPrompt(prompt=text, multi_modal_data={"image": images})
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
