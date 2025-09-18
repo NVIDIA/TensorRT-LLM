@@ -2,7 +2,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
@@ -10,11 +13,8 @@ from ..model_config import ModelConfig
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
-                                  TorchSampler, TorchStore, add_token,
-                                  int_tensor)
-from ..pyexecutor.sampler_utils import (BEAM_0, SINGLE_BEAM_WIDTH,
-                                        handle_stop_single_beam)
+from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
+                                  add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 
@@ -209,44 +209,40 @@ class MTPSpecMetadata(SpecMetadata):
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPStore(TorchStore):
-
-    def __init__(self, *, max_draft_len: int, max_num_sequences: int,
-                 max_beam_width: int):
-        super().__init__(max_draft_len=max_draft_len,
-                         max_num_sequences=max_num_sequences,
-                         max_beam_width=max_beam_width)
-        self.next_new_tokens = int_tensor(
-            (self.max_tokens, self.max_num_sequences, SINGLE_BEAM_WIDTH))
-        self.next_draft_tokens = int_tensor(
-            (self.max_num_sequences, self.max_draft_len))
-        self.new_tokens_lens = int_tensor((self.max_num_sequences, ))
-
-
-class MTPSampler(Sampler):
+class MTPSampler(TorchSampler):
     """
     MTP sampler.
     """
 
     SampleState = SampleStateMTP
 
-    def is_generation_model(self) -> bool:
-        return True
-
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
         self.draft_len = nextn
-        self.store = MTPStore(max_draft_len=nextn,
-                              max_num_sequences=args.max_num_sequences,
-                              max_beam_width=args.max_beam_width)
-        self.max_seq_len = args.max_seq_len
+        super().__init__(args)
+
+    @dataclass(frozen=True, kw_only=True)
+    class Store(TorchSampler.Store):
+        next_new_tokens: torch.Tensor
+        next_draft_tokens: torch.Tensor
+        new_tokens_lens: torch.Tensor
+
+    def create_store(self) -> Store:
+        num_tokens, seq_slots, _ = self.NEW_TOKENS_SHAPE
+        draft_len = num_tokens - 1
+        assert draft_len == self.draft_len
+        return self.Store(
+            new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
+            next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
+            next_draft_tokens=int_tensor((seq_slots, draft_len)),
+            new_tokens_lens=int_tensor((seq_slots, )),
+        )
 
     def _request_common_handling(self, request: LlmRequest,
                                  next_draft_tokens: list[list[int]]):
         assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
         assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
         assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-        assert request.py_seq_slot is not None
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
         request.py_decoding_iter += 1
 
@@ -257,12 +253,12 @@ class MTPSampler(Sampler):
         new_tokens = state.host.new_tokens
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
-        max_seq_len = self.max_seq_len
+        beam_idx = self.BEAM
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
-            new_token = add_token(req, new_tokens, beam=BEAM_0)
-            handle_stop_single_beam(req, new_token, max_seq_len=max_seq_len)
+            new_token = add_token(req, new_tokens, beam=beam_idx)
+            self._handle_stop_criteria(req, new_token)
             self._request_common_handling(req, next_draft_tokens_list)
 
         for req in state.scheduled_requests.generation_requests:
@@ -270,10 +266,8 @@ class MTPSampler(Sampler):
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
             for i in range(num_new_tokens):
-                new_token = add_token(req, new_tokens, beam=BEAM_0, step=i)
-                if handle_stop_single_beam(req,
-                                           new_token,
-                                           max_seq_len=max_seq_len):
+                new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
+                if self._handle_stop_criteria(req, new_token):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
@@ -1069,12 +1063,13 @@ class MTPWorker(nn.Module):
         }
 
     @torch.compile(options={"max-autotune": True})
-    def get_local_max_and_combined(self, logits):
+    def get_local_max_and_combined(self, logits, mapping_lm_tp=None):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
         # Adjust indices based on TP rank and size
         vocab_per_rank = logits.shape[-1]
+        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.model_config.mapping
         max_index_per_rank = local_argmax.type(
-            torch.int32) + (self.model_config.mapping.tp_rank * vocab_per_rank)
+            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
         # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
         # Convert both to float32 to ensure consistent dtype
         max_index_per_rank_float = max_index_per_rank.float()
@@ -1102,6 +1097,7 @@ class MTPWorker(nn.Module):
     def draft_sampler(
         self,
         logits: torch.Tensor,
+        mapping_lm_head_tp: Mapping = None,
     ):
         '''
         Sampling draft tokens.
@@ -1123,6 +1119,20 @@ class MTPWorker(nn.Module):
             combined = self.get_local_max_and_combined(logits)
             gathered = allgather(combined, self.model_config.mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
+        elif (self.model_config is not None
+              and hasattr(self.model_config, 'mapping')
+              and self.model_config.mapping.tp_size
+              > 1) and self.model_config.mapping.enable_lm_head_tp_in_adp:
+            # For ADP + LM head TP mode, we need to find the global argmax across all TP ranks
+            combined = self.get_local_max_and_combined(logits,
+                                                       mapping_lm_head_tp)
+            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
+            batch_size = logits.shape[0]
+            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
+            gathered = gathered.view(mapping_lm_head_tp.tp_size,
+                                     local_batch_size, -1)
+            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
+            draft_tokens = self.get_draft_tokens_from_gathered(sliced_gathered)
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
@@ -1229,14 +1239,44 @@ class MTPEagleWorker(MTPWorker):
                 self.guided_decoder.add_draft_batch(new_tokens,
                                                     num_accepted_tokens,
                                                     draft_step=i)
-
-            logits = draft_model.mtp_layers[0].shared_head(
-                hidden_states[gather_ids], draft_model.lm_head, attn_metadata,
-                True)
+            if self.model_config.mapping.enable_attention_dp and \
+                getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
+                hidden_states_gathered = hidden_states[gather_ids]
+                token_count = hidden_states_gathered.view(
+                    -1, hidden_states_gathered.shape[-1]).shape[0]
+                max_num_requests = spec_metadata.max_num_requests
+                pad_len = max_num_requests - token_count
+                if pad_len > 0:
+                    padded_hidden_states = F.pad(hidden_states_gathered.view(
+                        -1, hidden_states_gathered.shape[-1]),
+                                                 (0, 0, 0, pad_len),
+                                                 mode="constant",
+                                                 value=0)
+                elif pad_len == 0:
+                    padded_hidden_states = hidden_states_gathered.view(
+                        -1, hidden_states_gathered.shape[-1])
+                else:
+                    raise ValueError(
+                        f"In MTPEagleWorker.forward(), token_count < max_num_requests, which is not supported"
+                    )
+                logits = draft_model.mtp_layers[0].shared_head(
+                    padded_hidden_states, draft_model.lm_head, attn_metadata,
+                    True)
+            else:
+                logits = draft_model.mtp_layers[0].shared_head(
+                    hidden_states[gather_ids], draft_model.lm_head,
+                    attn_metadata, True)
             if self.guided_decoder is not None:
                 self.guided_decoder.execute_draft_batch(logits, draft_step=i)
 
-            new_draft_token = self.draft_sampler(logits)
+            if self.model_config.mapping.enable_attention_dp and \
+                getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
+                mapping_lm_head_tp = draft_model.mtp_layers[
+                    0].shared_head.mapping_lm_head_tp
+                new_draft_token = self.draft_sampler(logits, mapping_lm_head_tp)
+                new_draft_token = new_draft_token[:token_count]
+            else:
+                new_draft_token = self.draft_sampler(logits)
 
             hidden_states, position_ids = self.update_draft_tokens(
                 next_draft_tokens, new_draft_token, hidden_states, gather_ids,

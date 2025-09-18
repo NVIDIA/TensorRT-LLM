@@ -58,11 +58,19 @@ Property ```free_gpu_memory_fraction``` is a ratio > 0 and < 1 that specifies ho
 
 Block reuse across requests is enabled by default, but can be disabled by setting ```enable_block_reuse``` to False.
 
+### KV Cache Salting for Secure Reuse
+
+KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.
+
+To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
+
 ### Enable Offloading to Host Memory
 
 Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.
 
 When offloading is enabled, the client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded; they are evicted directly from GPU memory to reduce traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
+
+Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
 
 ### Partial Reuse
 

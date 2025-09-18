@@ -1735,11 +1735,16 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-def test_trtllm_benchmark_serving(llm_root, llm_venv):
+@pytest.mark.parametrize(
+    "model_name", ["llama-3.1-model/Meta-Llama-3.1-8B", "gpt_oss/gpt-oss-20b"])
+def test_trtllm_benchmark_serving(llm_venv, model_name):
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_trtllm_serve_benchmark.py")])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root /
+            f"_test_trtllm_serve_benchmark.py::test_trtllm_serve_benchmark[{model_name}]"
+            )
+    ])
 
 
 def test_build_time_benchmark_sanity(llm_root, llm_venv):
@@ -2349,6 +2354,10 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                  "gemma/gemma-3-27b-it",
                  marks=(pytest.mark.skip_less_device_memory(80000),
                         skip_post_blackwell)),
+    pytest.param(
+        "Nano-v2-VLM",
+        "Nano-v2-VLM",
+        marks=pytest.mark.skip(reason="Nano V2 VLM ckpt is not released yet.")),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
@@ -2395,6 +2404,23 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     }
 
     expected_keywords = {
+        "Nano-v2-VLM": {
+            "image": [
+                ["natural", "ocean", "waves", "stormy", "overcast", "sea"],
+                ["mountain", "rock", "large", "clear", "blue", "sky"],
+                ["road", "lane", "vehicle", "bus", "cars", "traffic"],
+            ],
+            "video": [
+                [
+                    "person", "red", "dress", "walking", "street", "black",
+                    "leather", "jacket"
+                ],
+                ["space", "earth", "black", "frame", "city", "lights", "dark"],
+            ],
+            "mixture_text_image":
+            [["invented", "internet", "person", "people", "computers"],
+             ["large", "rock", "mountain", "center", "sky", "clear", "trees"]]
+        },
         "NVILA-8B-FP16": {
             "image": [
                 ["stormy", "ocean", "waves", "cloudy", "sunlight", "sky"],
@@ -2491,6 +2517,13 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--disable_kv_cache_reuse")
         cmd.append("--kv_cache_fraction=0.5")
         cmd.append("--max_seq_len=1024")
+    # Nano V2 VLM needs smaller max_batch_size to save memory.
+    # Also need to disable kv cache reuse for Nemotron-H architecture.
+    if model_name == "Nano-v2-VLM":
+        cmd.append("--max_batch_size=128")
+        cmd.append("--disable_kv_cache_reuse")
+        if modality == "video":
+            cmd.append("--max_num_tokens=20480")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
@@ -2561,13 +2594,21 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])
-@pytest.mark.parametrize("model_name,model_path", [
-    ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
-    ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
-])
+@pytest.mark.parametrize(
+    "model_name,model_path,match_ratio",
+    [
+        ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf", 0.8),
+        ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.8),
+        pytest.param(
+            "mistral-small-3.1-24b-instruct",
+            "Mistral-Small-3.1-24B-Instruct-2503",
+            # Lower threshold to give some wiggle room for flakiness.
+            0.6,
+            marks=pytest.mark.skip_less_device_memory(80000)),
+    ])
 def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
                                                   model_name, model_path,
-                                                  modality):
+                                                  modality, match_ratio):
     # NOTE: individual tests need to be enabled in
     # tests/integration/test_lists/qa/examples_test_list.txt
 
@@ -2575,8 +2616,10 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     test_data_root = Path(
         os.path.join(llm_models_root(), "multimodals", "test_data"))
     print(f"Accuracy test {model_name} {modality} mode with example inputs.")
-    if modality == "video" and model_name == "llava-v1.6-mistral-7b":
-        pytest.skip("Skipping video modality test for llava-v1.6-mistral-7b")
+    if modality == "video" and model_name in {
+            "llava-v1.6-mistral-7b", "mistral-small-3.1-24b-instruct"
+    }:
+        pytest.skip(f"Skipping video modality test for {model_name}")
 
     num_same_requests = 3  # test kv cache reuse with multiple same requests
     accuracy_inputs = {
@@ -2610,6 +2653,14 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
             ] * num_same_requests,
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],
+            ] * num_same_requests,
+        },
+        "mistral-small-3.1-24b-instruct": {
+            "image": [
+                [
+                    "cloud", "dramatic", "seascape", "ocean", "turbulent",
+                    "waves"
+                ],
             ] * num_same_requests,
         },
     }
@@ -2651,13 +2702,21 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])
-@pytest.mark.parametrize("model_name,model_path", [
-    ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
-    ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
-])
+@pytest.mark.parametrize(
+    "model_name,model_path,match_ratio",
+    [
+        ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf", 0.8),
+        ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct", 0.8),
+        pytest.param(
+            "mistral-small-3.1-24b-instruct",
+            "Mistral-Small-3.1-24B-Instruct-2503",
+            # Lower threshold to give some wiggle room for flakiness.
+            0.6,
+            marks=pytest.mark.skip_less_device_memory(80000)),
+    ])
 def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
                                                    model_name, model_path,
-                                                   modality):
+                                                   modality, match_ratio):
     # NOTE: individual tests need to be enabled in
     # tests/integration/test_lists/qa/examples_test_list.txt
 
@@ -2665,10 +2724,11 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
     test_data_root = Path(
         os.path.join(llm_models_root(), "multimodals", "test_data"))
     print(f"Accuracy test {model_name} {modality} mode with example inputs.")
-    if modality == "video" and model_name == "llava-v1.6-mistral-7b":
+    if modality == "video" and model_name in {
+            "llava-v1.6-mistral-7b", "mistral-small-3.1-24b-instruct"
+    }:
         pytest.skip("Skipping video modality test for llava-v1.6-mistral-7b")
 
-    num_same_requests = 3  # test kv cache reuse with multiple same requests
     accuracy_inputs = {
         "image": {
             "prompt": [
@@ -2702,17 +2762,6 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
                 ["highway", "vehicles", "traffic", "bus", "suburban"],
             ],
         },
-        "qwen2-vl-7b-instruct": {
-            "image": [
-                ["ocean", "waves", "atmosphere", "stormy", "clouds", "intense"],
-                ["trees", "winding", "road", "sunny", "sky", "atmosphere"],
-                ["traffic", "vehicles", "moderate", "lanes", "road", "cars"],
-            ],
-            "video": [
-                ["city", "night", "lights", "jacket", "wet"],
-                ["earth", "spinning", "black"],
-            ],
-        },
         "qwen2.5-vl-7b-instruct": {
             "image": [
                 ["dramatic", "moody", "ocean", "stormy", "sky", "waves"],
@@ -2725,6 +2774,19 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],
                 ["earth", "world", "night", "lights", "cities"],
+            ],
+        },
+        "mistral-small-3.1-24b-instruct": {
+            "image": [
+                [
+                    "cloud", "dramatic", "seascape", "ocean", "turbulent",
+                    "waves"
+                ],
+                ["scenic", "rock", "landscape", "monolith", "formation"],
+                [
+                    "multi-lane", "highway", "moderate", "traffic", "flow",
+                    "vehicles", "congestion"
+                ],
             ],
         },
     }
@@ -2744,7 +2806,6 @@ def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
     ]
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
-    match_ratio = 4.0 / 5
     for prompt_output, prompt_keywords in zip(
             parse_output(output), expected_keywords[model_name][modality]):
         matches = [
@@ -3237,3 +3298,84 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
     if os.environ.get("SLURM_PROCID", '0') == '0':
         mmlu_accuracy = get_mmlu_accuracy(output)
         assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("return_generation_logits", [True, False])
+@pytest.mark.parametrize("model_path", [
+    ("llama-3.1-model/Llama-3.1-8B-Instruct"),
+    pytest.param("llama-3.3-models/Llama-3.3-70B-Instruct",
+                 marks=pytest.mark.skip_less_device(8)),
+])
+def test_llmapi_generation_logits(llm_venv, model_path,
+                                  return_generation_logits):
+    """
+    RCCA: https://nvbugspro.nvidia.com/bug/5501805
+    """
+
+    import asyncio
+
+    from tensorrt_llm import LLM, SamplingParams
+
+    seq_len, max_tokens = 131072, 100000
+    if return_generation_logits:
+        # use short seq_len and max_tokens for testing when return_generation_logits is True
+        seq_len, max_tokens = 1024, 1000
+    tp_size = 8 if "70B" in model_path else 1
+    # Model parameters
+    params = {
+        "cuda_graph_config": {
+            "batch_sizes": [512]
+        },
+        "enable_chunked_prefill": True,
+        "guided_decoding_backend": "xgrammar",
+        "kv_cache_config": {
+            "cross_kv_cache_fraction": None,
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.9,
+            "max_attention_window": None
+        },
+        "max_seq_len": seq_len,
+        "tensor_parallel_size": tp_size,
+    }
+
+    # Sampling parameters
+    sampling_params = SamplingParams(
+        max_tokens=max_tokens,
+        return_context_logits=False,
+        return_generation_logits=return_generation_logits,
+    )
+
+    # Test prompt (token IDs)
+    prompt = [
+        128000, 128006, 9125, 128007, 271, 38766, 1303, 33025, 2696, 25, 6790,
+        220, 2366, 18, 198, 15724, 2696, 25, 220, 2545, 17907, 220, 2366, 20,
+        271, 67, 10319, 7422, 389, 128009, 128006, 882, 128007, 271, 3923, 374,
+        701, 836, 30, 128009, 128006, 78191, 128007, 271
+    ]
+
+    async def async_generation_test():
+        """Async generation test function"""
+        model_path_full = f"{llm_models_root()}/{model_path}"
+        llm = LLM(**params, model=model_path_full, tokenizer=model_path_full)
+
+        try:
+            outputs = []
+            async for output in llm.generate_async(
+                    prompt,
+                    sampling_params,
+                    streaming=True,
+            ):
+                outputs.append(output)
+                print(f"Generated: {output}")
+
+            # Verify that we got some output
+            assert len(outputs) > 0, "No output generated"
+            print(f"Successfully generated {len(outputs)} streaming outputs")
+
+        finally:
+            llm.shutdown()
+
+    # Run the async test
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(async_generation_test())

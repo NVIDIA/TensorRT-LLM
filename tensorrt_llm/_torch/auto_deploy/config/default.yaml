@@ -1,8 +1,13 @@
-# Additional default args for AutoDeployConfig/LlmArgs in _torch/auto_deploy/llm_args.py
+# This is the set of transforms running in "graph" mode. In this mode, we capture the full graph
+# of the model and optimize it for inference.
 transforms:
+  ############################################################################################
+  # BUILD MODEL, EXPORT TO GRAPH MODULE, AND CLEAN UP
+  ############################################################################################
   build_model:
     stage: factory
     device: meta
+    use_strict_forward: true
     # nothing to clean up
     run_graph_cleanup: false
     requires_clean_graph: false
@@ -74,32 +79,36 @@ transforms:
   ############################################################################################
   load_weights:
     stage: weight_load
+  move_inputs_to_device:
+    stage: weight_load
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
-  # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-  # fuse_gemms:
-  #   stage: post_load_fusion
-  # fuse_fp4_gemms:
-  #   stage: post_load_fusion
-  # fuse_fp8_gemms:
-  #   stage: post_load_fusion
+  fuse_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_fp4_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_fp8_gemms:
+    stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: torch
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
-  # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
   fuse_moe:
     stage: post_load_fusion
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
   fuse_collectives:
     stage: post_load_fusion
-  # TODO (lucaslie): add backend selection as part of configurable inference optimizers
-  # check if we can fuse rmsnorm
   fuse_rmsnorm:
+    # TODO (lucaslie): add backend selection as part of configurable inference optimizers
+    # check if we can fuse rmsnorm
     stage: post_load_fusion
     backend: flashinfer
   ############################################################################################
@@ -121,3 +130,6 @@ transforms:
   ############################################################################################
   compile_model:
     stage: compile
+  forward_with_cached_sequence_interface:
+    stage: compile
+    args_only: true
