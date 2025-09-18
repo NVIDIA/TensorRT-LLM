@@ -1863,7 +1863,7 @@ class PyExecutor:
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = self._fetch_cached_tokens(req_id) \
-                        if self.enable_kv_cache_reuse else 0
+                        if self.model_engine.attn_runtime_features.cache_reuse else 0
                     new_responses.append((req_id, response))
 
             if request_done:
