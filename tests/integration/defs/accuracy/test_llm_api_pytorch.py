@@ -3261,6 +3261,43 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
+    def test_w4_chunked_prefill(self, kv_cache_dtype, moe_backend, mocker):
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("Triton kernels are not available")
+
+        pytorch_config = dict(disable_overlap_scheduler=True,
+                              cuda_graph_config=CudaGraphConfig())
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        tokens_per_block=512,
+                                        enable_block_reuse=True,
+                                        dtype=kv_cache_dtype)
+
+        model_name = "GPT-OSS/MXFP4"
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 enable_chunked_prefill=True,
+                 enable_attention_dp=False,
+                 moe_config=MoeConfig(backend=moe_backend),
+                 **pytorch_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+            mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                              {"scores_filter": "exact_match,flexible-extract"})
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
 
 class TestEXAONE4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
