@@ -40,13 +40,10 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
 
         # Track original parameter names for later safe unregistration.
         this_fusion_param_names = set()
-        try:
-            this_fusion_param_names.update([n.target for n in w1_list])
-            this_fusion_param_names.update([n.target for n in w2_list])
-            this_fusion_param_names.update([n.target for n in w3_list])
-            original_param_names.update(this_fusion_param_names)
-        except Exception:
-            pass
+        this_fusion_param_names.update([n.target for n in w1_list])
+        this_fusion_param_names.update([n.target for n in w2_list])
+        this_fusion_param_names.update([n.target for n in w3_list])
+        original_param_names.update(this_fusion_param_names)
 
         fused_w3_w1_experts = torch.stack(
             [
@@ -108,11 +105,8 @@ def _cleanup_unstacked_weights(
         name for name in this_fusion_param_names if name not in used_attr_names_iter
     ]
 
-    freed_param_bytes_iter = 0
     for name in names_to_unregister_iter:
         param_obj = gm.get_parameter(name)
-        if isinstance(param_obj, torch.nn.Parameter):
-            freed_param_bytes_iter += param_obj.element_size() * param_obj.numel()
         owner_mod, leaf = _resolve_owner_module_and_leaf_attr(gm, name)
         if hasattr(owner_mod, "_parameters") and leaf in owner_mod._parameters:
             owner_mod._parameters.pop(leaf, None)
