@@ -18,6 +18,9 @@ TensorRT-LLM
 <div align="left">
 
 ## Tech Blogs
+* [09/18] Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)
+
 * [08/29] ADP Balance Strategy
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog10_ADP_Balance_Strategy.md)
 
