@@ -94,7 +94,19 @@ class MultiNodeProbe(object):
     @staticmethod
     def get_nodelist():
         """Get list of nodes from SLURM environment"""
-        return os.environ.get("SLURM_NODELIST", "").split(',')
+        nodelist_str = os.environ.get("SLURM_NODELIST", "")
+        if not nodelist_str:
+            return []
+        
+        # Matched format: prefix-[num1,num2,...]
+        match = re.match(r'(.*?)\[([^\]]+)\]', nodelist_str)
+        if match:
+            prefix = match.group(1)
+            numbers = match.group(2).split(',')
+            return [f"{prefix}{num.strip()}" for num in numbers]
+        else:
+            # If not matched with bracket format, split by comma
+            return nodelist_str.split(',')
 
     @staticmethod
     def is_multi_node():
@@ -118,7 +130,7 @@ class MultiNodeProbe(object):
         """Check if this is rank 0 process on current node (should start servers)"""
         if not MultiNodeProbe.is_multi_node():
             return False
-        rank = int(os.environ.get("SLURM_PROCID", 0))
+        rank = int(os.environ.get("SLURM_LOCALID", 0))
         ntasks_per_node = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
         return (rank % ntasks_per_node) == 0
 
