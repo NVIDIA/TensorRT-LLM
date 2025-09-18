@@ -435,6 +435,7 @@ class BaseLLM:
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
             sampling_params,
+            streaming=streaming,
             is_gen_only=is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
@@ -569,11 +570,19 @@ class BaseLLM:
         sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
 
-    def _check_arguments(self, prompt_len: int, query_len: int,
+    def _check_arguments(self,
+                         prompt_len: int,
+                         query_len: int,
                          sampling_params: SamplingParams,
-                         is_gen_only: bool) -> None:
+                         streaming: bool = False,
+                         is_gen_only: bool = False) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
+            if streaming and sampling_params.prompt_logprobs:
+                raise ValueError(
+                    "prompt_logprobs is not yet supported in streaming mode for PyTorch backend. "
+                    "Please either disable streaming or set prompt_logprobs=None."
+                )
             if sampling_params.logprobs and sampling_params.logprobs > 1:
                 raise ValueError(
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
