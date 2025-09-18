@@ -105,9 +105,6 @@ class CapturedGraph(nn.Module):
             for input in args_batched
         ]
 
-        # create new args, kwargs with the input buffers and static args
-        args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
-
         # truncate input buffers to cuda_graph_max_batch_size
         inputs_truncated = [
             in_buffer[: self.cuda_graph_max_batch_size] for in_buffer in self._input_buffers
