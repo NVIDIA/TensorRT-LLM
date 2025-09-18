@@ -179,7 +179,8 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     gm = optimizer(cm)
 
     gm.to("cuda")
-    cm.initialize_caches()
+    num_caches = cm.initialize_caches()
+    print(f"num_caches: {num_caches}")
 
     # Helper function to call the model with proper sequence nesting
     def _call_and_unnest(x, input_pos):

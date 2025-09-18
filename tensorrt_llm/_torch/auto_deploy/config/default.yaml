@@ -1,8 +1,13 @@
-# Additional default args for AutoDeployConfig/LlmArgs in _torch/auto_deploy/llm_args.py
+# This is the set of transforms running in "graph" mode. In this mode, we capture the full graph
+# of the model and optimize it for inference.
 transforms:
+  ############################################################################################
+  # BUILD MODEL, EXPORT TO GRAPH MODULE, AND CLEAN UP
+  ############################################################################################
   build_model:
     stage: factory
     device: meta
+    use_strict_forward: true
     # nothing to clean up
     run_graph_cleanup: false
     requires_clean_graph: false
@@ -74,6 +79,8 @@ transforms:
   ############################################################################################
   load_weights:
     stage: weight_load
+  move_inputs_to_device:
+    stage: weight_load
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
@@ -123,3 +130,6 @@ transforms:
   ############################################################################################
   compile_model:
     stage: compile
+  forward_with_cached_sequence_interface:
+    stage: compile
+    args_only: true
