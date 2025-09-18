@@ -1,0 +1,33 @@
+# This is the set of transforms running in "transformers" mode. In this mode, we hook into the
+# HF attention mechanism and replace it with our custom cached attention mechanism.
+transforms:
+  ############################################################################################
+  # BUILD MODEL, LOAD WEIGHTS, AND WRAP IT INTO FAKE GRAPH MODULE
+  ############################################################################################
+  build_and_load_factory_model:
+    stage: factory
+    use_strict_forward: false
+  ############################################################################################
+  # MOVE ARGUMENTS TO DEVICE
+  ############################################################################################
+  move_inputs_to_device:
+    stage: weight_load
+  ############################################################################################
+  # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
+  ############################################################################################
+  detect_hf_attn_layers:
+    stage: cache_init
+  transformers_replace_cached_attn:
+    stage: cache_init
+    attn_backend: flashinfer
+  initialize_cache:
+    stage: cache_init
+  resize_kv_cache:
+    stage: cache_init
+    args_only: false # use kwargs instead of args
+  ############################################################################################
+  # COMPILE MODEL
+  ############################################################################################
+  forward_with_cached_sequence_interface:
+    stage: compile
+    args_only: false # use kwargs instead of args

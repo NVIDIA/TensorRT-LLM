@@ -1130,23 +1130,21 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
 # This class has extensively parameterized test methods, which yield totally 200 test cases.
 # This is because this model requires high test coverage over the feature combinations.
 # Normally we should not parameterize test methods so extensively -- just test on the typical/important feature combinations.
+@skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
     @pytest.mark.skip_less_device_memory(60000)
     # Chunked Prefill for MLA can only be enabled on SM100
-    @parametrize_with_ids(
-        "enable_chunked_prefill",
-        [False, pytest.param(True, marks=skip_pre_hopper)])
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (False, True, True), (True, True, True)])
     # Only Hopper and Blackwell MLA kernel supports MTP
-    @parametrize_with_ids("mtp_nextn",
-                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler, torch_compile, enable_chunked_prefill):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -3270,6 +3268,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             model_name = "GPT-OSS/MXFP4"
             task = GSM8K(model_name)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+            mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                              {"scores_filter": "exact_match,flexible-extract"})
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
@@ -3325,3 +3325,26 @@ class TestQwQ_32B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestNano_V2_VLM(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nano-v2-VLM"
+    MODEL_PATH = f"{llm_models_root()}/Nano-v2-VLM"
+    MAX_NUM_TOKENS = 25600
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(max_tokens=MAX_NUM_TOKENS,
+                                     truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+                                     stop="<|endoftext|>")
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                    enable_block_reuse=False)
+
+    @pytest.mark.skip(reason="Nano V2 VLM ckpt is not released yet.")
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 max_batch_size=128,
+                 max_num_tokens=self.MAX_NUM_TOKENS,
+                 kv_cache_config=self.kv_cache_config) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
