@@ -183,7 +183,9 @@ class CUDAGraphRunner:
 
         return key not in self.graph_outputs
 
-    def capture(self, key: Tuple[int, int, int], forward_fn: Callable,
+    def capture(self,
+                key: Tuple[int, int, int],
+                forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
                 postprocess_fn: Optional[Callable] = None):
         """Captures the forward pass for a given batch size."""
@@ -249,7 +251,6 @@ class CUDAGraphRunner:
     def replay(self, key: Tuple[int, int, int],
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
-        batch_size = key[0]
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:

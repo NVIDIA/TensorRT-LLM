@@ -856,8 +856,8 @@ class PyTorchModelEngine(ModelEngine):
 
                     _update_spec_resource_manager(draft_len > 0)
                     self.forward(batch,
-                                    new_tensors_device=None,
-                                    resource_manager=resource_manager)
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
                     torch.cuda.synchronize()
 
         if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
