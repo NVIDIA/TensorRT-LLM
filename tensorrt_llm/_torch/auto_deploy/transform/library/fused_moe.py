@@ -7,28 +7,8 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
-from ...utils.logger import ad_logger
 from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
-
-
-def _fmt_bytes(num_bytes: Optional[int]) -> str:
-    if num_bytes is None:
-        return "N/A"
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num_bytes < 1024:
-            return f"{num_bytes:.2f} {unit}"
-        num_bytes /= 1024
-    return f"{num_bytes:.2f} PB"
-
-
-def _cuda_mem_allocated() -> Optional[int]:
-    try:
-        if torch.cuda.is_available():
-            return torch.cuda.memory_allocated()
-    except Exception:
-        pass
-    return None
 
 
 def _resolve_owner_module_and_leaf_attr(
@@ -50,16 +30,11 @@ def _resolve_owner_module_and_leaf_attr(
 def _insert_fused_moe_ops(gm: GraphModule) -> int:
     fused_key_counter = 0
     graph = gm.graph
-    total_created_param_bytes = 0
-    total_cuda_delta = 0
     original_param_names = set()
-    total_freed_param_bytes = 0
 
     for node in list(graph.nodes):
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
-
-        mem_before = _cuda_mem_allocated()
 
         hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = node.args
 
@@ -84,10 +59,6 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         )
 
         fused_w2_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
-
-        created_bytes = fused_w3_w1_experts.element_size() * fused_w3_w1_experts.numel()
-        created_bytes += fused_w2_experts.element_size() * fused_w2_experts.numel()
-        total_created_param_bytes += created_bytes
 
         new_key_w3_w1 = f"fused_moe_w3_w1_stacked_{fused_key_counter}"
         new_key_w2 = f"fused_moe_w2_stacked_{fused_key_counter}"
@@ -115,12 +86,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
 
         _cleanup_unstacked_weights(
             gm,
-            node,
-            mem_before,
-            created_bytes,
             this_fusion_param_names,
-            total_cuda_delta,
-            total_freed_param_bytes,
         )
 
     return fused_key_counter
@@ -128,25 +94,9 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
 
 def _cleanup_unstacked_weights(
     gm,
-    node,
-    mem_before,
-    created_bytes,
     this_fusion_param_names,
-    total_cuda_delta,
-    total_freed_param_bytes,
 ):
     """DCE then unregister any now-unreferenced original params for this fusion"""
-    mem_after = _cuda_mem_allocated()
-    delta = (mem_after - mem_before) if (mem_before is not None and mem_after is not None) else None
-    if delta is not None:
-        total_cuda_delta += max(delta, 0)
-    ad_logger.info(
-        f"[fuse_moe] Fused MoE params for node={getattr(node, 'name', 'unknown')} | "
-        f"CUDA Δ={_fmt_bytes(delta if delta is not None else 0)} | "
-        f"created params={_fmt_bytes(created_bytes)} | "
-        f"CUDA after={_fmt_bytes(mem_after)}"
-    )
-
     gm.graph.eliminate_dead_code()
 
     used_attr_names_iter = set()
@@ -170,16 +120,8 @@ def _cleanup_unstacked_weights(
             delattr(owner_mod, leaf)
         del param_obj
 
-    if names_to_unregister_iter:
-        total_freed_param_bytes += freed_param_bytes_iter
-        ad_logger.info(
-            (
-                f"[fuse_moe] Per-fusion unregistered {len(names_to_unregister_iter)} params | "
-                f"approx freed={_fmt_bytes(freed_param_bytes_iter)}"
-            )
-        )
-        # Flush CUDA cache since we freed large chunks of memory
-        torch.cuda.empty_cache()
+    # Flush CUDA cache since we freed large chunks of memory
+    torch.cuda.empty_cache()
 
 
 def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
