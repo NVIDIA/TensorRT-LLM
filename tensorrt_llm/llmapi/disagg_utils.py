@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import IntEnum
 from typing import Any, List, Literal, Optional, Tuple
 
 import yaml
@@ -16,7 +16,7 @@ __all__ = [
 ]
 
 
-class ServerRole(Enum):
+class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
     MM_ENCODER = 2
