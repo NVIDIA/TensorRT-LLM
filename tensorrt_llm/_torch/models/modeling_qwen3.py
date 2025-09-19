@@ -24,6 +24,7 @@ from ..speculative import SpecMetadata
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
+
 class Qwen3Attention(QKNormRoPEAttention):
 
     def __init__(

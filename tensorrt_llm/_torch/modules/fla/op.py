@@ -41,7 +41,6 @@ if not is_gather_supported:
 else:
     gather = tl.gather
 
-
 if hasattr(triton.language, "_experimental_make_tensor_descriptor"):
     # For Triton 3.3.x
     make_tensor_descriptor = triton.language._experimental_make_tensor_descriptor

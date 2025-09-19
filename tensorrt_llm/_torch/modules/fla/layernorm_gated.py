@@ -6,7 +6,6 @@
 # This backward pass is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
-import math
 
 import torch
 import torch.nn.functional as F
@@ -26,7 +25,7 @@ def rms_norm_ref(
     upcast=True,
 ):
     dtype = x.dtype
-    N = x.shape[-1]
+    x.shape[-1]
     weight = weight.float()
     bias = bias.float() if bias is not None else None
     if upcast:
@@ -36,10 +35,12 @@ def rms_norm_ref(
         x = x * F.silu(z)
     if group_size is None:
         rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
-        out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
+        out = (x * rstd * weight) + bias if bias is not None else (x * rstd *
+                                                                   weight)
     else:
         x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
-        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
+        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) +
+                              eps)
         out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
         if bias is not None:
             out = out + bias
@@ -134,28 +135,26 @@ def _layer_norm_fwd(
     if z is not None:
         assert z.stride(-1) == 1
         assert z.shape == (M, N)
-    assert weight.shape == (N,)
+    assert weight.shape == (N, )
     assert weight.stride(-1) == 1
     if bias is not None:
         assert bias.stride(-1) == 1
-        assert bias.shape == (N,)
+        assert bias.shape == (N, )
     # allocate output
     if out is not None:
         assert out.shape == x.shape
     else:
         out = torch.empty_like(x)
     assert out.stride(-1) == 1
-    mean = (
-        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-        if not is_rms_norm
-        else None
-    )
-    rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+    mean = (torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
+            if not is_rms_norm else None)
+    rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
     if group_size > BLOCK_N:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+        raise RuntimeError(
+            "This layer norm doesn't support feature dim >= 64KB.")
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     grid = (M, ngroups)
@@ -234,17 +233,19 @@ def layernorm_fn(
     norm_before_gate=True,
     is_rms_norm=False,
 ):
-    return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm
-    )
+    return LayerNormFn.apply(x, weight, bias, z, eps, group_size,
+                             norm_before_gate, is_rms_norm)
 
 
-def rmsnorm_fn(
-    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True
-):
-    return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, True
-    )
+def rmsnorm_fn(x,
+               weight,
+               bias,
+               z=None,
+               eps=1e-6,
+               group_size=None,
+               norm_before_gate=True):
+    return LayerNormFn.apply(x, weight, bias, z, eps, group_size,
+                             norm_before_gate, True)
 
 
 class LayerNorm(torch.nn.Module):
@@ -265,8 +266,10 @@ class LayerNorm(torch.nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
-        self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
-        self.bias = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.weight = torch.nn.Parameter(
+            torch.empty(hidden_size, **factory_kwargs))
+        self.bias = torch.nn.Parameter(
+            torch.empty(hidden_size, **factory_kwargs))
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
         self.reset_parameters()
@@ -305,7 +308,8 @@ class RMSNorm(torch.nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
-        self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.weight = torch.nn.Parameter(
+            torch.empty(hidden_size, **factory_kwargs))
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate

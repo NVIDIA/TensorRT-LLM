@@ -6,10 +6,10 @@ from torch import nn
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
+from tensorrt_llm._torch.models.modeling_nemotron_h import split
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
 
-from tensorrt_llm._torch.models.modeling_nemotron_h import split
 
 @register_mapper("HF", "Qwen3NextForCausalLM")
 class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
@@ -61,9 +61,9 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
         # linear_num_key_heads = config.linear_num_key_heads
         # linear_key_head_dim = config.linear_key_head_dim
         # linear_value_head_dim = config.linear_value_head_dim
-        linear_key_dim = config.linear_key_head_dim * config.linear_num_key_heads # 16 * 128
-        linear_value_dim = config.linear_value_head_dim * config.linear_num_value_heads # 32 * 128
-        
+        linear_key_dim = config.linear_key_head_dim * config.linear_num_key_heads  # 16 * 128
+        linear_value_dim = config.linear_value_head_dim * config.linear_num_value_heads  # 32 * 128
+
         new_weights = {}
         for name, _ in weights.items():
             key = name
@@ -87,7 +87,8 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
                     w = w.squeeze(1)
 
                 conv_q, conv_k, conv_v = torch.split(
-                    w, [linear_key_dim, linear_key_dim, linear_value_dim], dim=0)
+                    w, [linear_key_dim, linear_key_dim, linear_value_dim],
+                    dim=0)
 
                 w = []
                 for rank in range(tp_size):

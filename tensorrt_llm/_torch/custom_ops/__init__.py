@@ -22,8 +22,8 @@ __all__ = [
 if IS_FLASHINFER_AVAILABLE:
     from .flashinfer_custom_ops import (
         flashinfer_apply_rope_with_cos_sin_cache_inplace,
-        flashinfer_fused_add_rmsnorm, flashinfer_rmsnorm,
-        flashinfer_silu_and_mul, flashinfer_gemma_fused_add_rmsnorm, flashinfer_gemma_rmsnorm)
+        flashinfer_fused_add_rmsnorm, flashinfer_gemma_fused_add_rmsnorm,
+        flashinfer_gemma_rmsnorm, flashinfer_rmsnorm, flashinfer_silu_and_mul)
     __all__ += [
         'flashinfer_silu_and_mul',
         'flashinfer_rmsnorm',

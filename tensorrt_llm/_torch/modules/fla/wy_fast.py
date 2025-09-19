@@ -9,8 +9,6 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
-from tensorrt_llm._torch.modules.fla.op import safe_exp
-from tensorrt_llm._torch.modules.fla.utils import check_shared_mem
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -46,25 +44,22 @@ def recompute_w_u_fwd_kernel(
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(
+            tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(
+            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
-    p_g = tl.make_block_ptr(g + (bos * H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
+    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T, ), (H, ), (i_t * BT, ),
+                               (BT, ), (0, ))
+    p_g = tl.make_block_ptr(g + (bos * H + i_h), (T, ), (H, ), (i_t * BT, ),
+                            (BT, ), (0, ))
+    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
+                            (i_t * BT, 0), (BT, BT), (1, 0))
+    b_beta = tl.load(p_beta, boundary_check=(0, ))
     b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
+    b_g = tl.exp(tl.load(p_g, boundary_check=(0, )))
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
@@ -123,9 +118,8 @@ def recompute_w_u_fwd(
     H = v.shape[-2]
     BT = A.shape[-1]
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    chunk_indices = (prepare_chunk_indices(cu_seqlens, BT)
+                     if cu_seqlens is not None else None)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64

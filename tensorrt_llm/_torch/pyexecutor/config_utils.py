@@ -12,5 +12,6 @@ def is_mla(config):
         return True
     return False
 
+
 def is_qwen3_next(config):
     return getattr(config, 'linear_key_head_dim', 0) > 0
