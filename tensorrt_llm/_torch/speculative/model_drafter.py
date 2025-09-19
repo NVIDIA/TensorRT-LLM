@@ -31,7 +31,7 @@ def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
     Can be used to modify prompts for speculative algorithms that need to update tokens
     before drafting.
     """
-    if spec_dec_mode.is_eagle3():
+    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         # EAGLE3 always throws away the first token when processing draft inputs
         return input_tokens[1:]
     return input_tokens
