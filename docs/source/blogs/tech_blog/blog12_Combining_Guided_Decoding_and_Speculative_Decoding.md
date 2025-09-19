@@ -56,7 +56,7 @@ TensorRT LLM integrates third-party grammar backends (e.g., [XGrammar](https://g
 
 ### Speculative Decoding
 
-Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward. Compared with normal LLM inference where each model forward generates a single token, speculative decoding effectively makes the generation phase less memory-bound.
+Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward. Compared with normal LLM inference where each model forward generates a single token, speculative decoding offers the potential to generate more tokens per iteration by leveraging more computation. This improves the arithmetic intensity and reduces the required number of iterations.
 
 TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and is coupled with the modeling code, but it offers the best performance. The two-model implementation decouples the target and draft models into separate CUDA graphs, which is much more flexible and offers better feature coverage. There are ongoing efforts to close the gaps between the two implementations.
 
@@ -301,9 +301,9 @@ Figures 7 and 8 show the results on JSON Schema Bench. The one-model EAGLE3 achi
 | JSON Schema Bench | LLaMA 3.1 8B  | 2.55 | 2.33 | 1.89 |
 | JSON Schema Bench | LLaMA 3.3 70B | 2.50 | 2.30 | 1.87 |
 
-<p align="center"><sub><em>Table 1: Acceptance lengths for EAGLE3 and NGram. The draft length is 3. "EAGLE3 w/o draft" means the draft model does not apply grammar constraints.</em></sub></p>
+<p align="center"><sub><em>Table 1: Average acceptance lengths per iteration for EAGLE3 and NGram. The acceptance length includes the golden token. The draft length is 3. "EAGLE3 w/o draft" means the draft model does not apply grammar constraints.</em></sub></p>
 
-Table 1 lists the acceptance lengths. We perform an ablation experiment where the draft model does not apply grammar constraints. As presented, this does decrease acceptance rates, but by a slighter margin than expected. Note that it introduces extra overheads to apply grammar constraints on the draft model:
+Table 1 lists the average acceptance lengths per iteration. We perform an ablation experiment where the draft model does not apply grammar constraints. As presented, this does decrease acceptance rates, but by a slighter margin than expected. Note that it introduces extra overheads to apply grammar constraints on the draft model:
 
 * In the drafting loop, the extra mask applying kernels slightly contribute to the GPU time.
 * If the drafting forwards are too fast to hide the grammar computation, the exposed CPU time will cause bubbles in the GPU timeline.
