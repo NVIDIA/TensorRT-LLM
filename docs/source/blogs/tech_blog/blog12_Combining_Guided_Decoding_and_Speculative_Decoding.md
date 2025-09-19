@@ -306,7 +306,7 @@ Figures 7 and 8 show the results on JSON Schema Bench. The one-model EAGLE3 achi
 Table 1 lists the acceptance lengths. We perform an ablation experiment where the draft model does not apply grammar constraints. As presented, this does decrease acceptance rates, but by a slighter margin than expected. Note that it introduces extra overheads to apply grammar constraints on the draft model:
 
 * In the drafting loop, the extra mask applying kernels slightly contribute to the GPU time.
-* If the drafting forwards are too fast to hide the grammar computation, the exposed CPU time will cause bubbles in the CPU timeline.
+* If the drafting forwards are too fast to hide the grammar computation, the exposed CPU time will cause bubbles in the GPU timeline.
 
 These extra overheads could partially offset the benefits from the improved acceptance.
 
