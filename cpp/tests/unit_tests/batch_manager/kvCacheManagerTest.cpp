@@ -14,6 +14,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -590,6 +591,64 @@ TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare)
             result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
         EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
     }
+}
+
+TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 8;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 4;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+
+    auto constexpr batchSize = 1;
+    auto constexpr maxBlocksPerSeq = 10;
+    auto constexpr bytesPerToken = 4;
+    auto constexpr maxAttentionWindow = 4096;
+    auto constexpr maxAttentionWindowAllLayer = 4096;
+    auto constexpr sinkTokenLen = 0;
+    auto constexpr canUseOneMoreBlock = true;
+
+    SizeType32 constexpr maxNewTokens{0};
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        false, stream, true, onboardBlocks);
+
+    // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16] (17 tokens, three blocks)
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+    LlmRequest::RequestIdType requestId{0};
+    auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest0);
+    EXPECT_EQ(llmRequest0->getContextCurrentPosition(), 0);
+    auto cacheBlockIds = kvCacheManager.getSequence(requestId).getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
+
+    kvCacheManager.removeSequence(requestId, llmRequest0);
+
+    inputTokens->pop_back();
+    BlockKey fullKey{*inputTokens};
+    auto const foundFull = kvCacheManager.findBlocksInReuseTreeByBlockKey(fullKey, maxAttentionWindow);
+    ASSERT_TRUE(foundFull.has_value());
+    ASSERT_NE(foundFull.value(), nullptr);
+    auto const& lastBlock = foundFull.value();
+
+    // Check the chain back to previous blocks
+    auto const prev2 = lastBlock->getPrevBlock();
+    ASSERT_NE(prev2, nullptr);
+    auto const prev1 = prev2->getPrevBlock();
+    ASSERT_NE(prev1, nullptr);
+    EXPECT_EQ(prev1->getPrevBlock(), nullptr);
 }
 
 #ifdef ENABLE_FP4
@@ -3615,6 +3674,85 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
         EXPECT_EQ(diff->newValue, 10);
         events.pop_front();
     }
+}
+
+TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksBasicNoPartial)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    std::vector<int> vec{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto blocks = chopVectorIntoBlocks<int>(vec, 10, 4, false);
+    std::vector<std::vector<int>> got(blocks.begin(), blocks.end());
+    ASSERT_EQ(got.size(), 2);
+    EXPECT_THAT(got[0], ::testing::ElementsAreArray({0, 1, 2, 3}));
+    EXPECT_THAT(got[1], ::testing::ElementsAreArray({4, 5, 6, 7}));
+}
+
+TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksBasicWithPartial)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    std::vector<int> vec{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto blocks = chopVectorIntoBlocks<int>(vec, 10, 4, true);
+    std::vector<std::vector<int>> got(blocks.begin(), blocks.end());
+    ASSERT_EQ(got.size(), 3);
+    EXPECT_THAT(got[0], ::testing::ElementsAreArray({0, 1, 2, 3}));
+    EXPECT_THAT(got[1], ::testing::ElementsAreArray({4, 5, 6, 7}));
+    EXPECT_THAT(got[2], ::testing::ElementsAreArray({8, 9}));
+}
+
+TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksWithUsableSize)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    std::vector<int> vec{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto blocks = chopVectorIntoBlocks<int>(vec, 7, 4, true);
+    std::vector<std::vector<int>> got(blocks.begin(), blocks.end());
+    ASSERT_EQ(got.size(), 2);
+    EXPECT_THAT(got[0], ::testing::ElementsAreArray({0, 1, 2, 3}));
+    EXPECT_THAT(got[1], ::testing::ElementsAreArray({4, 5, 6}));
+}
+
+TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        0, stream, std::nullopt, true, onboardBlocks);
+    kvCacheManager.allocatePools(false);
+
+    LlmRequest::RequestIdType requestId{0};
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequence(requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth, llmRequest);
+    auto const totalBlocks = kvCacheManager.getMaxNumBlocks();
+    auto const freeAfterAlloc = kvCacheManager.getNumFreeBlocks();
+    EXPECT_LT(freeAfterAlloc, totalBlocks);
+
+    kvCacheManager.pinBlocks(requestId);
+    auto lastBlockIdOpt = kvCacheManager.getLastBlockId(requestId);
+    ASSERT_TRUE(lastBlockIdOpt.has_value());
+    kvCacheManager.removeSequence(requestId, llmRequest);
+    auto const freeAfterRemovePinned = kvCacheManager.getNumFreeBlocks();
+    EXPECT_LT(freeAfterRemovePinned, totalBlocks);
+
+    kvCacheManager.unpinBlocksById(lastBlockIdOpt.value());
+    auto const freeAfterUnpin = kvCacheManager.getNumFreeBlocks();
+    EXPECT_EQ(freeAfterUnpin, totalBlocks);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamBlocking)

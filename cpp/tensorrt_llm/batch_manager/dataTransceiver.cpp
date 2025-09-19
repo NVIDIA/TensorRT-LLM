@@ -141,11 +141,6 @@ void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) cons
     outFile << '\n' << std::flush;
 }
 
-std::vector<size_t> const& RequestInfo::getBlockHashes() const noexcept
-{
-    return mBlockHashes;
-}
-
 using runtime::SizeType32;
 using AgentConnectionManager = tensorrt_llm::executor::kv_cache::AgentConnectionManager;
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
@@ -174,17 +169,19 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 {
 }
 
-RequestInfo::RequestInfo(
-    LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes, executor::DataTransceiverState transState)
+RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState,
+    int32_t indexFromEnd, BlockKey const& lastBlockKey)
     : mRequestId{requestId}
-    , mBlockHashes{std::move(blockHashes)}
+    , mIndexFromEnd{indexFromEnd}
+    , mLastBlockKey{lastBlockKey}
     , mTransState{std::move(transState)}
 {
 }
 
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
-    return mRequestId == rhs.mRequestId && mBlockHashes == rhs.mBlockHashes && mTransState == rhs.mTransState;
+    return mRequestId == rhs.mRequestId && mIndexFromEnd == rhs.mIndexFromEnd && mLastBlockKey == rhs.mLastBlockKey
+        && mTransState == rhs.mTransState;
 }
 
 LlmRequest::RequestIdType RequestInfo::getRequestId() const noexcept
@@ -201,7 +198,8 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
 {
     namespace su = executor::serialize_utils;
     su::serialize(requestInfo.mRequestId, os);
-    su::serialize(requestInfo.mBlockHashes, os);
+    su::serialize(requestInfo.mIndexFromEnd, os);
+    su::serialize(requestInfo.mLastBlockKey, os);
     su::serialize(requestInfo.mTransState, os);
 }
 
@@ -209,9 +207,10 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
 {
     namespace su = executor::serialize_utils;
     auto requestId = su::deserialize<decltype(mRequestId)>(is);
-    auto blockHashes = su::deserialize<decltype(mBlockHashes)>(is);
+    auto indexFromEnd = su::deserialize<decltype(mIndexFromEnd)>(is);
+    auto lastBlockKey = su::deserialize<decltype(mLastBlockKey)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    return RequestInfo{requestId, std::move(blockHashes), std::move(transState)};
+    return RequestInfo{requestId, std::move(transState), indexFromEnd, lastBlockKey};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -219,7 +218,8 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     namespace su = executor::serialize_utils;
     std::size_t totalSize = 0;
     totalSize += su::serializedSize(requestInfo.mRequestId);
-    totalSize += su::serializedSize(requestInfo.mBlockHashes);
+    totalSize += su::serializedSize(requestInfo.mIndexFromEnd);
+    totalSize += su::serializedSize(requestInfo.mLastBlockKey);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
 }
@@ -228,6 +228,12 @@ class CacheSender::Impl
 {
 public:
     using RequestIdType = LlmRequest::RequestIdType;
+
+    struct Response
+    {
+        LlmRequest* mRequest;
+        std::promise<void> mPromise;
+    };
 
     Impl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
@@ -290,25 +296,18 @@ public:
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         bool isAgent = agentConnectionManager != nullptr;
 
-        auto agentRecvFun = [&](RequestInfo& requestInfo)
-        {
-            auto const* connection = agentConnectionManager->recvConnectionAndRequestInfo(requestInfo);
-            return connection;
-        };
         TransceiverTag::Id id;
         RequestInfo info;
-        auto const* connection = isAgent ? agentRecvFun(info)
+        auto const* connection = isAgent ? agentConnectionManager->recvConnectionAndRequestInfo(info)
                                          : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
         if (!isAgent)
         {
             TLLM_CHECK(id == TransceiverTag::Id::REQUEST_SEND);
             std::uint64_t infoSize{0};
-            connection->recv(
-                executor::kv_cache::DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
+            connection->recv(DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
             std::string serializedInfo;
             serializedInfo.resize(infoSize);
-            connection->recv(
-                executor::kv_cache::DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
+            connection->recv(DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
             std::istringstream iss(serializedInfo);
             info = RequestInfo::deserialize(iss);
         }
@@ -331,7 +330,8 @@ public:
             if (it == mRequestToSession.end())
             {
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager);
+                    DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager,
+                    info.getIndexFromEnd(), info.getLastBlockKey());
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
@@ -354,13 +354,7 @@ public:
     }
 
 private:
-    struct Response
-    {
-        LlmRequest* mRequest;
-        std::promise<void> mPromise;
-    };
-
-    void sendAndRemoveResponse(RequestIdType id, Response resp) noexcept
+    void sendAndRemoveResponse(RequestIdType id, CacheSender::Impl::Response resp) noexcept
     {
         try
         {
@@ -377,12 +371,12 @@ private:
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
+            TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
             resp.mPromise.set_exception(std::current_exception());
         }
     }
 
-    void sendResponse(std::vector<size_t> const& blockHashes, std::map<RequestIdType, Response>::iterator it)
+    void sendResponse(std::map<RequestIdType, CacheSender::Impl::Response>::iterator it)
     {
         auto reqId = mCurrentRequest.value();
         auto count = --mRemainSendCount[reqId];
@@ -390,10 +384,6 @@ private:
         if (count == 0)
         {
             mRemainSendCount.erase(reqId);
-
-            // TODO(zhengd): pass the hashes directly instead of update llmRequest
-            auto llmRequest = it->second.mRequest;
-            llmRequest->setRequestedBlockHashes(std::move(blockHashes));
 
             if (common::getEnvParallelCacheSend())
             {
@@ -426,12 +416,10 @@ private:
                 {
                     break;
                 }
-                std::vector<size_t> blockHashes;
                 if (!isSending() && !mReadyResponses.empty())
                 {
                     auto const& requestInfo = recvRequestInfo();
                     auto reqId = requestInfo.getRequestId();
-                    blockHashes = requestInfo.getBlockHashes();
 
                     mCurrentRequest = reqId;
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
@@ -442,7 +430,7 @@ private:
                 auto it = getCurrentResponse();
                 if (it != mReadyResponses.end())
                 {
-                    sendResponse(blockHashes, it);
+                    sendResponse(it);
                 }
                 else
                 {
@@ -457,7 +445,7 @@ private:
                         }
                         it = getCurrentResponse();
                     }
-                    sendResponse(blockHashes, it);
+                    sendResponse(it);
                 }
             }
         }
@@ -516,7 +504,7 @@ private:
     std::map<RequestIdType, Response> mReadyResponses;
     std::mutex mSenderMutex, mCondMutex;
     std::atomic<bool> mAnyReady{false}, mTerminate{false};
-    std::condition_variable mSenderCv;
+    std::condition_variable mSenderCv, mResponderCv;
     std::future<void> mResponseFuture;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
     int mDeviceId{-1};
@@ -600,14 +588,31 @@ public:
 
         RequestInfo requestInfo(requestId, mSelfState);
 
-        auto disableSelectiveCacheTransfer = common::getEnvDisableSelectiveCacheTransfer()
-            || (mFormatter->getCacheManager()->getBlockManager().getNumPools() > 1);
-        if (!disableSelectiveCacheTransfer)
+        if (mFormatter->getCacheManager()->getBlockManager().getNumPools() == 1)
         {
             auto* cacheManager = mFormatter->getCacheManager();
-            auto blockRange
-                = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
-            requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+            auto beam = 0;
+            auto requestedBlockRange
+                = getBlockRangeForReceiving(cacheManager, llmRequest, destCacheState.getEnableBlockReuse());
+
+            auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
+            auto lastBlockKey
+                = BlockKey(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
+            if (llmRequest.getInputTokensExtraIds().has_value())
+            {
+                auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+                SizeType32 startTokenIdx
+                    = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
+                SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
+                auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
+                lastBlockKey.extraKeys = std::move(extraKeys);
+            }
+            // Compute indexFromEnd from the number of requested blocks
+            size_t requestedBlockSize = requestedBlockRange.getBlockIds().size();
+            TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
+            int32_t indexFromEnd = static_cast<int32_t>(requestedBlockSize - 1);
+
+            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -638,12 +643,12 @@ public:
             if (agentConnectionManager != nullptr)
             {
                 // TODO: index -> validConnectionIdx conversion
-                auto valideConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
+                auto validConnectionIdx = std::find(pickUpIdx.begin(), pickUpIdx.end(), i) - pickUpIdx.begin();
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
                 TLLM_CHECK(cacheBufferId.has_value());
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, valideConnectionIdx);
+                    ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, validConnectionIdx);
             }
             else
             {
@@ -652,7 +657,8 @@ public:
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
-            contextState, resource->mBufferManager, &llmRequest);
+            contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(),
+            &llmRequest);
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -680,9 +686,9 @@ public:
         auto const& serializedInfo = oss.str();
         std::size_t const infoSize = serializedInfo.size();
         TransceiverTag::Id id{TransceiverTag::Id::REQUEST_SEND};
-        connection->send(executor::kv_cache::DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
-        connection->send(executor::kv_cache::DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
-        connection->send(executor::kv_cache::DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
+        connection->send(DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
+        connection->send(DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
+        connection->send(DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
     }
 
     ~Impl()
