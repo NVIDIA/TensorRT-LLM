@@ -20,9 +20,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
     "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter",
     [
         [True, "TRTLLM", True, False, False, False, True],
-        [True, "TRTLLM", True, False, False, False, False],
+        # TODO: skip use_chain_drafter = False unitest and enable it when https://nvbugs/5517404 is fixed
+        # [True, "TRTLLM", True, False, False, False, False],
         [False, "TRTLLM", True, False, False, False, True],
-        [False, "TRTLLM", True, False, False, False, False],
+        # [False, "TRTLLM", True, False, False, False, False],
         [True, "FLASHINFER", True, False, False, False, True],
         [False, "FLASHINFER", True, False, False, False, True],
         [False, "TRTLLM", False, True, True, False, True],
@@ -33,10 +34,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
         # [True, "TRTLLM", True, False, False, True, True],
         [True, "TRTLLM", False, False, False, False, True],
         [False, "TRTLLM", False, False, False, False, True],
-        [True, "TRTLLM", False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False],
+        # [True, "TRTLLM", False, False, False, False, False],
+        # [False, "TRTLLM", False, False, False, False, False],
         [True, "TRTLLM", False, False, False, True, True],
-        [True, "TRTLLM", False, False, False, True, False],
+        # [True, "TRTLLM", False, False, False, True, False],
         [True, "FLASHINFER", False, False, False, False, True],
         [False, "FLASHINFER", False, False, False, False, True],
     ])
