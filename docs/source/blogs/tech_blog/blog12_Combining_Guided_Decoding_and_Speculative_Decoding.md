@@ -96,7 +96,7 @@ However, the CUDA graph of the one-model implementation contains multiple forwar
 
 ### Target Model
 
-For a target model forward step, a request should have one new token and multiple draft tokens from the last verification step and drafter, respectively. For each token in the sequence, guided decoding should advance the grammar state and fill the mask tensor. Before sampling, the masks should be applied to the corresponding logits. After verification, the grammar state should be rolled back by the number of rejected tokens.
+For a target model forward, a request should have one new token and multiple draft tokens from the last verification step and drafter, respectively. For each token in the sequence, guided decoding should advance the grammar state and fill the mask tensor. Before sampling, the masks should be applied to the corresponding logits. After verification, the grammar state should be rolled back by the number of rejected tokens.
 
 Compared to guided decoding with non-speculative decoding, the rollback operation is newly introduced. Thankfully, it has built-in support by grammar backends like [XGrammar](https://github.com/mlc-ai/xgrammar/blob/v0.1.21/python/xgrammar/matcher.py#L341-L350) and [LLGuidance](https://github.com/guidance-ai/llguidance/blob/v1.1.1/python/llguidance/_lib.pyi#L363-L366).
 
@@ -142,7 +142,7 @@ Hence, we can launch grammar computation along with other auxiliary host functio
   <img src="../media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps_by_cuda_callback.png" width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: The CPU-GPU synchronization for multiple generation steps by CUDA callback.</em></sub></p>
+<p align="center"><sub><em>Figure 4: The CPU-GPU synchronization for multiple model forwards by CUDA callback.</em></sub></p>
 
 ### Integration to TensorRT LLM Python Runtime
 
@@ -238,7 +238,7 @@ After the first version was implemented, the program intermittently encountered 
 
 As documented, a CUDA callback must not make any CUDA API calls. This implies that the CUDA callback execution and CUDA API calls compete for the same mutex. Note that the trampoline function needs to [acquire the GIL](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L52) before calling the Python code. Hence, when executing Python code by a CUDA callback, it acquires a CUDA mutex and then the GIL. In the meanwhile, the Python main thread may hold the GIL and make CUDA API calls, so it acquires the GIL and then the CUDA mutex. The two threads acquire the two locks in opposite orders, which creates a deadlock pattern.
 
-This deadlock can be resolved if the Python main thread can release the GIL for CUDA API calls. TensorRT LLM Python runtime is built on PyTorch. Thankfully, PyTorch releases the GIL for most CUDA API calls, even including PyTorch custom operators. However, we find an exception in PyTorch 2.8 ([Issue 163062](https://github.com/pytorch/pytorch/issues/163062)). When creating a device tensor using a shape depending on data from another device tensor, it triggers an implicit and synchronized D2H copy, and this D2H copy is executed with GIL being held. This can be reproduced by the below code snippet:
+This deadlock can be resolved if the Python main thread can release the GIL for CUDA API calls. TensorRT LLM Python runtime is built on PyTorch. Thankfully, PyTorch releases the GIL for most CUDA API calls, even including PyTorch custom operators. However, we find two exceptions in PyTorch 2.8. When creating a device tensor using a shape depending on data from another device tensor, it triggers an implicit and synchronized D2H copy, and this D2H copy is executed with GIL being held ([Issue 163062](https://github.com/pytorch/pytorch/issues/163062)). This can be reproduced by the below code snippet:
 
 ```python
 import torch
@@ -247,9 +247,13 @@ x = torch.randint(0, 100, (100,), dtype=torch.int64, device='cuda')
 y = torch.zeros(100, x.max(), dtype=torch.int64, device='cuda')
 ```
 
-In addition, some runtime components are implemented in C++ and exposed as Python bindings, and they may make CUDA API calls as well. By default, Python bindings do not release GIL, so this could be another source of deadlock. Hence, we swept these Python bindings and release GIL properly.
+The other case is that `torch.compile` kernels are called with GIL being held ([Issue 163061](https://github.com/pytorch/pytorch/issues/163061)), although Triton kernels are called with GIL released. Hence, we have to avoid any problematic operations and disable `torch.compile` when using CUDA callback to Python code, until these issues are fixed by PyTorch.
 
-After all these efforts, the hang issue disappears. It is generally recommended to release the GIL when calling C++ code from Python; without the context of CUDA callback, this is beneficial for multi-threading performance. However, we have to admit that it is difficult to make sure that every such place has been properly handled, and future code changes do not introduce any such risks.
+Another source of risk comes from some runtime components that are implemented in C++ and exposed as Python bindings; they may make CUDA API calls as well. By default, Python bindings do not release GIL. Hence, we swept these Python bindings and release GIL properly in [PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948).
+
+After all these efforts, the hang issue disappears. It is generally recommended to release the GIL when calling C++ code from Python; even without the context of CUDA callback, this is beneficial for multi-threading performance. However, we acknowledge the limitation that it is difficult to make sure that every such place has been properly handled, and future code changes do not introduce any risks.
+
+> **Note:** Theoretically, the GIL-free Python ([PEP 703](https://peps.python.org/pep-0703)) could be another remedy.
 
 ## Performance and Analysis
 
@@ -302,7 +306,7 @@ Figures 7 and 8 show the results on JSON Schema Bench. The one-model EAGLE3 achi
 Table 1 lists the acceptance lengths. We perform an ablation experiment where the draft model does not apply grammar constraints. As presented, this does decrease acceptance rates, but by a slighter margin than expected. Note that it introduces extra overheads to apply grammar constraints on the draft model:
 
 * In the drafting loop, the extra mask applying kernels slightly contribute to the GPU time.
-* If the drafting steps are too fast to hide the grammar computation, the exposed CPU time will cause bubbles in the CPU timeline.
+* If the drafting forwards are too fast to hide the grammar computation, the exposed CPU time will cause bubbles in the CPU timeline.
 
 These extra overheads could partially offset the benefits from the improved acceptance.
 
