@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Union
 
 from typing_extensions import NotRequired, TypedDict
 
+from .multimodal import MultimodalParams
+
 
 class TextPrompt(TypedDict):
     """Schema for a text prompt."""
@@ -11,9 +13,12 @@ class TextPrompt(TypedDict):
     prompt: str
     """The input text to be tokenized before passing to the model."""
 
+    query: NotRequired[str]
+    """The query input text for star attention."""
+
     multi_modal_data: NotRequired[Dict[str, Any]]
     """
-    Optional multi-modal data to pass to the model,
+    Optional raw multi-modal data to pass to the model,
     if the model supports it.
     """
 
@@ -23,8 +28,17 @@ class TextPrompt(TypedDict):
     input processor for mm input processing.
     """
 
-    query: NotRequired[str]
-    """The query input text for star attention."""
+    multimodal_params: NotRequired[MultimodalParams]
+    """
+    Optional multimodal params(after preprocess) to pass to the model,
+    if the model supports it.
+    """
+
+    multimodal_embeddings: NotRequired[Dict[str, Any]]
+    """
+    Optional multimodal embeddings to pass to the model,
+    if the model supports it.
+    """
 
 
 class TokensPrompt(TypedDict):
@@ -33,9 +47,12 @@ class TokensPrompt(TypedDict):
     prompt_token_ids: List[int]
     """A list of token IDs to pass to the model."""
 
+    query_token_ids: NotRequired[List[int]]
+    """The query input token IDs for star attention."""
+
     multi_modal_data: NotRequired[Dict[str, Any]]
     """
-    Optional multi-modal data to pass to the model,
+    Optional raw multi-modal data to pass to the model,
     if the model supports it.
     """
 
@@ -45,8 +62,17 @@ class TokensPrompt(TypedDict):
     input processor for mm input processing.
     """
 
-    query_token_ids: NotRequired[List[int]]
-    """The query input token IDs for star attention."""
+    multimodal_params: NotRequired[MultimodalParams]
+    """
+    Optional multimodal params(after preprocess) to pass to the model,
+    if the model supports it.
+    """
+
+    multimodal_embeddings: NotRequired[Dict[str, Any]]
+    """
+    Optional multimodal embeddings to pass to the model,
+    if the model supports it.
+    """
 
 
 PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]
