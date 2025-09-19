@@ -1183,8 +1183,8 @@ class BaseLlmArgs(StrictBaseModel):
     fail_fast_on_attention_window_too_large: bool = Field(
         default=False,
         description=
-        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
-    )
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
+        status="prototype")
 
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
