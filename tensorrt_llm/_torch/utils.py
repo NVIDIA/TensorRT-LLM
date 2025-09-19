@@ -304,8 +304,6 @@ def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
     )
 
 
-# Development flag to control chain drafter feature
+# Development function to control chain drafter feature
 def _get_allow_chain_drafter() -> bool:
-    """Get the chain drafter flag from environment variable."""
-    # Use environment variable for cross-process compatibility
-    return os.getenv("TRTLLM_ALLOW_CHAIN_DRAFTER", "0") == "1"
+    return True

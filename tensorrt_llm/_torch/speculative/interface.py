@@ -111,20 +111,20 @@ class SpeculativeDecodingMode(IntEnum):
         return not issubclass(attention_backend,
                               TrtllmAttention) or get_sm_version() != 100
 
-    def attention_need_spec_dec_mode(self,
-                                     spec_resource_manager: BaseResourceManager,
-                                     is_draft_model: bool,
-                                     attention_backend: Type[AttentionBackend],
-                                     allow_chain_drafter: bool,
-                                     is_extend_ctx: bool):
+    def attention_need_spec_dec_mode(
+        self,
+        spec_resource_manager: BaseResourceManager,
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
+        allow_chain_drafter: bool,
+    ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
         return self.is_eagle3_one_model() or (
             self.is_eagle3() and spec_resource_manager.is_first_draft
-            and is_trtllm_attention and allow_chain_drafter
-            and not is_extend_ctx)
+            and is_trtllm_attention and allow_chain_drafter and is_draft_model)
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
