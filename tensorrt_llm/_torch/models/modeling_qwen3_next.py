@@ -42,7 +42,6 @@ from .modeling_utils import (DecoderModel, EagerFusionConfig,
 
 from transformers import Qwen3NextConfig
 
-
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(
@@ -662,9 +661,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
-        has_initial_states = kwargs["has_initial_states"]
+        batch_size = kwargs["batch_size"]
+        has_initial_states = kwargs["has_initial_states"][:batch_size]
         cache_indices = kwargs["cache_indices"]
-        query_start_loc = kwargs["query_start_loc"]
+        query_start_loc = kwargs["query_start_loc"][:batch_size + 1]
+        num_prefill_tokens = kwargs["num_prefill_tokens"]
+        num_decode_tokens = kwargs["num_decode_tokens"]
+        state_indices_p = kwargs["state_indices_p"]
+        state_indices_d = kwargs["state_indices_d"]
+        num_prefill = kwargs["num_prefill"]
+        num_decode = kwargs["num_decode"]
 
         is_target_verify = False # forward_batch.forward_mode.is_target_verify()
 
@@ -686,16 +692,45 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             conv_states_to_use = conv_states.clone()
         else:
             conv_states_to_use = conv_states
-        mixed_qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            conv_weights,
-            bias,
-            activation=activation,
-            conv_states=conv_states_to_use,
-            has_initial_state=has_initial_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-        ).transpose(0, 1)[:seq_len]
+
+        seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
+        req_split_size = [num_prefill, num_decode]
+        if num_decode_tokens > 0:
+            mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv, seqlen_split_size, dim=0)
+            query_start_loc_p = query_start_loc[:num_prefill + 1]
+            has_initial_states_p = has_initial_states[:num_prefill]
+
+            mixed_qkv_p = causal_conv1d_fn(
+                mixed_qkv_p.transpose(0, 1),
+                conv_weights,
+                bias,
+                activation=activation,
+                conv_states=conv_states_to_use,
+                has_initial_state=has_initial_states_p,
+                cache_indices=state_indices_p,
+                query_start_loc=query_start_loc_p,
+            ).transpose(0, 1) # [:seq_len]
+            
+            mixed_qkv_d = causal_conv1d_update(
+                mixed_qkv_d,
+                conv_states_to_use,
+                conv_weights,
+                bias,
+                activation,
+                conv_state_indices=state_indices_d,
+            )
+            mixed_qkv = torch.cat((mixed_qkv_p, mixed_qkv_d), dim=0)
+        else:
+            mixed_qkv = causal_conv1d_fn(
+                mixed_qkv.transpose(0, 1),
+                conv_weights,
+                bias,
+                activation=activation,
+                conv_states=conv_states_to_use,
+                has_initial_state=has_initial_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            ).transpose(0, 1) # [:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -737,7 +772,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         else:
             recurrent_state = ssm_states[cache_indices]
-            query_start_loc = query_start_loc.to(torch.long)
+
+            if num_decode > 0:
+                # TODO set it in mambaCacheManager
+                decode_query_start_loc = torch.arange(1, num_decode + 1, device=query_start_loc.device) # num_decode 个
+                decode_query_start_loc = decode_query_start_loc + query_start_loc[num_prefill]
+                new_query_start_loc = torch.cat([query_start_loc[:num_prefill + 1], decode_query_start_loc])
+            else:
+                new_query_start_loc = query_start_loc
+
+            new_query_start_loc = new_query_start_loc.to(torch.long)
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -746,7 +790,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=True,
-                cu_seqlens=query_start_loc,
+                cu_seqlens=new_query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
@@ -771,12 +815,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         seq_len, _ = hidden_states.shape
         conv_state, recurrent_state = None, None
 
-        # if cache_params is None:
-        #     raise ValueError("cache_params cannot be None")
-
-        # has_prefill = forward_batch.forward_mode.is_prefill_or_idle()
-        ### sglang linear attn
-
         ### mamba2_mixer layer
         # calculate split size
         num_prefills = attn_metadata.num_contexts
@@ -785,6 +823,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decode_tokens = attn_metadata.num_tokens - num_prefill_tokens
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
+        has_initial_states = mamba_metadata.has_initial_states
 
         state_indices = attn_metadata.kv_cache_manager.get_state_indices(
         )[:num_prefills + num_decodes]
@@ -795,6 +834,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.layer_idx)
         ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
             self.layer_idx)
+        if num_prefills > 0:
+            ssm_states[state_indices_p] = 0
+            # conv_states[state_indices_p] = 0 # not necessary
 
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
@@ -835,9 +877,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "layer_id": self.layer_idx,
             "seq_len": seq_len,
             "z": z,
-            "has_initial_states": mamba_metadata.has_initial_states,
+            "has_initial_states": has_initial_states,
             "cache_indices": state_indices,
             "query_start_loc": mamba_metadata.cu_seqlens,
+            "batch_size": attn_metadata.seq_lens.shape[0],
+            "num_prefill_tokens": num_prefill_tokens,
+            "num_decode_tokens": num_decode_tokens,
+            "state_indices_p": state_indices_p,
+            "state_indices_d": state_indices_d,
+            "num_prefill": num_prefills,
+            "num_decode": num_decodes,
         }
 
         new_implementation = True
@@ -975,16 +1024,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 )
                 out.append(core_attn_out)
 
-            if self.attn_tp_rank == 0 and self.layer_idx == 0:
-                decode_cu_seqlens = torch.arange(0, num_decodes + 1, device=mamba_metadata.cu_seqlens.device).to(torch.long)
-                print(f"mamba_metadata.cu_seqlens: {mamba_metadata.cu_seqlens.shape} {mamba_metadata.cu_seqlens}")
-                print(f"decode_cu_seqlens: {decode_cu_seqlens.shape} {decode_cu_seqlens}")
-                for i,tmp_out in enumerate(out):
-                    print(f"{i} tmp_out: {tmp_out.shape}")
-                    import sys
-                    sys.stdout.flush()
-                # import time
-                # time.sleep(10)
             attn_out = torch.cat(out, dim=1)
 
         z_shape_og = z.shape
