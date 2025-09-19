@@ -3,19 +3,6 @@ import enum
 import os
 from itertools import chain, product
 
-file_to_patch = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "../../../../../3rdparty/cutlass/python/cutlass_library/heuristics_provider.py"
-    ))
-# replace "from library import" to "from cutlass_library.library import"
-with open(file_to_patch, "r") as f:
-    file_contents = f.read()
-with open(file_to_patch, "w") as f:
-    f.write(
-        file_contents.replace("from library import",
-                              "from cutlass_library.library import"))
-
 from cutlass_library import *
 
 

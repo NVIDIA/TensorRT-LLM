@@ -1735,8 +1735,10 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize(
-    "model_name", ["llama-3.1-model/Meta-Llama-3.1-8B", "gpt_oss/gpt-oss-20b"])
+@pytest.mark.parametrize("model_name", [
+    "llama-3.1-model/Meta-Llama-3.1-8B",
+    pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)
+])
 def test_trtllm_benchmark_serving(llm_venv, model_name):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([

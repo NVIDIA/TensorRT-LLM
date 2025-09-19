@@ -3,7 +3,7 @@ import subprocess
 import sys
 
 import pytest
-from utils.util import skip_gpu_memory_less_than_80gb
+from utils.util import skip_gpu_memory_less_than_80gb, skip_pre_hopper
 
 from .openai_server import RemoteOpenAIServer
 
@@ -45,9 +45,11 @@ def dataset_path(dataset_name: str):
 
 
 @skip_gpu_memory_less_than_80gb
-@pytest.mark.parametrize(
-    "model_name", ["llama-3.1-model/Meta-Llama-3.1-8B", "gpt_oss/gpt-oss-20b"],
-    indirect=True)
+@pytest.mark.parametrize("model_name", [
+    "llama-3.1-model/Meta-Llama-3.1-8B",
+    pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)
+],
+                         indirect=True)
 def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
                                 model_path: str):
     model_name = model_path.split("/")[-1]

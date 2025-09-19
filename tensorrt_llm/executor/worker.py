@@ -11,6 +11,7 @@ from queue import Queue
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import zmq
 
 from tensorrt_llm.logger import logger
 
@@ -512,6 +513,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 else:
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
+            if executor_config is not None:
+                assert (
+                    len(prompt_token_ids) <= executor_config.max_seq_len
+                ), f"`prompt_token_ids` length ({len(prompt_token_ids)}) is greater than `max_seq_len` ({executor_config.max_seq_len})"
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
             if default_max_tokens <= 0:
@@ -772,6 +777,7 @@ def worker_main(
         worker_init_status_queue = IpcQueue(
             worker_queues.worker_init_status_queue_addr,
             is_server=False,
+            socket_type=zmq.DEALER,
             name="worker_init_status_queue")
         mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
                                        is_server=False,
@@ -865,7 +871,10 @@ def worker_main(
         logger.error(traceback.format_exc())
         print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
-            worker_init_status_queue.put((e, traceback.format_exc()))
+            # Send error message with confirmation
+            error_msg = (e, traceback.format_exc())
+            if not worker_init_status_queue.notify_with_retry(error_msg):
+                logger.error("Failed to deliver error message to proxy")
         return
 
     with worker:
@@ -883,7 +892,12 @@ def worker_main(
                                                    mp_stats_queue)
                 worker._set_iteration_result_queue(worker.kv_events_queues,
                                                    kv_cache_events_queue)
-                worker_init_status_queue.put((ready_signal, None))
+                # Send ready signal with confirmation
+                ready_msg = (ready_signal, None)
+                if not worker_init_status_queue.notify_with_retry(ready_msg):
+                    logger.warning(
+                        "Failed to deliver ready signal to proxy, continuing anyway"
+                    )
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
@@ -892,6 +906,7 @@ def worker_main(
                             worker.submit(req)
                         except RequestError as e:
                             logger.error(f"submit request failed: {e}")
+                            logger.error(traceback.format_exc())
                             worker._await_response_helper.temp_error_responses.put(
                                 ErrorResponse(req.id, e, req.id))
                     else:
