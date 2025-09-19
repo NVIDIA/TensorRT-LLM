@@ -1055,6 +1055,9 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.oPtr = reinterpret_cast<void*>(params.context_buf);
         tllmRunnerParams.oSfPtr = generation_params.context_buf_sf;
 
+        // softmax stats if needed
+        tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
+
         // MLA uses different head dimensions for Qk and V.
         tllmRunnerParams.mHeadDimQk = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
         tllmRunnerParams.mHeadDimV = mMLAParams.kv_lora_rank;
@@ -1821,7 +1824,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
-        fmhaParams.softmaxStatsPtr = params.softmaxStatsPtr;
+        fmhaParams.softmaxStatsPtr = params.softmax_stats;
 
         if (mAttentionChunkSize)
         {
@@ -2569,8 +2572,7 @@ int AttentionOp::initialize() noexcept
     if (mIsMLAEnabled)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "MLA(Deepseek v2) only support fmha");
-        TLLM_CHECK_WITH_INFO(
-            !mFP8ContextFMHA && !mDenseContextFMHA, "MLA(Deepseek v2) currently not support FP8 and dense fmha");
+        TLLM_CHECK_WITH_INFO(!mDenseContextFMHA, "MLA(Deepseek v2) currently not support dense fmha");
         TLLM_CHECK_WITH_INFO(
             mPagedKVCache && mUseKVCache && mRemovePadding, "MLA(Deepseek v2) only support paged kv cache");
         TLLM_CHECK_WITH_INFO(!mCrossAttention, "MLA(Deepseek v2) do not support cross attention right now");
@@ -2735,11 +2737,6 @@ int AttentionOp::initialize() noexcept
                 {
                     qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;
-                }
-                // When FP8 Context FMHA is enabled, the output data type needs to be E4M3.
-                if (mFP8ContextFMHA)
-                {
-                    outputDataType = DATA_TYPE_E4M3;
                 }
 
                 // Instantiate the mTllmGenFMHARunner used for MLA
