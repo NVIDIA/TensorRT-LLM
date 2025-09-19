@@ -304,6 +304,13 @@ class ResizeKVCache(BaseTransform):
             self._log_info(f"After all_gather - new_num_pages: {new_num_pages}")
 
             cm.resize_cache(new_num_pages)
+
+            # Log the final cache size for performance measurement, do not remove this log.
+            final_cache_size_bytes = cm.current_cache_size_bytes()
+            final_cache_size_gb = final_cache_size_bytes / (1024**3)  # Convert to GiB
+            ad_logger.info(
+                f"Final KV cache size after resize: {final_cache_size_gb:.2f} GiB ({new_num_pages} pages)"
+            )
         except Exception as e:
             ad_logger.warning(
                 f"Error encountered while resizing kv cache: {e}.\nSkipping cache resize."
