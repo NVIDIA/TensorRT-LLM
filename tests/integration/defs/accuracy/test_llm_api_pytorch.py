@@ -1193,6 +1193,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
+            max_num_tokens=512 if enable_chunked_prefill else None,
         )
         mtp_config = None
         if mtp_nextn > 0:
