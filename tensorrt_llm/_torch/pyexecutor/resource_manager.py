@@ -10,7 +10,6 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
@@ -279,11 +278,7 @@ class KVCacheManager(BaseResourceManager):
             # Standard case: use original Python implementation
             self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
                 kv_cache_config=kv_cache_config,
-                head_dim=head_dim,
-                tokens_per_block=tokens_per_block,
                 mapping=mapping,
-                dtype=dtype,
-                kv_factor=self.kv_factor,
             )
             blocks_per_window = {
                 self.max_attention_window_vec[0]:
@@ -567,8 +562,7 @@ class KVCacheManager(BaseResourceManager):
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig,
-                                 executor_config: ExecutorConfig,
-                                 mapping: Mapping):
+                                 tokens_per_block: int, mapping: Mapping):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
@@ -623,13 +617,9 @@ class KVCacheManager(BaseResourceManager):
                 scaling_factor_dtype=DataType.FP8)
         return cache_size_bytes_per_token
 
-    def calculate_max_num_blocks(self,
-                                 kv_cache_config: KvCacheConfigCpp,
-                                 head_dim: int,
-                                 tokens_per_block: int,
-                                 mapping: Mapping,
-                                 dtype: DataType,
-                                 kv_factor: int = 2):
+    def calculate_max_num_blocks(self, kv_cache_config: KvCacheConfigCpp,
+                                 mapping: Mapping):
+        tokens_per_block = self.tokens_per_block
         free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
                              if kv_cache_config.free_gpu_memory_fraction
                              is not None else 0.9)

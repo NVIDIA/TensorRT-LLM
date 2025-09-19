@@ -15,7 +15,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, next_power_of_two
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings.executor import ExecutorConfig, KvCacheConfig
+from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.mapping import Mapping
@@ -843,9 +843,7 @@ class RocketKVCacheManager(KVCacheManager):
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig,
-                                 executor_config: ExecutorConfig,
-                                 mapping: Mapping):
-        sparse_attn_config = executor_config.sparse_attention_config
+                                 tokens_per_block: int, mapping: Mapping):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
@@ -875,7 +873,7 @@ class RocketKVCacheManager(KVCacheManager):
 
         # K and V
         # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
-        tokens_per_block = executor_config.tokens_per_block
+        sparse_attn_config = model_config.sparse_attention_config
         kt_tokens_per_block = next_power_of_two(
             math.ceil(tokens_per_block / sparse_attn_config.page_size))
         kv_factor = 2 + 2 * kt_tokens_per_block / tokens_per_block
