@@ -16,10 +16,14 @@
  */
 #pragma once
 
-#include "CommonUtils.h"
 #include <cassert>
 #include <cstdint>
 #include <string>
+#ifndef TLLM_GEN_EXPORT_INTERFACE
+#include "trtllm/gen/CommonUtils.h"
+#else  // TLLM_GEN_EXPORT_INTERFACE
+#include "CommonUtils.h"
+#endif // TLLM_GEN_EXPORT_INTERFACE
 
 namespace batchedGemm
 {
