@@ -160,7 +160,7 @@ class Qwen3MoE(nn.Module):
 class Qwen3MoEDecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[Qwen3MoeConfig],
-                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType, 
+                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
                                                        torch.cuda.Stream]):
         super().__init__()
         self.model_config = model_config
