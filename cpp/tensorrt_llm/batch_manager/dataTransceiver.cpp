@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <future>
 #include <map>
@@ -241,6 +242,11 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     totalSize += su::serializedSize(requestInfo.mLastBlockKey);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
+}
+
+std::unordered_map<SizeType32, std::vector<size_t>> const& RequestInfo::getBlockHashesPerWindow() const noexcept
+{
+    return mBlockHashesPerWindow;
 }
 
 class CacheSender::Impl

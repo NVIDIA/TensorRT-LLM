@@ -816,11 +816,8 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("overlap_scheduler", [False, True])
-    def test_auto_dtype(self, overlap_scheduler):
-        pytest.skip(
-            "Currently we require full kvcache for variable sliding window. "
-            "This test only transfers the kvcache inside the sliding window.")
+    @pytest.mark.parametrize("block_reuse", [False, True])
+    def test_auto_dtype(self, block_reuse):
 
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -830,19 +827,19 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         gen_server_config = {
-            "disable_overlap_scheduler": overlap_scheduler,
+            "disable_overlap_scheduler": False,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
             }
         }
         ctx_server_config["kv_cache_config"] = {
-            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": True
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": block_reuse
         }
         gen_server_config["kv_cache_config"] = {
-            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": True
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": block_reuse
         }
         disaggregated_server_config = {
             "hostname": "localhost",

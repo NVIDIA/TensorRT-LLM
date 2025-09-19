@@ -212,7 +212,10 @@ CacheTransBufferManager::CacheTransBufferManager(
             auto windowSize = static_cast<size_t>(mCacheManager->getBlockManager().getPoolWindowSize(poolIdx));
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
-            // if windowSize % (tokensPerBlock) !=0
+            if (common::getEnvKVCacheTransferAllBlocksForWindow())
+            {
+                validTokenNum = maxNumTokens.value();
+            }
             validTokenNum += tokensPerBlock; // add one more block
 
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
@@ -241,8 +244,8 @@ CacheTransBufferManager::CacheTransBufferManager(
     allocateBuffer();
 }
 
-size_t CacheTransBufferManager::preAllocBufferSize(size_t tokensPerBlock,
-    std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
+size_t CacheTransBufferManager::preAllocBufferSize(
+    std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow, SizeType32 tokensPerBlock,
     std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig)
 {
     if (!cacheTransceiverConfig.has_value())
@@ -262,6 +265,10 @@ size_t CacheTransBufferManager::preAllocBufferSize(size_t tokensPerBlock,
         {
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+            if (common::getEnvKVCacheTransferAllBlocksForWindow())
+            {
+                validTokenNum = maxNumTokens.value();
+            }
             validTokenNum += tokensPerBlock; // add one more block
             TransferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
