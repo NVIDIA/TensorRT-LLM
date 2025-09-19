@@ -1369,6 +1369,7 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
 
             # Multimodal
             py_multimodal_runtime = MultimodalRuntimeData(
@@ -1474,6 +1475,7 @@ class PyTorchModelEngine(ModelEngine):
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -1506,6 +1508,7 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     num_cached_tokens_per_seq.append(past_seen_token_num +
                                                      self.runtime_draft_len + 1)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend):
                     prompt_lengths.append(1 + self.runtime_draft_len)
@@ -1537,6 +1540,7 @@ class PyTorchModelEngine(ModelEngine):
 
                 position_ids.append(past_seen_token_num)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
@@ -2015,6 +2019,7 @@ class PyTorchModelEngine(ModelEngine):
             sequence_lengths.append(len(input_id))
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
         num_contexts = len(sequence_lengths)
         for request in scheduled_requests.context_requests:
             ctx_iter = request.ctx_iters
@@ -2054,6 +2059,7 @@ class PyTorchModelEngine(ModelEngine):
             sequence_lengths.append(len(input_id))
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
         num_queries = len(sequence_lengths) - num_contexts
 
         # Requests with draft tokens are treated like extend requests.
@@ -2111,6 +2117,7 @@ class PyTorchModelEngine(ModelEngine):
             position_ids.append(last_query_pos_id + request.gen_iters + 1)
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
 
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
