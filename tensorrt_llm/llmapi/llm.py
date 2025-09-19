@@ -435,7 +435,6 @@ class BaseLLM:
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
             sampling_params,
-            streaming=streaming,
             is_gen_only=is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
@@ -574,7 +573,6 @@ class BaseLLM:
                          prompt_len: int,
                          query_len: int,
                          sampling_params: SamplingParams,
-                         streaming: bool = False,
                          is_gen_only: bool = False) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:

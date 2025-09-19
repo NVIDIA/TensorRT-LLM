@@ -1885,7 +1885,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
             asyncio.run(main())
 
 
-# @force_ampere
+@force_ampere
 @pytest.mark.parametrize(
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
     [
@@ -1907,7 +1907,7 @@ def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                                      backend=backend)
 
 
-# @force_ampere
+@force_ampere
 def test_llm_return_logprobs_streaming():
     llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
 
