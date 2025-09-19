@@ -9,7 +9,7 @@ except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
 from tensorrt_llm._torch.distributed.communicator import TorchDist
-from tensorrt_llm._utils import get_free_port, mpi_disabled
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -185,7 +185,6 @@ class AllreducePGTest:
         return True
 
 
-@pytest.mark.skipif(not mpi_disabled(), reason="Only tested in ray stage")
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Requires at least 2 GPUs for this test")
 @pytest.mark.parametrize("hidden_size", [128, 1024],
@@ -254,7 +253,6 @@ def test_allgather_pg_op(seq_len, hidden_size, var_len):
         assert r is True
 
 
-@pytest.mark.skipif(not mpi_disabled(), reason="Only tested in ray stage")
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Requires at least 2 GPUs for this test")
 @pytest.mark.parametrize("hidden_size", [128, 1024],
@@ -331,7 +329,6 @@ def test_reducescatter_pg_op(seq_len, hidden_size, var_len):
         assert r is True
 
 
-@pytest.mark.skipif(not mpi_disabled(), reason="Only tested in ray stage")
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Requires at least 2 GPUs for this test")
 @pytest.mark.parametrize("hidden_size", [128, 1024],
