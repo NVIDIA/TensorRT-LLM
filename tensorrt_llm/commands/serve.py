@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 import signal  # Added import
 import subprocess  # nosec B404
@@ -482,6 +483,10 @@ def disaggregated(config_file: Optional[str],
                                 server_start_timeout_secs=server_start_timeout,
                                 metadata_server_cfg=metadata_server_cfg,
                                 metrics_interval_secs=metrics_log_interval)
+
+    # Disable GC by default
+    if int(os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1")):
+        gc.disable()
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 
