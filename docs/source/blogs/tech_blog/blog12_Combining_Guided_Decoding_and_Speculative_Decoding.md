@@ -7,8 +7,8 @@
   - [Table of Contents](#table-of-contents)
   - [Background and Challenges](#background-and-challenges)
     - [Motivation](#motivation)
-    - [Speculative Decoding](#speculative-decoding)
     - [Guided Decoding](#guided-decoding)
+    - [Speculative Decoding](#speculative-decoding)
     - [Two Challenges](#two-challenges)
   - [Trace Grammar State for Draft Token Proposal and Rejection](#trace-grammar-state-for-draft-token-proposal-and-rejection)
     - [Target Model](#target-model)
@@ -39,58 +39,58 @@ More complicated (higher-order) combinations are also supported; for example, we
 
 Among all these tasks, combining guided decoding with one-model speculative decoding is the most challenging one, and it achieves the best performance for low-latency or throughput@latency scenarios. This blog post shares the overall design, implementation details, and performance analysis.
 
-### Speculative Decoding
-
-Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward step. Compared with normal LLM inference where each model forward generates a single token, speculative decoding effectively makes the generation phase less memory-bound.
-
-TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and is coupled with the modeling code, but it offers the best performance. The two-model implementation decouples the target and draft models into separate CUDA graphs, which is much more flexible and offers better feature coverage.
-
-<div align="center">
-<figure>
-  <img src="../media/tech_blog12_one_model_vs_two_model.png" width="600">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 1: The GPU timelines of one-model and tow-model speculative decoding.</em></sub></p>
-
 ### Guided Decoding
 
 Guided decoding (or interchangeably constrained decoding, structured generation) guarantees that the LLM outputs are amenable to a user-specified grammar (e.g., JSON schema), which is particularly useful for LLM agents. For example, guided decoding can help an LLM generate function arguments that strictly conform to function signatures. Thus, the LLM can correctly call external tools and integrate the tool calling results for a better response.
 
-For a request at the prefill step, guided decoding creates an initial grammar state (i.e., grammar initialization), and generates a mask tensor indicating which tokens from the vocabulary are allowed for the first generated token (i.e., mask gen). At each generation step, guided decoding advances the grammar state based on the last generated token (i.e., grammar advance), and generates a mask tensor for the next token. The mask will be applied to the logits to mask out the disallowed tokens before sampling (i.e., mask applying), which ensures the next token is amenable to the grammar constraints.
+For a request at the prefill phase, guided decoding creates an initial grammar state (i.e., grammar compilation), and generates a mask tensor indicating which tokens from the vocabulary are allowed for the first generated token (i.e., mask gen). At each generation phase, guided decoding advances the grammar state based on the last generated token (i.e., grammar advance), and generates a mask tensor for the next token. The mask will be applied to the logits to mask out the disallowed tokens before sampling (i.e., mask applying), which ensures the next token is amenable to the grammar constraints.
 
-TensorRT LLM integrates third-party grammar backends (e.g., [XGrammar](https://github.com/mlc-ai/xgrammar), [LLGuidance](https://github.com/guidance-ai/llguidance)) for the grammar computation. Currently, these grammar backends are implemented on CPU, so the grammar computation introduces significant CPU overhead. Fortunately, this can be overlapped with the GPU computation, achieving [near-zero overhead](https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar).
+TensorRT LLM integrates third-party grammar backends (e.g., [XGrammar](https://github.com/mlc-ai/xgrammar), [LLGuidance](https://github.com/guidance-ai/llguidance)) for the grammar computation. Currently, these grammar backends are implemented on CPU, so the grammar computation introduces significant CPU overhead. Fortunately, this can be overlapped with the GPU computation, achieving [near-zero overhead](https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar). The core idea is that at every iteration, we should first launch the model forward to make the GPU busy, and then compute grammar compilation/advance and mask gen on CPU. Once both the computations finish, the mask can be applied to the logits before sampling.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog12_constrained_decoding_pipeline_overlap.png" width="600">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 2: Top: guided decoding pipeline without overlapping. Bottom: guided decoding pipeline with overlapping. (The figure is from the XGrammar paper.)</em></sub></p>
+<p align="center"><sub><em>Figure 1: Top: guided decoding timeline without overlapping. Bottom: guided decoding timeline with overlapping. (This figure is from the XGrammar paper.)</em></sub></p>
+
+### Speculative Decoding
+
+Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward. Compared with normal LLM inference where each model forward generates a single token, speculative decoding effectively makes the generation phase less memory-bound.
+
+TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and is coupled with the modeling code, but it offers the best performance. The two-model implementation decouples the target and draft models into separate CUDA graphs, which is much more flexible and offers better feature coverage. There are on-going efforts to close the gaps between the two implementations.
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog12_one_model_vs_two_model.png" width="600">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2: Top: GPU timeline of one-model speculative decoding. Bottom: GPU timeline of two-model speculative decoding.</em></sub></p>
 
 ### Two Challenges
 
-When combining guided decoding and speculative decoding, two challenges arise. First, at each generation step, speculative decoding proposes multiple draft tokens, and some of them might be rejected in the verification step. The draft token proposal and rejection are not transparent to guided decoding. Specifically, this can be broken down into two views:
+When combining guided decoding and speculative decoding, two challenges arise. First, at each generation iteration, speculative decoding proposes multiple draft tokens, and some of them might be rejected in the verification step. The draft token proposal and rejection are not transparent to guided decoding. Specifically, this can be broken down into two views:
 
 * For the target model, guided decoding should advance the grammar state and generate the mask for every draft token. If some draft tokens are rejected, guided decoding should rollback the grammar state to the last accepted token.
 * For the draft model, without grammar constraints, some draft tokens may violate the grammar and thus be forcefully rejected in the verification step. Clearly, this hurts the acceptance rate. Hence, guided decoding should also intervene on the logits for every draft token generation if possible.
   * Some speculative algorithms propose draft tokens recurrently by computing logits and sampling (e.g., the standard draft-target model, EAGLE or MTP), similarly to a standard LLM. In that case, guided decoding can apply grammar constraints in a similar mask gen and applying way.
   * Some drafting algorithms work without logits sampling, which require other ways to apply the grammar constraints.
 
-Second, the CPU-GPU synchronization is challenging when multiple (draft and target) generation steps are launched by a single CUDA graph.
-For every step $i$, there are two event waits:
+Second, specific to the one-model speculative decoding where a single CUDA graph contains multiple (draft and target) model forwards, the CPU-GPU synchronization becomes challenging. Note that for every step $i$, there are two event waits:
 
-* The host waits the CPU tokens (asynchronously copied from GPU tokens) from step $i-1$.
-* The model forward stream waits the GPU masks (asynchronously copied from CPU masks) from step $i$.
-
-If multi-step forwards are launched by a single CUDA graph, it is not possible to let the CUDA graph wait events recorded from the host anymore.
+* The host waits the *token event* that indicates the readiness of CPU tokens from step $i-1$.
+* The model forward stream waits the *mask event* that indicates the readiness of GPU masks from step $i$.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps.png" width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3: The CPU-GPU synchronization for multiple generation steps.</em></sub></p>
+<p align="center"><sub><em>Figure 3: The CPU-GPU synchronization for multiple model forwards.</em></sub></p>
 
+Note that in the two-model implementation, the sampling is excluded from the CUDA graphs for better flexibility (Figure 2). From the CPU perspective, this offers a timing for the grammar computation. In particular, the mask event wait can be inserted between the CUDA graph replay and sampling, effectively making the GPU wait for the GPU masks asynchronously copied from CPU.
+
+However, the CUDA graph of the one-model implementation contains multiple forwards, inevitably including the sampling operations. Hence, there is no timing for the grammar computation. The most outstanding problem is that when replaying the CUDA graph, the mask event wait cannot be inserted before sampling. An alternative is capturing the events and waits in the CUDA graph, but it is still ineffective because the grammar computation is on CPU and thus not capturable. Once such a CUDA graph is launched to replay, the GPU does not wait any newly recorded events, so it is impossible to block the GPU for the readiness of masks.
 
 ## Trace Grammar State for Draft Token Proposal and Rejection
 
@@ -116,14 +116,14 @@ One special case is EAGLE3, whose draft model has a [pruned vocabulary](https://
 
 ### CUDA Callback
 
-CUDA graph can help eliminate the CPU overhead, which is an important technique in the LLM inference systems, especially for the generation phase. As aforementioned, the one-model speculative decoding implementation launches a single CUDA graph to compute multi-step draft and target model forwards. This makes the CPU-GPU synchronization challenging: Once the CUDA graph is launched, the CUDA stream cannot wait the events recorded from the host anymore.
+CUDA graph can help eliminate the CPU overhead, which is an important technique in the LLM inference systems, especially for the generation phase. As aforementioned, the one-model speculative decoding implementation launches a single CUDA graph to compute multiple draft and target model forwards. This makes the CPU-GPU synchronization challenging: the sampling operation depends on masks computed on CPU, but the GPU is not able to wait the readiness of any CPU computation once the CUDA graph is launched.
 
-CUDA callback [`cudaLaunchHostFunc`](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g05841eaa5f90f27124241baafb3e856f) can launch a host function to a CUDA stream. (The host function should not call any CUDA API) This has two crucial implications:
+CUDA callback [`cudaLaunchHostFunc`](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g05841eaa5f90f27124241baafb3e856f) can launch a host function to a CUDA stream. (The host function should not call any CUDA API.) This has two crucial implications:
 
 * CUDA events and event waits can be inserted before and after the host functions, which can be used to synchronize the CPU and GPU computation.
 * The host functions can be captured and replayed by CUDA graph.
 
-Hence, we can launch grammar computation along with other auxiliary host functions as CUDA callbacks to a CUDA stream. The CUDA graph should capture and replay multi-step model forwards and corresponding grammar computation all together. To achieve CPU-GPU overlap, the grammar computation should be placed on a dedicated CUDA stream. Specifically, for every step $i$:
+Hence, we can launch grammar computation along with other auxiliary host functions as CUDA callbacks to a CUDA stream. The CUDA graph should capture and replay multiple model forwards and corresponding grammar computation all together. To achieve CPU-GPU overlapping, the grammar computation should be placed on a dedicated CUDA stream. Specifically, for every step $i$:
 
 * The grammar stream:
   * waits the *token event* that indicates the readiness of CPU tokens from step $i-1$;
@@ -202,7 +202,7 @@ Guided decoder manages the below buffers and resources:
 
 The buffers are stored in fixed memories, and the resources are accessed via fixed pointers. This makes grammar computation compatible with CUDA graph. The buffers and resources are connected via slot IDs. In the runtime, each request is assigned with an exclusive slot ID (0 <= slot ID < `max_batch_size`) upon the first scheduling. The slot ID is occupied until the request is finished and removed from the scheduler.
 
-When the runtime schedules a new batch of requests, the guided decoder updates the request states on the host. After that, all the other operations (grammar initialization/advance, mask gen, buffer copying, etc.) happen on CUDA streams and should be capturable by CUDA graph. More specifically, buffer copying should be asynchronous, and the other CPU computation should be CUDA callbacks.
+When the runtime schedules a new batch of requests, the guided decoder updates the request states on the host. After that, all the other operations (grammar compilation/advance, mask gen, buffer copying, etc.) happen on CUDA streams and should be capturable by CUDA graph. More specifically, buffer copying should be asynchronous, and the other CPU computation should be CUDA callbacks.
 
 ### CUDA Graph Compatibility: Mask Applying Kernel
 
