@@ -578,11 +578,6 @@ class BaseLLM:
                          is_gen_only: bool = False) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
-            if streaming and sampling_params.prompt_logprobs:
-                raise ValueError(
-                    "prompt_logprobs is not yet supported in streaming mode for PyTorch backend. "
-                    "Please either disable streaming or set prompt_logprobs=None."
-                )
             if sampling_params.logprobs and sampling_params.logprobs > 1:
                 raise ValueError(
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."

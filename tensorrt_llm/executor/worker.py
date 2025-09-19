@@ -1058,6 +1058,28 @@ def _get_params_for_first_rsp(
     return None, None
 
 
+def _compute_pytorch_prompt_logprobs(
+        generation_result: GenerationResult,
+        response: LlmResponse) -> Optional[LogProbsResult]:
+    """Compute prompt logprobs for PyTorch backend (cached when streaming) """
+    logprob_params = generation_result._logprob_params  # should be present and non None
+    assert logprob_params is not None
+    if generation_result._streaming:
+        cached = getattr(generation_result, '_cached_prompt_logprobs', None)
+        if cached is not None:
+            return LogProbsResult(
+                prompt=cached, generation=None
+            )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
+    context_logits = response.result.context_logits
+    assert context_logits is not None, "context_logits cannot be None when prompt_logprobs is requested."
+    logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
+                                       context_logits, None, None)
+    if generation_result._streaming:
+        generation_result._cached_prompt_logprobs = logprobs_result.prompt
+
+    return logprobs_result
+
+
 def _get_logprobs(worker,
                   response: Union[tllm.Response, LlmResponse],
                   is_pytorch_backend=False) -> Optional[LogProbsResult]:
@@ -1081,18 +1103,12 @@ def _get_logprobs(worker,
                 # PyTorch: generation logprobs computed in sampler, no post-processing needed
                 return
             else:
-                # PyTorch: compute only prompt logprobs from context logits
-                # This can be done as a postprocessing step instead of coupling it to the
-                # pytorch engine, because prompt_logprobs calculation is not complicated by
-                # generation sampling strategies. Therefore it is simpler to do it here than
-                # doing it in the pytorch engine and plumbing it through the response.
-                logprobs_result = compute_logprobs(
-                    logprob_params.prompt_logprobs, None,
-                    response.result.context_logits, None, None)
-                # Drop context logits if user didn't explicitly request them
-                if logprob_params.drop_context_logits and hasattr(
-                        response, 'clear_context_logits'):
+                logprobs_result = _compute_pytorch_prompt_logprobs(
+                    generation_result, response)
+
+                if logprob_params.drop_context_logits:
                     response.clear_context_logits()
+
                 return logprobs_result
 
         # TRT backend: compute both prompt and generation logprobs from logits
