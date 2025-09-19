@@ -14,7 +14,7 @@ l0_a100:
       backend: "pytorch"
   tests:
     - unittest/llmapi/test_llm_pytorch.py
-    - unittest/llmapi/test_mpi_session.py # generic tests
+    - unittest/llmapi/test_mpi_session.py ISOLATION
     - unittest/trt/model_api/test_model_quantization.py
 - condition:
     ranges:
