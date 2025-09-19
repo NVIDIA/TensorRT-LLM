@@ -4,12 +4,17 @@ from collections.abc import Iterable
 from typing import Dict, List, Optional
 
 import torch
+from transformers import AutoTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import \
+    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode
+from tensorrt_llm.inputs.registry import (create_input_processor,
+                                          create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (PeftCacheConfig, SamplerType,
                                           SpeculativeConfig)
 from tensorrt_llm.logger import logger
@@ -43,23 +48,16 @@ GB = 1 << 30
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
-    def __init__(
-        self,
-        *,
-        model_engine: PyTorchModelEngine,
-        draft_model_engine: Optional[PyTorchModelEngine],
-        mapping: Mapping,
-        net_max_seq_len: int,
-        kv_connector_manager: Optional[KvCacheConnectorManager],
-        max_num_tokens: int,
-        max_beam_width: int,
-        tokens_per_block: int,
-        max_seq_len: int,
-        max_batch_size: int,
-        kv_cache_config: trtllm.KvCacheConfig,
-        pytorch_backend_config: PyTorchConfig,
-        speculative_config: SpeculativeConfig,
-    ):
+    def __init__(self, *, model_engine: PyTorchModelEngine,
+                 draft_model_engine: Optional[PyTorchModelEngine],
+                 mapping: Mapping, net_max_seq_len: int,
+                 kv_connector_manager: Optional[KvCacheConnectorManager],
+                 max_num_tokens: int, max_beam_width: int,
+                 tokens_per_block: int, max_seq_len: int, max_batch_size: int,
+                 kv_cache_config: trtllm.KvCacheConfig,
+                 pytorch_backend_config: PyTorchConfig,
+                 speculative_config: SpeculativeConfig,
+                 profiling_stage_data: Optional[dict]):
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
         self._mapping = mapping
@@ -67,14 +65,15 @@ class KvCacheCreator:
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
+        self._max_seq_len = max_seq_len
         self._dummy_reqs = self._create_dummy_context_requests(net_max_seq_len -
                                                                1)
         self._kv_connector_manager = kv_connector_manager
         self._pytorch_backend_config = pytorch_backend_config
         self._speculative_config = speculative_config
         self._tokens_per_block = tokens_per_block
-        self._max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
+        self._profiling_stage_data = profiling_stage_data
 
     @staticmethod
     def _get_cache_size_per_token(model_config: ModelConfig,
@@ -150,13 +149,76 @@ class KvCacheCreator:
             f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
         return int(available_kv_mem)
 
+    def _create_dummy_mm_context_request(
+            self, input_seq_len: int) -> List[trtllm.Request]:
+        requests = []
+        self._model_name_or_path = getattr(self._model_engine.model,
+                                           "name_or_path", None)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self._model_name_or_path)
+        input_processor = create_input_processor(self._model_name_or_path,
+                                                 self._tokenizer)
+        if not (hasattr(input_processor, "get_dummy_prompt")):
+            logger.warning("The input processor of the model does not have the method [get_prompt_for_profiling] implemented." \
+            "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
+            "ViT's encoder")
+            return requests
+        text_prompt = input_processor.get_dummy_prompt(input_seq_len,
+                                                       {'image': 1})
+        max_beam_width = self._max_beam_width
+        input_processor_with_hash = create_input_processor_with_hash(
+            input_processor)
+        prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
+            text_prompt, None)
+        multimodal_input = extra_processed_inputs.get('multimodal_input')
+        multimodal_data = extra_processed_inputs.get('multimodal_data')
+
+        max_num_tokens = len(prompt_token_ids)
+        remaining_tokens = max(max_num_tokens, input_seq_len)
+        if remaining_tokens > input_seq_len:
+            logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len. " \
+                           f"Multimodal prompt has {remaining_tokens} while the input_seq_len is: {input_seq_len}")
+        ## add + 1 to avoid error: RuntimeError: The max KV cache length of input sequences (X + 1) exceeds the KV cache manager's maximum supported length X.
+        ## at line "/code/tensorrt_llm/tensorrt_llm/_torch/attention_backend/trtllm.py", line 837
+        self._max_seq_len = remaining_tokens + 1
+        while remaining_tokens > 0:
+            req_mm_input = trtllm.MultimodalInput(
+                multimodal_hashes=multimodal_input.multimodal_hashes,
+                multimodal_positions=multimodal_input.multimodal_positions,
+                multimodal_lengths=multimodal_input.multimodal_lengths
+            ) if multimodal_input else None
+            request = trtllm.Request(prompt_token_ids,
+                                     max_tokens=1,
+                                     streaming=False,
+                                     sampling_config=trtllm.SamplingConfig(
+                                         beam_width=max_beam_width, ),
+                                     output_config=trtllm.OutputConfig(),
+                                     end_id=-1,
+                                     multimodal_input=req_mm_input)
+            request.py_multimodal_data = multimodal_data
+            remaining_tokens -= max_num_tokens
+            requests.append(request)
+
+        if self._mapping.enable_attention_dp:
+            requests = requests * self._mapping.tp_size
+
+        return requests
+
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
+        requests = []
+        if hasattr(self._model_engine.model,
+                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                       self._model_engine.model.original_arch, None):
+            requests = self._create_dummy_mm_context_request(input_seq_len)
+        # if succeed profiling with multimodal requests then return, otherwise profile
+        # with default case
+        if requests:
+            return requests
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
 
-        requests = []
         input_seq_len = min(max_num_tokens, input_seq_len)
         remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
@@ -351,6 +413,9 @@ class KvCacheCreator:
         )
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        if isinstance(self._profiling_stage_data, dict):
+            self._profiling_stage_data[
+                "max_gpu_total_bytes"] = kv_cache_max_memory
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(

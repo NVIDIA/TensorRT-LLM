@@ -1,7 +1,8 @@
 from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .multimodal import MultimodalInput
-from .registry import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from .registry import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
+                       ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, create_input_processor,
                        create_input_processor_with_hash,
                        register_input_processor)
@@ -28,6 +29,7 @@ __all__ = [
     "create_input_processor_with_hash",
     "register_input_processor",
     "ExtraProcessedInputs",
+    "BaseDummyInputsBuilder",
     "BaseMultimodalInputProcessor",
     "MultimodalPlaceholderMetadata",
     "MultimodalPlaceholderPlacement",

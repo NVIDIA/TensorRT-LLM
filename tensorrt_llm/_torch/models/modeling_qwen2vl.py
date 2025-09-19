@@ -1,9 +1,11 @@
 import copy
 import os
+import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from PIL import Image
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
@@ -12,9 +14,11 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..._utils import nvtx_range_debug
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from ...inputs import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
+                       ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
+                       default_multimodal_input_loader,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -28,7 +32,8 @@ from .modeling_utils import register_auto_model, register_vision_encoder
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
+class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
+                                BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -38,6 +43,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         self.model_config = model_config
         self.tokenizer = tokenizer
         self.use_fast = True
+        self.model_path = model_path
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             use_fast=self.use_fast,
@@ -222,6 +228,32 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
+    def get_dummy_text(self, input_seq_len: int):
+        return self.tokenizer.decode([
+            random.randint(0, self.model_config.vocab_size - 1)
+            for _ in range(input_seq_len)
+        ])
+
+    def get_dummy_images(self, max_width: int, max_height: int,
+                         num_images: int):
+        image = Image.new("RGB", (max_width, max_height), color=255)
+        return [image] * num_images
+
+    def get_dummy_prompt(self, input_seq_len: int, mm_data: dict):
+        num_images = mm_data.get("image", 0)
+        text = self.get_dummy_text(input_seq_len)
+        images = self.get_dummy_images(
+            max_width=3584, max_height=3584,
+            num_images=num_images)  #w, h is sqrt of max_pixels value (12845056)
+        return default_multimodal_input_loader(
+            tokenizer=self.tokenizer,
+            model_dir=self.model_path,
+            model_type=self.model_config.model_type,
+            modality="image",
+            prompts=[text],
+            media=[images],
+            image_data_format="pt")[0]
+
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
         images = mm_data.get("image")
@@ -279,7 +311,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
             processed_inputs = self._preprocess(text_prompt, mm_data,
                                                 mm_processor_kwargs)
         if not mm_data:
-            fused_input_ids = processed_inputs['input_ids']
+            fused_input_ids = processed_inputs['input_ids'][0]
             return fused_input_ids.flatten().to(torch.int32).tolist(), {}
 
         pixel_values = processed_inputs.get('pixel_values', None)
@@ -437,7 +469,7 @@ class Qwen2VLModelBase(PreTrainedModel):
     ) -> None:
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
-
+        self.original_arch = model_config.pretrained_config.architectures[0]
         assert model_config.attn_backend == 'TRTLLM', "Qwen2/2.5-VL only supports TRTLLM backend now"
         super().__init__(config)
 
