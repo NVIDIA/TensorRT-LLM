@@ -582,18 +582,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         **kwargs,
     ):
         mixed_qkv = kwargs["mixed_qkv"]
-        conv_weights = kwargs["conv_weights"]
-        bias = kwargs["bias"]
-        activation = kwargs["activation"]
-        key_dim = kwargs["key_dim"]
-        value_dim = kwargs["value_dim"]
-        attn_tp_size = kwargs["attention_tp_size"]
-        head_k_dim = kwargs["head_k_dim"]
-        head_v_dim = kwargs["head_v_dim"]
         a = kwargs["a"]
         b = kwargs["b"]
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
         cache_indices = kwargs["cache_indices"]
 
         query_start_loc = torch.arange(0, num_decodes + 1, device=cu_seqlens.device).to(torch.long)
@@ -601,31 +591,31 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
-            conv_weights,
-            bias,
-            activation,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            self.activation,
             conv_state_indices=cache_indices,
         )
 
         query, key, value = torch.split(
             mixed_qkv,
             [
-                key_dim // attn_tp_size,
-                key_dim // attn_tp_size,
-                value_dim // attn_tp_size,
+                self.key_dim // self.attn_tp_size,
+                self.key_dim // self.attn_tp_size,
+                self.value_dim // self.attn_tp_size,
             ],
             dim=-1,
         )
         # Reshape from [l, h*d] to [1, l, h, d]
         seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
-        query = query.view(1, seq_len, num_heads, head_k_dim)
-        key = key.view(1, seq_len, num_heads, head_k_dim)
-        value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+        num_heads = query.shape[1] // self.head_k_dim
+        query = query.view(1, seq_len, num_heads, self.head_k_dim)
+        key = key.view(1, seq_len, num_heads, self.head_k_dim)
+        value = value.view(1, seq_len, value.shape[1] // self.head_v_dim, self.head_v_dim)
 
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
-            A_log=A_log,
-            dt_bias=dt_bias,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
             q=query,
             k=key,
             v=value,
@@ -647,20 +637,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         **kwargs,
     ):
         mixed_qkv = kwargs["mixed_qkv"]
-        conv_weights = kwargs["conv_weights"]
-        bias = kwargs["bias"]
-        activation = kwargs["activation"]
-        key_dim = kwargs["key_dim"]
-        value_dim = kwargs["value_dim"]
-        attn_tp_size = kwargs["attention_tp_size"]
-        head_k_dim = kwargs["head_k_dim"]
-        head_v_dim = kwargs["head_v_dim"]
         a = kwargs["a"]
         b = kwargs["b"]
-        A_log = kwargs["A_log"]
-        dt_bias = kwargs["dt_bias"]
-        layer_id = kwargs["layer_id"]
-        seq_len = kwargs["seq_len"]
         batch_size = kwargs["batch_size"]
         has_initial_states = kwargs["has_initial_states"][:batch_size]
         cache_indices = kwargs["cache_indices"]
@@ -672,29 +650,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_prefill = kwargs["num_prefill"]
         num_decode = kwargs["num_decode"]
 
-        is_target_verify = False # forward_batch.forward_mode.is_target_verify()
-
-        if is_target_verify:
-            (
-                conv_states,
-                ssm_states,
-                mixed_qkv_cache,
-                intermediate_state_cache,
-            ) = self.req_to_token_pool.get_mamba_params(layer_id)
-            mixed_qkv_cache[cache_indices] = mixed_qkv.view(
-                (-1,) + mixed_qkv_cache.shape[1:]
-            ).clone()
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
-            conv_states_to_use = conv_states.clone()
-        else:
-            conv_states_to_use = conv_states
+        conv_states_to_use = conv_states
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
-        req_split_size = [num_prefill, num_decode]
         if num_decode_tokens > 0:
             mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv, seqlen_split_size, dim=0)
             query_start_loc_p = query_start_loc[:num_prefill + 1]
@@ -702,38 +660,38 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
             mixed_qkv_p = causal_conv1d_fn(
                 mixed_qkv_p.transpose(0, 1),
-                conv_weights,
-                bias,
-                activation=activation,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                activation=self.activation,
                 conv_states=conv_states_to_use,
                 has_initial_state=has_initial_states_p,
                 cache_indices=state_indices_p,
                 query_start_loc=query_start_loc_p,
-            ).transpose(0, 1) # [:seq_len]
+            ).transpose(0, 1)
             
             mixed_qkv_d = causal_conv1d_update(
                 mixed_qkv_d,
                 conv_states_to_use,
-                conv_weights,
-                bias,
-                activation,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                activation=self.activation,
                 conv_state_indices=state_indices_d,
             )
             mixed_qkv = torch.cat((mixed_qkv_p, mixed_qkv_d), dim=0)
         else:
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
-                conv_weights,
-                bias,
-                activation=activation,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                activation=self.activation,
                 conv_states=conv_states_to_use,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-            ).transpose(0, 1) # [:seq_len]
+            ).transpose(0, 1)
 
-        key_split_dim = key_dim // attn_tp_size
-        value_split_dim = value_dim // attn_tp_size
+        key_split_dim = self.key_dim // self.attn_tp_size
+        value_split_dim = self.value_dim // self.attn_tp_size
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -742,60 +700,44 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
-        num_value_heads = value.shape[1] // head_v_dim
+        num_heads = query.shape[1] // self.head_k_dim
+        num_value_heads = value.shape[1] // self.head_v_dim
 
-        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
-        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
-        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
+        query = query.view(1, actual_seq_len, num_heads, self.head_k_dim)
+        key = key.view(1, actual_seq_len, num_heads, self.head_k_dim)
+        value = value.view(1, actual_seq_len, num_value_heads, self.head_v_dim)
 
         beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
+        g = fused_gdn_gating(self.A_log, a, self.dt_bias)
 
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        if is_target_verify:
-            core_attn_out = fused_recurrent_gated_delta_rule_update(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-            )
+        recurrent_state = ssm_states[cache_indices]
+
+        if num_decode > 0:
+            # TODO set it in mambaCacheManager
+            decode_query_start_loc = torch.arange(1, num_decode + 1, device=query_start_loc.device) # num_decode 个
+            decode_query_start_loc = decode_query_start_loc + query_start_loc[num_prefill]
+            new_query_start_loc = torch.cat([query_start_loc[:num_prefill + 1], decode_query_start_loc])
         else:
-            recurrent_state = ssm_states[cache_indices]
+            new_query_start_loc = query_start_loc
 
-            if num_decode > 0:
-                # TODO set it in mambaCacheManager
-                decode_query_start_loc = torch.arange(1, num_decode + 1, device=query_start_loc.device) # num_decode 个
-                decode_query_start_loc = decode_query_start_loc + query_start_loc[num_prefill]
-                new_query_start_loc = torch.cat([query_start_loc[:num_prefill + 1], decode_query_start_loc])
-            else:
-                new_query_start_loc = query_start_loc
-
-            new_query_start_loc = new_query_start_loc.to(torch.long)
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                cu_seqlens=new_query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[cache_indices] = last_recurrent_state
+        new_query_start_loc = new_query_start_loc.to(torch.long)
+        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=True,
+            cu_seqlens=new_query_start_loc,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+        ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
@@ -821,7 +763,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decodes = attn_metadata.seq_lens.shape[0] - num_prefills
         num_prefill_tokens = attn_metadata.num_ctx_tokens
         num_decode_tokens = attn_metadata.num_tokens - num_prefill_tokens
-        seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
         has_initial_states = mamba_metadata.has_initial_states
 
@@ -862,20 +803,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         kwargs = {
             "mixed_qkv": mixed_qkv,
-            "conv_weights": self.conv1d.weight,
-            "bias": self.conv1d.bias,
-            "activation": self.activation,
-            "key_dim": self.key_dim,
-            "value_dim": self.value_dim,
-            "attention_tp_size": self.attn_tp_size,
-            "head_k_dim": self.head_k_dim,
-            "head_v_dim": self.head_v_dim,
             "a": a,
             "b": b,
-            "A_log": self.A_log,
-            "dt_bias": self.dt_bias,
-            "layer_id": self.layer_idx,
-            "seq_len": seq_len,
             "z": z,
             "has_initial_states": has_initial_states,
             "cache_indices": state_indices,
@@ -895,136 +824,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 attn_out = self.forward_extend(conv_states, ssm_states, **kwargs)
             else:
                 attn_out = self.forward_decode(conv_states, ssm_states, num_decodes, mamba_metadata.cu_seqlens, **kwargs)
-        else:
-            # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
-
-            # - "cache_indices" updates the conv_state cache in positions
-            #   pointed to by "mamba_cache_params.state_indices_tensor"
-            has_initial_states = mamba_metadata.has_initial_states[:
-                                                                       num_prefills]
-
-            mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv, seqlen_split_size, dim=0)
-            # TODO For mixed prefill and decode
-            # z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
-            b_p, b_d = torch.split(b, seqlen_split_size, dim=0)
-            a_p, a_d = torch.split(a, seqlen_split_size, dim=0)
-            out = []
-            if num_prefills > 0:
-                cu_seqlens = mamba_metadata.cu_seqlens[:num_prefills + 1]
-                mixed_qkv = causal_conv1d_fn(
-                    mixed_qkv_p.transpose(0, 1),
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation=self.activation,
-                    conv_states=conv_states, # shape: [4, 4096, 3]
-                    has_initial_state=has_initial_states,
-                    cache_indices=state_indices_p,
-                    query_start_loc=cu_seqlens,
-                ).transpose(0, 1)[:seq_len]
-
-                # TODO: Why is this needed?
-                mixed_qkv = mixed_qkv.contiguous() # shape: [8192, 8192]
-                query, key, value = torch.split(
-                    mixed_qkv,
-                    [
-                        self.key_dim // self.attn_tp_size,
-                        self.key_dim // self.attn_tp_size,
-                        self.value_dim // self.attn_tp_size,
-                    ],
-                    dim=-1,
-                )
-                query, key = map(
-                    lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-                    (query, key),
-                )
-                value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-
-                beta = b_p.sigmoid()
-                # If the model is loaded in fp16, without the .float() here, A might be -inf
-                g = -self.A_log.float().exp() * F.softplus(a_p.float() + self.dt_bias)
-
-                g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
-
-                cache_indices = state_indices_p
-                recurrent_state = ssm_states[cache_indices]
-                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                    q=query, # shape: [1, 8192, 16, 128]
-                    k=key,   # shape: [1, 8192, 16, 128]
-                    v=value, # shape: [1, 8192, 32, 128]
-                    g=g,
-                    beta=beta,
-                    initial_state=
-                    recurrent_state, # TODO check that should we use None or recurrent_state?
-                    output_final_state=True,
-                    cu_seqlens=cu_seqlens.to(torch.long),
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
-                )
-
-                # core_attn_out shape: [1, 8192, 32 // tp_size, 128]
-                # last_recurrent_state shape: [1, 32 // tp_size, 128, 128]
-                # ssm_states shape: [4, 32, 128, 128]
-                last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-                ssm_states[cache_indices] = last_recurrent_state
-                out.append(core_attn_out)
-
-            # else:
-            if num_decodes > 0:
-                mixed_qkv = causal_conv1d_update(
-                    mixed_qkv_d,
-                    conv_states,
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=state_indices_d,
-                )
-                query, key, value = torch.split(
-                    mixed_qkv,
-                    [
-                        self.key_dim // self.attn_tp_size,
-                        self.key_dim // self.attn_tp_size,
-                        self.value_dim // self.attn_tp_size,
-                    ],
-                    dim=-1,
-                )
-                query, key = map(
-                    lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-                    (query, key),
-                )
-                value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-
-                beta = b_d.sigmoid()
-
-                # query,: torch.Size([1, 1, 16, 128])
-                # key,: torch.Size([1, 1, 16, 128])
-                # value,: torch.Size([1, 1, 32, 128])
-                # g,: torch.Size([1, 1, 32])
-                # beta,: torch.Size([1, 1, 32])
-                # ssm_states,: torch.Size([4, 32, 128, 128])
-                # state_indices_d,: tensor([3], device='cuda:0', dtype=torch.int32)
-                # cu_seqlens.to(torch.long): tensor([0], device='cuda:0')
-
-                cu_seqlens = torch.arange(0, num_decodes + 1, device=mamba_metadata.cu_seqlens.device).to(torch.long)
-                    
-                # ValueError: The number of initial states is expected to be equal to the number of input sequences, i.e., 0 rather than 1.
-                core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    q=query,
-                    k=key,
-                    v=value,
-                    a=a_d,
-                    b=b_d,
-                    initial_state_source=ssm_states,
-                    initial_state_indices=state_indices_d, # cache_indices
-                    cu_seqlens=cu_seqlens,
-                    use_qk_l2norm_in_kernel=True,
-                    softplus_beta=1.0,
-                    softplus_threshold=20.0,
-                )
-                out.append(core_attn_out)
-
-            attn_out = torch.cat(out, dim=1)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
