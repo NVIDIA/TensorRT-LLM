@@ -56,6 +56,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip(reason="https://nvbugs/5527956")
     def test_auto_dtype(self):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
