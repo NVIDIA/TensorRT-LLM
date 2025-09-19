@@ -941,14 +941,7 @@ private:
         // user should guarantee the correctness of the fusion pattern dispatching.
         if (!is_auto)
         {
-            if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
-            else
-            {
-                strategy = mStrategy;
-            }
+            strategy = mStrategy;
         }
         else if (world_size <= 2)
         {
