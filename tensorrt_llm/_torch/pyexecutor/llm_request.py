@@ -45,7 +45,7 @@ class LogitsStorage:
                  seq_length: int,
                  use_device_memory=True,
                  should_exclude_last=False,
-                 chunked_mode=False,
+                 use_chunked_logits=False,
                  streaming=False,
                  chunk_size=8):
         if should_exclude_last:
@@ -55,7 +55,7 @@ class LogitsStorage:
         self.seq_length = seq_length
         self.use_device_memory = use_device_memory
         self._should_exclude_last = should_exclude_last
-        self.chunked_mode = chunked_mode
+        self.use_chunked_logits = use_chunked_logits
         self.chunk_size = chunk_size
         self.streaming = streaming
         self._logits_indices = []
@@ -66,7 +66,7 @@ class LogitsStorage:
         self.vocab_size = -1
 
         # Chunked mode: device-side fragments
-        if chunked_mode:
+        if use_chunked_logits:
             self._device_fragments: List[torch.Tensor] = []
             self._current_position = 0
 
@@ -103,7 +103,7 @@ class LogitsStorage:
             logits = logits.unsqueeze(1)
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
 
-        if self.chunked_mode:
+        if self.use_chunked_logits:
             if self.beam_width == -1:
                 self._init_chunked_storage(logits)
             self._add_fragment(logits)
@@ -179,7 +179,7 @@ class LogitsStorage:
 
     def finalize_transfer(self):
         """Force transfer of any remaining fragments to host (for chunked mode)"""
-        if self.chunked_mode and hasattr(
+        if self.use_chunked_logits and hasattr(
                 self, '_device_fragments') and self._device_fragments:
             self._transfer_chunk_to_host()
 
@@ -241,20 +241,20 @@ class PyResult:
                  return_context_logits: bool = False,
                  return_generation_logits: bool = False,
                  exclude_last_generation_logits: bool = False,
-                 chunked_mode: bool = False,
+                 use_chunked_logits: bool = True,
                  chunk_size: int = 8):
         self._streaming = streaming
         self._context_logits = LogitsStorage(
             prompt_len,
             use_device_memory,
-            chunked_mode=chunked_mode,
+            use_chunked_logits=use_chunked_logits,
             streaming=streaming,
             chunk_size=chunk_size) if return_context_logits else None
         self._generation_logits = LogitsStorage(
             max_new_tokens,
             use_device_memory,
             exclude_last_generation_logits,
-            chunked_mode=chunked_mode,
+            use_chunked_logits=use_chunked_logits,
             streaming=streaming,
             chunk_size=chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
@@ -404,7 +404,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
             is_first_draft: bool = False,
-            use_chunked_logits: bool = False,
+            use_chunked_logits: bool = True,
             logits_chunk_size: int = 8,
             **kwargs):
 
@@ -479,7 +479,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_context_logits,
                                   return_generation_logits,
                                   exclude_last_generation_logits,
-                                  chunked_mode=use_chunked_logits,
+                                  use_chunked_logits=use_chunked_logits,
                                   chunk_size=logits_chunk_size)
         self.child_requests = []
 
