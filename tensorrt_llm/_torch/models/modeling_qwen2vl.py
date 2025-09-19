@@ -286,18 +286,17 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
             for _ in range(input_seq_len)
         ])
 
-    def get_dummy_images(self,
-                         max_width: int,
-                         max_height: int,
-                         num_images: int = 1):
+    def get_dummy_images(self, max_width: int, max_height: int,
+                         num_images: int):
         image = Image.new("RGB", (max_width, max_height), color=255)
         return [image] * num_images
 
-    def get_dummy_prompt(self, input_seq_len: int):
+    def get_dummy_prompt(self, input_seq_len: int, mm_data: dict):
+        num_images = mm_data.get("image", 0)
         text = self.get_dummy_text(input_seq_len)
         images = self.get_dummy_images(
-            max_width=3584,
-            max_height=3584)  #sqrt of max_pixels value (12845056)
+            max_width=3584, max_height=3584,
+            num_images=num_images)  #w, h is sqrt of max_pixels value (12845056)
         return default_multimodal_input_loader(
             tokenizer=self.tokenizer,
             model_dir=self.model_path,
