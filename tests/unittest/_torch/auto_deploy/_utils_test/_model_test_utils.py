@@ -380,7 +380,7 @@ _SMALL_MODEL_CONFIGS = {
             "hidden_size": 64,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
-            "num_local_experts": 2,
+            "num_experts": 16,
         },
     },
     "microsoft/Phi-3-mini-4k-instruct": {
@@ -427,7 +427,7 @@ _SMALL_MODEL_CONFIGS = {
             "n_shared_experts": 1,
             "num_attention_heads": 8,
             "num_key_value_heads": 2,
-            "num_experts_per_token": 2,
+            "num_experts_per_tok": 2,
             "q_lora_rank": 128,
         },
     },
