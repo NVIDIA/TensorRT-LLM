@@ -93,7 +93,7 @@ def test_recursive_update_config(mock_factory):
     }
 
     # Apply the recursive update
-    updated_config = factory._recursive_update_config(config, update_dict)
+    updated_config, nested_unused = factory._recursive_update_config(config, update_dict)
 
     # Check that it returns the same object
     assert updated_config is config
@@ -111,6 +111,8 @@ def test_recursive_update_config(mock_factory):
 
     # Check that non-existent keys were ignored
     assert not hasattr(config, "non_existent_key")
+    # Check that nested_unused contains the non-existent key
+    assert nested_unused == {"non_existent_key": "this should be ignored"}
 
     # Create a more complex update with deeper nesting
     complex_update = {"text_config": {"rope_scaling": {"factor": 2.0, "type": "linear"}}}

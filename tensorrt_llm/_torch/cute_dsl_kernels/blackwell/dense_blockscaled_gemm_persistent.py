@@ -58,6 +58,9 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
+    PipelineTmaUmma, PipelineUmmaAsync)
+
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
@@ -619,7 +622,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_tma_producer)
-        ab_pipeline = pipeline.PipelineTmaUmma.create(
+        ab_pipeline = PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
@@ -635,7 +638,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads)
-        acc_pipeline = pipeline.PipelineUmmaAsync.create(
+        acc_pipeline = PipelineUmmaAsync.create(
             barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=acc_pipeline_producer_group,
@@ -654,7 +657,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_arrive_relaxed(aligned=True)
 
         #
         # Setup smem tensor A/B/SFA/SFB/C
@@ -709,9 +712,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                    cute.slice_(self.mma_tiler, (None, 0, None)),
                                    (None, None, None))
         # (bN, bK, RestN, RestK, RestL)
-        gSFB_nkl = cute.local_tile(mSFB_nkl,
-                                   cute.slice_(self.mma_tiler, (0, None, None)),
-                                   (None, None, None))
+        gSFB_nkl = cute.local_tile(
+            mSFB_nkl, cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+            (None, None, None))
         # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(mC_mnl,
                                  cute.slice_(self.mma_tiler, (None, None, 0)),
@@ -850,8 +853,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # ((atom_v, rest_v), RestK)
                 tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None,
                                        mma_tile_coord_mnl[2])]
+                slice_n = mma_tile_coord_mnl[1]
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    slice_n = mma_tile_coord_mnl[1] // 2
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, mma_tile_coord_mnl[1], None,
+                tBgSFB_slice = tBgSFB[(None, slice_n, None,
                                        mma_tile_coord_mnl[2])]
 
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
@@ -1022,6 +1028,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
+                tCtSFB_mma = tCtSFB
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    # Move in increments of 64 columns of SFB
+                    offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
+                    shifted_ptr = cute.recast_ptr(
+                        acc_tmem_ptr +
+                        tcgen05.find_tmem_tensor_col_offset(tCtAcc_base) +
+                        tcgen05.find_tmem_tensor_col_offset(tCtSFA) + offset,
+                        dtype=self.sf_dtype,
+                    )
+                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+
                 #
                 # Reset the ACCUMULATE field for each tile
                 #
@@ -1078,7 +1096,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             )
                             tiled_mma.set(
                                 tcgen05.Field.SFB,
-                                tCtSFB[sf_kphase_coord].iterator,
+                                tCtSFB_mma[sf_kphase_coord].iterator,
                             )
 
                             cute.gemm(
@@ -1737,7 +1755,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Skip invalid mma tile shape
         if not mma_tiler_mn[0] in [128, 256]:
             is_valid = False
-        if not mma_tiler_mn[1] in [128, 256]:
+        if not mma_tiler_mn[1] in [64, 128, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
@@ -1925,6 +1943,7 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
         alpha: cutlass.Float32,
         max_active_clusters: cutlass.Constexpr,
         current_stream: cuda.CUstream,
+        swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Executes the wrapped GEMM kernel with dynamically shaped tensors.
@@ -1964,11 +1983,18 @@ class Sm100BlockScaledPersistentDenseGemmKernelWrapper:
             ),
         )
         # m, n, l
-        c_tensor = cute.make_tensor(c_ptr,
-                                    layout=cute.make_ordered_layout(
-                                        (m, n, l),
-                                        order=(1, 0, 2),
-                                    ))
+        if cutlass.const_expr(swap_ab):
+            c_tensor = cute.make_tensor(c_ptr,
+                                        layout=cute.make_ordered_layout(
+                                            (m, n, l),
+                                            order=(0, 1, 2),
+                                        ))
+        else:
+            c_tensor = cute.make_tensor(c_ptr,
+                                        layout=cute.make_ordered_layout(
+                                            (m, n, l),
+                                            order=(1, 0, 2),
+                                        ))
         # (1, int(sf_m/128), int(sf_k/4), 32, 4, 4).permute(3, 4, 1, 5, 2, 0) => (32, 4, int(sf_m/128), 4, int(sf_k/4), l)
         sfa_tensor = cute.make_tensor(a_sf_ptr,
                                       layout=cute.make_ordered_layout(

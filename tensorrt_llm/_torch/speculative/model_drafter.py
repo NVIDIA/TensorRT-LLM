@@ -31,7 +31,7 @@ def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
     Can be used to modify prompts for speculative algorithms that need to update tokens
     before drafting.
     """
-    if spec_dec_mode.is_eagle3():
+    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         # EAGLE3 always throws away the first token when processing draft inputs
         return input_tokens[1:]
     return input_tokens
@@ -395,23 +395,27 @@ class ModelDrafter(Drafter):
         new_tokens = torch.zeros_like(new_tensors_device.new_tokens)
         new_tokens_lens = None
         next_draft_tokens = None
+        has_draft_tokens = False
         # Iterate through generation requests and copy tokens based on accepted draft tokens
-        for idx, request in enumerate(scheduled_batch.all_requests()):
+        for request in scheduled_batch.all_requests():
+            idx = request.py_seq_slot
             if request.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 num_accepted_tokens = request.py_num_accepted_draft_tokens
                 new_tokens[0, idx] = new_tensors_device.new_tokens[
                     num_accepted_tokens, idx]
             else:
-                # Create new tensors with the correct device
-                # We already updated the target state, so the new_tokens_lens should be all ones.
-                new_tokens_lens = torch.ones(scheduled_batch.batch_size,
-                                             device=device)
-                next_draft_tokens = torch.zeros(scheduled_batch.batch_size,
-                                                self.max_draft_tokens,
-                                                device=device)
+                has_draft_tokens = True
                 num_accepted_tokens = request.py_num_accepted_draft_tokens
                 new_tokens[0, idx] = new_tensors_device.new_tokens[
                     num_accepted_tokens, idx]
+
+        if has_draft_tokens:
+            # We already updated the target state, so the new_tokens_lens should be all ones.
+            new_tokens_lens = torch.ones(scheduled_batch.batch_size,
+                                         device=device)
+            next_draft_tokens = torch.zeros(scheduled_batch.batch_size,
+                                            self.max_draft_tokens,
+                                            device=device)
 
         # Create a new SampleStateTensorsMTP object with the additional fields
         updated_tensors = SampleStateTensorsMTP(
@@ -428,26 +432,28 @@ class ModelDrafter(Drafter):
     def _update_target_inputs_with_draft_tokens(
             self, target_inputs: SampleStateTensorsMTP,
             draft_tensors: Optional[torch.Tensor], draft_position: int,
-            draft_length: int, num_draft_reqs: int) -> None:
+            draft_length: int, draft_batch: ScheduledRequests,
+            req_id_to_old_request: Dict[int, LlmRequest]) -> None:
         """
         Update target inputs with new draft tokens from sample state.
-
-        Args:
-            target_inputs: The target input tensors to update
-            draft_sample_state: The draft sample state containing new tokens
-            iteration: The current iteration index
         """
         if draft_tensors is not None:
-            for idx in range(num_draft_reqs):
+            for request in draft_batch.all_requests():
                 # Skip prefill requests
                 if target_inputs.next_draft_tokens is None:
                     continue
+
+                # Get the index of the draft/target tokens in the device tensor
+                draft_idx = request.py_seq_slot
+                target_idx = req_id_to_old_request[
+                    request.py_request_id].py_seq_slot
                 target_inputs.new_tokens[draft_position + 1:draft_position +
-                                         draft_length + 1, idx,
-                                         0] = draft_tensors[0:draft_length, idx]
+                                         draft_length + 1, target_idx,
+                                         0] = draft_tensors[0:draft_length,
+                                                            draft_idx]
                 target_inputs.next_draft_tokens[
-                    idx, draft_position:draft_position +
-                    draft_length] = draft_tensors[0:draft_length, idx]
+                    target_idx, draft_position:draft_position +
+                    draft_length] = draft_tensors[0:draft_length, draft_idx]
 
     def _setup_draft_batch_and_resources(
         self, scheduled_batch: ScheduledRequests
@@ -581,7 +587,8 @@ class ModelDrafter(Drafter):
                     draft_tensors,
                     draft_position=i + 1,
                     draft_length=1,
-                    num_draft_reqs=num_draft_reqs)
+                    draft_batch=draft_batch,
+                    req_id_to_old_request=req_id_to_old_request)
 
             if sample_state is not None and previous_draft_state is not None:
                 new_requests = self.process_decoded_tokens(
@@ -639,7 +646,8 @@ class ModelDrafter(Drafter):
                 outputs,
                 draft_position=0,
                 draft_length=self.max_draft_tokens,
-                num_draft_reqs=num_draft_reqs)
+                draft_batch=draft_batch,
+                req_id_to_old_request=req_id_to_old_request)
             return target_inputs, outputs, draft_batch
 
         # Handle guided decoder and sampling for non-static loop
@@ -656,7 +664,8 @@ class ModelDrafter(Drafter):
             draft_tensors,
             draft_position=0,
             draft_length=1,
-            num_draft_reqs=num_draft_reqs)
+            draft_batch=draft_batch,
+            req_id_to_old_request=req_id_to_old_request)
 
         self.update_request_states(draft_batch)
 
