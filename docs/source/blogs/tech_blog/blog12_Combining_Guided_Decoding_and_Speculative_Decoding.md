@@ -18,8 +18,8 @@
     - [Integration to TensorRT LLM Python Runtime](#integration-to-tensorrt-llm-python-runtime)
     - [CUDA Graph Compatibility: Grammar Computation](#cuda-graph-compatibility-grammar-computation)
     - [CUDA Graph Compatibility: Mask Applying Kernel](#cuda-graph-compatibility-mask-applying-kernel)
-    - [Troubleshooting: Data Race between Host and CUDA Callback](#trouble-shooting-data-race-between-host-and-cuda-callback)
-    - [Troubleshooting: Deadlock by GIL and CUDA Mutex](#trouble-shooting-deadlock-by-gil-and-cuda-mutex)
+    - [Troubleshooting: Data Race between Host and CUDA Callback](#troubleshooting-data-race-between-host-and-cuda-callback)
+    - [Troubleshooting: Deadlock by GIL and CUDA Mutex](#troubleshooting-deadlock-by-gil-and-cuda-mutex)
   - [Performance and Analysis](#performance-and-analysis)
   - [Acknowledgements](#acknowledgements)
 
