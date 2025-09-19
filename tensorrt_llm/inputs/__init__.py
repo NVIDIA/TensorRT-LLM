@@ -4,7 +4,8 @@ from .registry import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, create_input_processor,
                        create_input_processor_with_hash,
-                       register_input_processor)
+                       register_input_processor,
+                       support_multimodal_disaggregated)
 from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     ALL_SUPPORTED_MULTIMODAL_MODELS, ALL_SUPPORTED_VIDEO_MODELS,
                     ConversationMessage, MultimodalData, MultimodalDataTracker,
@@ -27,6 +28,7 @@ __all__ = [
     "create_input_processor",
     "create_input_processor_with_hash",
     "register_input_processor",
+    "support_multimodal_disaggregated",
     "ExtraProcessedInputs",
     "BaseMultimodalInputProcessor",
     "MultimodalPlaceholderMetadata",

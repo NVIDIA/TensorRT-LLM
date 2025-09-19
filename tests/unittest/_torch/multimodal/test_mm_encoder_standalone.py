@@ -116,11 +116,13 @@ def test_single_image_chat(model_key, multimodal_model_config):
     encoder_outputs = encoder.generate(inputs)
 
     # Generate output using llm (pass mm_embeddings)
-    outputs = llm.generate(
-        inputs,
-        sampling_params=sampling_params,
-        multimodal_disagg_params=encoder_outputs[0].multimodal_disagg_params)
+    ep_disaggregated_params = encoder_outputs[0].disaggregated_params
 
+    assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
+    ep_disaggregated_params.request_type = "context_and_generation"
+    outputs = llm.generate(inputs,
+                           sampling_params=sampling_params,
+                           disaggregated_params=ep_disaggregated_params)
     # Validate outputs
     assert len(outputs) == len(
         prompts), f"Expected {len(prompts)} outputs, got {len(outputs)}"
@@ -225,11 +227,12 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
 
     # Encoder path
     encoder_outputs = encoder.generate(inputs)
+    for eo in encoder_outputs:
+        eo.disaggregated_params.request_type = "context_and_generation"
     outputs = llm.generate(inputs,
                            sampling_params=sampling_params,
-                           multimodal_disagg_params=[
-                               eo.multimodal_disagg_params
-                               for eo in encoder_outputs
+                           disaggregated_params=[
+                               eo.disaggregated_params for eo in encoder_outputs
                            ])
 
     assert len(outputs) == len(prompts)
