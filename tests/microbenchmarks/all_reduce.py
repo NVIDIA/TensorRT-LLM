@@ -81,7 +81,7 @@ def allreduce_benchmark(dtype: str,
     bs = 1
     if mapping.rank == 0 and not no_header:
         print(
-            f"{'world_size':<15}, {'dtype':<10}, {'message size (MB)':<15}, {'strategy':<10}, {'fusion':<20}, {'version':<10}, {'duration (ms)':<10}"
+            f"{'world_size':<15}, {'dtype':<10}, {'tensor size (B)':<15}, {'strategy':<10}, {'fusion':<20}, {'version':<10}, {'duration (ms)':<10}"
         )
     while size < max_size:
         input = torch.ones((bs, hidden_size), dtype=torch_dtype, device="cuda")
@@ -171,9 +171,9 @@ def allreduce_benchmark(dtype: str,
                         torch.testing.assert_close(output, allreduce_ref)
 
                     if mapping.rank == 0:
-                        message_size_mb = (size * dtype_size_bytes) / (1024 * 1024)
+                        message_size_b = (size * dtype_size_bytes)
                         print(
-                            f"{mapping.world_size:<15}, {dtype:<10}, {message_size_mb:<15.3f}, {strategy.name:<10}, {fusion.name:<20}, {version:<10}, {median_ms:<10.5f}"
+                            f"{mapping.world_size:<15}, {dtype:<10}, {message_size_b:<15.0f}, {strategy.name:<10}, {fusion.name:<20}, {version:<10}, {median_ms:<10.5f}"
                         )
 
         size *= ratio
