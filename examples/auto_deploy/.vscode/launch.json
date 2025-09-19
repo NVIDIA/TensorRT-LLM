@@ -19,6 +19,7 @@
                 "--args.model-kwargs.num-hidden-layers=3",
                 "--args.model-kwargs.num-attention-heads=32",
                 "--prompt.sp-kwargs.max-tokens=128",
+                // "--yaml-extra=config.yaml", // uncomment to load a custom extra yaml config file
                 // "--dry-run", // uncomment to print the final config and return
             ],
             "console": "integratedTerminal",
