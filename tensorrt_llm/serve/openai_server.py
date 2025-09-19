@@ -737,7 +737,6 @@ class OpenAIServer:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
                 # await self._extract_metrics(res)
                 for pp_res in pp_results:
-                    logger.debug(f"pp_res: type: {type(pp_res)}, content: {pp_res}")
                     yield pp_res
                     if streaming_stop_substr in pp_res:
                         promise.abort()
