@@ -1145,7 +1145,7 @@ void benchmark(std::vector<std::filesystem::path> const& contextEngineDirs,
 int main(int argc, char* argv[])
 
 {
-    cxxopts::Options options("TensorRT-LLm DisaggServer Benchmark");
+    cxxopts::Options options("TensorRT LLM DisaggServer Benchmark");
     options.add_options()("h,help", "Print usage");
     options.add_options()("context_engine_dirs", "Directories that store context engines,separator is a ,",
         cxxopts::value<std::vector<std::string>>());

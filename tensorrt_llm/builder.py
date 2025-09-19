@@ -303,7 +303,7 @@ class Builder():
                                    builder_config) -> bool:
         '''
             For each profile, validate that the named dimensions of different input tensors in this profile all have same range.
-            TRT will validate the same condition, validate it earlier to make sure the modeling in TensorRT-LLM are correct and
+            TRT will validate the same condition, validate it earlier to make sure the modeling in TensorRT LLM are correct and
             makes the error msg more user friendly.
         '''
         valid = True
@@ -479,9 +479,9 @@ class Builder():
 
 @dataclass
 class BuildConfig:
-    """Configuration class for TensorRT-LLM engine building parameters.
+    """Configuration class for TensorRT LLM engine building parameters.
 
-    This class contains all the configuration parameters needed to build a TensorRT-LLM engine,
+    This class contains all the configuration parameters needed to build a TensorRT LLM engine,
     including sequence length limits, batch sizes, optimization settings, and various features.
 
     Args:
@@ -509,7 +509,7 @@ class BuildConfig:
         auto_parallel_config (AutoParallelConfig): Configuration for automatic parallelization. Defaults to default AutoParallelConfig.
         weight_sparsity (bool): Whether to enable weight sparsity optimization. Defaults to False.
         weight_streaming (bool): Whether to enable weight streaming for large models. Defaults to False.
-        plugin_config (PluginConfig): Configuration for TensorRT-LLM plugins. Defaults to default PluginConfig.
+        plugin_config (PluginConfig): Configuration for TensorRT LLM plugins. Defaults to default PluginConfig.
         use_strip_plan (bool): Whether to use stripped plan for engine building. Defaults to False.
         max_encoder_input_len (int): Maximum encoder input length for encoder-decoder models. Defaults to 1024.
         dry_run (bool): Whether to perform a dry run without actually building the engine. Defaults to False.

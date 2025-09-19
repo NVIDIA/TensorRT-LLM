@@ -214,12 +214,12 @@ struct KernelParams
     //     ScaleC    = SEncC
     //
     // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
-    // TensorRT-LLM API requires a scaling factor on the device.
+    // TensorRT LLM API requires a scaling factor on the device.
     // Shape is [B]. One scaling factor per tensor in batch.
     float const* ptrScaleC{nullptr};
 
     // The output gate scale for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
-    // TensorRT-LLM API requires a scaling factor on the device.
+    // TensorRT LLM API requires a scaling factor on the device.
     // Shape is [B]. One scaling factor per tensor in batch.
     float const* ptrScaleGate{nullptr};
 

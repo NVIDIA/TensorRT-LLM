@@ -7,7 +7,7 @@ import tensorrt_llm.plugin as _tlp
 
 
 def test_load_library():
-    """Test loading the TensorRT-LLM plugin library."""
+    """Test loading the TensorRT LLM plugin library."""
     runtime = _trt.Runtime(_trt.Logger(_trt.Logger.WARNING))
     _trt.init_libnvinfer_plugins(runtime.logger,
                                  namespace=_tlp.TRT_LLM_PLUGIN_NAMESPACE)

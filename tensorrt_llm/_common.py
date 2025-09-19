@@ -54,10 +54,10 @@ def _init(log_level: object = None) -> None:
         logger.set_level(log_level)
 
     if os.getenv("TRT_LLM_NO_LIB_INIT", "0") == "1":
-        logger.info("Skipping TensorRT-LLM init.")
+        logger.info("Skipping TensorRT LLM init.")
         return
 
-    logger.info("Starting TensorRT-LLM init.")
+    logger.info("Starting TensorRT LLM init.")
 
     # load plugin lib
     _load_plugin_lib()
@@ -82,7 +82,7 @@ def _init(log_level: object = None) -> None:
 
     MpiComm.local_init()
 
-    logger.info("TensorRT-LLM inited.")
+    logger.info("TensorRT LLM inited.")
 
 
 def default_net() -> Network:

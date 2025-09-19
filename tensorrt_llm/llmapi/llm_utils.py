@@ -152,7 +152,7 @@ class ModelLoader:
         if isinstance(self.llm_args.model, Module):
             # Build engine from user provided model
             self._build_pipeline.append(
-                ("Build TensorRT-LLM engine",
+                ("Build TensorRT LLM engine",
                  self._build_engine_from_inmemory_model))
             return
 

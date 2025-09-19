@@ -423,7 +423,7 @@ class CliFlowAccuracyTestHarness:
         self.env = env
 
     def convert(self):
-        print("Converting model to TensorRT-LLM checkpoint...")
+        print("Converting model to TensorRT LLM checkpoint...")
 
         is_prequantized = False
         for quant_config_file in [

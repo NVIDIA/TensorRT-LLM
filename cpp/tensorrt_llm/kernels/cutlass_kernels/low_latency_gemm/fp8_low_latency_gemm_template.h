@@ -195,7 +195,7 @@ size_t genericFp8LowLatencyGemmKernelLauncherSm90(__nv_fp8_e4m3 const* A, __nv_f
     {
         std::string errMsg = "SMEM size exceeds maximum allowed. Required " + std::to_string(smem_size) + ", got "
             + std::to_string(mMaxSmemSize);
-        throw std::runtime_error("[TensorRT-LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
     }
 
     // Return workspace size
@@ -208,7 +208,7 @@ size_t genericFp8LowLatencyGemmKernelLauncherSm90(__nv_fp8_e4m3 const* A, __nv_f
     {
         std::string errMsg("Requested workspace size insufficient. Required "
             + std::to_string(gemm.get_workspace_size(arguments)) + ", got " + std::to_string(workspaceBytes));
-        throw std::runtime_error("[TensorRT-LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
     }
 
     auto can_implement = gemm.can_implement(arguments);
@@ -216,26 +216,26 @@ size_t genericFp8LowLatencyGemmKernelLauncherSm90(__nv_fp8_e4m3 const* A, __nv_f
     {
         std::string errMsg = "Fp8LowLatencyGemm cutlass kernel not implemented given the params. Error: "
             + std::string(cutlassGetStatusString(can_implement));
-        throw std::runtime_error("[TensorRT-LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
     }
 
     auto initStatus = gemm.initialize(arguments, workspacePtr);
     if (initStatus != cutlass::Status::kSuccess)
     {
         std::string errMsg = "Failed to initialize. Error: " + std::string(cutlassGetStatusString(initStatus));
-        throw std::runtime_error("[TensorRT-LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
     }
 
     auto runStatus = gemm.run(stream, nullptr, pdl_overlap_ratio >= 0);
     if (runStatus != cutlass::Status::kSuccess)
     {
         std::string errMsg = "Failed to run gemm. Error: " + std::string(cutlassGetStatusString(runStatus));
-        throw std::runtime_error("[TensorRT-LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][Fp8LowLatencyGemm Runner] " + errMsg);
     }
     return gemm.get_workspace_size(arguments);
 #else  // COMPILE_HOPPER_TMA_GEMMS
     throw std::runtime_error(
-        "[TensorRT-LLm Error][genericFp8LowLatencyGemmKernelLauncherSm90] Please recompile with support for hopper by "
+        "[TensorRT LLM Error][genericFp8LowLatencyGemmKernelLauncherSm90] Please recompile with support for hopper by "
         "passing 90-real as an arch to build_wheel.py.");
 #endif // COMPILE_HOPPER_TMA_GEMMS
 }
@@ -264,7 +264,7 @@ size_t dispatchLowLatencyGemmCultassKernelSchedSm90(__nv_fp8_e4m3 const* A, __nv
         break;
     default:
         throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmCultassKernelSchedSm90] Config "
+            "[TensorRT LLM Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmCultassKernelSchedSm90] Config "
             "is "
             "invalid for low latency fp8 gemm");
         break;
@@ -300,7 +300,7 @@ size_t dispatchLowLatencyGemmClusterShapeSm90(__nv_fp8_e4m3 const* A, __nv_fp8_e
 
     default:
         throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmClusterShapeSm90] Config is "
+            "[TensorRT LLM Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmClusterShapeSm90] Config is "
             "invalid for low latency fp8 gemm");
         break;
     }
@@ -369,19 +369,19 @@ size_t dispatchLowLatencyGemmToCutlassSm90(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3
         break;
     case tkc::CutlassTileConfigSM90::Undefined:
         throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmToCutlassSm90] gemm config "
+            "[TensorRT LLM Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmToCutlassSm90] gemm config "
             "undefined.");
         break;
     case tkc::CutlassTileConfigSM90::ChooseWithHeuristic:
         throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmToCutlassSm90] gemm config "
+            "[TensorRT LLM Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmToCutlassSm90] gemm config "
             "should have "
             "already been set by "
             "heuristic.");
         break;
     default:
         throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmToCutlassSm90] Config is "
+            "[TensorRT LLM Error][CutlassLowLatencyFp8GemmRunner][dispatchLowLatencyGemmToCutlassSm90] Config is "
             "invalid for low latency fp8 gemm");
         break;
     }
@@ -413,7 +413,7 @@ size_t CutlassLowLatencyFp8GemmRunner<T>::dispatchToArch(__nv_fp8_e4m3 const* A,
     {
 
         throw std::runtime_error(
-            "[TensorRT-LLM Error][CutlassLowLatencyFp8GemmRunner][GEMM Dispatch] dtype unsupported for CUTLASS Low "
+            "[TensorRT LLM Error][CutlassLowLatencyFp8GemmRunner][GEMM Dispatch] dtype unsupported for CUTLASS Low "
             "Latency Gemm");
     }
     return 0;
@@ -499,7 +499,7 @@ std::vector<ConfigType> CutlassLowLatencyFp8GemmRunner<T>::getConfigs() const
     if (mSm != 90)
     {
         throw std::runtime_error(
-            "[TensorRT-LLM Error][CutlassLowLatencyFp8GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS FP8 Low "
+            "[TensorRT LLM Error][CutlassLowLatencyFp8GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS FP8 Low "
             "Latency GEMM");
     }
     tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param

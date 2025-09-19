@@ -115,6 +115,6 @@ __all__ = [
 
 _init()
 
-print(f"[TensorRT-LLM] TensorRT-LLM version: {__version__}")
+print(f"[TensorRT-LLM] TensorRT LLM version: {__version__}")
 
 sys.stdout.flush()
