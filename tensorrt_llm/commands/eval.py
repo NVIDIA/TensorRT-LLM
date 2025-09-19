@@ -96,13 +96,17 @@ from ..logger import logger, severity_map
               type=str,
               default=None,
               help="Path to a YAML file that overwrites the parameters")
+@click.option("--disable_kv_cache_reuse",
+              is_flag=True,
+              default=False,
+              help="Flag for disabling KV cache reuse.")
 @click.pass_context
 def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          backend: str, max_beam_width: int, max_batch_size: int,
          max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
-         extra_llm_api_options: Optional[str]):
+         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool):
     logger.set_level(log_level)
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
@@ -110,7 +114,8 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
                                max_seq_len=max_seq_len)
 
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
+        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        enable_block_reuse=not disable_kv_cache_reuse)
 
     llm_args = {
         "model": model,
