@@ -241,6 +241,9 @@ class LinearMethodBase(ABC):
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
+    def post_load_weights(self, module: Linear):
+        pass
+
     def load_weight_scales(self, weights: List[Dict], *args, **kwargs):
         """
         Load quantized weight scales from the checkpoint.
@@ -2001,3 +2004,6 @@ class Linear(nn.Module):
 
         weight_mode = self.weights_loading_config.weight_mode
         self.quant_method.load_weights(self, weights, weight_mode)
+
+    def post_load_weights(self):
+        self.quant_method.post_load_weights(self)
