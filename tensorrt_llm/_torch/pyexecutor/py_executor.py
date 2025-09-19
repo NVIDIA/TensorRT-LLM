@@ -1942,7 +1942,7 @@ class PyExecutor:
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
         for request, block_id in self.ctx_in_transmission_requests[:]:
-            if request.is_disagg_context_complete_state:
+            if request.is_disagg_context_complete_state and request.is_finished:
                 if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
                     self._terminate_request(request)
                 else:
