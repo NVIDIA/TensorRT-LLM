@@ -1249,10 +1249,12 @@ TEST(RefCheck, llama_V2_70b_3)
     runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 2048, runPerfTest, runCheckTest);
 
 #if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
-    runTest<4, HEAD_GROUP_SIZE, Q_SEQ_LEN>(4, 2039, false, runCheckTest, true, false, ~0U, 1024);
-    runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 63, false, runCheckTest, true, false, ~0U, 61);
-    runTest<1, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 2, false, true, true, false, ~0U, 1);
-
+    runTest<4, HEAD_GROUP_SIZE, Q_SEQ_LEN>(4, 2039, false, runCheckTest, true, false, false, ~0U, 1024);
+    runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 63, false, runCheckTest, true, false, false, ~0U, 61);
+    runTest<1, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 2, false, true, true, false, false, ~0U, 1);
+    runTest<4, HEAD_GROUP_SIZE, Q_SEQ_LEN>(4, 2039, false, runCheckTest, true, false, true, ~0U, 1024);
+    runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 63, false, runCheckTest, true, false, true, ~0U, 61);
+    runTest<1, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 2, false, true, true, false, true, ~0U, 1);
 #endif
 }
 #endif

@@ -2715,6 +2715,28 @@ __device__ void storeShmRowWiseVec(uint32_t warpRank, ShmQWiseVec& smemVec, RegR
 __device__ inline void storeGemm0AccToShm(
     uint32_t warpRank, uint32_t lane, SharedMem::XBuffer& smemX, CtaBarrier& barConsumed, Gemm0Acc const& acc)
 {
+#if CACHE_ELEM_ENUM == 0
+    uint32_t const idxRow = lane % 8;
+    barConsumed.arrive_and_wait();
+    // todo: change to stmatrix_4x
+#pragma unroll
+    for (uint32_t m = 0; m < Gemm0Acc::rows; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
+        {
+#pragma unroll
+            for (uint32_t n = 0; n < Gemm0Acc::cols; n++)
+            {
+                Vec<CacheElem, 2> f16data{acc(m, n)(i, 0), acc(m, n)(i, 1)};
+                auto const dstAddr = lane < 8
+                    ? &smemX[m].template at<true>(gmma::instM * m + 16 * warpRank + 8 * i + idxRow, n)
+                    : nullptr;
+                stmatrix<false>(dstAddr, reinterpret_cast<Vec<uint32_t, 1> const&>(f16data));
+            }
+        }
+    }
+#else
     uint32_t const idxMat = lane / 8;
     uint32_t const idxRow = lane % 8;
     barConsumed.arrive_and_wait();
@@ -2737,6 +2759,7 @@ __device__ inline void storeGemm0AccToShm(
                 this_warp(), &smemX[m].template at<true>(16 * warpRank + 8 * i + idxRow, idxMat), fp8Data);
         }
     }
+#endif
 }
 #endif
 
@@ -2778,6 +2801,23 @@ __device__ inline Vec<RegMatAFrag, gemm1NbGmmaInstM> loadVTileTransposed(
 __device__ inline void transposeVTile(
     uint32_t warpRank, uint32_t lane, SharedMem::VTBuffer& dst, SharedMem::VBuffer const& src)
 {
+#if CACHE_ELEM_ENUM == 0
+    uint32_t const idxMat = lane / 8; // only for thread 0-7, 8-15
+    uint32_t const idxRow = lane % 8; // only for thread 0-7, 8-15
+    // todo: change to stmatrix_4x
+    for (uint32_t m = 0; m < exactDiv(SharedMem::VTBuffer::rows, gmma::instM); m++)
+    {
+        uint32_t const idxPart = gmma::instM * m / cacheHeadPartElems;
+        for (uint32_t n = 0; n < SharedMem::VTBuffer::cols; n++)
+        {
+            auto const srcAddr
+                = lane < 16 ? &src[idxPart].template at<true>(warpRank * 16 + 8 * idxMat + idxRow, n) : nullptr;
+            Vec<uint32_t, 2> const a = ldmatrix<true, 2>(srcAddr);
+            auto const dstAddr = lane < 16 ? &dst.template at<true>(n * 8 + idxRow, warpRank * 2 + idxMat) : nullptr;
+            stmatrix<false, 2>(dstAddr, a);
+        }
+    }
+#else
     uint32_t const idxMat = lane / 8;
     uint32_t const idxRow = lane % 8;
 #pragma unroll
@@ -2800,6 +2840,7 @@ __device__ inline void transposeVTile(
                 this_warp(), &dst.template at<true>(gmma::instM * m + 16 * warpRank + 8 * i + idxRow, 2 * n + j), b);
         }
     }
+#endif
 }
 #endif
 
@@ -3171,6 +3212,83 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst,
 
     using DstElem = typename DstHead::Elem;
     auto const lane = laneId();
+
+#if CACHE_ELEM_ENUM == 0
+    uint32_t const idxRow = lane % 8;
+#pragma unroll
+    for (uint32_t m = 0; m < Gemm1Acc::rows; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
+        {
+#pragma unroll
+            for (uint32_t n = 0; n < Gemm1Acc::cols; n++)
+            {
+                Vec<DstElem, 2> data = convert<DstElem>(Vec<float, 2>{acc(m, n)(i, 0), acc(m, n)(i, 1)});
+                auto const dstAddr = lane < 8
+                    ? &swizzleBuf.template at<true>(gmma::instM * m + 16 * warpRank + 8 * i + idxRow, n)
+                    : nullptr;
+                stmatrix<false>(
+                    dstAddr, reinterpret_cast<Vec<uint32_t, exactDiv(sizeof(data), sizeof(uint32_t))> const&>(data));
+            }
+        }
+    }
+    __syncwarp();
+
+#pragma unroll
+    for (uint32_t m = 0; m < Gemm1Acc::rows; m++)
+    {
+        constexpr uint32_t srcHeadBytes = sizeof(DstElem) * headElems;
+        constexpr uint32_t grpSize = exactDiv(srcHeadBytes, grainBytes);
+        constexpr uint32_t nbGrps = exactDiv(warp_size, grpSize);
+        uint32_t const idxGrp = lane / grpSize;
+        constexpr uint32_t grainsPerAtom = exactDiv(sizeof(SharedMem::OutSwizzleBuf::Elem), grainBytes);
+        uint32_t const rowBase = gmma::instM * m + 16 * warpRank;
+        constexpr uint32_t totalNbGrains = grainsPerAtom * Gemm1Acc::cols * 16;
+        uint32_t const nbIters = divUp(totalNbGrains, nbGrps);
+        constexpr bool wholeIters = (totalNbGrains % nbGrps == 0);
+        constexpr bool wholeHeads = (validElemsPerHead == headElems);
+#pragma unroll
+        for (uint32_t iter = 0; iter < nbIters; iter++)
+        {
+            uint32_t const idxGrain = nbGrps * iter + idxGrp;
+            constexpr uint32_t grainsPerSrcHead = exactDiv(srcHeadBytes, grainBytes);
+            uint32_t const r = idxGrain / grainsPerSrcHead;
+            if (!wholeIters && r >= 16)
+            {
+                break;
+            }
+            uint32_t const cGrain = idxGrain % grainsPerSrcHead;
+            uint32_t const cAtom = cGrain / grainsPerAtom;
+            constexpr uint32_t grainsPerDstHead = exactDiv(sizeof(DstHead), grainBytes);
+            uint32_t const glbRow = gmma::instM * m + 16 * warpRank + r;
+            if (ctaNbValidQHeads != ctaNbQHeads && glbRow >= ctaNbValidQHeads)
+            {
+                break;
+            }
+            if (wholeHeads || cGrain < grainsPerDstHead)
+            {
+                uint32_t const srcRow = rowBase + r;
+                auto const data
+                    = reinterpret_cast<LdGrain(&)[grainsPerAtom]>(swizzleBuf.template at<true>(srcRow, cGrain))[0];
+#if SPEC_DEC
+                static_assert(beamWidth == 1);
+                uint32_t const idxToken = srcRow / headGrpSize; // inside CTA
+                if (idxToken >= ctaNbValidTokens)
+                {
+                    break;
+                }
+                uint32_t const tokenPad = headGrpSize * (nbKHeads - 1);
+                uint32_t const dstRow = srcRow + idxToken * tokenPad;
+#else
+                uint32_t const dstRow = srcRow;
+#endif
+                reinterpret_cast<LdGrain(&)[grainsPerDstHead]>(dst[dstRow])[cGrain] = data;
+            }
+        }
+    }
+
+#else
     uint32_t const idxQuad = lane / 4;
     uint32_t const idxInQuad = lane % 4;
     using Atom = Vec<Vec<DstElem, 4>, 4>;
@@ -3253,6 +3371,7 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst,
             }
         }
     }
+#endif
 }
 #endif
 
