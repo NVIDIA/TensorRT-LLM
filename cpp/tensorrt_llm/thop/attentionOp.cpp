@@ -357,6 +357,18 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+        if (softmax_stats_tensor.has_value())
+        {
+            TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().scalar_type() == at::ScalarType::Float,
+                "softmax_stats_tensor must have float type");
+            TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().size(0) >= num_tokens,
+                "softmax_stats_tensor must have first dimension >= num_tokens");
+            TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().size(1) >= op.mNumHeads,
+                "softmax_stats_tensor must have second dimension >= num_heads");
+            TLLM_CHECK_WITH_INFO(
+                softmax_stats_tensor.value().size(2) == 2, "softmax_stats_tensor must have third dimension == 2");
+            common_enqueue_params.softmax_stats = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
+        }
 
         if (is_context) // context stage
         {
@@ -364,10 +376,6 @@ public:
             AttentionOp::EnqueueContextParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.host_block_offsets = host_block_offsets;
             enqueue_params.batch_size = num_seqs;
-            if (softmax_stats_tensor.has_value())
-            {
-                enqueue_params.softmaxStatsPtr = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
-            }
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
 
@@ -495,7 +503,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
     std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
-    std::optional<int64_t> q_lora_rank, std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
+    std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
+    std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
@@ -529,38 +538,38 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         if (is_fp8_out)
         {
-            runner.reset(new Runner<half, __nv_fp8_e4m3>());
+            runner = std::make_shared<Runner<half, __nv_fp8_e4m3>>();
         }
         else if (is_fp4_out)
         {
-            runner.reset(new Runner<half, __nv_fp4_e2m1>());
+            runner = std::make_shared<Runner<half, __nv_fp4_e2m1>>();
         }
         else
         {
             TLLM_CHECK(!out_dtype.has_value() || out_dtype.value() == torch::kFloat16);
-            runner.reset(new Runner<half>());
+            runner = std::make_shared<Runner<half>>();
         }
     }
     else if (dtype == nvinfer1::DataType::kFLOAT)
     {
         TLLM_CHECK(!out_dtype.has_value() || out_dtype.value() == torch::kFloat32);
-        runner.reset(new Runner<float>());
+        runner = std::make_shared<Runner<float>>();
     }
 #ifdef ENABLE_BF16
     else if (dtype == nvinfer1::DataType::kBF16)
     {
         if (is_fp8_out)
         {
-            runner.reset(new Runner<__nv_bfloat16, __nv_fp8_e4m3>());
+            runner = std::make_shared<Runner<__nv_bfloat16, __nv_fp8_e4m3>>();
         }
         else if (is_fp4_out)
         {
-            runner.reset(new Runner<__nv_bfloat16, __nv_fp4_e2m1>());
+            runner = std::make_shared<Runner<__nv_bfloat16, __nv_fp4_e2m1>>();
         }
         else
         {
             TLLM_CHECK(!out_dtype.has_value() || out_dtype.value() == torch::kBFloat16);
-            runner.reset(new Runner<__nv_bfloat16>());
+            runner = std::make_shared<Runner<__nv_bfloat16>>();
         }
     }
 #endif
@@ -628,7 +637,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
             static_cast<int>(layer_num)};
 
-        op->mFP8ContextMLA = tensorrt_llm::common::getSMVersion() == 120 && op->mKVCacheQuantMode.hasFp8KvCache();
+        op->mFP8ContextMLA = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
+                                 || tensorrt_llm::common::getSMVersion() == 120)
+            && op->mKVCacheQuantMode.hasFp8KvCache();
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
         op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
@@ -639,6 +650,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         // mNumKVHeads/mHeadSize are overwritten in common/attentionOp.cpp.
         op->mNumKVHeads = 1;
         op->mHeadSize = op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
+
+        // For chunked prefill MLA, we need larger buffer size for k and v
+        op->mChunkPrefillBufferBatchSize
+            = chunked_prefill_buffer_batch_size.has_value() ? chunked_prefill_buffer_batch_size.value() : 1;
     }
 
     auto cache_key = std::make_tuple(op->data(), runner->data());

@@ -45,8 +45,7 @@ export LLM_ROOT=$llmSrcNode
 export LLM_MODELS_ROOT=$MODEL_CACHE_DIR
 export UCX_TLS=^gdr_copy
 
-# TODO: Move back to tensorrt_llm/llmapi/trtllm-llmapi-launch later
-llmapiLaunchScript="$llmSrcNode/jenkins/scripts/trtllm-llmapi-launch"
+llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 testCmdLines=(

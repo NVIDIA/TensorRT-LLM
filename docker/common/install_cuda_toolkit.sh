@@ -5,7 +5,7 @@ set -ex
 # This script is used for reinstalling CUDA on Rocky Linux 8 with the run file.
 # CUDA version is usually aligned with the latest NGC CUDA image tag.
 # Only use when public CUDA image is not ready.
-CUDA_VER="12.9.1_575.57.08"
+CUDA_VER="13.0.0_580.65.06"
 CUDA_VER_SHORT="${CUDA_VER%_*}"
 
 NVCC_VERSION_OUTPUT=$(nvcc --version)

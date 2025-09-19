@@ -512,6 +512,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 else:
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
+            if executor_config is not None:
+                assert (
+                    len(prompt_token_ids) <= executor_config.max_seq_len
+                ), f"`prompt_token_ids` length ({len(prompt_token_ids)}) is greater than `max_seq_len` ({executor_config.max_seq_len})"
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
             if default_max_tokens <= 0:
@@ -592,6 +596,9 @@ class GenerationExecutorWorker(GenerationExecutor):
             executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
+
+            if request.arrival_time is not None:
+                executor_request.py_arrival_time = request.arrival_time
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
@@ -889,6 +896,7 @@ def worker_main(
                             worker.submit(req)
                         except RequestError as e:
                             logger.error(f"submit request failed: {e}")
+                            logger.error(traceback.format_exc())
                             worker._await_response_helper.temp_error_responses.put(
                                 ErrorResponse(req.id, e, req.id))
                     else:

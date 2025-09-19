@@ -164,8 +164,11 @@ class CUDAGraphRunner:
     def needs_capture(self, batch_size: int):
         return (batch_size, self.draft_len) not in self.graph_outputs
 
-    def capture(self, batch_size: int, forward_fn: Callable,
-                initial_inputs: Dict[str, Any]):
+    def capture(self,
+                batch_size: int,
+                forward_fn: Callable,
+                initial_inputs: Dict[str, Any],
+                postprocess_fn: Optional[Callable] = None):
         """Captures the forward pass for a given batch size."""
         key = (batch_size, self.draft_len)
         # [CUDA graph spec decode padding]
@@ -203,8 +206,12 @@ class CUDAGraphRunner:
         with with_multi_stream(True), piecewise_cuda_graph(False):
             for _ in range(self.WARMUP_STEPS):
                 forward_fn(capture_inputs)
+                if postprocess_fn is not None:
+                    postprocess_fn(capture_inputs)
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
+            if postprocess_fn is not None:
+                postprocess_fn(capture_inputs)
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
@@ -231,7 +238,8 @@ class CUDAGraphRunner:
 
         if "mrope_position_deltas" in current_inputs:
             assert "mrope_position_deltas" in static_tensors
-            static_tensors["mrope_position_deltas"][:batch_size].copy_(
+            mrope_num = current_inputs["mrope_position_deltas"].shape[0]
+            static_tensors["mrope_position_deltas"][:mrope_num].copy_(
                 current_inputs["mrope_position_deltas"])
 
         self.graphs[key].replay()
