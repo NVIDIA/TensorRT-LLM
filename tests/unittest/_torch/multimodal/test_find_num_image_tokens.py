@@ -1,9 +1,9 @@
-import io
+import os
+from pathlib import Path
 
 import pytest
-import requests
-from PIL import Image
 from transformers import AutoConfig, AutoTokenizer
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.models.modeling_llava_next import \
@@ -12,11 +12,7 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import \
     Qwen2VLInputProcessorBase
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import default_multimodal_input_loader
-from tensorrt_llm.inputs.utils import load_video, load_image
-
-from utils.llm_data import llm_models_root
-import os
-from pathlib import Path
+from tensorrt_llm.inputs.utils import load_image, load_video
 
 test_data_root = Path(
     os.path.join(llm_models_root(), "multimodals", "test_data"))
@@ -29,8 +25,6 @@ example_videos = [
     str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
     str(test_data_root / "world.mp4"),
 ]
-
-
 
 
 @pytest.fixture(scope="function")
