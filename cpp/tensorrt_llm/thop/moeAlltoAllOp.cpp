@@ -57,6 +57,8 @@ struct MoeA2ADataOffsets
     size_t recv_counters_offset;
     size_t completion_flags_offset;
     size_t sendIndices_offset;
+    size_t topk_target_ranks_offset;
+    size_t topk_send_indices_offset;
     size_t payload_data_offset;
 };
 
@@ -93,8 +95,20 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokensPerRank)
     // send_indices
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets.sendIndices_offset = offset;
-    offset += epSize * maxNumTokensPerRank * SIZEOF_INT32;
-    
+    offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokensPerRank) * SIZEOF_INT32;
+
+    // topk_target_ranks: [maxNumTokensPerRank, kMaxTopK]
+    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
+    offsets.topk_target_ranks_offset = offset;
+    offset += static_cast<size_t>(maxNumTokensPerRank)
+        * static_cast<size_t>(tensorrt_llm::kernels::moe_a2a::kMaxTopK) * SIZEOF_INT32;
+
+    // topk_send_indices: [maxNumTokensPerRank, kMaxTopK]
+    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
+    offsets.topk_send_indices_offset = offset;
+    offset += static_cast<size_t>(maxNumTokensPerRank)
+        * static_cast<size_t>(tensorrt_llm::kernels::moe_a2a::kMaxTopK) * SIZEOF_INT32;
+
     // payload data
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets.payload_data_offset = offset;
@@ -254,6 +268,10 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
         options
     );
 
+    // Derive Top-K compact buffers from workspace
+    int* topkTargetRanksPtr = reinterpret_cast<int*>(rank_workspace + offsets.topk_target_ranks_offset);
+    int* topkSendIndicesPtr = reinterpret_cast<int*>(rank_workspace + offsets.topk_send_indices_offset);
+
     // Setup dispatch parameters
     MoeA2ADispatchParams params{};
     params.one_block_per_token = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken();  // TODO: Decide this based on the workload
@@ -286,6 +304,8 @@ std::tuple<std::vector<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tens
     params.send_counters = sendCounters.data_ptr<int>();
     params.local_token_counter = localTokenCounter.data_ptr<int>();
     params.send_indices = sendIndices.data_ptr<int>();
+    params.topk_target_ranks = topkTargetRanksPtr;
+    params.topk_send_indices = topkSendIndicesPtr;
     params.local_num_tokens = static_cast<int>(localNumTokens);
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
@@ -423,6 +443,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& sendIndices, torch::Tensor co
     params.max_tokens_per_rank = static_cast<int>(maxTokensPerRank);
     params.top_k = static_cast<int>(topK);
     params.send_indices = sendIndices.data_ptr<int>();
+    params.topk_target_ranks = reinterpret_cast<int const*>(current_rank_workspace + offsets.topk_target_ranks_offset);
+    params.topk_send_indices = reinterpret_cast<int const*>(current_rank_workspace + offsets.topk_send_indices_offset);
     params.output_data = output.data_ptr();
     params.elements_per_token = static_cast<int>(elementsPerToken);
     params.dtype = nvDtype;

@@ -51,9 +51,13 @@ struct DispatchKernelPointers
     
     // Local aux data pointers
     int* send_counters;       // [ep_size] How many tokens have been sent to each target rank
-    int* send_indices;        // [local_num_tokens, ep_size] send index tensor
+    int* send_indices;        // [local_num_tokens, ep_size] send index tensor  //TODO: this is not used anymore
     int* recv_counters[kMaxRanks];       // How many tokens have been received from each source rank. Each rank has [ep_size] counters
     int* local_token_counter; // Atomic counter for completed tokens
+
+    // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
+    int* topk_target_ranks;   // target rank per k, -1 for duplicates
+    int* topk_send_indices;   // dst index per k, -1 for duplicates
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -69,6 +73,10 @@ struct CombineKernelPointers
     
     // Local aux data pointers
     int const* send_indices;  // [local_num_tokens, ep_size] from dispatch
+
+    // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
+    int const* topk_target_ranks;   // target rank per k, -1 for duplicates
+    int const* topk_send_indices;   // dst index per k, -1 for duplicates
 };
 
 // Dispatch phase parameters
@@ -107,6 +115,10 @@ struct MoeA2ADispatchParams
     int* send_indices;        // [local_num_tokens, ep_size] send index tensor
     int* local_token_counter; // Atomic counter for completed tokens on this rank
 
+    // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
+    int* topk_target_ranks;   // target rank per k, -1 for duplicates
+    int* topk_send_indices;   // dst index per k, -1 for duplicates
+
     cudaStream_t stream;
 };
 
@@ -132,6 +144,10 @@ struct MoeA2ACombineParams
     // Expert routing information
     int const* send_indices; // [local_num_tokens, ep_size] from dispatch
     int const* recv_counters; // [ep_size] number of valid tokens per source rank for this target
+
+    // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
+    int const* topk_target_ranks;   // target rank per k, -1 for duplicates
+    int const* topk_send_indices;   // dst index per k, -1 for duplicates
 
     // Single payload information
     void const* recv_buffers[kMaxRanks]; // Per-rank receive buffers (only for single payload)
