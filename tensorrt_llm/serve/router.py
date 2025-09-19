@@ -164,6 +164,24 @@ class Router(ABC):
             new_servers: The new server list
         """
 
+    @property
+    def servers(self) -> List[str]:
+        return self._servers
+
+    @abstractmethod
+    async def add_server(self, server):
+        """
+        Args:
+            server: The server to add
+        """
+
+    @abstractmethod
+    async def remove_server(self, server):
+        """
+        Args:
+            server: The server to remove
+        """
+
     @abstractmethod
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
         '''Select server by request and return some intermediate information'''
@@ -423,6 +441,31 @@ class RoundRobinRouter(Router):
     async def finish_request(self, request: OpenAIRequest):
         pass
 
+    async def add_server(self, server: str):
+        if server in self._servers:
+            logger.warning(f"Server {server} already exists")
+            return
+        async with self._lock:
+            old_servers = self._servers
+            new_servers = old_servers.copy() + [server]
+            self._servers = new_servers
+            self._on_servers_updated(old_servers, new_servers)
+        logger.debug(
+            f"Added server {server}, current server list: {self._servers}")
+
+    async def remove_server(self, server):
+        if server not in self._servers:
+            logger.warning(f"Server {server} does not exist")
+            return
+        async with self._lock:
+            old_servers = self._servers
+            new_servers = old_servers.copy()
+            new_servers.remove(server)
+            self._servers = new_servers
+            self._on_servers_updated(old_servers, new_servers)
+        logger.debug(
+            f"Removed server {server}, current server list: {self._servers}")
+
 
 class LoadBalancingRouter(Router):
 
@@ -463,6 +506,31 @@ class LoadBalancingRouter(Router):
         for server in new_servers:
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
+
+    async def add_server(self, server: str):
+        if server in self._servers:
+            logger.warning(f"Server {server} already exists")
+            return
+        async with self._lock:
+            self._servers.append(server)
+            old_servers = self._servers
+            new_servers = old_servers.copy() + [server]
+            self._on_servers_updated(old_servers, new_servers)
+        logger.debug(
+            f"Added server {server}, current server list: {self._servers}")
+
+    async def remove_server(self, server: str):
+        if server not in self._servers:
+            logger.warning(f"Server {server} does not exist")
+            return
+        async with self._lock:
+            old_servers = self._servers
+            new_servers = old_servers.copy()
+            new_servers.remove(server)
+            self._servers = new_servers
+            self._on_servers_updated(old_servers, new_servers)
+        logger.debug(
+            f"Removed server {server}, current server list: {self._servers}")
 
     def _init_heap(self):
         for server in self._servers:
@@ -523,6 +591,7 @@ class KvCacheAwareRouter(Router):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server)
         self._lock = asyncio.Lock()
+        self._use_tokens = use_tokens
 
         # Load map between servers and their number of tokens processed
         self._server_state: dict[str, KvCacheAwareServerState] = {
@@ -556,8 +625,33 @@ class KvCacheAwareRouter(Router):
         tokenizer = self._tokenizers[request.model]
         return [tokenizer(prompt)["input_ids"] for prompt in prompts]
 
+    async def add_server(self, server: str):
+        if server in self._servers:
+            logger.warning(f"Server {server} already exists")
+            return
+        async with self._lock:
+            if server not in self._servers:
+                self._servers.append(server)
+                self._server_state[server] = KvCacheAwareServerState(
+                    server, self._use_tokens)
+        logger.debug(
+            f"Added server {server}, current server list: {self._servers}")
+
+    # TODO: distinguish between a server is temporarily inactive because of heavy load or permanently dead
+    # A possible solution is to delay the removal of the server state for some time
+    async def remove_server(self, server: str):
+        if server not in self._servers:
+            logger.warning(f"Server {server} does not exist")
+            return
+        async with self._lock:
+            self._servers.remove(server)
+            self._server_state.pop(server)
+        logger.debug(
+            f"Removed server {server}, current server list: {self._servers}")
+
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
-        servers = list(self._server_state.keys())
+        async with self._lock:
+            servers = list(self._server_state.keys())
         token_lists = self._tokenize(request)
         block_hashes: list[list[int]] = []
         for token_list in token_lists:
@@ -589,8 +683,8 @@ class KvCacheAwareRouter(Router):
                 i] / self._max_batch_size
             scores.append(score)
         server = servers[scores.index(max(scores))]
-        await self._server_state[server].increment_load(request)
         async with self._lock:
+            await self._server_state[server].increment_load(request)
             self._req_routing_table[id(request)] = server
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
@@ -604,8 +698,9 @@ class KvCacheAwareRouter(Router):
         async with self._lock:
             server = self._req_routing_table[id(request)]
             del self._req_routing_table[id(request)]
-        await self._server_state[server].decrement_load(request,
-                                                        session=session)
+            if server in self._server_state:
+                await self._server_state[server].decrement_load(request,
+                                                                session=session)
 
     def _on_servers_updated(self, old_servers, new_servers):
         raise NotImplementedError(
@@ -632,22 +727,19 @@ def create_router(router_config: Optional[RouterConfig],
     Raises:
         ValueError: If an unsupported router type is provided
     """
-    if router_config is None:
-        # Create a default router without server_role
-        return RoundRobinRouter(None, servers)
-
     router_map = {
         "round_robin": RoundRobinRouter,
         "load_balancing": LoadBalancingRouter,
         "kv_cache_aware": KvCacheAwareRouter,
     }
-
-    router_type = router_config.type
+    default_router_type = "round_robin"
+    router_type = router_config.type if router_config else default_router_type
     router_class = router_map.get(router_type.lower())
+
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
 
-    # Pass server_role as the first argument
-    return router_class(router_config.server_role, servers, metadata_server_cfg,
-                        metadata_server, **router_config.args)
+    return router_class(router_config.server_role if router_config else None,
+                        servers, metadata_server_cfg, metadata_server,
+                        **router_config.args)
