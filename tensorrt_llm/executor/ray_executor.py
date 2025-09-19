@@ -271,8 +271,7 @@ class RayExecutor(GenerationExecutor):
         nodes = ray.nodes()
         gpus_per_node = int(nodes[0]["Resources"].get(
             "GPU", 0))  # assume symmetric across nodes
-        # Don't set bundle_cpu to be bundle_gpu * 2, because RayAsyncQueue
-        # currently requires 2 CPUs.
+
         bundle_cpu = bundle_gpu = min(tp_size, gpus_per_node)
 
         bundles, bundle_indices = [], []
@@ -281,7 +280,7 @@ class RayExecutor(GenerationExecutor):
             if current == 0:
                 bundle = {"GPU": bundle_gpu, "CPU": bundle_cpu}
                 if len(bundles) == 0:
-                    bundle[head_tag] = 0.01  # to force placement on head
+                    bundle[head_tag] = 0.01  # to force placement on head node
                 bundles.append(bundle)
 
             bundle_indices.append(len(bundles) - 1)

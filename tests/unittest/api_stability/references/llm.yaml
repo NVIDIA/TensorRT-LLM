@@ -240,25 +240,6 @@ methods:
     parameters: {}
     return_annotation: None
     status: beta
-  collective_rpc:
-    parameters:
-      method:
-        annotation: str
-        default: inspect._empty
-      args:
-        annotation: tuple[Any, ...]
-        default: ()
-      kwargs:
-        annotation: Optional[dict]
-        default: null
-      non_block:
-        annotation: bool
-        default: False
-      unique_reply_rank:
-        annotation: Optional[int]
-        default: null
-    return_annotation: list[Any]
-    status: prototype
 properties:
   llm_id:
     annotation: str

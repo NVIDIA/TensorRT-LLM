@@ -249,7 +249,7 @@ class GenerationResultBase:
     def __init__(self,
                  id: int,
                  sampling_params: SamplingParams,
-                 queue: Optional[RayAsyncQueue] = None,
+                 ray_queue: Optional[RayAsyncQueue] = None,
                  background_error_handler: Optional[Callable] = None,
                  postproc_params: "Optional[PostprocParams]" = None):
         self.id = id
@@ -263,12 +263,12 @@ class GenerationResultBase:
         self._done = False
         self.metrics_dict = {}
 
-        if queue is not None:
+        if ray_queue is not None:
             if has_event_loop():
-                self.aqueue = queue
+                self.aqueue = ray_queue
                 self.queue = self.aqueue
             else:
-                self.queue = queue
+                self.queue = ray_queue
                 self.aqueue = None
 
             ray.get(self.queue.register.remote(id))
@@ -490,6 +490,9 @@ class GenerationResultBase:
             raise ValueError(f"Unknown response type: {response}")
 
         if self._done and mpi_disabled():
+            assert hasattr(
+                self.queue, "unregister"
+            ), "Ray path should be activated for unregistering the Ray queue."
             self.queue.unregister.remote(self.id)
 
     def record_stats(self,

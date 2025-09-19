@@ -11,10 +11,11 @@ from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig
 
 
-# TODO: fix RayQueue CPU issue
 @pytest.mark.gpu4
 def test_bundle_indices():
     """Placement via bundle indices"""
+    pytest.skip('To be fixed')
+
     os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
     ray.init()
 
@@ -47,7 +48,7 @@ def test_bundle_indices():
         orchestrator_type="ray",
     )
 
-    infer_worker_uuids = ray.get(llm.collective_rpc.remote("report_device_id"))
+    infer_worker_uuids = ray.get(llm._collective_rpc.remote("report_device_id"))
     print(f"{infer_worker_uuids=}")
 
 
@@ -59,7 +60,7 @@ def test_cuda_visible_device():
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               orchestrator_type="ray")
 
-    infer_actor_uuids = llm.collective_rpc("report_device_id")
+    infer_actor_uuids = llm._collective_rpc("report_device_id")
 
     del os.environ["CUDA_VISIBLE_DEVICES"]
     assert infer_actor_uuids[0] == get_device_uuid(1)

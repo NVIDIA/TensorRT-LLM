@@ -969,12 +969,12 @@ class _TorchLLM(BaseLLM):
                          **kwargs)
 
     @set_api_status("prototype")
-    def collective_rpc(self,
-                       method: str,
-                       args: tuple[Any, ...] = (),
-                       kwargs: Optional[dict] = None,
-                       non_block: bool = False,
-                       unique_reply_rank: Optional[int] = None) -> list[Any]:
+    def _collective_rpc(self,
+                        method: str,
+                        args: tuple[Any, ...] = (),
+                        kwargs: Optional[dict] = None,
+                        non_block: bool = False,
+                        unique_reply_rank: Optional[int] = None) -> list[Any]:
         """
         Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
 
