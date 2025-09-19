@@ -541,7 +541,6 @@ def create_input_processor_with_hash(
                     try:
                         return input_processor(inputs, sampling_params)
                     except Exception as e2:
-                        import traceback
                         traceback.print_exc()
                         logger.warning(f"Basic input processor failed: {e}.")
                         raise e2
