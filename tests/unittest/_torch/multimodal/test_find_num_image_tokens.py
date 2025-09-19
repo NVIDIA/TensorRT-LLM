@@ -33,10 +33,13 @@ def multimodal_model_configs():
     model_configs = {
         'llava-v1.6-mistral-7b-hf': {
             'hf_model_dir': 'llava-hf/llava-v1.6-mistral-7b-hf',
+            'model_dir':
+            llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf",
             'model_type': 'llava_next',
         },
         'qwen2.5-vl': {
             'hf_model_dir': 'Qwen/Qwen2.5-VL-3B-Instruct',
+            'model_dir': llm_models_root() / "Qwen2.5-VL-3B-Instruct",
             'model_type': 'qwen2_5_vl',
         },
     }
@@ -59,7 +62,7 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
         pytest.skip(f"Skipping test for {model_key} - model not available")
 
     model_config = multimodal_model_configs[model_key]
-    encoder_model_dir = model_config['hf_model_dir']
+    encoder_model_dir = model_config['model_dir']
     model_type = model_config['model_type']
 
     # Test configuration
@@ -166,7 +169,7 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
         pytest.skip(f"Skipping test for {model_key} - model not available")
 
     model_config = multimodal_model_configs[model_key]
-    encoder_model_dir = model_config['hf_model_dir']
+    encoder_model_dir = model_config['model_dir']
     model_type = model_config['model_type']
 
     # Test configuration
