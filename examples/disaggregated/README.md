@@ -248,8 +248,7 @@ CUDA_VISIBLE_DEVICES=3 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
     --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
 ```
-
-TensorRT-LLM will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
+TensorRT LLM will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
 
 ### Dynamically removing servers
 

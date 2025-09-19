@@ -1,12 +1,12 @@
 # Phi
 
-This document explains how to build Phi-2, Phi-3 and Phi-3.5 family of models using TensorRT-LLM and run on a single or multiple GPUs.
+This document explains how to build Phi-2, Phi-3 and Phi-3.5 family of models using TensorRT LLM and run on a single or multiple GPUs.
 For multimodal models (Phi-3-vision-128k-instruct and Phi-3.5-vision-instruct), see `../multimodal/README.md`.
 
 - [Overview](#overview)
 - [Support Matrix](#support-matrix)
 - [Usage](#usage)
-  - [1. Convert weights from HF Transformers to TensorRT-LLM format](#1-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+  - [1. Convert weights from HF Transformers to TensorRT LLM format](#1-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
   - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
   - [3. Summarization using the Phi model](#3-summarization-using-the-phi-model)
   - [4. Quantization](#4-quantization)
@@ -14,9 +14,9 @@ For multimodal models (Phi-3-vision-128k-instruct and Phi-3.5-vision-instruct), 
 
 ## Overview
 
-The TensorRT-LLM Phi implementation can be found in [`tensorrt_llm/models/phi/model.py`](../../../../tensorrt_llm/models/phi/model.py) and [`tensorrt_llm/models/phi3/model.py`](../../../../tensorrt_llm/models/phi3/model.py). The TensorRT-LLM Phi example code is located in [`examples/models/core/phi`](./) with a single file:
+The TensorRT LLM Phi implementation can be found in [`tensorrt_llm/models/phi/model.py`](../../../../tensorrt_llm/models/phi/model.py) and [`tensorrt_llm/models/phi3/model.py`](../../../../tensorrt_llm/models/phi3/model.py). The TensorRT LLM Phi example code is located in [`examples/models/core/phi`](./) with a single file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -43,7 +43,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 
 ## Usage
 
-### 1. Convert weights from HF Transformers to TensorRT-LLM format
+### 1. Convert weights from HF Transformers to TensorRT LLM format
 
 Please install required packages first:
 
@@ -65,13 +65,13 @@ The section on Parallelism Modes in `../mixtral/README.md` discusses tensor and 
 
 ### 2. Build TensorRT engine(s)
 
-TensorRT-LLM builds TensorRT engine(s) using a HF checkpoint. If no checkpoint directory is specified, TensorRT-LLM will build engine(s) using dummy weights.
+TensorRT LLM builds TensorRT engine(s) using a HF checkpoint. If no checkpoint directory is specified, TensorRT LLM will build engine(s) using dummy weights.
 
 Examples of build invocations:
 
 ```bash
 # Build a float16 engine using a single GPU and HF weights.
-# Enable several TensorRT-LLM plugins to increase runtime performance. It also helps with build time.
+# Enable several TensorRT LLM plugins to increase runtime performance. It also helps with build time.
 trtllm-build \
     --checkpoint_dir ./phi-checkpoint \
     --output_dir ./phi-engine \
@@ -83,7 +83,7 @@ trtllm-build \
 
 ### 3. Summarization using the Phi model
 
-The following section describes how to run a TensorRT-LLM Phi model to summarize the articles from the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset. For each summary, the script can compute the [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
+The following section describes how to run a TensorRT LLM Phi model to summarize the articles from the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset. For each summary, the script can compute the [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 The script can also perform the same summarization using the HF Phi model.
 
 As previously explained, the first step is to build the TensorRT engine as described above using HF weights. You also have to install the requirements:
@@ -95,7 +95,7 @@ pip install -r requirements.txt
 The summarization can be done using the [`summarize.py`](../../../summarize.py) script as follows:
 
 ```bash
-# Run the summarization task using a TensorRT-LLM model and a single GPU.
+# Run the summarization task using a TensorRT LLM model and a single GPU.
 python3 ../../../summarize.py --engine_dir ./phi-engine \
                         --hf_model_dir /path/to/phi-model \
                         --batch_size 1 \
@@ -105,7 +105,7 @@ python3 ../../../summarize.py --engine_dir ./phi-engine \
                         --check_accuracy \
                         --tensorrt_llm_rouge1_threshold=20
 
-# Run the summarization task using a TensorRT-LLM model and 2-way tensor parallelism.
+# Run the summarization task using a TensorRT LLM model and 2-way tensor parallelism.
 mpirun -n 2 --allow-run-as-root                             \
 python3 ../../../summarize.py --engine_dir ./phi-engine-tp2  \
                         --hf_model_dir /path/to/phi-model    \
@@ -149,7 +149,7 @@ and to run [summarization test](#3-summarization-using-the-phi-model) are same a
 
 ### 5. Run Phi-3 with LoRA
 
-TensorRT-LLM supports running Phi-3-mini/small models with FP16/BF16/FP32 LoRA. In this section, we use Phi-3-mini as an example to show how to run an FP8 base model with FP16 LoRA module.
+TensorRT LLM supports running Phi-3-mini/small models with FP16/BF16/FP32 LoRA. In this section, we use Phi-3-mini as an example to show how to run an FP8 base model with FP16 LoRA module.
 
 * download the base model and lora model from HF
 
