@@ -51,6 +51,13 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
+        # Deepseek default cases
+        {
+            'patterns': 'deepseek_r1',
+            'config': {
+                'enable_attention_dp': True,
+            }
+        },
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [
@@ -91,6 +98,21 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        # Deepseek R1 model with chunked prefill
+        {
+            'patterns': [
+                'deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_fp8-bench-pytorch-float8-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000',
+                'deepseek_v3_lite_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+            }
+        },
         # Deepseek_v3_lite_cases
         {
             'patterns':
@@ -101,13 +123,6 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': True,
                     'batch_sizes': [1, 512, 1024, 2048]
                 }
-            }
-        },
-        # Deepseek default cases
-        {
-            'patterns': 'deepseek_r1',
-            'config': {
-                'enable_attention_dp': True,
             }
         },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
