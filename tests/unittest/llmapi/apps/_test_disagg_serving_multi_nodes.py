@@ -1,6 +1,5 @@
 import os
 import socket
-import subprocess
 import time
 
 import openai
@@ -9,7 +8,7 @@ import requests
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
-from .utils import expand_slurm_nodelist, get_local_interfaces, get_local_ip
+from .utils import expand_slurm_nodelist
 
 RANK = int(os.environ.get("SLURM_PROCID", 0))
 NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
@@ -52,56 +51,14 @@ def is_pytest_node():
     return NODE_RANK == 0
 
 
-def find_nic():
-    test_ip = socket.gethostbyname(get_the_other_host())
-    print(f"test_ip: {test_ip} for the other host {get_the_other_host()}")
-    try:
-        # iproute2 may not be installed
-        proc = subprocess.run(["ip", "route", "get", test_ip],
-                              capture_output=True,
-                              text=True,
-                              shell=True,
-                              check=True)
-        output_parts = proc.stdout.split()
-        if "dev" in output_parts:
-            dev_idx = output_parts.index("dev")
-            nic_name = output_parts[dev_idx + 1]
-        else:
-            raise ValueError("Could not find 'dev' in ip route output")
-        print(f"get NIC name from ip route, result: {nic_name}")
-        return nic_name
-    except Exception as e:
-        print(f"Failed to find NIC from ip route: {e}")
-        try:
-            # Establish a socket to the test ip, then get the local ip from the socket,
-            # enumerate the local interfaces and find the one with the local ip
-            local_ip = get_local_ip(test_ip)
-            local_ip_dict = get_local_interfaces()
-            for nic_name, ip in local_ip_dict.items():
-                if ip == local_ip:
-                    return nic_name
-        except OSError as e:
-            print(f"Failed to find NIC from local interfaces: {e}")
-        return None
-
-
 def env():
     # Remove MPI related environment variables to isolate the ctx/gen processes
     # so that they will not be in the same MPI communicator, otherwise the rank and world_size may mismatch
-    new_env = {
+    return {
         k: v
         for k, v in os.environ.items()
         if not ('PMI_' in k or 'OMPI_' in k or 'PMIX_' in k or 'SLURM_' in k)
     }
-    nic = find_nic()
-    if nic:
-        # TODO: integrate this into disagg-serving
-        # setting TRTLLM_UCX_INTERFACE manually if possible because the interfaces found automatically by TRTLLM can have the same ip across nodes, then cache transceiver may fail to send/receive kv cache
-        print(f"setting TRTLLM_UCX_INTERFACE to {nic}")
-        new_env["TRTLLM_UCX_INTERFACE"] = nic
-    else:
-        print(f"Failed to find NIC, will use default UCX interface")
-    return new_env
 
 
 @pytest.fixture(scope="module")
