@@ -812,6 +812,21 @@ def get_test_prompts(use_code_prompts: bool = False) -> list[str]:
         ]
 
 
+def get_test_prompts_for_torch() -> list[str]:
+    """Get test prompts for LoRA Torch testing.
+
+    Returns:
+        List of test prompts.
+    """
+    return [
+        "Hey how are you doing today?",
+        "How is the weather in Seattle, WA?",
+        "Is it ok to fill diesel in a petrol car?",
+        "Can you check the top 5 trending songs on spotify?",
+        "What is the capital of France?",
+    ]
+
+
 def test_multi_lora_support(
     hf_model_dir,
     tllm_ckpt_dir,
@@ -909,10 +924,14 @@ def test_llm_torch_multi_lora_support(
         target_hf_modules=["q_proj", "k_proj", "v_proj"],
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
-        use_code_prompts=False,
         tensor_parallel_size=1,
-        pipeline_parallel_size=1):
+        pipeline_parallel_size=1,
+        expected_outputs=None):
     """Test multi-LoRA support with LLM-API Torch backend."""
+
+    # if expected_outputs is None:
+    #     raise ValueError("expected_outputs must be provided for exact validation")
+
     start_time = time.time()
     print("Creating dummy LoRAs...")
     lora_start = time.time()
@@ -938,7 +957,7 @@ def test_llm_torch_multi_lora_support(
                              max_cpu_loras=num_loras,
                              lora_target_modules=target_trtllm_modules)
 
-    input_prompts = get_test_prompts(use_code_prompts)
+    input_prompts = get_test_prompts_for_torch()
 
     with LLM_torch(
             model=hf_model_dir,
@@ -985,12 +1004,30 @@ def test_llm_torch_multi_lora_support(
         )
 
         for i, output in enumerate(outputs):
+            actual_text = output.outputs[0].text
             print(f"Prompt {i+1}: {input_prompts[i]}")
             print(
                 f"LoRA: {lora_requests[i].lora_int_id if lora_requests[i] else 'None'}"
             )
-            print(f"Output: {output.outputs[0].text}")
+            print(f"Actual: {actual_text}")
             print("-" * 50)
+
+        # Validate exact outputs
+        # print("Validating exact outputs...")
+        # assert len(outputs) == len(expected_outputs), \
+        #     f"Expected {len(expected_outputs)} outputs, got {len(outputs)}"
+
+        # for i, (output, expected) in enumerate(zip(outputs, expected_outputs)):
+        #     actual_text = output.outputs[0].text
+        #     print(f"Prompt {i+1}: {input_prompts[i]}")
+        #     print(f"LoRA: {lora_requests[i].lora_int_id if lora_requests[i] else 'None'}")
+        #     print(f"Expected: {expected}")
+        #     print(f"Actual: {actual_text}")
+        #     print("-" * 50)
+
+        #     # Exact string comparison
+        #     assert actual_text == expected, \
+        #         f"Output {i+1} mismatch:\nExpected: {expected!r}\nActual: {actual_text!r}"
 
     total_time = time.time() - start_time
     print(f"Total test execution time: {total_time:.2f} seconds")

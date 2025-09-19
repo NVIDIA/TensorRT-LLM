@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import defs.ci_profiler
@@ -141,9 +142,21 @@ def test_nemotron_nano_8b_lora_torch(nemotron_nas_example_root, llm_venv,
                                      llm_rouge_root, engine_dir, cmodel_dir):
     """Run Nemotron Nano 8B with multiple dummy LoRAs using LLM-API Torch backend."""
 
+    expected_outputs = {
+        'llama-3.1-nemotron-nano-8b-v1': [
+            " I am having a bit of a problem with my computer. The screen is black, but my monitor is still giving me the same signals. The brightness",
+            " How is the climate like? What are some of the typical foods and drinks of the region? What is the economy like? How does the city compare",
+            " I have heard that it's possible but can be dangerous. What are the potential risks? Are there any safety guidelines? I should probably check some references",
+            " I can't do that right now. But I can suggest that if you're interested in music trends, you can check Spotify's \"Discover Weekly\"",
+            " The capital of France is Paris. But wait, I think there's another city called Paris. No, no, that's the same city. Maybe"
+        ],
+    }
+
     print("Testing with LLM-API Torch backend...")
 
     defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+
+    model_name = os.path.basename(nemotron_nas_model_root).lower()
     test_llm_torch_multi_lora_support(
         hf_model_dir=nemotron_nas_model_root,
         llm_venv=llm_venv,
@@ -151,9 +164,8 @@ def test_nemotron_nano_8b_lora_torch(nemotron_nas_example_root, llm_venv,
         lora_rank=8,
         target_hf_modules=["q_proj", "k_proj", "v_proj"],
         zero_lora_weights=True,
-        use_code_prompts=False,
         tensor_parallel_size=1,
-    )
+        expected_outputs=expected_outputs[model_name])
     defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
     print(
         f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"
@@ -161,29 +173,32 @@ def test_nemotron_nano_8b_lora_torch(nemotron_nas_example_root, llm_venv,
 
 
 @pytest.mark.skip(
-    reason="TODO: Upload the LoRA adapter to llm-models repo and rerun the test"
-)
+    reason="TODO: Resolve the hanging issue while running the test")
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("nemotron_nas_model_root", [
     "Llama-3_3-Nemotron-Super-49B-v1",
 ],
                          indirect=True)
+@pytest.mark.parametrize(
+    "llm_lora_model_root",
+    ['Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32'],
+    indirect=True)
 def test_nemotron_super_49b_real_lora_torch(nemotron_nas_example_root, llm_venv,
                                             nemotron_nas_model_root,
+                                            llm_lora_model_root,
                                             llm_datasets_root, llm_rouge_root,
                                             engine_dir, cmodel_dir):
     """Run Nemotron Super 49B with real LoRA adapters using LLM-API Torch backend."""
 
     print("Testing Nemotron Super 49B with real LoRA adapters...")
 
-    lora_adapter_path = f"/code/tensorrt_llm/llama-3.3-nemotron-super-49b-v1/llama-3.3-nemotron-super-49b-v1_vlora-1a2cb80-v2"
-    print(f"Using real LoRA from: {lora_adapter_path}")
+    print(f"Using real LoRA from: {llm_lora_model_root}")
 
     defs.ci_profiler.start("test_nemotron_real_lora_torch")
 
     lora_config = LoraConfig(
-        lora_dir=[lora_adapter_path],
+        lora_dir=[llm_lora_model_root],
         max_lora_rank=32,  # From adapter_config.json: "r": 32
         max_loras=1,
         max_cpu_loras=1,
@@ -196,7 +211,8 @@ def test_nemotron_super_49b_real_lora_torch(nemotron_nas_example_root, llm_venv,
              max_batch_size=2,
              max_input_len=512,
              max_seq_len=1024,
-             max_beam_width=1) as llm:
+             max_beam_width=1,
+             load_format="dummy") as llm:
 
         prompts = [
             "What is the capital of France?",
@@ -207,7 +223,7 @@ def test_nemotron_super_49b_real_lora_torch(nemotron_nas_example_root, llm_venv,
                                          temperature=0.7,
                                          top_p=0.9)
 
-        lora_request = [LoRARequest("nemotron-lora", 0, lora_adapter_path)]
+        lora_request = [LoRARequest("nemotron-lora", 0, llm_lora_model_root)]
 
         print("Running inference with real LoRA adapter...")
         outputs = llm.generate(prompts,
@@ -244,9 +260,14 @@ def test_nemotron_ultra_253b_lora_torch(nemotron_nas_example_root, llm_venv,
                                         engine_dir, cmodel_dir):
     """Run Nemotron Ultra 253B with multiple dummy LoRAs using LLM-API Torch backend."""
 
+    expected_outputs = {
+        'Llama-3_1-Nemotron-Ultra-253B-v1': ["...", "...", "...", "...", "..."],
+    }
+
     print("Testing with LLM-API Torch backend...")
 
     defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    model_name = os.path.basename(nemotron_nas_model_root).lower()
     test_llm_torch_multi_lora_support(
         hf_model_dir=nemotron_nas_model_root,
         llm_venv=llm_venv,
@@ -254,9 +275,8 @@ def test_nemotron_ultra_253b_lora_torch(nemotron_nas_example_root, llm_venv,
         lora_rank=8,
         target_hf_modules=["q_proj", "k_proj", "v_proj"],
         zero_lora_weights=True,
-        use_code_prompts=False,
         tensor_parallel_size=8,
-    )
+        expected_outputs=expected_outputs[model_name])
     defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
     print(
         f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"

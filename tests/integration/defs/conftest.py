@@ -1335,6 +1335,11 @@ def llm_lora_model_root(request):
         elif item == "komt-mistral-7b-v1-lora":
             model_root_list.append(
                 os.path.join(models_root, "komt-mistral-7b-v1-lora"))
+        elif item == "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32":
+            model_root_list.append(
+                os.path.join(
+                    models_root, "nemotron-nas",
+                    "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32"))
 
     return ",".join(model_root_list)
 

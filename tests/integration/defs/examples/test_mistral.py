@@ -14,6 +14,7 @@
 # limitations under the License.
 """Module test_mistral test mistral examples."""
 import multiprocessing
+import os
 
 import defs.ci_profiler
 import psutil
@@ -293,7 +294,7 @@ def test_mistral_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
                                       llm_mistral_model_root):
     """Run Mistral models with multiple dummy LoRAs using LLM-API Torch backend."""
 
-    if llm_mistral_model_root == "mistral-nemo-instruct-2407":
+    if "mistral-nemo-instruct-2407" in llm_mistral_model_root.lower():
         tensor_parallel_size = 2
         if get_device_count() < 2:
             pytest.skip(
@@ -301,9 +302,27 @@ def test_mistral_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
     else:
         tensor_parallel_size = 1
 
+    expected_outputs = {
+        'mistral-7b-v0.1': [
+            "I hope you’re doing well. I’m doing well. I’m doing well. I’m doing well. I’m doing",
+            "\n\nSeattle, WA Weather Forecast. Today's weather in Seattle, WA. 59°F. 15°",
+            "\n\nNo, it is not ok to fill diesel in a petrol car. Diesel is a heavier fuel than petrol and will",
+            "\n\nYes, you can check the top 5 trending songs on Spotify. To do this, go to the Spotify website and sign",
+            "\n\nParis is the capital of France.\n\nWhat is the capital of the United States?\n\nWashington, D.C."
+        ],
+        'mistral-nemo-instruct-2407': [
+            " I'm doing fine, thanks for asking! How can I assist you today? Let me know if you have any questions or just want to chat!",
+            " Seattle, WA is currently experiencing a temperature of 55°F (13°C) with a chance of rain. The weather is typically cloud",
+            " I have a 2005 Honda City. I have filled diesel in my car by mistake. I have driven the car for about 1",
+            " I'm using python and I've tried using the spotipy library but I can't seem to get it to work. I'm not sure if it",
+            " Paris\n\nThe capital of France is Paris. It is the largest city in the country and is known for its iconic landmarks such as the Eiffel"
+        ],
+    }
+
     print(f"Testing {llm_mistral_model_root} with LLM-API Torch backend...")
 
     defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    model_name = os.path.basename(llm_mistral_model_root).lower()
     test_llm_torch_multi_lora_support(
         hf_model_dir=llm_mistral_model_root,
         llm_venv=llm_venv,
@@ -311,9 +330,8 @@ def test_mistral_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
         lora_rank=8,
         target_hf_modules=["q_proj", "k_proj", "v_proj"],
         zero_lora_weights=True,
-        use_code_prompts=False,
         tensor_parallel_size=tensor_parallel_size,
-    )
+        expected_outputs=expected_outputs[model_name])
     defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
     print(
         f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"
