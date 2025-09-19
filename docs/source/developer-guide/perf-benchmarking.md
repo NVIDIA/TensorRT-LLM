@@ -181,7 +181,7 @@ trtllm-bench --model meta-llama/Llama-3.1-8B \
 ===========================================================
 Model:                  meta-llama/Llama-3.1-8B
 Model Path:             /Ckpt/Path/To/Llama-3.1-8B
-TensorRT-LLM Version:   0.17.0
+TensorRT LLM Version:   0.17.0
 Dtype:                  bfloat16
 KV Cache Dtype:         None
 Quantization:           FP8

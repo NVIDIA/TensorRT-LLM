@@ -1,34 +1,34 @@
 # Description
 
-TensorRT-LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports
-state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs. TensorRT-LLM also contains components to
+TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports
+state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs. TensorRT LLM also contains components to
 create Python and C++ runtimes that orchestrate the inference execution in a performant way.
 
 # Overview
 
-## TensorRT-LLM Develop Container
+## TensorRT LLM Develop Container
 
-The TensorRT-LLM Develop container includes all necessary dependencies to build TensorRT-LLM from source. It is
-specifically designed to be used alongside the source code cloned from the official TensorRT-LLM repository:
+The TensorRT LLM Develop container includes all necessary dependencies to build TensorRT LLM from source. It is
+specifically designed to be used alongside the source code cloned from the official TensorRT LLM repository:
 
 [GitHub Repository - NVIDIA TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
 
-Full instructions for cloning the TensorRT-LLM repository can be found in
-the [TensorRT-LLM Documentation](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html).
+Full instructions for cloning the TensorRT LLM repository can be found in
+the [TensorRT LLM Documentation](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html).
 
-### Running TensorRT-LLM Using Docker
+### Running TensorRT LLM Using Docker
 
-With the top-level directory of the TensorRT-LLM repository cloned to your local machine, you can run the following
+With the top-level directory of the TensorRT LLM repository cloned to your local machine, you can run the following
 command to start the development container:
 
 ```bash
 make -C docker ngc-devel_run LOCAL_USER=1 DOCKER_PULL=1 IMAGE_TAG=x.y.z
 ```
 
-where `x.y.z` is the version of the TensorRT-LLM container to use (cf. [release history on GitHub](https://github.com/NVIDIA/TensorRT-LLM/releases) and [tags in NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags)). This command pulls the specified container from the
+where `x.y.z` is the version of the TensorRT LLM container to use (cf. [release history on GitHub](https://github.com/NVIDIA/TensorRT-LLM/releases) and [tags in NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags)). This command pulls the specified container from the
 NVIDIA NGC registry, sets up the local user's account within the container, and launches it with full GPU support. The
-local source code of TensorRT-LLM will be mounted inside the container at the path `/code/tensorrt_llm` for seamless
-integration. Ensure that the image version matches the version of TensorRT-LLM in your currently checked out local git branch. Not
+local source code of TensorRT LLM will be mounted inside the container at the path `/code/tensorrt_llm` for seamless
+integration. Ensure that the image version matches the version of TensorRT LLM in your currently checked out local git branch. Not
 specifying a `IMAGE_TAG` will attempt to resolve this automatically, but not every intermediate release might be
 accompanied by a development container. In that case, use the latest version preceding the version of your development
 branch.
@@ -50,9 +50,9 @@ docker run --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864  \
 Note that this will start the container with the user `root`, which may leave files with root ownership in your local
 checkout.
 
-### Building the TensorRT-LLM Wheel within the Container
+### Building the TensorRT LLM Wheel within the Container
 
-You can build the TensorRT-LLM Python wheel inside the development container using the following command:
+You can build the TensorRT LLM Python wheel inside the development container using the following command:
 
 ```bash
 ./scripts/build_wheel.py --clean --use_ccache --cuda_architectures=native
@@ -78,7 +78,7 @@ The wheel will be built in the `build` directory and can be installed using `pip
 pip install ./build/tensorrt_llm*.whl
 ```
 
-For additional information on building the TensorRT-LLM wheel, refer to
+For additional information on building the TensorRT LLM wheel, refer to
 the [official documentation on building from source](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html#option-1-full-build-with-c-compilation).
 
 ### Security CVEs

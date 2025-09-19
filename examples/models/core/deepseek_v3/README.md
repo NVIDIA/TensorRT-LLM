@@ -1,11 +1,11 @@
 # DeepSeek‑V3 and DeepSeek-R1
 
-This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1 models using NVIDIA's TensorRT-LLM framework with the PyTorch backend.
+This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1 models using NVIDIA's TensorRT LLM framework with the PyTorch backend.
 **DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT-LLM, for brevity we only provide one model example, the example command to be used interchangeably by only replacing the model name to the other one**.
 
 To benchmark the model with best configurations, refer to [DeepSeek R1 benchmarking blog](../../../../docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md).
 
-Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and start a TRT-LLM docker container.
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container.
 
 > [!NOTE]
 > This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.
@@ -390,7 +390,7 @@ settings for your specific use case.
 ### Dynamo
 
 NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
-Dynamo supports TensorRT-LLM as one of its inference engine. For details on how to use TensorRT-LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
+Dynamo supports TensorRT LLM as one of its inference engine. For details on how to use TensorRT LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
 
 ### tensorrtllm_backend for triton inference server (Prototype)
 To serve the model using [tensorrtllm_backend](https://github.com/triton-inference-server/tensorrtllm_backend.git), make sure the version is v0.19+ in which the pytorch path is added as a prototype feature.
@@ -414,7 +414,7 @@ Available parameters for the requests are listed in https://github.com/triton-in
 
 ## Advanced Usages
 ### Multi-node
-TensorRT-LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
+TensorRT LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
 
 #### mpirun
 mpirun requires each node to have passwordless ssh access to the other node. We need to setup the environment inside the docker container. Run the container with host network and mount the current directory as well as model directory to the container.
@@ -606,7 +606,7 @@ sbatch --nodes=2 --ntasks=8 --ntasks-per-node=4 benchmark.slurm
 
 
 ### DeepGEMM
-TensorRT-LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs. DeepGEMM can be disabled by setting the environment variable `TRTLLM_DG_ENABLED` to `0`:
+TensorRT LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs. DeepGEMM can be disabled by setting the environment variable `TRTLLM_DG_ENABLED` to `0`:
 
 DeepGEMM-related behavior can be controlled by the following environment variables:
 
@@ -677,7 +677,7 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
 ```
 
 ### FlashMLA
-TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
+TensorRT LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
 
 ### FP8 KV Cache and MLA
 
@@ -693,7 +693,7 @@ You can enable FP8 MLA through either of these methods:
 
 **Option 1: Checkpoint config**
 
-TensorRT-LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+TensorRT LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
 
 To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following shows the config for DeepSeek's block-wise FP8 GEMM quantization + FP8 MLA:
 
@@ -717,7 +717,7 @@ kv_cache_dtype: fp8
 
 ### W4AFP8
 
-TensorRT-LLM supports W(INT)4-A(FP)8 for DeepSeek on __Hopper__. Activations and weights are quantized at per-tensor and per-group (1x128) granularity respectively for MoE, and FP8 block scaling is preserved for dense layers.
+TensorRT LLM supports W(INT)4-A(FP)8 for DeepSeek on __Hopper__. Activations and weights are quantized at per-tensor and per-group (1x128) granularity respectively for MoE, and FP8 block scaling is preserved for dense layers.
 
 We provide a pre-quantized checkpoint for DeepSeek-R1 W4AFP8 at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8).
 
