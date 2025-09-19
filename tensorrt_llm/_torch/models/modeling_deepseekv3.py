@@ -1451,7 +1451,7 @@ class DeepseekV3Model(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1472,7 +1472,8 @@ class DeepseekV3Model(DecoderModel):
                 spec_metadata=spec_metadata,
             )
 
-        return hidden_states
+        # Export residual to avoid residual pp_send get eliminated by torch.compile for pp > 1.
+        return hidden_states, residual
 
 
 @register_auto_model("DeepseekV3ForCausalLM")

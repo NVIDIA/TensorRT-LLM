@@ -247,11 +247,13 @@ def init_pp_comm(mapping):
     _pp_comm = PPComm(mapping)
 
 
-def pp_recv(tensor):
+@torch.library.custom_op("trtllm::pp_recv", mutates_args=("tensor", ))
+def pp_recv(tensor: torch.Tensor) -> None:
     """Receive tensors from previous pp rank."""
     _pp_comm.recv(tensor)
 
 
-def pp_send(tensor):
+@torch.library.custom_op("trtllm::pp_send", mutates_args=("tensor", ))
+def pp_send(tensor: torch.Tensor) -> None:
     """Send tensors to next pp rank."""
     _pp_comm.send(tensor)

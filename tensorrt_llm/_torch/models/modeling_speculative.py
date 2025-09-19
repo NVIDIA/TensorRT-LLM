@@ -531,7 +531,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.model(
+        outputs = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
@@ -539,6 +539,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
+        hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
