@@ -317,11 +317,36 @@ a model name (HuggingFace reference or path to a local model), a [generated data
 trtllm-bench --model $model_name throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options $llm_options
 ```
 
-The data collected for the v0.21 benchmarks was run with the following file:
+The data collected for the v1.0 benchmarks was run with the following files:
 
+Dense / non-MoE models:
 `llm_options.yml`
 ```yaml
 cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
+    - 512
+    - 1024
+    - 2048
+    - 4096
+    - 8192
+```
+
+MoE models:
+`llm_options.yml`
+```yaml
+cuda_graph_config:
+  enable_attention_dp: true
   enable_padding: true
   batch_sizes:
     - 1
