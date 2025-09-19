@@ -354,7 +354,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
-        self.cached_tokens = 0
+        self._cached_tokens = 0
+        self._cached_tokens_set = False
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -374,6 +375,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
             else:
                 self._py_embedding_bias_1d = self.embedding_bias
+
+    @property
+    def cached_tokens(self):
+        return self._cached_tokens
+
+    @cached_tokens.setter
+    def cached_tokens(self, value):
+        if not self._cached_tokens_set:
+            self._cached_tokens = value
+            self._cached_tokens_set = True
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
