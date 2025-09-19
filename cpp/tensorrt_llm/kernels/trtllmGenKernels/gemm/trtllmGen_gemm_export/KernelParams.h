@@ -204,7 +204,7 @@ struct KernelParams
     void* ptrSfC;
 
     // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
-    // TensorRT-LLM API requires a scaling factor on the device.
+    // TensorRT LLM API requires a scaling factor on the device.
     // Shape is [1].
     float const* ptrScaleC;
 

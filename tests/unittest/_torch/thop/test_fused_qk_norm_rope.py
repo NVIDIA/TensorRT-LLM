@@ -148,7 +148,7 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, is_neox,
                                         k_weight, base, is_neox, position_ids)
     output = qkv  # This op is inplace
 
-    # Compute reference output using TensorRT-LLM modules
+    # Compute reference output using TensorRT LLM modules
     ref_output = torch_ref_rms_norm_rope(qkv_copy, num_heads_q, num_heads_k,
                                          num_heads_v, head_dim, eps, q_weight,
                                          k_weight, base, is_neox, position_ids)

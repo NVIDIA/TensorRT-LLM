@@ -4,7 +4,7 @@
 r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands:
-    TensorRT-LLM OpenAI API server
+    TensorRT LLM OpenAI API server
     trtllm-serve <your_model>
 
 On the client side, run:

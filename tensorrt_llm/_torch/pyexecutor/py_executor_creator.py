@@ -109,8 +109,8 @@ class _ExecutorMemoryMonitor():
                f"{self._bytes_to_gib(sample.free_gpu_memory_bytes_pre):.2f} / {self._bytes_to_gib(sample.free_gpu_memory_bytes_post):.2f}"
                ) for sample in self._samples),
             "",
-            ("Please refer to the TensorRT-LLM documentation for information on how "
-             "to control the memory usage through TensorRT-LLM configuration options. "
+            ("Please refer to the TensorRT LLM documentation for information on how "
+             "to control the memory usage through TensorRT LLM configuration options. "
              "Possible options include:"),
             *(f"  {stage.value}: {tuning_knobs[stage]}"
               for stage in chain((sample.creation_stage
