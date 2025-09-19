@@ -36,6 +36,7 @@ import tqdm
 import yaml
 from _pytest.mark import ParameterSet
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
@@ -2430,3 +2431,13 @@ def torch_empty_cache() -> None:
     """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@pytest.fixture(autouse=True)
+def ray_cleanup(llm_venv) -> None:
+    if mpi_disabled():
+        llm_venv.run_cmd([
+            "-m",
+            "ray.scripts.scripts",
+            "stop",
+        ])
