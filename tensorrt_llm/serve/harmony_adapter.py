@@ -1422,9 +1422,7 @@ class HarmonyAdapter:
                 delta_message.reasoning_content = None
                 # tool_calls will use default factory (empty list)
 
-            should_stop = False
-            if "should_stop" in harmony_delta:
-                should_stop = True
+            should_stop = ("should_stop" in harmony_delta)
 
             # Create the streaming response
             choice = ChatCompletionResponseStreamChoice(
