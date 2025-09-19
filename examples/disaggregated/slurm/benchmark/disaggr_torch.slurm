@@ -1,173 +1,159 @@
 #!/bin/bash
-#SBATCH --nodes=2
-#SBATCH --ntasks=8
-#SBATCH --ntasks-per-node=4
-#SBATCH --partition=${partition} # add your partition here or specify in the sbatch command
-#SBATCH --account=${account} # add your account here or specify in the sbatch command
-#SBATCH --job-name=${job_name} # add your job name here or specify in the sbatch command
-#SBATCH --time=02:00:00
+set -euo pipefail
 
-set -u
-set -e
-set -x
+# Validate required environment variables
+check_env_var() {
+    local var_name=$1
+    local var_value=${!var_name}
+    if [[ -z "${var_value}" ]]; then
+        echo "Error: ${var_name} environment variable is not set. Please set it in your submit script." >&2
+        exit 1
+    fi
+}
 
-# Context servers arguments
-num_ctx_servers=${1}
-ctx_tp_size=${2}
-ctx_pp_size=${3}
-ctx_batch_size=${4}
-ctx_max_num_tokens=${5}
-ctx_enable_attention_dp=${6}
-ctx_gpu_memory_fraction=${7}
+# Hardware Configuration
+check_env_var "GPUS_PER_NODE"
 
-# Generation servers arguments
-num_gen_servers=${8}
-gen_tp_size=${9}
-gen_pp_size=${10}
-gen_batch_size=${11}
-gen_max_num_tokens=${12}
-gen_enable_attention_dp=${13}
-gen_gpu_memory_fraction=${14}
+# Benchmark Configuration
+check_env_var "USE_NV_SA_BENCHMARK"
+check_env_var "ISL"
+check_env_var "OSL"
+check_env_var "MULTI_ROUND"
+check_env_var "BENCHMARK_RATIO"
+check_env_var "STREAMING"
+check_env_var "CACHE_MAX_TOKENS"
+check_env_var "DATASET_FILE"
 
-# Other arguments
-eplb_num_slots=${15}
-mtp_size=${16}
+# Environment Configuration
+check_env_var "MOUNT_DIR"
+check_env_var "CONTAINER_IMAGE"
 
-# Benchmarking arguments
-concurrency=${17}
-isl=${18}
-osl=${19}
-multi_round=${20}
-streaming=${21}
+# Model Configuration
+check_env_var "MODEL_PATH"
+check_env_var "TRTLLM_REPO"
+check_env_var "BUILD_WHEEL"
 
-# User specific arguments
-container_image=${22}
-mounts=${23}
-workdir=${24}
-model_dir=${25}
-benchmark_mode=${26}
-trtllm_repo=${27:-""}
+# Workspace Configuration
+check_env_var "WORK_DIR"
 
-# Get GPUs per node dynamically from SLURM
-ntasks_per_node=${SLURM_NTASKS_PER_NODE:-4}  # Default to 4 for GB200
+# Profiling Configuration
+check_env_var "NSYS_ON"
 
-echo "================= parameters ================="
-echo "num_ctx_servers: ${num_ctx_servers}"
-echo "ctx_tp_size: ${ctx_tp_size}"
-echo "ctx_pp_size: ${ctx_pp_size}"
-echo "ctx_batch_size: ${ctx_batch_size}"
-echo "ctx_max_num_tokens: ${ctx_max_num_tokens}"
-echo "ctx_enable_attention_dp: ${ctx_enable_attention_dp}"
-echo "ctx_gpu_memory_fraction: ${ctx_gpu_memory_fraction}"
-echo "num_gen_servers: ${num_gen_servers}"
-echo "gen_tp_size: ${gen_tp_size}"
-echo "gen_pp_size: ${gen_pp_size}"
-echo "gen_batch_size: ${gen_batch_size}"
-echo "gen_max_num_tokens: ${gen_max_num_tokens}"
-echo "gen_enable_attention_dp: ${gen_enable_attention_dp}"
-echo "gen_gpu_memory_fraction: ${gen_gpu_memory_fraction}"
-echo "eplb_num_slots: ${eplb_num_slots}"
-echo "mtp_size: ${mtp_size}"
-echo "concurrency: ${concurrency}"
-echo "isl: ${isl}"
-echo "osl: ${osl}"
-echo "multi_round: ${multi_round}"
-echo "streaming: ${streaming}"
-echo "container_image: ${container_image}"
-echo "mounts: ${mounts}"
-echo "workdir: ${workdir}"
-echo "model_dir: ${model_dir}"
-echo "benchmark_mode: ${benchmark_mode}"
-echo "trtllm_repo: ${trtllm_repo}"
-echo "ntasks_per_node: ${ntasks_per_node}"
-echo "==========================================="
+container_name="disaggr-test"
 
+# Parse arguments
+num_ctx_servers=$1
+ctx_tp_size=$2
+ctx_batch_size=$3
+ctx_max_num_tokens=$4
+ctx_enable_attention_dp=$5
+ctx_gpu_frac=$6
+num_gen_servers=$7
+gen_tp_size=$8
+gen_batch_size=$9
+gen_max_num_tokens=${10}
+gen_enable_attention_dp=${11}
+gen_gpu_memory_fraction=${12}
+eplb_num_slots=${13}
+mtp_size=${14}
+concurrency_list=${15}
 
-numa_bind=true # Only allocate memory from nodes, this only works on GB200
-ctx_max_seq_len=$((isl + 10))
-gen_max_seq_len=$((isl + osl + 10))
-ctx_gpu_frac=${ctx_gpu_memory_fraction}
-cache_transceiver_max_num_tokens=8448
-
-container_name=disaggregated_serving
-logdir=${workdir}/slurm-${SLURM_JOB_ID}/benchmark-${isl}-${osl}
-mkdir -p ${logdir}
-full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
-
-nsys_on=""
-# nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
-
-echo "concurrency: ${concurrency}"
-
-ctx_gpus=$((num_ctx_servers * ctx_tp_size * ctx_pp_size))
-gen_gpus=$((num_gen_servers * gen_tp_size * gen_pp_size))
-
-echo "enable_attention_dp: ${ctx_enable_attention_dp}, ${gen_enable_attention_dp}, gpu_memory_fraction: ${gen_gpu_memory_fraction}"
-
+# Setup logging directory
+log_base="${WORK_DIR}/${ISL}-${OSL}/" # path to the log directory
+full_logdir=${log_base}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
 enable_pdl=false
 if [ "${gen_enable_attention_dp}" = "false" ]; then
     enable_pdl=true
     echo "enable_pdl: ${enable_pdl}"
-    full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_tep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
+    full_logdir=${log_base}/ctx${num_ctx_servers}_gen${num_gen_servers}_tep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
 fi
-mkdir -p ${full_logdir}
-echo "Log will be saved to: ${full_logdir}"
+mkdir -p "${full_logdir}"
 
-# check benchmark_mode
-if [ "${benchmark_mode}" != "gen_only" ] && [ "${benchmark_mode}" != "e2e" ]; then
-    echo "benchmark_mode: ${benchmark_mode} is not supported, change to default value: e2e"
-    benchmark_mode="e2e"
-fi
+echo "concurrency_list: ${concurrency_list}"
+echo "enable_attention_dp: ${ctx_enable_attention_dp}, ${gen_enable_attention_dp}, gpu_memory_fraction: ${gen_gpu_memory_fraction}"
 
-if [ -z "${TRT_LLM_GIT_COMMIT:-}" ]; then
-    export TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
-fi
+# Function to cleanup on failure
+cleanup_on_failure() {
+    echo "Error: $1"
+    scancel ${SLURM_JOB_ID}
+    exit 1
+}
 
-# start the container
-srun -l --container-image=${container_image} \
+# Start container
+echo "Starting container..."
+if ! srun -l --container-image=${CONTAINER_IMAGE} \
         --container-name=${container_name} \
-        --container-mounts=${mounts} \
+        --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
         --mpi=pmix \
-        echo "Container up."
-
-if [ -n "${trtllm_repo}" ]; then
-    srun --container-name=${container_name} \
-        --container-mounts=${mounts} \
-        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "cd ${trtllm_repo} && echo 'Running install operation...' && pip install -e .  " 2>&1 | tee ${full_logdir}/install.log
+        echo "Container up." &> ${full_logdir}/container_launch.log; then
+    cleanup_on_failure "Failed to start container. Check ${full_logdir}/container_launch.log"
 fi
 
-echo "Generating YAML file for workers."
-srun -l -N 1 -n 1 \
+# Build TensorRT-LLM if needed
+if [ -d "${TRTLLM_REPO}" ]; then
+    echo "Installing TensorRT-LLM from ${TRTLLM_REPO}..."
+
+    if [ "${BUILD_WHEEL}" = "true" ]; then
+        echo "Building TensorRT-LLM wheel on one node..."
+        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures '100-real' --binding_type pybind --clean"
+        if ! srun --container-name=${container_name} \
+            --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
+            --mpi=pmix --overlap -N 1 --ntasks-per-node=1 \
+            bash -c "cd ${TRTLLM_REPO} && ${build_command}" \
+            &> ${full_logdir}/build.log; then
+            cleanup_on_failure "TensorRT-LLM build failed. Check ${full_logdir}/build.log for details"
+        fi
+        echo "TensorRT-LLM build completed successfully"
+    fi
+
+    echo "Installing TensorRT-LLM..."
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
+        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash -c "cd ${TRTLLM_REPO} && pip install -e ." \
+        &> ${full_logdir}/install.log; then
+        cleanup_on_failure "TensorRT-LLM installation failed. Check ${full_logdir}/install.log for details"
+    fi
+    echo "TensorRT-LLM installation completed successfully"
+fi
+
+# Generate worker config
+echo "Generating worker config..."
+# Sequence Length Configuration
+seq_offset=203            # Offset added to sequence lengths
+ctx_max_seq_len=$((ISL + seq_offset))
+gen_max_seq_len=$((ISL + OSL + seq_offset))
+if ! srun -l -N 1 -n 1 \
         --container-name=${container_name} \
-        --container-mounts=${mounts} \
+        --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
         --mpi=pmix --overlap \
-        python3 ${workdir}/gen_worker_config.py \
+        python3 ${WORK_DIR}/gen_worker_config.py \
                 --work_dir ${full_logdir} \
                 --ctx_tp_size ${ctx_tp_size} \
-                --ctx_pp_size ${ctx_pp_size} \
+                --ctx_pp_size 1 \
                 --ctx_batch_size ${ctx_batch_size} \
                 --ctx_max_num_tokens ${ctx_max_num_tokens} \
                 --ctx_max_seq_len ${ctx_max_seq_len} \
                 --ctx_free_gpu_memory_fraction ${ctx_gpu_frac} \
                 --gen_tp_size ${gen_tp_size} \
-                --gen_pp_size ${gen_pp_size} \
+                --gen_pp_size 1 \
                 --gen_batch_size ${gen_batch_size} \
                 --gen_max_num_tokens ${gen_max_num_tokens} \
                 --gen_max_seq_len ${gen_max_seq_len} \
                 --gen_gpu_memory_fraction ${gen_gpu_memory_fraction} \
                 --eplb_num_slots ${eplb_num_slots} \
                 --mtp_size ${mtp_size} \
-                --cache_transceiver_max_num_tokens ${cache_transceiver_max_num_tokens} \
+                --cache_transceiver_max_num_tokens ${CACHE_MAX_TOKENS} \
                 $(if [ "${ctx_enable_attention_dp}" = "true" ]; then echo "--ctx_enable_attention_dp"; fi) \
                 $(if [ "${gen_enable_attention_dp}" = "true" ]; then echo "--gen_enable_attention_dp"; fi) \
-                2>&1 | tee ${full_logdir}/gen_worker_config.log
+                &> ${full_logdir}/gen_worker_config.log; then
+    cleanup_on_failure "Failed to generate worker config. Check ${full_logdir}/gen_worker_config.log for details"
+fi
+echo "Worker config generated successfully"
 
-echo "YAML file generated."
-
-ctx_nodes_num=$(((ctx_tp_size + ntasks_per_node - 1) / ntasks_per_node))
-gen_nodes_num=$(((gen_tp_size + ntasks_per_node - 1) / ntasks_per_node))
+# Calculate nodes needed
+ctx_nodes_num=$(((ctx_tp_size + GPUS_PER_NODE - 1) / GPUS_PER_NODE))
+gen_nodes_num=$(((gen_tp_size + GPUS_PER_NODE - 1) / GPUS_PER_NODE))
 
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 total_nodes_num=${#all_nodes[@]}
@@ -184,46 +170,71 @@ ctx_nodes=(${all_nodes[@]:${total_gen_nodes_num}:${total_nodes_num}})
 echo "ctx_nodes: ${ctx_nodes[@]}, total_ctx_nodes_num: ${total_ctx_nodes_num}"
 
 rm -rf ${full_logdir}/hostnames
+rm -rf ${full_logdir}/server_config.yaml
 
 # start the gen workers
+echo "Starting gen workers..."
 for i in $(seq 0 $((num_gen_servers - 1))); do
     srun -l -N ${gen_nodes_num} \
         --ntasks=${gen_tp_size} \
-        --ntasks-per-node=${ntasks_per_node} \
-        --container-image=${container_image} \
+        --ntasks-per-node=${GPUS_PER_NODE} \
+        --container-image=${CONTAINER_IMAGE} \
         --container-name=${container_name} \
-        --container-mounts=${mounts} \
+        --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
         --mpi=pmix \
-        bash ${workdir}/start_worker.sh "GEN" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${numa_bind} ${full_logdir} ${nsys_on} \
+        bash ${WORK_DIR}/start_worker.sh \
+        "GEN" ${i} ${MODEL_PATH} "8336" "${enable_pdl}" "${full_logdir}" ${NSYS_ON} \
         &> ${full_logdir}/output_gen_${i}.log &
 done
 
 # start the ctx workers
+echo "Starting ctx workers..."
 for i in $(seq 0 $((num_ctx_servers - 1))); do
     srun -l -N ${ctx_nodes_num} \
         --ntasks=${ctx_tp_size} \
-        --ntasks-per-node=${ntasks_per_node} \
-        --container-image=${container_image} \
+        --ntasks-per-node=${GPUS_PER_NODE} \
+        --container-image=${CONTAINER_IMAGE} \
         --container-name=${container_name} \
-        --container-mounts=${mounts} \
+        --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
         --mpi=pmix \
-        bash ${workdir}/start_worker.sh "CTX" ${i} ${model_dir} "8336" ${benchmark_mode} ${concurrency} ${enable_pdl} ${numa_bind} ${full_logdir} ${nsys_on} \
-            &> ${full_logdir}/output_ctx_${i}.log &
+        bash ${WORK_DIR}/start_worker.sh \
+        "CTX" ${i} ${MODEL_PATH} "8336" "${enable_pdl}" "${full_logdir}" ${NSYS_ON} \
+        &> ${full_logdir}/output_ctx_${i}.log &
 done
 
 # start the server
+echo "Starting server..."
 srun -l --container-name=${container_name} \
-    --container-image=${container_image} \
-    --container-mounts=${mounts} \
+    --container-image=${CONTAINER_IMAGE} \
+    --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
     --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${workdir}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${workdir} \
+    bash ${WORK_DIR}/start_server.sh ${num_ctx_servers} ${num_gen_servers} ${full_logdir} ${WORK_DIR} \
         &> ${full_logdir}/output_server.log &
 
-# start benchmarking
-srun -l --container-name=${container_name} \
-    --container-mounts=${mounts} \
-    --mpi=pmix --overlap -N 1 -n 1 \
-    bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} \
-        &> ${full_logdir}/benchmark.log 2>&1
+# Start benchmarking
+echo "Starting benchmark..."
+if [ "${USE_NV_SA_BENCHMARK}" = "true" ]; then
+    echo "Using NVIDIA SA benchmark script..."
+    if ! srun -l --container-name=${container_name} \
+            --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
+            --mpi=pmix --overlap -N 1 -n 1 \
+            bash ${WORK_DIR}/run_benchmark_nv_sa.sh \
+            "${MODEL_PATH}" "${ISL}" "${OSL}" "${BENCHMARK_RATIO}" "${MULTI_ROUND}" "${num_gen_servers}" "${concurrency_list}" "${STREAMING}" "${full_logdir}/" \
+            &> ${full_logdir}/bench.log; then
+        cleanup_on_failure "NVIDIA SA benchmark failed. Check ${full_logdir}/bench.log for details"
+    fi
+else
+    echo "Using default benchmark script..."
+    if ! srun -l --container-name=${container_name} \
+            --container-mounts=${MOUNT_DIR}:${MOUNT_DIR} \
+            --mpi=pmix --overlap -N 1 -n 1 \
+            bash ${WORK_DIR}/run_benchmark.sh \
+            "${MODEL_PATH}" "${DATASET_FILE}" "${MULTI_ROUND}" "${num_gen_servers}" "${concurrency_list}" "${STREAMING}" "${full_logdir}/" \
+            &> ${full_logdir}/bench.log; then
+        cleanup_on_failure "Benchmark failed. Check ${full_logdir}/bench.log for details"
+    fi
+fi
+echo "Benchmark completed successfully"
 
+# try to kill the server and workers
 scancel ${SLURM_JOB_ID}

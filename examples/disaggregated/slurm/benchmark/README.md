@@ -18,15 +18,46 @@ The benchmarking process is orchestrated through a set of shell scripts and Pyth
 
 ### `submit.sh`
 
-This script is used to submit multiple SLURM jobs for running benchmarks with different parameters. It iterates through various configurations and uses `sbatch` to submit `disaggr_torch.slurm` for each one.
+This script is used to submit SLURM jobs for running benchmarks with specific configurations. It provides helper functions to calculate required nodes and submit jobs with the right parameters.
+
+The script includes a user configuration section where you can set various parameters:
+
+1. Hardware Configuration:
+   - `GPUS_PER_NODE`: Number of GPUs per node (default: 4)
+
+2. Benchmark Configuration:
+   - `USE_NV_SA_BENCHMARK`: Whether to use NVIDIA SA benchmark script
+   - `ISL`: Input sequence length
+   - `OSL`: Output sequence length
+   - `MULTI_ROUND`: Number of benchmark rounds
+   - `BENCHMARK_RATIO`: Benchmark ratio
+   - `STREAMING`: Enable streaming mode
+   - `CACHE_MAX_TOKENS`: Cache transceiver max tokens
+   - `DATASET_FILE`: Path to dataset file for benchmarking
+
+3. Environment Configuration:
+   - `MOUNT_DIR`: Directory to mount in container
+   - `CONTAINER_IMAGE`: Path to container image
+
+4. Model Configuration:
+   - `MODEL_PATH`: Path to model directory
+   - `TRTLLM_REPO`: Path to TensorRT-LLM repository
+   - `BUILD_WHEEL`: Whether to build TensorRT-LLM from source
+
+5. Workspace and Profiling Configuration:
+   - `WORK_DIR`: Path to work directory
+   - `NSYS_ON`: Path for nsys profiling output (empty to disable)
 
 **Usage:**
 
+The script provides a `run_single` function that takes all the necessary parameters for both context and generation servers. Example usage:
+
 ```bash
-./submit.sh
+#      CTX: num tp_size batch tokens attn_dp gpu_frac  GEN: num tp_size batch tokens attn_dp gpu_frac mtp eplb concurrency
+run_single  1   4       4     4608   true    0.85           1   8       32    128    false   "0.9"    3   0    "16"
 ```
 
-You can modify the loops in this script to change the parameter space for the benchmark sweep.
+The script automatically calculates the required number of nodes based on the tensor parallel size and server count.
 
 ### `disaggr_torch.slurm`
 
@@ -36,29 +67,19 @@ It takes the following arguments in order:
 
 1.  `num_ctx_servers`: Number of context servers.
 2.  `ctx_tp_size`: Tensor parallel size for context servers.
-3.  `ctx_pp_size`: Pipeline parallel size for context servers.
-4.  `ctx_batch_size`: Max batch size for context servers.
-5.  `ctx_max_num_tokens`: Max number of tokens for context servers.
-6.  `ctx_enable_attention_dp`: `true` or `false` to enable attention DP for context servers.
+3.  `ctx_batch_size`: Max batch size for context servers.
+4.  `ctx_max_num_tokens`: Max number of tokens for context servers.
+5.  `ctx_enable_attention_dp`: `true` or `false` to enable attention DP for context servers.
+6.  `ctx_gpu_frac`: GPU memory fraction for context servers.
 7.  `num_gen_servers`: Number of generation servers.
 8.  `gen_tp_size`: Tensor parallel size for generation servers.
-9.  `gen_pp_size`: Pipeline parallel size for generation servers.
-10. `gen_batch_size`: Max batch size for generation servers.
-11. `gen_max_num_tokens`: Max number of tokens for generation servers.
-12. `gen_enable_attention_dp`: `true` or `false` to enable attention DP for generation servers.
-13. `gen_gpu_memory_fraction`: GPU memory fraction for generation servers.
-14. `eplb_num_slots`: Number of slots for eplb.
-15. `mtp_size`: Number of nextn layers for MTP.
-16. `concurrency`: Concurrency level for benchmarking.
-17. `isl`: Input sequence length.
-18. `osl`: Output sequence length.
-19. `multi_round`: Number of rounds for the benchmark.
-20. `streaming`: `true` or `false` for streaming mode.
-21. `container_image`: Container image to use.
-22. `mounts`: Container mounts.
-23. `workdir`: Working directory.
-24. `model_dir`: Model directory path.
-25. `trtllm_repo`: TensorRT-LLM repository path.
+9.  `gen_batch_size`: Max batch size for generation servers.
+10. `gen_max_num_tokens`: Max number of tokens for generation servers.
+11. `gen_enable_attention_dp`: `true` or `false` to enable attention DP for generation servers.
+12. `gen_gpu_memory_fraction`: GPU memory fraction for generation servers.
+13. `eplb_num_slots`: Number of slots for eplb.
+14. `mtp_size`: Number of nextn layers for MTP.
+15. `concurrency_list`: Space-separated list of concurrencies for benchmarking.
 
 ### `gen_worker_config.py`
 
@@ -86,11 +107,12 @@ This script starts a `trtllm-serve disaggregated_mpi_worker`. It is launched by 
 2.  `worker_index`: Index of the worker instance.
 3.  `model_dir`: Path to the model directory.
 4.  `worker_port`: Port for the worker to listen on.
-5.  `benchmark_mode`: Benchmark mode setting.
-6.  `concurrency`: Concurrency level.
-7.  `enable_pdl`: `true` or `false`.
-8.  `work_dir`: Work directory for logs and configuration.
-9.  `nsys_on`: Whether to enable nsys profiling.
+5.  `benchmark_mode`: Either "ctx_only" or "gen_only" for benchmarking.
+6.  `batch_size`: Batch size for the worker.
+7.  `enable_pdl`: `true` or `false` for enabling PDL.
+8.  `enable_profiling`: `true` or `false` for enabling profiling.
+9.  `work_dir`: Work directory for logs and configuration.
+10. `nsys_on`: Path for nsys profiling output (empty string to disable).
 
 ### `start_server.sh`
 
@@ -103,30 +125,43 @@ This script starts the `trtllm-serve disaggregated` server. It first generates t
 3.  `work_dir`: Work directory for logs and configuration.
 4.  `script_dir`: Directory containing the scripts.
 
-### `run_benchmark.sh`
+### `run_benchmark.sh` and `run_benchmark_nv_sa.sh`
 
-This script orchestrates the execution of the benchmark client. It waits for the configuration files to be created and for the server's `/health` endpoint to respond, then it runs the benchmark.
+The benchmark can be run using either the default benchmark script (`run_benchmark.sh`) or the NVIDIA SA benchmark script (`run_benchmark_nv_sa.sh`), controlled by the `USE_NV_SA_BENCHMARK` environment variable.
 
-**Arguments:**
+**Default Benchmark Script Arguments (`run_benchmark.sh`):**
 
-1.  `isl`: Input sequence length.
-2.  `osl`: Output sequence length.
+1.  `model_name`: Path to the model directory.
+2.  `dataset_file`: Path to the dataset file for benchmarking.
 3.  `multi_round`: Number of rounds for the benchmark.
-4.  `model_name`: Name of the model being benchmarked.
+4.  `num_gen_servers`: Number of generation servers.
 5.  `concurrency_list`: Space-separated list of concurrencies.
-6.  `streaming`: `true` or `false`.
+6.  `streaming`: `true` or `false` for streaming mode.
 7.  `log_path`: Path to the log directory.
+
+**NVIDIA SA Benchmark Script Arguments (`run_benchmark_nv_sa.sh`):**
+
+1.  `model_name`: Path to the model directory.
+2.  `isl`: Input sequence length.
+3.  `osl`: Output sequence length.
+4.  `benchmark_ratio`: Ratio for benchmarking.
+5.  `multi_round`: Number of rounds for the benchmark.
+6.  `num_gen_servers`: Number of generation servers.
+7.  `concurrency_list`: Space-separated list of concurrencies.
+8.  `streaming`: `true` or `false` for streaming mode.
+9.  `log_path`: Path to the log directory.
 
 ## Workflow
 
-1.  Make sure that SLURM parameters are correctly set in `disaggr_torch.slurm`.
-2.  The user runs `./submit.sh`.
-3.  `submit.sh` submits one or more jobs to SLURM by calling `sbatch disaggr_torch.slurm` with different parameters.
+1.  Configure the environment variables in `submit.sh` (e.g., sequence lengths, dataset file, model path, container image).
+2.  The user runs `./submit.sh` with appropriate parameters for context and generation servers.
+3.  `submit.sh` calculates required nodes and submits the job to SLURM using `sbatch disaggr_torch.slurm`.
 4.  For each job, SLURM allocates resources and runs `disaggr_torch.slurm`.
-5.  `disaggr_torch.slurm` runs `gen_worker_config.py` to create worker configuration files.
-6.  `disaggr_torch.slurm` uses `srun` to launch `start_worker.sh` on all nodes, starting the MPI workers for both context and generation phases.
-7.  `disaggr_torch.slurm` starts the main `trtllm-serve` process using `start_server.sh`, which generates the server configuration using `gen_server_config.py`.
-8.  `disaggr_torch.slurm` runs `run_benchmark.sh` which waits for the server to be ready.
-9.  `run_benchmark.sh` executes the benchmark for each concurrency level specified.
-10. After the benchmark, `run_benchmark.sh` and `disaggr_torch.slurm` attempt to kill the server and worker processes.
-11. Logs for each run are stored in a subdirectory specified by the `sub_file` parameter.
+5.  `disaggr_torch.slurm` validates all required environment variables.
+6.  `disaggr_torch.slurm` starts the container and optionally builds/installs TensorRT-LLM.
+7.  `disaggr_torch.slurm` runs `gen_worker_config.py` to create worker configuration files.
+8.  `disaggr_torch.slurm` uses `srun` to launch `start_worker.sh` on allocated nodes for context and generation workers.
+9.  `disaggr_torch.slurm` generates server configuration using `gen_server_config.py` and starts the server with `start_server.sh`.
+10. `disaggr_torch.slurm` runs either `run_benchmark.sh` or `run_benchmark_nv_sa.sh` based on `USE_NV_SA_BENCHMARK` setting.
+11. The benchmark script executes the benchmark for each concurrency level.
+12. After completion, processes are cleaned up and logs are stored in the specified log directory.
