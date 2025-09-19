@@ -25,6 +25,7 @@ namespace tensorrt_llm::kernels::moe_a2a
 {
 
 #define ENABLE_DEBUG_PRINT 0
+#define DISABLE_SYNC_FOR_PROFILING 0
 
 // ============================================================================
 // Helper Functions for Expert-to-Rank Mapping
@@ -88,45 +89,12 @@ __device__ void vectorized_copy_impl(void* dst, void const* src, int size)
     uint8_t const* src_ptr = static_cast<uint8_t const*>(src);
 
     int const stride = ThreadingPolicy::stride() * VEC_SIZE;
-    int const initial_offset = ThreadingPolicy::offset() * VEC_SIZE;
-    int remaining = size - initial_offset;
-    if (remaining <= 0)
+
+    for (int offset = ThreadingPolicy::offset() * VEC_SIZE; offset < size; offset += stride)
     {
-        return;
-    }
-
-    int num_iters = (remaining + stride - 1) / stride;
-    int unrolled_iters = (num_iters / 4) * 4;
-
-    for (int i = 0; i < unrolled_iters; i += 4)
-    {
-        int o0 = initial_offset + (i + 0) * stride;
-        int o1 = initial_offset + (i + 1) * stride;
-        int o2 = initial_offset + (i + 2) * stride;
-        int o3 = initial_offset + (i + 3) * stride;
-
-        vec_t<uint8_t, VEC_SIZE> v0;
-        vec_t<uint8_t, VEC_SIZE> v1;
-        vec_t<uint8_t, VEC_SIZE> v2;
-        vec_t<uint8_t, VEC_SIZE> v3;
-
-        v0.load(src_ptr + o0);
-        v1.load(src_ptr + o1);
-        v2.load(src_ptr + o2);
-        v3.load(src_ptr + o3);
-
-        v0.store(dst_ptr + o0);
-        v1.store(dst_ptr + o1);
-        v2.store(dst_ptr + o2);
-        v3.store(dst_ptr + o3);
-    }
-
-    for (int i = unrolled_iters; i < num_iters; ++i)
-    {
-        int o = initial_offset + i * stride;
         vec_t<uint8_t, VEC_SIZE> v;
-        v.load(src_ptr + o);
-        v.store(dst_ptr + o);
+        v.load(src_ptr + offset);
+        v.store(dst_ptr + offset);
     }
 }
 
@@ -275,6 +243,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 #endif
             }
 
+#if !DISABLE_SYNC_FOR_PROFILING
             // Busy wait until all source ranks targeting this rank have completed sending
             uint32_t expected_value = *ptrs.flag_val;
             bool all_flags_set;
@@ -293,6 +262,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                     all_flags_set = all_flags_set && (flag_value == expected_value);
                 }
             } while (!all_flags_set);
+#endif
         }
     }
 }
@@ -394,83 +364,10 @@ __device__ void vectorized_combine_impl(
     uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst_typed_base);
 
     const int stride = ThreadingPolicy::stride() * VEC_SIZE;
-    const int initial_offset = ThreadingPolicy::offset() * VEC_SIZE;
     const int local_token_idx = ThreadingPolicy::token_idx();
 
-    int remaining = size_per_token - initial_offset;
-    if (remaining <= 0)
+    for (int offset = ThreadingPolicy::offset() * VEC_SIZE; offset < size_per_token; offset += stride)
     {
-        return;
-    }
-
-    int num_iters = (remaining + stride - 1) / stride;
-    int unrolled_iters = (num_iters / 4) * 4;
-
-    // Unrolled loop processing 4 segments per lane
-    for (int i = 0; i < unrolled_iters; i += 4)
-    {
-        int o0 = initial_offset + (i + 0) * stride;
-        int o1 = initial_offset + (i + 1) * stride;
-        int o2 = initial_offset + (i + 2) * stride;
-        int o3 = initial_offset + (i + 3) * stride;
-
-        vec_t<uint8_t, VEC_SIZE> acc0;
-        vec_t<uint8_t, VEC_SIZE> acc1;
-        vec_t<uint8_t, VEC_SIZE> acc2;
-        vec_t<uint8_t, VEC_SIZE> acc3;
-
-        // Zero accumulators
-        {
-            T* a0 = reinterpret_cast<T*>(&acc0);
-            T* a1 = reinterpret_cast<T*>(&acc1);
-            T* a2 = reinterpret_cast<T*>(&acc2);
-            T* a3 = reinterpret_cast<T*>(&acc3);
-            
-            #pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j) { a0[j] = T(0); a1[j] = T(0); a2[j] = T(0); a3[j] = T(0); }
-        }
-
-        // Combine: Pull and accumulate from peer ranks
-        for (int target_rank = 0; target_rank < ep_size; ++target_rank)
-        {
-            // Check if the token was dispatched to target_rank
-            int dst_idx = ptrs.send_indices[local_token_idx * ep_size + target_rank];
-            if (dst_idx < 0) continue;
-
-            uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
-            size_t base_source_rank = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) + static_cast<size_t>(dst_idx);
-            size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
-
-            vec_t<uint8_t, VEC_SIZE> s0, s1, s2, s3;
-            s0.load(recv_buffer + base_token + o0);
-            s1.load(recv_buffer + base_token + o1);
-            s2.load(recv_buffer + base_token + o2);
-            s3.load(recv_buffer + base_token + o3);
-
-            T* a0 = reinterpret_cast<T*>(&acc0);
-            T* a1 = reinterpret_cast<T*>(&acc1);
-            T* a2 = reinterpret_cast<T*>(&acc2);
-            T* a3 = reinterpret_cast<T*>(&acc3);
-            T const* v0 = reinterpret_cast<T const*>(&s0);
-            T const* v1 = reinterpret_cast<T const*>(&s1);
-            T const* v2 = reinterpret_cast<T const*>(&s2);
-            T const* v3 = reinterpret_cast<T const*>(&s3);
-            #pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j) { a0[j] += v0[j]; a1[j] += v1[j]; a2[j] += v2[j]; a3[j] += v3[j]; }     
-        }
-
-        // Store accumulated results once
-        acc0.store(dst_bytes + o0);
-        acc1.store(dst_bytes + o1);
-        acc2.store(dst_bytes + o2);
-        acc3.store(dst_bytes + o3);
-    }
-
-    // Remainder
-    for (int i = unrolled_iters; i < num_iters; ++i)
-    {
-        int o = initial_offset + i * stride;
-
         vec_t<uint8_t, VEC_SIZE> acc;
         {
             T* a = reinterpret_cast<T*>(&acc);
@@ -486,14 +383,14 @@ __device__ void vectorized_combine_impl(
             size_t base_source_rank = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) + static_cast<size_t>(dst_idx);
             size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
             vec_t<uint8_t, VEC_SIZE> s;
-            s.load(recv_buffer + base_token + o);
+            s.load(recv_buffer + base_token + offset);
             T* a = reinterpret_cast<T*>(&acc);
             T const* v = reinterpret_cast<T const*>(&s);
             #pragma unroll
             for (int j = 0; j < elems_per_vec; ++j) { a[j] += v[j]; }
         }
 
-        acc.store(dst_bytes + o);
+        acc.store(dst_bytes + offset);
     }
 }
 
@@ -601,11 +498,11 @@ __global__ void moeA2ACombineKernel(
         }
     }
 
+#if !DISABLE_SYNC_FOR_PROFILING
     if (threadIdx.x == 0)
     {
         uint32_t expected_value = *ptrs.flag_val;
         bool all_flags_set;
-
         do {
             all_flags_set = true;
             for (int peer_rank = 0; peer_rank < ep_size; ++peer_rank)
@@ -620,9 +517,9 @@ __global__ void moeA2ACombineKernel(
                 all_flags_set = all_flags_set && (flag_value == expected_value);
             }
         } while (!all_flags_set);
-
     }
     __syncthreads();
+#endif
 
     // Get output location for this token (using src_data_ptrs[0] as output)
     T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
