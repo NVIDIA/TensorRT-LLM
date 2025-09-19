@@ -25,15 +25,15 @@ The Deepseek-v1 model requires 1x80G GPU memory.
 
 ## Overview
 
-The TensorRT-LLM Deepseek-v1 implementation can be found in [tensorrt_llm/models/deepseek_v1/model.py](../../tensorrt_llm/models/deepseek_v1/model.py). The TensorRT-LLM Deepseek-v1 example code is located in [`examples/models/contrib/deepseek_v1`](./). There is one main file:
+The TensorRT LLM Deepseek-v1 implementation can be found in [tensorrt_llm/models/deepseek_v1/model.py](../../tensorrt_llm/models/deepseek_v1/model.py). The TensorRT LLM Deepseek-v1 example code is located in [`examples/models/contrib/deepseek_v1`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the Deepseek-v1 model into tensorrt-llm checkpoint format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the Deepseek-v1 model into TensorRT LLM checkpoint format.
 
 In addition, there are three shared files in the parent folder [`examples`](../../../) can be used for inference and evaluation:
 
 * [`../../../run.py`](../../../run.py) to run the model inference output by given an input text.
-* [`../../../summarize.py`](../../../summarize.py) to summarize the article from [cnn_dailmail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset, it can running the summarize from HF model and TensorRT-LLM model.
-* [`../../../mmlu.py`](../../../mmlu.py) to running score script from https://github.com/declare-lab/instruct-eval to compare HF model and TensorRT-LLM model on the MMLU dataset.
+* [`../../../summarize.py`](../../../summarize.py) to summarize the article from [cnn_dailmail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset, it can running the summarize from HF model and TensorRT LLM model.
+* [`../../../mmlu.py`](../../../mmlu.py) to running score script from https://github.com/declare-lab/instruct-eval to compare HF model and TensorRT LLM model on the MMLU dataset.
 
 ## Support Matrix
 
@@ -43,13 +43,13 @@ In addition, there are three shared files in the parent folder [`examples`](../.
 
 ## Usage
 
-The TensorRT-LLM Deepseek-v1 example code locates at [examples/models/contrib/deepseek_v1](./). It takes PyTorch weights as input, and builds corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM Deepseek-v1 example code locates at [examples/models/contrib/deepseek_v1](./). It takes PyTorch weights as input, and builds corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build TensorRT engine(s)
 
 Below is the step-by-step to run Deepseek-v1 with TensorRT-LLM.
 
-First the checkpoint will be converted to the TensorRT-LLM checkpoint format by apply [`convert_checkpoint.py`](./convert_checkpoint.py). After that, the TensorRT engine(s) can be build with TensorRT-LLM checkpoint.
+First the checkpoint will be converted to the TensorRT LLM checkpoint format by apply [`convert_checkpoint.py`](./convert_checkpoint.py). After that, the TensorRT engine(s) can be build with TensorRT LLM checkpoint.
 
 ```bash
 # Build the bfloat16 engine from Deepseek-v1 HF weights.
@@ -76,7 +76,7 @@ python ../../../run.py --engine_dir ./trtllm_engines/deepseek_v1/bf16/tp1 \
 
 ### FP8 Quantization
 
-The [`../../../quantization/quantize.py`](../../../quantization/quantize.py) script can be used to quantize the models and export TensorRT-LLM checkpoints.
+The [`../../../quantization/quantize.py`](../../../quantization/quantize.py) script can be used to quantize the models and export TensorRT LLM checkpoints.
 
 ```bash
 # Deepseek-v1: single gpu, fp8 quantization

@@ -1,6 +1,6 @@
-# TensorRT-LLM Wide-EP Benchmark Scripts
+# TensorRT LLM Wide-EP Benchmark Scripts
 
-This directory contains scripts for benchmarking TensorRT-LLM wide-ep performance using SLURM job scheduler.
+This directory contains scripts for benchmarking TensorRT LLM wide-ep performance using SLURM job scheduler.
 
 ## ⚠️ DISCLAIMER
 
@@ -28,7 +28,7 @@ Note that, core implementation of the slurm scripts are included in `examples/di
 
 Before running the scripts, ensure you have:
 - Access to a SLURM cluster
-- Container image with TensorRT-LLM installed
+- Container image with TensorRT LLM installed
 - Model files accessible on the cluster
 - Required environment variables set
 

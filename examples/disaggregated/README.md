@@ -1,6 +1,6 @@
 # Disaggregated Serving
 
-To run TensorRT-LLM in disaggregated mode, you must first launch context (prefill) and generation (decode) servers using `trtllm-serve`.
+To run TensorRT LLM in disaggregated mode, you must first launch context (prefill) and generation (decode) servers using `trtllm-serve`.
 
 ## Launching disaggregated servers locally on single node
 
@@ -142,7 +142,7 @@ CUDA_VISIBLE_DEVICES=3 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --extra_llm_api_options ./gen_extra-llm-api-config.yml \
     --metadata_server_config_file ./metadata_config.yml &> log_gen_0 &
 ```
-TensorRT-LLM will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
+TensorRT LLM will automatically register any newly launched server with the ETCD server, allowing the router to send new requests to the added server.
 
 ### Dynamically removing servers
 

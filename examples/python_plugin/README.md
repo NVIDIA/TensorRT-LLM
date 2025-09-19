@@ -1,18 +1,18 @@
-# TensorRT-LLM Python Plugin
+# TensorRT LLM Python Plugin
 
-TensorRT-LLM provides a Python plugin interface to integrate TensorRT-LLM with pure Python.
+TensorRT LLM provides a Python plugin interface to integrate TensorRT LLM with pure Python.
 
 + `openai_triton_plugin`: plugin package
-+ `build_lookup.py`: Build a TensorRT engine with TensorRT-LLM Python plugin
++ `build_lookup.py`: Build a TensorRT engine with TensorRT LLM Python plugin
 + `run_lookup.py`: Run the engine and compare the result with PyTorch
 
 ## Plugin Definition
 
 The following code shows how to create a look-up plugin.
-We only need to do a few things to define a TensorRT-LLM plugin.
+We only need to do a few things to define a TensorRT LLM plugin.
 
 1. Inherit the `PluginBase`.
-2. Register the plugin class to TensorRT-LLM by using `@trtllm_plugin("your_plugin_name")`.
+2. Register the plugin class to TensorRT LLM by using `@trtllm_plugin("your_plugin_name")`.
 3. Define an `__init__` function and initialize the base class.
 4. Define a shape and dtype inference function.
 5. Define the compute flow.
@@ -55,7 +55,7 @@ class LookUpPlugin(PluginBase):
 
 ```
 
-## Adding a TensorRT-LLM Plugin to a Network
+## Adding a TensorRT LLM Plugin to a Network
 
 You only need an instance of the plugin object and then call it with `tensorrt_llm.Tensor` as input arguments.
 
@@ -80,7 +80,7 @@ with tensorrt_llm.net_guard(network):
 
 ## Plugin Code Structure
 
-Because TensorRT-LLM performs plugin registration when importing the custom TensorRT-LLM plugin, there are some code structure conventions to register the plugin at runtime.
+Because TensorRT LLM performs plugin registration when importing the custom TensorRT LLM plugin, there are some code structure conventions to register the plugin at runtime.
 
 ```text
 plugin_lib
@@ -99,7 +99,7 @@ from .lookup_plugin import LookUpPlugin
 __all__ = ["LookUpPlugin"]
 ```
 
-## Deserialize an Engine with TensorRT-LLM Plugin
+## Deserialize an Engine with TensorRT LLM Plugin
 
 During deserialization, TensorRT needs to find the user-defined plugin. Thus, we need to import the plugin once to register them. If the plugin follows the code structure convention, users only need to import that package to register all the custom plugins.
 

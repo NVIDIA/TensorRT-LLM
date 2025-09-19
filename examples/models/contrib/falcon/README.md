@@ -1,13 +1,13 @@
 # Falcon
 
-This document shows how to build and run a Falcon model in TensorRT-LLM on single GPU, single node multi-GPU, and multi-node multi-GPU.
+This document shows how to build and run a Falcon model in TensorRT LLM on single GPU, single node multi-GPU, and multi-node multi-GPU.
 
 - [Falcon](#falcon)
   - [Overview](#overview)
   - [Support Matrix](#support-matrix)
   - [Usage](#usage)
     - [1. Download weights from HuggingFace Transformers](#1-download-weights-from-huggingface-transformers)
-    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Convert weights from HF Transformers to TensorRT LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
     - [4. Run summarization task with the TensorRT engine(s)](#4-run-summarization-task-with-the-tensorrt-engines)
     - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
@@ -18,9 +18,9 @@ This document shows how to build and run a Falcon model in TensorRT-LLM on singl
 
 ## Overview
 
-The TensorRT-LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT-LLM Falcon example code is located in [`examples/models/contrib/falcon`](./). There is one main file:
+The TensorRT LLM Falcon implementation can be found in [tensorrt_llm/models/falcon/model.py](../../tensorrt_llm/models/falcon/model.py). The TensorRT LLM Falcon example code is located in [`examples/models/contrib/falcon`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -39,7 +39,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 ## Usage
 
 The next two sections describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers)
-format to the TensorRT-LLM format.
+format to the TensorRT LLM format.
 
 ### 1. Download weights from HuggingFace Transformers
 
@@ -72,8 +72,8 @@ git clone https://huggingface.co/tiiuae/falcon-180B falcon/180b
 git clone https://huggingface.co/tiiuae/falcon-11B falcon/11b
 ```
 
-### 2. Convert weights from HF Transformers to TensorRT-LLM format
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
+### 2. Convert weights from HF Transformers to TensorRT LLM format
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
 
 ```bash
 # falcon-rw-1b: single gpu, dtype float16
@@ -127,7 +127,7 @@ For example, you can't configure 2-way tensor parallelism for [falcon-7b](https:
 
 
 ### 3. Build TensorRT engine(s)
-The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
+The `trtllm-build` command builds TensorRT LLM engines from TensorRT LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
 
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
@@ -239,8 +239,8 @@ python ../../../summarize.py --test_trt_llm \
 If the engines are run successfully, you will see output like (falcon-rw-1b as the example):
 ```
 ......
-[12/27/2023-03:57:02] [TRT-LLM] [I] TensorRT-LLM (total latency: 5.816917419433594 sec)
-[12/27/2023-03:57:02] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[12/27/2023-03:57:02] [TRT-LLM] [I] TensorRT LLM (total latency: 5.816917419433594 sec)
+[12/27/2023-03:57:02] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [12/27/2023-03:57:02] [TRT-LLM] [I]   rouge1 : 15.061493342516243
 [12/27/2023-03:57:02] [TRT-LLM] [I]   rouge2 : 4.495335888974063
 [12/27/2023-03:57:02] [TRT-LLM] [I]   rougeL : 11.800002670828547

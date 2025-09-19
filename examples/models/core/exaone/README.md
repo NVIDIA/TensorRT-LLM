@@ -2,7 +2,7 @@
 
 This document shows how to build and run a [EXAONE](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct) model in TensorRT-LLM.
 
-The TensorRT-LLM EXAONE implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
+The TensorRT LLM EXAONE implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
 See the LLaMA example [`examples/models/core/llama`](../llama) for details.
 
 - [EXAONE](#exaone)
@@ -114,7 +114,7 @@ For models with sliding window attention, DynamicCache is less memory-efficient 
 
 ### TRT flow
 
-The next section describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format. We will use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE model and then we build the model with `trtllm-build`.
+The next section describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE model and then we build the model with `trtllm-build`.
 
 ### Convert checkpoint and build TensorRT engine(s)
 

@@ -1,6 +1,6 @@
 # Disaggregated Inference Benchmark Scripts
 
-This directory contains scripts to run disaggregated inference benchmarks using TensorRT-LLM and SLURM.
+This directory contains scripts to run disaggregated inference benchmarks using TensorRT LLM and SLURM.
 
 ## Overview
 

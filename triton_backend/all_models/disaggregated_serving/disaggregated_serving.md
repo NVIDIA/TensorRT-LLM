@@ -26,7 +26,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 !-->
 
-# Running Disaggregated Serving with Triton TensorRT-LLM Backend
+# Running Disaggregated Serving with Triton TensorRT LLM Backend
 
 ## Overview
 

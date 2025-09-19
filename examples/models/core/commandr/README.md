@@ -1,13 +1,13 @@
 # Command R
 
-This document explains how to build the [C4AI Command-R](https://huggingface.co/CohereForAI/c4ai-command-r-v01), [C4AI Command R+](https://huggingface.co/CohereForAI/c4ai-command-r-plus), [Aya-23-8B](https://huggingface.co/CohereForAI/aya-23-8B), [Aya-23-35B](https://huggingface.co/CohereForAI/aya-23-35B) models using TensorRT-LLM and run on a single GPU or a single node with multiple GPUs.
+This document explains how to build the [C4AI Command-R](https://huggingface.co/CohereForAI/c4ai-command-r-v01), [C4AI Command R+](https://huggingface.co/CohereForAI/c4ai-command-r-plus), [Aya-23-8B](https://huggingface.co/CohereForAI/aya-23-8B), [Aya-23-35B](https://huggingface.co/CohereForAI/aya-23-35B) models using TensorRT LLM and run on a single GPU or a single node with multiple GPUs.
 
 - [Command R](#Command-R)
   - [Overview](#overview)
   - [Support Matrix](#support-matrix)
   - [Usage](#usage)
     - [1. Download repo and weights from HuggingFace Transformers](#1-download-repo-and-weights-from-huggingface-transformers)
-    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+    - [2. Convert weights from HF Transformers to TensorRT LLM format](#2-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
     - [4. Run inference](#4-run-inference)
       - [Single node, single GPU](#single-node-single-gpu)
@@ -18,10 +18,10 @@ This document explains how to build the [C4AI Command-R](https://huggingface.co/
 
 ## Overview
 
-The TensorRT-LLM Command-R implementation can be found in [`tensorrt_llm/models/commandr/model.py`](../../../../tensorrt_llm/models/commandr/model.py).
-The TensorRT-LLM Command-R example code is located in [`examples/models/core/commandr`](./). There is one main file:
+The TensorRT LLM Command-R implementation can be found in [`tensorrt_llm/models/commandr/model.py`](../../../../tensorrt_llm/models/commandr/model.py).
+The TensorRT LLM Command-R example code is located in [`examples/models/core/commandr`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
@@ -52,9 +52,9 @@ git clone https://huggingface.co/CohereForAI/aya-23-8B                  aya_23_8
 git clone https://huggingface.co/CohereForAI/aya-23-35B                 aya_23_35B
 ```
 
-### 2. Convert weights from HF Transformers to TensorRT-LLM format
+### 2. Convert weights from HF Transformers to TensorRT LLM format
 
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT LLM checkpoints. The number of checkpoint files (in .safetensors format) is same to the number of GPUs used to run inference.
 
 ```bash
 # Command-R: single gpu, dtype float16
@@ -72,7 +72,7 @@ python3 convert_checkpoint.py --model_dir aya_23_35B --output_dir trt_ckpt/aya_2
 
 ### 3. Build TensorRT engine(s)
 
-The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
+The `trtllm-build` command builds TensorRT LLM engines from TensorRT LLM checkpoints. The number of engine files is also same to the number of GPUs used to run inference.
 
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
@@ -174,10 +174,10 @@ If the engines are run successfully, you will see output like (Command-R as the 
 
 ```txt
 ......
-[01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT-LLM (total latency: 81.05689692497253 sec)
-[01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2000)
-[01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 24.67402621952367)
-[01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT LLM (total latency: 81.05689692497253 sec)
+[01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT LLM (total output tokens: 2000)
+[01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT LLM (tokens per second: 24.67402621952367)
+[01/26/2024-02:51:56] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [01/26/2024-02:51:56] [TRT-LLM] [I]   rouge1 : 24.06804397902119
 [01/26/2024-02:51:56] [TRT-LLM] [I]   rouge2 : 6.456513335555016
 [01/26/2024-02:51:56] [TRT-LLM] [I]   rougeL : 16.77644999660741

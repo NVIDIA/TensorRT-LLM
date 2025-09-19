@@ -1,9 +1,9 @@
 # Medusa Decoding
 
-This document shows how to build and run a model using Medusa decoding([`Github`](https://github.com/FasterDecoding/Medusa), [`BLOG`](https://sites.google.com/view/medusa-llm)) in TensorRT-LLM on single GPU, single node multiple GPU.
+This document shows how to build and run a model using Medusa decoding([`Github`](https://github.com/FasterDecoding/Medusa), [`BLOG`](https://sites.google.com/view/medusa-llm)) in TensorRT LLM on single GPU, single node multiple GPU.
 
 ## Overview
-Different from other models, Medusa decoding needs a base model and Medusa heads. The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py). The implementation adds Medusa heads to a base model.
+Different from other models, Medusa decoding needs a base model and Medusa heads. The TensorRT LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py). The implementation adds Medusa heads to a base model.
 
 For more info about Medusa visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
 
@@ -16,7 +16,7 @@ For more info about Medusa visit [speculative decoding documentation](https://nv
   * Tensor Parallel
 
 ## Usage
-The TensorRT-LLM Medusa example code is located in [`examples/medusa`](./). There is one [`convert_checkpoint.py`](./convert_checkpoint.py) file to convert and build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with Medusa decoding support.
+The TensorRT LLM Medusa example code is located in [`examples/medusa`](./). There is one [`convert_checkpoint.py`](./convert_checkpoint.py) file to convert and build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with Medusa decoding support.
 In this example, we demonstrate the usage of two models:
 1. The Vucuna 7B model from Hugging Face [`FasterDecoding/medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3) with its Medusa heads [`medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3).
 2. The quantized checkpoint [`nvidia/Llama-3.1-8B-Medusa-FP8`](https://huggingface.co/nvidia/Llama-3.1-8B-Medusa-FP8) on Hugging Face by [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (ModelOpt). This model is based on [Llama-3.1 8B](https://huggingface.co/meta-llama/Llama-3.1-8B) and enhanced with Medusa heads, with both the base model (except lm_head) and Medusa heads already quantized in FP8.
@@ -32,7 +32,7 @@ git clone https://huggingface.co/lmsys/vicuna-7b-v1.3
 https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3
 ```
 
-We use `convert_checkpoint.py` script to convert the model for Medusa decoding into TensorRT-LLM checkpoint format.
+We use `convert_checkpoint.py` script to convert the model for Medusa decoding into TensorRT LLM checkpoint format.
 We could use `--num_medusa_heads` to set the number of medusa heads that we want to use. If not, `num_medusa_heads` will be set according to the `medusa_num_heads` from medusa weights' `config.json`.
 
 Here is the example:
@@ -118,7 +118,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_base_model_fp8_medusa_fp16 
 ```
 
 ### Run
-To run a TensorRT-LLM model with Medusa decoding support, we can use `../run.py` script, with an additional argument `--medusa_choices`.
+To run a TensorRT LLM model with Medusa decoding support, we can use `../run.py` script, with an additional argument `--medusa_choices`.
 The `--medusa_choices` is of type `list[list[int]]`.
 
 Medusa decoding is supported by Python runtime and C++ runtime with inflight-batching. C++ runtime is recommended for performance.

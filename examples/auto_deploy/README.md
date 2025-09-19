@@ -252,7 +252,7 @@ for more detail on how AutoDeploy is configured via the `**kwargs` of the `LLM` 
 
 ### Expert Configuration of LLM API
 
-For expert TensorRT-LLM users, we also expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+For expert TensorRT LLM users, we also expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
 *at your own risk* (the argument list diverges from TRT-LLM's argument list):
 
 <details>

@@ -64,7 +64,7 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
-# Add TensorRT-LLM Gen export interface and CUDA support
+# Add TensorRT LLM Gen export interface and CUDA support
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
@@ -134,9 +134,9 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 if(TRTLLM_VERSION_RESULT EQUAL 0)
-  message(STATUS "TensorRT-LLM version: ${TRTLLM_VERSION}")
+  message(STATUS "TensorRT LLM version: ${TRTLLM_VERSION}")
 else()
-  message(FATAL_ERROR "Failed to determine Tensorrt-LLM version")
+  message(FATAL_ERROR "Failed to determine TensorRT LLM version")
 endif()
 
 configure_file(

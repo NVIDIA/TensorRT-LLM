@@ -26,7 +26,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 -->
 
-# Testing TensorRT-LLM backend
+# Testing TensorRT LLM backend
 
 Tests in this CI directory can be run manually to provide extensive testing.
 
@@ -66,7 +66,7 @@ requests to the deployed `ensemble` model.
 
 Ensemble model is ensembled by three models: `preprocessing`, `tensorrt_llm` and `postprocessing`:
 - "preprocessing": This model is used for tokenizing, meaning the conversion from prompts(string) to input_ids(list of ints).
-- "tensorrt_llm": This model is a wrapper of your TensorRT-LLM model and is used for inferencing
+- "tensorrt_llm": This model is a wrapper of your TensorRT LLM model and is used for inferencing
 - "postprocessing": This model is used for de-tokenizing, meaning the conversion from output_ids(list of ints) to outputs(string).
 
 The end to end latency includes the total latency of the three parts of an ensemble model.

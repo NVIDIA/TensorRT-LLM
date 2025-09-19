@@ -5,7 +5,7 @@ using a TensorRT engine.
 
 ## Setup
 
-Build a TensorRT engine for one of the supported TensorRT-LLM model following
+Build a TensorRT engine for one of the supported TensorRT LLM model following
 instructions in the corresponding `examples` folder.
 
 ## Usage

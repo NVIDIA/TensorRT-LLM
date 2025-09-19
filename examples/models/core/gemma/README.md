@@ -51,7 +51,7 @@ Please install required packages first:
 pip install -r requirements.txt
 ```
 
-Users can use `convert_checkpoint.py` to convert the different source checkpoint to unified TensorRT-LLM checkpoint format. Users could set `--dtype` to determine the inference data type, and set the quantization options like `--enable_fp8`, `--fp8_kv_cache` `--use_smooth_quant`, `--calibrate_kv_cache` (for INT8 kv cache) and `--use-weight-only-with-precision` (weight only). Users could also control the source checkpoint type by `--ckpt-type`. Currently, supported checkpoint types are `jax`, `torch` and `keras`.
+Users can use `convert_checkpoint.py` to convert the different source checkpoint to unified TensorRT LLM checkpoint format. Users could set `--dtype` to determine the inference data type, and set the quantization options like `--enable_fp8`, `--fp8_kv_cache` `--use_smooth_quant`, `--calibrate_kv_cache` (for INT8 kv cache) and `--use-weight-only-with-precision` (weight only). Users could also control the source checkpoint type by `--ckpt-type`. Currently, supported checkpoint types are `jax`, `torch` and `keras`.
 
 ```bash
 CKPT_PATH=/tmp/models/gemma_nv/checkpoints/tmp_2b_it
@@ -67,7 +67,7 @@ python3 ./convert_checkpoint.py \
 
 ### Build engine
 
-After getting checkpoint, we can use `trtllm-build` command to build TensorRT-LLM engines from TensorRT-LLM checkpoints.
+After getting checkpoint, we can use `trtllm-build` command to build TensorRT LLM engines from TensorRT LLM checkpoints.
 
 ```bash
 ENGINE_PATH=/tmp/gemma/2B/bf16/1-gpu/
@@ -97,7 +97,7 @@ python3 ../../../run.py --engine_dir ${ENGINE_PATH} \
                   --max_output_len 30 \
                   --vocab_file ${VOCAB_FILE_PATH}
 
-[TensorRT-LLM] TensorRT-LLM version: 0.9.0.dev2024020600Input [Text 0]: "<bos> Born in north-east France, Soyer trained as a"
+[TensorRT-LLM] TensorRT LLM version: 0.9.0.dev2024020600Input [Text 0]: "<bos> Born in north-east France, Soyer trained as a"
 Output [Text 0 Beam 0]: "chef in the renowned kitchens of Lyon. After honing his skills in various Michelin-starred establishments, he embarked on a solo venture, establishing his own restaurant"
 ```
 
@@ -110,10 +110,10 @@ python3 ../../../summarize.py --test_trt_llm \
                         --max_ite 5 \
                         --vocab_file ${VOCAB_FILE_PATH}
 
-[02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.2821836471557617 sec)
-[02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1989)
-[02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 605.9989975648089)
-[02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT LLM (total latency: 3.2821836471557617 sec)
+[02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT LLM (total output tokens: 1989)
+[02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT LLM (tokens per second: 605.9989975648089)
+[02/06/2024-10:08:54] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/06/2024-10:08:55] [TRT-LLM] [I]   rouge1 : 26.376388677070615
 [02/06/2024-10:08:55] [TRT-LLM] [I]   rouge2 : 7.468157586877296
 [02/06/2024-10:08:55] [TRT-LLM] [I]   rougeL : 17.953060795106556
@@ -178,10 +178,10 @@ python3 ../../../summarize.py --test_trt_llm \
                       --batch_size 8 \
                       --max_ite 5
 
-[03/05/2024-02:24:39] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.0897433757781982 sec)
-[03/05/2024-02:24:39] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2141)
-[03/05/2024-02:24:39] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 692.9378073221881)
-[03/05/2024-02:24:39] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[03/05/2024-02:24:39] [TRT-LLM] [I] TensorRT LLM (total latency: 3.0897433757781982 sec)
+[03/05/2024-02:24:39] [TRT-LLM] [I] TensorRT LLM (total output tokens: 2141)
+[03/05/2024-02:24:39] [TRT-LLM] [I] TensorRT LLM (tokens per second: 692.9378073221881)
+[03/05/2024-02:24:39] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [03/05/2024-02:24:39] [TRT-LLM] [I]   rouge1 : 21.042873132085678
 [03/05/2024-02:24:39] [TRT-LLM] [I]   rouge2 : 6.322669223228836
 [03/05/2024-02:24:39] [TRT-LLM] [I]   rougeL : 16.450116567540338
@@ -226,10 +226,10 @@ python3 ../../../summarize.py --test_trt_llm \
                       --batch_size 8 \
                       --max_ite 5
 
-[02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.116227149963379 sec)
-[02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2419)
-[02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 776.259201781368)
-[02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT LLM (total latency: 3.116227149963379 sec)
+[02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT LLM (total output tokens: 2419)
+[02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT LLM (tokens per second: 776.259201781368)
+[02/08/2024-10:37:15] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/08/2024-10:37:15] [TRT-LLM] [I]   rouge1 : 20.206082692133098
 [02/08/2024-10:37:15] [TRT-LLM] [I]   rouge2 : 5.902141189518428
 [02/08/2024-10:37:15] [TRT-LLM] [I]   rougeL : 15.403458457907643
@@ -274,10 +274,10 @@ python3 ../../../summarize.py --test_trt_llm \
                       --batch_size 8 \
                       --max_ite 5
 
-[02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.460859775543213 sec)
-[02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1786)
-[02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 516.0567361385428)
-[02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT LLM (total latency: 3.460859775543213 sec)
+[02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT LLM (total output tokens: 1786)
+[02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT LLM (tokens per second: 516.0567361385428)
+[02/08/2024-04:42:06] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/08/2024-04:42:06] [TRT-LLM] [I]   rouge1 : 22.534044843245525
 [02/08/2024-04:42:06] [TRT-LLM] [I]   rouge2 : 5.940093176022924
 [02/08/2024-04:42:06] [TRT-LLM] [I]   rougeL : 16.258991712579736
@@ -319,10 +319,10 @@ python3 ../../../summarize.py --test_trt_llm \
                       --batch_size 8 \
                       --max_ite 5
 
-[02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.5987987518310547 sec)
-[02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1797)
-[02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 499.3332842203787)
-[02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT LLM (total latency: 3.5987987518310547 sec)
+[02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT LLM (total output tokens: 1797)
+[02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT LLM (tokens per second: 499.3332842203787)
+[02/08/2024-04:44:54] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/08/2024-04:44:54] [TRT-LLM] [I]   rouge1 : 24.48521318679745
 [02/08/2024-04:44:54] [TRT-LLM] [I]   rouge2 : 7.240543314565931
 [02/08/2024-04:44:54] [TRT-LLM] [I]   rougeL : 17.857921729984078
@@ -360,10 +360,10 @@ python3 ../../../summarize.py --test_trt_llm \
                       --batch_size 8 \
                       --max_ite 5
 
-[02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT-LLM (total latency: 3.5348474979400635 sec)
-[02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1819)
-[02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 514.5907994786265)
-[02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT LLM (total latency: 3.5348474979400635 sec)
+[02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT LLM (total output tokens: 1819)
+[02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT LLM (tokens per second: 514.5907994786265)
+[02/08/2024-04:52:22] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/08/2024-04:52:22] [TRT-LLM] [I]   rouge1 : 24.0397941580232
 [02/08/2024-04:52:22] [TRT-LLM] [I]   rouge2 : 7.325311340360227
 [02/08/2024-04:52:22] [TRT-LLM] [I]   rougeL : 17.54210044633271
@@ -447,10 +447,10 @@ python3 ../../../summarize.py --test_trt_llm \
                       --batch_size 8 \
                       --max_ite 5
 
-[02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT-LLM (total latency: 5.884302377700806 sec)
-[02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2694)
-[02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 457.8282737830064)
-[02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT LLM (total latency: 5.884302377700806 sec)
+[02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT LLM (total output tokens: 2694)
+[02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT LLM (tokens per second: 457.8282737830064)
+[02/08/2024-06:42:13] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/08/2024-06:42:13] [TRT-LLM] [I]   rouge1 : 27.18633861010837
 [02/08/2024-06:42:13] [TRT-LLM] [I]   rouge2 : 7.734928823230158
 [02/08/2024-06:42:13] [TRT-LLM] [I]   rougeL : 19.32537431798716
@@ -488,10 +488,10 @@ python3 ../../../summarize.py --test_trt_llm \
                         --max_ite 5
 
 [02/19/2024-10:02:53] [TRT-LLM] [I] ---------------------------------------------------------
-[02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT-LLM (total latency: 13.65670919418335 sec)
-[02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 8351)
-[02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 611.494312521266)
-[02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT LLM (total latency: 13.65670919418335 sec)
+[02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT LLM (total output tokens: 8351)
+[02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT LLM (tokens per second: 611.494312521266)
+[02/19/2024-10:03:09] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/19/2024-10:03:09] [TRT-LLM] [I]   rouge1 : 28.8107815115074
 [02/19/2024-10:03:09] [TRT-LLM] [I]   rouge2 : 8.623835512061866
 [02/19/2024-10:03:09] [TRT-LLM] [I]   rougeL : 19.7277195532959
@@ -537,10 +537,10 @@ python3 ../../../summarize.py --test_trt_llm \
                       --batch_size 8 \
                       --max_ite 5
 
-[02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT-LLM (total latency: 8.49835753440857 sec)
-[02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2654)
-[02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 312.2956393931832)
-[02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT LLM (total latency: 8.49835753440857 sec)
+[02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT LLM (total output tokens: 2654)
+[02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT LLM (tokens per second: 312.2956393931832)
+[02/08/2024-07:38:15] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/08/2024-07:38:16] [TRT-LLM] [I]   rouge1 : 20.396209981234687
 [02/08/2024-07:38:16] [TRT-LLM] [I]   rouge2 : 5.73302850102211
 [02/08/2024-07:38:16] [TRT-LLM] [I]   rougeL : 16.001683776127507
@@ -577,10 +577,10 @@ python3 ../../../summarize.py --test_trt_llm \
                       --batch_size 8 \
                       --max_ite 5
 
-[02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT-LLM (total latency: 8.73880124092102 sec)
-[02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 2771)
-[02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 317.09154649544956)
-[02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT LLM (total latency: 8.73880124092102 sec)
+[02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT LLM (total output tokens: 2771)
+[02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT LLM (tokens per second: 317.09154649544956)
+[02/08/2024-07:51:11] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [02/08/2024-07:51:11] [TRT-LLM] [I]   rouge1 : 20.934864626327627
 [02/08/2024-07:51:11] [TRT-LLM] [I]   rouge2 : 4.954721611692932
 [02/08/2024-07:51:11] [TRT-LLM] [I]   rougeL : 15.307592049634444
@@ -669,10 +669,10 @@ python3 ../../../summarize.py --test_trt_llm \
 ...
 [TensorRT-LLM][INFO] TRTGptModel mMaxAttentionWindowSize: (512, 512, 512, 512, 512, 3100) * 4 + (512, 512)
 ...
-[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT-LLM (total latency: 1.6197962760925293 sec)
-[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 475)
-[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 293.2467539349165)
-[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT LLM (total latency: 1.6197962760925293 sec)
+[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT LLM (total output tokens: 475)
+[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT LLM (tokens per second: 293.2467539349165)
+[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rouge1: 22.780314381954003
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rouge2: 4.331099231480823
 [04/09/2025-18:28:26] [TRT-LLM] [I]   rougeL: 15.26751867562475
@@ -768,7 +768,7 @@ curl http://localhost:8000/v1/completions \
 #### Dynamo
 
 NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
-Dynamo supports TensorRT-LLM as one of its inference engine. For details on how to use TensorRT-LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
+Dynamo supports TensorRT LLM as one of its inference engine. For details on how to use TensorRT LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
 
 ### Run Modelopt Quantization
 

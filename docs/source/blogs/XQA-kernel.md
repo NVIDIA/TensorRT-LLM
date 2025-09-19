@@ -10,7 +10,7 @@ Looking at the Throughput-Latency curves below, we see that the enabling of XQA 
 
 <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/XQA_ThroughputvsLatency.png?raw=true" alt="XQA increased throughput within same latency budget" width="950" height="auto">
 
-<sub>Preliminary measured Performance, subject to change. TPOT lower is better. FP8, 8xH100 GPUs, Single Engine, ISL/OSL: 512/2048, BS: 1 - 256, TensorRT-LLM v0.8a</sub>
+<sub>Preliminary measured Performance, subject to change. TPOT lower is better. FP8, 8xH100 GPUs, Single Engine, ISL/OSL: 512/2048, BS: 1 - 256, TensorRT LLM v0.8a</sub>
 
 
 ## Llama-70B on H200 up to 2.4x increased throughput with XQA within same latency budget

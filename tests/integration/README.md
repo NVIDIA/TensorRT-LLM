@@ -26,7 +26,7 @@ All the perf test names are in the form of `perf/test_perf.py::test_perf[...]` w
 Below are some specific pytest options used for perf tests
 
 ```bash
-# execute these in the tensorrt-llm source repo root dir.
+# execute these in the TensorRT LLM source repo root dir.
 # install dependencies, do not need to do it every time if already installed.
 pip install -r requirements-dev.txt
 

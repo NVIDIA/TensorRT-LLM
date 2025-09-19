@@ -1,6 +1,6 @@
 # Scheduler
 
-TensorRT-LLM PyTorch backend employs inflight batching, a mechanism where batching and scheduling occur dynamically at each LLM step.
+TensorRT LLM PyTorch backend employs inflight batching, a mechanism where batching and scheduling occur dynamically at each LLM step.
 The scheduler is invoked to determine which requests are scheduled at the current step.
 
 ## Scheduler Introduction
