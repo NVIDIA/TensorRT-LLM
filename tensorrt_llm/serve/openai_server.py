@@ -729,6 +729,7 @@ class OpenAIServer:
             return chat_response
 
         async def create_streaming_generator(promise: RequestOutput, postproc_params: PostprocParams):
+            streaming_stop_substr = '"finish_reason":"stop"'
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
 
@@ -737,6 +738,9 @@ class OpenAIServer:
                 # await self._extract_metrics(res)
                 for pp_res in pp_results:
                     yield pp_res
+                    if streaming_stop_substr in pp_res:
+                        promise.abort()
+                        break
 
             yield "data: [DONE]\n\n"
 
