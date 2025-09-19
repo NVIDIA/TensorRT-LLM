@@ -360,6 +360,10 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
 
     sh "cat ${cleanedTestDBList}"
     echo "DEBUG: isolationTestLines contains ${isolationTestLines.size()} tests that had ISOLATION markers"
+    println "DEBUG: isolationTestLines content:"
+    isolationTestLines.each { line ->
+        println "  - ${line}"
+    }
 
     def shardTestList = []
 
@@ -442,9 +446,9 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
                     }
 
                     // Check if this test is in the isolation list
-                    if (isolationTestLines.contains(trimmedTest)) {
-                        // This test needs isolation - find the actual line from isolationTestLines
-                        def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
+                    def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
+                    if (isolationTestLine) {
+                        // This test needs isolation
                         shardIsolateTests.add(isolationTestLine)
                         echo "DEBUG: Test '${trimmedTest}' found in isolation list, adding to isolate tests"
                     } else {
