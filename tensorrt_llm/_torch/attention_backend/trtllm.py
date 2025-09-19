@@ -181,6 +181,7 @@ class TrtllmAttentionWrapper:
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
         is_spec_dec_tree: bool = False,
@@ -225,6 +226,7 @@ class TrtllmAttentionWrapper:
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
+            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
         """
@@ -262,6 +264,7 @@ class TrtllmAttentionWrapper:
             'mrope_position_deltas') if mrope_config is not None else None
         self.block_ids_per_seq = block_ids_per_seq
         self.softmax_stats_tensor = softmax_stats_tensor
+        self.helix_position_offsets = helix_position_offsets
         self.attention_sinks = attention_sinks
 
         if max_sequence_length > self.rope_params.max_positions:
@@ -420,6 +423,7 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
+        mla_tensor_params = [self.helix_position_offsets]
 
         thop.attention(
             q,
@@ -482,6 +486,7 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
+            mla_tensor_params,
             self.attention_chunk_size,
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
@@ -1214,6 +1219,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mrope_config: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         softmax_stats_tensor: Optional[torch.Tensor] = None,
+        helix_position_offsets: Optional[torch.Tensor] = None,
         enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
@@ -1284,6 +1290,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             q_pe=q_pe,
             mrope_config=mrope_config,
             softmax_stats_tensor=softmax_stats_tensor,
+            helix_position_offsets=helix_position_offsets,
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
             is_spec_dec_tree=metadata.is_spec_dec_tree,
