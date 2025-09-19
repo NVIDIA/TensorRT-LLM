@@ -56,8 +56,20 @@ def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
     client_script = os.path.join(benchmark_root, "benchmark_serving.py")
     dataset = dataset_path("sharegpt")
     benchmark_cmd = [
-        "python3", client_script, "--dataset-name", "sharegpt", "--model",
-        model_name, "--dataset-path", dataset, "--tokenizer", model_path
+        "python3",
+        client_script,
+        "--dataset-name",
+        "sharegpt",
+        "--model",
+        model_name,
+        "--dataset-path",
+        dataset,
+        "--tokenizer",
+        model_path,
+        "--temperature",
+        "1.0",
+        "--top-p",
+        "1.0",
     ]
 
     # CalledProcessError will be raised if any errors occur
