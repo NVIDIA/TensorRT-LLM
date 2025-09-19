@@ -2006,10 +2006,14 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
-                 enable_chunked_prefill=True) as llm:
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512) as llm:
 
             assert llm.args.moe_config.backend == moe_backend
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     def test_nvfp4_multi_gpus_corner_case(self):
         """
@@ -2168,7 +2172,8 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
-                 enable_chunked_prefill=True) as llm:
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
             task = GSM8K(self.MODEL_NAME)
