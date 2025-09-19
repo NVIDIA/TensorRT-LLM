@@ -14,6 +14,7 @@ set(SRCS
     executor/executor.cpp
     executor/executorConfig.cpp
     executor/request.cpp
+    process_group/bindings.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp
     common/tllmExceptions.cpp
@@ -48,7 +49,8 @@ target_link_libraries(
          torch_python
          ${CUDA_DRV_LIB}
          ${CUDA_NVML_LIB}
-         th_common)
+         th_common
+         pg_utils)
 target_compile_definitions(
   ${TRTLLM_PYBIND_MODULE} PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE}
                                  PYBIND11_DETAILED_ERROR_MESSAGES=1)
