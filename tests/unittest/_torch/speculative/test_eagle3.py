@@ -37,8 +37,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
         [False, "TRTLLM", False, False, False, False, False],
         [True, "TRTLLM", False, False, False, True, True],
         [True, "TRTLLM", False, False, False, True, False],
-        # TODO: nvbugs/5522851
-        # [True, "FLASHINFER", False, False, False, False, True],
+        [True, "FLASHINFER", False, False, False, False, True],
         [False, "FLASHINFER", False, False, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
