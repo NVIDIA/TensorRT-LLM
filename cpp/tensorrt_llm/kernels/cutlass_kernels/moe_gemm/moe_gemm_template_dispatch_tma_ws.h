@@ -145,18 +145,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
 #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability == 103)
     {
-        static std::once_flag flag;
-        std::call_once(flag,
-            []()
-            {
-                TLLM_LOG_WARNING(
-                    "For best performance please recompile with support for blackwell by "
-                    "passing 103-real as an arch to build_wheel.py.");
-            });
-        dispatchMoeGemmFinalDispatchTmaWarpSpecialized<cutlass::arch::Sm100, T, WeightType, OutputType, EpilogueTag,
-            FUSION, TileShape, ClusterShape>(
-            hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy, workspace_size);
-        return;
+        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
     }
 #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
@@ -443,7 +432,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
             TLLM_THROW("Unsupported SM90 configuration requested");
         }
     }
-#ifdef ENABLE_FP4
+#if defined(ENABLE_FP4) && defined(COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS)
     // Check this before SM100 because we fall back to SM100 if not NVFP4
     else if (gemm_config.sm_version == 103
         && std::is_same_v<T, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1>)
