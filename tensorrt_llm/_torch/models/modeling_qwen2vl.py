@@ -1,13 +1,14 @@
 import copy
 import os
+import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from PIL import Image
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -17,6 +18,7 @@ from ...inputs import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
                        ExtraProcessedInputs, InputProcessor,
                        MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
+                       default_multimodal_input_loader,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -41,6 +43,7 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
         self.model_config = model_config
         self.tokenizer = tokenizer
         self.use_fast = True
+        self.model_path = model_path
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             use_fast=self.use_fast,
@@ -225,33 +228,32 @@ class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def get_dummy_text(self, mm_data: dict[str, int]):
-        num_images = mm_data.get("image", 0)
-        img_token = self.processor.image_token
+    def get_dummy_text(self, input_seq_len: int):
+        return self.tokenizer.decode([
+            random.randint(0, self.model_config.vocab_size - 1)
+            for _ in range(input_seq_len)
+        ])
 
-        return img_token * num_images
+    def get_dummy_images(self,
+                         max_width: int,
+                         max_height: int,
+                         num_images: int = 1):
+        image = Image.new("RGB", (max_width, max_height), color=255)
+        return [image] * num_images
 
-    def get_dummy_images(self, mm_data: dict[str, int]):
-        num_images = mm_data.get("image", 0)
-        max_width = 9999999
-        max_height = 9999999
-        resized_height, resized_width = smart_resize(
-            height=max_height,
-            width=max_width,
-            factor=self.model_config.vision_config.patch_size *
-            self.model_config.vision_config.spatial_merge_size,
-            min_pixels=self.processor.image_processor.min_pixels,
-            max_pixels=self.processor.image_processor.max_pixels,
-        )
-        img_tensor = torch.rand([3, resized_width, resized_height],
-                                device="cpu")
-        return num_images * [img_tensor]
-
-    def get_dummy_prompt(self):
-        mm_reqs = {"image": 1}
-        text = self.get_dummy_text(mm_reqs)
-        images = self.get_dummy_images(mm_reqs)
-        return TextPrompt(prompt=text, multi_modal_data={"image": images})
+    def get_dummy_prompt(self, input_seq_len: int):
+        text = self.get_dummy_text(input_seq_len)
+        images = self.get_dummy_images(
+            max_width=3584,
+            max_height=3584)  #sqrt of max_pixels value (12845056)
+        return default_multimodal_input_loader(
+            tokenizer=self.tokenizer,
+            model_dir=self.model_path,
+            model_type=self.model_config.model_type,
+            modality="image",
+            prompts=[text],
+            media=[images],
+            image_data_format="pt")[0]
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
