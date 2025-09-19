@@ -20,6 +20,7 @@ from ..speculative import SpecMetadata
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
+
 class Qwen3Attention(QKNormRoPEAttention):
 
     def __init__(
@@ -55,7 +56,7 @@ class Qwen3Attention(QKNormRoPEAttention):
         # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
         # and https://nvbugspro.nvidia.com/bug/5505402)
         disable_deep_gemm = True
-        
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,

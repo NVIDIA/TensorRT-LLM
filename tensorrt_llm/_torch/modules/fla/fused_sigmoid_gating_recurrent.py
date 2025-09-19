@@ -9,12 +9,10 @@ import triton.language as tl
 from tensorrt_llm._torch.modules.fla.utils import input_guard
 
 
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
+@triton.heuristics({
+    "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
+    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+})
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -83,13 +81,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
+            p_h0 = (h0_source + idx * HV * K * V + i_hv * K * V +
+                    o_k[:, None] * V + o_v[None, :])
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for _ in range(0, T):
@@ -154,13 +147,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
+            p_h0 = (h0_source + idx * HV * K * V + i_hv * K * V +
+                    o_k[:, None] * V + o_v[None, :])
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
@@ -196,7 +184,7 @@ def fused_sigmoid_gating_delta_rule_update(
     num_warps = 1
 
     if scale is None:
-        scale = k.shape[-1] ** -0.5
+        scale = k.shape[-1]**-0.5
     else:
         assert scale > 0, "scale must be positive"
 

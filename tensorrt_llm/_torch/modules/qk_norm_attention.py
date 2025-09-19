@@ -165,9 +165,9 @@ class QKNormRoPEAttention(Attention):
         self.skip_rope = skip_rope
         if use_gemma_rms_norm:
             assert fuse_qk_norm_rope is False, "fused_qk_norm_rope is not supported for gemma rms norm."
-        
+
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
-        rope_fusion=not self.fuse_qk_norm_rope and not skip_rope
+        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope
         if self.attn_output_gate and use_gemma_rms_norm:
             rope_fusion = False
         assert not (fuse_qk_norm_rope and skip_rope

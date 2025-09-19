@@ -33,8 +33,7 @@ def check_environments():
         logger.warning(
             "Detected Windows operating system. Triton does not have an official Windows release, "
             "thus FLA will not be adapted for Windows, and any potential errors will not be fixed. "
-            "Please consider using a Linux environment for compatibility."
-        )
+            "Please consider using a Linux environment for compatibility.")
 
     triton_version = version.parse(triton.__version__)
     required_triton_version = version.parse("3.2.0")
@@ -43,11 +42,11 @@ def check_environments():
         logger.warning(
             f"Current Triton version {triton_version} is below the recommended 3.2.0 version. "
             "Errors may occur and these issues will not be fixed. "
-            "Please consider upgrading Triton."
-        )
+            "Please consider upgrading Triton.")
 
     # Check Python version
-    py_version = version.parse(f"{sys.version_info.major}.{sys.version_info.minor}")
+    py_version = version.parse(
+        f"{sys.version_info.major}.{sys.version_info.minor}")
     required_py_version = version.parse("3.11")
 
     if py_version < required_py_version:
@@ -91,7 +90,8 @@ def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
 
-def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+def tensor_cache(
+        fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
     A decorator that caches the most recent results of a function with tensor inputs.
     This decorator will store the output of the decorated function for the most recent set of input tensors.
@@ -114,13 +114,10 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
             last_args, last_kwargs, last_result = entry
             if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
                 if all(a is b for a, b in zip(args, last_args)) and all(
-                    k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
-                ):
-                    cache_entries = (
-                        cache_entries[:i]
-                        + cache_entries[i + 1 :]
-                        + [(args, kwargs, last_result)]
-                    )
+                        k in last_kwargs and v is last_kwargs[k]
+                        for k, v in kwargs.items()):
+                    cache_entries = (cache_entries[:i] + cache_entries[i + 1:] +
+                                     [(args, kwargs, last_result)])
                     return last_result
 
         result = fn(*args, **kwargs)
@@ -140,9 +137,8 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        contiguous_args = (
-            i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args
-        )
+        contiguous_args = (i if not isinstance(i, torch.Tensor) else
+                           i.contiguous() for i in args)
         contiguous_kwargs = {
             k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
             for k, v in kwargs.items()
@@ -179,6 +175,7 @@ def require_version(version, hint):
     """
 
     def decorator(fn):
+
         @functools.wraps(fn)
         def wrapper(ctx, *args, **kwargs):
             from transformers.utils.versions import require_version
@@ -186,12 +183,11 @@ def require_version(version, hint):
             require_version(version, hint)
             return fn(
                 ctx,
-                *(
-                    i if not isinstance(i, torch.Tensor) else i.contiguous()
-                    for i in args
-                ),
+                *(i if not isinstance(i, torch.Tensor) else i.contiguous()
+                  for i in args),
                 **{
-                    k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
+                    k:
+                    (v if not isinstance(v, torch.Tensor) else v.contiguous())
                     for k, v in kwargs.items()
                 },
             )
@@ -202,6 +198,7 @@ def require_version(version, hint):
 
 
 def checkpoint(fn):
+
     def wrapper(*args, **kwargs):
         return torch.utils.checkpoint.checkpoint(fn, *args, **kwargs)
 
@@ -217,16 +214,15 @@ def _cpu_device_warning():
     import warnings
 
     warnings.warn(
-        ("Triton is not supported on current platform, roll back to CPU."), stacklevel=1
-    )
+        ("Triton is not supported on current platform, roll back to CPU."),
+        stacklevel=1)
 
 
 @lru_cache(maxsize=None)
 def get_multiprocessor_count(tensor_idx: int = 0) -> int:
     try:
-        return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)[
-            "multiprocessor_count"
-        ]
+        return triton.runtime.driver.active.utils.get_device_properties(
+            tensor_idx)["multiprocessor_count"]
     except BaseException:
         _cpu_device_warning()
         return -1
@@ -264,11 +260,10 @@ device_platform = _check_platform()
 is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
-is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
-is_nvidia_hopper = is_nvidia and (
-    "NVIDIA H" in torch.cuda.get_device_name(0)
-    or torch.cuda.get_device_capability()[0] >= 9
-)
+is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(
+    0)
+is_nvidia_hopper = is_nvidia and ("NVIDIA H" in torch.cuda.get_device_name(0)
+                                  or torch.cuda.get_device_capability()[0] >= 9)
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
@@ -279,10 +274,8 @@ is_gather_supported = hasattr(triton.language, "gather")
 def get_all_max_shared_mem():
     try:
         return [
-            triton.runtime.driver.active.utils.get_device_properties(i)[
-                "max_shared_mem"
-            ]
-            for i in range(device_torch_lib.device_count())
+            triton.runtime.driver.active.utils.get_device_properties(i)
+            ["max_shared_mem"] for i in range(device_torch_lib.device_count())
         ]
     except BaseException:
         _cpu_device_warning()
@@ -315,16 +308,17 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
 
 if check_pytorch_version("2.4"):
     device = "cuda" if device == "cpu" else device
-    autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=device)
-    autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=device)
+    autocast_custom_fwd = functools.partial(torch.amp.custom_fwd,
+                                            device_type=device)
+    autocast_custom_bwd = functools.partial(torch.amp.custom_bwd,
+                                            device_type=device)
 
     def custom_device_ctx(index: int):
         return device_torch_lib.device(index)
 
 else:
-    assert (
-        device == "cuda"
-    ), "Only cuda device is supported for PyTorch version < 2.4.0."
+    assert (device == "cuda"
+            ), "Only cuda device is supported for PyTorch version < 2.4.0."
     autocast_custom_fwd = device_torch_lib.amp.custom_fwd
     autocast_custom_bwd = device_torch_lib.amp.custom_bwd
 

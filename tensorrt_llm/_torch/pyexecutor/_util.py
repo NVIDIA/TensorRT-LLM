@@ -464,16 +464,26 @@ class KvCacheCreator:
                     "Connector manager is not supported for MambaHybridCacheManager."
                 )
             config = model_engine.model.model_config.pretrained_config
-            mamba_layer_mask = [True if i % config.full_attention_interval != config.full_attention_interval - 1 else False for i in range(num_hidden_layers)]
-            layer_mask=[False if i % config.full_attention_interval != config.full_attention_interval - 1 else True for i in range(num_hidden_layers)]
-            num_mamba_layers = num_hidden_layers // config.full_attention_interval * (config.full_attention_interval - 1)
+            mamba_layer_mask = [
+                True if i % config.full_attention_interval
+                != config.full_attention_interval - 1 else False
+                for i in range(num_hidden_layers)
+            ]
+            layer_mask = [
+                False if i % config.full_attention_interval
+                != config.full_attention_interval - 1 else True
+                for i in range(num_hidden_layers)
+            ]
+            num_mamba_layers = num_hidden_layers // config.full_attention_interval * (
+                config.full_attention_interval - 1)
             num_layers = num_hidden_layers - num_mamba_layers
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.linear_key_head_dim,
                 config.linear_conv_kernel_dim,
                 config.linear_num_value_heads,
-                config.linear_num_key_heads, # config.mamba2_ngroups, FIXME check this parameter is correct or not
+                config.
+                linear_num_key_heads,
                 config.linear_value_head_dim,
                 num_mamba_layers,
                 mamba_layer_mask,

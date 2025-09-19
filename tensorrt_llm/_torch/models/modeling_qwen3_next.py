@@ -4,16 +4,15 @@ import os
 from typing import Dict, List, Optional
 
 import torch
-from torch import nn
 import torch.nn.functional as F
-from einops import rearrange
+from torch import nn
+from transformers import Qwen3NextConfig
 
-from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
-from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
+from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import \
+    fused_sigmoid_gating_delta_rule_update
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm.mapping import Mapping
 
@@ -38,9 +37,8 @@ from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig,
-                             register_auto_model, register_config_loader)
+                             register_auto_model)
 
-from transformers import Qwen3NextConfig
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
@@ -53,6 +51,7 @@ def divide(numerator, denominator):
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
+
 
 class Qwen3NextGate(nn.Module):
 
@@ -229,59 +228,29 @@ def fused_qkvzba_split_reshape_cat_kernel(
     BA_DIM_T: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK * 2
     QKV_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
     q_end: tl.constexpr = HEAD_QK
-    blk_q_ptr = (
-        mixed_qkvz
-        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
-        + i_qk * QKVZ_DIM_T
-        + tl.arange(0, q_end)
-    )
+    blk_q_ptr = (mixed_qkvz + i_bs * NUM_HEADS_QK * QKVZ_DIM_T +
+                 i_qk * QKVZ_DIM_T + tl.arange(0, q_end))
     k_end: tl.constexpr = q_end + HEAD_QK
-    blk_k_ptr = (
-        mixed_qkvz
-        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
-        + i_qk * QKVZ_DIM_T
-        + tl.arange(q_end, k_end)
-    )
+    blk_k_ptr = (mixed_qkvz + i_bs * NUM_HEADS_QK * QKVZ_DIM_T +
+                 i_qk * QKVZ_DIM_T + tl.arange(q_end, k_end))
     v_end: tl.constexpr = k_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
-    blk_v_ptr = (
-        mixed_qkvz
-        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
-        + i_qk * QKVZ_DIM_T
-        + tl.arange(k_end, v_end)
-    )
+    blk_v_ptr = (mixed_qkvz + i_bs * NUM_HEADS_QK * QKVZ_DIM_T +
+                 i_qk * QKVZ_DIM_T + tl.arange(k_end, v_end))
     z_end: tl.constexpr = v_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
-    blk_z_ptr = (
-        mixed_qkvz
-        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
-        + i_qk * QKVZ_DIM_T
-        + tl.arange(v_end, z_end)
-    )
-    blk_q_st_ptr = (
-        mixed_qkv
-        + i_bs * NUM_HEADS_QK * QKV_DIM_T
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
-    )
-    blk_k_st_ptr = (
-        mixed_qkv
-        + i_bs * NUM_HEADS_QK * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
-    )
-    blk_v_st_ptr = (
-        mixed_qkv
-        + i_bs * NUM_HEADS_QK * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK * 2
-        + i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK
-        + tl.arange(0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK)
-    )
-    blk_z_st_ptr = (
-        z
-        + i_bs * NUM_HEADS_V * HEAD_V
-        + i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK
-        + tl.arange(0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK)
-    )
+    blk_z_ptr = (mixed_qkvz + i_bs * NUM_HEADS_QK * QKVZ_DIM_T +
+                 i_qk * QKVZ_DIM_T + tl.arange(v_end, z_end))
+    blk_q_st_ptr = (mixed_qkv + i_bs * NUM_HEADS_QK * QKV_DIM_T +
+                    i_qk * HEAD_QK + tl.arange(0, HEAD_QK))
+    blk_k_st_ptr = (mixed_qkv + i_bs * NUM_HEADS_QK * QKV_DIM_T +
+                    NUM_HEADS_QK * HEAD_QK + i_qk * HEAD_QK +
+                    tl.arange(0, HEAD_QK))
+    blk_v_st_ptr = (mixed_qkv + i_bs * NUM_HEADS_QK * QKV_DIM_T +
+                    NUM_HEADS_QK * HEAD_QK * 2 +
+                    i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK +
+                    tl.arange(0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK))
+    blk_z_st_ptr = (z + i_bs * NUM_HEADS_V * HEAD_V +
+                    i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK +
+                    tl.arange(0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK))
     tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
     tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
     tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
@@ -294,9 +263,8 @@ def fused_qkvzba_split_reshape_cat_kernel(
         tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
     for i in tl.static_range(b_end, a_end):
         blk_a_ptr = mixed_ba + i_bs * NUM_HEADS_QK * BA_DIM_T + i_qk * BA_DIM_T + i
-        blk_a_st_ptr = (
-            a + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + (i - b_end)
-        )
+        blk_a_st_ptr = (a + i_bs * NUM_HEADS_V +
+                        i_qk * NUM_HEADS_V // NUM_HEADS_QK + (i - b_end))
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
 
@@ -468,8 +436,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             skip_create_weights_in_init,
             allreduce_strategy=model_config.allreduce_strategy,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False
-        )
+            use_cute_dsl_blockscaling_mm=False)
         self.in_proj_ba = Linear(
             self.hidden_size,
             self.num_v_heads * 2,
@@ -483,8 +450,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             skip_create_weights_in_init,
             allreduce_strategy=model_config.allreduce_strategy,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=False
-        )
+            use_cute_dsl_blockscaling_mm=False)
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
@@ -512,7 +478,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             device=torch.cuda.current_device(),
             dtype=config.torch_dtype,
         )
-        
+
         # gemmaNorm is not supported in fused_all_reduce kernel.
         # So, we need to do allReduce in Linear and do gemmaNorm in separate kernel.
         self.out_proj = Linear(
@@ -536,13 +502,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         """
         new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
             self.num_k_heads // self.attn_tp_size,
-            (
-                self.head_k_dim
-                + self.head_k_dim
-                + (self.head_v_dim + self.head_v_dim)
-                * self.num_v_heads
-                // self.num_k_heads
-            ),
+            (self.head_k_dim + self.head_k_dim +
+             (self.head_v_dim + self.head_v_dim) * self.num_v_heads //
+             self.num_k_heads),
         )
         new_tensor_shape_ba = mixed_ba.size()[:-1] + (
             self.num_k_heads // self.attn_tp_size,
@@ -565,7 +527,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
         # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
+        (query, key, value, z) = torch.split(mixed_qkvz,
+                                             split_arg_list_qkvz,
+                                             dim=2)
         (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=2)
 
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
@@ -578,7 +542,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def forward_decode(
         self,
-        conv_states, ssm_states, num_decodes, cu_seqlens,
+        conv_states,
+        ssm_states,
+        num_decodes,
+        cu_seqlens,
         **kwargs,
     ):
         mixed_qkv = kwargs["mixed_qkv"]
@@ -586,7 +553,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         b = kwargs["b"]
         cache_indices = kwargs["cache_indices"]
 
-        query_start_loc = torch.arange(0, num_decodes + 1, device=cu_seqlens.device).to(torch.long)
+        query_start_loc = torch.arange(0,
+                                       num_decodes + 1,
+                                       device=cu_seqlens.device).to(torch.long)
 
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -611,7 +580,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_heads = query.shape[1] // self.head_k_dim
         query = query.view(1, seq_len, num_heads, self.head_k_dim)
         key = key.view(1, seq_len, num_heads, self.head_k_dim)
-        value = value.view(1, seq_len, value.shape[1] // self.head_v_dim, self.head_v_dim)
+        value = value.view(1, seq_len, value.shape[1] // self.head_v_dim,
+                           self.head_v_dim)
 
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log,
@@ -633,7 +603,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def forward_extend(
         self,
-        conv_states, ssm_states,
+        conv_states,
+        ssm_states,
         **kwargs,
     ):
         mixed_qkv = kwargs["mixed_qkv"]
@@ -654,7 +625,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         if num_decode_tokens > 0:
-            mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv, seqlen_split_size, dim=0)
+            mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv,
+                                                   seqlen_split_size,
+                                                   dim=0)
             query_start_loc_p = query_start_loc[:num_prefill + 1]
             has_initial_states_p = has_initial_states[:num_prefill]
 
@@ -668,7 +641,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 cache_indices=state_indices_p,
                 query_start_loc=query_start_loc_p,
             ).transpose(0, 1)
-            
+
             mixed_qkv_d = causal_conv1d_update(
                 mixed_qkv_d,
                 conv_states_to_use,
@@ -717,9 +690,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         if num_decode > 0:
             # TODO set it in mambaCacheManager
-            decode_query_start_loc = torch.arange(1, num_decode + 1, device=query_start_loc.device) # num_decode 个
-            decode_query_start_loc = decode_query_start_loc + query_start_loc[num_prefill]
-            new_query_start_loc = torch.cat([query_start_loc[:num_prefill + 1], decode_query_start_loc])
+            decode_query_start_loc = torch.arange(
+                1, num_decode + 1,
+                device=query_start_loc.device)  # num_decode 个
+            decode_query_start_loc = decode_query_start_loc + query_start_loc[
+                num_prefill]
+            new_query_start_loc = torch.cat(
+                [query_start_loc[:num_prefill + 1], decode_query_start_loc])
         else:
             new_query_start_loc = query_start_loc
 
@@ -736,7 +713,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
-        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype,
+                                                       copy=False)
         ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
@@ -781,9 +759,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
-        
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4]: # and is_cuda_graph:
+        query, key, value, z, b, a = self.fix_query_key_value_ordering(
+            projected_states_qkvz, projected_states_ba)
+
+        if self.num_v_heads // self.num_k_heads in [1, 2,
+                                                    4]:  # and is_cuda_graph:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -794,11 +774,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states_qkvz, projected_states_ba
-            )
-            query, key, value = map(
-                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
-            )
+                projected_states_qkvz, projected_states_ba)
+            query, key, value = map(lambda x: x.reshape(x.shape[0], -1),
+                                    (query, key, value))
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         kwargs = {
@@ -821,9 +799,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         new_implementation = True
         if new_implementation:
             if num_prefills > 0:
-                attn_out = self.forward_extend(conv_states, ssm_states, **kwargs)
+                attn_out = self.forward_extend(conv_states, ssm_states,
+                                               **kwargs)
             else:
-                attn_out = self.forward_decode(conv_states, ssm_states, num_decodes, mamba_metadata.cu_seqlens, **kwargs)
+                attn_out = self.forward_decode(conv_states, ssm_states,
+                                               num_decodes,
+                                               mamba_metadata.cu_seqlens,
+                                               **kwargs)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -853,7 +835,9 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp = Qwen3NextSparseMoeBlock(model_config, aux_stream, layer_idx=layer_idx)
+        self.mlp = Qwen3NextSparseMoeBlock(model_config,
+                                           aux_stream,
+                                           layer_idx=layer_idx)
 
         use_gemma_rms_norm = True
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -878,11 +862,11 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
             "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "1") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
-        has_tp = self.mapping.has_tp()
+        self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         # self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
-        self.fusion_config.PRE_MOE_FUSION = False # the fusion kernel does not support gemmaNorm yet
+        self.fusion_config.PRE_MOE_FUSION = False  # the fusion kernel does not support gemmaNorm yet
         self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.mapping.tp_size == 1
@@ -907,11 +891,13 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
         # Linear Attention
         ### FIXME: 1. forward_batch; 2. allreduce
         if hidden_states.shape[0] != 0:
-            hidden_states = self.linear_attn(hidden_states, attn_metadata,
-                                            all_reduce_params=AllReduceParams(
-                                                enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
-                                                                      or self.mapping.tp_size == 1)),
-                                             **kwargs)
+            hidden_states = self.linear_attn(
+                hidden_states,
+                attn_metadata,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
+                                          or self.mapping.tp_size == 1)),
+                **kwargs)
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
@@ -921,7 +907,7 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
                     norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
                     enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
-                                      or self.mapping.tp_size == 1),
+                                          or self.mapping.tp_size == 1),
                 ))
         else:
             # No fusion
@@ -983,10 +969,16 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
                     hidden_states, residual)
         return hidden_states, residual
 
+
 class Qwen3NextAttention(Qwen3Attention):
 
-    def __init__(self, model_config: ModelConfig[Qwen3NextConfig], layer_idx: int, fuse_qk_norm_rope: bool):
-        super().__init__(model_config, layer_idx, fuse_qk_norm_rope=fuse_qk_norm_rope, attn_output_gate=True, use_gemma_rms_norm=True)
+    def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
+                 layer_idx: int, fuse_qk_norm_rope: bool):
+        super().__init__(model_config,
+                         layer_idx,
+                         fuse_qk_norm_rope=fuse_qk_norm_rope,
+                         attn_output_gate=True,
+                         use_gemma_rms_norm=True)
 
 
 class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
@@ -1005,7 +997,9 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        self.mlp = Qwen3NextSparseMoeBlock(model_config, aux_stream, layer_idx=layer_idx)
+        self.mlp = Qwen3NextSparseMoeBlock(model_config,
+                                           aux_stream,
+                                           layer_idx=layer_idx)
 
         use_gemma_rms_norm = True
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -1029,7 +1023,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
-        has_tp = self.mapping.has_tp()
+        self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         # self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
@@ -1164,10 +1158,9 @@ class Qwen3NextModel(DecoderModel):
             # When attention_dp is enabled, we cannot do all_reduce since
             # the problem size of different ranks are different.
             # So, we don't do parallelism here.
-            self.embed_tokens = Embedding(
-                pretrained_config.vocab_size,
-                pretrained_config.hidden_size,
-                dtype=pretrained_config.torch_dtype)
+            self.embed_tokens = Embedding(pretrained_config.vocab_size,
+                                          pretrained_config.hidden_size,
+                                          dtype=pretrained_config.torch_dtype)
         else:
             self.embed_tokens = Embedding(
                 pretrained_config.vocab_size,
@@ -1235,8 +1228,8 @@ class Qwen3NextModel(DecoderModel):
 
 
 @register_auto_model("Qwen3NextForCausalLM")
-class Qwen3NextForCausalLM(
-        SpecDecOneEngineForCausalLM[Qwen3NextModel, Qwen3NextConfig]):
+class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
+                                                       Qwen3NextConfig]):
 
     def __init__(
         self,
@@ -1247,8 +1240,6 @@ class Qwen3NextForCausalLM(
             model_config,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
-
-
 
     def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
         new_weights = weight_mapper.preprocess_weights(weights)

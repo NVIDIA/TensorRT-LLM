@@ -2,25 +2,22 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk.py
 # -*- coding: utf-8 -*-
 
-import warnings
 from typing import Optional
 
 import torch
 from einops import rearrange
 
-from tensorrt_llm._torch.modules.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from tensorrt_llm._torch.modules.fla.chunk_delta_h import \
+    chunk_gated_delta_rule_fwd_h
 from tensorrt_llm._torch.modules.fla.chunk_o import chunk_fwd_o
-from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import (
-    chunk_scaled_dot_kkt_fwd,
-)
+from tensorrt_llm._torch.modules.fla.chunk_scaled_dot_kkt import \
+    chunk_scaled_dot_kkt_fwd
 from tensorrt_llm._torch.modules.fla.cumsum import chunk_local_cumsum
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._torch.modules.fla.solve_tril import solve_tril
-from tensorrt_llm._torch.modules.fla.utils import (
-    SUPPRESS_LEVEL,
-    autocast_custom_fwd,
-    input_guard,
-)
+from tensorrt_llm._torch.modules.fla.utils import (SUPPRESS_LEVEL,
+                                                   autocast_custom_fwd,
+                                                   input_guard)
 from tensorrt_llm._torch.modules.fla.wy_fast import recompute_w_u_fwd
 
 
@@ -37,9 +34,11 @@ def chunk_gated_delta_rule_fwd(
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
-    )
+    A = chunk_scaled_dot_kkt_fwd(k=k,
+                                 beta=beta,
+                                 g_cumsum=g,
+                                 cu_seqlens=cu_seqlens,
+                                 output_dtype=torch.float32)
     A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
     w, u = recompute_w_u_fwd(
         k=k,
@@ -91,8 +90,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
-        q_orig = q
-        k_orig = k
+        pass
 
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -200,11 +198,9 @@ def chunk_gated_delta_rule(
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
-            "Please use head_first=False for now instead."
-        )
-        q, k, v, beta, g = map(
-            lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g)
-        )
+            "Please use head_first=False for now instead.")
+        q, k, v, beta, g = map(lambda x: rearrange(x, "b h t ... -> b t h ..."),
+                               (q, k, v, beta, g))
     # if not head_first and q.shape[1] < q.shape[2]:
     #     warnings.warn(
     #         f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
@@ -216,15 +212,15 @@ def chunk_gated_delta_rule(
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing."
-            )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+                f"Please flatten variable-length inputs before processing.")
+        if initial_state is not None and initial_state.shape[0] != len(
+                cu_seqlens) - 1:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
             )
     if scale is None:
-        scale = k.shape[-1] ** -0.5
+        scale = k.shape[-1]**-0.5
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,

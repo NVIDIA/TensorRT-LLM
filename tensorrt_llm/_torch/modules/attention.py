@@ -392,7 +392,6 @@ class Attention(nn.Module):
                 mrope_config["mrope_rotary_cos_sin"] = mrope_rotary_cos_sin
             if mrope_position_deltas is not None:
                 mrope_config["mrope_position_deltas"] = mrope_position_deltas
-        
 
         attn_output = self.attn.forward(
             q,
@@ -508,7 +507,6 @@ class Attention(nn.Module):
         """
         qkv = self.qkv_proj(hidden_states)
 
-
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
                                               self.layer_idx)
@@ -539,14 +537,14 @@ class Attention(nn.Module):
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
 
         attn_output = self.forward_impl(q,
-                                   k,
-                                   v,
-                                   attn_metadata,
-                                   attention_mask,
-                                   attention_window_size,
-                                   attention_mask_data,
-                                   mrope_config=mrope_config,
-                                   attention_sinks=attention_sinks)
+                                        k,
+                                        v,
+                                        attn_metadata,
+                                        attention_mask,
+                                        attention_window_size,
+                                        attention_mask_data,
+                                        mrope_config=mrope_config,
+                                        attention_sinks=attention_sinks)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
