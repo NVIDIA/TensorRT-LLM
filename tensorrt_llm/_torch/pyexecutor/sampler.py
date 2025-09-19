@@ -709,6 +709,9 @@ class TorchSampler(Sampler):
                 batched_strategy = strategies[0]
             else:
                 batched_strategy = None
+        else:
+            assert len(set(strategies)) == 1, "mixed sampler is not enabled"
+            batched_strategy = strategies[0]
         generator = self.get_generator(raw_logits.device)
         if batched_strategy is not None:
             logits = raw_logits[:sum_steps]
