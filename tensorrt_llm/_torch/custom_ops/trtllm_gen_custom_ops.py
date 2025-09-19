@@ -376,12 +376,12 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         routing_method_type: int,
     ):
 
@@ -542,12 +542,12 @@ def fp8_block_scale_moe_runner(
     gemm2_weights_scale: torch.Tensor,
     num_experts: int,
     top_k: int,
-    n_group: int,
-    topk_group: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float],
     routing_method_type: int,
 ) -> torch.Tensor:
 
@@ -598,12 +598,12 @@ def _(
     gemm2_weights_scale: torch.Tensor,
     num_experts: int,
     top_k: int,
-    n_group: int,
-    topk_group: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float],
     routing_method_type: int,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
