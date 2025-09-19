@@ -23,7 +23,8 @@ The performance numbers below were collected using the steps described in this d
 
 Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/TensorRT-Model-Optimizer/#) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
 
-*(NEW for v1.0) RTX 6000 Pro Blackwell Server Edition Benchmarks*
+*(NEW for v1.0) RTX 6000 Pro Blackwell Server Edition Benchmarks:*
+
 RTX 6000 Pro Blackwell Server Edition data is now included in the perf overview. RTX 6000 systems can benefit from enabling pipeline parallelism (PP) in LLM workloads, so we included several new benchmarks for this GPU at various TP x PP combinations. That data is presented in a separate table for each network. 
 
 
