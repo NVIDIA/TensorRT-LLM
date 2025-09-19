@@ -536,6 +536,7 @@ class TestMoEAlltoAll:
             (2, [100, 50], 2, torch.float16),
             (4, [32, 32, 32, 32], 4, torch.float32),
             (4, [1, 1, 1, 1], 2, torch.float32),
+            (8, [640, 640, 640, 640, 640, 640, 640, 640], 4, torch.bfloat16),
         ],
         indirect=["mpi_pool_executor"])
     def test_combine(self, mpi_pool_executor, all_num_tokens, top_k, dtype):
@@ -553,7 +554,7 @@ class TestMoEAlltoAll:
         assert torch.cuda.device_count(
         ) >= ep_size, f"Need at least {ep_size} GPUs"
 
-        hidden_size = 256  # Smaller for combine test
+        hidden_size = 2880  # gpt-oss
         num_experts_per_rank = 8
         max_tokens_per_rank = max(all_num_tokens)
 
@@ -618,7 +619,15 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
                                           rank, token_selected_experts)
 
         # Run dispatch
-        recv_buffers = moe_a2a.dispatch(token_selected_experts, payloads, invalid_token_expert_id=-1, expert_id_payload_index=expert_id_payload_index)
+
+        with torch.cuda.profiler.profile():
+            # start_event = torch.cuda.Event(enable_timing=True)
+            # end_event = torch.cuda.Event(enable_timing=True)
+            # start_event.record()
+            recv_buffers = moe_a2a.dispatch(token_selected_experts, payloads, invalid_token_expert_id=-1, expert_id_payload_index=expert_id_payload_index)
+            # end_event.record()
+            # elapsed_time_ms = start_event.elapsed_time(end_event)
+            # print(f"moe_a2a.dispatch execution time: {elapsed_time_ms:.3f} ms")
 
 
         hidden_states_recv = recv_buffers[
@@ -645,8 +654,17 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
             num_experts_per_rank=num_experts_per_rank).view(ep_size, max_tokens_per_rank, hidden_states_recv.shape[-1])
 
         # Run combine on the received data
+
         send_indices = moe_a2a.send_indices
-        combined_output = moe_a2a.combine(hidden_states_recv)
+
+        with torch.cuda.profiler.profile():
+            # start_event = torch.cuda.Event(enable_timing=True)
+            # end_event = torch.cuda.Event(enable_timing=True)
+            # start_event.record()
+            combined_output = moe_a2a.combine(hidden_states_recv)
+            # end_event.record()
+            # elapsed_time_ms = start_event.elapsed_time(end_event)
+            # print(f"moe_a2a.combine execution time: {elapsed_time_ms:.3f} ms")
 
         # Verify completion flags after combine
         completion_flags_offset = moe_a2a.moe_a2a_metainfo[MoeAlltoAll.COMPLETION_FLAGS_OFFSET_INDEX].item()
