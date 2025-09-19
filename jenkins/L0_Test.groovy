@@ -273,7 +273,6 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, St
 def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
-    echo "Found ${preprocessedLists.isolateCount} isolated tests to run"
     def isolateTestLines = readFile(file: isolateTestList).readLines()
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
@@ -290,7 +289,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
             !cmd.contains("--junit-xml")
         }
         isolateTestCmdLine += ["--test-list=${singleTestFile}"]
-        isolateTestCmdLine += ["--test-prefix=${stageName}_isolated_${i}"]
+        isolateTestCmdLine += ["--test-prefix=${stageName}"]
         isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
         isolateTestCmdLine += ["--junit-xml ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
         isolateTestCmdLine += ["--cov-append"]  // Append coverage data to avoid overwriting previous data
@@ -303,7 +302,10 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            error "The isolated test ${isolateTestName} failed."
+            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, results_isolated_${i}.xml)
+                if (isRerunFailed) {
+                    error "The tests still failed after rerun attempt."
+                }
         } finally {
             // Clean up the temporary test file
             sh "rm -f ${singleTestFile}"
@@ -359,11 +361,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
     }
 
     sh "cat ${cleanedTestDBList}"
-    echo "DEBUG: isolationTestLines contains ${isolationTestLines.size()} tests that had ISOLATION markers"
-    println "DEBUG: isolationTestLines content:"
-    isolationTestLines.each { line ->
-        println "  - ${line}"
-    }
+    echo "Original testDBList contains ${isolationTestLines.size()} tests that had ISOLATION markers"
 
     def shardTestList = []
 
@@ -391,7 +389,6 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
             ).trim()
 
             // Debug: Show the raw pytest output
-            echo "DEBUG: Raw pytestOutput (${pytestOutput.length()} characters):"
             echo "<<<START_PYTEST_OUTPUT>>>"
             echo "${pytestOutput}"
             echo "<<<END_PYTEST_OUTPUT>>>"
@@ -404,19 +401,15 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
                 lineIndex++
 
                 if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
-                    echo "DEBUG: Found 'Running X items in this shard' or '[pytest-split] Running group' line: '${line}'"
                     foundRunningLine = true
                     return false  // Don't include the "Running" line itself
                 }
 
                 def hasDoubleColon = line.contains('::')
                 def shouldInclude = foundRunningLine && hasDoubleColon
-                echo "DEBUG: Line analysis - foundRunningLine: ${foundRunningLine}, hasDoubleColon: ${hasDoubleColon}, shouldInclude: ${shouldInclude}"
-
                 return shouldInclude
             }
-
-            echo "DEBUG: Filtering complete. shardTestList size: ${shardTestList.size()}"
+            echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
         } catch (Exception e) {
             echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
             error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
@@ -450,12 +443,10 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
                     if (isolationTestLine) {
                         // This test needs isolation
                         shardIsolateTests.add(isolationTestLine)
-                        echo "DEBUG: Test '${trimmedTest}' found in isolation list, adding to isolate tests"
                     } else {
                         // This test is a regular test - find the actual line from cleanedTestLines
                         def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
                         shardRegularTests.add(cleanedTestLine)
-                        echo "DEBUG: Test '${trimmedTest}' adding to regular tests"
                     }
                 }
             }
@@ -1623,9 +1614,9 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
-def rerunFailedTests(stageName, llmSrc, testCmdLine) {
-    if (!fileExists("${WORKSPACE}/${stageName}/results.xml")) {
-        error "There is not results.xml file, skip the rerun step"
+def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml") {
+    if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
+        error "There is not ${resultFileName} file, skip the rerun step"
     }
 
     // Generate rerun test lists
@@ -1634,7 +1625,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${WORKSPACE}/${stageName}/ \
-        --input-file=${WORKSPACE}/${stageName}/results.xml \
+        --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
         --fail-signatures='${failSignaturesList}'
     """
 
@@ -2024,13 +2015,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             try {
                 echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
                 runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName)
-            } catch (InterruptedException e) {
-                throw e
             } catch (Exception e) {
-                def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
-                if (isRerunFailed) {
-                    error "The tests still failed after rerun attempt."
-                }
+               throw e
             }
         } else {
             echo "No isolated tests to run for stage ${stageName}"
