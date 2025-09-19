@@ -27,7 +27,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
-                        skip_gpu_memory_less_than_138gb)
+                        skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -50,6 +50,7 @@ def test_tinyllama_logits_processor(enable_chunked_prefill):
         backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
 
 
+@skip_ray
 @pytest.mark.parametrize(
     "return_context_logits, use_overlap, enable_iter_req_stats", [
         (False, False, False),
@@ -66,6 +67,7 @@ def test_llm_get_stats(return_context_logits, use_overlap,
                                enable_iter_req_stats=enable_iter_req_stats)
 
 
+@skip_ray
 @pytest.mark.parametrize(
     "return_context_logits, use_overlap, enable_iter_req_stats", [
         (False, False, False),
@@ -88,6 +90,7 @@ def test_llm_capture_request_error():
 
 
 @force_ampere
+@pytest.mark.mpi_ray_parity
 @pytest.mark.parametrize(
     "sampling_params",
     [
@@ -175,6 +178,7 @@ def test_llm_reward_model():
     assert not outputs[0].outputs[0].text
 
 
+@skip_ray
 def test_llm_perf_metrics():
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     sampling_params = SamplingParams(max_tokens=10, return_perf_metrics=True)
@@ -200,6 +204,7 @@ def test_llm_perf_metrics():
     assert perf_metrics.last_iter == perf_metrics.iter
 
 
+@skip_ray
 def test_llm_prometheus():
     test_prompts = [
         "Hello, my name is",
@@ -221,6 +226,7 @@ def test_llm_prometheus():
         assert request_output.outputs is not None
 
 
+@skip_ray
 @pytest.mark.parametrize("streaming", [True, False])
 def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
@@ -404,6 +410,7 @@ def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_ca
         repeats_per_call=1)
 
 
+@skip_ray
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_peft_cache_config_affects_peft_cache_size():
     """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
@@ -832,6 +839,7 @@ FailingExecutor = type(
     })
 
 
+@skip_ray
 def test_llm_with_proxy_error():
     """Test that LLM properly handles GenerationExecutorWorker constructor failures.
 
@@ -885,6 +893,7 @@ def test_min_tokens(use_speculative: bool):
     assert len(res.outputs[0].token_ids) == output_len
 
 
+@skip_ray
 @pytest.mark.parametrize(
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
     [
@@ -907,6 +916,7 @@ def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                                      backend=backend)
 
 
+@skip_ray
 @pytest.mark.parametrize(
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
     [

@@ -446,3 +446,8 @@ def check_accuracy(a, b, atol, rtol, percent):
     if not (mismatch_percent < 1 - percent):
         raise Exception("Mismatch percentage is %f for rtol %f" %
                         (mismatch_percent, rtol))
+
+
+skip_ray = pytest.mark.skipif(
+    os.environ.get("TLLM_DISABLE_MPI") == "1",
+    reason="This test is skipped for Ray orchestrator.")

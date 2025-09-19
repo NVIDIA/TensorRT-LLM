@@ -12,6 +12,7 @@ l0_h100:
     terms:
       stage: pre_merge
       backend: pytorch
+      orchestrator: mpi
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/attention
@@ -121,6 +122,32 @@ l0_h100:
         lte: 1
     wildcards:
       gpu:
+        - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: ray
+  tests:
+    - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
+    - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=False]
+    - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
+    - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency]
+    - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
+    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
+    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-DeepSeek-V3-Lite-fp8/fp8]
+    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]
+    - unittest/_torch/executor
+    - unittest/_torch/ray_orchestrator/single_gpu
+    - unittest/llmapi/test_llm_pytorch.py
+    - examples/test_ray.py::test_llm_inference_async_ray
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
       - '*h100*'
       linux_distribution_name: ubuntu*
     terms:
@@ -189,6 +216,7 @@ l0_h100:
     terms:
       stage: post_merge
       backend: pytorch
+      orchestrator: mpi
   tests:
   # ------------- PyTorch tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile=False]
