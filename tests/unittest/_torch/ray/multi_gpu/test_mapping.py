@@ -24,7 +24,7 @@ class TestMapping(unittest.TestCase):
             # 8 GPUs, no cp
             (4, 2, 1, -1, -1),
             (2, 4, 1, -1, -1),
-            # 8 GPPUs with cp
+            # 8 GPUs with cp
             (4, 1, 2, -1, -1),
             (2, 1, 4, -1, -1),
             # with moe_tp, moe_ep
