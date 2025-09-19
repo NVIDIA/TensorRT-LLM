@@ -481,7 +481,7 @@ class KvCacheCreator:
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
-            executor_config.max_seq_len = kv_cache_manager.max_seq_len
+            self._max_seq_len = kv_cache_manager.max_seq_len
 
         # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
         if kv_cache_manager is not None:
