@@ -23,22 +23,22 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_traceback_on_error)
 from ..lora_helper import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
+from .base_worker import BaseWorker
 from .executor import IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
 from .result import IterationResult
-from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    WorkerCommIpcAddrs, has_event_loop)
-from .worker_base import WorkerBase
+from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
+                    has_event_loop)
 
 __all__ = [
     "GenerationExecutorWorker",
 ]
 
 
-class GenerationExecutorWorker(WorkerBase):
+class GenerationExecutorWorker(BaseWorker):
 
     class WorkerExit(GeneratorExit):
         pass
@@ -100,20 +100,9 @@ class GenerationExecutorWorker(WorkerBase):
                 it_result_queue.queue = _queue
                 it_result_queue.aqueue = None
 
-    def _set_iteration_result_queue(self, it_result_queue: IterationResultQueue,
-                                    queue: Union[Queue, FusedIpcQueue,
-                                                 IntraProcessQueue]):
-        assert not it_result_queue.is_initialized, "Iteration result queue should not already be initialized."
-        it_result_queue.is_initialized = True
-        it_result_queue.queue = queue
-        it_result_queue.aqueue = None
-
     def start_thread(self, thread: ManagedThread):
         if self.engine.can_enqueue_requests() and not thread.is_alive():
             thread.start()
-
-    def _engine_response_callback(self, response: tllm.Response):
-        return response
 
     def await_response_task(self) -> bool:
         return self._await_response_helper()
@@ -203,10 +192,6 @@ class GenerationExecutorWorker(WorkerBase):
         if mpi_rank() == 0:
             self.start_thread(self.dispatch_stats_thread)
 
-    def _pop_result(self, client_id: int):
-        self._results.pop(client_id, None)
-        self._client_id_to_request_id.pop(client_id, None)
-
     def shutdown(self):
 
         if self.doing_shutdown:
@@ -261,16 +246,6 @@ class GenerationExecutorWorker(WorkerBase):
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
-        self.shutdown()
-        return exc_type is None or exc_type == GenerationExecutorWorker.WorkerExit
-
-    def __del__(self):
-        self.shutdown()
 
 
 @print_traceback_on_error
