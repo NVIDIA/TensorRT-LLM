@@ -324,12 +324,6 @@ bool getEnvDisableSelectiveCacheTransfer()
     return disableSelectiveCacheTransfer;
 }
 
-bool getEnvParallelCacheSend()
-{
-    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
-    return parallelCacheSend;
-}
-
 bool getEnvRequestKVCacheConcurrent()
 {
     static bool const requestKVCacheConcurrent = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");

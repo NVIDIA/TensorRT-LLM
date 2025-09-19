@@ -256,7 +256,7 @@ TEST_F(CacheTransBufferTest, TestBufferIndexAssignment1)
         SizeType32 tokensPerBlock = 8;
         std::optional<size_t> maxNumTokens = maxBlocksPerSeq * tokensPerBlock;
         setenv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT", "1", 1);
-        setenv("TRTLLM_PARALLEL_CACHE_SEND", "1", 1);
+        setenv("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM", "2", 1);
         SetUpCacheTransBuffer(4, 2, 64, tokensPerBlock, CacheType::kSELF, maxNumTokens, maxBlocksPerSeq);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
