@@ -19,11 +19,13 @@ import io
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
+import requests
 from _pytest.nodes import Item
 from _pytest.python import Function
 from defs.trt_test_alternative import (check_output, popen, print_error,
@@ -316,6 +318,19 @@ class PerfDisaggScriptTestCmds(NamedTuple):
     client_cmd: List[str]
     benchmark_cmd: List[str]
 
+    def wait_for_endpoint_ready(self, url: str, timeout: int = 600):
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            try:
+                time.sleep(1)
+                if requests.get(url).status_code == 200:
+                    print(f"endpoint {url} is ready")
+                    return
+            except Exception as err:
+                print(f"endpoint {url} is not ready, with exception: {err}")
+        print_error(
+            f"Endpoint {url} did not become ready within {timeout} seconds")
+
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
         try:
@@ -340,6 +355,9 @@ class PerfDisaggScriptTestCmds(NamedTuple):
                           stderr=subprocess.STDOUT,
                           env=venv._new_env,
                           shell=True) as server_proc):
+                self.wait_for_endpoint_ready(
+                    f"http://localhost:8000/health",
+                    timeout=1800)  # 30 minutes for large models
                 check_output(self.client_cmd, env=venv._new_env)
                 output += check_output(self.benchmark_cmd, env=venv._new_env)
         finally:
