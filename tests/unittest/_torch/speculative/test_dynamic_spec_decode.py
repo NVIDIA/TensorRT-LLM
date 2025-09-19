@@ -70,7 +70,6 @@ def test_dynamic_spec_decode(disable_overlap_scheduler: bool):
     generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
 
-
     llm_ref = LLM(**llm_common_config)
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]
