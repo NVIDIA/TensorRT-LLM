@@ -1530,7 +1530,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     def post_load_weights(self):
         all_named_modules = dict(self.model.named_modules())
         for name, module in tqdm(all_named_modules.items(),
-                                 desc="Loading weights"):
+                                 desc="Post loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
                 continue
             else:
