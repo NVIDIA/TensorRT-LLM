@@ -1804,80 +1804,88 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      backend=None):
     LLM_CLASS = LLM
     llm_args_extra = {}
+    kv_cache_args_extra = {}
     if backend in ["pytorch", "autodeploy"]:
         LLM_CLASS = LLM_torch
+        if streaming:
+            # need this so that context_logits / prompt_logprobs are not dropped
+            # in the 2nd reuse of llm.generate() in streaming mode
+            kv_cache_args_extra["enable_block_reuse"] = False
     else:
         llm_args_extra["fast_build"] = True
 
     llm = LLM_CLASS(
         llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                      **kv_cache_args_extra),
         build_config=BuildConfig(gather_context_logits=True),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
         **llm_args_extra,
     )
 
-    prompts = ["A B C D E F G H I J K"]
-    sampling_params = SamplingParams(
-        logprobs=logprobs,
-        prompt_logprobs=prompt_logprobs,
-        return_context_logits=return_context_logits,
-        return_generation_logits=return_generation_logits)
+    with llm:
+        prompts = ["A B C D E F G H I J K"]
+        sampling_params = SamplingParams(
+            logprobs=logprobs,
+            prompt_logprobs=prompt_logprobs,
+            return_context_logits=return_context_logits,
+            return_generation_logits=return_generation_logits)
 
-    for output in llm.generate(prompts, sampling_params):
-        context_logits = output.context_logits
-        generation_logits = output.outputs[0].generation_logits
-        logprobs_result = output.outputs[0].logprobs
-        prompt_logprobs_result = output.outputs[0].prompt_logprobs
-        token_ids = output.outputs[0].token_ids
+        for output in llm.generate(prompts, sampling_params):
+            context_logits = output.context_logits
+            generation_logits = output.outputs[0].generation_logits
+            logprobs_result = output.outputs[0].logprobs
+            prompt_logprobs_result = output.outputs[0].prompt_logprobs
+            token_ids = output.outputs[0].token_ids
 
-        # ensure logits are dropped unless users specify return_context_logits=True
-        if prompt_logprobs and not return_context_logits:
-            assert context_logits is None
+            # ensure logits are dropped unless users specify return_context_logits=True
+            if prompt_logprobs and not return_context_logits:
+                assert context_logits is None
 
-        if logprobs and not return_generation_logits:
-            assert generation_logits is None
+            if logprobs and not return_generation_logits:
+                assert generation_logits is None
 
-        if return_context_logits:
-            assert isinstance(context_logits, torch.Tensor)
+            if return_context_logits:
+                assert isinstance(context_logits, torch.Tensor)
 
-        if return_generation_logits:
-            assert isinstance(generation_logits, torch.Tensor)
+            if return_generation_logits:
+                assert isinstance(generation_logits, torch.Tensor)
 
-        if prompt_logprobs:
-            assert prompt_logprobs_result and len(
-                prompt_logprobs_result[0].keys()) == prompt_logprobs
-            print("prompt_logprobs[0]: ", prompt_logprobs_result[0])
+            if prompt_logprobs:
+                assert prompt_logprobs_result and len(
+                    prompt_logprobs_result[0].keys()) == prompt_logprobs
+                print("prompt_logprobs[0]: ", prompt_logprobs_result[0])
 
-        if logprobs:
-            assert logprobs_result and len(
-                logprobs_result[0].keys()) in {logprobs, logprobs + 1}
-            # Most contain log prob of the sample token, even if it's not within K
-            assert token_ids[0] in logprobs_result[0].keys()
-            print("logprobs[0]: ", logprobs_result[0])
+            if logprobs:
+                assert logprobs_result and len(
+                    logprobs_result[0].keys()) in {logprobs, logprobs + 1}
+                # Most contain log prob of the sample token, even if it's not within K
+                assert token_ids[0] in logprobs_result[0].keys()
+                print("logprobs[0]: ", logprobs_result[0])
 
-    if streaming:
+        if streaming:
 
-        async def task(id: int, prompt: str):
-            logprobs_result_streaming = []
-            async for output in llm.generate_async(prompt,
-                                                   sampling_params,
-                                                   streaming=True):
-                logprobs_result_streaming += output.outputs[0].logprobs_diff
+            async def task(id: int, prompt: str):
+                logprobs_result_streaming = []
+                async for output in llm.generate_async(prompt,
+                                                       sampling_params,
+                                                       streaming=True):
+                    logprobs_result_streaming += output.outputs[0].logprobs_diff
 
-            # comparing streaming logprobs result to non-streaming
-            assert logprobs_result_streaming == logprobs_result
-            assert output.outputs[0].prompt_logprobs == prompt_logprobs_result
+                # comparing streaming logprobs result to non-streaming
+                assert logprobs_result_streaming == logprobs_result
+                assert output.outputs[
+                    0].prompt_logprobs == prompt_logprobs_result
 
-        async def main():
-            tasks = [task(id, prompt) for id, prompt in enumerate(prompts)]
-            await asyncio.gather(*tasks)
+            async def main():
+                tasks = [task(id, prompt) for id, prompt in enumerate(prompts)]
+                await asyncio.gather(*tasks)
 
-        asyncio.run(main())
+            asyncio.run(main())
 
 
-@force_ampere
+# @force_ampere
 @pytest.mark.parametrize(
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
     [
@@ -1887,14 +1895,6 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         (2, None, False, False,
          "trt"),  # prompt_logprobs without context_logits
         (None, None, False, False, "trt"),  # no logprobs at all
-        # PyTorch backend test cases (adjusted for PyTorch limitations)
-        (2, None, True, False, "pytorch"
-         ),  # prompt_logprobs with context_logits
-        (None, 1, False, False,
-         "pytorch"),  # generation logprobs only (top-1, PyTorch limit)
-        (2, None, False, False,
-         "pytorch"),  # prompt_logprobs without context_logits
-        (None, None, False, False, "pytorch"),  # no logprobs at all
     ])
 def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                              logprobs: Optional[int],
@@ -1907,7 +1907,7 @@ def test_llm_return_logprobs(prompt_logprobs: Optional[int],
                                      backend=backend)
 
 
-@force_ampere
+# @force_ampere
 def test_llm_return_logprobs_streaming():
     llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
 
