@@ -89,4 +89,4 @@ def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
             )
 
         dataset_path = prepare_dataset(llm_root, temp_dir, model_path_or_name)
-        run_benchmark(model_name, model_path, dataset_path, temp_dir)
+        run_benchmark(model_name, dataset_path, temp_dir)
