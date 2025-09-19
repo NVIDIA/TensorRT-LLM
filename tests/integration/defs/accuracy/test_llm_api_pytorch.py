@@ -3276,8 +3276,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytorch_config = dict(disable_overlap_scheduler=True,
                               cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        tokens_per_block=512,
-                                        enable_block_reuse=True,
                                         dtype=kv_cache_dtype)
 
         model_name = "GPT-OSS/MXFP4"
@@ -3287,6 +3285,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                  moe_expert_parallel_size=1,
                  kv_cache_config=kv_cache_config,
                  max_seq_len=8192,
+                 max_num_tokens=512,
                  enable_chunked_prefill=True,
                  enable_attention_dp=False,
                  moe_config=MoeConfig(backend=moe_backend),
