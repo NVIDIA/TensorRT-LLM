@@ -53,7 +53,6 @@ struct WarpPolicy
 {
     __device__ static int stride() { return warpSize; }
     __device__ static int offset() { return (threadIdx.x % warpSize); }
-    __device__ static int thread_idx() { return threadIdx.x % warpSize; }
     __device__ static int token_idx() { return (blockIdx.x * blockDim.x + threadIdx.x) / warpSize; }
     __device__ static void sync() { __syncwarp(); }
     __device__ static int broadcast_int(int value)
@@ -66,7 +65,6 @@ struct BlockPolicy
 {
     __device__ static int stride() { return blockDim.x; }
     __device__ static int offset() { return threadIdx.x; }
-    __device__ static int thread_idx() { return threadIdx.x; }
     __device__ static int token_idx() { return blockIdx.x; }
     __device__ static void sync() { __syncthreads(); }
     __device__ static int broadcast_int(int value)
@@ -198,7 +196,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
     int local_num_tokens, int rank_id, int ep_size, int top_k, int num_experts_per_rank)
 {
 
-    int thread_idx = ThreadingPolicy::thread_idx();
+    int thread_idx = ThreadingPolicy::offset();
     int local_token_idx = ThreadingPolicy::token_idx();
 
     if (local_token_idx >= local_num_tokens)
