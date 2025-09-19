@@ -107,11 +107,7 @@ class AttentionMetadata:
 
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
-    _request_ids: Optional[List[int]] = None
-
-    # The mapping of each request_id to its index in the request_ids list.
-    # The shape is (batch_size, batch_size).
-    _request_id_to_index: Optional[Dict[int, int]] = None
+    request_ids: Optional[List[int]] = None
 
     # The prompt length of each sequence in the batch.
     # For context-phase sequence, the value is its token number, which is same with `context_lens`.
@@ -270,21 +266,6 @@ class AttentionMetadata:
     @property
     def num_tokens(self) -> int:
         return self._num_tokens
-
-    @property
-    def request_ids(self) -> Optional[List[int]]:
-        return self._request_ids
-
-    @request_ids.setter
-    def request_ids(self, value: Optional[List[int]]):
-        self._request_ids = value
-        self._request_id_to_index = {
-            request_id: i
-            for i, request_id in enumerate(self._request_ids)
-        }
-
-    def index_of_seq(self, request_id) -> int:
-        return self._request_id_to_index.get(request_id, -1)
 
     def prepare(self):
         """
