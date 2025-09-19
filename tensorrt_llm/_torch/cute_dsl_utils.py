@@ -11,6 +11,4 @@ if platform.system() != "Windows":
         logger.info(f"cutlass dsl is available")
         IS_CUTLASS_DSL_AVAILABLE = True
     except ImportError:
-        logger.warning(
-            "To enable support for cute based kernels, please install nvidia-cutlass-dsl"
-        )
+        pass
