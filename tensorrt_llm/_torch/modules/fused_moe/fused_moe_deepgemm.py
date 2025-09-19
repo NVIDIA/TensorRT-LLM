@@ -425,13 +425,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             (num_experts * m_max * fp8_dim, ),
             dtype=torch.float8_e4m3fn,
             buffer_name='workspace_0',
-            create_if_miss=True,
             pin_memory=capture_graph)
         workspace_1 = DeepGemmFusedMoE.buffer.get_buffer(
             (num_experts * m_max * max(intermediate_size * 2, hidden_size), ),
             dtype=torch.bfloat16,
             buffer_name='workspace_1',
-            create_if_miss=True,
             pin_memory=capture_graph)
 
         # create workspace for scaling factors
@@ -443,7 +441,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             (num_experts * (scale_k_padded // 4) * m_padded, ),
             dtype=torch.int32,
             buffer_name='workspace_sf',
-            create_if_miss=True,
             pin_memory=capture_graph)
 
         workspace = {
