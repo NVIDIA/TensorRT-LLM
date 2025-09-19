@@ -1166,7 +1166,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             build_cmd.append(f"--output_timing_cache={timing_cache}")
         return build_cmd
 
-    @multi_node_llm_command_wrapper
     def get_prepare_data_command(self, engine_dir, input_len,
                                  output_len) -> list:
         data_cmd = []
@@ -2018,7 +2017,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         gen_cmd = f'CUDA_VISIBLE_DEVICES={gen_gpu_list} {llm_api_cmd} trtllm-serve {model_dir} --host localhost --port 8002 --extra_llm_api_options {gen_config_path}'
         return ctx_cmd, gen_cmd
 
-    @multi_node_disagg_server_command_wrapper
     def _get_disagg_server_deploy_command(self):
         server_config = self._gen_disagg_server_config()
         server_config_path = os.path.join(self._working_dir,
@@ -2027,7 +2025,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             yaml.dump(server_config, f)
         return f'trtllm-serve disaggregated -c {server_config_path} -t 3600 -r 3600'
 
-    @multi_node_disagg_server_command_wrapper
     def _get_disagg_client_command(self):
         client_dir = os.path.join(self._llm_root,
                                   "examples/disaggregated/clients")
@@ -2040,7 +2037,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         ]
         return client_cmd
 
-    @multi_node_disagg_server_command_wrapper
     def _get_disagg_benchmark_command(self):
         benchmark_script = os.path.join(self._llm_root, "tensorrt_llm", "serve",
                                         "scripts", "benchmark_serving.py")

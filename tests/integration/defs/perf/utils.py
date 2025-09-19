@@ -103,6 +103,8 @@ class MultiNodeProbe(object):
         if match:
             prefix = match.group(1)
             numbers = match.group(2).split(',')
+            if len(numbers) == 1:
+                numbers = match.group(2).split('-')
             return [f"{prefix}{num.strip()}" for num in numbers]
         else:
             # If not matched with bracket format, split by comma
@@ -173,31 +175,6 @@ def multi_node_llm_command_wrapper(func):
                 return ["trtllm-llmapi-launch"] + result
 
             # Fallback: unknown format, return as-is
-            else:
-                print(
-                    f"Warning: Fallback: Unknown return format from {func.__name__}: {type(result)}"
-                )
-                return result
-
-        return result
-
-    return wrapper
-
-
-def multi_node_disagg_server_command_wrapper(func):
-    '''
-    decorator: add trtllm-llmapi-launch prefix to test command in multi-node env
-    '''
-
-    def wrapper(self, *args, **kwargs):
-        # Get the original result
-        result = func(self, *args, **kwargs)
-        # Use trtllm-api-launch prefix if running on multi-node env
-        if MultiNodeProbe.is_multi_node():
-            if isinstance(result, str):
-                return "trtllm-llmapi-launch " + result
-            elif isinstance(result, list):
-                return ["trtllm-llmapi-launch"] + result
             else:
                 print(
                     f"Warning: Fallback: Unknown return format from {func.__name__}: {type(result)}"
@@ -568,8 +545,10 @@ class PerfDisaggScriptTestCmds(NamedTuple):
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         if MultiNodeProbe.is_multi_node():
+            print_info(f"Running command on multi-node")
             return self.run_cmd_on_multi_node(cmd_idx, venv)
         else:
+            print_info(f"Running command on single-node")
             return self.run_cmd_on_single_node(cmd_idx, venv)
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
