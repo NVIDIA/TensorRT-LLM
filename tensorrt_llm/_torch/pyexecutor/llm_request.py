@@ -248,6 +248,7 @@ class LlmResult:
         self._result = result
         self._py_result = py_result
         self.is_final = is_final
+        self.cached_tokens = 0
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
@@ -353,6 +354,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
+        self.cached_tokens = 0
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
