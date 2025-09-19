@@ -288,7 +288,6 @@ full:L40S/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_
 full:L20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False] SKIP (https://nvbugs/5347051)
 full:L20/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2] SKIP (https://nvbugs/5471108)
 test_e2e.py::test_multi_nodes_eval[llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8-tp8pp2-mmlu] SKIP (https://nvbugs/5473781)
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8] SKIP (https://nvbugs/5477404)
 triton_server/test_triton.py::test_python_bls_unit_tests[python-bls-unit-tests] SKIP (https://nvbugs/5477392)
 triton_server/test_triton.py::test_mistral_ib[mistral-ib] SKIP (https://nvbugs/5477399)
 triton_server/test_triton.py::test_eagle[eagle] SKIP (https://nvbugs/5477378)
