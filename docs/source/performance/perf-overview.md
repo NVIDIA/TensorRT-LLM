@@ -23,6 +23,10 @@ The performance numbers below were collected using the steps described in this d
 
 Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/TensorRT-Model-Optimizer/#) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
 
+*(NEW for v1.0) RTX 6000 Pro Blackwell Server Edition Benchmarks*
+RTX 6000 Pro Blackwell Server Edition data is now included in the perf overview. RTX 6000 systems can benefit from enabling pipeline parallelism (PP) in LLM workloads, so we included several new benchmarks for this GPU at various TP x PP combinations. That data is presented in a separate table for each network. 
+
+
 ### Hardware
 The following GPU variants were used for testing:
 - H100 SXM 80GB (DGX H100)
@@ -68,6 +72,18 @@ nvidia/Qwen3-235B-A22B-FP8
 | 5000/500 | 9,425 | 9,859 | 4,605 | 3,342 |
 | 20000/2000 | 6,141 | 6,509 | 2,105 | |
 
+RTX 6000 Pro Blackwell Server Edition
+| Sequence Length (ISL/OSL) | **4 GPUs**<br/>TP2,PP2 (FP4) | **8 GPUs**<br/>TP4,PP2 (FP4) |
+|---|---|---|
+| 128/128 | 18,644 | 23,454 |
+| 128/2048 | 12,321 | 21,035 |
+| 128/4096 | 7,643 | 13,421 |
+| 1000/1000 | 9,476 | 15,781 |
+| 1000/2000 | 8,919 | 16,434 |
+| 2048/128 | 2,615 | 2,941 |
+| 2048/2048 | 6,208 | 10,410 |
+| 5000/500 | 2,662 | |
+
 #### Llama 3.3 70B
 
 | Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP1 (FP8) | H100<br/>TP2 (FP8) |
@@ -82,6 +98,20 @@ nvidia/Qwen3-235B-A22B-FP8
 | 2048/2048 | 4,783 | 5,646 | 2,003 | 3,082 |
 | 5000/500 | 1,459 | 1,602 | 566 | 898 |
 | 20000/2000 | 665 | 755 | 283 | 437 |
+
+RTX 6000 Pro Blackwell Server Edition
+| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) | **4 GPUs**<br/>TP1,PP4 (FP4) | **8 GPUs**<br/>TP1,PP8 (FP4) |
+|---|---|---|---|---|
+| 128/128 | 3,264 | 6,172 | 9,641 | 11,881 |
+| 128/2048 | 2,422 | 4,993 | 7,922 | 9,833 |
+| 128/4096 | 1,349 | 2,893 | 4,978 | 7,352 |
+| 500/2000 | 1,856 | 4,114 | 6,939 | 9,435 |
+| 1000/1000 | 1,787 | 3,707 | 5,961 | 8,166 |
+| 1000/2000 | 1,594 | 2,993 | 5,274 | 6,943 |
+| 2048/128 | 393 | 813 | 1,511 | 2,495 |
+| 2048/2048 | 1,074 | 2,336 | 3,870 | 6,078 |
+| 5000/500 | 401 | 812 | 1,511 | 2,491 |
+| 20000/2000 | 142 | 319 | 630 | 1,148 |
 
 #### Qwen3-235B-A22B
 
@@ -98,6 +128,19 @@ nvidia/Qwen3-235B-A22B-FP8
 | 5000/500 | 8,190 | 3,623 | 3,225 |
 | 20000/2000 | 4,453 | 1,876 | |
 
+RTX 6000 Pro Blackwell Server Edition
+| Sequence Length (ISL/OSL) | **8 GPUs**<br/>TP2,PP4 (FP4) |
+|---|---|
+| 128/128 | 18,890 |
+| 128/2048 | 12,494 |
+| 128/4096 | 7,715 |
+| 500/2000 | 11,157 |
+| 1000/1000 | 10,697 |
+| 1000/2000 | 10,109 |
+| 2048/128 | 3,181 |
+| 2048/2048 | 6,712 |
+| 5000/500 | 3,173 |
+
 #### Qwen3-30B-A3B
 
 | Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) |
@@ -112,6 +155,20 @@ nvidia/Qwen3-235B-A22B-FP8
 | 2048/2048 | 17,554 | 14,719 |
 | 5000/500 | 6,142 | 5,908 |
 | 20000/2000 | 2,944 | 3,203 |
+
+RTX 6000 Pro Blackwell Server Edition
+| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP2,PP1 (FP4) | **4 GPUs**<br/>TP4,PP1 (FP4) | **8 GPUs**<br/>TP8,PP1 (FP4) |
+|---|---|---|---|---|
+| 128/128 | 28,011 | 32,646 | 36,819 | 39,490 |
+| 128/2048 | 12,540 | 22,744 | 35,715 | 52,676 |
+| 128/4096 | 7,491 | 15,049 | 28,139 | 33,895 |
+| 500/2000 | 10,695 | 17,266 | 26,175 | 44,088 |
+| 1000/1000 | 9,910 | 16,431 | 24,046 | 31,785 |
+| 1000/2000 | 8,378 | 13,323 | 25,131 | 28,881 |
+| 2048/128 | 3,257 | 3,785 | 4,311 | 4,798 |
+| 2048/2048 | 5,908 | 10,679 | 18,134 | 22,391 |
+| 5000/500 | 2,530 | 3,799 | 5,212 | 5,965 |
+| 20000/2000 | 871 | 1,558 | 2,551 | |
 
 #### Llama 4 Maverick
 
@@ -128,6 +185,19 @@ nvidia/Qwen3-235B-A22B-FP8
 | 5000/500 | | 8,456 | 3,457 |
 | 20000/2000 | 12,678 | 4,106 | |
 
+RTX 6000 Pro Blackwell Server Edition
+| Sequence Length (ISL/OSL) | **8 GPUs**<br/>TP4,PP2 (FP4) |
+|---|---|
+| 128/128 | 30,583 |
+| 128/2048 | 19,146 |
+| 128/4096 | 12,165 |
+| 500/2000 | 17,870 |
+| 1000/1000 | 15,954 |
+| 1000/2000 | 12,456 |
+| 2048/128 | 4,463 |
+| 2048/2048 | 10,727 |
+| 5000/500 | 4,613 |
+
 #### Llama 3.1 405B
 
 | Sequence Length (ISL/OSL) | B200<br/>TP4 (FP4) | GB200<br/>TP4 (FP4) | H200<br/>TP8 (FP8) | H100<br/>TP8 (FP8) |
@@ -142,6 +212,16 @@ nvidia/Qwen3-235B-A22B-FP8
 | 2048/2048 | 4,212 | 4,407 | 2,948 | 2,296 |
 | 5000/500 | 1,048 | 1,112 | 650 | 610 |
 | 20000/2000 | 672 | 739 | 505 | 345 |
+
+RTX 6000 Pro Blackwell Server Edition
+| Sequence Length (ISL/OSL) | **8 GPUs**<br/>TP1,PP8 (FP4) |
+|---|---|
+| 128/128 | 4,452 |
+| 128/2048 | 2,981 |
+| 1000/1000 | 2,369 |
+| 1000/2000 | 1,931 |
+| 2048/128 | 579 |
+| 2048/2048 | 1,442 |
 
 #### Llama 3.1 8B
 
