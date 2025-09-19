@@ -350,8 +350,8 @@ trtllm-bench --tp $tp_size --pp $pp_size --ep $ep_size --model $model_name throu
 
 `llm_options.yml`
 ```yaml
+enable_attention_dp: true
 cuda_graph_config:
-  enable_attention_dp: true
   enable_padding: true
   batch_sizes:
     - 1
