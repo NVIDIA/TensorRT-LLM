@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 # isort: off
 # needed before trying to import bindings to load tensorrt_libs
 import tensorrt as trt  # noqa
@@ -58,6 +60,17 @@ class DisaggregatedParams:
             )
 
     def __post_init__(self):
+        if self.request_type is not None:
+            self.request_type = self.request_type.lower()
+            if self.request_type not in [
+                "context_only",
+                "generation_only",
+                "context_and_generation",
+            ]:
+                raise ValueError(
+                    f"Unknown request type: {self.request_type}. Must be context_only, generation_only or "
+                    "context_and_generation"
+                )
         if self.multimodal_embedding_handles is not None:
             if self.multimodal_hashes is not None:
                 # if mm hashes are provided, kvcache reuse can be enabled
@@ -69,8 +82,6 @@ class DisaggregatedParams:
                     assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
                     assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
             else:
-                import numpy as np
-
                 # if user did not provide mm embedding handles, kvcache reuse will be disabled
                 assert len(self.multimodal_embedding_handles) > 0, (
                     "multimodal_embedding_handles must be provided"
