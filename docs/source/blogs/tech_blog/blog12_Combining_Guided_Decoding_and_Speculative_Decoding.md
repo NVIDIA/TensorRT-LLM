@@ -58,7 +58,7 @@ TensorRT LLM integrates third-party grammar backends (e.g., [XGrammar](https://g
 
 Speculative decoding is a crucial feature in low-latency or throughput@latency LLM inference scenarios. For each request, a lightweight drafter proposes several draft tokens, and then the target model verifies the draft tokens in parallel. Hopefully, most draft tokens are accepted, and thus multiple tokens are generated in a single target model forward. Compared with normal LLM inference where each model forward generates a single token, speculative decoding effectively makes the generation phase less memory-bound.
 
-TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and is coupled with the modeling code, but it offers the best performance. The two-model implementation decouples the target and draft models into separate CUDA graphs, which is much more flexible and offers better feature coverage. There are on-going efforts to close the gaps between the two implementations.
+TensorRT LLM has two kinds of speculative decoding implementations, namely the one-model and two-model implementations. The one-model implementation launches a single CUDA graph for a target model forward together with multiple draft model forwards. This is more difficult to implement and is coupled with the modeling code, but it offers the best performance. The two-model implementation decouples the target and draft models into separate CUDA graphs, which is much more flexible and offers better feature coverage. There are ongoing efforts to close the gaps between the two implementations.
 
 <div align="center">
 <figure>
@@ -69,7 +69,7 @@ TensorRT LLM has two kinds of speculative decoding implementations, namely the o
 
 ### Two Challenges
 
-When combining guided decoding and speculative decoding, two challenges arise. First, at each generation iteration, speculative decoding proposes multiple draft tokens, and some of them might be rejected in the verification step. The draft token proposal and rejection are not transparent to guided decoding. Specifically, this can be broken down into two views:
+When combining guided decoding and speculative decoding, two challenges arise. First, at each generation iteration, speculative decoding proposes multiple draft tokens, some of which might be rejected in the verification step. The draft token proposal and rejection are not transparent to guided decoding. Specifically, this can be broken down into two views:
 
 * For the target model, guided decoding should advance the grammar state and generate the mask for every draft token. If some draft tokens are rejected, guided decoding should rollback the grammar state to the last accepted token.
 * For the draft model, without grammar constraints, some draft tokens may violate the grammar and thus be forcefully rejected in the verification step. Clearly, this hurts the acceptance rate. Hence, guided decoding should also intervene on the logits for every draft token generation if possible.
@@ -78,8 +78,8 @@ When combining guided decoding and speculative decoding, two challenges arise. F
 
 Second, specific to the one-model speculative decoding where a single CUDA graph contains multiple (draft and target) model forwards, the CPU-GPU synchronization becomes challenging. Note that for every step $i$, there are two event waits:
 
-* The host waits the *token event* that indicates the readiness of CPU tokens from step $i-1$.
-* The model forward stream waits the *mask event* that indicates the readiness of GPU masks from step $i$.
+* The host waits for the *token event* that indicates the readiness of CPU tokens from step $i-1$.
+* The model forward stream waits for the *mask event* that indicates the readiness of GPU masks from step $i$.
 
 <div align="center">
 <figure>
@@ -90,7 +90,7 @@ Second, specific to the one-model speculative decoding where a single CUDA graph
 
 Note that in the two-model implementation, the sampling is excluded from the CUDA graphs for better flexibility (Figure 2). From the CPU perspective, this offers a timing for the grammar computation. In particular, the mask event wait can be inserted between the CUDA graph replay and sampling, effectively making the GPU wait for the GPU masks asynchronously copied from CPU.
 
-However, the CUDA graph of the one-model implementation contains multiple forwards, inevitably including the sampling operations. Hence, there is no timing for the grammar computation. The most outstanding problem is that when replaying the CUDA graph, the mask event wait cannot be inserted before sampling. An alternative is capturing the events and waits in the CUDA graph, but it is still ineffective because the grammar computation is on CPU and thus not capturable. Once such a CUDA graph is launched to replay, the GPU does not wait any newly recorded events, so it is impossible to block the GPU for the readiness of masks.
+However, the CUDA graph of the one-model implementation contains multiple forwards, inevitably including the sampling operations. Hence, there is no timing for the grammar computation. The most outstanding problem is that when replaying the CUDA graph, the mask event wait cannot be inserted before sampling. An alternative is capturing the events and waits in the CUDA graph, but it is still ineffective because the grammar computation is on CPU and thus not capturable. Once such a CUDA graph is launched to replay, the GPU does not wait for any newly recorded events, so it is impossible to block the GPU for the readiness of masks.
 
 ## Trace Grammar State for Draft Token Proposal and Rejection
 
@@ -116,7 +116,7 @@ One special case is EAGLE3, whose draft model has a [pruned vocabulary](https://
 
 ### CUDA Callback
 
-CUDA graph can help eliminate the CPU overhead, which is an important technique in the LLM inference systems, especially for the generation phase. As aforementioned, the one-model speculative decoding implementation launches a single CUDA graph to compute multiple draft and target model forwards. This makes the CPU-GPU synchronization challenging: the sampling operation depends on masks computed on CPU, but the GPU is not able to wait the readiness of any CPU computation once the CUDA graph is launched.
+CUDA graph can help eliminate the CPU overhead, which is an important technique in the LLM inference systems, especially for the generation phase. As aforementioned, the one-model speculative decoding implementation launches a single CUDA graph to compute multiple draft and target model forwards. This makes the CPU-GPU synchronization challenging: the sampling operation depends on masks computed on CPU, but the GPU is not able to wait for the readiness of any CPU computation once the CUDA graph is launched.
 
 CUDA callback [`cudaLaunchHostFunc`](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g05841eaa5f90f27124241baafb3e856f) can launch a host function to a CUDA stream. (The host function should not call any CUDA API.) This has two crucial implications:
 
@@ -126,13 +126,13 @@ CUDA callback [`cudaLaunchHostFunc`](https://docs.nvidia.com/cuda/cuda-runtime-a
 Hence, we can launch grammar computation along with other auxiliary host functions as CUDA callbacks to a CUDA stream. The CUDA graph should capture and replay multiple model forwards and corresponding grammar computation all together. To achieve CPU-GPU overlapping, the grammar computation should be placed on a dedicated CUDA stream. Specifically, for every step $i$:
 
 * The grammar stream:
-  * waits the *token event* that indicates the readiness of CPU tokens from step $i-1$;
+  * waits for the *token event* that indicates the readiness of CPU tokens from step $i-1$;
   * performs grammar advance and mask gen (CUDA callback);
   * asynchronously copies the CPU masks to GPU;
   * records the *mask event*.
 * The model forward stream:
   * computes model forward using the last GPU tokens;
-  * waits the *mask event* that indicates the readiness of GPU masks;
+  * waits for the *mask event* that indicates the readiness of GPU masks;
   * applies the mask to logits and then samples new tokens;
   * asynchronously copies the GPU tokens to CPU;
   * records the *token event*.
@@ -146,11 +146,11 @@ Hence, we can launch grammar computation along with other auxiliary host functio
 
 ### Integration to TensorRT LLM Python Runtime
 
-We surveyed some off-the-shelf Python bindings implementations of `cudaLaunchHostFunc`, but it turned out that they do not work well with CUDA graph (e.g., CUDA-Python [Issue 790](https://github.com/NVIDIA/cuda-python/issues/790), cupy [Issue 9274](https://github.com/cupy/cupy/issues/9274)). The probable reason is that the intermediate wrapper data structures are released once the callback is executed; hence, even though the callback is captured by CUDA graph, it cannot be replayed for multiple times.
+We surveyed some off-the-shelf Python bindings implementations of `cudaLaunchHostFunc`, but it turned out that they do not work well with CUDA graph (e.g., CUDA-Python [Issue 790](https://github.com/NVIDIA/cuda-python/issues/790), cupy [Issue 9274](https://github.com/cupy/cupy/issues/9274)). The probable reason is that the intermediate wrapper data structures are released once the callback is executed; hence, even though the callback is captured by CUDA graph, it cannot be replayed multiple times.
 
 We implement our own bindings to `cudaLaunchHostFunc` — [`launch_hostfunc`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L76). Specifically, `launch_hostfunc` packs the Python function and arguments to an [intermediate data structure](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L33) and calls `cudaLaunchHostFunc` to launch a [trampoline function](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L49) to a CUDA stream. The trampoline function unpacks the intermediate data structure and invokes the Python function with the arguments. Note that `launch_hostfunc` offers great flexibility — it can launch an arbitrary Python function (without any CUDA API calls) as a CUDA callback. Hence, the grammar computation logics can still be implemented in Python.
 
-When CUDA graph is capturing, `launch_hostfunc` does not release the intermediate data structure, so it is accessible during CUDA graph replay. The intermediate data structures can be manually released via [`free_hostfunc_user_data`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L97); otherwise, they are automatically cleaned up when the Python interpreter exists. If CUDA graph is disabled (e.g., prefill phase), the intermediate data structure should be released timely to avoid memory leak. Specifically, the trampoline function automatically release it once the callback finishes execution.
+When CUDA graph is capturing, `launch_hostfunc` does not release the intermediate data structure, so it is accessible during CUDA graph replay. The intermediate data structures can be manually released via [`free_hostfunc_user_data`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L97); otherwise, they are automatically cleaned up when the Python interpreter exists. If CUDA graph is disabled (e.g., prefill phase), the intermediate data structure should be released promptly to avoid memory leak. Specifically, the trampoline function automatically releases it once the callback finishes execution.
 
 In Python, we provide a decorator `hostfunc` which casts an arbitrary Python function to a CUDA callback. For example, run the below code snippet:
 
@@ -187,7 +187,7 @@ tensor([20, 20, 20, 20, 20, 20, 20, 20, 20, 20], dtype=torch.int32)
 
 Note that the CUDA graph increases the tensor twice, and it is replayed for ten times, so the tensor should be totally increased by 20 times. Clearly, the output validates that the CUDA graph capture and replay are successful.
 
-As the final step, we implemented a variant of `GuidedDecoder` — [`CapturableGuidedDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L405). It reuses most logics from `GuidedDecoder`, but the grammar computation and some auxilirary methods are decorated by `hostfunc`, making it capturable by CUDA graph.
+As the final step, we implemented a variant of `GuidedDecoder` — [`CapturableGuidedDecoder`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L405). It reuses most logics from `GuidedDecoder`, but the grammar computation and some auxiliary methods are decorated by `hostfunc`, making it capturable by CUDA graph.
 
 ### CUDA Graph Compatibility: Grammar Computation
 
@@ -214,15 +214,15 @@ Some requests may have no grammar constraints. For such requests, we can fill th
 
 ### Troubleshooting: Data Race between Host and CUDA Callback
 
-Similar to GPU kernels, CUDA callbacks are asynchronously executed on CUDA streams. Note that both normal host functions and CUDA callbacks can access the same CPU memory addresses, so it can easily cause data race.
+Similar to GPU kernels, CUDA callbacks are asynchronously executed on CUDA streams. Note that both normal host functions and CUDA callbacks can access the same CPU memory addresses, so it can easily cause a data race.
 
 In the initial implementation, `CapturableGuidedDecoder` directly reads request states from [`ScheduledRequests`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/scheduler.py#L18). However, the `ScheduledRequests` is shared through an executor iteration and thus probably modified by other executor components. This creates a potential data race scenario:
 
-* Guided decoder launches A CUDA callback, which will read some request states from `ScheduledRequests`;
+* Guided decoder launches a CUDA callback, which will read some request states from `ScheduledRequests`;
 * Some other executor components inplace modify `ScheduledRequests`;
 * The CUDA callback is executed, reading some modified request states from `ScheduledRequests`.
 
-Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class — [`GuidedRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20). It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then only accessed via CUDA callbacks only. This prevents potential data race within an executor iteration.
+Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class — [`GuidedRequest`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20). It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then accessed only via CUDA callbacks. This prevents potential data race within an executor iteration.
 
 When overlap scheduler is enabled, another data race scenario exists between executor iterations:
 
@@ -234,7 +234,7 @@ Again, the CUDA callbacks may read unexpected data. A straightforward solution i
 
 ### Troubleshooting: Deadlock by GIL and CUDA Mutex
 
-After the first version was implemented, the program intermittently encountered a hang issue when `CapturableGuidedDecoder` is enabled. By checking out the callstack, we found it hanged on completely irrelevant kernel launches or other CUDA API calls. With further investigation, we discovered that the hang issue was caused by a deadlock between the Python GIL and a CUDA mutex.
+After the first version was implemented, the program intermittently encountered a hang issue when `CapturableGuidedDecoder` is enabled. By checking out the callstack, we found that it was hanging on completely irrelevant kernel launches or some other CUDA API calls. With further investigation, we discovered that the hang issue was caused by a deadlock between the Python GIL and a CUDA mutex.
 
 As documented, a CUDA callback must not make any CUDA API calls. This implies that the CUDA callback execution and CUDA API calls compete for the same mutex. Note that the trampoline function needs to [acquire the GIL](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/cpp/tensorrt_llm/nanobind/runtime/hostfunc.cpp#L52) before calling the Python code. Hence, when executing Python code by a CUDA callback, it acquires a CUDA mutex and then the GIL. In the meanwhile, the Python main thread may hold the GIL and make CUDA API calls, so it acquires the GIL and then the CUDA mutex. The two threads acquire the two locks in opposite orders, which creates a deadlock pattern.
 
@@ -249,9 +249,9 @@ y = torch.zeros(100, x.max(), dtype=torch.int64, device='cuda')
 
 The other case is that `torch.compile` kernels are called with GIL being held ([Issue 163061](https://github.com/pytorch/pytorch/issues/163061)), although Triton kernels are called with GIL released. Hence, we have to avoid any problematic operations and disable `torch.compile` when using CUDA callback to Python code, until these issues are fixed by PyTorch.
 
-Another source of risk comes from some runtime components that are implemented in C++ and exposed as Python bindings; they may make CUDA API calls as well. By default, Python bindings do not release GIL. Hence, we swept these Python bindings and release GIL properly in [PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948).
+Another source of risk comes from some runtime components that are implemented in C++ and exposed as Python bindings; they may make CUDA API calls as well. By default, Python bindings do not release GIL. Hence, we swept these Python bindings and released GIL properly in [PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948).
 
-After all these efforts, the hang issue disappears. It is generally recommended to release the GIL when calling C++ code from Python; even without the context of CUDA callback, this is beneficial for multi-threading performance. However, we acknowledge the limitation that it is difficult to make sure that every such place has been properly handled, and future code changes do not introduce any risks.
+After all these efforts, the hang issue disappears. It is generally recommended to release the GIL when calling C++ code from Python; even without the context of CUDA callback, this is beneficial for multi-threading performance. However, we acknowledge the limitation that it is difficult to make sure that every such place has been properly handled, and that future code changes do not introduce any risks.
 
 > **Note:** Theoretically, the GIL-free Python ([PEP 703](https://peps.python.org/pep-0703)) could be another remedy.
 
@@ -292,7 +292,7 @@ Note that although NGram is a two-model implementation, it performs surprisingly
 </div>
 <p align="center"><sub><em>Figure 8: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
 
-Figures 7 and 8 show the results on JSON Schema Bench. The one-model EAGLE3 achieves the best performance across almost all scenarios. Note that the NGram becomes less performant since the task is not information extraction anymore, although the JSON schemas are still present in the prompts.
+Figures 7 and 8 show the results on JSON Schema Bench. The one-model EAGLE3 achieves the best performance across almost all scenarios. Note that the NGram becomes less performant since the task is no longer an information extraction task, although the JSON schemas are still present in the prompts.
 
 | Dataset | Model | EAGLE3 | EAGLE3 w/o draft | NGram |
 | :-----: | :---: | :----: | :--------------: | :---: |
@@ -314,4 +314,4 @@ These extra overheads could partially offset the benefits from the improved acce
 
 This work demonstrates an outstanding example of cross-team collaboration between the TensorRT LLM and XGrammar teams. We sincerely appreciate the support from everyone who contributed to making this happen.
 
-We acknowledge that it is built on top of the tremendous existing foundations from the community. In particular, some designs were inspired by vLLM [PR 14702](https://github.com/vllm-project/vllm/pull/14702) and SGLang [PR 6499](https://github.com/sgl-project/sglang/pull/6499). In addition, special thanks goes to the authors who proposed the speculative algorithms like EAGLE/MTP, and the grammar backend projects like XGrammar/LLGuidance.
+We acknowledge that it is built on top of the tremendous existing foundations from the community. In particular, some designs were inspired by vLLM [PR 14702](https://github.com/vllm-project/vllm/pull/14702) and SGLang [PR 6499](https://github.com/sgl-project/sglang/pull/6499). In addition, special thanks go to the authors who proposed the speculative algorithms like EAGLE/MTP, and the grammar backend projects like XGrammar/LLGuidance.
