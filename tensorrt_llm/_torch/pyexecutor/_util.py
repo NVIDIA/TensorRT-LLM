@@ -487,7 +487,7 @@ class KvCacheCreator:
                 if kv_cache_manager.max_seq_len < self._max_seq_len:
                     self._dummy_reqs = self._create_dummy_context_requests(
                         max(
-                            1, kv_cache_manager._net_max_seq_len - 1 -
+                            1, self._net_max_seq_len - 1 -
                             (self._max_seq_len - kv_cache_manager.max_seq_len)))
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
