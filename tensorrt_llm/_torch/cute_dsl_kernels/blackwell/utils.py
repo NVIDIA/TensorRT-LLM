@@ -53,22 +53,22 @@ from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
 # WAR for CuTeDSL make_ptr implementation
 class _Pointer(Pointer):
-    """Runtime representation of a pointer that can inter-operate with
-    various data structures, including numpy arrays and device memory.
-    :param pointer: The pointer to the data
-    :type pointer: int or pointer-like object
-    :param dtype: Data type of the elements pointed to
-    :type dtype: Type
-    :param mem_space: Memory space where the pointer resides, defaults generic
-    :type mem_space: _cute_ir.AddressSpace, optional
-    :param assumed_align: Alignment of input pointer in bytes, defaults None
-    :type assumed_align: int, optional
-    :ivar _pointer: The underlying pointer
-    :ivar _dtype: Data type of the elements
-    :ivar _addr_space: Memory space of the pointer
-    :ivar _assumed_align: Alignment of the pointer in bytes
-    :ivar _desc: C-type descriptor for the pointer
-    :ivar _c_pointer: C-compatible pointer representation
+    """Represents a runtime pointer that can interoperate with various data structures,
+    including numpy arrays and device memory.
+
+    Args:
+        pointer (int or pointer-like object): The pointer to the data.
+        dtype (Type): Data type of the elements pointed to.
+        mem_space (_cute_ir.AddressSpace, optional): Memory space where the pointer resides. Defaults to generic.
+        assumed_align (int, optional): Alignment of the input pointer in bytes. Defaults to None.
+
+    Attributes:
+        _pointer: The underlying pointer.
+        _dtype: Data type of the elements.
+        _addr_space: Memory space of the pointer.
+        _assumed_align: Alignment of the pointer in bytes.
+        _desc: C-type descriptor for the pointer.
+        _c_pointer: C-compatible pointer representation.
     """
 
     def __init__(
@@ -145,28 +145,31 @@ def make_ptr(
     mem_space: AddressSpace = AddressSpace.generic,
     assumed_align=None,
 ) -> Pointer:
-    """Create a pointer from a memory address
-    :param dtype: Data type of the pointer elements
-    :type dtype: Type[Numeric]
-    :param value: Memory address as integer or ctypes pointer
-    :type value: Union[int, ctypes._Pointer]
-    :param mem_space: Memory address space, defaults to AddressSpace.generic
-    :type mem_space: AddressSpace, optional
-    :param assumed_align: Alignment in bytes, defaults to None
-    :type assumed_align: int, optional
-    :return: A pointer object
-    :rtype: Pointer
-    .. code-block:: python
+    """Creates a pointer from a memory address.
+
+    Args:
+        dtype (Type[Numeric]): Data type of the pointer elements.
+        value (Union[int, ctypes._Pointer]): Memory address as an integer or ctypes pointer.
+        mem_space (AddressSpace, optional): Memory address space. Defaults to AddressSpace.generic.
+        assumed_align (int, optional): Alignment in bytes. Defaults to None.
+
+    Returns:
+        Pointer: A pointer object.
+
+    Example:
+        ```python
         import numpy as np
         import ctypes
         from cutlass import Float32
         from cutlass.cute.runtime import make_ptr
+
         # Create a numpy array
         a = np.random.randn(16, 32).astype(np.float32)
-        # Get pointer address as integer
+        # Get pointer address as ctypes pointer
         ptr_address = a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         # Create pointer from address
         y = make_ptr(cutlass.Float32, ptr_address)
+        ```
     """
     # check if value is int or ctypes.POINTER
     if isinstance(value, int):
