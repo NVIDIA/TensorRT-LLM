@@ -469,19 +469,19 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
     return notifs;
 }
 
-ConnectionInfoType NixlTransferAgent::getConnectionInfo()
+ConnectionInfoType NixlTransferAgent::getLocalConnectionInfo()
 {
     return mAddress;
 }
 
-void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
+void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
 {
     std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
     std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
+        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
         name.c_str());
-    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "connectRemoteAgent get empty ip or port, connectionInfo: %s",
+    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: %s",
         connectionInfo.c_str());
     nixl_opt_args_t md_extra_params;
     md_extra_params.ipAddr = ip;
@@ -506,7 +506,7 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
         }
     }
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s success status: %s",
+        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s success status: %s",
         connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
 }
 
