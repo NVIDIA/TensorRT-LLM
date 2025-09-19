@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import pytest
 from utils.llm_data import llm_models_root
@@ -9,10 +10,12 @@ from tensorrt_llm.inputs import default_multimodal_input_loader
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
+test_data_root = Path(
+    os.path.join(llm_models_root(), "multimodals", "test_data"))
 example_images = [
-    "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
-    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
-    "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+    str(test_data_root / "seashore.png"),
+    str(test_data_root / "inpaint.png"),
+    str(test_data_root / "61.jpg"),
 ]
 
 
@@ -189,7 +192,8 @@ def test_multi_request_batch_chat(model_key, multimodal_model_config):
 
     sampling_params = SamplingParams(max_tokens=max_tokens)
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True,
+        enable_block_reuse=
+        False,  # Disable block reuse for output 1-1 matching check
         free_gpu_memory_fraction=free_gpu_memory_fraction,
     )
 
