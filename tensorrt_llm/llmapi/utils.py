@@ -244,14 +244,14 @@ class ManagedThread(threading.Thread):
                  task: Callable[..., bool],
                  error_queue: Queue,
                  name: Optional[str] = None,
+                 stop_event: Optional[threading.Event] = None,
                  **kwargs):
         super().__init__(name=name)
         self.task = task
         self.error_queue = error_queue
         self.kwargs = kwargs
         self.daemon = True
-
-        self.stop_event = threading.Event()
+        self.stop_event = stop_event or threading.Event()
 
     def run(self):
 
