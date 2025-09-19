@@ -1882,9 +1882,9 @@ class PyExecutor:
 
     def _fetch_cached_tokens(self, req_id: int):
         try:
-            idx = self.model_engine.attn_metadata.request_ids.index(req_id)
+            idx = self.model_engine.attn_metadata.index_of_seq(req_id)
             return self.model_engine.attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
-                idx]
+                idx] if idx != -1 else 0
         except Exception as e:
             logger.warning(f"Error in fetch_cached_tokens: {e}")
             logger.warning(traceback.format_exc())
