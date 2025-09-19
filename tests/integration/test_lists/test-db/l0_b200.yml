@@ -114,7 +114,7 @@ l0_b200:
   tests:
   - triton_server/test_triton.py::test_llava[llava]
   - triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]
-  - triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora] ISOLATION,TIMEOUT (90)
+  - triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora] ISOLATION
 - condition:
     ranges:
       system_gpu_count:
