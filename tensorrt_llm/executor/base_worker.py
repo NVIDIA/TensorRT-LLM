@@ -37,11 +37,11 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
 
 __all__ = [
-    "WorkerBase",
+    "BaseWorker",
 ]
 
 
-class WorkerBase(GenerationExecutor):
+class BaseWorker(GenerationExecutor):
 
     class WorkerExit(GeneratorExit):
         pass
@@ -105,7 +105,7 @@ class WorkerBase(GenerationExecutor):
         """
 
         if isinstance(self._engine, list):
-            self._engine[self.rank]
+            self._engine = self._engine[self.rank]
 
         def _get_comm_ranks_device_id():
             device_id = self.global_rank % torch.cuda.device_count()
@@ -275,9 +275,6 @@ class WorkerBase(GenerationExecutor):
     def _engine_response_callback(self, response: tllm.Response):
         return response
 
-    def await_response_task(self) -> bool:
-        return self._await_response_helper()
-
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()
 
@@ -289,7 +286,7 @@ class WorkerBase(GenerationExecutor):
 
     def start(self):
         raise NotImplementedError(
-            "start method is not implemented in WorkerBase")
+            "start method is not implemented in BaseWorker")
 
     def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
         """Returns True if the adapter was loaded by this call, False if it was already loaded"""
@@ -443,8 +440,10 @@ class WorkerBase(GenerationExecutor):
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
-                max_tokens=_deduce_max_tokens(request, self._executor_config,
-                                              self.llm_args),
+                max_tokens=_deduce_max_tokens(
+                    request,
+                    self._executor_config if not self.llm_args else None,
+                    self.llm_args),
                 streaming=request.streaming,
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
@@ -549,23 +548,12 @@ class WorkerBase(GenerationExecutor):
         self._results.pop(client_id, None)
         self._client_id_to_request_id.pop(client_id, None)
 
-    def block_subordinates(self):
-        if self.rank != 0:
-            if isinstance(self.engine, tllm.Executor):
-                self.shutdown()
-                raise self.WorkerExit(
-                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
-                )
-            from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-            if isinstance(self.engine, PyExecutor):
-                self.engine.wait_shutdown()
-
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         self.shutdown()
-        return exc_type is None or exc_type == WorkerBase.WorkerExit
+        return exc_type is None or exc_type == BaseWorker.WorkerExit
 
     def __del__(self):
         self.shutdown()
@@ -579,7 +567,7 @@ class AwaitResponseHelper:
         single_process_worker = 1
         ipc_batched = 2
 
-    def __init__(self, worker: "WorkerBase"):
+    def __init__(self, worker: "BaseWorker"):
         # TODO: make worker weakref
         self.worker = worker
         self.handler_kind: AwaitResponseHelper.HandlerKind = AwaitResponseHelper.HandlerKind.unknown
