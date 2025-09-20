@@ -41,7 +41,8 @@ from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
 
-# Development function to control chain drafter feature
+# Development function to control chain drafter feature.
+# It's here so that unit tests can mock it and turn it off.
 def _get_allow_chain_drafter() -> bool:
     return True
 
