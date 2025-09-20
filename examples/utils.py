@@ -358,7 +358,7 @@ def add_common_args(parser):
         default=None,
         nargs="+",
         help=
-        'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
+        'The attention window size that controls the sliding window attention kv cache behavior'
     )
     parser.add_argument(
         '--multi_block_mode',
