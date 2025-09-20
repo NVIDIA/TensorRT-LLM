@@ -98,8 +98,8 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
     py::classh<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(py::init(
                  [](py::object pg_obj, std::string pybind11_abi) {
-                     return common::get_intrusive_ptr<c10d::ProcessGroup, py::error_already_set>(
-                         pg_obj.ptr(), pybind11_abi);
+                     return new CacheTransceiverComm(common::get_intrusive_ptr<c10d::ProcessGroup, py::error_already_set>(
+                         pg_obj.ptr(), pybind11_abi));
                  }),
             py::arg("process_group"), py::arg("pybind11_abi"))
         .def("get_rank", &tb::CacheTransceiverComm::getRank)
