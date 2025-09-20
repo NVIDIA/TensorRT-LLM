@@ -36,7 +36,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 @click.command(name="latency")
 @optgroup.group("Engine run configuration",
-                help="Runtime settings for executing a TensorRT-LLM engine.")
+                help="Runtime settings for executing a TensorRT LLM engine.")
 @optgroup.option(
     "--engine_dir",
     type=click.Path(exists=True,
@@ -137,7 +137,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     "Desired concurrency rate (number of requests processing at the same time), <=0 for no concurrency limit.",
 )
 @optgroup.group("Speculative Decode Options",
-                help="Runtime settings for executing a TensorRT-LLM engine.")
+                help="Runtime settings for executing a TensorRT LLM engine.")
 @optgroup.option(
     "--medusa_choices",
     type=click.Path(exists=True,

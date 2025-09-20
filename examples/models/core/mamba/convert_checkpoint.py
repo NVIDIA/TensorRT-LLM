@@ -59,7 +59,7 @@ def parse_arguments():
         '--output_dir',
         type=Path,
         default='mamba_tllm_checkpoint',
-        help='The path to save the mamba TensorRT-LLM checkpoint')
+        help='The path to save the mamba TensorRT LLM checkpoint')
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument(
         '--workers',

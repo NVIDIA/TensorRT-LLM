@@ -1482,7 +1482,7 @@ class STDiT3ModelWeightsLoader(ModelWeightsLoader):
 
     def translate_to_external_key(self, tllm_key: str,
                                   tllm_to_externel_key_dict: dict):
-        """Convert and load external checkpoint into a TensorRT-LLM model.
+        """Convert and load external checkpoint into a TensorRT LLM model.
         """
         trtllm_to_hf_name = {
             r"spatial_blocks.(\d+).attn.q_layernorm.weight":

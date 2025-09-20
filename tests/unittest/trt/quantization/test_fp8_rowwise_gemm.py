@@ -65,20 +65,20 @@ class TestFp8RowwiseGemm(unittest.TestCase):
         # Allow fp8_rowwise_gemm_plugin of dtype type
         network.plugin_config.fp8_rowwise_gemm_plugin = dtype
         with tensorrt_llm.net_guard(network):
-            # Init TensorRT-LLM tensor for mat1
+            # Init TensorRT LLM tensor for mat1
             x = Tensor(name='x',
                        shape=mat1.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt("fp8"))
-            # Init TensorRT-LLM tensor for mat2
+            # Init TensorRT LLM tensor for mat2
             y = Tensor(name='y',
                        shape=mat2.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt("fp8"))
-            # Init TensorRT-LLM tensor for per token scaling
+            # Init TensorRT LLM tensor for per token scaling
             scale_a = Tensor(
                 name='scale_a',
                 shape=scale_a_torch.shape,
                 dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
-            # Init TensorRT-LLM tensor for per channel scaling
+            # Init TensorRT LLM tensor for per channel scaling
             scale_b = Tensor(
                 name='scale_b',
                 shape=scale_b_torch.shape,
@@ -97,7 +97,7 @@ class TestFp8RowwiseGemm(unittest.TestCase):
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
         assert engine is not None, "Failed to build engine"
 
-        # Create TensorRT-LLM session
+        # Create TensorRT LLM session
         session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine.serialize())
 

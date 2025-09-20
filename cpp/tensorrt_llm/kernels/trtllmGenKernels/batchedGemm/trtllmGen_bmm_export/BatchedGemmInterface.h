@@ -235,12 +235,12 @@ struct BatchedGemmData
         void const* mPtrBias{nullptr};
 
         // The output tensor scaling factor for MxFp{4,8}, Fp8 and NvFp4 quantization.
-        // TensorRT-LLM API requires a scaling factor on the device.
+        // TensorRT LLM API requires a scaling factor on the device.
         // Shape is [B].
         float const* mPtrScaleC{nullptr};
 
         // The output gate scale for MxFp{4,8} and NvFp4 quantization.
-        // TensorRT-LLM API requires a scaling factor on the device.
+        // TensorRT LLM API requires a scaling factor on the device.
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 

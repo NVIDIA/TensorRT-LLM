@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Stress test script for inference of model using TensorRT-LLM with PyTorch/TRT backend.
+Stress test script for inference of model using TensorRT LLM with PyTorch/TRT backend.
 This script is used for stress testing inference performance using trtllm-serve and genai-perf.
 """
 import contextlib
