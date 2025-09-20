@@ -322,6 +322,9 @@ class FusedMoEMethodBase(ABC):
             module.layer_load_balancer.set_initial_weight_assignments(
                 module.initial_global_assignments)
 
+    def post_load_weights(self, module: torch.nn.Module):
+        pass
+
     def load_quant_scales(self, module: torch.nn.Module, weights: List[Dict]):
         pass
 
@@ -726,6 +729,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                         weight, scale)
         super().load_weights(module, weights, weight_loading_mode)
 
+    def post_load_weights(self, module: torch.nn.Module):
         if is_sm_100f():
             transfromed_w3_w1_scale = transform_sf_into_required_layout(
                 module.quant_scales[0],
