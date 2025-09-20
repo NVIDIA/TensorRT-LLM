@@ -41,11 +41,10 @@ from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
 
-# Development flag to control chain drafter feature
+# Development function to control chain drafter feature.
+# It's here so that unit tests can mock it and turn it off.
 def _get_allow_chain_drafter() -> bool:
-    """Get the chain drafter flag from environment variable."""
-    # Use environment variable for cross-process compatibility
-    return os.getenv("TRTLLM_ALLOW_CHAIN_DRAFTER", "0") == "1"
+    return True
 
 
 class _ExecutorCreationStage(enum.Enum):

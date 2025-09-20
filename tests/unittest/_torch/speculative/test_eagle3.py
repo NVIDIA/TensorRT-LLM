@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -16,35 +17,50 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
+@pytest.fixture(scope="function")
+def enforce_single_worker(monkeypatch):
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    yield
+
+
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch",
     [
-        [True, "TRTLLM", True, False, False, False, True],
-        [True, "TRTLLM", True, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True],
-        [False, "TRTLLM", True, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, True],
-        [False, "FLASHINFER", True, False, False, False, True],
-        [False, "TRTLLM", False, True, True, False, True],
-        [True, "TRTLLM", False, True, True, False, True],
-        [True, "TRTLLM", True, False, True, True, True],
-        [True, "TRTLLM", True, False, True, False, True],
+        [True, "TRTLLM", True, False, False, False, True, False],
+        [True, "TRTLLM", True, False, False, False, False, False],
+        [False, "TRTLLM", True, False, False, False, True, False],
+        [False, "TRTLLM", True, False, False, False, False, False],
+        [True, "FLASHINFER", True, False, False, False, True, False],
+        [False, "FLASHINFER", True, False, False, False, True, False],
+        [False, "TRTLLM", False, True, True, False, True, False],
+        [True, "TRTLLM", False, True, True, False, True, False],
+        [True, "TRTLLM", True, False, True, True, True, False],
+        [True, "TRTLLM", True, False, True, False, True, False],
         # TODO: nvbugs/5461761
-        # [True, "TRTLLM", True, False, False, True, True],
-        [True, "TRTLLM", False, False, False, False, True],
-        [False, "TRTLLM", False, False, False, False, True],
-        [True, "TRTLLM", False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, True, True],
-        [True, "TRTLLM", False, False, False, True, False],
-        [True, "FLASHINFER", False, False, False, False, True],
-        [False, "FLASHINFER", False, False, False, False, True],
+        # [True, "TRTLLM", True, False, False, True, True, False],
+        [True, "TRTLLM", False, False, False, False, True, False],
+        [False, "TRTLLM", False, False, False, False, True, False],
+        [True, "TRTLLM", False, False, False, False, False, True],
+        [False, "TRTLLM", False, False, False, False, False, True],
+        [True, "TRTLLM", False, False, False, False, True, True],
+        [False, "TRTLLM", False, False, False, False, True, True],
+        [True, "TRTLLM", False, False, False, False, False, False],
+        [False, "TRTLLM", False, False, False, False, False, False],
+        [True, "TRTLLM", False, False, False, True, True, False],
+        [True, "TRTLLM", False, False, False, True, False, False],
+        [True, "FLASHINFER", False, False, False, False, True, False],
+        [False, "FLASHINFER", False, False, False, False, True, False],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
                       use_one_model: bool, enable_chunked_prefill: bool,
-                      use_chain_drafter: bool):
+                      use_chain_drafter: bool, multi_batch: bool, request):
+    # Use enforce_single_worker fixture only when use_chain_drafter is False.
+    # Otherwise, we can't modify the returned value of _get_allow_chain_drafter in multiprocessing.
+    if not use_chain_drafter:
+        request.getfixturevalue('enforce_single_worker')
+
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -54,46 +70,52 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
-    # bs > 1 gives non-deterministic when doing IFB. There are slight chances
-    # that ref and spec does not match 100%
-    max_batch_size = 1
-    max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1]) if use_cuda_graph else None
+    # Mock _get_allow_chain_drafter to return False when use_chain_drafter is False
+    if not use_chain_drafter:
+        patch_context = patch(
+            'tensorrt_llm._torch.pyexecutor.py_executor_creator._get_allow_chain_drafter',
+            return_value=False)
+    else:
+        patch_context = patch(
+            'tensorrt_llm._torch.pyexecutor.py_executor_creator._get_allow_chain_drafter',
+            return_value=True)
 
-    llm_common_config = dict(
-        model=target_model_dir,
-        attn_backend=attn_backend,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
-        max_batch_size=max_batch_size,
-        kv_cache_config=kv_cache_config,
-        # This max_seq_len is larger than the one specified
-        # in the llama 3 8B eagle's config. We want to make sure
-        # that the draft model won't go above its max in warmup
-        # in this test.
-        max_seq_len=8192,
-        enable_chunked_prefill=enable_chunked_prefill,
-    )
-    if enable_chunked_prefill:
-        # Use a small max_num_tokens so that the chunked prefill path gets exercised.
-        llm_common_config['max_num_tokens'] = 64
+    with patch_context:
+        # bs > 1 gives non-deterministic when doing IFB. There are slight chances
+        # that ref and spec does not match 100%
+        max_batch_size = 4 if multi_batch else 1
+        max_draft_len = 4
+        kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
+                                        max_tokens=8192)
+        cuda_graph_config = CudaGraphConfig(
+            batch_sizes=[1]) if use_cuda_graph else None
 
-    spec_config = EagleDecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model_dir=eagle_model_dir,
-        # Llama 3 does not support one model eagle.
-        eagle3_one_model=use_one_model,
-    )
+        llm_common_config = dict(
+            model=target_model_dir,
+            attn_backend=attn_backend,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            cuda_graph_config=cuda_graph_config,
+            max_batch_size=max_batch_size,
+            kv_cache_config=kv_cache_config,
+            # This max_seq_len is larger than the one specified
+            # in the llama 3 8B eagle's config. We want to make sure
+            # that the draft model won't go above its max in warmup
+            # in this test.
+            max_seq_len=8192,
+            enable_chunked_prefill=enable_chunked_prefill,
+        )
+        if enable_chunked_prefill:
+            # Use a small max_num_tokens so that the chunked prefill path gets exercised.
+            llm_common_config['max_num_tokens'] = 64
 
-    # Set the development flag to control use_chain_drafter behavior
-    original_env_value = os.environ.get("TRTLLM_ALLOW_CHAIN_DRAFTER", "0")
-    try:
-        os.environ[
-            "TRTLLM_ALLOW_CHAIN_DRAFTER"] = "1" if use_chain_drafter else "0"
-        # Create the LLM instance with the mocked flag controlling use_chain_drafter
+        spec_config = EagleDecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model_dir=eagle_model_dir,
+            # Llama 3 does not support one model eagle.
+            eagle3_one_model=use_one_model,
+        )
+
+        # Create the LLM instance
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
         # Acceptance rate tests
@@ -142,9 +164,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
             # The spec decode algorithm currently guarantees identical results
             assert text_spec == text_ref
-    finally:
-        # Restore the original environment variable value
-        os.environ["TRTLLM_ALLOW_CHAIN_DRAFTER"] = original_env_value
 
 
 def test_deepseek_eagle3():

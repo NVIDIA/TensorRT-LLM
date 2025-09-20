@@ -188,6 +188,7 @@ def create_mock_engine(batch_size: int):
         max_beam_width=1,
         max_num_tokens=8192,
         is_spec_decode=False,
+        enable_spec_decode=False,
         spec_config=None,
         _cuda_graph_mem_pool=None,
         use_mrope=False,
