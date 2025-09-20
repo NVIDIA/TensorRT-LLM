@@ -1,9 +1,9 @@
-# Inference Time Compute Implementation in TensorRT-LLM
+# Inference Time Compute Implementation in TensorRT LLM
 
-By NVIDIA TensorRT-LLM Team
+By NVIDIA TensorRT LLM Team and UCSD Hao AI Lab
 
 ## Table of Contents
-- [Inference-Time Compute Implementation in TensorRT-LLM (Part 1: Design and Implementation](#inference-time-compute-implementation-in-tensorrt-llm)
+- [Inference-Time Compute Implementation in TensorRT LLM (Part 1: Design and Implementation）](#inference-time-compute-implementation-in-tensorrt-llm)
   - [Table of Content](#table-of-content)
   - [Background and Motivation](#background-and-motivation)
   - [Introduction for Scaffolding: A Framework for inference-time compute](#introduction-for-scaffolding)
@@ -16,15 +16,16 @@ By NVIDIA TensorRT-LLM Team
     - [Introduction for Dynasor](#dynasor-introduction)
     - [Implement Dynasor-CoT in Scaffolding](#dynasor-cot-implement-in-scaffolding)
     - [Implement Dynasor-CoT based Majority Voting in Scaffolding](#dynasor-cot-based-majority-vote-in-scaffolding)
+    - [Reference](#dynasor-reference)
   - [Feature List on Scaffolding](#scaffolding-feature-list)
   - [Future Work](#scaffolding-future-work)
 
 
 ## Background and Motivation
-Inference-time compute (aka test-time scaling) is becoming increasingly important. In addition to simply increasing the length of the output, using various workflows such as best-of-N and MCTS (Monte Carlo Tree Search) to obtain better answers is also an important means. Further, most of the workflows of agentic or multi-agent are logically similar to these methods of inference-time compute, except that they use more complex tools and context engineering. However, how to conveniently define these methods while achieving excellent inference performance has become a new problem. Because good performance requires careful asynchronous scheduling, but writing asynchronous scheduling programs is not easy for algorithm engineers. When considering the use of external tools and token budget management, the problem becomes even more complex.
+Inference-time compute, also known as test-time scaling, is increasingly important. Beyond simply increasing output length, workflows such as best-of-N and Monte Carlo Tree Search (MCTS) offer additional capabilities for optimizing inference. Further, most of the workflows of agentic or multi-agent are logically similar to these methods of inference-time compute, except that they use more complex tools and context engineering. However, how to conveniently define these methods while achieving excellent inference performance has become a new problem. Because good performance requires careful asynchronous scheduling, but writing asynchronous scheduling programs is not easy for algorithm engineers. When considering the use of external tools and token budget management, the problem becomes even more complex.
 
 
-LLM inference frameworks such as TensorRT-LLM,vLLM and SGLang provide high performance for inference of generation models or reward models, but they are only for single request inference. Popular Agent frameworks such as LangChain and Dify focus on enabling users to develop agents as simply as possible. But precisely because of this, they may have difficulty completing many inference-time compute methods that require precise definition and developments.
+LLM inference frameworks such as TensorRT LLM,vLLM and SGLang provide high performance for inference of generation models or reward models, but they are only for single request inference. Popular Agent frameworks such as LangChain and Dify focus on enabling users to develop agents as simply as possible. But precisely because of this, they may have difficulty completing many inference-time compute methods that require precise definition and developments.
 
 
 So we want to build a good framework to support users in exploring and deploying more inference-time compute methods. It should provide a modular infrastructure and fill the gap in balancing usability and performance for inference-time compute.
@@ -55,7 +56,7 @@ Provides sufficient concurrency to achieve good performance while ease of use. C
 
 This is the call sequence diagram of `Scaffolding`:
 <div align="center">
-    <img src="../media/tech_blog12_scaffolding_sequence.png" alt="Scaffolding Sequence" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_scaffolding_sequence.png" alt="Scaffolding Sequence" width="900px">
 </div>
 <p align="center"><sub><em>Figure 1. Scaffolding Sequence</em></sub></p>
 
@@ -77,7 +78,7 @@ class Worker(ABC):
 
     task_handlers = {}
 ```
-`Worker`'s core interface is `run_task()`. This interface takes in a `Task`, then completes this `Task` and writes the result into the corresponding field. It should be noted that `run_task()` is an asynchronous function and it can be concurrently and asynchronously called with python asyncio.
+The core interface of `Worker` is `run_task()`, which accepts a `Task`, executes it, and writes the result to the appropriate field. It should be noted that `run_task()` is an asynchronous function and it can be concurrently and asynchronously called with python asyncio.
 
 
 #### Controller
@@ -100,7 +101,7 @@ class Controller(ABC):
     def process(self, tasks: List[Task], **kwargs):
         raise NotImplementedError
 ```
-Its two core interfaces are `generate()` and `process()`. `generate()` is the entry point for `ScaffoldingLlm` to invoke. In the default implementation of `generte()`, it produces a `Task` and then invokes `process()`. The `process()` is the most important part of every `Contronller` class, as it defines the implementation the workflow of this inference-time compute method.
+Its two core interfaces are `generate()` and `process()`. `generate()` is the entry point for `ScaffoldingLlm` to invoke. In the default implementation of `generate()`, it produces a `Task` and then invokes `process()`. The `process()` is the most important part of every `Contronller` class, as it defines the implementation the workflow of this inference-time compute method.
 
 
 Let's go into a specific subclass of `Controller` to see how `process()` is implemented. 
@@ -171,44 +172,48 @@ results = llm.generate(prompts)
 Users need to first create instances of `Worker` and `Controller`, and map them by `WorkerTag` to create the `ScaffoldingLlm` class. Then call the generate interface of `ScaffoldingLlm` to get the final result. 
 
 
-`ScaffoldingLlm` also provides async inferface.
+`ScaffoldingLlm` also provides async interface.
 ```python
 async for result in llm.generate_async(prompt):
     print(">>>", result.outputs[0].text)
 ```
-So an instance of `ScaffoldingLlm` can support the concurrent execution of multiple requests.
+Therefore, an instance of ScaffoldingLlm supports concurrent execution of multiple requests.
 
 
 Let's make a summary of the overall implementation of `Scaffolding`. If users want to implement a new inference-time compute method, users can develop a new `Controller`. They can also call some existing `Controllers` as its `sub-Controller`. If users want to implement a new backend, users can either create a new `Worker` or add a new `Task` handler to an existing `Worker`.  As for `ScaffoldingLlM`, we have hidden many complex implementations, such as async scheduling within `ScaffoldingLlM`, and users do not need to modify the code of `ScaffoldingLlM`.
 
 
 ## An Example: Implement Dynasor-CoT on Scaffolding
-Dynasor-CoT is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT) inference. This chapter discusses how inference-time compute methods can be smoothly integrated into the TRT-LLM Scaffolding framework, using Dynasor-CoT as an example.
+Dynasor-CoT 
+<a href="https://arxiv.org/abs/2412.20993">
+  <img src="https://img.shields.io/badge/arXiv-2412.20993-b31b1b.svg?style=plastic" alt="arXiv" style="vertical-align: text-top;">
+</a>
+is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT) inference. This chapter discusses how inference-time compute methods can be smoothly integrated into the TRT-LLM Scaffolding framework, using Dynasor-CoT as an example.
 
 <div align="center">
-    <img src="../media/tech_blog12_dynasor_demo.gif" alt="Dynasor Demo" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_dynasor_demo.gif" alt="Dynasor Demo" width="900px">
 </div>
 <p align="center"><sub><em>Figure 2. Demo of DeepSeek-R1-Distill-Qwen-7B achieving a 5.74x speedup compared to the baseline when using Dynasor-CoT on MATH500</em></sub></p>
 
-### Introducation for Dynasor-CoT
+### Introduction for Dynasor-CoT
 #### Motivation of Dynasor-CoT
 LLM reasoning is highly token-inefficient, often requiring far more tokens to achieve the same accuracy as non-reasoning models. A major source of this inefficiency is that reasoning models tend to **self-doubt**; they often reach the correct answer early but then engage in extended verification behaviors like double-checking and reassessment.
 
 For instance, Figure 2 compares a traditional Qwen-7B model with a reasoning-focused, Deepseek-distilled Qwen-7B model on a simple question. While the traditional model reaches its answer in 180 tokens, the reasoning model expends 1,000 tokens on iterative verification, despite having already found the correct answer at token 340. This represents a significant waste of tokens for diminishing returns on accuracy.
 
 <div align="center">
-    <img src="../media/tech_blog12_dynasor_hesitation.png" alt="Motivation" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_dynasor_hesitation.png" alt="Motivation" width="900px">
 </div>
 <p align="center"><sub><em>Figure 2. An example answer from reasoning model (Deepseek-distilled Qwen-2.5 7B) vs traditional model (Qwen-2.5 7B) on one of the problem in MATH500 dataset.</em></sub></p>
 
 #### The "Probe" technique
-Dynasor-CoT uses a **"Probe-In-The-Middle"** (or "probe" for short) technique to force reasoning models to output their early-stage results based on their unfinished reasoning. Imagine you're in a math exam working on a hard problem. When time is up, you're forced to write down your final answer, regardless of how confident you are.
+Dynasor-CoT uses a **"Probe-In-The-Middle"** (or "probe" for short) technique, which prompts reasoning models to output early-stage results during intermediate steps of reasoning. Imagine you're in a math exam working on a hard problem. When time is up, you're forced to write down your final answer, regardless of how confident you are.
 
 More specifically, a probe is an extra generation request with an eliciting prompt appended to the intermediate reasoning tokens. One effective eliciting prompt is: `Oh, I suddenly got the answer to the whole problem, Final Answer: boxed{`. Figure 3 shows an analysis comparing the accuracy of directly asking versus probing the model. Taking AMC23 as an example, reasoning models frequently arrive at correct answers early (median: 830 tokens) but continue generating unnecessary tokens due to self-doubt (median: 2.7K tokens).
 
 
 <div align="center">
-    <img src="../media/tech_blog12_dynasor_pressure_testing.png" alt="Dynasor Demo" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_dynasor_pressure_testing.png" alt="Dynasor Demo" width="900px">
 </div>
 <p align="center"><sub><em>Figure 3. DeepSeek-R1's performance on AMC23 and AIME24 at varying token budgets. (Left) Standard reasoning with late answer outputs. (Right) Early answer extraction using the Probe-In-The-Middle technique, demonstrating equivalent accuracy with a 50% token reduction. The greener regions in the right panels suggest the model knows the answers much earlier than it reveals in standard reasoning.</em></sub></p>
 
@@ -217,16 +222,16 @@ Instead of generating a fixed number of tokens or waiting for a stop token, Dyna
 
 Figure 4 provides an illustration:
 
-* **Case 1**: All three probe requests lead to the same answer, "3159." We can assume this is the final answer with high certainty and exit early.
+* **Case 1**: All three probe requests yield the same answer, "3159.", indicating high certainty. The process can exit early.
 
-* **Case 2**: The early-stage answers are inconsistent, which indicates low confidence, so we continue generation.
+* **Case 2**: Early-stage answers are inconsistent, indicating low confidence, so generation continues.
 
-* **Case 3**: The model generates special tokens like "wait" or "hmm," which also indicate hesitation, so we continue the generation.
+* **Case 3**: The model generates special tokens such as "wait" or "hmm," signaling hesitation; generation continues.
 
 <div align="center">
-    <img src="../media/tech_blog12_dynasor_illustration.jpg" alt="Dynasor Illustration" width="900px">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_dynasor_illustration.jpg" alt="Dynasor Illustration" width="900px">
 </div>
-<p align="center"><sub><em>Figure 4. Illustration of Dynasor-CoT. Case 1: early exit due to consistent early-stage results. Case 2: continue generation due to inconsistent early-stage results. Case 3: responses containing hesitation words (e.g., wait) are disgarded.</em></sub></p>
+<p align="center"><sub><em>Figure 4. Illustration of Dynasor-CoT. Case 1: early exit due to consistent early-stage results. Case 2: continue generation due to inconsistent early-stage results. Case 3: responses containing hesitation words (e.g., wait) are discarded.</em></sub></p>
 
 ### Implement Dynasor-CoT in Scaffolding
 A key difference between inference-time compute methods like Dynasor-CoT and a normal LLM generation request is that the generation process can consist of multiple smaller, user-defined tasks. The results of these tasks can dynamically control the overall logic—for example, by determining whether to expand the scope of subsequent generation or to terminate the process entirely. In a single Dynasor-CoT request, generation proceeds chunk by chunk, with additional "probe" tasks running in parallel with the main generation. Once a consistent answer is formed across recent probes, the process terminates early.
@@ -320,8 +325,6 @@ In the following `for` loop, each iteration performs these steps:
 
 ```python
         # Iterate over generation rounds until the maximum tokens limit is reached.
-        # Make sure length of prefilling is always smaller than the max_tokens in TRTLLMWorker.init_with_new_llm
-        # Otherwise it will through an assertion fail, stated in issue #3576
         for _ in range(initial_prompt_token_num + probe_suffix_token_num,
                     self.max_tokens, self.chunk_size):
             proposer_task.input_str = current_prompt
@@ -352,7 +355,7 @@ In the following `for` loop, each iteration performs these steps:
                                         probe_answers[-1] + "}\n\\]")
                     return
 
-            # If not confident, do another round of generation
+            # If the answer is not deemed confident, perform another round of generation.
             # Append the newly generated text from the proposer to the current prompt for the next iteration.
             current_prompt += proposer_task.output_str
 
@@ -362,7 +365,7 @@ In the following `for` loop, each iteration performs these steps:
         tasks[0].output_str = current_prompt
         return
 ```
-The `probe_task` can utilize prefix kvcache reuse to enhance inference performance. TensorRT-LLM enables the kvcache of an in-progress request to be reused by other requests, so `probe_task` can `proposer_task`'s kvcache even though the `proposer_task` is in a continuous running state.
+The `probe_task` can utilize prefix kvcache reuse to enhance inference performance. TensorRT LLM enables the kvcache of an in-progress request to be reused by other requests, so `probe_task` can `proposer_task`'s kvcache even though the `proposer_task` is in a continuous running state.
 
 Now we have implemented a `Controller` for Dynasor-CoT. Here is an example of how to use it:
 ```python
@@ -398,12 +401,15 @@ llm = ScaffoldingLlm(
 results = llm.generate(prompts)
 ```
 
+### Reference
+[1] Y. Fu*, J. Chen*, Y. Zhuang, Z. Fu, I. Stoica, and H. Zhang, "Dynasor: More Efficient Chain-of-Thought Through Certainty Probing," Hao-AI-Lab Blog, Feb. 16, 2025. [Online]. Available: https://hao-ai-lab.github.io/blogs/dynasor-cot/
+
 
 ## Feature List on Scaffolding
-Although users can customize their own `Controller`, `Worker` and `Task`, we have still implemented a series of the most used ones as the foundation.
+You can customize your own `Controller`, `Worker` and `Task`, however, we have provided a foundational set with commonly used functionality that you can use.
 
 
-`Worker`: TensorRT-LLM, OpenaiAPI, MCP;
+`Worker`: TensorRT LLM, OpenaiAPI, MCP;
 
 
 `Task`: Generation, Reward, ToolCall;
@@ -419,9 +425,7 @@ The future work is divided into two parts.
 The first part is to enable `Scaffolding` to support more inference-time compute methods, especially the methods of agentic and multi-agent system. 
 
 
-The second part is that we hope to find more opportunities to optimize TensorRT-LLM based on `Scaffolding` workloads. For examples, in terms of kvcache prefix reuse, `Scaffolding` can identify which parts are system prompts, which parts are likely to be reused in the subsequent requests of the agent task, and which parts cannot be reused and can be evicted immediately.
+The second part is that we hope to find more opportunities to optimize TensorRT LLM based on `Scaffolding` workloads. For examples, in terms of kvcache prefix reuse, `Scaffolding` can identify which parts are system prompts, which parts are likely to be reused in the subsequent requests of the agent task, and which parts cannot be reused and can be evicted immediately.
 
 
-Finally, what we want to emphasize is that we welcome and look forward to more people joining our open source community. You can find these issues in the [TensorRT-LLM GitHub issues with Scaffolding tag](https://github.com/NVIDIA/TensorRT-LLM/issues?q=state%3Aopen%20label%3AScaffolding).
-
-
+Finally, what we want to emphasize is that we welcome and look forward to more people joining our open source community. You can find these issues in the [TensorRT LLM GitHub issues with Scaffolding tag](https://github.com/NVIDIA/TensorRT-LLM/issues?q=state%3Aopen%20label%3AScaffolding).
