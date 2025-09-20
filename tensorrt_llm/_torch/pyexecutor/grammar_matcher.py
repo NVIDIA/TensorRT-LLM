@@ -29,6 +29,10 @@ class GrammarMatcher(ABC):
     def is_terminated(self) -> bool:
         pass
 
+    @abstractmethod
+    def guidance_started(self) -> bool:
+        pass
+
 
 class GrammarMatcherFactory(ABC):
 
@@ -57,6 +61,63 @@ class XGrammarMatcher(GrammarMatcher):
     def is_terminated(self) -> bool:
         return self._matcher.is_terminated()
 
+    def guidance_started(self) -> bool:
+        return True
+
+
+class GrammarMatcherWrapper(GrammarMatcher):
+    def __init__(self, matcher: GrammarMatcher, guidance_start_token_id: int):
+        super().__init__()
+        self._matcher = matcher
+        self._guidance_start_token_id = guidance_start_token_id
+        self._guidance_started = False
+        self._steps_after_guidance_start = 0
+
+    def accept_token(self, token_id: int) -> bool:
+        if not self._guidance_started:
+            if token_id == self._guidance_start_token_id:
+                self._guidance_started = True
+                self._steps_after_guidance_start = 0
+                return True
+            else:
+                return True
+        accepted = self._matcher.accept_token(token_id)
+        if accepted:
+            self._steps_after_guidance_start += 1
+        return accepted
+
+    def rollback(self, num_tokens: int) -> None:
+        if not self._guidance_started:
+            return
+        # cannot rollback more than _steps_after_guidance_start
+        num_tokens_to_rollback = min(num_tokens, self._steps_after_guidance_start)
+        if num_tokens > self._steps_after_guidance_start:
+            self._guidance_started = False
+        else:
+            self._steps_after_guidance_start -= num_tokens_to_rollback
+        self._matcher.rollback(num_tokens_to_rollback)
+
+    def fill_next_token_bitmask(self, next_token_bitmask: torch.Tensor,
+                                index: int) -> None:
+        self._matcher.fill_next_token_bitmask(next_token_bitmask, index)
+
+    def is_terminated(self) -> bool:
+        return self._matcher.is_terminated()
+
+    def guidance_started(self) -> bool:
+        return self._guidance_started
+
+class GrammarMatcherFactoryWrapper(GrammarMatcherFactory):
+    def __init__(self, factory: GrammarMatcherFactory):
+        super().__init__()
+        self._factory = factory
+
+    def create(self,
+               guided_decoding_params: GuidedDecodingParams) -> GrammarMatcher:
+        matcher = self._factory.create(guided_decoding_params)
+        if guided_decoding_params.guidance_start_token_id:
+            return GrammarMatcherWrapper(matcher, guided_decoding_params.guidance_start_token_id)
+        return matcher
 
 class XGrammarMatcherFactory(GrammarMatcherFactory):
 
@@ -166,6 +227,9 @@ class LLGuidanceMatcher(GrammarMatcher):
 
     def is_terminated(self) -> bool:
         return self._is_terminated
+
+    def guidance_started(self) -> bool:
+        return True
 
     def _check_err(self) -> None:
         if self._matcher.is_error():

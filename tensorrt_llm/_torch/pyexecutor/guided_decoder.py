@@ -10,7 +10,7 @@ from ...bindings.executor import GuidedDecodingConfig, GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
 from ..hostfunc import hostfunc
-from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
+from .grammar_matcher import (GrammarMatcher, GrammarMatcherFactoryWrapper, LLGuidanceMatcherFactory,
                               XGrammarMatcherFactory)
 from .llm_request import LlmRequest
 from .scheduler import ScheduledRequests
@@ -161,6 +161,7 @@ class GuidedDecoder:
             raise ValueError(
                 f"Invalid guided decoding backend: {self.guided_decoding_backend}"
             )
+        self.grammar_matcher_factory = GrammarMatcherFactoryWrapper(self.grammar_matcher_factory)
         logger.info(
             f"Guided decoder initialized with backend: {self.guided_decoding_backend}"
         )
@@ -249,9 +250,10 @@ class GuidedDecoder:
 
             self.num_advanced_tokens[slot] += 1
             if not matcher.is_terminated():
-                matcher.fill_next_token_bitmask(self.bitmask_host, offset)
-                self.token_mask_host[offset] = 1
-                self.num_guided_tokens[slot] += 1
+                if matcher.guidance_started():
+                    matcher.fill_next_token_bitmask(self.bitmask_host, offset)
+                    self.token_mask_host[offset] = 1
+                    self.num_guided_tokens[slot] += 1
                 # Process draft tokens
                 for i, tid in enumerate(req.draft_tokens, 1):
                     accepted = matcher.accept_token(tid)
@@ -260,10 +262,11 @@ class GuidedDecoder:
                     self.num_advanced_tokens[slot] += 1
                     if matcher.is_terminated():
                         break
-                    matcher.fill_next_token_bitmask(self.bitmask_host,
+                    if matcher.guidance_started():
+                        matcher.fill_next_token_bitmask(self.bitmask_host,
                                                     offset + i)
-                    self.token_mask_host[offset + i] = 1
-                    self.num_guided_tokens[slot] += 1
+                        self.token_mask_host[offset + i] = 1
+                        self.num_guided_tokens[slot] += 1
 
             if req.is_draft:
                 assert len(req.draft_tokens) == 0
