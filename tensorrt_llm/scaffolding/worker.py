@@ -181,7 +181,8 @@ class TRTLLMWorker(Worker):
             temperature=task.temperature,
             top_p=task.top_p,
             top_k=task.top_k,
-            return_context_logits=task.return_context_logits)
+            return_context_logits=task.return_context_logits,
+            logprobs=task.num_logprobs)
         return sampling_params
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
