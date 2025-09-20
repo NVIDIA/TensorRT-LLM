@@ -421,13 +421,14 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                graph_runner.capture(1, lambda inputs: mistral.forward(**inputs), inputs)
+                key = (1, 0, False)
+                graph_runner.capture(key, lambda inputs: mistral.forward(**inputs), inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(1, inputs)
+                    logits = graph_runner.replay(key, inputs)
                 return logits
 
         if use_cuda_graph:
