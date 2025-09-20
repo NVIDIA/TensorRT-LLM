@@ -18,6 +18,7 @@
 #include "cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/bindingUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include <ATen/ATen.h>
 #include <pybind11/functional.h>
@@ -98,7 +99,7 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def(py::init(
                  [](py::object pg_obj, std::string pybind11_abi) {
                      return common::get_intrusive_ptr<c10d::ProcessGroup, py::error_already_set>(
-                         pg_obj.ptr(), pybind11_abi)
+                         pg_obj.ptr(), pybind11_abi);
                  }),
             py::arg("process_group"), py::arg("pybind11_abi"))
         .def("get_rank", &tb::CacheTransceiverComm::getRank)
