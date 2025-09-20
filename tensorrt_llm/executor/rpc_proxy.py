@@ -74,6 +74,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         # TBD: Move model creation to the mpi task, or left in RPC?
         self.setup_engine_remote()
 
+        # Setup main loop after engine is ready
         self.setup_mainloop()
 
     def launch_workers(self):
@@ -88,11 +89,15 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         """
         Main loop of the proxy, it will invoke the actions periodically.
         """
-        async for responses in self.rpc_client.fetch_responses_loop_async(
-        ).remote_streaming():
-            if self._shutdown_event.is_set():
-                return
-            self.handle_responses(responses)
+        try:
+            async for responses in self.rpc_client.fetch_responses_loop_async(
+            ).remote_streaming():
+                if self._shutdown_event.is_set():
+                    return
+                self.handle_responses(responses)
+        except Exception as e:
+            logger.error(f"Error in main_loop_task: {e}")
+            raise
 
     def setup_mainloop(self):
 
@@ -115,6 +120,11 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 nonlocal event_loop
                 nonlocal async_queues
 
+                if client_id not in self._results:
+                    logger.warning(
+                        f"Received response for unknown client_id: {client_id}")
+                    continue
+
                 queue = self._results[client_id].queue
                 if isinstance(queue, _SyncQueue):
                     queue.put_nowait(r)
@@ -127,6 +137,11 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 if (is_llm_response(r) and r.result.is_final) or isinstance(
                         r, ErrorResponse):
                     self._results.pop(client_id)
+
+        # Handle the case where responses might not be a list of lists
+        if responses and not isinstance(responses[0], list):
+            # If responses is a flat list, wrap it
+            responses = [responses]
 
         for res in responses:
             global_tracer().log_instant("RPC.get")

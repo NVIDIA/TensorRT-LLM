@@ -544,6 +544,16 @@ class BaseWorker(GenerationExecutor):
 
         return result
 
+    def shutdown(self):
+        if self.doing_shutdown:
+            return
+        else:
+            self.doing_shutdown = True
+
+        if self.engine is not None and self.engine.can_enqueue_requests():
+            self.engine.shutdown()
+            self.engine = None
+
     def _pop_result(self, client_id: int):
         self._results.pop(client_id, None)
         self._client_id_to_request_id.pop(client_id, None)
