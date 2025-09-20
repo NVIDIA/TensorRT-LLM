@@ -28,7 +28,8 @@ import transformers
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
+from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
+                                   GenerationResult, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
                                  KvCacheConfig, KvCacheRetentionConfig,
@@ -1907,27 +1908,37 @@ class DummyExecutorWorker3(GenerationExecutorWorker):
         self.failed_requests = set()
 
     def _engine_response_callback(self, response: tllm.Response):
-        if response.client_id in self.failed_requests:
+        client_id = response.client_id
+        if client_id in self.failed_requests:
             return response
         # Making the first response failed, and the subsequent responses successful
         if DummyExecutorWorker3.should_raise_error:
             DummyExecutorWorker3.should_raise_error = False
-            print(f"Raise error for {response.client_id}")
-            self.failed_requests.add(response.client_id)
+            print(f"Raise error for {client_id}")
+            self.failed_requests.add(client_id)
+            if not response.result.is_final:
+                self.abort_request(client_id)
             return tllm.Response(
-                request_id=0,  # dummy value
-                client_id=response.client_id,
+                request_id=self._client_id_to_request_id[client_id],
+                client_id=client_id,
                 error_msg="Test error")
         else:
             return response
+
+    def _pop_result(self, client_id: int):
+        # The actual worker didn't error, so it may continue generating result,
+        # until the abort message reached it.
+        # So we avoid removing the result queue.
+        if client_id in self.failed_requests:
+            return
+        super()._pop_result(client_id)
 
 
 DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
                                    worker_cls=DummyExecutorWorker3)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
-def test_llm_handling_per_requeust_error():
+def test_llm_handling_per_request_error():
     llm = LLM(
         model=llama_model_path,
         executor_cls=DummyExecutor3,
@@ -1950,8 +1961,7 @@ def test_llm_handling_per_requeust_error():
     batch_task()
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
-def test_llm_handling_per_requeust_error_async():
+def test_llm_handling_per_request_error_async():
     llm = LLM(
         model=llama_model_path,
         executor_cls=DummyExecutor3,
@@ -1978,6 +1988,45 @@ def test_llm_handling_per_requeust_error_async():
             print(output)
 
     asyncio.run(task())
+
+
+class DummyExecutorWorker4(GenerationExecutorWorker):
+    should_raise_error = True
+
+    def submit(self, request: GenerationRequest) -> GenerationResult:
+        # Making the first response failed, and the subsequent responses successful
+        if DummyExecutorWorker4.should_raise_error:
+            DummyExecutorWorker4.should_raise_error = False
+            raise RequestError("Test error")
+
+        return super().submit(request)
+
+
+DummyExecutor4 = DummyExecutorMeta("DummyExecutor4", (), {},
+                                   worker_cls=DummyExecutorWorker4)
+
+
+def test_llm_handling_per_request_submit_error():
+    llm = LLM(
+        model=llama_model_path,
+        executor_cls=DummyExecutor4,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+    # The dummy executor will delay the responses
+    sampling_params = SamplingParams(max_tokens=6)
+
+    def batch_task():
+        DummyExecutorWorker4.should_raise_error = True
+        with pytest.raises(RequestError):
+            for output in llm.generate(prompts,
+                                       sampling_params=sampling_params):
+                print(output)
+
+        for output in llm.generate(prompts, sampling_params=sampling_params):
+            print(output)
+
+    batch_task()
 
 
 def validate_stats(results,
