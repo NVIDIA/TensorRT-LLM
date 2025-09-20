@@ -87,8 +87,6 @@ class GenerationExecutorWorker(BaseWorker):
             error_queue=self._error_queue,
             name="dispatch_kv_cache_events_thread")
 
-        self.setup_engine()
-
     def _create_iteration_result_queue(self,
                                        it_result_queue: IterationResultQueue):
         if not it_result_queue.is_initialized:
@@ -217,7 +215,22 @@ class GenerationExecutorWorker(BaseWorker):
                     self.dispatch_kv_cache_events_thread.stop()
                     self.dispatch_kv_cache_events_thread.join()
 
-            super().shutdown()
+            self.engine.shutdown()
+            self.engine = None
+
+            if self.llm_args is not None:
+                assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
+                if (self.llm_args.backend == "pytorch"
+                        and hasattr(self, "checkpoint_loader")
+                        and self.checkpoint_loader is not None):
+                    self.checkpoint_loader.cleanup()
+                    self.checkpoint_loader = None
+            else:
+                if hasattr(
+                        self._executor_config, "checkpoint_loader"
+                ) and self._executor_config.checkpoint_loader is not None:
+                    self._executor_config.checkpoint_loader.cleanup()
+                    self._executor_config.checkpoint_loader = None
 
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()

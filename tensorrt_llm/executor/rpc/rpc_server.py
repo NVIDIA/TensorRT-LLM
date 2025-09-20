@@ -192,6 +192,10 @@ class RPCServer:
             except asyncio.TimeoutError:
                 await asyncio.sleep(0)
                 continue
+            except Exception as e:
+                logger.error(f"RPC dispatcher caught an exception: {e}")
+                logger.error(traceback.format_exc())
+                continue
 
             await self._queue.put(req)  # type: ignore
 
@@ -272,8 +276,9 @@ class RPCServer:
                     logger_debug(
                         f"RPC Server sending response for request {req}, pending: {self._num_pending_requests}"
                     )
-                    await self._client_socket.put_async(response)
-                    logger_debug(f"RPC Server sent response for request {req}")
+                    if await self._send_response(req, response):
+                        logger_debug(
+                            f"RPC Server sent response for request {req}")
 
             # Only decrement if this request was counted in the first place
             if req.method_name not in ["_rpc_shutdown", "shutdown"]:
@@ -352,9 +357,11 @@ class RPCServer:
             async for result in func(*req.args, **req.kwargs):
                 logger_debug(
                     f"RPC Server got data and ready to send result {result}")
-                await self._client_socket.put_async(
-                    RPCResponse(req.request_id, result, None, True,
-                                sequence_number, 'data'))
+                response = RPCResponse(req.request_id, result, None, True,
+                                       sequence_number, 'data')
+                if not await self._send_response(req, response):
+                    # Stop streaming after a pickle error
+                    return
                 sequence_number += 1
 
             # Send end signal
@@ -372,13 +379,46 @@ class RPCServer:
                     sequence_number, 'error'))
 
         except Exception as e:
-            await self._client_socket.put_async(
-                RPCResponse(
+            response = RPCResponse(
+                req.request_id, None,
+                RPCStreamingError(str(e), traceback=traceback.format_exc()),
+                True, sequence_number, 'error')
+            await self._send_response(req, response)
+
+    async def _send_response(self, req: RPCRequest,
+                             response: RPCResponse) -> bool:
+        """Safely sends a response, handling pickle errors."""
+        try:
+            await self._client_socket.put_async(response)
+            return True
+        except Exception as e:
+            logger.error(
+                f"Failed to pickle response for request {req.request_id}: {e}")
+            error_msg = f"Failed to pickle response: {e}"
+            if req.is_streaming:
+                error_cls = RPCStreamingError
+                # For streaming, we also need sequence number. The original response has it.
+                sequence_number = response.sequence_number if response else None
+                error_response = RPCResponse(
+                    req.request_id,
+                    None,
+                    error_cls(error_msg, traceback=traceback.format_exc()),
+                    is_streaming=True,
+                    sequence_number=sequence_number,
+                    stream_status='error')
+            else:
+                error_cls = RPCError
+                error_response = RPCResponse(
                     req.request_id, None,
-                    RPCStreamingError(str(e),
-                                      cause=e,
-                                      traceback=traceback.format_exc()), True,
-                    sequence_number, 'error'))
+                    error_cls(error_msg, traceback=traceback.format_exc()))
+
+            try:
+                await self._client_socket.put_async(error_response)
+            except Exception as e_inner:
+                logger.error(
+                    f"Failed to send error response for request {req.request_id}: {e_inner}"
+                )
+            return False
 
     def start(self):
         """Binds sockets, starts workers, and begins proxying messages."""

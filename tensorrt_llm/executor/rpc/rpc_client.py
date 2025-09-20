@@ -152,6 +152,7 @@ class RPCClient:
 
     async def _response_reader(self):
         """Task to read responses from the socket and set results on futures."""
+        logger_debug("Response reader started")
 
         while not self._stop_event.is_set():
             try:
@@ -166,6 +167,11 @@ class RPCClient:
                     continue
 
                 logger_debug(f"RPC Client received response: {response}")
+                logger_debug(
+                    f"Response request_id: {response.request_id}, is_streaming: {response.is_streaming}"
+                )
+                logger_debug(
+                    f"Pending futures: {list(self._pending_futures.keys())}")
 
                 # Handle streaming responses
                 if response.is_streaming:
@@ -187,18 +193,34 @@ class RPCClient:
                                                        None)
                 else:
                     # Handle regular responses
+                    logger_debug(
+                        f"Handling regular response for request_id: {response.request_id}"
+                    )
                     if future_info := self._pending_futures.get(
                             response.request_id):
                         future, target_loop = future_info
+                        logger_debug(
+                            f"Found future for request_id: {response.request_id}, future done: {future.done()}"
+                        )
 
                         if not future.done():
                             if response.error is None:
+                                logger_debug(
+                                    f"Setting result for request_id: {response.request_id}, result: {response.result}"
+                                )
                                 target_loop.call_soon_threadsafe(
                                     future.set_result, response.result)
                             else:
                                 # Use the original RPCError from the response
+                                logger_debug(
+                                    f"Setting exception for request_id: {response.request_id}, error: {response.error}"
+                                )
                                 target_loop.call_soon_threadsafe(
                                     future.set_exception, response.error)
+                    else:
+                        logger_debug(
+                            f"No future found for request_id: {response.request_id}"
+                        )
                     self._pending_futures.pop(response.request_id, None)
 
             except asyncio.CancelledError:
@@ -268,16 +290,27 @@ class RPCClient:
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+        logger_debug(
+            f"RPC Client _call_async: Created future for request_id: {request_id} in loop: {id(loop)}"
+        )
         self._pending_futures[request_id] = (future, loop)
+        logger_debug(
+            f"RPC Client _call_async: Stored future in pending_futures")
 
         try:
             # If timeout, the remote call should return a timeout error timely,
             # so we add 1 second to the timeout to ensure the client can get
             # that result.
+            logger_debug(
+                f"RPC Client _call_async: Awaiting future for request_id: {request_id}"
+            )
             if timeout is None:
                 res = await future
             else:
                 res = await asyncio.wait_for(future, timeout + 1)
+            logger_debug(
+                f"RPC Client _call_async: Got result for request_id: {request_id}: {res}"
+            )
             return res
         except RPCCancelled:
             self._server_stopped = True
@@ -315,9 +348,16 @@ class RPCClient:
             f"RPC Client calling method: {method_name} with args: {args} and kwargs: {kwargs}"
         )
         self._ensure_event_loop()
+        logger_debug(
+            f"RPC Client _call_sync: Creating future for {method_name}")
         future = asyncio.run_coroutine_threadsafe(
             self._call_async(method_name, *args, **kwargs), self._loop)
-        return future.result()
+        logger_debug(
+            f"RPC Client _call_sync: Waiting for result of {method_name}")
+        result = future.result()
+        logger_debug(
+            f"RPC Client _call_sync: Got result for {method_name}: {result}")
+        return result
 
     def call_async(self, name: str, *args, **kwargs):
         """

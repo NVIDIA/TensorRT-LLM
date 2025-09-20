@@ -548,6 +548,32 @@ class BaseWorker(GenerationExecutor):
 
         return result
 
+    def shutdown(self):
+        if self.doing_shutdown:
+            return
+        else:
+            self.doing_shutdown = True
+
+        if self.engine is not None and self.engine.can_enqueue_requests():
+            self.engine.shutdown()
+            self.engine = None
+
+    # Define a Callable to join iteration and request stats
+    @staticmethod
+    def _stats_serializer(
+            stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
+        iteration_stats, req_stats = stats
+        stats_dict = json.loads(iteration_stats.to_json_str())
+
+        if req_stats is not None and len(req_stats) > 0:
+            stats_dict["requestStats"] = []
+            for req_stat in req_stats:
+                stats_dict["requestStats"].append(
+                    json.loads(req_stat.to_json_str()))
+
+        # Convert back to JSON string
+        return json.dumps(stats_dict)
+
     def _pop_result(self, client_id: int):
         self._results.pop(client_id, None)
         self._client_id_to_request_id.pop(client_id, None)

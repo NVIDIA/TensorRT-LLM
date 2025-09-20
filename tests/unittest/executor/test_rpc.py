@@ -618,8 +618,44 @@ class TestRpcAsync:
                 pass
 
 
-if __name__ == "__main__":
-    #TestRpcError().test_shutdown_cancelled_error()
-    #test_rpc_shutdown_server()
-    #TestRpcShutdown().test_submit_request_after_server_shutdown()
-    test_rpc_timeout(True)
+class TestResponsePickleError:
+    """ The pickle error will break the whole server, test the error handling. """
+
+    class App:
+
+        def unpickleable_return(self):
+            # Functions defined locally are not pickleable
+            def nested_function():
+                pass
+
+            return nested_function
+
+        async def unpickleable_streaming_return(self):
+            # Functions defined locally are not pickleable
+            def nested_function():
+                pass
+
+            yield nested_function
+
+    def test_unpickleable_error(self):
+        with RpcServerWrapper(
+                self.App(), addr="ipc:///tmp/rpc_test_pickle_error") as server:
+            with RPCClient("ipc:///tmp/rpc_test_pickle_error") as client:
+                with pytest.raises(RPCError) as exc_info:
+                    client.unpickleable_return().remote()
+
+                assert "Failed to pickle response" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_unpickleable_streaming_error(self):
+        with RpcServerWrapper(self.App(),
+                              addr="ipc:///tmp/rpc_test_pickle_error_streaming",
+                              async_run_task=True) as server:
+            with RPCClient(
+                    "ipc:///tmp/rpc_test_pickle_error_streaming") as client:
+                with pytest.raises(RPCStreamingError) as exc_info:
+                    async for _ in client.unpickleable_streaming_return(
+                    ).remote_streaming():
+                        pass
+
+                assert "Failed to pickle response" in str(exc_info.value)

@@ -10,21 +10,24 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs
+from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
+from ..llmapi.tokenizer import TokenizerBase
 from ..logger import set_level
 from ..lora_manager import LoraConfig
 from ..sampling_params import BatchedLogitsProcessor
+from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
+from .request import GenerationRequest
 from .rpc import RPCServer
-from .worker_base import WorkerBase
 
 
-class RpcWorker(WorkerBase):
+class RpcWorker(BaseWorker):
     """
-    A RPC wrapper for the WorkerBase class.
+    A RPC wrapper for the BaseWorker class.
 
     Actions:
         - `setup_engine`: Setup the engine.
+        - `submit`: Submit a request to the worker.
         - `fetch_responses`: Fetch the latest responses from engine.
         - `fetch_stats`: Fetch the latest stats from engine.
         - `fetch_kv_cache_events`: Fetch the latest kv cache events from engine.
@@ -38,21 +41,35 @@ class RpcWorker(WorkerBase):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
-        llm_args: Optional[BaseLlmArgs] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
         super().__init__(
             engine=engine,
             executor_config=executor_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             llm_args=llm_args,
-            batched_logits_processor=batched_logits_processor)
+            batched_logits_processor=batched_logits_processor,
+            postproc_worker_config=postproc_worker_config,
+            kv_connector_config=kv_connector_config,
+            hf_model_dir=hf_model_dir,
+            tokenizer=tokenizer,
+        )
+        # Store garbage_collection_gen0_threshold if needed in the future
+        self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
         self.shutdown_event = Event()
 
         self._response_queue = Queue()
         self.set_result_queue(self._response_queue)
+
+    def submit(self, request: GenerationRequest):
+        """ Submits a request to the worker. """
+        super().submit(request)
 
     def fetch_stats(self) -> list:
         return super().fetch_stats()
@@ -61,13 +78,42 @@ class RpcWorker(WorkerBase):
         logger_debug(f"RpcWorker {mpi_rank()} is fetching responses",
                      color="yellow")
         # NOTE: This is a blocking call, it will wait for the responses to be available.
-        super().await_responses(timeout)
+        responses = super().await_responses(timeout)
+        self._await_response_helper.responses_handler(responses)
+
         qsize = self._response_queue.qsize()
         logger_debug(f"RpcWorker returning {qsize} responses", color="yellow")
-        return [self._response_queue.get() for _ in range(qsize)]
+
+        if qsize == 0:
+            return []
+
+        all_responses = []
+        for _ in range(qsize):
+            # The queue contains batches of responses, so extend the list
+            all_responses.extend(self._response_queue.get())
+        return all_responses
 
     async def fetch_responses_async(self) -> list:
-        return await asyncio.to_thread(self.fetch_responses)
+        # A really async version of fetch_responses
+        logger_debug(f"RpcWorker {mpi_rank()} is fetching responses async",
+                     color="yellow")
+
+        # First, await any pending responses without blocking the event loop
+        responses = await asyncio.to_thread(self.await_responses, 0.001)
+        # Handle the responses that are ready
+        self._await_response_helper.responses_handler(responses)
+
+        qsize = self._response_queue.qsize()
+        logger_debug(f"RpcWorker returning {qsize} async responses",
+                     color="yellow")
+
+        if qsize == 0:
+            return []
+
+        all_responses = []
+        for _ in range(qsize):
+            all_responses.extend(self._response_queue.get())
+        return all_responses
 
     # for streaming performance
     async def fetch_responses_loop_async(self) -> AsyncGenerator[list, None]:
@@ -88,7 +134,9 @@ class RpcWorker(WorkerBase):
 
     def setup_engine(self):
         # Force all the ranks to wait here, and start creating the executor simultaneously.
-        mpi_comm().barrier()
+        # Only call barrier if we have multiple ranks to avoid hanging in single-process tests
+        if mpi_comm().Get_size() > 1:
+            mpi_comm().barrier()
 
         super().setup_engine()
 
@@ -97,6 +145,9 @@ class RpcWorker(WorkerBase):
                      color="yellow")
         self.shutdown_event.set()
         super().shutdown()
+
+    def start(self):
+        pass
 
     @staticmethod
     def main_task(
@@ -110,6 +161,9 @@ class RpcWorker(WorkerBase):
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
         **kwargs,
     ) -> None:
         if enable_llm_debug():
@@ -123,7 +177,12 @@ class RpcWorker(WorkerBase):
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             llm_args=llm_args,
-            batched_logits_processor=batched_logits_processor)
+            batched_logits_processor=batched_logits_processor,
+            postproc_worker_config=postproc_worker_config,
+            kv_connector_config=kv_connector_config,
+            hf_model_dir=hf_model_dir,
+            tokenizer=tokenizer,
+        )
 
         if mpi_rank() != 0:
             # The non-leader worker will setup the engine immediately.
