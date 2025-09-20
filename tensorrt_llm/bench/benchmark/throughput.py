@@ -45,10 +45,11 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     help="Path to a serialized TRT-LLM engine.",
 )
-@optgroup.option("--backend",
-                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
-                 default="pytorch",
-                 help="The backend to use when running benchmarking.")
+@optgroup.option(
+    "--backend",
+    type=click.Choice(ALL_SUPPORTED_BACKENDS),
+    default="pytorch",
+    help="The backend to use for benchmark. Default is pytorch backend.")
 @optgroup.option(
     "--custom_module_dirs",
     type=click.Path(exists=True,
@@ -370,9 +371,9 @@ def throughput_command(
                 f"{metadata.max_sequence_length}. Please rebuild a new engine "
                 "to support this dataset.")
     else:
-        raise RuntimeError(
-            f"Invalid backend: {options.backend}, please use one of the following: "
-            "pytorch, tensorrt, _autodeploy.")
+        raise click.BadParameter(
+            f"{options.backend} is not a known backend, check help for available options.",
+            param_hint="backend")
 
     exec_settings["model"] = options.model
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
