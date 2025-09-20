@@ -404,13 +404,18 @@ class MultimodalParams:
     def to_device(self,
                   element: str,
                   device: str,
-                  pin_memory: bool = False) -> None:
+                  pin_memory: bool = False,
+                  target_keywords: Optional[List[str]] = None) -> None:
         """Move specified multimodal data element to target device.
 
         Args:
             element: Element to move (only "multimodal_data" is supported)
             device: Target device (e.g., "cuda", "cpu")
-            pin_memory: Whether to pin memory for faster transfers
+            pin_memory: Whether to pin memory for asynchronous transfers
+            target_keywords: Optional list of keyword paths to filter which data to move.
+                    Each string can be a simple key or dot-separated path
+                    (e.g., ["image.pixel_values", "mrope_config"])
+                    If provided, only data matching these paths will be moved to device.
 
         Raises:
             ValueError: If element is not "multimodal_data" or device is invalid
@@ -425,30 +430,90 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to move
 
-        transformed_data = self._apply_tensor_operation(data,
-                                                        "to_device",
-                                                        device=device,
-                                                        pin_memory=pin_memory)
+        # If keyword is specified, only move data for those keyword paths
+        if target_keywords is not None:
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"multimodal_data must be a dictionary when keyword is specified, "
+                    f"got {type(data)}")
+
+            # Process multiple keyword paths
+            transformed_data = self._move_multiple_paths_to_device(
+                data, target_keywords, device, pin_memory)
+        else:
+            # Move all data as before
+            transformed_data = self._apply_tensor_operation(
+                data, "to_device", device=device, pin_memory=pin_memory)
+
         setattr(self, element, transformed_data)
+
+    def _move_multiple_paths_to_device(self, data: Dict[str, Any],
+                                       target_keywords: List[str], device: str,
+                                       pin_memory: bool) -> Dict[str, Any]:
+        """Move multiple nested data paths to device.
+
+        Args:
+            data: The multimodal data dictionary
+            target_keywords: List of keyword paths (can be dot-separated)
+            device: Target device
+            pin_memory: Whether to pin memory
+
+        Returns:
+            Updated data dictionary with specified paths moved to device
+        """
+        result = data
+        for keyword_path in target_keywords:
+            # Parse each keyword path
+            if '.' in keyword_path:
+                key_path = keyword_path.split('.')
+            else:
+                key_path = [keyword_path]
+
+            # Navigate to the target location and move data
+            current = result
+            parent_path = key_path[:-1]
+            target_key = key_path[-1]
+
+            # Navigate to the parent dictionary
+            for key in parent_path:
+                if not isinstance(current, dict) or key not in current:
+                    # Path doesn't exist, skip this keyword path
+                    break
+                current = current[key]
+            else:
+                # Check if the target key exists and move it to device
+                if isinstance(current, dict) and target_key in current:
+                    current[target_key] = self._apply_tensor_operation(
+                        current[target_key],
+                        "to_device",
+                        device=device,
+                        pin_memory=pin_memory)
+
+        return result
 
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_config and removes all other multimodal data
+        Keeps only mrope_position_deltas and removes all other multimodal data
         (embeddings, images, etc.) as they're not needed during generation.
         """
         if not self.multimodal_data:
             return
 
-        # Extract mrope_config before clearing
-        mrope_config = None
+        # Extract mrope_position_deltas before clearing
+        mrope_position_deltas = None
         if 'mrope_config' in self.multimodal_data:
             mrope_config = self.multimodal_data['mrope_config']
+            if isinstance(mrope_config,
+                          dict) and 'mrope_position_deltas' in mrope_config:
+                mrope_position_deltas = mrope_config['mrope_position_deltas']
 
-        # Clear all data and restore only mrope_config if it exists
+        # Clear all data and restore only position deltas if they exist
         self.multimodal_data = {}
-        if mrope_config is not None:
-            self.multimodal_data['mrope_config'] = mrope_config
+        if mrope_position_deltas is not None:
+            self.multimodal_data['mrope_config'] = {
+                'mrope_position_deltas': mrope_position_deltas
+            }
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
