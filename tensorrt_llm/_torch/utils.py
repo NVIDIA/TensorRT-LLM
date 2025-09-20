@@ -302,3 +302,11 @@ def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
         enable_attention_dp=mapping.enable_attention_dp,
         enable_lm_head_tp_in_adp=mapping.enable_lm_head_tp_in_adp,
     )
+
+
+def get_device_uuid(device_idx: int) -> str:
+    """Get the UUID of a CUDA device using torch cuda api"""
+
+    property = torch.cuda.get_device_properties(device_idx)
+    uuid = "GPU-" + str(property.uuid)
+    return uuid

@@ -1277,6 +1277,12 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     } else {
         makoArgs += ["auto_trigger=others"]
     }
+    if (stageName.contains("-Ray-")) {
+        makoArgs += ["orchestrator=ray"]
+    } else {
+        // Select tests with mpi or unspecified orchestrator
+        makoArgs += ["orchestrator=mpi"]
+    }
 
     if (parseSysinfo) {
         def taskConfig = parseMultiNodeTaskConfigFromStageName(stageName)
@@ -1706,6 +1712,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 "--perf-log-formats yaml"
             ]
         }
+        if (stageName.contains("-Ray-")) {
+            testCmdLine += ["--run-ray"]
+
+            sh "pip3 install ray[default]"
+        }
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
         sh "echo ${TRTLLM_WHL_PATH}"
@@ -2040,6 +2051,8 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-2_GPUs-PyTorch-Ray-1": ["dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
+        "DGX_H100-4_GPUs-PyTorch-Ray-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
@@ -2062,6 +2075,7 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
+        "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
