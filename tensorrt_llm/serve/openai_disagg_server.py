@@ -44,7 +44,6 @@ class OpenAIDisaggServer:
                  server_start_timeout_secs: int = 180,
                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
                  metrics_interval_secs: int = 0):
-
         self.ctx_servers, self.gen_servers = get_ctx_gen_server_urls(config.server_configs)
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.ctx_router = create_router(
