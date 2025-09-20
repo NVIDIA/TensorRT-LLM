@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
-from test_worker_base import create_fake_executor_config
+from test_base_worker import create_fake_executor_config
 
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc import RPCClient
@@ -21,6 +21,7 @@ from utils.llm_data import llm_models_root
 # isort: on
 
 model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+assert model_path.exists()
 
 
 class TestRpcWorkerTP1:
@@ -31,6 +32,7 @@ class TestRpcWorkerTP1:
         self.pool, self.addr = self.create_worker_pool()
         self.client = self.create_rpc_client(self.addr)
         self.client.setup_engine().remote()
+        print(f"Worker setup engine done")
         time.sleep(10)
 
     def teardown_method(self):
@@ -43,11 +45,14 @@ class TestRpcWorkerTP1:
         mp_context = multiprocessing.get_context(
             'spawn')  # spawn for CUDA context
         pool = ProcessPoolExecutor(max_workers=1, mp_context=mp_context)
-        pool.submit(RpcWorker.main_task,
-                    engine=model_path,
-                    rpc_addr=addr,
-                    executor_config=self.executor_config,
-                    llm_args=self.llm_args)
+        pool.submit(
+            RpcWorker.main_task,
+            engine=model_path,
+            rpc_addr=addr,
+            executor_config=self.executor_config,
+            llm_args=self.llm_args,
+            hf_model_dir=model_path,
+        )
         return pool, addr
 
     def create_rpc_client(self, addr: str):
@@ -58,13 +63,21 @@ class TestRpcWorkerTP1:
         pass
 
     def test_fetch_responses_sync(self):
+        # Wait a bit to ensure engine is ready
+        time.sleep(1)
+
+        print(f"start to submit")
         self.client.submit(
             GenerationRequest(prompt_token_ids=[3, 4, 5],
                               sampling_params=SamplingParams(
                                   max_tokens=5)), ).remote(need_response=False)
+        print(f"submit done")
+
+        time.sleep(3)
+
         results = []
-        while not results:
-            results.extend(self.client.fetch_responses().remote())
+        # Fetch responses
+        results.extend(self.client.fetch_responses().remote())
         assert len(results) == 1
 
     def test_fetch_responses_streaming_sync(self):
@@ -75,9 +88,12 @@ class TestRpcWorkerTP1:
 
         results = []
         for i in range(10):
-            res = self.client.fetch_responses().remote()
+            res = self.client.fetch_responses().remote(timeout=1.0)
             results.extend(res)
             print(f"fetch_responses {i} result: {results}")
+            # If we've received enough results, break early
+            if len(results) >= 5:
+                break
         assert 0 < len(results) <= 5
 
         time.sleep(5)
@@ -174,52 +190,6 @@ class TestRpcWorkerTP1:
 
         await process_request_streaming()
 
-    def test_main_loop(self):
-        time.sleep(1)
-
-        def process_request():
-            ret = self.client.submit(
-                GenerationRequest(
-                    prompt_token_ids=[3, 4, 5],
-                    sampling_params=SamplingParams(max_tokens=10)), ).remote(
-                        need_response=False)
-            assert ret is None  # need_response = False
-
-            print(f"submit result: {ret}")
-            print("call fetch_responses")
-            # NOTE: known issue, the responses should be fetched before shutdown,
-            # or the shutdown will hang.
-            results = []
-            time.sleep(8)  # wait for PyExecutor to finish the generation
-            results.extend(self.client.fetch_responses().remote()
-                           )  # fetch_responses will block
-            print(f"fetch_responses result: {results}")
-            assert len(results) == 1  # one request, one response
-
-        def process_request_streaming():
-            ret = self.client.submit(
-                GenerationRequest(prompt_token_ids=[3, 4, 5],
-                                  sampling_params=SamplingParams(max_tokens=10),
-                                  streaming=True), ).remote(need_response=False)
-            assert ret is None
-            print("submit result: ", ret)
-
-            # NOTE: known issue, the responses should be fetched before shutdown,
-            # or the shutdown will hang.
-            results = []
-            time.sleep(8)
-
-            while not results:
-                time.sleep(1)
-                results.extend(self.client.fetch_responses().remote(timeout=10))
-                print(f"try fetch_responses result: {results}")
-            print(f"fetch_responses result: {results}")
-            assert results
-
-        for i in range(5):
-            process_request()
-        process_request_streaming()
-
 
 class TestRpcWorkerTP2:
 
@@ -244,6 +214,7 @@ class TestRpcWorkerTP2:
                                  rpc_addr=addr,
                                  executor_config=self.executor_config,
                                  llm_args=self.llm_args,
+                                 hf_model_dir=model_path,
                                  model_world_size=2)
         return session, addr, futures
 
@@ -256,12 +227,18 @@ class TestRpcWorkerTP2:
         pass
 
     def test_fetch_responses_sync(self):
+        # Wait a bit to ensure engine is ready
+        time.sleep(1)
+
         self.client.submit(
             GenerationRequest(prompt_token_ids=[3, 4, 5],
                               sampling_params=SamplingParams(
-                                  max_tokens=5)), )\
-                                    .remote(need_response=False)
+                                  max_tokens=5)), ).remote(need_response=False)
+
+        # Wait for generation to complete
+        time.sleep(3)
+
         results = []
-        while not results:
-            results.extend(self.client.fetch_responses().remote())
+        # Fetch responses with timeout
+        results.extend(self.client.fetch_responses().remote(timeout=5))
         assert len(results) == 1

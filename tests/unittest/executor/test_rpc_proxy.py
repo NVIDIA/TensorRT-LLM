@@ -3,7 +3,7 @@ import sys
 import time
 
 import pytest
-from test_worker_base import create_fake_executor_config
+from test_base_worker import create_fake_executor_config
 
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
@@ -33,6 +33,7 @@ class TestRpcProxy:
                 "executor_config": None,
                 "llm_args": llm_args,
                 "model_world_size": tp_size,
+                "hf_model_dir": model_path,
             },
             model_world_size=tp_size,
             mpi_session=mpi_session,
@@ -78,4 +79,4 @@ class TestRpcProxy:
 
 
 if __name__ == "__main__":
-    TestRpcProxyTp1().test_tp1()
+    TestRpcProxy().test_tp1(1)
