@@ -1,6 +1,6 @@
 # Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly
 
-*By NVIDIA TensorRT LLM Team and XGrammar Team*
+*By NVIDIA TensorRT LLM Team and the XGrammar Team*
 
 ## Table of Contents
 - [Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly](#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly)
@@ -247,9 +247,9 @@ x = torch.randint(0, 100, (100,), dtype=torch.int64, device='cuda')
 y = torch.zeros(100, x.max(), dtype=torch.int64, device='cuda')
 ```
 
-The other case is that `torch.compile` kernels are called with GIL being held ([Issue 163061](https://github.com/pytorch/pytorch/issues/163061)), although Triton kernels are called with GIL released. Hence, we have to avoid any problematic operations and disable `torch.compile` when using CUDA callback to Python code, until these issues are fixed by PyTorch.
+The other case is that `torch.compile` kernels are called with GIL being held ([Issue 163061](https://github.com/pytorch/pytorch/issues/163061)), although Triton kernels are called with GIL released. Hence, we have to avoid any problematic operators and disable `torch.compile` when using CUDA callback to Python code ([PR 7871](https://github.com/NVIDIA/TensorRT-LLM/pull/7871)), until these issues are fixed by PyTorch.
 
-Another source of risk comes from some runtime components that are implemented in C++ and exposed as Python bindings; they may make CUDA API calls as well. By default, Python bindings do not release GIL. Hence, we swept these Python bindings and released GIL properly in [PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948).
+Another source of risk comes from some runtime components that are implemented in C++ and exposed as Python bindings; they may make CUDA API calls as well. By default, Python bindings do not release GIL. Hence, we swept these Python bindings and released GIL properly ([PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948)).
 
 After all these efforts, the hang issue disappears. It is generally recommended to release the GIL when calling C++ code from Python; even without the context of CUDA callback, this is beneficial for multi-threading performance. However, we acknowledge the limitation that it is difficult to make sure that every such place has been properly handled, and that future code changes do not introduce any risks.
 
