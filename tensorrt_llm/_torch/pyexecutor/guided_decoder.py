@@ -424,6 +424,11 @@ class CapturableGuidedDecoder(GuidedDecoder):
                                                dtype=torch.int32,
                                                pin_memory=True)
 
+        # torch.compile kernels are called with GIL being held;
+        # this could cause deadlock with CUDA callback to Python code.
+        # See: https://github.com/pytorch/pytorch/issues/163061
+        torch.compiler.set_stance("force_eager")
+
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
