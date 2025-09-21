@@ -104,12 +104,7 @@ class CapturedGraph(nn.Module):
             input[:1].repeat_interleave(self.cuda_graph_max_batch_size, dim=0)
             for input in args_batched
         ]
-
-        # truncate input buffers to cuda_graph_max_batch_size
-        inputs_truncated = [
-            in_buffer[: self.cuda_graph_max_batch_size] for in_buffer in self._input_buffers
-        ]
-        args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
+        args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
 
         # capture output once with cuda_graph_max_batch_size to capture output buffers
         with CudaGraphWarmUpPhase():
