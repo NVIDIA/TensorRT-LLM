@@ -396,6 +396,7 @@ class ModelDrafter(Drafter):
         new_tokens_lens = None
         next_draft_tokens = None
         has_draft_tokens = False
+        batch_size = new_tokens.shape[1]
         # Iterate through generation requests and copy tokens based on accepted draft tokens
         for request in scheduled_batch.all_requests():
             idx = request.py_seq_slot
@@ -411,9 +412,8 @@ class ModelDrafter(Drafter):
 
         if has_draft_tokens:
             # We already updated the target state, so the new_tokens_lens should be all ones.
-            new_tokens_lens = torch.ones(scheduled_batch.batch_size,
-                                         device=device)
-            next_draft_tokens = torch.zeros(scheduled_batch.batch_size,
+            new_tokens_lens = torch.ones(batch_size, device=device)
+            next_draft_tokens = torch.zeros(batch_size,
                                             self.max_draft_tokens,
                                             device=device)
 
@@ -438,15 +438,15 @@ class ModelDrafter(Drafter):
         Update target inputs with new draft tokens from sample state.
         """
         if draft_tensors is not None:
-            for request in draft_batch.all_requests():
+            for req_idx, request in enumerate(draft_batch.all_requests()):
                 # Skip prefill requests
                 if target_inputs.next_draft_tokens is None:
                     continue
 
                 # Get the index of the draft/target tokens in the device tensor
-                draft_idx = request.py_seq_slot
+                draft_idx = req_idx if self.use_static_draft_loop else request.py_batch_idx
                 target_idx = req_id_to_old_request[
-                    request.py_request_id].py_seq_slot
+                    request.py_request_id].py_batch_idx
                 target_inputs.new_tokens[draft_position + 1:draft_position +
                                          draft_length + 1, target_idx,
                                          0] = draft_tensors[0:draft_length,
