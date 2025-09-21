@@ -136,6 +136,287 @@ def moe_reduce_add_shared_output(routed_output, shared_output):
     return shared_output + routed_output
 
 
+class DeepseekV3WeightLoader:
+
+    def __init__(self, model, is_draft_model: bool = False):
+        self.model = model
+        self.config = model.config
+        self.model_config = model.model_config
+        self.is_draft_model = is_draft_model
+
+    def load_weights(self, weights: Dict):
+
+        def rename_moe_weight(weights: Dict, rename_rules: Dict):
+            result = {}
+            for key, value in weights.items():
+                new_key = key
+                for old, new in rename_rules.items():
+                    new_key = new_key.replace(old, new)
+                result[new_key] = value
+            return result
+
+        ## Prepare weights for TP
+        def split(v, tp_size, idx, dim=0):
+            if tp_size == 1:
+                return v
+            if len(v.shape) == 1:
+                return torch.chunk(v, tp_size)[idx].contiguous()
+            return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
+
+        def split_matrix_tp(v, tensor_parallel, rank, dim):
+            return split(v, tensor_parallel, rank, dim=dim)
+
+        def load_kv_b_proj_and_k_b_proj_trans(module_name: str,
+                                              is_scale: bool) -> torch.Tensor:
+            weight_name = "weight" if not is_scale else "weight_scale_inv"
+            local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
+            local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
+            local_kv_lora_rank = kv_lora_rank if not is_scale else kv_lora_rank // 128
+
+            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].unflatten(
+                0,
+                [
+                    num_heads,
+                    local_qk_nope_head_dim + local_v_head_dim,
+                ],
+            )
+
+            if not self.model_config.mapping.enable_attention_dp:
+                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
+            k_nope_weight, v_weight = kv_b_proj.split(
+                [local_qk_nope_head_dim, local_v_head_dim],
+                dim=1,
+            )
+            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            local_num_heads = num_heads // weight_divisor
+
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+
+            kv_b_proj = torch.concat([
+                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
+                                      local_kv_lora_rank),
+                v_weight.reshape(local_num_heads * local_v_head_dim,
+                                 local_kv_lora_rank)
+            ],
+                                     dim=0)
+
+            return kv_b_proj, k_nope_weight_trans
+
+        def load_kv_b_proj_and_k_b_proj_trans_dequant(
+                module_name: str) -> torch.Tensor:
+            weight_name = "weight"
+            local_qk_nope_head_dim = qk_nope_head_dim
+            local_v_head_dim = v_head_dim
+            local_kv_lora_rank = kv_lora_rank
+
+            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].cuda()
+
+            weight_name = "weight_scale_inv"
+            kv_b_proj_scale = weights[f"{module_name}.{weight_name}"][:].cuda()
+
+            kv_b_proj = weight_dequant(kv_b_proj, kv_b_proj_scale)
+            kv_b_proj = kv_b_proj.unflatten(
+                0,
+                [
+                    num_heads,
+                    local_qk_nope_head_dim + local_v_head_dim,
+                ],
+            )
+            if not self.model_config.mapping.enable_attention_dp:
+                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
+            k_nope_weight, v_weight = kv_b_proj.split(
+                [local_qk_nope_head_dim, local_v_head_dim],
+                dim=1,
+            )
+            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            local_num_heads = num_heads // weight_divisor
+
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+
+            kv_b_proj = torch.concat([
+                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
+                                      local_kv_lora_rank),
+                v_weight.reshape(local_num_heads * local_v_head_dim,
+                                 local_kv_lora_rank)
+            ],
+                                     dim=0)
+
+            return kv_b_proj, k_nope_weight_trans
+
+        def split_kv_b_proj(kv_b_proj: torch.Tensor,
+                            is_scale: bool) -> torch.Tensor:
+            local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
+            local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
+
+            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            local_num_heads = num_heads // weight_divisor
+
+            k_b_proj, v_b_proj = kv_b_proj.split([
+                local_num_heads * local_qk_nope_head_dim,
+                local_num_heads * local_v_head_dim
+            ],
+                                                 dim=0)
+            k_b_proj = k_b_proj.view(
+                [local_num_heads, local_qk_nope_head_dim, -1])
+            v_b_proj = v_b_proj.view([local_num_heads, local_v_head_dim, -1])
+
+            return k_b_proj, v_b_proj
+
+        is_lite = self.config.q_lora_rank is None
+        num_heads = self.config.num_attention_heads
+        qk_nope_head_dim = self.config.qk_nope_head_dim
+        v_head_dim = self.config.v_head_dim
+        kv_lora_rank = self.config.kv_lora_rank
+
+        tp_rank = self.model_config.mapping.tp_rank
+        tp_size = self.model_config.mapping.tp_size
+
+        params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
+        all_named_modules = dict(self.model.named_modules())
+
+        for name, module in tqdm(all_named_modules.items(),
+                                 desc="Loading weights"):
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            else:
+                names = name.split('.')
+                parent_module_name = '.'.join(names[:-1])
+                if "model.layers" in name and int(
+                        names[2]) >= self.config.num_hidden_layers:
+                    mtp_layer_idx = int(
+                        names[2]) - self.config.num_hidden_layers
+                    names[2] = str(mtp_layer_idx %
+                                   self.config.num_nextn_predict_layers +
+                                   self.config.num_hidden_layers)
+                    name = '.'.join(names)
+                if names[-1] == "kv_b_proj":
+                    # TODO: remove weight_dequant after enabling fp8_bmm
+                    dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
+                        names[-1])
+                    if dequant_kv_b_proj:
+                        kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
+                            name)
+                    else:
+                        kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans(
+                            name, is_scale=False)
+                    module.weight.data.copy_(
+                        kv_b_proj.reshape(module.weight.shape))
+
+                    attn_module = all_named_modules[parent_module_name]
+                    _, v_b_proj = split_kv_b_proj(module.weight.data,
+                                                  is_scale=False)
+                    attn_module.v_b_proj = nn.Parameter(v_b_proj,
+                                                        requires_grad=False)
+
+                    attn_module.k_b_proj_trans.data.copy_(
+                        k_b_proj_trans.reshape(
+                            attn_module.k_b_proj_trans.shape))
+
+                    if getattr(module, "weight_scale",
+                               None) is not None and not dequant_kv_b_proj:
+                        kv_b_proj_scale, k_b_proj_trans_scale = load_kv_b_proj_and_k_b_proj_trans(
+                            name, is_scale=True)
+                        module.weight_scale.copy_(
+                            kv_b_proj_scale.reshape(module.weight_scale.shape))
+                        attn_module.k_b_proj_trans_scale.copy_(
+                            k_b_proj_trans_scale.reshape(
+                                attn_module.k_b_proj_trans_scale.shape))
+
+                        _, v_b_proj_scale = split_kv_b_proj(
+                            module.weight_scale.data, is_scale=True)
+                        attn_module.v_b_proj_scale = nn.Parameter(
+                            v_b_proj_scale, requires_grad=False)
+
+                        if attn_module.k_b_proj_trans_dequant is not None:
+                            attn_module.k_b_proj_trans_dequant.data.copy_(
+                                weight_dequant(
+                                    k_b_proj_trans.view(
+                                        -1, k_b_proj_trans.shape[-1]).cuda(),
+                                    k_b_proj_trans_scale.view(
+                                        -1,
+                                        k_b_proj_trans_scale.shape[-1]).cuda(),
+                                ).view(
+                                    *attn_module.k_b_proj_trans_dequant.shape).
+                                to(attn_module.k_b_proj_trans_dequant.dtype))
+                        if attn_module.v_b_proj_dequant is not None:
+                            attn_module.v_b_proj_dequant.data.copy_(
+                                weight_dequant(
+                                    v_b_proj.view(-1,
+                                                  v_b_proj.shape[-1]).cuda(),
+                                    v_b_proj_scale.view(
+                                        -1, v_b_proj_scale.shape[-1]).cuda(),
+                                ).view(*attn_module.v_b_proj_dequant.shape).to(
+                                    attn_module.v_b_proj_dequant.dtype))
+                elif names[-1] == "kv_a_proj_with_mqa":
+                    fused_a = weights[
+                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
+                    if not is_lite:
+                        q_a_proj = weights[
+                            f"{'.'.join(names[:-1])}.q_a_proj.weight"][:]
+                        fused_a = torch.cat([q_a_proj, fused_a], dim=0)
+
+                    if f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv" in weights:
+                        fused_a_scale = weights[
+                            f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv"]
+                        if not is_lite:
+                            q_a_proj_scale = weights[
+                                f"{'.'.join(names[:-1])}.q_a_proj.weight_scale_inv"][:]
+                            fused_a_scale = torch.cat(
+                                [q_a_proj_scale, fused_a_scale], dim=0)
+
+                        module.weight_scale.data.copy_(fused_a_scale)
+
+                    module.weight.data.copy_(fused_a)
+                elif names[-1] in params_map:
+                    module_weights = []
+                    for new_name in params_map[names[-1]]:
+                        module_weights.append(
+                            filter_weights('.'.join(names[:-1] + [new_name]),
+                                           weights))
+                    module.load_weights(weights=module_weights)
+                elif names[-1] == "experts":
+                    module_weights = filter_weights(name, weights)
+                    module_weights = rename_moe_weight(module_weights, {
+                        "down_proj": "w2",
+                        "up_proj": "w3",
+                        "gate_proj": "w1",
+                    })
+                    module.load_weights(weights=[module_weights])
+                elif names[-1] == "self_attn":
+                    continue
+                elif names[-1] == "next_layer_layernorm":
+                    continue
+                else:
+                    module_weights = filter_weights(name, weights)
+                    if hasattr(module, 'load_weights'):
+                        module.load_weights(weights=[module_weights])
+                    else:
+                        for n, p in module.named_parameters():
+                            p.data.copy_(module_weights[n][:])
+
+                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                ) and is_sm_100f() and hasattr(module, "weight_scale"):
+                    weight, weight_scale = resmooth_to_fp8_e8m0(
+                        module.weight, module.weight_scale)
+                    transfromed_scale = transform_sf_into_required_layout(
+                        weight_scale,
+                        mn=weight.shape[0],
+                        k=weight.shape[1],
+                        recipe=(1, 128, 128),
+                        is_sfa=False)
+                    module.weight = nn.Parameter(weight, requires_grad=False)
+                    module.weight_scale = nn.Parameter(transfromed_scale,
+                                                       requires_grad=False)
+        if not self.is_draft_model:
+            for idx, layer in enumerate(
+                    self.model.model.layers[:self.config.num_hidden_layers]):
+                if idx == self.config.num_hidden_layers - 1:
+                    layer.next_layer_layernorm = self.model.model.norm
+                else:
+                    layer.next_layer_layernorm = self.model.model.layers[
+                        idx + 1].input_layernorm
+
+
 class DeepseekV3MTPHead(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
@@ -304,16 +585,17 @@ class Deepseekv3RoutingImpl():
         self.routed_scaling_factor = routed_scaling_factor
         self.is_fused = is_fused
 
+    @staticmethod
     @torch.compile(options={"max-autotune": True})
-    def get_scores(self, logits, e_score_correction_bias):
+    def get_scores(logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias
         return scores, scores_with_bias
 
     def noaux_tc(self, logits, e_score_correction_bias):
         n_group = self.n_group
-        scores, scores_with_bias = self.get_scores(logits,
-                                                   e_score_correction_bias)
+        scores, scores_with_bias = Deepseekv3RoutingImpl.get_scores(
+            logits, e_score_correction_bias)
         scores_shape = list(scores_with_bias.shape)
 
         if enable_llm_debug():
@@ -522,8 +804,9 @@ class Deepseekv3MoE(nn.Module):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
-    def _compute_shared_expert_tp_size(self, intermediate_size: int,
-                                       block_size: int) -> int:
+    def _compute_shared_expert_tp_size(
+            self, intermediate_size: int,
+            block_size: int) -> tuple[int, float | None]:
         """
         In the case of Deepseek-R1, the TP size of MLP is capped by intermediate_size // block_size.
         For example, when the intermediate_size is 2048 and block scaling size is 128,
@@ -535,7 +818,9 @@ class Deepseekv3MoE(nn.Module):
                 it's 128. For NVFP4, it's 16.
 
         Returns:
-            int: The computed tp_size.
+            tuple[int, float | None]: A tuple containing (shared_tp_size, shared_output_scale).
+                - shared_tp_size: The computed TP size.
+                - shared_output_scale: The output scale factor, or None if not needed.
         """
 
         assert intermediate_size % block_size == 0, "intermediate_size must be divisible by block_size."
@@ -647,9 +932,11 @@ class Deepseekv3MoE(nn.Module):
 
 class DeepseekV3DecoderLayer(DecoderLayer):
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
-                                                       torch.cuda.Stream]):
+    def __init__(self,
+                 model_config: ModelConfig[PretrainedConfig],
+                 layer_idx: int,
+                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+                 is_separate_draft_engine: bool = False):
         super().__init__()
         self.model_config = model_config
         self.config = model_config.pretrained_config
@@ -663,10 +950,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.mapping = model_config.mapping
         mapping = self.mapping
+        layer_idx_for_attention = layer_idx
+        if is_separate_draft_engine:
+            #KVCacheManager only support 1 layer for separate draft engine
+            layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
         self.self_attn = DeepseekV3Attention(
             model_config,
-            layer_idx=layer_idx,
+            layer_idx=layer_idx_for_attention,
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
         self.enable_attention_dp = mapping.enable_attention_dp
 
@@ -984,10 +1275,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
 class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
-                                                       torch.cuda.Stream]):
-        super().__init__(model_config, layer_idx, aux_stream_dict)
+    def __init__(self,
+                 model_config: ModelConfig[PretrainedConfig],
+                 layer_idx: int,
+                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+                 is_separate_draft_engine: bool = False):
+        super().__init__(model_config, layer_idx, aux_stream_dict,
+                         is_separate_draft_engine)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -1203,7 +1497,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                          model_config=model_config)
 
         self.model_nextn = 0
-        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp(
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
         ):
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
@@ -1252,274 +1546,5 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                **kwargs)
 
     def load_weights(self, weights: Dict):
-
-        def rename_moe_weight(weights: Dict, rename_rules: Dict):
-            result = {}
-            for key, value in weights.items():
-                new_key = key
-                for old, new in rename_rules.items():
-                    new_key = new_key.replace(old, new)
-                result[new_key] = value
-            return result
-
-        ## Prepare weights for TP
-        def split(v, tp_size, idx, dim=0):
-            if tp_size == 1:
-                return v
-            if len(v.shape) == 1:
-                return torch.chunk(v, tp_size)[idx].contiguous()
-            else:
-                return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
-
-        def split_matrix_tp(v, tensor_parallel, rank, dim):
-            return split(v, tensor_parallel, rank, dim=dim)
-
-        def load_kv_b_proj_and_k_b_proj_trans(module_name: str,
-                                              is_scale: bool) -> torch.Tensor:
-            weight_name = "weight" if not is_scale else "weight_scale_inv"
-            local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
-            local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
-            local_kv_lora_rank = kv_lora_rank if not is_scale else kv_lora_rank // 128
-
-            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].unflatten(
-                0,
-                [
-                    num_heads,
-                    local_qk_nope_head_dim + local_v_head_dim,
-                ],
-            )
-
-            if not self.model_config.mapping.enable_attention_dp:
-                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
-            k_nope_weight, v_weight = kv_b_proj.split(
-                [local_qk_nope_head_dim, local_v_head_dim],
-                dim=1,
-            )
-            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
-            local_num_heads = num_heads // weight_divisor
-
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
-
-            kv_b_proj = torch.concat([
-                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
-                                      local_kv_lora_rank),
-                v_weight.reshape(local_num_heads * local_v_head_dim,
-                                 local_kv_lora_rank)
-            ],
-                                     dim=0)
-
-            return kv_b_proj, k_nope_weight_trans
-
-        def load_kv_b_proj_and_k_b_proj_trans_dequant(
-                module_name: str) -> torch.Tensor:
-            weight_name = "weight"
-            local_qk_nope_head_dim = qk_nope_head_dim
-            local_v_head_dim = v_head_dim
-            local_kv_lora_rank = kv_lora_rank
-
-            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].cuda()
-
-            weight_name = "weight_scale_inv"
-            kv_b_proj_scale = weights[f"{module_name}.{weight_name}"][:].cuda()
-
-            kv_b_proj = weight_dequant(kv_b_proj, kv_b_proj_scale)
-            kv_b_proj = kv_b_proj.unflatten(
-                0,
-                [
-                    num_heads,
-                    local_qk_nope_head_dim + local_v_head_dim,
-                ],
-            )
-            if not self.model_config.mapping.enable_attention_dp:
-                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
-            k_nope_weight, v_weight = kv_b_proj.split(
-                [local_qk_nope_head_dim, local_v_head_dim],
-                dim=1,
-            )
-            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
-            local_num_heads = num_heads // weight_divisor
-
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
-
-            kv_b_proj = torch.concat([
-                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
-                                      local_kv_lora_rank),
-                v_weight.reshape(local_num_heads * local_v_head_dim,
-                                 local_kv_lora_rank)
-            ],
-                                     dim=0)
-
-            return kv_b_proj, k_nope_weight_trans
-
-        def split_kv_b_proj(kv_b_proj: torch.Tensor,
-                            is_scale: bool) -> torch.Tensor:
-            local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
-            local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
-
-            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
-            local_num_heads = num_heads // weight_divisor
-
-            k_b_proj, v_b_proj = kv_b_proj.split([
-                local_num_heads * local_qk_nope_head_dim,
-                local_num_heads * local_v_head_dim
-            ],
-                                                 dim=0)
-            k_b_proj = k_b_proj.view(
-                [local_num_heads, local_qk_nope_head_dim, -1])
-            v_b_proj = v_b_proj.view([local_num_heads, local_v_head_dim, -1])
-
-            return k_b_proj, v_b_proj
-
-        is_lite = self.config.q_lora_rank is None
-        num_heads = self.config.num_attention_heads
-        qk_nope_head_dim = self.config.qk_nope_head_dim
-        v_head_dim = self.config.v_head_dim
-        kv_lora_rank = self.config.kv_lora_rank
-
-        tp_rank = self.model_config.mapping.tp_rank
-        tp_size = self.model_config.mapping.tp_size
-
-        params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
-        all_named_modules = dict(self.named_modules())
-
-        for name, module in tqdm(all_named_modules.items(),
-                                 desc="Loading weights"):
-            if len(module._parameters) <= 0 or name.startswith("draft_model"):
-                continue
-            else:
-                names = name.split('.')
-                parent_module_name = '.'.join(names[:-1])
-                if "model.layers" in name and int(
-                        names[2]) >= self.config.num_hidden_layers:
-                    mtp_layer_idx = int(
-                        names[2]) - self.config.num_hidden_layers
-                    names[2] = str(mtp_layer_idx %
-                                   self.config.num_nextn_predict_layers +
-                                   self.config.num_hidden_layers)
-                    name = '.'.join(names)
-                if names[-1] == "kv_b_proj":
-                    # TODO: remove weight_dequant after enabling fp8_bmm
-                    dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
-                        names[-1])
-                    if dequant_kv_b_proj:
-                        kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
-                            name)
-                    else:
-                        kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans(
-                            name, is_scale=False)
-                    module.weight.data.copy_(
-                        kv_b_proj.reshape(module.weight.shape))
-
-                    attn_module = all_named_modules[parent_module_name]
-                    _, v_b_proj = split_kv_b_proj(module.weight.data,
-                                                  is_scale=False)
-                    attn_module.v_b_proj = nn.Parameter(v_b_proj,
-                                                        requires_grad=False)
-
-                    attn_module.k_b_proj_trans.data.copy_(
-                        k_b_proj_trans.reshape(
-                            attn_module.k_b_proj_trans.shape))
-
-                    if getattr(module, "weight_scale",
-                               None) is not None and not dequant_kv_b_proj:
-                        kv_b_proj_scale, k_b_proj_trans_scale = load_kv_b_proj_and_k_b_proj_trans(
-                            name, is_scale=True)
-                        module.weight_scale.copy_(
-                            kv_b_proj_scale.reshape(module.weight_scale.shape))
-                        attn_module.k_b_proj_trans_scale.copy_(
-                            k_b_proj_trans_scale.reshape(
-                                attn_module.k_b_proj_trans_scale.shape))
-
-                        _, v_b_proj_scale = split_kv_b_proj(
-                            module.weight_scale.data, is_scale=True)
-                        attn_module.v_b_proj_scale = nn.Parameter(
-                            v_b_proj_scale, requires_grad=False)
-
-                        if attn_module.k_b_proj_trans_dequant is not None:
-                            attn_module.k_b_proj_trans_dequant.data.copy_(
-                                weight_dequant(
-                                    k_b_proj_trans.view(
-                                        -1, k_b_proj_trans.shape[-1]).cuda(),
-                                    k_b_proj_trans_scale.view(
-                                        -1,
-                                        k_b_proj_trans_scale.shape[-1]).cuda(),
-                                ).view(
-                                    *attn_module.k_b_proj_trans_dequant.shape).
-                                to(attn_module.k_b_proj_trans_dequant.dtype))
-                        if attn_module.v_b_proj_dequant is not None:
-                            attn_module.v_b_proj_dequant.data.copy_(
-                                weight_dequant(
-                                    v_b_proj.view(-1,
-                                                  v_b_proj.shape[-1]).cuda(),
-                                    v_b_proj_scale.view(
-                                        -1, v_b_proj_scale.shape[-1]).cuda(),
-                                ).view(*attn_module.v_b_proj_dequant.shape).to(
-                                    attn_module.v_b_proj_dequant.dtype))
-                elif names[-1] == "kv_a_proj_with_mqa":
-                    fused_a = weights[
-                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
-                    if not is_lite:
-                        q_a_proj = weights[
-                            f"{'.'.join(names[:-1])}.q_a_proj.weight"][:]
-                        fused_a = torch.cat([q_a_proj, fused_a], dim=0)
-
-                    if f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv" in weights:
-                        fused_a_scale = weights[
-                            f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight_scale_inv"]
-                        if not is_lite:
-                            q_a_proj_scale = weights[
-                                f"{'.'.join(names[:-1])}.q_a_proj.weight_scale_inv"][:]
-                            fused_a_scale = torch.cat(
-                                [q_a_proj_scale, fused_a_scale], dim=0)
-
-                        module.weight_scale.data.copy_(fused_a_scale)
-
-                    module.weight.data.copy_(fused_a)
-                elif names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        module_weights.append(
-                            filter_weights('.'.join(names[:-1] + [new_name]),
-                                           weights))
-                    module.load_weights(weights=module_weights)
-                elif names[-1] == "experts":
-                    module_weights = filter_weights(name, weights)
-                    module_weights = rename_moe_weight(module_weights, {
-                        "down_proj": "w2",
-                        "up_proj": "w3",
-                        "gate_proj": "w1",
-                    })
-                    module.load_weights(weights=[module_weights])
-                elif names[-1] == "self_attn":
-                    continue
-                elif names[-1] == "next_layer_layernorm":
-                    continue
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module.named_parameters():
-                            p.data.copy_(module_weights[n][:])
-
-                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-                ) and is_sm_100f() and hasattr(module, "weight_scale"):
-                    weight, weight_scale = resmooth_to_fp8_e8m0(
-                        module.weight, module.weight_scale)
-                    transfromed_scale = transform_sf_into_required_layout(
-                        weight_scale,
-                        mn=weight.shape[0],
-                        k=weight.shape[1],
-                        recipe=(1, 128, 128),
-                        is_sfa=False)
-                    module.weight = nn.Parameter(weight, requires_grad=False)
-                    module.weight_scale = nn.Parameter(transfromed_scale,
-                                                       requires_grad=False)
-
-        for idx, layer in enumerate(
-                self.model.layers[:self.config.num_hidden_layers]):
-            if idx == self.config.num_hidden_layers - 1:
-                layer.next_layer_layernorm = self.model.norm
-            else:
-                layer.next_layer_layernorm = self.model.layers[
-                    idx + 1].input_layernorm
+        weight_loader = DeepseekV3WeightLoader(self)
+        weight_loader.load_weights(weights)

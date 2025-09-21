@@ -8,6 +8,7 @@ from build_and_run_ad import ExperimentConfig, main
 
 
 @pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.parametrize("mode", ["graph", "transformers"])
 @pytest.mark.parametrize(
     "experiment_config",
     [
@@ -18,9 +19,10 @@ from build_and_run_ad import ExperimentConfig, main
         ),
     ],
 )
-def test_build_ad(world_size: int, experiment_config: Dict):
+def test_build_ad(world_size: int, experiment_config: Dict, mode: str):
     experiment_config["args"]["world_size"] = world_size
     experiment_config["args"]["runtime"] = "trtllm"  # Default runtime set to trtllm
+    experiment_config["args"]["mode"] = mode
     experiment_config = ExperimentConfig(**experiment_config)
     print(f"Experiment Config: {experiment_config}")
     main(experiment_config)
