@@ -2,6 +2,7 @@ import json
 import os
 
 import pytest
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
@@ -22,8 +23,12 @@ def multimodal_model_config():
     # You can extend this to support multiple models or get from environment
     model_configs = {
         'llava-v1.6-mistral-7b-hf': {
-            'model_name': 'llava-v1.6-mistral-7b-hf',
-            'hf_model_dir': 'llava-hf/llava-v1.6-mistral-7b-hf',
+            'model_name':
+            'llava-v1.6-mistral-7b-hf',
+            'hf_model_dir':
+            'llava-hf/llava-v1.6-mistral-7b-hf',
+            'model_dir':
+            llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf",
         }
     }
 
@@ -47,7 +52,7 @@ def test_single_image_chat(model_key, multimodal_model_config):
         )
 
     # Extract model information from config
-    encoder_model_dir = multimodal_model_config['hf_model_dir']
+    encoder_model_dir = multimodal_model_config['model_dir']
 
     # Test configuration
     max_tokens = 64
