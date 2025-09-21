@@ -135,25 +135,9 @@ class CapturedGraph(nn.Module):
         if self._args_hash != self._get_hash(args_static):
             return self.model(*args, **kwargs)
 
-        # Calculate rounded-up shapes for each input
-        # If any batch size exceeds max cuda_graph_batch_sizes, fall back to regular forward
-        rounded_batch_sizes = [
-            self.round_to_cuda_batch_size(input.shape[0]) for input in args_batched
-        ]
-
-        # If any rounded batch size is None (exceeds max), use regular forward
-        if any(bs is None for bs in rounded_batch_sizes):
-            actual_batch_sizes = [input.shape[0] for input in args_batched]
-            max_cuda_bs = max(self.cuda_graph_batch_sizes) if self.cuda_graph_batch_sizes else 0
-            ad_logger.debug(
-                f"Batch size {actual_batch_sizes} exceeds max CUDA graph batch size {max_cuda_bs}. "
-                f"Falling back to regular forward pass."
-            )
-            return self.model(*args, **kwargs)
-
         rounded_shapes = [
-            (rounded_bs,) + input.shape[1:]
-            for rounded_bs, input in zip(rounded_batch_sizes, args_batched)
+            (self.round_to_cuda_batch_size(input.shape[0]),) + input.shape[1:]
+            for input in args_batched
         ]
         combined_shape = sum(rounded_shapes, start=())
 
