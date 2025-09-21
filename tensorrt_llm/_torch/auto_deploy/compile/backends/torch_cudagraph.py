@@ -104,6 +104,8 @@ class CapturedGraph(nn.Module):
             input[:1].repeat_interleave(self.cuda_graph_max_batch_size, dim=0)
             for input in args_batched
         ]
+
+        # create new args, kwargs with the input buffers and static args
         args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
 
         # capture output once with cuda_graph_max_batch_size to capture output buffers
@@ -116,11 +118,13 @@ class CapturedGraph(nn.Module):
         # capture graph now for a range of batch sizes
         for bs in self.cuda_graph_batch_sizes:
             ad_logger.info(f"Capturing graph for batch size: {bs}")
-            # Truncate inputs to current batch size
-            inputs_bs = [in_buffer[:bs] for in_buffer in self._input_buffers]
-            args_bs, kwargs_bs = self._in_spec.unflatten(inputs_bs + args_static)
-            combined_shape = sum((input.shape for input in inputs_bs), start=())
-            self.graphs[combined_shape] = self._capture_one_graph(*args_bs, **kwargs_bs)
+
+            # setup args, kwargs
+            inputs_truncated = [in_buffer[:bs] for in_buffer in self._input_buffers]
+            args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
+            # capture graph for truncated inputs
+            combined_shape = sum((input.shape for input in inputs_truncated), start=())
+            self.graphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
