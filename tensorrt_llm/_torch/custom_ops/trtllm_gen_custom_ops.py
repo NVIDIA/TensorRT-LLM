@@ -1457,7 +1457,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
     def __init__(self, num_experts: int, top_k: int, n_group: Optional[int],
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
-                 routed_scaling_factor: Optional[float], tile_tokens_dim: int,
+                 routed_scaling_factor: Optional[float],
                  routing_method_type: int, do_finalize: bool, act_type: int):
 
         self.num_experts = num_experts
@@ -1468,27 +1468,12 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         self.local_expert_offset = local_expert_offset
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
-        self.tile_tokens_dim = tile_tokens_dim
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
         self.act_type = act_type
 
         FP8FP4BlockScaleMoERunner.tuning_config = FP8FP4BlockScaleMoERunner.get_tuning_config(
         )
-
-        instance_key = (
-            self.top_k,
-            self.intermediate_size,
-            self.local_num_experts,
-            self.tile_tokens_dim,
-        )
-
-        if instance_key not in FP8FP4BlockScaleMoERunner.runner_dict:
-            FP8FP4BlockScaleMoERunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP8FP4BlockScaleMoERunner(
-                    tile_tokens_dim, self.act_type)
-
-        self.kernel_runner = FP8FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     # The hash is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2
@@ -1498,7 +1483,6 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             self.top_k,
             self.intermediate_size,
             self.local_num_experts,
-            self.tile_tokens_dim,
             self.act_type,
         ))
 
@@ -1510,8 +1494,24 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         return (self.top_k == other.top_k
                 and self.intermediate_size == other.intermediate_size
                 and self.local_num_experts == other.local_num_experts
-                and self.tile_tokens_dim == other.tile_tokens_dim
                 and self.act_type == other.act_type)
+
+    def get_runner(
+        self,
+        num_tokens: int,
+    ):
+        num_tokens = min(last_positive_power_of_2(num_tokens), 4096)
+        tile_tokens_dim = calculate_tile_tokens_dim(
+            num_tokens,
+            self.num_experts,
+            self.top_k,
+        )
+        instance_key = (tile_tokens_dim, )
+        if instance_key not in FP8FP4BlockScaleMoERunner.runner_dict:
+            FP8FP4BlockScaleMoERunner.runner_dict[
+                instance_key] = torch.classes.trtllm.FP8FP4BlockScaleMoERunner(
+                    tile_tokens_dim, self.act_type)
+        return FP8FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
         self,
@@ -1519,9 +1519,10 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
 
+        kernel_runner = self.get_runner(inputs[0].shape[0])
         args = FP8FP4BlockScaleMoEInputs(*inputs)
 
-        return self.kernel_runner.run_moe(
+        return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.gemm1_weights, args.gemm1_weights_scale, args.gemm2_weights,
             args.gemm2_weights_scale, args.output1_scale_scalar,
@@ -1540,10 +1541,15 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
         hidden_size = args.hidden_states.shape[1]
 
-        tactics = self.kernel_runner.get_valid_configs(self.top_k, hidden_size,
-                                                       self.intermediate_size,
-                                                       self.local_num_experts,
-                                                       num_tokens)
+        kernel_runner = self.get_runner(num_tokens)
+
+        tactics = kernel_runner.get_valid_configs(
+            self.top_k,
+            hidden_size,
+            self.intermediate_size,
+            self.local_num_experts,
+            num_tokens,
+        )
 
         return tactics
 
@@ -1622,35 +1628,45 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
 @torch.library.custom_op("trtllm::fp8_fp4_block_scale_moe_runner",
                          mutates_args=())
-def fp8_fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
-                                   routing_bias: Optional[torch.Tensor],
-                                   hidden_states: torch.Tensor,
-                                   gemm1_weights: torch.Tensor,
-                                   gemm1_weights_scale: torch.Tensor,
-                                   gemm2_weights: torch.Tensor,
-                                   gemm2_weights_scale: torch.Tensor,
-                                   output1_scale_scalar: torch.Tensor,
-                                   output1_scale_gate_scalar: torch.Tensor,
-                                   output2_scale_scalar: torch.Tensor,
-                                   num_experts: int, top_k: int,
-                                   n_group: Optional[int],
-                                   topk_group: Optional[int],
-                                   intermediate_size: int,
-                                   local_expert_offset: int,
-                                   local_num_experts: int,
-                                   routed_scaling_factor: Optional[float],
-                                   routing_method_type: int, do_finalize: bool,
-                                   act_type: int) -> List[torch.Tensor]:
+def fp8_fp4_block_scale_moe_runner(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    do_finalize: bool,
+    act_type: int,
+) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
 
-    num_tokens = hidden_states.shape[0]
-    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
-
     kernel_runner = FP8FP4BlockScaleMoERunner(
-        num_experts, top_k, n_group, topk_group, intermediate_size,
-        local_expert_offset, local_num_experts, routed_scaling_factor,
-        tile_tokens_dim, routing_method_type, do_finalize, act_type)
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        do_finalize,
+        act_type,
+    )
 
     inputs = [
         routing_logits,
@@ -1666,7 +1682,7 @@ def fp8_fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
     ]
 
     _, best_tactic = tuner.choose_one(
-        "trtllm::fp4_block_scale_moe_runner",
+        "trtllm::fp8_fp4_block_scale_moe_runner",
         [kernel_runner],
         kernel_runner.tuning_config,
         inputs,
@@ -1675,20 +1691,14 @@ def fp8_fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
     return kernel_runner(inputs, tactic=best_tactic)
 
 
-@fp8_fp4_block_scale_moe_runner.register_fake
-def _(routing_logits, routing_bias, hidden_states, gemm1_weights,
-      gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
-      output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
-      num_experts, top_k, n_group, topk_group, intermediate_size,
-      local_expert_offset, local_num_experts, routed_scaling_factor,
-      routing_method_type, do_finalize, act_type) -> List[torch.Tensor]:
+def fp8_fp4_block_scale_fake_output_without_finalize(
+    hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
+    num_experts: int,
+    top_k: int,
+    routing_bias: Optional[torch.Tensor],
+):
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1]
-    if do_finalize:
-        return [
-            hidden_states.new_empty((num_tokens, hidden_size),
-                                    dtype=torch.bfloat16)
-        ]
 
     tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
 
@@ -1703,3 +1713,43 @@ def _(routing_logits, routing_bias, hidden_states, gemm1_weights,
         hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
         hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
     ]
+
+
+@fp8_fp4_block_scale_moe_runner.register_fake
+def _(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights,
+    gemm2_weights_scale,
+    output1_scale_scalar,
+    output1_scale_gate_scalar,
+    output2_scale_scalar,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor,
+    routing_method_type,
+    do_finalize,
+    act_type,
+) -> List[torch.Tensor]:
+    if do_finalize:
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1]
+        return [
+            hidden_states.new_empty((num_tokens, hidden_size),
+                                    dtype=torch.bfloat16)
+        ]
+
+    return fp8_fp4_block_scale_fake_output_without_finalize(
+        hidden_states,
+        num_experts,
+        top_k,
+        routing_bias,
+    )
