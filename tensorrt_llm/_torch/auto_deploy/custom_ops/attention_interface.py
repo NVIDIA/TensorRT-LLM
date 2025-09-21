@@ -704,6 +704,10 @@ class SequenceInfo:
             free_slot_idx = self._get_unique_value(set(slot_idx), self.max_batch_size)
             self._store_arg("slot_idx", slot_idx, reset_val=free_slot_idx)
 
+        # check for updated slot_idx
+        if slot_idx is not None:
+            self._store_arg("slot_idx", slot_idx)
+
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
         self._store_arg("input_ids", self._flatten(input_ids))
