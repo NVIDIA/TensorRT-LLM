@@ -758,7 +758,7 @@ def main(*,
                     clear_folder(ucx_dir)
                 install_tree("/usr/local/ucx/lib", ucx_dir, dirs_exist_ok=True)
                 build_run(
-                    f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
+                    f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
                 )
         if os.path.exists(
                 build_dir /
@@ -782,7 +782,7 @@ def main(*,
                     nixl_lib_path = "/opt/nvidia/nvda_nixl/lib64"
                 install_tree(nixl_lib_path, nixl_dir, dirs_exist_ok=True)
                 build_run(
-                    f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/nixl:$ORIGIN/../\' {{}} \\;"
+                    f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
                 )
         install_file(
             build_dir /
