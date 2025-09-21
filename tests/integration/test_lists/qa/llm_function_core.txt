@@ -595,6 +595,7 @@ accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4::test_fp8
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen2_VL_7B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestNano_V2_VLM::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
 accuracy/test_llm_api_pytorch.py::TestMistralNemo12B::test_auto_dtype
@@ -649,9 +650,11 @@ test_e2e.py::test_ptp_quickstart_multimodal[mistral-small-3.1-24b-instruct-Mistr
 test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-False]
 test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-True]
 test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-0.8-image]
+test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-0.8-image]
 test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-0.8-image]
 test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-0.8-video]
 test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-0.8-image]
+test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[phi4-multimodal-instruct-multimodals/Phi-4-multimodal-instruct-0.8-image]
 test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-0.8-video]
 test_e2e.py::test_ptp_quickstart_multimodal_chunked_prefill[qwen2.5-vl-7b-instruct-Qwen2.5-VL-7B-Instruct-0.8-image]
 test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[audio]

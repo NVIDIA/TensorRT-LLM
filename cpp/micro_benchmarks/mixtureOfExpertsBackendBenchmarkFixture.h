@@ -549,6 +549,9 @@ public:
     ActivationType mActType = ActivationType::Relu;
 
     constexpr static int64_t NUM_BUFFERS = 32;
+    int64_t mNumWorkspaceBuffers = NUM_BUFFERS;
+    int64_t mNumInputBuffers = NUM_BUFFERS;
+    int64_t mNumGemmProfilerBuffers = NUM_BUFFERS;
 
     std::array<QuantParams, NUM_BUFFERS> mQuantParams{};
     bool mUseLora = false;
@@ -619,12 +622,12 @@ public:
 
         if (gemm_to_profile == GemmToProfile::LAYER)
         {
-
             mWorkspaceSize = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
                 mActType, parallelism_config, mUseLora, /*use_deepseek_fp8_block_scale=*/false,
                 /*min_latency_mode=*/false, mUsePrequantScale);
 
-            mWorkspace = allocBuffer<char>(mWorkspaceSize * NUM_BUFFERS);
+            mNumWorkspaceBuffers = mWorkspaceSize > 1024 * 1024 * 1024 ? 2 : NUM_BUFFERS;
+            mWorkspace = allocBuffer<char>(mWorkspaceSize * mNumWorkspaceBuffers);
 
             mExpertBias1 = nullptr;
             mExpertBias2 = nullptr;
@@ -690,9 +693,10 @@ public:
             mScaleProbsSize = padSize(mTotalTokens * mK);
             mScaleProbs = allocBuffer<float>(mScaleProbsSize * NUM_BUFFERS);
             mInputTensorSize = padSize(mTotalTokens * mHiddenSize);
-            mInputTensor = allocBuffer<DataType>(mInputTensorSize * NUM_BUFFERS);
+            mNumInputBuffers = mInputTensorSize > 1024 * 1024 * 1024 ? 2 : NUM_BUFFERS;
+            mInputTensor = allocBuffer<DataType>(mInputTensorSize * mNumInputBuffers);
             mFinalOutputSize = padSize(mTotalTokens * mHiddenSize);
-            mFinalOutput = allocBuffer<OutputType>(mFinalOutputSize * NUM_BUFFERS);
+            mFinalOutput = allocBuffer<OutputType>(mFinalOutputSize * mNumInputBuffers);
 
             mSourceToExpandedMapSize = padSize(mTotalTokens * mK);
             mSourceToExpandedMap = allocBuffer<int>(mSourceToExpandedMapSize * NUM_BUFFERS);
@@ -732,10 +736,11 @@ public:
                 = std::max(mGemmProfilerWorkspaceSize, mGemmProfilerBackend.getWorkspaceSize(mTotalTokens));
         }
 
-        int64_t num_gemm_buffers = gemm_to_profile == GemmToProfile::LAYER ? 1 : NUM_BUFFERS;
         mGemmProfilerWorkspaceSize = padSize(mGemmProfilerWorkspaceSize);
+        mNumGemmProfilerBuffers = mGemmProfilerWorkspaceSize > 1024 * 1024 * 1024 ? 2 : NUM_BUFFERS;
+        mNumGemmProfilerBuffers = gemm_to_profile == GemmToProfile::LAYER ? 1 : mNumGemmProfilerBuffers;
         mGemmProfilerWorkspace = mGemmProfilerWorkspaceSize > 0
-            ? allocBuffer<char>(mGemmProfilerWorkspaceSize * num_gemm_buffers)
+            ? allocBuffer<char>(mGemmProfilerWorkspaceSize * mNumGemmProfilerBuffers)
             : nullptr;
 
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
@@ -748,7 +753,8 @@ public:
         mGemmProfilerBackend.mGemmToProfile = static_cast<GemmProfilerBackend::GemmToProfile>(gemm_to_profile);
         auto* expert_weights = gemm_to_profile == GemmToProfile::GEMM_1 ? mExpertWeight1 : mExpertWeight2;
         auto expert_weights_size = gemm_to_profile == GemmToProfile::GEMM_1 ? mExpertWeight1Size : mExpertWeight2Size;
-        mGemmProfilerBackend.prepare(mTotalTokens, mGemmProfilerWorkspace + mGemmProfilerWorkspaceSize * mBufferIndex,
+        mGemmProfilerBackend.prepare(mTotalTokens,
+            mGemmProfilerWorkspace + mGemmProfilerWorkspaceSize * (mBufferIndex % mNumGemmProfilerBuffers),
             /*expert_weights=*/expert_weights + expert_weights_size * mBufferIndex, streamPtr->get());
     }
 
@@ -865,7 +871,7 @@ public:
                 }
 
                 // Profile all samples or for 1 sec
-                int const max_iters = mGemmProfilerBackend.NUM_ROUTING_SAMPLES;
+                int const max_iters = mGemmProfilerBackend.NUM_ROUTING_SAMPLES * 2;
                 float const max_time_ms = 1000.f;
 
                 float time = 0.f;
@@ -974,7 +980,7 @@ public:
             }
             mGemmProfilerBackend.mSampleIndex = mBufferIndex % mGemmProfilerBackend.NUM_ROUTING_SAMPLES;
             mGemmProfilerBackend.runProfiler(mTotalTokens, tactics,
-                mGemmProfilerWorkspace + mGemmProfilerWorkspaceSize * mBufferIndex,
+                mGemmProfilerWorkspace + mGemmProfilerWorkspaceSize * (mBufferIndex % mNumGemmProfilerBuffers),
                 /*expert_weights=*/expert_weights + expert_weights_size * mBufferIndex, streamPtr->get());
             break;
         }
@@ -983,26 +989,28 @@ public:
             auto stream = streamPtr->get();
             MoeMinLatencyParams min_latency_params;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-            mMoERunner.runMoe(mInputTensor + mInputTensorSize * mBufferIndex, nullptr, true,
+            mMoERunner.runMoe(mInputTensor + mInputTensorSize * (mBufferIndex % mNumInputBuffers), nullptr, true,
                 mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
                 mUseFinalScale ? mScaleProbs + mScaleProbsSize * mBufferIndex : nullptr,
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
                 ActivationParams(mActType), mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
                 mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
-                mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
-                mFinalOutput + mFinalOutputSize * mBufferIndex,
+                mHiddenSize, mInterSize, mNumExperts, mK,
+                mWorkspace + mWorkspaceSize * (mBufferIndex % mNumWorkspaceBuffers),
+                mFinalOutput + mFinalOutputSize * (mBufferIndex % mNumInputBuffers),
                 mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config,
                 /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
                 /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
 #else
-            mMoERunner.runMoe(mInputTensor + mInputTensorSize * mBufferIndex, nullptr, true,
+            mMoERunner.runMoe(mInputTensor + mInputTensorSize * (mBufferIndex % mNumInputBuffers), nullptr, true,
                 mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
                 mUseFinalScale ? mScaleProbs + mScaleProbsSize * mBufferIndex : nullptr,
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
                 ActivationParams(mActType), mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
                 mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
-                mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
-                mFinalOutput + mFinalOutputSize * mBufferIndex,
+                mHiddenSize, mInterSize, mNumExperts, mK,
+                mWorkspace + mWorkspaceSize * (mBufferIndex % mNumWorkspaceBuffers),
+                mFinalOutput + mFinalOutputSize * (mBufferIndex % mNumInputBuffers),
                 mSourceToExpandedMap + mSourceToExpandedMapSize * mBufferIndex, parallelism_config,
                 /*enable_alltoall=*/false, mUseLora, mLoraParams[mBufferIndex],
                 /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
