@@ -1,30 +1,38 @@
 import torch  # noqa
 import torch.export as te
 from torch.export import Dim  # noqa
-import pytest
+
+# import pytest
 from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device  # noqa
 
 MODEL_DIR = "ibm-ai-platform/Bamba-9B-v2"
+# NOTE: find example inputs with the same tokenization length to avoid seq concat.
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
+# EXAMPLE_INPUT = "Boa is a snake with the following properties:"
+EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 
 
-@pytest.mark.parametrize(
-    "model_on_meta_during_export",
-    [
-        True,
-        # False,
-    ],
-)
-@pytest.mark.parametrize(
-    "export_func",
-    [
-        "torch_export_to_gm",
-        # "torch_export",
-    ],
-)
-def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
+# @pytest.mark.parametrize(
+#     "model_on_meta_during_export",
+#     [
+#         True,
+#         False,
+#     ],
+# )
+# @pytest.mark.parametrize(
+#     "export_func",
+#     [
+#         "torch_export_to_gm",
+#         "torch_export",
+#     ],
+# )
+def test_bamba_patches(
+    model_on_meta_during_export: bool = True,
+    export_func: str = "torch_export_to_gm",
+    use_cache: bool = True,
+):
     llm_args = AutoDeployConfig(
         **{
             "model": MODEL_DIR,
@@ -34,9 +42,10 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
             "attn_backend": "flashinfer",
             "model_factory": "AutoModelForCausalLM",
             "model_kwargs": {
-                "use_cache": False,
+                # "use_cache": True,
+                "use_cache": use_cache,
                 "torch_dtype": "bfloat16",
-                "num_hidden_layers": 10,
+                # "num_hidden_layers": 10,
             },
             "max_seq_len": 512,
             "skip_loading_weights": False,
@@ -102,6 +111,9 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
 
     factory.load_or_random_init(model, device="cuda")
 
+    _verify_generation(factory, model, tokenizer)
+    # return
+
     print("====== EXPORTING GRAPH MODULE ======")
     if not model_on_meta_during_export:
         gm = _run_export()
@@ -111,8 +123,6 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
 
     # let's do a comparison of every state dict item between the model and the gm
     torch.testing.assert_close(model.state_dict(), gm.state_dict(), rtol=0.0, atol=0.0)
-
-    _verify_generation(factory, model, tokenizer)
 
     outputs_for_comparison = {}
     with torch.inference_mode():
@@ -144,20 +154,27 @@ def test_bamba_patches(model_on_meta_during_export: bool, export_func: str):
             print(f"{comp=}")
 
 
-# NOTE: remember to augment `_simple_forward` to pass `*args, **kwargs`.
 def _verify_generation(factory, model, tokenizer):
-    # print("====== WITHOUT PATCH ======")
-    # _generate(tokenizer, model)
+    print("====== WITHOUT PATCH ======")
+    _generate(tokenizer, model)
     with apply_export_patches(patch_list=["bamba"]):
         print("====== WITH PATCH ======")
         _generate(tokenizer, model)
 
 
 def _generate(tokenizer, model):
-    message = [EXAMPLE_INPUT]
-    inputs = tokenizer(message, return_tensors="pt", return_token_type_ids=False).to(model.device)
+    messages = [
+        EXAMPLE_INPUT,
+        EXAMPLE_INPUT2,
+    ]
+    for msg in messages:
+        num_tokens = tokenizer(
+            msg, return_tensors="pt", return_token_type_ids=False
+        ).input_ids.shape[1]
+        print(f"{msg=}, {num_tokens=}")
+    inputs = tokenizer(messages, return_tensors="pt", return_token_type_ids=False).to(model.device)
     response = model.generate(**inputs, max_new_tokens=64)
-    print(tokenizer.batch_decode(response, skip_special_tokens=True)[0])
+    print("\n".join(tokenizer.batch_decode(response, skip_special_tokens=True)))
 
 
 # def _get_example_inputs(llm_args, factory, device):
@@ -170,3 +187,7 @@ def _generate(tokenizer, model):
 #             inputs[key] = value.to(device=device, dtype=dtype)
 #
 #     return inputs
+
+
+if __name__ == "__main__":
+    test_bamba_patches()

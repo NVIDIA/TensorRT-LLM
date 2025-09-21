@@ -114,6 +114,7 @@ class DemoEngine(ADEngine):
             input_ids=input_ids,
             input_pos=0,
             page_assignments=self._assign_pages(total_lens),
+            slot_idx=list(range(len(input_ids))),
             **extra_args,
         )
 

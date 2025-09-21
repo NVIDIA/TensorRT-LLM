@@ -71,6 +71,8 @@ class SequenceInfo:
     - pages_per_seq: [ps_0, ps_1, ..., ps_{b-1}] where ps_i is the number of pages allocated for
       sequence i. Note that, for example, cache_loc[p_0:p_1] will correspond to the pages associated
       with sequence 1 in the batch.
+    - slot_idx: [s_0, s_1, ..., s_{b-1}]
+      Corresponds to the slot index of each sequence in the batch.
 
     ################################################################################################
 
@@ -157,6 +159,7 @@ class SequenceInfo:
             "input_pos": torch.empty(self.max_batch_size, dtype=torch.int),
             "cache_loc": torch.empty(self.num_pages, dtype=torch.int),
             "pages_per_seq": torch.empty(self.max_batch_size, dtype=torch.int),
+            "slot_idx": torch.empty(self.max_batch_size, dtype=torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             "_gather_idx": torch.empty(self.max_num_tokens, dtype=torch.int),
         }
@@ -165,7 +168,8 @@ class SequenceInfo:
         }
         # NOTE: order of keys is relevant here!
         self._uncached_arg_names = ("input_ids", "position_ids")
-        self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq")
+        self._cached_arg_names = ("seq_len", "input_pos", "cache_loc", "pages_per_seq", "slot_idx")
+        self._cached_constants = ("page_size",)
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
@@ -289,7 +293,7 @@ class SequenceInfo:
         ``insert_cached_attention`` to extract the constant arguments and add them to the
         ``prepare_metadata`` node/op.
         """
-        return (self.page_size,)
+        return tuple(getattr(self, k) for k in self._cached_constants)
 
     @property
     def named_dynamic_shapes(self) -> Dict[str, Dict[str, Dim]]:
@@ -516,11 +520,15 @@ class SequenceInfo:
         cache_loc = list(range(sum(pages_per_seq)))
         page_assignments = self._get_page_assignments(cache_loc, pages_per_seq)
 
+        # vanilla slot indices
+        slot_idx = list(range(len(input_ids)))
+
         self.nest_sequences(
             input_ids,
             position_ids,  # will be auto-inferred if None
             input_pos=0,  # no cache history
             page_assignments=page_assignments,  # vanilla page assignments
+            slot_idx=slot_idx,  # vanilla slot indices
             **extra_args,
         )
 
@@ -601,6 +609,7 @@ class SequenceInfo:
         position_ids: Optional[Sequence[Sequence[int]]] = None,
         input_pos: Optional[Union[Sequence[int], int]] = None,
         page_assignments: Optional[Sequence[Sequence[int]]] = None,
+        slot_idx: Optional[Sequence[int]] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
@@ -610,6 +619,7 @@ class SequenceInfo:
             position_ids: List of sequences of position_ids for each token.
             input_pos: Absolute starting position in the cache for each sequence.
             page_assignments: List of sequences of page assignments for each sequence.
+            slot_idx: List of slot indices for each sequence.
             extra_args: Extra arguments to be stored in the interface.
 
         This i/f will ensure that all sequence info args are updated accordingly.
@@ -635,6 +645,10 @@ class SequenceInfo:
             )
             self._store_arg("cache_loc", cache_loc)
             self._store_arg("pages_per_seq", pages_per_seq)
+
+        # check for updated slot_idx
+        if slot_idx is not None:
+            self._store_arg("slot_idx", slot_idx)
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
@@ -737,6 +751,7 @@ class PrepareMetadataCallable(Protocol):
         input_pos: torch.Tensor,
         cache_loc: torch.Tensor,
         pages_per_seq: torch.Tensor,
+        slot_idx: torch.Tensor,
         page_size: int,
     ) -> List[torch.Tensor]: ...
 
@@ -822,6 +837,9 @@ class AttentionDescriptor(ABC):
             seq_len: torch.Tensor,
             input_pos: torch.Tensor,
             cache_loc: torch.Tensor,
+            pages_per_seq: torch.Tensor,
+            slot_idx: torch.Tensor,
+            page_size: int,
         ) -> List[torch.Tensor]: ...
         ```
         The metadata should contain all necessary global information required for the underlying

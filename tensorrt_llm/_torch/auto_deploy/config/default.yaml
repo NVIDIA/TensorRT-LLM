@@ -121,6 +121,12 @@ transforms:
   insert_cached_mla_attention:
     stage: cache_init
     attn_backend: MultiHeadLatentAttention
+  insert_cached_ssm_attention:
+    stage: cache_init
+    attn_backend: torch_ssm
+  insert_cached_causal_conv:
+    stage: cache_init
+    attn_backend: torch_causal_conv
   initialize_cache:
     stage: cache_init
   resize_kv_cache:
