@@ -18,7 +18,7 @@ def tiny_llama_details():
     return model_path_or_name, model_name, model_path
 
 
-def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
+def run_benchmark(model_name: str, dataset_path: str, extra_llm_api_options_path: str):
     runner = CliRunner()
 
     args = [
@@ -30,7 +30,7 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
         "--dataset",
         dataset_path,
         "--extra_llm_api_options",
-        f"{temp_dir}/model_kwargs.yaml",
+        f"{extra_llm_api_options_path}",
     ]
     result = runner.invoke(main, args, catch_exceptions=False)
     assert result.exit_code == 0
@@ -77,7 +77,8 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str):
 def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
     model_path_or_name, model_name, model_path = tiny_llama_details()
     with tempfile.TemporaryDirectory() as temp_dir:
-        with open(f"{temp_dir}/extra_llm_api_options.yaml", "w") as f:
+        extra_llm_api_options_path = f"{temp_dir}/extra_llm_api_options.yaml"
+        with open(extra_llm_api_options_path, "w") as f:
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": 2},
@@ -89,4 +90,4 @@ def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
             )
 
         dataset_path = prepare_dataset(llm_root, temp_dir, model_path_or_name)
-        run_benchmark(model_name, dataset_path, temp_dir)
+        run_benchmark(model_name, dataset_path, extra_llm_api_options_path)
