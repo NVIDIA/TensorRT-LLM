@@ -289,7 +289,6 @@ triton_server/test_triton.py::test_python_bls_unit_tests[python-bls-unit-tests] 
 triton_server/test_triton.py::test_mistral_ib[mistral-ib] SKIP (https://nvbugs/5477399)
 triton_server/test_triton.py::test_eagle[eagle] SKIP (https://nvbugs/5477378)
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora] SKIP (https://nvbugs/5477421)
-unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[pp1-ep4-enable_adp-enable_graph-tp8-trtllm-scout] SKIP (https://nvbugs/5477730)
 test_e2e.py::test_openai_chat_example[trt] SKIP (https://nvbugs/5477444)
 examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5448462)
 examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:8-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5448462)
