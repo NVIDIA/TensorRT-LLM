@@ -1,22 +1,32 @@
 import os
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
                                  KvCacheConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
+@pytest.fixture(scope="function")
+def enforce_single_worker(monkeypatch):
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    yield
+
+
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.high_cuda_memory
-def test_dynamic_spec_decode(disable_overlap_scheduler: bool):
+def test_dynamic_spec_decode(enforce_single_worker,
+                             disable_overlap_scheduler: bool):
+    # mock_should_use_spec_decode doesn't work with multiple processes,
+    # so we use the enforce_single_worker fixture to set the environment variable.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
@@ -51,32 +61,42 @@ def test_dynamic_spec_decode(disable_overlap_scheduler: bool):
         eagle3_one_model=False,
     )
 
-    # Mock should_use_spec_decode to return True for first two calls, then False
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+    sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
+    # Output tests
+    prompts = [
+        "The president of the United States is",
+    ]
+    sampling_params = SamplingParams(max_tokens=20, temperature=0)
+
+    # Mock should_use_spec_decode to turn on/off spec decode dynamically.
     def mock_should_use_spec_decode(requests, max_batch_size, max_num_tokens,
                                     max_draft_len):
-        if not hasattr(mock_should_use_spec_decode, 'call_count'):
-            mock_should_use_spec_decode.call_count = 0
-        mock_should_use_spec_decode.call_count += 1
-        return mock_should_use_spec_decode.call_count <= 2
+        for req in requests:
+            if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                continue
+
+            mock_should_use_spec_decode.call_count += 1
+            # Turn off spec decode when we've called it 5 times.
+            # In the current case, at the 5th call, there are 2 accepted draft tokens,
+            # so we can have better coverage for the switching between spec decode on and off.
+            if mock_should_use_spec_decode.call_count > 5:
+                return False
+        return True
+
+    # Create a Mock object with the mock function as side_effect
+    mock_should_use_spec_decode = Mock(side_effect=mock_should_use_spec_decode)
+    # Reset mock state before using it
+    mock_should_use_spec_decode.reset_mock()
+    mock_should_use_spec_decode.call_count = 0
 
     with patch(
             'tensorrt_llm._torch.speculative.model_drafter.ModelDrafter.should_use_spec_decode',
-            side_effect=mock_should_use_spec_decode):
-        llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-        sampling_params = SamplingParams(max_tokens=128, temperature=0)
-
-        # Output tests
-        prompts = [
-            "The capital of France is",
-            "The president of the United States is",
-        ]
-        sampling_params = SamplingParams(max_tokens=10, temperature=0)
-
+            mock_should_use_spec_decode):
         results_spec = llm_spec.generate(prompts, sampling_params)
-        generated_text_spec = [
-            result.outputs[0].text for result in results_spec
-        ]
-        llm_spec.shutdown()
+    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.shutdown()
 
     llm_ref = LLM(**llm_common_config)
     results_ref = llm_ref.generate(prompts, sampling_params)
