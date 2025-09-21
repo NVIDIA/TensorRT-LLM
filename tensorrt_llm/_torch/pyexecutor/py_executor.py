@@ -1812,6 +1812,8 @@ class PyExecutor:
                         request, cache_block_ids):
                     self.resource_manager.free_resources(request)
         else:
+            if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa and request.is_context_only_request:
+                self.kv_cache_manager.pin_blocks(request.py_request_id)
             self.resource_manager.free_resources(request)
 
     @nvtx_range("_handle_canceled_requests")
@@ -1920,7 +1922,7 @@ class PyExecutor:
                     request_done = request.is_finished
                     new_responses.append((req_id, response))
 
-            if request_done:
+            if request_done or request.is_disagg_context_complete_state:
                 if request.is_disagg_context_transmission_state:
                     if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
                         requests_to_terminate.append(request)
@@ -1942,7 +1944,7 @@ class PyExecutor:
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
         for request, block_id in self.ctx_in_transmission_requests[:]:
-            if request.is_disagg_context_complete_state and request.is_finished:
+            if request.is_disagg_context_complete_state:
                 if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
                     self._terminate_request(request)
                 else:

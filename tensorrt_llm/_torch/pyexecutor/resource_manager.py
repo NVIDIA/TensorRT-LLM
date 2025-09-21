@@ -1011,6 +1011,9 @@ class KVCacheManager(BaseResourceManager):
         else:
             return blocks_per_window, max_seq_len, max_attention_window_vec
 
+    def pin_blocks(self, request_id: int):
+        self.impl.pin_blocks(request_id)
+
     def _set_temp_attention_window_inputs(
             self) -> Optional[TempAttentionWindowInputs]:
         """

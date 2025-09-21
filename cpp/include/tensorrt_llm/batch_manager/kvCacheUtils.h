@@ -40,14 +40,6 @@ public:
         return BlockRange(cacheManager, blockIds, requestId);
     }
 
-    static BlockRange fromNewlyAllocatedBlockIds(
-        BaseKVCacheManager const& cacheManager, LlmRequest::RequestIdType requestId)
-    {
-        auto const windowSize = firstWindowSize(cacheManager);
-        auto const blockIds = cacheManager.getNewlyAllocatedBlockIds(requestId, windowSize);
-        return BlockRange(cacheManager, blockIds, requestId);
-    }
-
     static BlockRange fromReuseTree(
         BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
     {
@@ -62,11 +54,11 @@ public:
         blockIds.reserve(numBlocksToCollect);
         for (int32_t i = 0; i < numBlocksToCollect; ++i)
         {
+            TLLM_CHECK_WITH_INFO(lastBlock->getPrevBlock(), "last block has no prev block");
             blockIds.push_back(lastBlock->getBlockId());
             if (i + 1 < numBlocksToCollect)
             {
                 lastBlock = lastBlock->getPrevBlock();
-                TLLM_CHECK_WITH_INFO(lastBlock, "Previous block not found while traversing reuse tree");
             }
         }
         // Reverse to chronological order: oldest to newest

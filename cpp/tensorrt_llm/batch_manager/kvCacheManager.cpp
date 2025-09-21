@@ -1103,6 +1103,7 @@ std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReu
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
+
     std::vector<BlockKey> blockKeys;
     for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
     {
@@ -2296,12 +2297,6 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
 void KVCacheManager::removeSequence(RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest)
 {
     TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
-    if (mBlockManager.getNumPools() == 1 && llmRequest
-        && llmRequest->getLlmRequestType() == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY && mEnableBlockReuse
-        && !mBlockManager.isVariableWindow())
-    {
-        pinBlocks(requestId);
-    }
     auto sequenceNode = [this, requestId]
     {
         std::scoped_lock lock(mSequencesMtx);

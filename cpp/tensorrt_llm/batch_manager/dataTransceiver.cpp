@@ -699,9 +699,9 @@ public:
                 lastBlockKey.extraKeys = std::move(extraKeys);
             }
             // Compute indexFromEnd from the number of requested blocks
-            size_t requestedBlockSize = requestedBlockRange.getBlockIds().size();
+            int32_t requestedBlockSize = requestedBlockRange.getBlockIds().size();
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
-            int32_t indexFromEnd = static_cast<int32_t>(requestedBlockSize - 1);
+            int32_t indexFromEnd = requestedBlockSize - 1;
 
             requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
         }

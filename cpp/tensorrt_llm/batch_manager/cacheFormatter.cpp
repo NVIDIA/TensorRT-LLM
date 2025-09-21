@@ -32,6 +32,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -57,11 +58,34 @@ BlockRange getBlockRangeForSending(
 BlockRange getBlockRangeForReceiving(
     BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse)
 {
-
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum == 1 && cacheManager->isEnableBlockReuse() && srcEnableBlockReuse)
+    if (poolNum == 1 && srcEnableBlockReuse)
     {
-        return BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+        // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
+        constexpr SizeType32 beam{0};
+        auto range = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+        auto const& allBlockIds = range.getBlockIds();
+        auto const totalBlocks = static_cast<SizeType32>(allBlockIds.size());
+        // Derive reused blocks count from number of unique prepopulated tokens
+        auto const tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const prepopulatedTokens = llmRequest.getPrepopulatedPromptLen();
+        auto const totalUniqueTokens = llmRequest.getPromptLen();
+        auto const usedBlocks = std::min<SizeType32>(
+            static_cast<SizeType32>((totalUniqueTokens + tokensPerBlock - 1) / tokensPerBlock), totalBlocks);
+        auto const reusedBlocks = std::min<SizeType32>(
+            static_cast<SizeType32>((prepopulatedTokens + tokensPerBlock - 1) / tokensPerBlock), usedBlocks);
+
+        std::vector<SizeType32> newBlockIds;
+        if (reusedBlocks < usedBlocks)
+        {
+            newBlockIds.assign(allBlockIds.begin() + reusedBlocks, allBlockIds.begin() + usedBlocks);
+        }
+        else
+        {
+            newBlockIds.clear();
+        }
+        range.setBlockIds(std::move(newBlockIds));
+        return range;
     }
     else
     {
@@ -328,6 +352,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         auto bufferEleSizes = getBufferSizeForTarget();
         auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(bufferTargetNum), bufferEleSizes, bufferManager);
+
         auto& outputSplitCaches = std::get<0>(result);
         auto& bufferCoverTargetNum = std::get<1>(result);
         auto& onlyUseDynamicBuffer = std::get<2>(result);
@@ -380,7 +405,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             }
             else
             {
-
                 // If cacheIdx< bufferCoverTargetNum, the ouputSplitCaches.at(cacheIdx) is allocated by cudaMallocAsync,
                 // which is unable to be transferred by UCX GPU-direct RDMA. We need copy the data to pre-allocated
                 // cudaMalloc buffer,and then start send.
@@ -402,7 +426,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                     auto sendSize = std::min(remainSendSize, sendBufferEleSize);
                     auto copySlice = runtime::ITensor::slice(
                         outputSplitCaches[bufferIdx], needSendSize - remainSendSize, sendSize);
-
                     auto copyTargetSlice = runtime::ITensor::slice(sendUseAllocBuffer, 0, sendSize);
                     bufferManager.copy(*copySlice, *copyTargetSlice);
                     bufferManager.getStream().synchronize();
