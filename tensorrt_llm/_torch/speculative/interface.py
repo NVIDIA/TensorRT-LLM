@@ -116,7 +116,7 @@ class SpeculativeDecodingMode(IntEnum):
         spec_resource_manager: BaseResourceManager,
         is_draft_model: bool,
         attention_backend: Type[AttentionBackend],
-        allow_chain_drafter: bool,
+        use_chain_drafter: bool,
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
@@ -124,7 +124,7 @@ class SpeculativeDecodingMode(IntEnum):
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
         return self.is_eagle3_one_model() or (
             self.is_eagle3() and spec_resource_manager.is_first_draft
-            and is_trtllm_attention and allow_chain_drafter and is_draft_model)
+            and is_trtllm_attention and use_chain_drafter and is_draft_model)
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":

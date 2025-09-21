@@ -304,6 +304,7 @@ def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
     )
 
 
-# Development function to control chain drafter feature
+# Development function to control chain drafter feature.
+# It's here so that unit tests can mock it and turn it off.
 def _get_allow_chain_drafter() -> bool:
     return True

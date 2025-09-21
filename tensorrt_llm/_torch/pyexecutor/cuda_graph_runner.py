@@ -42,9 +42,6 @@ class CUDAGraphRunner:
         self.max_supported_batch_size = engine._max_cuda_graph_batch_size
         self.max_beam_width = engine.max_beam_width
         self.spec_config = engine.spec_config
-        engine = self._get_engine()
-        self.max_possible_draft_len = (engine.original_max_draft_len
-                                       if self.enable_spec_decode else 0)
 
         self.graphs: Dict[Tuple[int, int, int], torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[Tuple[int, int, int],
@@ -90,6 +87,11 @@ class CUDAGraphRunner:
     @property
     def enable_spec_decode(self):
         return self._get_engine().enable_spec_decode
+
+    @property
+    def max_possible_draft_len(self):
+        engine = self._get_engine()
+        return (engine.original_max_draft_len if self.enable_spec_decode else 0)
 
     def get_graph_key(
             self,
@@ -196,12 +198,8 @@ class CUDAGraphRunner:
                 initial_inputs: Dict[str, Any],
                 postprocess_fn: Optional[Callable] = None):
         """Captures the forward pass for a given batch size."""
-<<<<<<< HEAD
         engine = self._get_engine()
-        key = (batch_size, self.draft_len)
-=======
         batch_size = key[0]
->>>>>>> 61ef183ad (eagle3 cuda graph for the 1st draft model infer)
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
@@ -232,8 +230,9 @@ class CUDAGraphRunner:
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
-        def wrap_forward_fn(key: Tuple[int, int, int], forward_fn: Callable,
-                            capture_inputs: Dict[str, Any]):
+        def _setup_spec_decoding_and_forward(key: Tuple[int, int, int],
+                                             forward_fn: Callable,
+                                             capture_inputs: Dict[str, Any]):
             engine = self._get_engine()
             # for the first inference of draft model, we need to set the use_spec_decoding to True when capture the graph for multiple runs.
             is_first_draft = key[2]
@@ -250,11 +249,13 @@ class CUDAGraphRunner:
         graph = torch.cuda.CUDAGraph()
         with with_multi_stream(True), piecewise_cuda_graph(False):
             for _ in range(self.WARMUP_STEPS):
-                wrap_forward_fn(key, forward_fn, capture_inputs)
+                _setup_spec_decoding_and_forward(key, forward_fn,
+                                                 capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
             with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = wrap_forward_fn(key, forward_fn, capture_inputs)
+                output = _setup_spec_decoding_and_forward(
+                    key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
 

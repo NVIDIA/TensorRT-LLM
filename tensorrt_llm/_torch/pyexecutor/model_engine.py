@@ -54,7 +54,7 @@ from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
 from ..speculative.drafting_loops import ChainDrafter
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.mtp import SampleStateTensorsMTP
-from ..utils import (_get_allow_chain_drafter, get_model_extra_attrs,
+from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
@@ -443,7 +443,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
             pytorch_backend_config.cuda_graph_batch_sizes, self.batch_size,
-            self.max_num_tokens, self.max_draft_len,
+            self.max_num_tokens, self.original_max_draft_len,
             self._cuda_graph_padding_enabled
         ) if pytorch_backend_config.cuda_graph_batch_sizes else []
 
@@ -742,8 +742,9 @@ class PyTorchModelEngine(ModelEngine):
             return result
 
         curr_max_num_tokens = min(
-            kv_cache_manager.get_num_available_tokens(self.max_draft_len),
-            self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
+            kv_cache_manager.get_num_available_tokens(
+                self.original_max_draft_len), self.max_num_tokens,
+            self.batch_size * (self.max_seq_len - 1))
 
         def get_autotune_warmup_request():
             return get_warmup_request(curr_max_num_tokens, 0)
@@ -832,7 +833,8 @@ class PyTorchModelEngine(ModelEngine):
                 # value. This will save on memory.
                 and self.spec_config.max_concurrency is not None):
             draft_lengths.append(0)
-        if self.is_spec_decode and self.is_draft_model:
+        if self.is_spec_decode and self.is_draft_model and spec_resource_manager is not None and isinstance(
+                spec_resource_manager, Eagle3ResourceManager):
             draft_lengths.append(self.original_max_draft_len)
 
         for bs in cuda_graph_batch_sizes:
@@ -851,12 +853,19 @@ class PyTorchModelEngine(ModelEngine):
                     )
                     self.enable_spec_decode = draft_len > 0 or self.is_draft_model
 
-                    def _update_spec_resource_manager(is_first_draft):
+                    def _update_draft_inference_state(is_first_draft: bool,
+                                                      batch: ScheduledRequests):
                         if self.is_draft_model and isinstance(
                                 spec_resource_manager, Eagle3ResourceManager):
                             spec_resource_manager.is_first_draft = is_first_draft
+                            if is_first_draft:
+                                for req in batch.generation_requests:
+                                    req.py_is_first_draft = True
+                                    # Reset the draft tokens for the first draft inference
+                                    req.py_draft_tokens = []
 
-                    _update_spec_resource_manager(draft_len > 0)
+                    _update_draft_inference_state(draft_len > 0, batch)
+
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
@@ -1210,7 +1219,7 @@ class PyTorchModelEngine(ModelEngine):
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
-                    if num_chunked_ctx_requests > 0:
+                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
                         inputs['attn_metadata'].kv_lens_cuda[
                             num_ctx_requests -
@@ -1251,7 +1260,7 @@ class PyTorchModelEngine(ModelEngine):
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
-                    if num_chunked_ctx_requests > 0:
+                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         inputs['attn_metadata'].kv_lens_cuda[
                             num_ctx_requests -
                             num_chunked_ctx_requests:num_ctx_requests] -= (
@@ -2400,7 +2409,7 @@ class PyTorchModelEngine(ModelEngine):
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
-                _get_allow_chain_drafter())
+                self.model_is_wrapped)
             attn_metadata.update_spec_dec_param(
                 is_spec_dec_mode, spec_metadata.is_spec_dec_tree,
                 spec_metadata.is_spec_dec_dynamic_tree,

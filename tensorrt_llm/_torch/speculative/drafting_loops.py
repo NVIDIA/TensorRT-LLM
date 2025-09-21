@@ -63,10 +63,9 @@ def prepare_for_generation(attn_metadata: AttentionMetadata,
                            spec_metadata: SpecMetadata,
                            position_ids: torch.Tensor) -> torch.Tensor:
     batch_size = attn_metadata.num_seqs
-    # Using attn_metadata.seq_lens_cuda[:batch_size] to get the max_draft_len + 1
     num_accepted_draft_tokens = spec_metadata.num_accepted_draft_tokens[:
                                                                         batch_size]
-    #Get sequence lengths                                                                 batch_size]
+    # Using attn_metadata.seq_lens_cuda[:batch_size] to get the max_draft_len + 1
     seq_lens = attn_metadata.seq_lens_cuda[:batch_size]
     attn_metadata.kv_lens_cuda[:
                                batch_size] -= seq_lens - num_accepted_draft_tokens - 1
@@ -84,7 +83,7 @@ def prepare_for_generation(attn_metadata: AttentionMetadata,
 
     attn_metadata.host_request_types[:attn_metadata.num_contexts].fill_(1)
     attn_metadata.num_contexts = 0
-    # the next inference of draft model will not use spec decoding and the number of input tokens is 1.
+    # The next inference of draft model will not use spec decoding and the number of input tokens is 1
     attn_metadata.use_spec_decoding = False
 
     spec_metadata.num_tokens = batch_size
