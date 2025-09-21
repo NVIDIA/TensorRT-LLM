@@ -100,10 +100,7 @@ def _cleanup_unstacked_weights(
     for name in names_to_unregister_iter:
         param_obj = gm.get_parameter(name)
         owner_mod, leaf = _resolve_owner_module_and_leaf_attr(gm, name)
-        if hasattr(owner_mod, "_parameters") and leaf in owner_mod._parameters:
-            owner_mod._parameters.pop(leaf, None)
-        if hasattr(owner_mod, leaf):
-            delattr(owner_mod, leaf)
+        delattr(owner_mod, leaf)
         del param_obj
 
     # Flush CUDA cache since we freed large chunks of memory
