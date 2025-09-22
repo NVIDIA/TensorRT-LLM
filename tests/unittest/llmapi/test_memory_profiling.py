@@ -22,13 +22,10 @@ def test_profile_kvcache():
 
     VLM_MODEL = "Qwen2.5-VL-7B-Instruct"
     VLM_MODEL_PATH = get_model_path(VLM_MODEL)
-    LLM_MODEL = "Qwen2.5-7B-Instruct"
-    LLM_MODEL_PATH = get_model_path(LLM_MODEL)
 
     build_config = BuildConfig(max_batch_size=2048,
-                               max_num_tokens=8192,
                                max_beam_width=1,
-                               max_seq_len=None)
+                               max_seq_len=8192)
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9, )
 
     dynamic_batch_config = DynamicBatchConfig(
@@ -66,21 +63,19 @@ def test_profile_kvcache():
 
     torchllm_args = TorchLlmArgs(**llm_args)
 
-    profiling_data = dict()
+    profiling_data = {"enable_mm_reqs": True}
     py_executor = create_py_executor(llm_args=torchllm_args,
                                      checkpoint_dir=VLM_MODEL_PATH,
                                      profiling_stage_data=profiling_data)
-    vlm_max_gpu_total_bytes = profiling_data["max_gpu_total_bytes"]
+    vlm_max_gpu_total_bytes_with_mm_reqs = profiling_data["max_gpu_total_bytes"]
     py_executor.shutdown()
     torch.cuda.empty_cache()
 
-    profiling_data = dict()
-    llm_args["model"] = LLM_MODEL
-    llm_args["postprocess_tokenizer_dir"] = LLM_MODEL
+    profiling_data = {"enable_mm_reqs": False}
     torchllm_args = TorchLlmArgs(**llm_args)
     create_py_executor(llm_args=torchllm_args,
-                       checkpoint_dir=LLM_MODEL_PATH,
+                       checkpoint_dir=VLM_MODEL_PATH,
                        profiling_stage_data=profiling_data)
-    llm_max_gpu_total_bytes = profiling_data["max_gpu_total_bytes"]
+    vlm_max_gpu_total_bytes_no_mm_reqs = profiling_data["max_gpu_total_bytes"]
 
-    assert vlm_max_gpu_total_bytes < llm_max_gpu_total_bytes, f"available KVCache for VLMs is expected to be less than LLMs, but got {vlm_max_gpu_total_bytes} for VLM and {llm_max_gpu_total_bytes} for LLM"
+    assert vlm_max_gpu_total_bytes_with_mm_reqs < vlm_max_gpu_total_bytes_no_mm_reqs, f"available KVCache for VLMs is expected to be less when profiling with mm reqs, but got {vlm_max_gpu_total_bytes_with_mm_reqs} for mm reqs and {vlm_max_gpu_total_bytes_no_mm_reqs} without mm reqs"
