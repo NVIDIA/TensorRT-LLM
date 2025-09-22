@@ -83,6 +83,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/perf-benchmarking.md
    developer-guide/ci-overview.md
    developer-guide/dev-containers.md
+   developer-guide/api-change.md
 
 
 .. .. toctree::
