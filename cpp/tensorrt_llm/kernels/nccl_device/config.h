@@ -12,6 +12,13 @@
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 #include "nccl_device.h"
 #endif
+#if NCCL_VERSION_CODE <= NCCL_VERSION(2, 28, 0)
+using ncclDevComm = void*;
+#endif
+#if NCCL_VERSION_CODE <= NCCL_VERSION(2, 27, 0)
+using ncclWindow_t = void*;
+#endif
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/runtime/iBuffer.h"

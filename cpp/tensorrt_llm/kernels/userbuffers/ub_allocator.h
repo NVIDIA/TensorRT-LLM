@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <map>
 #include <memory>
+#include <tuple>
 
 // Forward declarations for NCCL device communicator types
 struct ncclDevComm;

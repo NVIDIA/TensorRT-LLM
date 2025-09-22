@@ -16,7 +16,7 @@ set_target_properties(
 # Include directories
 target_include_directories(
   tensorrt_llm_nccl_device PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-                                  ${CMAKE_CURRENT_SOURCE_DIR} /../..)
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
 # Link libraries
 target_link_libraries(tensorrt_llm_nccl_device tensorrt_llm_common)

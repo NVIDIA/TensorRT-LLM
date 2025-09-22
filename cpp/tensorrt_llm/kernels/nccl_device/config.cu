@@ -144,8 +144,15 @@ template <typename T>
 bool TypedLaunchConfig<T>::isValidConfig(int threadsPerBlock, int unrollFactor, int blocksPerRank) const
 {
     // Get CUDA device properties
+    int dev = -1;
+    cudaError_t cudaStatus = cudaGetDevice(&dev);
+    if (cudaStatus != cudaSuccess)
+    {
+        TLLM_LOG_ERROR("Failed to get CUDA device: " + std::string(cudaGetErrorString(cudaStatus)));
+        return false;
+    }
     cudaDeviceProp deviceProp;
-    cudaError_t cudaStatus = cudaGetDeviceProperties(&deviceProp, 0);
+    cudaStatus = cudaGetDeviceProperties(&deviceProp, dev);
     if (cudaStatus != cudaSuccess)
     {
         TLLM_LOG_ERROR("Failed to get CUDA device properties: " + std::string(cudaGetErrorString(cudaStatus)));
@@ -432,7 +439,7 @@ void LaunchConfig::launchRMSNorm(ncclWindow_t inWindow, ncclWindow_t outWindow, 
 {
     // Input validation
     TLLM_CHECK_WITH_INFO(inWindow != nullptr, "NCCL inWindow needs to be initialized.");
-    TLLM_CHECK_WITH_INFO(outWindow != nullptr, "NNCL outWindow needs to be initialized.");
+    TLLM_CHECK_WITH_INFO(outWindow != nullptr, "NCCL outWindow needs to be initialized.");
 
     TLLM_CHECK_WITH_INFO(eps >= 0.0f, "Epsilon must be non-negative, got %f", eps);
     TLLM_CHECK_WITH_INFO(weight != nullptr, "Weight pointer cannot be null");

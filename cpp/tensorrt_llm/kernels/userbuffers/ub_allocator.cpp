@@ -151,7 +151,10 @@ NCCLUserBufferAllocator::~NCCLUserBufferAllocator()
             {
                 NCCLCHECK(ncclCommWindowDeregisterFunc(*mComm, buffer.window));
             }
-            NCCLCHECK(ncclMemFreeFunc(buffer.addr));
+            if (ncclMemFreeFunc != nullptr)
+            {
+                NCCLCHECK(ncclMemFreeFunc(buffer.addr));
+            }
         }
         auto ncclDevCommDestroyFunc = ncclHelper.getNCCLDevCommDestroy();
         if (ncclDevCommDestroyFunc)
@@ -178,9 +181,9 @@ ncclDevComm NCCLUserBufferAllocator::getNCCLDevComm(int const numLsaBarriers)
         reqs.lsaMultimem = multimemSupport;
 
         auto& ncclHelper = getNCCLHelper();
-        // auto ncclDevCommCreateFunc = ncclHelper.getNCCLDevCommCreate();
+        auto ncclDevCommCreateFunc = ncclHelper.getNCCLDevCommCreate();
 
-        ncclResult_t ncclError = ncclDevCommCreate(*mComm, &reqs, &devComm);
+        ncclResult_t ncclError = ncclDevCommCreateFunc(*mComm, &reqs, &devComm);
         TLLM_CHECK_WITH_INFO(
             ncclError == ncclSuccess, "Failed to create NCCL device communicator: %s", ncclGetErrorString(ncclError));
         mDevCommBlockID[numLsaBarriers] = devComm;

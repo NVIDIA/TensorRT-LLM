@@ -354,11 +354,17 @@ private:
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
     {
 
+        TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(),
+            "UserBuffer has not been initialized (required for NCCL_DEVICE)")
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
         auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
         auto& allocator = tensorrt_llm::runtime::ub::UserBufferAllocator::Instance();
-        auto& nccl_ub_allocator = dynamic_cast<tensorrt_llm::runtime::ub::NCCLUserBufferAllocator&>(allocator);
+        auto* nccl_ub_allocator_ptr = dynamic_cast<tensorrt_llm::runtime::ub::NCCLUserBufferAllocator*>(&allocator);
+        TLLM_CHECK_WITH_INFO(nccl_ub_allocator_ptr != nullptr,
+            "NCCL_DEVICE requires the UBAllocator to be set up with the use_nccl option = True.");
+        auto& nccl_ub_allocator = *nccl_ub_allocator_ptr;
+
         auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
 
         if (ub_buffer0.invalid())
@@ -394,6 +400,7 @@ private:
         {
 
             TORCH_CHECK(norm_weight, "norm_weight is required for residual rms norm allreduce");
+            TORCH_CHECK(residual, "residual is required for residual rms norm allreduce");
             TORCH_CHECK(!bias, "bias is not supported for residual rms norm allreduce");
 
             int const hidden_size = input.size(-1);
