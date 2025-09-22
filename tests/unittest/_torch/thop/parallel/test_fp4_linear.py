@@ -9,6 +9,7 @@ from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 scaling_vector_size = 16
@@ -80,10 +81,6 @@ def test_fp4_linear(dtype):
     # compare
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref)
-
-
-def pad_up(x, pad_size):
-    return (x + pad_size - 1) // pad_size * pad_size
 
 
 @pytest.mark.skipif(sys.version_info < (3, 12),
@@ -263,6 +260,136 @@ def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
     torch.testing.assert_close(output, output_ref)
 
 
+# cold L2 cache for benchmarking (using circular buffer)
+def nvfp4_gemm_perf_test(
+    dtype,
+    SEQ_LEN,
+    OUTPUT_SIZE,
+    HIDDEN_SIZE,
+    test_ref=True,
+    use_cold_l2_cache=True,
+    warmup_iterations=2,
+    iterations=1000,
+):
+    import cutlass.cute as cute
+    import nvtx
+
+    torch.manual_seed(0)
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+    x_sf_global = (448 * 6) / x.abs().max().float()
+    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
+    w_sf_global = (448 * 6) / w.abs().max().float()
+    w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(x, x_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+
+    if use_cold_l2_cache:
+        one_workspace_bytes = (x_fp4.numel() * x_fp4.element_size() +
+                               w_fp4.numel() * w_fp4.element_size() +
+                               x_sf_block.numel() * x_sf_block.element_size() +
+                               w_sf_block.numel() * w_sf_block.element_size())
+        workspace_count = cute.testing.get_workspace_count(
+            one_workspace_bytes, warmup_iterations, iterations)
+        x_fp4_list = [x_fp4]
+        w_fp4_list = [w_fp4]
+        x_sf_block_list = [x_sf_block]
+        w_sf_block_list = [w_sf_block]
+        for _ in range(workspace_count - 1):
+            x_fp4_list.append(x_fp4.clone())
+            w_fp4_list.append(w_fp4.clone())
+            x_sf_block_list.append(x_sf_block.clone())
+            w_sf_block_list.append(w_sf_block.clone())
+    else:
+        workspace_count = 1
+        x_fp4_list = [x_fp4]
+        w_fp4_list = [w_fp4]
+        x_sf_block_list = [x_sf_block]
+        w_sf_block_list = [w_sf_block]
+
+    with torch.inference_mode(), autotune():
+        with nvtx.annotate(
+                f"cute_dsl tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="orange",
+        ):
+            output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                x_fp4, w_fp4, x_sf_block, w_sf_block, 1.0, dtype)
+
+    alpha_tensor = torch.tensor(1.0).cuda()
+    if test_ref:
+        with nvtx.annotate(
+                f"ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="orange"):
+            with torch.inference_mode(), autotune():
+                output_ref = torch.ops.trtllm.nvfp4_gemm(
+                    x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_tensor, dtype)
+        torch.testing.assert_close(output, output_ref)
+        print(f"PASSED")
+
+    buffer_idx = 0
+    with nvtx.annotate(
+            f"cute_dsl warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+            color="green"):
+        for _ in range(warmup_iterations):
+            output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                x_fp4_list[buffer_idx % workspace_count],
+                w_fp4_list[buffer_idx % workspace_count],
+                x_sf_block_list[buffer_idx % workspace_count],
+                w_sf_block_list[buffer_idx % workspace_count],
+                1.0,
+                dtype,
+            )
+            buffer_idx = buffer_idx + 1
+
+    with nvtx.annotate(
+            f"cute_dsl run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+            color="green"):
+        for i in range(iterations):
+            output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                x_fp4_list[buffer_idx % workspace_count],
+                w_fp4_list[buffer_idx % workspace_count],
+                x_sf_block_list[buffer_idx % workspace_count],
+                w_sf_block_list[buffer_idx % workspace_count],
+                1.0,
+                dtype,
+            )
+            buffer_idx = buffer_idx + 1
+
+    if test_ref:
+        torch.testing.assert_close(output, output_ref)
+        print(f"PASSED")
+
+        buffer_idx = 0
+        with nvtx.annotate(
+                f"ref warmup, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="red"):
+            for _ in range(warmup_iterations):
+                output_ref = torch.ops.trtllm.nvfp4_gemm(
+                    x_fp4_list[buffer_idx % workspace_count],
+                    w_fp4_list[buffer_idx % workspace_count],
+                    x_sf_block_list[buffer_idx % workspace_count],
+                    w_sf_block_list[buffer_idx % workspace_count],
+                    alpha_tensor,
+                    dtype,
+                )
+                buffer_idx = buffer_idx + 1
+        with nvtx.annotate(
+                f"ref run, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
+                color="red"):
+            for i in range(iterations):
+                output_ref = torch.ops.trtllm.nvfp4_gemm(
+                    x_fp4_list[buffer_idx % workspace_count],
+                    w_fp4_list[buffer_idx % workspace_count],
+                    x_sf_block_list[buffer_idx % workspace_count],
+                    w_sf_block_list[buffer_idx % workspace_count],
+                    alpha_tensor,
+                    dtype,
+                )
+                buffer_idx = buffer_idx + 1
+
+
 if __name__ == "__main__":
     # m, n, k
     fp4_linear_perf_test(torch.bfloat16, 128, 7168, 16384)
@@ -270,3 +397,18 @@ if __name__ == "__main__":
     fp4_linear_perf_test(torch.bfloat16, 128, 2112, 7168)
     fp4_linear_perf_test(torch.bfloat16, 128, 4096, 7168)
     fp4_linear_perf_test(torch.bfloat16, 128, 7168, 2048)
+
+    # group-1 test cases
+    for tokens in [128, 8192]:
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 16384)
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 24576, 1536)
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 2112, 7168)
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 4096, 7168)
+        nvfp4_gemm_perf_test(torch.bfloat16, tokens, 7168, 2048)
+
+    # group-2 test cases
+    for m in [128, 256, 512]:
+        nvfp4_gemm_perf_test(torch.bfloat16, m, 131584, 7168)
+        nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
+        nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
+        nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)
