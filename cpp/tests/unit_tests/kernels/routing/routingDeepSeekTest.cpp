@@ -183,6 +183,17 @@ private:
 
 TYPED_TEST_SUITE(RoutingDeepSeekKernelTest, Bf16Types);
 
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization384)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1024, // 10
+        /*numExperts=*/384, /*topK=*/8,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1024, // 10
@@ -216,16 +227,16 @@ TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization)
     this->runTest(param);
 };
 
-// TYPED_TEST(RoutingDeepSeekKernelTest, DeviceLevelParallelization)
-// {
-//     RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/20300,
-//         /*numExperts=*/128, /*topK=*/8,
-//         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
-//         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-//         /*usePdl=*/true, /*getExpWeights=*/true,
-//         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
-//     this->runTest(param);
-// };
+TYPED_TEST(RoutingDeepSeekKernelTest, DeviceLevelParallelization)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/20300,
+        /*numExperts=*/128, /*topK=*/8,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    this->runTest(param);
+};
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationTop2)
 {
