@@ -276,6 +276,7 @@ class ModelLoader:
         config = checkpoint_loader.load_config(
             checkpoint_dir,
             trust_remote_code=True,
+            mapping=self.mapping,
             enable_min_latency=self.pytorch_backend_config.enable_min_latency,
             use_cuda_graph=self.pytorch_backend_config.use_cuda_graph,
             force_dynamic_quantization=self.pytorch_backend_config.
