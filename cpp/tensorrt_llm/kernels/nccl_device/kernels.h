@@ -20,7 +20,9 @@
 #include "constants.h"
 #include "multimem.h"
 #include "nccl.h"
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 #include "nccl_device.h"
+#endif
 #include "tensorrt_llm/common/assert.h"
 #include "vector_types.h"
 #include <cassert>
@@ -32,6 +34,8 @@
 
 namespace tensorrt_llm::kernels::nccl_device
 {
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceSumV2(T* val)
@@ -244,6 +248,8 @@ __global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t
     }
     bar.sync(ncclCoopCta(), cuda::memory_order_release);
 }
+
+#endif // NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 
 } // namespace tensorrt_llm::kernels::nccl_device
 

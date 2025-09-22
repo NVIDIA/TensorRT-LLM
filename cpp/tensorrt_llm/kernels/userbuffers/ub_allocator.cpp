@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "ub_allocator.h"
+#include "nccl.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include <set>
 #include <stdexcept>

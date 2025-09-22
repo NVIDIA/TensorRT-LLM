@@ -9,7 +9,9 @@
 
 #include "constants.h"
 #include "nccl.h"
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 #include "nccl_device.h"
+#endif
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -156,7 +158,12 @@ public:
 
     virtual bool getValid() const
     {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
         return this->valid;
+#else
+        TLLM_LOG_WARNING("NCCL device kernels not available (NCCL version < 2.28). LaunchConfig will be invalid.");
+        return false;
+#endif
     }
 };
 

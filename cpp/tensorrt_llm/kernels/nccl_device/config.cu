@@ -5,7 +5,10 @@
  ************************************************************************/
 
 #include "config.h"
+#include "nccl.h"
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 #include "kernels.h"
+#endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "vector_types.h"
 #include <cuda_runtime.h>
@@ -259,7 +262,7 @@ void* TypedLaunchConfig<T>::getKernelPtrForUnroll() const
 template <typename T>
 void* TypedLaunchConfig<T>::getKernelPtrForUnrollFactor(int unrollFactor) const
 {
-
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     void* result = nullptr;
     switch (unrollFactor)
     {
@@ -275,6 +278,9 @@ void* TypedLaunchConfig<T>::getKernelPtrForUnrollFactor(int unrollFactor) const
     }
 
     return result;
+#else
+    return nullptr;
+#endif
 }
 
 // Function to launch kernel for any unroll factor (shares logic with getKernelPtrForUnrollFactor)
@@ -284,6 +290,7 @@ void TypedLaunchConfig<T>::launchKernelForUnrollFactor(ncclWindow_t inWindow, nc
     ncclDevComm devComm, float const eps, cudaStream_t stream, dim3 const& gridDim, dim3 const& blockDim,
     size_t const sharedMemSize) const
 {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     using TN = typename VectorType<T>::type;
 
     // Use the same logic as getKernelPtrForUnrollFactor but launch the kernel directly
@@ -333,6 +340,9 @@ void TypedLaunchConfig<T>::launchKernelForUnrollFactor(ncclWindow_t inWindow, nc
         TLLM_CHECK_WITH_INFO(false, "Invalid unroll factor %d for %s precision. Supported values: 1-8",
             this->unrollFactor, typeid(T).name());
     }
+#else
+    TLLM_THROW("NCCL device kernels not available (NCCL version < 2.28). Cannot launch kernel.");
+#endif
 }
 
 // Template implementation that shares the exact same logic as getKernelPtrForUnroll
@@ -344,6 +354,7 @@ void TypedLaunchConfig<T>::launchKernelForUnrollImpl(ncclWindow_t inWindow, nccl
     size_t const sharedMemSize, bool useResidual, bool useBias, bool unshardResidualOut, int startToken, int hiddenDim,
     int numTokens) const
 {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     using TN = typename VectorType<T>::type;
 
     // Use the exact same logic as getKernelPtrForUnroll but launch the kernel
@@ -383,6 +394,9 @@ void TypedLaunchConfig<T>::launchKernelForUnrollImpl(ncclWindow_t inWindow, nccl
             inWindow, outWindow, static_cast<const TN*>(residual), residualOutWindow, static_cast<const TN*>(weight),
             static_cast<const TN*>(bias), startToken, hiddenDim, numTokens, devComm, eps);
     }
+#else
+    TLLM_THROW("NCCL device kernels not available (NCCL version < 2.28). Cannot launch kernel.");
+#endif
 }
 
 // Implementation of launch function that handles all type-specific logic
@@ -391,6 +405,7 @@ void TypedLaunchConfig<T>::launchKernel(ncclWindow_t inWindow, ncclWindow_t outW
     ncclWindow_t residualOutWindow, void const* const weight, void const* const bias, ncclDevComm devComm,
     float const eps, cudaStream_t stream) const
 {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     using TN = typename VectorType<T>::type;
 
     dim3 const gridDim(this->getBlocksPerRank(), 1, 1);
@@ -405,6 +420,9 @@ void TypedLaunchConfig<T>::launchKernel(ncclWindow_t inWindow, ncclWindow_t outW
     // Launch kernel using runtime template parameter selection (shared with getKernelPtrForUnroll logic)
     launchKernelForUnrollFactor(inWindow, outWindow, residual, residualOutWindow, weight, bias, devComm, eps, stream,
         gridDim, blockDim, sharedMemSize);
+#else
+    TLLM_THROW("NCCL device kernels not available (NCCL version < 2.28). Cannot launch kernel.");
+#endif
 }
 
 // Member function implementations
