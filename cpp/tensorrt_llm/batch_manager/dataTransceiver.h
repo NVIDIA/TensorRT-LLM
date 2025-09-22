@@ -144,6 +144,7 @@ struct TransceiverTag
     static constexpr int32_t kID_TAG{19};
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
+    static constexpr int32_t kREADY_SIGNAL_TAG{42};
 };
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
@@ -240,6 +241,16 @@ public:
     /// @param llmRequest The request object to which the data belongs.
     virtual RequestInfo recvRequestInfo();
 
+    /// @brief Cancel the request.
+    /// @param requestId The ID used in the context phase of the current request.
+    /// @return Whether the request is cancelled.
+    virtual bool cancelRequest(LlmRequest const& llmRequest);
+
+    /// @brief Send ready signal.
+    /// @param requestId The ID used in the context phase of the current request.
+    /// @param isReady Whether the request is ready to be received.
+    virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
+
     /// @brief Destructor.
     virtual ~CacheSender();
 
@@ -272,6 +283,17 @@ public:
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 
     virtual void receiveSync(TransferSession& session);
+
+    /// @brief Cancel the request.
+    /// @param llmRequest Request object.
+    /// @return Whether the request is cancelled.
+    virtual bool cancelRequest(LlmRequest const& llmRequest);
+
+    /// @brief Receive ready signal.
+    /// @param session The session object.
+    /// @return Whether the request is ready to be received.
+    virtual bool receiveReadySignal(TransferSession& session);
+
     /// @brief Destructor.
     virtual ~CacheReceiver();
 
