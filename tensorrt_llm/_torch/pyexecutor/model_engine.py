@@ -1242,7 +1242,6 @@ class PyTorchModelEngine(ModelEngine):
                     prompt_lengths.append(1 + self.runtime_draft_len)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
-
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
@@ -1265,7 +1264,6 @@ class PyTorchModelEngine(ModelEngine):
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
-
                 position_ids.append(past_seen_token_num)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)
