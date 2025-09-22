@@ -593,6 +593,7 @@ def executor_request_to_llm_request(
         context_phase_params=executor_request.context_phase_params,
         cache_salt_id=executor_request.cache_salt_id,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
+        global_steady_clock_offset=getattr(executor_request, "py_global_steady_clock_offset", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
     if child_req_ids:

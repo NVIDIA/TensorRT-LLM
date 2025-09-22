@@ -101,6 +101,7 @@ public:
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+    using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
     using CacheSaltIDType = runtime::CacheSaltIDType;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
@@ -139,7 +140,9 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<Duration> globalSteadyClockOffset = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -197,6 +200,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
+        , mGlobalSteadyClockOffset(globalSteadyClockOffset)
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -224,7 +228,8 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<Duration> globalSteadyClockOffset = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
@@ -265,6 +270,7 @@ public:
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
         , mCacheSaltID(cacheSaltID)
+        , mGlobalSteadyClockOffset(globalSteadyClockOffset)
     {
         if (mEncoderTokens.has_value())
         {
@@ -1255,7 +1261,7 @@ public:
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = std::chrono::steady_clock::now();
+            mPerfMetrics.timingMetrics.firstScheduledTime = getCurrentSteadyClock();
         }
     }
 
@@ -1671,8 +1677,8 @@ public:
         {
             return false;
         }
-        auto const currentTime = std::chrono::steady_clock::now();
-        auto const elapsed = (std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - mStartTime));
+        auto const currentTime = getCurrentSteadyClock();
+        auto const elapsed = (std::chrono::duration_cast<Duration>(currentTime - mStartTime));
         TLLM_LOG_DEBUG("Checked timeOut for request %ld with allotted Time %ld after time %ld and got %d", mRequestId,
             mAllottedTimeMs->count(), elapsed.count(), (elapsed >= mAllottedTimeMs));
 
@@ -1689,22 +1695,22 @@ public:
         mDecodingIter = iter;
     }
 
-    void setKvCacheTransferStart(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    void setKvCacheTransferStart(TimePoint const& time)
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferStart = time;
+        mPerfMetrics.timingMetrics.kvCacheTransferStart = maybeToGlobalSteadyClock(time);
     }
 
-    void setKvCacheTransferEnd(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    void setKvCacheTransferEnd(TimePoint const& time)
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferEnd = time;
+        mPerfMetrics.timingMetrics.kvCacheTransferEnd = maybeToGlobalSteadyClock(time);
     }
 
-    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferStart()
+    TimePoint getKvCacheTransferStart()
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferStart;
     }
 
-    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferEnd()
+    TimePoint getKvCacheTransferEnd()
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
     }
@@ -1788,7 +1794,7 @@ public:
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
             TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
-                std::chrono::duration<float>(std::chrono::steady_clock::now() - mStartTime).count());
+                std::chrono::duration<float>(getCurrentSteadyClock() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
         {
@@ -1826,7 +1832,7 @@ public:
 
     void updatePerfMetrics(executor::IterationType iter)
     {
-        auto const currentTokenTime = std::chrono::steady_clock::now();
+        auto const currentTokenTime = getCurrentSteadyClock();
 
         if (!mPerfMetrics.firstIter)
         {
@@ -2041,6 +2047,8 @@ protected:
     // Cache salt id for each request.
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
 
+    // The offset between local steady clock and glabol steady clock (at rank 0)
+    std::optional<Duration> mGlobalSteadyClockOffset;
 private:
     void initialize(
         VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
@@ -2137,9 +2145,9 @@ private:
 
         if (mReturnPerfMetrics)
         {
-            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(std::chrono::steady_clock::now());
+            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(getCurrentSteadyClock());
         }
-        mStartTime = std::chrono::steady_clock::now();
+        mStartTime = getCurrentSteadyClock();
     }
 
     TensorPtr createListTensor(std::list<VecTokens> const& wordsList)
@@ -2166,6 +2174,20 @@ private:
         tensor->unsqueeze(0);
 
         return tensor;
+    }
+
+    TimePoint maybeToGlobalSteadyClock(TimePoint const & time_point) const {
+        if (mGlobalSteadyClockOffset.has_value()) {
+            return time_point + *mGlobalSteadyClockOffset;
+        } else {
+            return time_point;
+        }
+    }
+
+    TimePoint getCurrentSteadyClock() const {
+        const TimePoint time_point = std::chrono::steady_clock::now();
+
+        return maybeToGlobalSteadyClock(time_point);
     }
 };
 
@@ -2223,7 +2245,7 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt, std::optional<Duration> globalSteadyClockOffset = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2254,7 +2276,7 @@ public:
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
-            arrivalTime)
+            arrivalTime, globalSteadyClockOffset)
     {
     }
 

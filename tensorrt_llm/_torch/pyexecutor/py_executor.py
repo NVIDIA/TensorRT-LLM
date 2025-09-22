@@ -166,6 +166,8 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
+        self.dist = dist
+        self.monotonic_ts_offset = self._get_monotonic_ts_offset()
 
         self.peft_cache_config = peft_cache_config
 
@@ -184,7 +186,6 @@ class PyExecutor:
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
         self.guided_decoder = guided_decoder
-        self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
 
         # enqueue and _fetch_new_requests used data
@@ -263,6 +264,7 @@ class PyExecutor:
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
+            monotonic_ts_offset = self.monotonic_ts_offset
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
@@ -364,6 +366,15 @@ class PyExecutor:
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
+
+    def _get_monotonic_ts_offset(self):
+        assert self.global_rank >= 0, "rank should be >= 0"
+        self.dist.barrier()
+        local_timestamp = time.monotonic()
+        timestamps = self.dist.allgather(local_timestamp)
+        if self.global_rank == 0:
+            logger.info(f"monotonic_ts_offsets for each rank: {[local_timestamp - ts for ts in timestamps]}")
+        return timestamps[0] - local_timestamp
 
     def __enter__(self):
         return self
