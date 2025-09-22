@@ -3534,8 +3534,8 @@ def generate_files(specs_names):
     # this gives: kname, smem bytes, threads_per_cta, loop_step
     kernel_traits = [traits.split() for traits in output.splitlines()]
     cubin_header = get_cubin_header(kernel_traits, valid_specs_names)
-    if generate_cu_trtllm:
-        cubin_header = modify_cubin_header(cubin_header)
+    #if generate_cu_trtllm:
+        #cubin_header = modify_cubin_header(cubin_header)
 
     with open('./generated/fmha_cubin.h', 'w') as f:
         f.write(cubin_header)
