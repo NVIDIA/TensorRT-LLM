@@ -290,7 +290,7 @@ class TestMLlama(unittest.TestCase):
         """
         Compare output to HF
         """
-        if scenario.backend == "FLASHINFER" and scenario.use_cuda_graph == False:
+        if scenario.backend == "FLASHINFER":
             pytest.skip("https://nvbugspro.nvidia.com/bug/5458945")
         backend = scenario.backend
         metadata_cls = get_attention_backend(backend).Metadata

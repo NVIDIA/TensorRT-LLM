@@ -1982,8 +1982,8 @@ def selected_mask_types(kspec):
             custom_mask = '0'
         # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
         elif kspec.input_layout == InputLayout.PACKED_QKV:
-            # NOTE: 72 is added for vision transformer
-            if kspec.head_size not in [32, 64, 72, 128]:
+            # NOTE: 72/80 are added for vision transformer
+            if kspec.head_size not in [32, 64, 72, 80, 128]:
                 padding_mask = '0'
         # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:

@@ -57,6 +57,11 @@ class MpiWaitThread;
 
 namespace tensorrt_llm::batch_manager
 {
+class BaseCacheTransceiver;
+}
+
+namespace tensorrt_llm::batch_manager
+{
 
 namespace kv_cache_manager
 {
@@ -79,7 +84,6 @@ class LlmRequest;
 class RuntimeBuffers;
 class BasePeftCacheManager;
 class GuidedDecoder;
-class BaseCacheTransceiver;
 
 // Algorithms
 class CapacityScheduler;

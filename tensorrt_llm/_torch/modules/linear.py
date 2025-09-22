@@ -23,6 +23,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
 
@@ -766,7 +767,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
 
-        if module.use_cute_dsl_nvfp4_blockscaling_mm:
+        if IS_CUTLASS_DSL_AVAILABLE and module.use_cute_dsl_nvfp4_blockscaling_mm:
             output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale,
                 module.scalar_alpha, module.dtype)
@@ -1296,7 +1297,10 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
 
         copy_weight(module.weight, fused_weight)
 
-        weight_scales = self.load_weight_scales(weights)
+        weight_scales = self.load_weight_scales(weights,
+                                                tp_size=module.tp_size,
+                                                tp_rank=module.tp_rank,
+                                                tp_mode=module.tp_mode)
 
         # Create concatenated weight scale tensor
         cat_weight_scale = torch.cat(weight_scales, dim=0)
