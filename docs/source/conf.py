@@ -50,6 +50,7 @@ extensions = [
     'sphinx.ext.autosummary',
     'sphinx.ext.viewcode',
     'sphinx.ext.napoleon',
+    'sphinx.ext.mathjax',
     'myst_parser',  # for markdown support
     "breathe",
     'sphinx.ext.todo',
@@ -86,6 +87,8 @@ myst_heading_anchors = 4
 myst_enable_extensions = [
     "deflist",
     "substitution",
+    "dollarmath",
+    "amsmath",
 ]
 
 myst_substitutions = {
@@ -167,8 +170,11 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
 def setup(app):
     from helper import generate_examples, generate_llmapi
 
-    from tensorrt_llm.llmapi.utils import tag_llm_params
-    tag_llm_params()
+    try:
+        from tensorrt_llm.llmapi.utils import tag_llm_params
+        tag_llm_params()
+    except ImportError:
+        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
 

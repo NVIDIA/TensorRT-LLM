@@ -1002,7 +1002,7 @@ class PyTorchModelEngine(ModelEngine):
 
             except Exception:
                 logger.info(
-                    f"Fallback to regular model init: {traceback.format_exc(limit=1)}\n"
+                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
 
@@ -1218,13 +1218,28 @@ class PyTorchModelEngine(ModelEngine):
                 num_ctx_requests = inputs['attn_metadata'].num_contexts
                 num_gen_requests = inputs['attn_metadata'].num_generations
                 num_ctx_tokens = inputs['attn_metadata'].num_ctx_tokens
+                num_chunked_ctx_requests = inputs[
+                    'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
                 inputs['position_ids'][0, num_ctx_tokens:] -= (
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
-                inputs['attn_metadata'].kv_lens_cuda[
-                    num_ctx_requests:num_seqs] -= (
-                        self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+                # Only TrtllmAttentionMetadata has kv_lens_cuda.
+                if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
+                    if num_chunked_ctx_requests > 0:
+                        inputs['attn_metadata'].kv_lens_cuda[
+                            num_ctx_requests -
+                            num_chunked_ctx_requests:num_ctx_requests] -= (
+                                self.
+                                previous_kv_lens_offsets_cuda[:
+                                                              num_chunked_ctx_requests]
+                            )
+                    else:
+                        inputs['attn_metadata'].kv_lens_cuda[
+                            num_ctx_requests:num_seqs] -= (
+                                self.
+                                previous_kv_lens_offsets_cuda[:num_gen_requests]
+                            )
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
@@ -1496,7 +1511,6 @@ class PyTorchModelEngine(ModelEngine):
                     prompt_lengths.append(1 + self.runtime_draft_len)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
-
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
@@ -1519,7 +1533,6 @@ class PyTorchModelEngine(ModelEngine):
                     if beam == first_beam:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
-
                 position_ids.append(past_seen_token_num)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 prompt_lengths.append(request.py_prompt_len)

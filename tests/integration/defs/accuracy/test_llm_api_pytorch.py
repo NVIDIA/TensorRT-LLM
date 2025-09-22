@@ -1212,7 +1212,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_no_hopper
+    @skip_pre_hopper
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
@@ -1236,6 +1236,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
         )
 
         if fp8kv:
@@ -1311,7 +1313,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_device_not_contain(["H100"])
+    @skip_pre_hopper
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales_cuda_graph_padding(self, mtp_nextn):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -1324,6 +1326,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 max_batch_size=512,
                 enable_padding=True,
             ),
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
         )
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                  kv_cache_config=kv_cache_config,
@@ -1334,7 +1338,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    @skip_no_hopper
+    @skip_pre_hopper
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("attention_dp", [False, True])
     def test_fp8_block_scales_cuda_graph_padding_4gpus(self, mtp_nextn,
@@ -1346,6 +1350,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(enable_padding=True),
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
         )
 
         with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
@@ -1359,7 +1365,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    @skip_no_hopper
+    @skip_pre_hopper
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
@@ -1388,6 +1394,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"),
         )
 
         if fp8kv:
@@ -1474,7 +1482,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @skip_pre_hopper
     def test_fp8_block_scales_4gpus_static_eplb(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
 
@@ -2002,42 +2010,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             assert llm.args.moe_config.backend == moe_backend
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-    def test_nvfp4_multi_gpus_corner_case(self):
-        """
-        This test is used to test the corner case of the NVFP4 model.
-        When using the same value for max_seq_len and max_num_tokens, there will be no
-        enough kv block for the dummy requests in CUDA graph warmup when creating
-        the py_executor before estimating kv cache. Then CUDA graph capture will be
-        triggered when estimating kv cache. This may cause some errors.
-        More info in https://nvbugs/5485325.
-        """
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80,
-                                        dtype="fp8",
-                                        enable_block_reuse=False)
-        pytorch_config = dict(disable_overlap_scheduler=False,
-                              cuda_graph_config=CudaGraphConfig(
-                                  enable_padding=True, max_batch_size=1024),
-                              moe_config=MoeConfig(backend="TRTLLM"))
-
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=1)
-        with LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
-                 tensor_parallel_size=8,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=8,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 enable_attention_dp=False,
-                 speculative_config=mtp_config,
-                 max_seq_len=5120,
-                 max_num_tokens=5120) as llm:
-
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
+    @skip_pre_blackwell
     def test_nvfp4_multi_gpus_corner_case(self):
         """
         This test is used to test the corner case of the NVFP4 model.

@@ -155,7 +155,7 @@ class MTPSpecMetadata(SpecMetadata):
     @all_rank_num_seqs.setter
     def all_rank_num_seqs(self, value: List[int]):
         self._all_rank_num_seqs = value
-        if self.spec_dec_mode.is_mtp_eagle():
+        if self.spec_dec_mode.is_mtp_eagle_one_model():
             self.subseq_all_rank_num_tokens = value
 
     def prepare(self):
@@ -172,7 +172,7 @@ class MTPSpecMetadata(SpecMetadata):
         # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
         # forward and only one input token in the following draft forward.
         # This num_tokens is used to set the all_rank_num_tokens for attention dp.
-        if not self.spec_dec_mode.is_mtp_eagle():
+        if not self.spec_dec_mode.is_mtp_eagle_one_model():
             self.num_tokens -= self.num_generations
 
         if self.mtp_hidden_states_manager is not None:  # MTP vanilla or use relaxed acceptance
@@ -183,7 +183,7 @@ class MTPSpecMetadata(SpecMetadata):
                 mtp_slot_ids.append(slot_id)
 
             # MTP Vanilla: Update mtp hidden states and past tokens
-            if self.spec_dec_mode.is_mtp():
+            if self.spec_dec_mode.is_mtp_one_model():
                 mtp_hidden_states_ptrs = []
                 mtp_past_tokens_ptrs = []
                 for slot_id in mtp_slot_ids:
