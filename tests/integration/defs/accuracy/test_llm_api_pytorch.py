@@ -704,6 +704,7 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
         if get_device_count() != tp_size * pp_size:
             pytest.skip("Device count mismatch with world size")
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         with LLM(
                 f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
                 tensor_parallel_size=tp_size,
@@ -711,6 +712,7 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                 max_seq_len=8192,
                 pipeline_parallel_size=pp_size,
                 moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
                 cuda_graph_config=CudaGraphConfig()
                 if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
@@ -2513,16 +2515,25 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(1, 1, 1, False, True, True)],
-        ids=["latency"])
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,is_cached",
+        [(1, 1, 1, False, True, True, True),
+         pytest.param(8,
+                      1,
+                      1,
+                      False,
+                      True,
+                      True,
+                      False,
+                      marks=pytest.mark.skip_less_mpi_world_size(8))],
+        ids=["latency", "multi_gpus_no_cache"])
     def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                  overlap_scheduler):
+                  overlap_scheduler, is_cached):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B"
+                 if is_cached else "Qwen/Qwen3-8B",
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
@@ -2865,13 +2876,17 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,eagle3",
         [
             (8, 1, 8, True, True, True, "CUTLASS", False),
+            (8, 1, 8, False, True, True, "TRTLLM", False),
             (8, 1, 8, True, True, True, "TRTLLM", False),
+            (8, 1, 8, False, True, True, "TRTLLM", True),
             (8, 1, 8, True, True, True, "TRTLLM", True),
         ],
         ids=[
             "latency_moe_cutlass",
             "latency_moe_trtllm",
+            "latency_moe_trtllm_attention_dp",
             "latency_moe_trtllm_eagle3",
+            "latency_moe_trtllm_eagle3_attention_dp",
         ],
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
@@ -3243,6 +3258,42 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
             mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                               {"scores_filter": "exact_match,flexible-extract"})
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
+    def test_w4_chunked_prefill(self, kv_cache_dtype, moe_backend, mocker):
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("Triton kernels are not available")
+
+        pytorch_config = dict(disable_overlap_scheduler=True,
+                              cuda_graph_config=CudaGraphConfig())
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        dtype=kv_cache_dtype)
+
+        model_name = "GPT-OSS/MXFP4"
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 max_num_tokens=512,
+                 enable_chunked_prefill=True,
+                 enable_attention_dp=False,
+                 moe_config=MoeConfig(backend=moe_backend),
+                 **pytorch_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+            mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                              {"scores_filter": "exact_match,flexible-extract"})
+            task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 

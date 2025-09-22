@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from transformers import Qwen3MoeConfig
 
+from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 
@@ -187,6 +188,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                                    strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
 
+        self.is_p2p_supported = can_access_peer(model_config.mapping)
+
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
             "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
@@ -242,11 +245,11 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 hidden_states, residual)
 
         # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        do_finalize = not (
+            hidden_states.shape[0] <= self.moe_allreduce.max_token
+            and self.fusion_config.POST_MOE_FUSION
+            and self.model_config.moe_backend == 'TRTLLM'
+            and self.mlp.experts.has_nvfp4 and self.is_p2p_supported)
 
         hidden_states = self.mlp(
             hidden_states,
