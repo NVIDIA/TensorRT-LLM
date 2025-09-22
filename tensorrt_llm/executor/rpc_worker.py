@@ -84,36 +84,22 @@ class RpcWorker(BaseWorker):
         qsize = self._response_queue.qsize()
         logger_debug(f"RpcWorker returning {qsize} responses", color="yellow")
 
-        if qsize == 0:
-            return []
-
         all_responses = []
         for _ in range(qsize):
             # The queue contains batches of responses, so extend the list
             all_responses.extend(self._response_queue.get())
         return all_responses
 
-    async def fetch_responses_async(self) -> list:
+    async def fetch_responses_async(self,
+                                    timeout: Optional[float] = None) -> list:
         # A really async version of fetch_responses
         logger_debug(f"RpcWorker {mpi_rank()} is fetching responses async",
                      color="yellow")
 
         # First, await any pending responses without blocking the event loop
-        responses = await asyncio.to_thread(self.await_responses, 0.001)
-        # Handle the responses that are ready
-        self._await_response_helper.responses_handler(responses)
-
-        qsize = self._response_queue.qsize()
-        logger_debug(f"RpcWorker returning {qsize} async responses",
-                     color="yellow")
-
-        if qsize == 0:
-            return []
-
-        all_responses = []
-        for _ in range(qsize):
-            all_responses.extend(self._response_queue.get())
-        return all_responses
+        responses = await asyncio.to_thread(self.fetch_responses,
+                                            timeout=timeout)
+        return responses
 
     # for streaming performance
     async def fetch_responses_loop_async(self) -> AsyncGenerator[list, None]:
@@ -145,6 +131,7 @@ class RpcWorker(BaseWorker):
                      color="yellow")
         self.shutdown_event.set()
         super().shutdown()
+        logger_debug(f"RPC worker {mpi_rank()} is shutdown", color="yellow")
 
     def start(self):
         pass

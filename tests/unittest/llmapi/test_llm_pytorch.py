@@ -6,6 +6,7 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutorWorker
+from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -940,3 +941,18 @@ class TestLlmError:
                            match="should not exceed max_num_tokens"):
             ids = [random.randint(10, 100) for _ in range(101)]
             llm.generate([ids])
+
+
+def test_llm_rpc():
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             orchestrator_type="rpc") as llm:
+        assert isinstance(llm._executor, GenerationExecutorRpcProxy)
+
+        res = llm.generate("Tell me a joke",
+                           sampling_params=SamplingParams(max_tokens=10,
+                                                          end_id=-1))
+        print(f"get result: {res}")
+
+        assert len(res.outputs) == 1
+        assert len(res.outputs[0].token_ids) == 10
