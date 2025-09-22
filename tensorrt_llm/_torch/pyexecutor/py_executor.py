@@ -1865,6 +1865,27 @@ class PyExecutor:
         else:
             self.resource_manager.free_resources(request)
 
+    def _is_request_in_transmission(self, request) -> bool:
+        """Check if a request is currently in transmission state."""
+        return (request.state
+                == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                or request.state
+                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+
+    def _can_cancel_request(self, request) -> bool:
+        """Check if a request can be canceled and attempt cancellation if needed.
+
+        Returns:
+            bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
+        """
+        if self.kv_cache_transceiver is None:
+            return True
+
+        if not self._is_request_in_transmission(request):
+            return True
+
+        return self.kv_cache_transceiver.cancel_request(request)
+
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
         if self.executor_request_queue.get_canceled_req_ids_size() == 0:
@@ -1875,7 +1896,11 @@ class PyExecutor:
 
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
-            if req_id in self.executor_request_queue.get_canceled_req_ids():
+            if req_id not in self.executor_request_queue.get_canceled_req_ids():
+                continue
+
+            is_cancelled = self._can_cancel_request(request)
+            if is_cancelled:
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
                 request.finish_by_reason(FinishReason.CANCELLED)

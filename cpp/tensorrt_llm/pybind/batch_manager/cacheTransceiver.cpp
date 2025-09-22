@@ -68,6 +68,11 @@ public:
     {
         PYBIND11_OVERLOAD_PURE(bool, tb::BaseCacheTransceiver, checkGenTransferComplete);
     }
+
+    bool cancelRequest(tb::LlmRequest* llmRequest) override
+    {
+        PYBIND11_OVERLOAD_PURE(bool, tb::BaseCacheTransceiver, cancelRequest, llmRequest);
+    }
 };
 } // namespace
 
@@ -79,7 +84,8 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
         .def("check_context_transfer_status", &BaseCacheTransceiver::checkContextTransferStatus)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
-        .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete);
+        .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
 
     py::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
