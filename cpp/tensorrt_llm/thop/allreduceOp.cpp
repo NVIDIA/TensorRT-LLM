@@ -707,6 +707,16 @@ private:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
             break;
         }
+        case AllReduceStrategyType::ONESHOT:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: ONESHOT", rank);
+            break;
+        }
+        case AllReduceStrategyType::TWOSHOT:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: TWOSHOT", rank);
+            break;
+        }
         case AllReduceStrategyType::UB:
         {
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
@@ -941,36 +951,40 @@ private:
         // user should guarantee the correctness of the fusion pattern dispatching.
         if (!is_auto)
         {
-            if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
-            else
-            {
-                strategy = mStrategy;
-            }
-        }
-        else if (world_size <= 2)
-        {
-            strategy = AllReduceStrategyType::MIN_LATENCY;
+            strategy = mStrategy;
         }
         else
         {
-            static char* threshold_ptr = std::getenv("ALLREDUCE_AUTO_HEURISTIC_MIN_LATENCY_THRESHOLD_TOKEN_NUM");
-            size_t threshold = 128;
-            if (threshold_ptr)
-            {
-                threshold = static_cast<size_t>(std::atoi(threshold_ptr));
-            }
-            // Generally, NCCL is faster than MIN_LATENCY when the token number is greater than 256. I conservatively
-            // set the threshold here to 128 tokens.
-            if (seq_len > threshold)
+            // The heuristic is based on the following assumptions:
+            //  __________________________________
+            // |              \ TWO-SHOT zone |
+            // | ONE-SHOT zone    \           | NCCL zone
+            // |_______________________\______|___
+            // sm_major is 9 or 10
+            auto const sm_major = std::min(10, std::max(9, tensorrt_llm::common::getSMVersion() / 10));
+
+            TORCH_CHECK(
+                m2DHeuristicThreshold.find(sm_major) != m2DHeuristicThreshold.end(), "SM major version not supported");
+            TORCH_CHECK(m2DHeuristicThreshold[sm_major].find(world_size) != m2DHeuristicThreshold[sm_major].end(),
+                "TP size not supported");
+
+            auto const [nccl_num_token_threshold, two_shot_numel_threshold]
+                = m2DHeuristicThreshold[sm_major][world_size];
+
+            if (seq_len >= nccl_num_token_threshold)
             {
                 strategy = AllReduceStrategyType::NCCL;
             }
             else
             {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
+                if (message_size >= two_shot_numel_threshold)
+                {
+                    strategy = AllReduceStrategyType::TWOSHOT;
+                }
+                else
+                {
+                    strategy = AllReduceStrategyType::ONESHOT;
+                }
             }
         }
         return strategy;
@@ -1000,6 +1014,23 @@ private:
     AllReduceFusionOp mOp;
     float mEps;
     std::shared_ptr<ncclComm_t> mNcclComm;
+    static std::unordered_map<int, std::unordered_map<int, std::pair<size_t, size_t>>> m2DHeuristicThreshold;
+};
+
+// (SM major_version, TP_size) -> (NCCL_num_token_threshold, TWO_SHOT_numel_threshold)
+std::unordered_map<int, std::unordered_map<int, std::pair<size_t, size_t>>> AllreduceOp::m2DHeuristicThreshold{
+    {9,
+        {
+            {2, {4096, 4096 * 4096}},
+            {4, {4096, 1024 * 1024}},
+            {8, {2048, 512 * 512}},
+        }},
+    {10,
+        {
+            {2, {4096, 4096 * 4096}},
+            {4, {4096, 1024 * 2048}},
+            {8, {4096, 1024 * 1024}},
+        }},
 };
 
 } // namespace
