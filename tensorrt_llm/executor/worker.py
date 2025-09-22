@@ -11,13 +11,7 @@ import zmq
 
 from tensorrt_llm.logger import logger
 
-<<<<<<< HEAD
 from .._utils import KVCacheEventSerializer, mpi_comm, mpi_rank
-=======
-from .._torch.pyexecutor.llm_request import LlmResponse
-from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
-                      mpi_comm, mpi_rank, nvtx_range_debug)
->>>>>>> a5fad18ea7 (initial prototype)
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
