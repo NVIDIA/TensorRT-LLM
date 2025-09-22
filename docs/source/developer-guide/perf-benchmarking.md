@@ -8,14 +8,14 @@ Expect breaking API changes.
 ```
 
 TensorRT LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
-easier for users to reproduce our officially published [performance overview](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
+easier for users to reproduce our officially published [performance overview](../legacy/performance/perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
 
 - A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.
 - An entirely Python workflow for benchmarking.
 - Ability to benchmark various flows and features within TensorRT LLM.
 
 `trtllm-bench` executes all benchmarks using [in-flight batching] -- for more information see
-the [in-flight batching section](../advanced/gpt-attention.md#in-flight-batching) that describes the concept
+the [in-flight batching section](../legacy/advanced/gpt-attention.md#in-flight-batching) that describes the concept
 in further detail.
 
 ## Before Benchmarking
@@ -67,7 +67,7 @@ sudo nvidia-smi boost-slider --vboost <max_boost_slider>
 
 While `trtllm-bench` should be able to run any network that TensorRT LLM supports, the following are the list
 that have been validated extensively and is the same listing as seen on the
-[Performance Overview](./perf-overview.md) page.
+[Performance Overview](../legacy/performance/perf-overview.md) page.
 
 - [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)
 - [meta-llama/Llama-2-70b-hf](https://huggingface.co/meta-llama/Llama-2-70b-hf)
@@ -98,8 +98,8 @@ Export your token in the `HF_TOKEN` environment variable.
 - `FP8`
 - `NVFP4`
 
-For more information about quantization, refer to [](../reference/precision.md) and
-the [support matrix](../reference/precision.md#support-matrix) of the supported quantization methods for each network.
+For more information about quantization, refer to [](../legacy/reference/precision.md) and
+the [support matrix](../legacy/reference/precision.md#support-matrix) of the supported quantization methods for each network.
 
 ```{tip}
 Although TensorRT LLM supports more quantization modes than listed above, `trtllm-bench` currently only configures for

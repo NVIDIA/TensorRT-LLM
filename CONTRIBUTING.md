@@ -136,7 +136,7 @@ Meanwhile, please add the "release blocker" label to any PRs that could potentia
 
 Some APIs are committed to be stable; any breaking changes to these APIs require careful design and review.
 
-This repo contains an [API stability testsuite](./tests/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
+This repo contains an [API stability testsuite](./tests/unittest/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
 
 ```txt
 def test_signature(self):

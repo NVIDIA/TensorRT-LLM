@@ -19,21 +19,21 @@ Here is a simple example to show how to use `tensorrt_llm.LLM` API with Llama mo
 
 ## Features
 
-- [Sampling](./torch/features/sampling.md)
-- [Quantization](./torch/features/quantization.md)
-- [Overlap Scheduler](./torch/features/overlap_scheduler.md)
-- [Feature Combination Matrix](./torch/features/feature_combination_matrix.md)
+- [Sampling](../features/sampling.md)
+- [Quantization](../features/quantization.md)
+- [Overlap Scheduler](../torch/features/overlap_scheduler.md)
+- [Feature Combination Matrix](../torch/features/feature_combination_matrix.md)
 
 ## Developer Guide
 
-- [Architecture Overview](./torch/arch_overview.md)
-- [Adding a New Model](./torch/adding_new_model.md)
+- [Architecture Overview](../torch/arch_overview.md)
+- [Adding a New Model](../models/adding-new-model.md)
 
 ## Key Components
 
-- [Attention](./torch/attention.md)
-- [KV Cache Manager](./torch/kv_cache_manager.md)
-- [Scheduler](./torch/scheduler.md)
+- [Attention](../features/attention.md)
+- [KV Cache Manager](../torch/kv_cache_manager.md)
+- [Scheduler](../torch/scheduler.md)
 
 ## Known Issues
 
