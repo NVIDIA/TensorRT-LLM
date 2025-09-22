@@ -165,7 +165,6 @@ l0_h100:
   - examples/test_gemma.py::test_llm_gemma_1gpu_summary_vswa[gemma-3-1b-it-other-bfloat16-8]
   - unittest/trt/model/eagle # 1 mins on H100
   - unittest/test_model_runner_cpp.py
-  - test_cache.py::test_cache_sanity # 1 sec
   - unittest/llmapi/test_llm_quant.py # 5.5 mins on H100
   - test_e2e.py::test_mistral_large_hidden_vocab_size
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit

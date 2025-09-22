@@ -88,7 +88,7 @@ def llm_models_root() -> str:
         "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
     )
 
-    return root if root.exists() else None
+    return str(root)
 
 
 def tests_path() -> Path:
@@ -150,14 +150,13 @@ def cached_in_llm_models_root(path_relative_to_llm_models_root,
 
         @wraps(f)
         def decorated(*args, **kwargs):
-            if llm_models_root() is not None:
-                cached_dir = f"{llm_models_root()}/{path_relative_to_llm_models_root}"
-                if os.path.exists(cached_dir):
-                    return cached_dir
-                elif fail_if_path_is_invalid:
-                    assert (
-                        False
-                    ), f"{cached_dir} does not exist, and fail_if_path_is_invalid is True, please check the cache directory"
+            cached_dir = f"{llm_models_root()}/{path_relative_to_llm_models_root}"
+            if os.path.exists(cached_dir):
+                return cached_dir
+            elif fail_if_path_is_invalid:
+                assert (
+                    False
+                ), f"{cached_dir} does not exist, and fail_if_path_is_invalid is True, please check the cache directory"
             return f(*args, **kwargs)
 
         return decorated
