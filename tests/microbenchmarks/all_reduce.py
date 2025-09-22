@@ -17,6 +17,7 @@ from argparse import ArgumentParser
 
 # isort: off
 import torch
+
 # isort: on
 try:
     from cuda.bindings import runtime as cudart
@@ -24,20 +25,23 @@ except ImportError:
     from cuda import cudart
 
 import tensorrt_llm as tllm
+import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
-import tensorrt_llm.bindings.internal.userbuffers as ub
 
-def allreduce_benchmark(dtype: str,
-                        test_range: str = "1,10000000,10",
-                        no_header: bool = False,
-                        enable_cudagraph: bool = False,
-                        only_ub:bool = False):
-    tllm.logger.set_level('error')
+
+def allreduce_benchmark(
+    dtype: str,
+    test_range: str = "1,10000000,10",
+    no_header: bool = False,
+    enable_cudagraph: bool = False,
+    only_ub: bool = False,
+):
+    tllm.logger.set_level("error")
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
     local_rank = local_mpi_rank()
@@ -53,7 +57,7 @@ def allreduce_benchmark(dtype: str,
 
     torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
     min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
-    
+
     # Calculate dtype size in bytes
     dtype_size_bytes = torch_dtype.itemsize
     max_bytes = max_size * dtype_size_bytes
@@ -61,18 +65,23 @@ def allreduce_benchmark(dtype: str,
     if only_ub:
         fusion_ops = [AllReduceFusionOp.RESIDUAL_RMS_NORM]
         strategies = [AllReduceStrategy.UB]
-        ub.initialize_userbuffers_manager(world_size, 1, 1, rank, torch.cuda.device_count(), max_bytes, False)
+        ub.initialize_userbuffers_manager(world_size, 1, 1, rank,
+                                          torch.cuda.device_count(), max_bytes,
+                                          False)
     else:
-        fusion_ops = [AllReduceFusionOp.RESIDUAL_RMS_NORM, AllReduceFusionOp.NONE]
-        strategies = [AllReduceStrategy.NCCL,
-                      AllReduceStrategy.MIN_LATENCY,
-                      AllReduceStrategy.NCCL_SYMMETRIC,
-                      AllReduceStrategy.NCCL_DEVICE,
-                      ]
-        ub.initialize_userbuffers_manager(world_size, 1, 1, rank, torch.cuda.device_count(), max_bytes, True)
-    
+        fusion_ops = [
+            AllReduceFusionOp.RESIDUAL_RMS_NORM, AllReduceFusionOp.NONE
+        ]
+        strategies = [
+            AllReduceStrategy.NCCL,
+            AllReduceStrategy.MIN_LATENCY,
+            AllReduceStrategy.NCCL_SYMMETRIC,
+            AllReduceStrategy.NCCL_DEVICE,
+        ]
+        ub.initialize_userbuffers_manager(world_size, 1, 1, rank,
+                                          torch.cuda.device_count(), max_bytes,
+                                          True)
 
-    
     inner_loop = 1200
     outer_loop = 10
 
@@ -103,16 +112,18 @@ def allreduce_benchmark(dtype: str,
                         if version == "v1":
                             params = {
                                 "all_reduce_params":
-                                AllReduceParams(fusion_op=fusion,
-                                                residual=input,
-                                                norm_weight=norm.weight,
-                                                eps=norm.variance_epsilon)
+                                AllReduceParams(
+                                    fusion_op=fusion,
+                                    residual=input,
+                                    norm_weight=norm.weight,
+                                    eps=norm.variance_epsilon,
+                                )
                             }
                         else:
                             params = {
                                 "reduce_fusion_inputs": [input, norm.weight],
                                 "eps": norm.variance_epsilon,
-                                "fusion_op": fusion
+                                "fusion_op": fusion,
                             }
                     else:
                         if version == "v1":
@@ -164,14 +175,15 @@ def allreduce_benchmark(dtype: str,
                         start[i].elapsed_time(stop[i])
                         for i in range(outer_loop)
                     ]
-                    median_ms = sorted(runtimes)[len(runtimes) // 2]/inner_loop
+                    median_ms = sorted(runtimes)[len(runtimes) //
+                                                 2] / inner_loop
 
                     if fusion == AllReduceFusionOp.NONE:
                         allreduce_ref = (input * world_size)**inner_loop
                         torch.testing.assert_close(output, allreduce_ref)
 
                     if mapping.rank == 0:
-                        message_size_b = (size * dtype_size_bytes)
+                        message_size_b = size * dtype_size_bytes
                         print(
                             f"{mapping.world_size:<15}, {dtype:<10}, {message_size_b:<15.0f}, {strategy.name:<10}, {fusion.name:<20}, {version:<10}, {median_ms:<10.5f}"
                         )
@@ -191,7 +203,8 @@ if __name__ == "__main__":
         "--range",
         "-r",
         default="256,256000000,4",  # 256 to 256M
-        help="min_size,max_size,multiplicative_ratio")
+        help="min_size,max_size,multiplicative_ratio",
+    )
     parser.add_argument("--no-header", action="store_true")
     parser.add_argument("--enable-cudagraph", action="store_true")
     parser.add_argument("--only-ub", action="store_true")
