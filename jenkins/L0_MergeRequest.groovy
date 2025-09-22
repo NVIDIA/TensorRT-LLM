@@ -338,7 +338,8 @@ def mergeWaiveList(pipeline, globalVars)
     try {
         // Get TOT waive list
         LLM_TOT_ROOT = "llm-tot"
-        targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+        // targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+        targetBranch = "8cf95681e65483887caf811ee3cb11c414b83cbb"
         echo "Target branch: ${targetBranch}"
         withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
             trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, false)
