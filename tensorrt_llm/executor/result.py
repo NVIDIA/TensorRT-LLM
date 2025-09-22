@@ -259,6 +259,10 @@ class GenerationResultBase:
             # each streamed response_tensors.log_probs[src_idx]
             # contains a streamwise monotonically growing list of logprobs.
             # so we need to accumulate only the new ones unique to that particular streamed response
+            assert output._last_logprobs_len <= len(
+                response_tensors.log_probs[src_idx]
+            ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
+                f"{len(response_tensors.log_probs[src_idx])})")
             output.logprobs += response_tensors.log_probs[src_idx][
                 output._last_logprobs_len:]
             # overcome some WAR in the cpp executor

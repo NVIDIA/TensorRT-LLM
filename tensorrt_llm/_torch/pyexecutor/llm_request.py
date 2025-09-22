@@ -398,10 +398,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         parent class's serialized result in a PyTorch-specific LlmResponse object.
 
         Args:
-            use_fast_logits (bool, optional): Whether to use fast logits computation
-                for improved performance. Defaults to False.
-            mpi_world_rank (int, optional): The MPI world rank for distributed
-                inference. Defaults to 0.
+            use_fast_logits (bool, optional, default=False): Only applicable for TRT-backend with speculative decoding enabled. When returning generation logits under speculative decoding,
+            `use_fast_logits=True` replaces tensor payloads with tiny metadata so the target pulls logits
+            directly (zero-copy/IPC), reducing overhead; ignored on PyTorch.
+            mpi_world_rank (int, optional, default=0): Only applicable for TRT-backend, with speculative decoding
+            enabled, and `use_fast_logits=True`. Contains the MPI world rank of the process containing the draft
+            model, that produces the generation logits. This helps transfer logits from the draft model to the
+            target model without going through the serialization/transport path.
 
         Returns:
             LlmResponse | None: An LlmResponse object containing the request results

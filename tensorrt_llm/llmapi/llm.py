@@ -569,11 +569,9 @@ class BaseLLM:
         sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
 
-    def _check_arguments(self,
-                         prompt_len: int,
-                         query_len: int,
+    def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams,
-                         is_gen_only: bool = False) -> None:
+                         is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
             if sampling_params.logprobs and sampling_params.logprobs > 1:
