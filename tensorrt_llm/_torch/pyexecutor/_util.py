@@ -482,8 +482,7 @@ class KvCacheCreator:
                 config.linear_key_head_dim,
                 config.linear_conv_kernel_dim,
                 config.linear_num_value_heads,
-                config.
-                linear_num_key_heads,
+                config.linear_num_key_heads,
                 config.linear_value_head_dim,
                 num_mamba_layers,
                 mamba_layer_mask,
