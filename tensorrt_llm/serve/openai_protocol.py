@@ -97,7 +97,7 @@ class ResponseFormat(OpenAIBaseModel):
     schema: Optional[dict] = None
     structures: Optional[List[StructuralTag]] = None
     triggers: Optional[List[str]] = None
-
+    guidance_start_token_id: Optional[int] = None
 
 class DisaggregatedParams(OpenAIBaseModel):
     request_type: str
@@ -190,9 +190,9 @@ def _response_format_to_guided_decoding_params(
             raise ValueError(
                 "The 'schema' field is required when response_format.type is 'json'."
             )
-        return GuidedDecodingParams(json=response_format.schema)
+        return GuidedDecodingParams(json=response_format.schema, guidance_start_token_id=response_format.guidance_start_token_id)
     elif response_format.type == "json_object":
-        return GuidedDecodingParams(json_object=True)
+        return GuidedDecodingParams(json_object=True, guidance_start_token_id=response_format.guidance_start_token_id)
     elif response_format.type == "structural_tag":
         return GuidedDecodingParams(
             structural_tag=response_format.model_dump_json(by_alias=True,

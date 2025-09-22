@@ -496,11 +496,11 @@ void initRequestBindings(pybind11::module_& m)
         .value("STRUCTURAL_TAG", tle::GuidedDecodingParams::GuideType::kSTRUCTURAL_TAG);
 
     auto guidedDecodingParamsGetstate
-        = [](tle::GuidedDecodingParams const& self) { return py::make_tuple(self.getGuideType(), self.getGuide()); };
+        = [](tle::GuidedDecodingParams const& self) { return py::make_tuple(self.getGuideType(), self.getGuide(), self.getGuidanceStartTokenId()); };
 
     auto guidedDecodingParamsSetstate = [](py::tuple state)
     {
-        if (state.size() != 2)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid GuidedDecodingParams state!");
         }
@@ -513,6 +513,7 @@ void initRequestBindings(pybind11::module_& m)
             py::arg("guide") = py::none())
         .def_property_readonly("guide_type", &tle::GuidedDecodingParams::getGuideType)
         .def_property_readonly("guide", &tle::GuidedDecodingParams::getGuide)
+        .def_property_readonly("guidance_start_token_Id", &tle::GuidedDecodingParams::getGuidanceStartTokenId)
         .def(py::pickle(guidedDecodingParamsGetstate, guidedDecodingParamsSetstate));
 
     auto requestGetstate = [](tle::Request const& self)
