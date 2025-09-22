@@ -50,31 +50,8 @@ jobs:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
 
-  Vulnerability-scan:
-    name: Vulnerability scan
-    needs: [Authorization]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-        with:
-          repository: ${{ fromJson(needs.Authorization.outputs.args).repo }}
-          ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}
-          lfs: 'true'
-
-      - name: Run blossom action
-        uses: NVIDIA/blossom-action@main
-        env:
-          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
-        with:
-          args1: ${{ fromJson(needs.Authorization.outputs.args).args1 }}
-          args2: ${{ fromJson(needs.Authorization.outputs.args).args2 }}
-          args3: ${{ fromJson(needs.Authorization.outputs.args).args3 }}
-
   Job-trigger:
     name: Start ci job
-    needs: [Vulnerability-scan]
     runs-on: blossom
     steps:
       - name: Start ci job
