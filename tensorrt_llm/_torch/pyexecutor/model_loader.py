@@ -18,8 +18,6 @@ from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
-from ..modules.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer, maybe_create_moe_load_balancer)
 from .config import LoadFormat, PyTorchConfig
 
 _KV_CACHE_MAP = {
@@ -202,9 +200,7 @@ class ModelLoader:
                                                 checkpoint_loader)
         load_format = self.pytorch_backend_config.load_format
 
-        with timing("Model init total"), maybe_create_moe_load_balancer(
-                config, self.mapping) as moe_load_balancer:
-
+        with timing("Model init total"):
             try:
                 # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
@@ -268,13 +264,6 @@ class ModelLoader:
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
-
-            if isinstance(moe_load_balancer, MoeLoadBalancer):
-                setattr(self, "moe_load_balancer", moe_load_balancer)
-                moe_load_balancer.register_weight_slots_after_to_cuda()
-                logger.info("moe_load_balancer finalizing model...")
-                moe_load_balancer.finalize_model()
-                logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
 

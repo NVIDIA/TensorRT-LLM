@@ -37,8 +37,8 @@ from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
-from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
-                                                   MoeLoadBalancerIterContext)
+from ..modules.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
 from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
                            get_spec_metadata,
                            update_spec_config_from_model_config)
@@ -175,6 +175,14 @@ class PyTorchModelEngine(ModelEngine):
             )
             self.model = loader.load(checkpoint_dir=model_path,
                                      checkpoint_loader=checkpoint_loader)
+            moe_load_balancer = maybe_create_moe_load_balancer(
+                self.model.config, self.mapping)
+            if isinstance(moe_load_balancer, MoeLoadBalancer):
+                setattr(self, "moe_load_balancer", moe_load_balancer)
+                moe_load_balancer.register_weight_slots_after_to_cuda()
+                logger.info("moe_load_balancer finalizing model...")
+                moe_load_balancer.finalize_model()
+                logger.info("moe_load_balancer finalize model done")
         else:
             self.model = model
         if drafting_loop_wrapper is not None:
