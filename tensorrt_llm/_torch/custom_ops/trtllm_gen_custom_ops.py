@@ -1579,26 +1579,6 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
             return num_tokens
 
-        def _constrain_fp4_linear_layout(shapes: Tuple[torch.Size]) -> int:
-            HIDDEN_STATES_IDX = 2
-            NUM_TOKENS_DIM = 0
-            HIDDEN_SIZE_DIM = 1
-
-            num_tokens = shapes[HIDDEN_STATES_IDX][NUM_TOKENS_DIM]
-
-            hidden_size = shapes[HIDDEN_STATES_IDX][HIDDEN_SIZE_DIM]
-
-            sf_linear_size = num_tokens * (hidden_size // 32)
-
-            return sf_linear_size
-
-        HIDDEN_STATES_SCALE_IDX = 3
-        CONSTRAINED_HS_SCALE_DIM = 0
-
-        constraint_hidden_states_scale = ConstraintSpec(
-            HIDDEN_STATES_SCALE_IDX, CONSTRAINED_HS_SCALE_DIM,
-            _constrain_fp4_linear_layout)
-
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_RL_DIM = 0
 
@@ -1606,10 +1586,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
                                                    CONSTRAINED_RL_DIM,
                                                    _constrain_to_num_tokens)
 
-        constraint_specs_tuple = (
-            constraint_hidden_states_scale,
-            constraint_routing_logits,
-        )
+        constraint_specs_tuple = (constraint_routing_logits, )
 
         return constraint_specs_tuple
 

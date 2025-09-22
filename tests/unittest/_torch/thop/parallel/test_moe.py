@@ -1068,6 +1068,13 @@ class TestMoeFp4:
                               routing_info,
                               use_autotune=True,
                               use_topk_as_input=False)
+        if intermediate_size >= 256:
+            self.run_moe_fp8_fp4_test(num_tokens,
+                                      hidden_size,
+                                      intermediate_size,
+                                      routing_info,
+                                      use_autotune=True,
+                                      use_topk_as_input=False)
 
     @pytest.mark.parametrize("num_tokens", [1, 150])
     @pytest.mark.parametrize("hidden_size", [1024])
@@ -1116,7 +1123,8 @@ class TestMoeFp4:
                                   hidden_size,
                                   intermediate_size,
                                   routing_info,
-                                  use_autotune=False, use_topk_as_input=use_topk_as_input)
+                                  use_autotune=False,
+                                  use_topk_as_input=use_topk_as_input)
 
     def run_moe_fp4_test(self, num_tokens: int, hidden_size: int,
                          intermediate_size: int, routing_info: dict,
