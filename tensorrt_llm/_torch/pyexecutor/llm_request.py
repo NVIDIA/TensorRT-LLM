@@ -1,8 +1,6 @@
-from collections.abc import Generator
 from copy import deepcopy
 from dataclasses import dataclass
-from itertools import pairwise
-from typing import Any, Dict, List, Optional, TypeAlias, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -329,6 +327,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_prompt_len = self.prompt_len
         self.py_orig_prompt_len = self.orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens
+        self.py_min_length = self.sampling_config.min_length
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
@@ -426,10 +425,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.child_requests.append(py_request)
 
 
-StopWordList: TypeAlias = list[list[int]]
-
-
-def convert_wordlist(word_list) -> StopWordList:
+def convert_wordlist(word_list) -> List[List[int]]:
     """Converts a wordlist from format:
 
     [[word_0 token_0, word_0 token_1, ...], [word_1 token_0, ...], ...]]
@@ -464,16 +460,6 @@ def convert_wordlist(word_list) -> StopWordList:
     if len(tokens) > len(offsets):
         offsets.extend([-1] * (len(tokens) - len(offsets)))
     return [tokens, offsets]
-
-
-def produce_stop_words(
-        py_stop_words_list: StopWordList) -> Generator[list[int], None, None]:
-    """yield stop sequences from the output of `convert_wordlist` above."""
-    stop_words_list, prefix_sum = py_stop_words_list
-    for start, end in pairwise((0, *prefix_sum)):  # first element: prepend 0
-        if end == -1:  # -1 is a sentinel value in convert_wordlist
-            break
-        yield stop_words_list[start:end]
 
 
 def executor_request_to_llm_request(
