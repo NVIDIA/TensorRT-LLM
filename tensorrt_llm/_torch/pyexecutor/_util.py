@@ -21,7 +21,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
-from .config_utils import is_mla, is_nemotron_hybrid
+from .config_utils import is_mla, is_nemotron_hybrid, is_falcon_h1
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -402,6 +402,44 @@ class KvCacheCreator:
                 is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
+            )
+        elif is_falcon_h1(config):
+            if self._max_beam_width > 1:
+                raise ValueError(
+                    "MambaHybridCacheManager + beam search is not supported yet."
+                )
+
+            if not estimating_kv_cache and self._kv_connector_manager is not None:
+                raise NotImplementedError(
+                    "Connector manager is not supported for MambaHybridCacheManager."
+                )
+
+            config = model_engine.model.model_config.pretrained_config
+            kv_cache_manager = MambaHybridCacheManager(
+                # mamba cache parameters
+                config.mamba_d_state,
+                config.mamba_d_conv,
+                config.mamba_n_heads,
+                config.mamba_n_groups,
+                config.mamba_d_head,
+                config.num_hidden_layers,
+                None,  # mamba_layer_mask, optional for MambaCacheManager
+                config.torch_dtype,
+                model_engine.model.model_config.quant_config.
+                mamba_ssm_cache_dtype,
+                # kv cache parameters
+                self._kv_cache_config,
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                num_layers=config.num_hidden_layers,
+                layer_mask=None,  # layer_mask, optional for KVCacheManager
+                num_kv_heads=num_key_value_heads,
+                head_dim=head_dim,
+                tokens_per_block=self._tokens_per_block,
+                max_seq_len=self._max_seq_len,
+                max_batch_size=self._max_batch_size,
+                mapping=mapping,
+                dtype=kv_cache_dtype,
+                spec_config=spec_config,
             )
         elif is_nemotron_hybrid(config):
             if self._max_beam_width > 1:

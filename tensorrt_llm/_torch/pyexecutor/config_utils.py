@@ -5,6 +5,8 @@ def is_nemotron_hybrid(config):
         return True
     return False
 
+def is_falcon_h1(config):
+    return "FalconH1ForCausalLM" in getattr(config, "architectures", [])
 
 def is_mla(config):
     if getattr(config, "kv_lora_rank", None) and getattr(
