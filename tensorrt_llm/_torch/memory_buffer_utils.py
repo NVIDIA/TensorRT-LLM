@@ -92,16 +92,12 @@ class Buffers:
 
         if buffer_name in self.buffers:
             candidate_buffers = self.buffers.get(buffer_name, [])
-            remove_idx = []
-            for idx, buffer in enumerate(candidate_buffers):
+            for buffer in list(candidate_buffers):
                 if not buffer.pin_memory:
-                    remove_idx.append(idx)
-
-            for idx in remove_idx[::-1]:
-                removed = candidate_buffers.pop(idx)
-                # Need to call del BufferBlock.buffer, otherwise memory isn't
-                # released and OOM may happen.
-                del removed.buffer
+                    # Need to call del BufferBlock.buffer, otherwise memory isn't
+                    # released and OOM may happen.
+                    del buffer.buffer
+                    candidate_buffers.remove(buffer)
 
         new_buffer = torch.zeros((required_memory_size, ),
                                  device='cuda',

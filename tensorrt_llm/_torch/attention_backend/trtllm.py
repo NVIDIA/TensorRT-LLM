@@ -621,7 +621,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         capture_graph = torch.cuda.is_current_stream_capturing()
 
         def get_empty(tensor_shape: list[int], dtype: torch.dtype,
-                      cache_name: str, pin_memory: boolean) -> torch.Tensor:
+                      cache_name: str, pin_memory: bool) -> torch.Tensor:
             """
             Finds a compatible, reusable buffer from a cache or creates a new one.
 
@@ -644,11 +644,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if buffers is None:
                 return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
 
-            return buffers.get_buffer(self, tensor_shape, dtype, cache_name,
+            return buffers.get_buffer(tensor_shape, dtype, cache_name,
                                       pin_memory)
 
         def get_empty_like(like_tensor: torch.Tensor, cache_name: str,
-                           pin_memory: boolean) -> torch.Tensor:
+                           pin_memory: bool) -> torch.Tensor:
             return get_empty(like_tensor.shape,
                              cache_name=cache_name,
                              dtype=like_tensor.dtype,
