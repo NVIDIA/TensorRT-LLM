@@ -29,9 +29,7 @@ _add_trt_llm_dll_directory()
 
 import sys
 
-# Need to import xgrammar before tensorrt_llm library,
-# otherwise `MemoryError: std::bad_alloc` pattern error will be raised.
-import xgrammar  # noqa
+import torch  # noqa
 
 import tensorrt_llm._torch.models as torch_models
 import tensorrt_llm.functional as functional
