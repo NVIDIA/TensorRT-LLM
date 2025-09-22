@@ -19,8 +19,8 @@ from PIL import Image
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...executor.request import LoRARequest
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
+                       InputProcessor, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -29,7 +29,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings)
 from .modeling_utils import register_auto_model
 
 # Special token ids from the original Phi-4-multimodal-instruct implementation
@@ -389,7 +390,7 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel,
             return self._encoding_batch_request(multimodal_params, mm_token_ids)
 
 
-class Phi4MMInputProcessor(InputProcessor):
+class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -414,6 +415,20 @@ class Phi4MMInputProcessor(InputProcessor):
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
+
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        return torch.tensor([_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
+                            dtype=torch.int32,
+                            device=self.device)
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image: Image.Image,
+        **kwargs,
+    ):
+        data = self.processor.image_processor.preprocess(image)
+        return data["num_img_tokens"][0]
 
     @torch.inference_mode()
     def __call__(
@@ -579,16 +594,22 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         mm_embedding = []
         if len(multimodal_params) > 0:
             if not _is_disagg():
-                # Forward the multimodal data to HFPhi4MultimodalEncoder in AGGREGATE mode.
-                mm_embedding = self.hf_phi4mm_model(multimodal_params,
-                                                    self.mm_token_ids)
+                encoder_kwargs = {
+                    "mm_token_ids": self.mm_token_ids,
+                }
+                mm_embedding = get_multimodal_embeddings(
+                    encoder_forward_fn=self.hf_phi4mm_model.forward,
+                    multimodal_params=multimodal_params[:num_context_requests],
+                    encoder_kwargs=encoder_kwargs,
+                )
             else:
-                # Directly fetch the multimodal embedding for DISAGG mode.
-                # This path is not functional now. `multimodal_params` will be prepared in PyExecutor.
-                mm_embedding = [
-                    multimodal_param.multimodal_data["multimodal_embedding"]
-                    for multimodal_param in multimodal_params
-                ]
+                raise NotImplementedError(
+                    "Phi-4-multimodal does not support disaggregated inference yet. Please unset "
+                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                )
+            mm_embedding = find_input_mm_embeds(
+                mm_embedding, multimodal_params[:num_context_requests])
+
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,

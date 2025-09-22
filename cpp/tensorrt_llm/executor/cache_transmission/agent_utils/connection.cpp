@@ -104,7 +104,7 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     MemoryDesc srcDesc{
         reinterpret_cast<uintptr_t>(data), size, static_cast<uint32_t>(mAgentConnectionManager->getDeviceId())};
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
-    auto dstBaseDesc = mSenderState.mReceiverBufferDesc;
+    auto dstBaseDesc = mSenderState.mCacheReceiverBufferDesc;
     auto offset = size / mSenderState.mOffsetRatio.second * mSenderState.mOffsetRatio.first;
     MemoryDesc dstDesc{dstBaseDesc.getAddr() + offset, size, dstBaseDesc.getDeviceId()};
     TLLM_LOG_DEBUG(
@@ -162,9 +162,9 @@ void AgentConnection::sendRequestAndBufferInfo(
 }
 
 void AgentConnection::setSenderState(
-    MemoryDesc mReceiverBufferDesc, int validSegmentIdx, std::pair<size_t, size_t> offsetRatio)
+    MemoryDesc mCacheReceiverBufferDesc, int validSegmentIdx, std::pair<size_t, size_t> offsetRatio)
 {
-    mSenderState.mReceiverBufferDesc = mReceiverBufferDesc;
+    mSenderState.mCacheReceiverBufferDesc = mCacheReceiverBufferDesc;
     mSenderState.validSegmentIdx = validSegmentIdx;
     mSenderState.mOffsetRatio = offsetRatio;
 }

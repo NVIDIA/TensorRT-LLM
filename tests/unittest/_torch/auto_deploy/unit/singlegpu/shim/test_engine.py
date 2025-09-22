@@ -1,4 +1,4 @@
-from typing import Type
+from typing import Type, Union
 
 import pytest
 import torch
@@ -8,6 +8,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoEngine
+from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 
 
 class TransformerLikeModelwithFakeCachePool(nn.Module):
@@ -22,7 +23,11 @@ class TransformerLikeModelwithFakeCachePool(nn.Module):
         )
         self.output_projection = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, input_ids, *cache_args):
+    def forward(self, cm_or_input_ids: Union[CachedSequenceInterface, torch.Tensor]):
+        if isinstance(cm_or_input_ids, CachedSequenceInterface):
+            input_ids = cm_or_input_ids.args[0]
+        else:
+            input_ids = cm_or_input_ids
         embeddings = self.embedding(input_ids)
         hidden_states = self.mlp(embeddings)
         logits = self.output_projection(hidden_states)
