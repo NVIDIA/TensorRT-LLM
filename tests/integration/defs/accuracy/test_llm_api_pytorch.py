@@ -3287,7 +3287,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         "apply_chat_template": True,
     }
 
-    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+    MODEL_PATH = f"openai/gpt-oss-120b"
 
     @pytest.mark.parametrize(
         "kv_cache_dtype",
@@ -3378,10 +3378,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
-    # Blocked by https://github.com/NVIDIA/TensorRT-LLM/pull/7728
-    # Need to add Hopper as well
     @pytest.mark.skip_less_device(4)
-    def test_eagle3(self, mocker):
+    @pytest.mark.parametrize(
+        "moe_backend",
+        ["CUTLASS",
+         pytest.param("TRTLLM", marks=skip_pre_blackwell), "TRITON"],
+        ids=["cutlass", "trtllm", "triton"])
+    def test_eagle3(self, moe_backend, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -3406,7 +3409,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   speculative_config=spec_config,
                   **pytorch_config,
                   enable_attention_dp=False,
-                  moe_config=MoeConfig(backend="TRTLLM"))
+                  moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
