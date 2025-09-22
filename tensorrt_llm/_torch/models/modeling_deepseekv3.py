@@ -1548,11 +1548,10 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                     module.weight_scale = nn.Parameter(transfromed_scale,
                                                        requires_grad=False)
 
-        if not self.is_draft_model:
-            for idx, layer in enumerate(
-                    self.model.model.layers[:self.config.num_hidden_layers]):
-                if idx == self.config.num_hidden_layers - 1:
-                    layer.next_layer_layernorm = self.model.model.norm
-                else:
-                    layer.next_layer_layernorm = self.model.model.layers[
-                        idx + 1].input_layernorm
+        for idx, layer in enumerate(
+                self.model.layers[:self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.layers[
+                    idx + 1].input_layernorm
