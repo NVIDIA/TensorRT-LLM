@@ -1104,7 +1104,7 @@ def is_multi_device_enable():
     This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
     So we can avoid broadcast calls on single GPU.
     Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
-    ENABLE_MULTI_DEVICE is true by default when building tensorrt-llm so we need to also check
+    ENABLE_MULTI_DEVICE is true by default when building TensorRT LLM so we need to also check
     the number of devices
     """
     return local_mpi_size() > 1

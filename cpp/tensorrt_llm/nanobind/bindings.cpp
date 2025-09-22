@@ -73,7 +73,7 @@ tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& con
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
-    m.doc() = "TensorRT-LLM Python bindings for C++ runtime";
+    m.doc() = "TensorRT LLM Python bindings for C++ runtime";
     m.attr("binding_type") = "nanobind";
     nb::set_leak_warnings(false);
 

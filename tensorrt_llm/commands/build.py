@@ -62,26 +62,26 @@ def parse_arguments():
         '--checkpoint_dir',
         type=str,
         default=None,
-        help="The directory path that contains TensorRT-LLM checkpoint.")
+        help="The directory path that contains TensorRT LLM checkpoint.")
     parser.add_argument(
         '--model_config',
         type=str,
         default=None,
-        help="The file path that saves TensorRT-LLM checkpoint config.")
+        help="The file path that saves TensorRT LLM checkpoint config.")
     parser.add_argument(
         '--build_config',
         type=str,
         default=None,
-        help="The file path that saves TensorRT-LLM build config.")
+        help="The file path that saves TensorRT LLM build config.")
     parser.add_argument(
         '--model_cls_file',
         type=str,
         default=None,
-        help="The file path that defines customized TensorRT-LLM model.")
+        help="The file path that defines customized TensorRT LLM model.")
     parser.add_argument('--model_cls_name',
                         type=str,
                         default=None,
-                        help="The customized TensorRT-LLM model class name.")
+                        help="The customized TensorRT LLM model class name.")
     parser.add_argument(
         '--output_dir',
         type=str,
