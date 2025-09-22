@@ -1988,7 +1988,8 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
                 }
                 // We submit the Slurm job with SlurmConfig.DEFAULT_TIMEOUT minutes (300) timeout
                 // The timeout here is to avoid the Slurm job being stuck.
-                timeout(time: SlurmConfig.DEFAULT_TIMEOUT, unit: 'MINUTES') {
+                // Minus 10 minutes to avoid the Slurm job being stopped earlier.
+                timeout(time: SlurmConfig.DEFAULT_TIMEOUT - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
                         runner()
                     }
