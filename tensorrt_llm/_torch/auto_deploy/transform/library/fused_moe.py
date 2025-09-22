@@ -11,22 +11,6 @@ from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
-def _resolve_owner_module_and_leaf_attr(
-    module: torch.nn.Module, target: str
-) -> tuple[torch.nn.Module, str]:
-    """
-    Given a dotted target path (e.g., "layer.expert.w1.weight"), resolve and return
-    the owning module and the leaf attribute name (e.g., (module.layer.expert.w1, "weight")).
-    """
-    if "." not in target:
-        return module, target
-    parts = target.split(".")
-    owner = module
-    for part in parts[:-1]:
-        owner = getattr(owner, part)
-    return owner, parts[-1]
-
-
 def _insert_fused_moe_ops(gm: GraphModule) -> int:
     fused_key_counter = 0
     graph = gm.graph
@@ -36,9 +20,6 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
             continue
 
         hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = node.args
-
-        # Track original parameter names for later safe unregistration.
-        pre_fusion_param_names = {n.target for lst in (w1_list, w2_list, w3_list) for n in lst}
 
         fused_w3_w1_experts = torch.stack(
             [
@@ -76,35 +57,13 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
 
-        _cleanup_unstacked_weights(gm, pre_fusion_param_names)
+        # Delete the unstacked weights immediately to save GPU memory
+        # This will happen automatically after the graph is canonicalized, but for large models we'll run out of memory
+        # during the transformation itself.
+        gm.graph.eliminate_dead_code()
+        gm.delete_all_unused_submodules()
 
     return fused_key_counter
-
-
-def _cleanup_unstacked_weights(
-    gm,
-    pre_fusion_param_names,
-):
-    """DCE then unregister any now-unreferenced original params for this fusion"""
-    gm.graph.eliminate_dead_code()
-
-    used_attr_names_iter = set()
-    for n in gm.graph.nodes:
-        if getattr(n, "op", None) == "get_attr":
-            used_attr_names_iter.add(getattr(n, "target", None))
-
-    names_to_unregister_iter = [
-        name for name in pre_fusion_param_names if name not in used_attr_names_iter
-    ]
-
-    for name in names_to_unregister_iter:
-        param_obj = gm.get_parameter(name)
-        owner_mod, leaf = _resolve_owner_module_and_leaf_attr(gm, name)
-        delattr(owner_mod, leaf)
-        del param_obj
-
-    # Flush CUDA cache since we freed large chunks of memory
-    torch.cuda.empty_cache()
 
 
 def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
