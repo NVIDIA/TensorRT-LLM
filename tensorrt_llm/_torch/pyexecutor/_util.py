@@ -138,16 +138,20 @@ class KvCacheCreator:
     def _create_dummy_mm_context_request(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        self._model_name_or_path = getattr(self._model_engine.model,
-                                           "name_or_path", None)
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            self._model_name_or_path)
-        input_processor = create_input_processor(self._model_name_or_path,
-                                                 self._tokenizer)
+        if isinstance(
+                self._profiling_stage_data,
+                dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
+            return requests
+
+        model_name_or_path = getattr(self._model_engine.model, "name_or_path",
+                                     None)
+        assert model_name_or_path is not None, "Could not determine model name or path"
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        input_processor = create_input_processor(model_name_or_path, tokenizer)
         if not (hasattr(input_processor, "get_dummy_prompt")):
-            logger.warning("The input processor of the model does not have the method [get_prompt_for_profiling] implemented." \
+            logger.warning("The input processor of the model does not have the method [get_dummy_prompt] implemented." \
             "Profiling with the default input dummy context request. This may not take into account the memory consumption of " \
-            "ViT's encoder")
+            "the image encoder")
             return requests
         text_prompt = input_processor.get_dummy_prompt(input_seq_len,
                                                        {'image': 1})
@@ -160,6 +164,7 @@ class KvCacheCreator:
         multimodal_data = extra_processed_inputs.get('multimodal_data')
 
         max_num_tokens = len(prompt_token_ids)
+        assert max_num_tokens > 0, "the length of the prompt of the dummy mm req is less than or equal to 0"
         remaining_tokens = max(max_num_tokens, input_seq_len)
         if remaining_tokens > input_seq_len:
             logger.warning(f"Profiling with multimedia prompt which contains more tokens than the allowed input_seq_len. " \

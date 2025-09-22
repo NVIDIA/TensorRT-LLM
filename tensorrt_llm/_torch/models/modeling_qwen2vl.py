@@ -1,8 +1,8 @@
 import copy
 import os
-import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -281,10 +281,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         return position_ids, mrope_position_deltas
 
     def get_dummy_text(self, input_seq_len: int):
-        return self.tokenizer.decode([
-            random.randint(0, self.model_config.vocab_size - 1)
-            for _ in range(input_seq_len)
-        ])
+        return self.tokenizer.decode(
+            np.random.randint(
+                low=0,
+                high=self.model_config.
+                vocab_size,  # Note: high is exclusive in NumPy
+                size=input_seq_len))
 
     def get_dummy_images(self, max_width: int, max_height: int,
                          num_images: int):
