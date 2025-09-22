@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Optional
 
+from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import (_SyncQueue, logger_debug, print_colored_debug,
@@ -24,15 +25,16 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
     # NOTE: this is a global counter for the number of instances of this class
     INSTANCE_COUNTER = 0
 
-    def __init__(self,
-                 worker_kwargs: dict,
-                 model_world_size: int = 1,
-                 mpi_session: Optional[MpiSession] = None,
-                 *,
-                 postproc_worker_config: Optional[PostprocWorkerConfig] = None,
-                 is_llm_executor: Optional[bool] = None,
-                 garbage_collection_gen0_threshold: Optional[int] = None,
-                 clock_unit: int = 1):
+    def __init__(
+        self,
+        worker_kwargs: dict,
+        model_world_size: int = 1,
+        mpi_session: Optional[MpiSession] = None,
+        *,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        is_llm_executor: Optional[bool] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
+    ):
         """
         Args:
             worker_kwargs: kwargs for the rpc worker
@@ -40,11 +42,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             mpi_session: the mpi session to use
             postproc_worker_config: the postproc worker config
             is_llm_executor: whether this is an llm executor
-            garbage_collection_gen0_threshold: the garbage collection gen0 threshold
-            clock_unit: the unit of the clock, 1 means 1 second
+            kv_connector_config: the kv cache connector config
         """
-        self.clock_unit = clock_unit
-
         GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
         self.rpc_addr = self.gen_uniq_rpc_addr()
         self.rpc_client = RPCClient(self.rpc_addr)
@@ -66,6 +65,9 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         self._shutdown_event = threading.Event()
         self.worker_kwargs = worker_kwargs
+
+        self.main_loop_task_obj = None
+        self.main_loop = None
 
         self.launch_workers()
         time.sleep(1)  # wait for the workers to launch
@@ -95,6 +97,8 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
                 if self._shutdown_event.is_set():
                     return
                 self.handle_responses(responses)
+        except asyncio.CancelledError:
+            logger.debug("Main loop task cancelled")
         except Exception as e:
             logger.error(f"Error in main_loop_task: {e}")
             raise
@@ -103,7 +107,17 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
 
         def _run_main_loop_task():
             """Local method to run the main loop task."""
-            asyncio.run(self.main_loop_task())
+            self.main_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.main_loop)
+
+            self.main_loop_task_obj = self.main_loop.create_task(
+                self.main_loop_task())
+            try:
+                self.main_loop.run_until_complete(self.main_loop_task_obj)
+            except asyncio.CancelledError:
+                pass  # Task cancellation is expected during shutdown
+            finally:
+                self.main_loop.close()
 
         self.main_loop_thread = threading.Thread(target=_run_main_loop_task,
                                                  daemon=True)
@@ -190,6 +204,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
     def shutdown(self):
         if self._shutdown_event.is_set():
             return
+        self._shutdown_event.set()
         logger_debug(f"Shutting down GenerationExecutorRpcProxy",
                      color="yellow")
 
@@ -197,13 +212,25 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         self.shutdown_remote()
 
         # 2. stop the main loop, so that no new rpc requests
-        self._shutdown_event.set()
+        if self.main_loop and self.main_loop_task_obj:
+            logger_debug("Cancelling main loop task.", color="yellow")
+            # The cancel() is thread-safe
+            try:
+                self.main_loop.call_soon_threadsafe(
+                    self.main_loop_task_obj.cancel)
+            except Exception as e:
+                logger_debug(f"Error cancelling main loop task: {e}",
+                             color="yellow")
+
         self.main_loop_thread.join()
 
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
         if self.mpi_session is not None:
+            logger_debug(f"Shutting down mpi session", color="yellow")
             self.mpi_session.shutdown()
+            logger_debug(f"Mpi session shutdown", color="yellow")
+            self.mpi_session = None
 
         self.rpc_client.close()
 

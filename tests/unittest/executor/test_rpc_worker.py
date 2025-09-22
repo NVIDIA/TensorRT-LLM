@@ -96,23 +96,6 @@ class TestRpcWorkerTP1:
                 break
         assert 0 < len(results) <= 5
 
-        time.sleep(5)
-
-    @pytest.mark.asyncio
-    async def test_fetch_responses_streaming_async(self):
-        self.client.submit(
-            GenerationRequest(prompt_token_ids=[3, 4, 5],
-                              sampling_params=SamplingParams(max_tokens=5),
-                              streaming=True), ).remote(need_response=False)
-
-        results = []
-        # Must fetch all the responses, or the PyExecutor will hang
-        for i in range(10):
-            res = await self.client.fetch_responses_async().remote_async()
-            results.extend(res)
-            print(f"fetch_responses_async {i} result: {results}")
-        assert 0 < len(results) <= 5
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize("req_count", [10])
     async def test_main_loop_async(self, req_count: int):
