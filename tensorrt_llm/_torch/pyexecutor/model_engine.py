@@ -176,7 +176,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model = loader.load(checkpoint_dir=model_path,
                                      checkpoint_loader=checkpoint_loader)
             moe_load_balancer = maybe_create_moe_load_balancer(
-                self.model.config, self.mapping)
+                self.model.model_config, self.mapping)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
                 moe_load_balancer.register_weight_slots_after_to_cuda()
