@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from torch.nn import functional as F
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
@@ -26,8 +27,9 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..._utils import nvtx_range, nvtx_range_debug
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from ...inputs import (BaseDummyInputsBuilder, BaseMultimodalInputProcessor,
+                       ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        default_multimodal_input_loader,
                        register_input_processor)
@@ -85,7 +87,8 @@ def process_weights(weights: Dict,
     return filtered_weights
 
 
-class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
+class Qwen2VLInputProcessorBase(BaseDummyInputsBuilder,
+                                BaseMultimodalInputProcessor, InputProcessor):
 
     def __init__(self,
                  model_path: str,
@@ -821,7 +824,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         **kwargs,
     ) -> None:
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
-
+        self.original_arch = model_config.pretrained_config.architectures[0]
         # NOTE: Setting disable_fuse_rope to True to do mrope fusion in the model engine by pre-computing rotary_cos_sin in the model engine
         disabble_fuse_rope = kwargs.get('disable_fuse_rope', False)
         model_config.pretrained_config.text_config.disable_fuse_rope = disabble_fuse_rope
