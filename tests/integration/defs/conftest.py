@@ -85,7 +85,7 @@ def llm_models_root() -> str:
         root = Path("/scratch.trt_llm_data/llm-models/")
 
     assert root.exists(), (
-        "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
+        "You shall set LLM_MODELS_ROOT env or be able to access scratch.trt_llm_data to run this test"
     )
 
     return str(root)
