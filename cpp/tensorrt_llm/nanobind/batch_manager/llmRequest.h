@@ -86,7 +86,8 @@ public:
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<TimePoint::duration> globalSteadyClockOffset = std::nullopt)
         : Base(requestId,                                                                                       //
             maxNewTokens,                                                                                       //
             std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),                                 //
@@ -149,7 +150,8 @@ public:
             allottedTimeMs,                                                                                      //
             contextPhaseParams,                                                                                  //
             cacheSaltID,                                                                                         //
-            arrivalTime                                                                                          //
+            arrivalTime,                                                                                         //
+            globalSteadyClockOffset                                                                              //
         )
     {
     }
