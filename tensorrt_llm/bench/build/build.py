@@ -131,7 +131,7 @@ def apply_build_mode_settings(params):
 
 @click.command(name="build")
 @optgroup.group("Engine Configuration",
-                help="Configuration of the TensorRT-LLM engine.")
+                help="Configuration of the TensorRT LLM engine.")
 @optgroup.option(
     "--tp_size",
     "-tp",

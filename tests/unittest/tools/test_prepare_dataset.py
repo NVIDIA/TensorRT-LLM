@@ -54,7 +54,7 @@ class TestPrepareDatasetLora:
         Build the base command for running prepare_dataset.py.
 
         Args:
-            llm_root: Path to the TensorRT-LLM root directory
+            llm_root: Path to the TensorRT LLM root directory
 
         Returns:
             List[str]: Base command components
@@ -116,7 +116,7 @@ class TestPrepareDatasetLora:
         output.
 
         Args:
-            llm_root: Path to the TensorRT-LLM root directory
+            llm_root: Path to the TensorRT LLM root directory
             **kwargs: Keyword arguments for LoRA configuration
 
         Returns:
