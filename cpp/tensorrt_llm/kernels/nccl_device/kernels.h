@@ -17,38 +17,43 @@
 #ifndef TRTLLM_NCCL_DEVICE_KERNELS_H
 #define TRTLLM_NCCL_DEVICE_KERNELS_H
 
-#include "nccl.h"
-#include "nccl_device.h"
-#include <cuda_runtime.h>
-#include <cuda/std/cmath>
-#include <cub/cub.cuh>
-#include <cooperative_groups.h>
-#include <cassert>
-#include <device_launch_parameters.h>
-#include "vector_types.h"
-#include "multimem.h"
 #include "constants.h"
+#include "multimem.h"
+#include "nccl.h"
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+#include "nccl_device.h"
+#endif
 #include "tensorrt_llm/common/assert.h"
+#include "vector_types.h"
+#include <cassert>
+#include <cooperative_groups.h>
+#include <cub/cub.cuh>
+#include <cuda/std/cmath>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 
-namespace tensorrt_llm::kernels::nccl_device {
+namespace tensorrt_llm::kernels::nccl_device
+{
 
-  template <typename T, int NUM>
-  __inline__ __device__ T warpReduceSumV2(T* val)
-  {
-    constexpr unsigned int kFinalMask= 0xffffffff;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceSumV2(T* val)
+{
+    constexpr unsigned int kFinalMask = 0xffffffff;
 #pragma unroll
     for (int i = 0; i < NUM; i++)
-      {
+    {
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
-          val[i] += __shfl_xor_sync(kFinalMask, val[i], mask, kWarpSize);
-      }
+            val[i] += __shfl_xor_sync(kFinalMask, val[i], mask, kWarpSize);
+    }
     return (T) (0.0f);
-  }
+}
 
-  template <typename T, int NUM>
-  __inline__ __device__ T blockReduceSumV2(T* val)
-  {
+template <typename T, int NUM>
+__inline__ __device__ T blockReduceSumV2(T* val)
+{
     static __shared__ T shared[NUM][33];
     int lane = threadIdx.x & 0x1f;
     int wid = threadIdx.x >> 5;
@@ -56,82 +61,78 @@ namespace tensorrt_llm::kernels::nccl_device {
     warpReduceSumV2<T, NUM>(val);
 
     if (lane == 0)
-      {
+    {
 #pragma unroll
         for (int i = 0; i < NUM; i++)
-          {
+        {
             shared[i][wid] = val[i];
-          }
-      }
+        }
+    }
 
     __syncthreads();
 
     bool is_mask = threadIdx.x < (blockDim.x / 32.f);
 #pragma unroll
     for (int i = 0; i < NUM; i++)
-      {
+    {
         val[i] = is_mask ? shared[i][lane] : (T) (0.0f);
-      }
+    }
     warpReduceSumV2<T, NUM>(val);
     return (T) 0.0f;
-  }
-
+}
 
 // AllReduce deterministic multimem unrolled kernel with template parameters
-template <typename T, typename TN, int Nunroll, bool useResidual, bool useBias, bool kUnshardCompletely>
-__global__ void fusedAllReduceRMSNormKernel(
-    ncclWindow_t input_win,
-    ncclWindow_t output_win,
-    const TN* residual,
-    ncclWindow_t residual_out_win,
-    const TN* weight,
-    const TN* bias,
-    const int startToken,
-    const int hidden_size,
-    const int num_tokens,
-    ncclDevComm devComm,
-    const float eps)
+template <typename T, typename TN, int Nunroll, bool useResidual, bool useBias, bool oneShot>
+__global__ void fusedAllReduceRMSNormKernel(ncclWindow_t input_win, ncclWindow_t output_win, const TN* residual,
+    ncclWindow_t residual_out_win, const TN* weight, const TN* bias, int const startToken, int const hidden_size,
+    int const tokensPerRank, ncclDevComm devComm, float const eps)
 {
-    // Static assertion: kUnshardCompletely can only be true when useResidual is true
-    static_assert(!kUnshardCompletely || useResidual, "kUnshardCompletely can only be true when useResidual is true");
-    
+
     using accType = typename VectorType<T>::accType;
-    ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x, true , devComm.lsaMultimem };
+    ncclLsaBarrierSession<ncclCoopCta> bar{
+        ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x, true, devComm.lsaMultimem};
     bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
     // Calculate which token this block should process
-    const int token_id = blockIdx.x + startToken;
-    if(token_id < num_tokens) {
+#pragma unroll 1
+    for (int token_offset = blockIdx.x; token_offset < tokensPerRank; token_offset += gridDim.x)
+    {
+        int const token_id = token_offset + startToken;
         // Calculate elements per vector type
         constexpr int elems_per_vec = sizeof(TN) / sizeof(T);
 
-        const int token_base_offset = token_id * hidden_size; // Base offset for this token in T elements
+        int const token_base_offset = token_id * hidden_size; // Base offset for this token in T elements
 
         // Calculate warp and lane within this block
-        const int warp_id = threadIdx.x / kWarpSize;
-        const int lane_id = threadIdx.x % kWarpSize;
+        int const warp_id = threadIdx.x / kWarpSize;
+        int const lane_id = threadIdx.x % kWarpSize;
 
         // Ensure warp striding through memory within the token
         // Scale offsets by elements per vector since each thread handles more data with vectors
-        const int warp_offset = (warp_id * kWarpSize * Nunroll) * elems_per_vec;
-        const int lane_offset = lane_id * elems_per_vec;
+        int const warp_offset = (warp_id * kWarpSize * Nunroll) * elems_per_vec;
+        int const lane_offset = lane_id * elems_per_vec;
 
-        const int base_offset_T = warp_offset + lane_offset + token_base_offset;
+        int const base_offset_T = warp_offset + lane_offset + token_base_offset;
 
         // Get aligned pointers for vector types
         TN* send_ptr = reinterpret_cast<TN*>(ncclGetMultimemPointer(input_win, 0, devComm.lsaMultimem));
-        TN* recv_ptr = reinterpret_cast<TN*>(ncclGetMultimemPointer(output_win, 0, devComm.lsaMultimem));
+        TN* recv_ptr = reinterpret_cast<TN*>(
+            oneShot ? ncclGetLocalPointer(output_win, 0) : ncclGetMultimemPointer(output_win, 0, devComm.lsaMultimem));
 
         assert(send_ptr != nullptr);
         assert(recv_ptr != nullptr);
         TN* residual_out = nullptr;
-        if constexpr(useResidual) {
-            residual_out = kUnshardCompletely ? reinterpret_cast<TN*>(ncclGetMultimemPointer(residual_out_win, 0, devComm.lsaMultimem)) : reinterpret_cast<TN*>(ncclGetLocalPointer(residual_out_win, 0));
+        if constexpr (useResidual)
+        {
+            residual_out = oneShot
+                ? reinterpret_cast<TN*>(ncclGetLocalPointer(residual_out_win, 0))
+                : reinterpret_cast<TN*>(ncclGetMultimemPointer(residual_out_win, 0, devComm.lsaMultimem));
 
             assert(residual != nullptr);
             assert(residual_out != nullptr);
         }
-        if constexpr(useBias) {
+        if constexpr (useBias)
+        {
             assert(bias != nullptr);
         }
 
@@ -139,55 +140,59 @@ __global__ void fusedAllReduceRMSNormKernel(
         TN v[Nunroll];
         accType local_sum_squares = accType{0}; // For RMS calculation
 #pragma unroll Nunroll
-        for(int i=0; i < Nunroll; i++) {
-            const int stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
-            const size_t offset_T = base_offset_T + stride_offset;
-            const size_t offset_TN = offset_T / elems_per_vec; // Convert to vector offset
+        for (int i = 0; i < Nunroll; i++)
+        {
+            int const stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
+            size_t const offset_T = base_offset_T + stride_offset;
+            size_t const offset_TN = offset_T / elems_per_vec;       // Convert to vector offset
 
-            v[i] = multimemLoadSum<T,TN>(reinterpret_cast<T*>(send_ptr + offset_TN));
+            v[i] = multimemLoadSum<T, TN>(reinterpret_cast<T*>(send_ptr + offset_TN));
         }
 
 #pragma unroll Nunroll
-        for(int i=0; i < Nunroll; i++) {
-            const int stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
-            const size_t offset_T = base_offset_T + stride_offset;
-            const size_t offset_TN = offset_T / elems_per_vec; // Convert to vector offset
+        for (int i = 0; i < Nunroll; i++)
+        {
+            int const stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
+            size_t const offset_T = base_offset_T + stride_offset;
+            size_t const offset_TN = offset_T / elems_per_vec;       // Convert to vector offset
             // The residual is the allreduced result (v) plus the input residual
-            const T* residual_elem = useResidual ? reinterpret_cast<const T*>(residual + offset_TN) : nullptr;
-            T* residual_out_elem = useResidual ? reinterpret_cast<T*>(residual_out + offset_TN) : nullptr;
+            T const* residual_elem = useResidual ? reinterpret_cast<T const*>(residual + offset_TN) : nullptr;
             T* v_elem = reinterpret_cast<T*>(&v[i]);
 
 #pragma unroll elems_per_vec
-            for (int j = 0; j < elems_per_vec; ++j) {
-                if constexpr (useResidual) {
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                if constexpr (useResidual)
+                {
                     // Residual = allreduced_result + input_residual
-                    v_elem[j] = static_cast<T>(static_cast<accType>(v_elem[j]) + static_cast<accType>(residual_elem[j]));
-
-                    // Update v_elem to be the residual for RMS normalization
-                    if(not kUnshardCompletely)
-                        residual_out_elem[j] = v_elem[j];
+                    v_elem[j]
+                        = static_cast<T>(static_cast<accType>(v_elem[j]) + static_cast<accType>(residual_elem[j]));
                 }
-        
+
                 // Calculate sum of squares using residual values
                 accType value = static_cast<accType>(v_elem[j]);
                 local_sum_squares += value * value;
             }
         }
-        if constexpr(kUnshardCompletely) {
+
 #pragma unroll Nunroll
-            for(int i=0; i < Nunroll; i++) {
-                const int stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
-                const size_t offset_T = base_offset_T + stride_offset;
-                const size_t offset_TN = offset_T / elems_per_vec; // Convert to vector offset
-                multimemStore<T,TN>(reinterpret_cast<T*>(residual_out + offset_TN), v[i]);
-            }
+        for (int i = 0; i < Nunroll; i++)
+        {
+            int const stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
+            size_t const offset_T = base_offset_T + stride_offset;
+            size_t const offset_TN = offset_T / elems_per_vec;       // Convert to vector offset
+            if (!oneShot)
+                multimemStore<T, TN>(reinterpret_cast<T*>(residual_out + offset_TN), v[i]);
+            else
+                residual_out[offset_TN] = v[i];
         }
 
         // RMS normalization: each block processes exactly one token
         __shared__ accType rms;
         blockReduceSumV2<accType, 1>(&local_sum_squares);
-        if (threadIdx.x == 0) {
-            const accType block_sum_squares = local_sum_squares;
+        if (threadIdx.x == 0)
+        {
+            accType const block_sum_squares = local_sum_squares;
             rms = rsqrtf((block_sum_squares / static_cast<accType>(hidden_size)) + eps);
         }
         // Synchronize again to ensure RMS is computed before using it
@@ -195,10 +200,11 @@ __global__ void fusedAllReduceRMSNormKernel(
 
         // Apply RMS normalization with per-token weight and bias
 #pragma unroll Nunroll
-        for(int i=0; i < Nunroll; i++) {
+        for (int i = 0; i < Nunroll; i++)
+        {
             // Get the position within the hidden dimension for this thread
             // Since each block processes one token, we just need the position within that token
-            const int hidden_dim_pos = warp_offset + lane_offset + i * kWarpSize * elems_per_vec;
+            int const hidden_dim_pos = warp_offset + lane_offset + i * kWarpSize * elems_per_vec;
 
             // Index into weight and bias arrays: just the position within hidden dimension
             TN weight_vec = weight[hidden_dim_pos / elems_per_vec];
@@ -211,7 +217,8 @@ __global__ void fusedAllReduceRMSNormKernel(
             T* bias_elem = reinterpret_cast<T*>(&bias_vec);
 
 #pragma unroll elems_per_vec
-            for (int j = 0; j < elems_per_vec; ++j) {
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
                 // Promote to accType for intermediate calculations
                 accType v_acc = static_cast<accType>(v_elem[j]);
                 accType weight_acc = static_cast<accType>(weight_elem[j]);
@@ -227,16 +234,21 @@ __global__ void fusedAllReduceRMSNormKernel(
             }
         }
 #pragma unroll Nunroll
-        for(int i=0; i < Nunroll; i++) {
-            const int stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
-            const size_t offset_T = base_offset_T + stride_offset;
-            const size_t offset_TN = offset_T / elems_per_vec; // Convert to vector offset
-            multimemStore<T,TN>(reinterpret_cast<T*>(recv_ptr + offset_TN), v[i]);
+        for (int i = 0; i < Nunroll; i++)
+        {
+            int const stride_offset = i * kWarpSize * elems_per_vec; // Scale stride by elements per vector
+            size_t const offset_T = base_offset_T + stride_offset;
+            size_t const offset_TN = offset_T / elems_per_vec;       // Convert to vector offset
+            if (!oneShot)
+                multimemStore<T, TN>(reinterpret_cast<T*>(recv_ptr + offset_TN), v[i]);
+            else
+                recv_ptr[offset_TN] = v[i];
         }
     }
     bar.sync(ncclCoopCta(), cuda::memory_order_release);
 }
 
+#endif // NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 
 } // namespace tensorrt_llm::kernels::nccl_device
 

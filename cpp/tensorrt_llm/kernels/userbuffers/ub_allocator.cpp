@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "ub_allocator.h"
+#include "nccl.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include <set>
 #include <stdexcept>
@@ -118,7 +119,6 @@ UBBuffer NCCLUserBufferAllocator::registerUBBuffer(size_t bytes)
     ub_buffer.size = bytes;
     return ub_buffer;
 }
-  
 
 // Static member definitions
 std::unique_ptr<NCCLHelper> NCCLUserBufferAllocator::mNCCLHelper = nullptr;
@@ -132,71 +132,70 @@ NCCLHelper& NCCLUserBufferAllocator::getNCCLHelper()
     return *mNCCLHelper;
 }
 
-
 NCCLUserBufferAllocator::~NCCLUserBufferAllocator()
-  {
-      // Deallocate buffers
-      auto& ncclHelper = getNCCLHelper();
-      if(ncclHelper.isLoaded())
+{
+    // Deallocate buffers
+    auto& ncclHelper = getNCCLHelper();
+    if (ncclHelper.isLoaded())
+    {
+        auto ncclMemFreeFunc = ncclHelper.getNCCLMemFree();
+        auto ncclCommWindowDeregisterFunc = ncclHelper.getNCCLCommWindowDeregister();
+        if (ncclCommWindowDeregisterFunc == nullptr)
         {
-          auto ncclMemFreeFunc = ncclHelper.getNCCLMemFree();
-          auto ncclCommWindowDeregisterFunc = ncclHelper.getNCCLCommWindowDeregister();
-          if(ncclCommWindowDeregisterFunc == nullptr)
+            TLLM_LOG_WARNING("NCCL buffer windows cannot be released.");
+        }
+        for (auto buffer : mBuffers)
+        {
+            buffer.size = 0;
+            if (ncclCommWindowDeregisterFunc != nullptr)
             {
-              TLLM_LOG_WARNING("NCCL buffer windows cannot be released.");
+                NCCLCHECK(ncclCommWindowDeregisterFunc(*mComm, buffer.window));
             }
-          for(auto buffer : mBuffers)
+            if (ncclMemFreeFunc != nullptr)
             {
-              buffer.size = 0;
-              if(ncclCommWindowDeregisterFunc != nullptr)
-                {
-                  NCCLCHECK(ncclCommWindowDeregisterFunc(*mComm, buffer.window));
-                }
-              NCCLCHECK(ncclMemFreeFunc(buffer.addr));
-            }
-          auto ncclDevCommDestroyFunc = ncclHelper.getNCCLDevCommDestroy();
-          if(ncclDevCommDestroyFunc)
-            {
-              for(auto x : mDevCommBlockID)
-                {
-                  ncclDevComm devComm = x.second;
-                  NCCLCHECK(ncclDevCommDestroyFunc(*mComm, devComm));
-                }
+                NCCLCHECK(ncclMemFreeFunc(buffer.addr));
             }
         }
-  }  
+        auto ncclDevCommDestroyFunc = ncclHelper.getNCCLDevCommDestroy();
+        if (ncclDevCommDestroyFunc)
+        {
+            for (auto x : mDevCommBlockID)
+            {
+                ncclDevComm devComm = x.second;
+                NCCLCHECK(ncclDevCommDestroyFunc(*mComm, devComm));
+            }
+        }
+    }
+}
 
-ncclDevComm NCCLUserBufferAllocator::getNCCLDevComm(const int numLsaBarriers)
-  {
+ncclDevComm NCCLUserBufferAllocator::getNCCLDevComm(int const numLsaBarriers)
+{
     constexpr bool multimemSupport = true;
-    auto commIter = mDevCommBlockID.find(numLsaBarriers);
-    if(commIter == mDevCommBlockID.end())
-      {
+    auto commIter = mDevCommBlockID.find(numLsaBarriers); // codespell:ignore word
+    if (commIter == mDevCommBlockID.end())
+    {
         ncclDevComm devComm;
         ncclDevCommRequirements reqs = {0};
         memset(&reqs, 0, sizeof(ncclDevCommRequirements));
         reqs.lsaBarrierCount = numLsaBarriers;
         reqs.lsaMultimem = multimemSupport;
 
-	auto& ncclHelper = getNCCLHelper();
-	// auto ncclDevCommCreateFunc = ncclHelper.getNCCLDevCommCreate();
-	
-        ncclResult_t ncclError = ncclDevCommCreate(*mComm, &reqs, &devComm);
-        TLLM_CHECK_WITH_INFO(ncclError == ncclSuccess, "Failed to create NCCL device communicator: %s", ncclGetErrorString(ncclError));
+        auto& ncclHelper = getNCCLHelper();
+        auto ncclDevCommCreateFunc = ncclHelper.getNCCLDevCommCreate();
+
+        ncclResult_t ncclError = ncclDevCommCreateFunc(*mComm, &reqs, &devComm);
+        TLLM_CHECK_WITH_INFO(
+            ncclError == ncclSuccess, "Failed to create NCCL device communicator: %s", ncclGetErrorString(ncclError));
         mDevCommBlockID[numLsaBarriers] = devComm;
-      }
+    }
     commIter = mDevCommBlockID.find(numLsaBarriers);
-    if(commIter == mDevCommBlockID.end())
-      {
-      TLLM_THROW("NCCL cannot create required device communicator");
-      }
+    if (commIter == mDevCommBlockID.end())
+    {
+        TLLM_THROW("NCCL cannot create required device communicator");
+    }
     return commIter->second;
-  }
+}
 
-    
-  
-
-  
 // NCCLHelper implementation
 NCCLHelper::NCCLHelper()
     : mLibraryHandle(nullptr)
@@ -241,10 +240,11 @@ void NCCLHelper::loadNCCLLibrary()
             if (mLibraryHandle)
             {
                 TLLM_LOG_INFO("Successfully loaded NCCL library: %s", libraryNames[i]);
-                
+
                 // Get the actual path of the loaded library
                 Dl_info info;
-                if (dladdr(mLibraryHandle, &info) && info.dli_fname) {
+                if (dladdr(mLibraryHandle, &info) && info.dli_fname)
+                {
                     TLLM_LOG_INFO("NCCL library loaded from: %s", info.dli_fname);
                 }
                 break;
@@ -267,14 +267,15 @@ void NCCLHelper::loadNCCLLibrary()
 
         mNCCLMemAlloc = reinterpret_cast<ncclMemAllocFunc>(getSymbolAddress(mLibraryHandle, "ncclMemAlloc"));
 
-        mNCCLCommWindowDeregister = reinterpret_cast<ncclCommWindowDeregisterFunc>(getSymbolAddress(mLibraryHandle, "ncclCommWindowDeregister"));
-                                                                                   
+        mNCCLCommWindowDeregister = reinterpret_cast<ncclCommWindowDeregisterFunc>(
+            getSymbolAddress(mLibraryHandle, "ncclCommWindowDeregister"));
+
         mNCCLMemFree = reinterpret_cast<ncclMemFreeFunc>(getSymbolAddress(mLibraryHandle, "ncclMemFree"));
 
         // Try to resolve device communicator functions using proper symbol resolution
         mNCCLDevCommCreate = resolveNCCLDevCommCreate(mLibraryHandle);
         mNCCLDevCommDestroy = resolveNCCLDevCommDestroy(mLibraryHandle);
-        
+
         if (mNCCLCommWindowRegister == nullptr or mNCCLCommWindowDeregister == nullptr)
         {
             TLLM_LOG_WARNING("Failed to load ncclCommWindowRegister symbol, NCCL symmetric will not be supported.");
@@ -282,7 +283,9 @@ void NCCLHelper::loadNCCLLibrary()
 
         if (mNCCLDevCommCreate == nullptr or mNCCLDevCommDestroy == nullptr)
         {
-            TLLM_LOG_WARNING("Failed to load ncclDevCommCreate/ncclDevCommDestroy symbols, NCCL fused kernels will not be supported. Ensure NCCL version >= 2.28.");
+            TLLM_LOG_WARNING(
+                "Failed to load ncclDevCommCreate/ncclDevCommDestroy symbols, NCCL fused kernels will not be "
+                "supported. Ensure NCCL version >= 2.28.");
             if (mNCCLDevCommCreate == nullptr)
             {
                 TLLM_LOG_WARNING("ncclDevCommCreate symbol not found (tried both C and C++ mangled names)");
@@ -296,7 +299,7 @@ void NCCLHelper::loadNCCLLibrary()
         {
             TLLM_LOG_INFO("Successfully loaded ncclDevCommCreate and ncclDevCommDestroy symbols");
         }
-        
+
         if (mNCCLMemAlloc and mNCCLMemFree)
         {
             mIsLoaded = true;
@@ -338,60 +341,65 @@ void* NCCLHelper::getSymbolAddress(void* handle, char const* symbolName)
 // Robust symbol resolution for device communicator functions
 NCCLHelper::ncclDevCommCreateFunc NCCLHelper::resolveNCCLDevCommCreate(void* handle)
 {
-    if (!handle) return nullptr;
-    
+    if (!handle)
+        return nullptr;
+
     // Try C-style symbol first (preferred)
     void* symbol = getSymbolAddress(handle, "ncclDevCommCreate");
-    if (symbol) {
+    if (symbol)
+    {
         TLLM_LOG_DEBUG("Found ncclDevCommCreate with C linkage");
         return reinterpret_cast<ncclDevCommCreateFunc>(symbol);
     }
-    
+
     // Try common C++ mangled variants (fallback)
-    const char* mangledNames[] = {
-        "_Z17ncclDevCommCreateP8ncclCommPK23ncclDevCommRequirementsP11ncclDevComm",  // GCC/Clang
-        "?ncclDevCommCreate@@YAHPAUncclComm@@PBUncclDevCommRequirements@@PAUncclDevComm@@@Z",  // MSVC
-        nullptr
-    };
-    
-    for (int i = 0; mangledNames[i] != nullptr; ++i) {
+    char const* mangledNames[]
+        = {"_Z17ncclDevCommCreateP8ncclCommPK23ncclDevCommRequirementsP11ncclDevComm",            // GCC/Clang
+            "?ncclDevCommCreate@@YAHPAUncclComm@@PBUncclDevCommRequirements@@PAUncclDevComm@@@Z", // MSVC
+            nullptr};
+
+    for (int i = 0; mangledNames[i] != nullptr; ++i)
+    {
         symbol = getSymbolAddress(handle, mangledNames[i]);
-        if (symbol) {
+        if (symbol)
+        {
             TLLM_LOG_WARNING("Found ncclDevCommCreate with C++ mangled name (fragile): %s", mangledNames[i]);
             return reinterpret_cast<ncclDevCommCreateFunc>(symbol);
         }
     }
-    
+
     TLLM_LOG_DEBUG("ncclDevCommCreate not found with any known symbol name");
     return nullptr;
 }
 
 NCCLHelper::ncclDevCommDestroyFunc NCCLHelper::resolveNCCLDevCommDestroy(void* handle)
 {
-    if (!handle) return nullptr;
-    
+    if (!handle)
+        return nullptr;
+
     // Try C-style symbol first (preferred)
     void* symbol = getSymbolAddress(handle, "ncclDevCommDestroy");
-    if (symbol) {
+    if (symbol)
+    {
         TLLM_LOG_DEBUG("Found ncclDevCommDestroy with C linkage");
         return reinterpret_cast<ncclDevCommDestroyFunc>(symbol);
     }
-    
+
     // Try common C++ mangled variants (fallback)
-    const char* mangledNames[] = {
-        "_Z18ncclDevCommDestroyP8ncclCommPK11ncclDevComm",  // GCC/Clang
-        "?ncclDevCommDestroy@@YAHPAUncclComm@@PBUncclDevComm@@@Z",  // MSVC
-        nullptr
-    };
-    
-    for (int i = 0; mangledNames[i] != nullptr; ++i) {
+    char const* mangledNames[] = {"_Z18ncclDevCommDestroyP8ncclCommPK11ncclDevComm", // GCC/Clang
+        "?ncclDevCommDestroy@@YAHPAUncclComm@@PBUncclDevComm@@@Z",                   // MSVC
+        nullptr};
+
+    for (int i = 0; mangledNames[i] != nullptr; ++i)
+    {
         symbol = getSymbolAddress(handle, mangledNames[i]);
-        if (symbol) {
+        if (symbol)
+        {
             TLLM_LOG_WARNING("Found ncclDevCommDestroy with C++ mangled name (fragile): %s", mangledNames[i]);
             return reinterpret_cast<ncclDevCommDestroyFunc>(symbol);
         }
     }
-    
+
     TLLM_LOG_DEBUG("ncclDevCommDestroy not found with any known symbol name");
     return nullptr;
 }
@@ -408,22 +416,23 @@ NCCLHelper::ncclMemAllocFunc NCCLHelper::getNCCLMemAlloc()
 
 NCCLHelper::ncclCommWindowDeregisterFunc NCCLHelper::getNCCLCommWindowDeregister()
 {
-  return mNCCLCommWindowDeregister;
+    return mNCCLCommWindowDeregister;
 }
+
 NCCLHelper::ncclMemFreeFunc NCCLHelper::getNCCLMemFree()
 {
-  return mNCCLMemFree;
+    return mNCCLMemFree;
 }
+
 NCCLHelper::ncclDevCommCreateFunc NCCLHelper::getNCCLDevCommCreate()
 {
-  return mNCCLDevCommCreate;
+    return mNCCLDevCommCreate;
 }
+
 NCCLHelper::ncclDevCommDestroyFunc NCCLHelper::getNCCLDevCommDestroy()
 {
-  return mNCCLDevCommDestroy;
+    return mNCCLDevCommDestroy;
 }
-
-
 
 bool NCCLHelper::isLoaded() const
 {
@@ -432,24 +441,24 @@ bool NCCLHelper::isLoaded() const
 
 bool UserBufferAllocator::use_nccl_symmetric = false;
 
-std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> 
-NCCLUserBufferAllocator::getCachedNCCLDeviceLaunchConfig(nvinfer1::DataType dataType, const int hidden_dim, 
-                                                         const int num_tokens, const int rank, const int nRanks, 
-                                                         bool useResidual, bool useBias, bool unshardResidualOut)
+std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig>
+NCCLUserBufferAllocator::getCachedNCCLDeviceLaunchConfig(nvinfer1::DataType dataType, int const hidden_dim,
+    int const num_tokens, int const rank, int const nRanks, bool useResidual, bool useBias)
 {
     // Create cache key
-    LaunchConfigKey key{dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, unshardResidualOut};
-    
+    LaunchConfigKey key{dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias};
+
     // Check if config already exists in cache
     auto it = mLaunchConfigCache.find(key);
-    if (it != mLaunchConfigCache.end()) {
-        return it->second;  // Return cached config
+    if (it != mLaunchConfigCache.end())
+    {
+        return it->second; // Return cached config
     }
-    
+
     // Create new config and cache it
     auto config = tensorrt_llm::kernels::nccl_device::makeLaunchConfig(
-        dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, unshardResidualOut);
-    
+        dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias);
+
     mLaunchConfigCache[key] = config;
     return config;
 }
