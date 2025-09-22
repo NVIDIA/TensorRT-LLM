@@ -1,6 +1,6 @@
 # Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly
 
-*By NVIDIA TensorRT LLM Team and XGrammar Team*
+*By NVIDIA TensorRT LLM Team and the XGrammar Team*
 
 ## Table of Contents
 - [Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly](#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly)
@@ -49,7 +49,7 @@ TensorRT LLM integrates third-party grammar backends (e.g., [XGrammar](https://g
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_constrained_decoding_pipeline_overlap.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_constrained_decoding_pipeline_overlap.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Top: guided decoding timeline without overlapping. Bottom: guided decoding timeline with overlapping. (This figure is from the XGrammar paper.)</em></sub></p>
@@ -62,7 +62,7 @@ TensorRT LLM has two kinds of speculative decoding implementations, namely the o
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_one_model_vs_two_model.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_one_model_vs_two_model.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Top: GPU timeline of one-model speculative decoding. Bottom: GPU timeline of two-model speculative decoding.</em></sub></p>
@@ -83,7 +83,7 @@ Second, specific to the one-model speculative decoding where a single CUDA graph
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: The CPU-GPU synchronization for multiple model forwards.</em></sub></p>
@@ -139,7 +139,7 @@ Hence, we can launch grammar computation along with other auxiliary host functio
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps_by_cuda_callback.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_cpu_gpu_synchronization_for_multiple_steps_by_cuda_callback.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: The CPU-GPU synchronization for multiple model forwards by CUDA callback.</em></sub></p>
@@ -247,9 +247,9 @@ x = torch.randint(0, 100, (100,), dtype=torch.int64, device='cuda')
 y = torch.zeros(100, x.max(), dtype=torch.int64, device='cuda')
 ```
 
-The other case is that `torch.compile` kernels are called with GIL being held ([Issue 163061](https://github.com/pytorch/pytorch/issues/163061)), although Triton kernels are called with GIL released. Hence, we have to avoid any problematic operations and disable `torch.compile` when using CUDA callback to Python code, until these issues are fixed by PyTorch.
+The other case is that `torch.compile` kernels are called with GIL being held ([Issue 163061](https://github.com/pytorch/pytorch/issues/163061)), although Triton kernels are called with GIL released. Hence, we have to avoid any problematic operators and disable `torch.compile` when using CUDA callback to Python code ([PR 7871](https://github.com/NVIDIA/TensorRT-LLM/pull/7871)), until these issues are fixed by PyTorch.
 
-Another source of risk comes from some runtime components that are implemented in C++ and exposed as Python bindings; they may make CUDA API calls as well. By default, Python bindings do not release GIL. Hence, we swept these Python bindings and released GIL properly in [PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948).
+Another source of risk comes from some runtime components that are implemented in C++ and exposed as Python bindings; they may make CUDA API calls as well. By default, Python bindings do not release GIL. Hence, we swept these Python bindings and released GIL properly ([PR 6948](https://github.com/NVIDIA/TensorRT-LLM/pull/6948)).
 
 After all these efforts, the hang issue disappears. It is generally recommended to release the GIL when calling C++ code from Python; even without the context of CUDA callback, this is beneficial for multi-threading performance. However, we acknowledge the limitation that it is difficult to make sure that every such place has been properly handled, and that future code changes do not introduce any risks.
 
@@ -261,7 +261,7 @@ We benchmark the performance of guided decoding on two datasets [JSON Mode Eval]
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_mode_eval_llama_3.1_8b.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_mode_eval_llama_3.1_8b.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
@@ -269,7 +269,7 @@ We benchmark the performance of guided decoding on two datasets [JSON Mode Eval]
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_mode_eval_llama_3.3_70b.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_mode_eval_llama_3.3_70b.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Mode Eval. The concurrency ranges from 1 to 128.</em></sub></p>
@@ -280,14 +280,14 @@ Note that although NGram is a two-model implementation, it performs surprisingly
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_schema_bench_llama_3.1_8b.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_schema_bench_llama_3.1_8b.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7: Pareto curve on LLaMA 3.1 8B TP1 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_schema_bench_llama_3.3_70b.png" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog12_pareto_curve_json_schema_bench_llama_3.3_70b.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 8: Pareto curve on LLaMA 3.3 70B TP4 on H200, JSON Schema Bench. The concurrency ranges from 1 to 128.</em></sub></p>
