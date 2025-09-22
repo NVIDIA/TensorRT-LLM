@@ -163,14 +163,16 @@ public:
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
+        size_t hidden_size = input.size(-1);
         size_t bytes_per_element = input.element_size();
         TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
 
-        AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, size);
+        AllReduceStrategyType runtime_strategy = selectImplementation(seq_len, hidden_size);
 
         // Log runtime strategy
         auto const rank = COMM_SESSION.getRank();
-        logRunTimeStrategy(runtime_strategy, rank);
+        TLLM_LOG_DEBUG(
+            "AllReduceOp runtime strategy for rank %d: " + tensorrt_llm::kernels::toString(runtime_strategy), rank);
 
         // Dispatch to different allreduce implementations
         switch (runtime_strategy)
@@ -447,10 +449,11 @@ private:
         allreduce_fusion_params.norm_out = nullptr;
         allreduce_fusion_params.trigger_completion_at_end = trigger_completion_at_end;
 
-        // Determine if using oneshot or twoshot allreduce kernel
+        // Determine if using oneshot or twoshot allreduce kernel in case using MIN_LATENCY strategy.
         if (strategy == AllReduceStrategyType::MIN_LATENCY)
         {
-            allreduce_fusion_params.use_oneshot = seq_len <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken;
+            allreduce_fusion_params.use_oneshot = seq_len <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken
+                || hidden_size < static_cast<int64_t>(tp_size);
         }
         else
         {
@@ -657,70 +660,6 @@ private:
         return {};
     }
 
-    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
-    {
-        AllReduceStrategyType runtime_strategy;
-        if (mStrategy == AllReduceStrategyType::UB)
-        {
-            runtime_strategy = AllReduceStrategyType::UB;
-        }
-        else if (mStrategy == AllReduceStrategyType::NCCL)
-        {
-            runtime_strategy = AllReduceStrategyType::NCCL;
-        }
-        else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
-        {
-            runtime_strategy = AllReduceStrategyType::NCCL_SYMMETRIC;
-        }
-        else
-        {
-            // This is for DEBUG and BENCHMARK purpose. It will overried the strategy if AUTO is set.
-            static char* ifForBenchMark = std::getenv("OVERRIDE_HEURISTIC_ALLREDUCE_STRATEGY");
-            if (ifForBenchMark != nullptr)
-            {
-                runtime_strategy = mStrategy;
-            }
-            else
-            {
-                runtime_strategy = selectImplementation(seq_len, size, mGroup.size(), mType);
-            }
-        }
-        return runtime_strategy;
-    }
-
-    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank)
-    {
-        switch (strategy)
-        {
-        case AllReduceStrategyType::NCCL:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
-            break;
-        }
-        case AllReduceStrategyType::NCCL_SYMMETRIC:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
-            break;
-        }
-        case AllReduceStrategyType::MIN_LATENCY:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
-            break;
-        }
-        case AllReduceStrategyType::UB:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
-            break;
-        }
-        case AllReduceStrategyType::LOWPRECISION:
-        {
-            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
-            break;
-        }
-        default: TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UNKNOWN: %d", rank, strategy); break;
-        }
-    }
-
     void initGroupTopology()
     {
         static std::map<std::set<int>, std::tuple<bool, bool>> cache;
@@ -846,134 +785,60 @@ private:
         }
     }
 
-    bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size, bool is_auto)
+    AllReduceStrategyType selectImplementation(size_t seq_len, size_t hidden_size)
     {
-        // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
-        if (message_size_bytes > max_workspace_size)
+        if (mStrategy != AllReduceStrategyType::AUTO)
         {
-            if (!is_auto)
+            // For UB,NCCL,NCCL_SYMMETRIC, the correctness of the strategy dispatching is guaranteed by the user.
+            if (mStrategy == AllReduceStrategyType::UB || mStrategy == AllReduceStrategyType::NCCL
+                || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
             {
-                TLLM_LOG_WARNING(
-                    "Since messageSize is greater than maxWorkspaceSize, fallback to AllReduceStrategy: NCCL");
+                return mStrategy;
             }
-            return true;
         }
 
-        // If Peer to Peer is not supported, fallback to NCCL.
-        if (!mIsP2PSupported)
-        {
-            if (!is_auto)
-            {
-                TLLM_LOG_WARNING("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
-            }
-            return true;
-        }
+        // For ONESHOT, TWOSHOT, LOWPRECISION, fallback is allowed.
+        auto const message_size = seq_len * hidden_size;
 
-        // If NVLINK is not supported, fallback to NCCL.
-        if (!mIsNVLINKSupported)
-        {
-            if (!is_auto)
-            {
-                TLLM_LOG_WARNING("Since NVLINK not supported, fallback to AllReduceStrategy: NCCL");
-            }
-            return true;
-        }
-        return false;
-    }
-
-    AllReduceStrategyType selectImplementation(
-        size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type)
-    {
-
-        if (isUsingLowPrecision(message_size))
+        // Check if LOWPRECISION is supported.
+        if (isUsingLowPrecision(hidden_size))
         {
             return AllReduceStrategyType::LOWPRECISION;
         }
-        else
-        {
-            if (mStrategy == AllReduceStrategyType::LOWPRECISION)
-            {
-                mStrategy = AllReduceStrategyType::AUTO;
-            }
-        }
 
-        // Check that heuristic is only applied when AUTO is set.
-        // Use Auto select
-        bool const is_auto = (mStrategy == AllReduceStrategyType::AUTO);
-        auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(type);
+        auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(mType);
         auto const max_workspace_size
-            = tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(world_size);
+            = tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(mGroup.size());
 
-        if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size, is_auto))
+        if (ifFallbackToNCCL(seq_len, message_size_bytes, max_workspace_size))
         {
             return AllReduceStrategyType::NCCL;
         }
 
         // This rule based heuristic only chooses between NCCL and MIN_LATENCY strategies.
-
-        // Heurisitic will only be applied on NONE and RESIDUAL_RMS_NORM fusion types.
-        // Because NCCL might be faster on some large messageSize cases.
-        // Otherwise, MIN_LATENCY strategy will be directly returned due to more fusions it can support.
-        // TODO: NCCL AllReduce + subsequent quantization ops (as fallback) can also support the fusion types.
-        // This should be compared with MIN_LATENCY fused kernels to determine the best strategy.
-        switch (mOp)
+        // From this point, all fusion patterns are supported by all these strategies: NCCL, ONESHOT, TWOSHOT and
+        // MIN_LATENCY.
+        if (mStrategy != AllReduceStrategyType::AUTO)
         {
-        case AllReduceFusionOp::NONE:
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM: break;
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8:
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4:
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: return AllReduceStrategyType::MIN_LATENCY;
-        // Suppose NCCL has fallback implementations for all fusion types.
-        default: return AllReduceStrategyType::NCCL;
-        }
-
-        // Check mOp to be supported by the heuristic.
-        TORCH_CHECK(mOp == AllReduceFusionOp::NONE || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM,
-            "Only NONE and RESIDUAL_RMS_NORM are supported for NCCL/MIN_LATENCY heuristic.");
-
-        // Default to NCCL.
-        AllReduceStrategyType strategy = AllReduceStrategyType::NCCL;
-
-        // Currently we will not remove ONESHOT and TWOSHOT from the strategy list
-        // But torch flow user should not use them, but use AUTO or MIN_LATENCY instead.
-        // NOTICE: When a fusion type is not supported by the corresponding strategy but strategy is not AUTO,
-        // user should guarantee the correctness of the fusion pattern dispatching.
-        if (!is_auto)
-        {
-            if (mStrategy == AllReduceStrategyType::ONESHOT || mStrategy == AllReduceStrategyType::TWOSHOT)
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
-            else
-            {
-                strategy = mStrategy;
-            }
-        }
-        else if (world_size <= 2)
-        {
-            strategy = AllReduceStrategyType::MIN_LATENCY;
+            return mStrategy;
         }
         else
         {
-            static char* threshold_ptr = std::getenv("ALLREDUCE_AUTO_HEURISTIC_MIN_LATENCY_THRESHOLD_TOKEN_NUM");
-            size_t threshold = 128;
-            if (threshold_ptr)
-            {
-                threshold = static_cast<size_t>(std::atoi(threshold_ptr));
-            }
-            // Generally, NCCL is faster than MIN_LATENCY when the token number is greater than 256. I conservatively
-            // set the threshold here to 128 tokens.
-            if (seq_len > threshold)
-            {
-                strategy = AllReduceStrategyType::NCCL;
-            }
-            else
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
+            return tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
+                seq_len, hidden_size, mOp, mGroup.size());
         }
-        return strategy;
+        return AllReduceStrategyType::NCCL;
+    }
+
+    bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
+    {
+        // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
+        if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     bool isUsingLowPrecision(size_t message_size) const noexcept
