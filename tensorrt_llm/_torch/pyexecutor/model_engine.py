@@ -449,6 +449,9 @@ class PyTorchModelEngine(ModelEngine):
         self.position_ids_cuda = torch.empty((self.max_num_tokens, ),
                                              dtype=torch.int,
                                              device='cuda')
+        if self.use_mrope:
+            self.mrope_position_ids_cuda = torch.empty(
+                (3, 1, self.max_num_tokens), dtype=torch.int, device='cuda')
         self.iter_counter = 0
 
         # We look up this key in resource_manager during forward to find the
@@ -571,7 +574,6 @@ class PyTorchModelEngine(ModelEngine):
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
-        use_mrope = self.use_mrope
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy request to None in warmup.
@@ -601,7 +603,7 @@ class PyTorchModelEngine(ModelEngine):
                     list(range(batch_size - 1)),
                     is_gen=True,
                     max_num_draft_tokens=draft_len,
-                    use_mrope=use_mrope,
+                    use_mrope=self.use_mrope,
                     max_beam_width=self.max_beam_width,
                     num_extra_decoding_steps=num_extra_decoding_steps)
                 # Divide by max_beam_width to get an approximation of the number of tokens that can be added to the final request.
@@ -630,7 +632,7 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=[token_num],
                     is_gen=True,
                     max_num_draft_tokens=draft_len,
-                    use_mrope=use_mrope,
+                    use_mrope=self.use_mrope,
                     max_beam_width=self.max_beam_width,
                     num_extra_decoding_steps=num_extra_decoding_steps)[0]
                 # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
@@ -703,7 +705,7 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=ctx_token_nums,
                     is_gen=False,
                     max_num_draft_tokens=self.runtime_draft_len,
-                )
+                    use_mrope=self.use_mrope)
 
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(
@@ -717,7 +719,7 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=[1] * num_gen_tokens,
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
-                )
+                    use_mrope=self.use_mrope)
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(request_ids=list(
                         range(num_ctx_requests, num_ctx_requests +
@@ -1351,8 +1353,9 @@ class PyTorchModelEngine(ModelEngine):
         num_cached_tokens_per_seq = []  # per sequence
         draft_tokens = []
         draft_lens = []
-        multimodal_params_list = []
         gen_request_seq_slots = []  # per generation request
+        multimodal_params_list = []
+        mrope_position_ids = []
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -1383,11 +1386,24 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime)
-
             if multimodal_params.has_content():
+                if self.use_mrope:
+                    ctx_mrope_position_ids = multimodal_params.multimodal_data[
+                        'mrope_config'][
+                            'mrope_position_ids'][:, :,
+                                                  begin_compute:begin_compute +
+                                                  len(prompt_tokens)]
+                    mrope_position_ids.append(ctx_mrope_position_ids)
+
+                # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
-                                            pin_memory=True)
+                                            pin_memory=True,
+                                            target_keywords=getattr(
+                                                self.model,
+                                                "multimodal_data_device_paths",
+                                                None))
+
                 #re-assign the multimodal_data to the request after to_device for generation requests
                 request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
@@ -1416,17 +1432,6 @@ class PyTorchModelEngine(ModelEngine):
                     extend_requests.append(request)
             else:
                 generation_requests.append(request)
-            # Multimodal
-            multimodal_params = MultimodalParams(
-                multimodal_data=request.py_multimodal_data)
-            multimodal_params.strip_for_generation()
-            if multimodal_params.has_content():
-                multimodal_params.to_device("multimodal_data",
-                                            "cuda",
-                                            pin_memory=True)
-                # re-assign the multimodal_data to the request after strip_for_generation for another generation request,
-                request.py_multimodal_data = multimodal_params.multimodal_data
-                multimodal_params_list.append(multimodal_params)
         extend_requests += extend_dummy_requests
 
         spec_config = self.spec_config if self.enable_spec_decode else None
@@ -1539,6 +1544,28 @@ class PyTorchModelEngine(ModelEngine):
                 draft_lens.append(0)
                 sequence_lengths.append(1)
                 gather_ids.append(len(position_ids) - 1)
+
+                # Multimodal
+                multimodal_params = MultimodalParams(
+                    multimodal_data=request.py_multimodal_data)
+                multimodal_params.strip_for_generation()
+                if multimodal_params.has_content():
+                    if self.use_mrope:
+                        mrope_position_deltas = multimodal_params.multimodal_data[
+                            'mrope_config']['mrope_position_deltas']
+                        # NOTE: Expanding position_ids to 3D tensor who is using mrope
+                        gen_mrope_position_ids = (past_seen_token_num +
+                                                  mrope_position_deltas).expand(
+                                                      3, 1, 1)
+                        mrope_position_ids.append(gen_mrope_position_ids)
+                        multimodal_params.to_device(
+                            "multimodal_data",
+                            "cuda",
+                            pin_memory=True,
+                            target_keywords=[
+                                "mrope_config.mrope_position_deltas"
+                            ])
+                        multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot
             # Do not add a gen_request_seq_slot for CUDA graph dummy requests
@@ -1654,11 +1681,26 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
 
-        position_ids = torch.tensor(position_ids,
-                                    dtype=torch.int,
-                                    pin_memory=True)
-        self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
-                                                        non_blocking=True)
+        if self.use_mrope and mrope_position_ids:
+            # NOTE: self.use_mrope is enough for differentiating whether to use mrope_position_ids but
+            # `_create_dummy_context_requests` from `kv_cache_creater` makes an exception that I can not add multimodal_data to the dummy_request
+            # so that we only replace position_ids with mrope_position_ids when it is not a dummy request and for models who is using mrope.
+            mrope_position_ids = torch.cat(mrope_position_ids,
+                                           dim=-1).pin_memory()
+            self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
+                mrope_position_ids[:, :, :total_num_tokens], non_blocking=True)
+            final_position_ids = self.mrope_position_ids_cuda[:, :, :
+                                                              total_num_tokens]
+        else:
+            position_ids = torch.tensor(position_ids,
+                                        dtype=torch.int,
+                                        pin_memory=True)
+            self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
+                                                            non_blocking=True)
+            final_position_ids = self.position_ids_cuda[:
+                                                        total_num_tokens].unsqueeze(
+                                                            0)
+
         if self.enable_spec_decode:
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
                 gather_ids, dtype=torch.int, pin_memory=True),
@@ -1718,8 +1760,18 @@ class PyTorchModelEngine(ModelEngine):
         virtual_num_tokens = total_num_tokens
         if attn_metadata.padded_num_tokens is not None:
             self.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-            self.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
+            if self.use_mrope and mrope_position_ids:
+                self.mrope_position_ids_cuda[
+                    total_num_tokens:padded_num_tokens].fill_(0)
+                final_position_ids = self.mrope_position_ids_cuda[:, :, :
+                                                                  virtual_num_tokens]
+            else:
+                self.position_ids_cuda[
+                    total_num_tokens:padded_num_tokens].fill_(0)
+                final_position_ids = self.position_ids_cuda[:
+                                                            virtual_num_tokens].unsqueeze(
+                                                                0)
 
         if self.enable_attention_dp:
             attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
@@ -1728,23 +1780,10 @@ class PyTorchModelEngine(ModelEngine):
         inputs = {
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:virtual_num_tokens],
-            'position_ids':
-            self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0),
+            'position_ids': final_position_ids,
             'inputs_embeds': None,
             "multimodal_params": multimodal_params_list,
         }
-
-        # Directly input mrope_position_deltas as a Tensor for cuda graph, because dictionary could not be captured.
-        if attn_metadata.is_cuda_graph and len(multimodal_params_list) > 0:
-            if 'mrope_position_deltas' in multimodal_params_list[
-                    0].multimodal_data.get('mrope_config', {}):
-                mrope_position_deltas_list = [
-                    multimodal_params.multimodal_data['mrope_config']
-                    ['mrope_position_deltas']
-                    for multimodal_params in multimodal_params_list
-                ]
-                inputs['mrope_position_deltas'] = torch.cat(
-                    mrope_position_deltas_list, dim=0)
 
         if bool(lora_params):
             inputs['lora_params'] = lora_params
