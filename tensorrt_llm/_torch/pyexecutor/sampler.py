@@ -657,6 +657,36 @@ class TorchSampler(Sampler):
 
         return logits
 
+    @staticmethod
+    @torch.inference_mode()
+    def _apply_min_length_penalty(logits: torch.Tensor,
+                                  requests: list[LlmRequest],
+                                  num_steps: list[int]) -> torch.Tensor:
+        """Inplace apply min_length_penalty to logits.
+
+            Args:
+                logits: The logits to apply min length penalty to
+                requests: The requests to apply min length penalty to
+                num_steps: The number of steps per request
+
+            Returns:
+                The logits with min length penalty applied
+        """
+        if any(r.py_min_length and r.max_beam_num_tokens < r.py_min_length[0]
+               for r in requests):
+            current_offset = 0
+            for index, r in enumerate(requests):
+                if r.py_min_length:
+                    for step in range(num_steps[index]):
+                        if r.max_beam_num_tokens + step < r.py_min_length[0]:
+                            logits[current_offset + step,
+                                   r.py_end_id] = float('-inf')
+                        else:
+                            #early exit
+                            break
+                current_offset += num_steps[index]
+        return logits
+
     def _process_requests(self,
                           scheduled_requests: ScheduledRequests,
                           model_outputs: dict[str, torch.Tensor],
@@ -686,6 +716,8 @@ class TorchSampler(Sampler):
 
         requests = scheduled_requests.all_requests()
         num_steps = [1 + get_draft_token_length(req) for req in requests]
+        raw_logits = self._apply_min_length_penalty(raw_logits, requests,
+                                                    num_steps)
         sum_steps = sum(num_steps)
         no_draft_tokens = len(requests) == sum_steps
         fast_path = not self.enable_mixed_sampler and no_draft_tokens and log_probs_host is None
