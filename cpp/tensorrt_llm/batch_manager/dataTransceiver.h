@@ -129,6 +129,7 @@ private:
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };
+
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
 
